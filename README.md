@@ -52,6 +52,17 @@ cd frontend && bun install && bun run dev
 cargo tauri dev
 ```
 
+### AI 辅助开发(可选)
+
+本项目包含 Claude Code 智能体配置,提供 Rust 代码审查、TDD 引导、架构设计等 AI 辅助能力:
+
+```bash
+# 安装 Claude Code 后,进入项目目录即可自动加载配置
+claude
+```
+
+`.claude/` 目录中的技能(skills)和智能体(agents)会自动注入至 AI 会话,提供 Rust 模式检查、性能审查、测试策略指导等上下文。
+
 ## 架构
 
 ### 分层架构
@@ -82,12 +93,12 @@ cargo tauri dev
 |---------------|---------------------------------------------|---------------------------------|
 | `qf-core`     | 核心类型、trait 定义、错误体系、配置与事件   | thiserror, serde                |
 | `qf-engine`   | 分片引擎、连接管理、MP-QUIC 多路径传输       | tokio, quinn, bytes             |
-| `qf-scheduler`| 智能调度器、带宽预测、优先级队列             | tokio, chrono                   |
-| `qf-io`       | io_uring 零拷贝存储引擎、缓冲区池管理        | io-uring, bytes                 |
+| `qf-scheduler`| 智能调度器、带宽预测、优先级队列             | Holt-Winters, BinaryHeap        |
+| `qf-io`       | 跨平台异步文件 I/O、缓冲区池管理             | tokio, bytes, io-uring(可选)    |
 | `qf-protocol` | HTTP/HTTPS/QUIC/FTP 协议适配与实现           | reqwest, quinn, url             |
-| `qf-sniffer`  | 浏览器资源嗅探、流量拦截与解析               | playwright MCP                  |
-| `qf-crypto`   | GPU 加速哈希校验、完整性验证                 | vulkano/wgpu, blake3, sha2      |
-| `qf-p2sp`     | P2SP 混合下载、DHT 网络、Peer 发现           | 自研 DHT                        |
+| `qf-sniffer`  | 浏览器资源嗅探、流量拦截与解析               | url, playwright MCP             |
+| `qf-crypto`   | CPU/GPU 哈希校验、完整性验证                 | blake3, sha2, wgpu(可选)        |
+| `qf-p2sp`     | P2SP 混合下载、DHT 网络、Peer 发现           | 自研 Kademlia DHT, Xorshift64   |
 | `qf-app`      | Tauri 应用入口、命令注册、GUI 事件桥接       | tauri v2                        |
 
 ## 项目结构
@@ -97,19 +108,21 @@ QuantumFetch/
   Cargo.toml              # workspace 根配置
   LICENSE                 # MIT 许可证
   README.md               # 项目说明(本文件)
+  .claude/                # AI 辅助配置(skills + agents)
   crates/
     qf-core/              # 核心类型与 trait 定义
     qf-engine/            # 分片引擎与连接管理
     qf-scheduler/         # 智能调度器
-    qf-io/                # io_uring 存储引擎
+    qf-io/                # 跨平台异步文件 I/O
     qf-protocol/          # 多协议适配
     qf-sniffer/           # 浏览器资源嗅探
-    qf-crypto/            # GPU 加速校验
+    qf-crypto/            # CPU/GPU 哈希校验
     qf-p2sp/              # P2SP 混合下载
     qf-app/               # Tauri 应用入口
   frontend/               # Tauri 前端(Bun)
   tests/                  # 集成测试
-  benches/                # criterion 基准测试
+  benches/                # criterion 基准测试(3组)
+  docx/                   # 参考文档(本地,不提交)
 ```
 
 ## 测试
@@ -147,6 +160,8 @@ cargo llvm-cov --fail-under-lines 95
 
 使用 `proptest` 进行属性测试,`tokio::test` 进行异步测试,`mockall` 隔离外部依赖。
 
+项目结构代码检查清单: `cargo clippy` (零警告)、`cargo fmt` (合规)、`cargo test` (通过)。
+
 ## 基准测试
 
 ```bash
@@ -168,19 +183,19 @@ cargo bench
 |--------------|--------------------------------|-----------------------------------|
 | 异步运行时   | `tokio`                        | multi-thread, full features       |
 | QUIC 协议    | `quinn`                        | 基于 rustls 的 QUIC 实现          |
-| io_uring     | `io-uring` / `tokio-uring`     | Linux 异步 IO 接口                |
+| io_uring     | `io-uring` / `tokio-uring`     | Linux 异步 IO 接口(按需启用)      |
 | HTTP 客户端  | `reqwest`                      | 基于 hyper,支持 rustls-tls        |
 | 桌面框架     | `tauri` v2                     | 跨平台桌面应用框架                |
-| GPU 计算     | `vulkano` / `wgpu`             | Vulkan Compute / WebGPU           |
+| GPU 计算     | `wgpu` / `vulkano`             | WebGPU / Vulkan Compute(预留)     |
 | 哈希算法     | `blake3`, `sha2`               | 高性能哈希与校验                  |
 | 序列化       | `serde`, `serde_json`          | JSON 与结构化数据序列化           |
-| 错误处理     | `thiserror`, `anyhow`          | 结构化错误与便捷错误传播          |
-| 日志         | `tracing`, `tracing-subscriber`| 结构化日志与过滤                  |
+| 错误处理     | `thiserror`                    | 结构化错误体系                    |
+| 日志         | `tracing`                      | 结构化日志与过滤                  |
 | 属性测试     | `proptest`                     | 基于属性的随机测试                |
 | 基准测试     | `criterion`                    | 统计学基准测试框架                |
 | Mock 框架    | `mockall`                      | trait 与函数 mock                 |
-| UUID         | `uuid`                         | 任务唯一标识生成                  |
-| 时间处理     | `chrono`                       | 时间戳与持续时间计算              |
+| 时间序列预测 | Holt-Winters(自研)             | 带宽预测模型                      |
+| Tauri 测试   | `serial_test`                  | 全局 Mutex 隔离测试               |
 
 ### 发布构建优化
 
@@ -202,6 +217,17 @@ strip = true        # 剥离符号表(减小二进制体积)
 6. 确保 `cargo fmt --all -- --check` 通过
 7. 新功能需附带测试,覆盖率不低于 95%
 8. 提交 Pull Request 前运行 `cargo test --all` 确保全部通过
+
+## 项目状态
+
+| 指标        | 状态 |
+|-------------|------|
+| 编译       | `cargo check` 通过,零错误 |
+| 代码质量   | `cargo clippy` 零警告 |
+| 测试       | 单元 + 集成 + 属性测试全部通过 |
+| 覆盖率目标 | 95%+(行覆盖率) |
+| Crate 数量 | 9 个 workspace crate |
+| 基准测试   | 3 组 criterion 基准测试 |
 
 ## 许可证
 
