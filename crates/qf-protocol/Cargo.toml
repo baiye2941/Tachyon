@@ -13,6 +13,9 @@ bytes.workspace = true
 url.workspace = true
 tracing.workspace = true
 futures.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

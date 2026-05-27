@@ -261,6 +261,120 @@
     .panel-label { color: var(--text-muted); }
     .panel-value { color: var(--text-primary); font-weight: 500; }
 
+    /* 设置面板 */
+    .settings-view, .sniffer-view { display: none; padding: 24px; overflow-y: auto; flex: 1; }
+    .settings-view.active, .sniffer-view.active { display: block; }
+    .downloads-view { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+    .downloads-view.active { display: flex; }
+    .setting-group {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .setting-group-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: var(--text-primary);
+    }
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .setting-row:last-child { border-bottom: none; }
+    .setting-label { font-size: 13px; color: var(--text-secondary); }
+    .setting-value { font-size: 13px; }
+    .setting-input {
+      padding: 8px 12px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 13px;
+      outline: none;
+      width: 200px;
+    }
+    .setting-input:focus { border-color: var(--border-active); }
+    select.setting-input { cursor: pointer; }
+    .toggle {
+      width: 44px;
+      height: 24px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
+      position: relative;
+      transition: all 0.2s;
+    }
+    .toggle.on { background: var(--accent); border-color: var(--accent); }
+    .toggle::after {
+      content: '';
+      width: 18px;
+      height: 18px;
+      background: white;
+      border-radius: 50%;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s;
+    }
+    .toggle.on::after { transform: translateX(20px); }
+
+    /* 嗅探面板 */
+    .sniffer-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .sniffer-status {
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .sniffer-status.active { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+    .sniffer-status.inactive { background: rgba(136, 136, 160, 0.12); color: var(--text-muted); }
+    .sniffer-list { display: flex; flex-direction: column; gap: 8px; }
+    .sniffer-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      transition: border-color 0.15s;
+    }
+    .sniffer-item:hover { border-color: #353560; }
+    .sniffer-type {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 700;
+      text-transform: uppercase;
+      min-width: 50px;
+      text-align: center;
+    }
+    .type-video { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+    .type-audio { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+    .type-document { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+    .type-archive { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+    .type-executable { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
+    .sniffer-info { flex: 1; min-width: 0; }
+    .sniffer-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sniffer-url { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sniffer-size { font-size: 12px; color: var(--text-secondary); min-width: 70px; text-align: right; }
+    .sniffer-actions { display: flex; gap: 6px; }
+    .btn-sm { padding: 6px 12px; font-size: 11px; border-radius: 4px; border: none; cursor: pointer; font-weight: 600; }
+    .btn-download-sm { background: var(--accent); color: white; }
+    .btn-download-sm:hover { background: var(--accent-hover); }
+
     /* 分片进度 */
     .fragment-grid {
       display: grid;
@@ -322,14 +436,101 @@
 
     <!-- 内容区 -->
     <div class="content" id="content">
-      <div class="section-title">下载中</div>
-      <div id="active-downloads"></div>
-      <div class="section-title" style="margin-top: 20px;">已完成</div>
-      <div id="completed-downloads"></div>
-      <div class="empty-state" id="empty-state">
-        <div class="empty-icon">&#9660;</div>
-        <div class="empty-text">暂无下载任务</div>
-        <div class="empty-hint">在上方输入链接开始下载</div>
+      <!-- 下载列表视图 -->
+      <div class="downloads-view active" id="view-downloads">
+        <div class="section-title">下载中</div>
+        <div id="active-downloads"></div>
+        <div class="section-title" style="margin-top: 20px;">已完成</div>
+        <div id="completed-downloads"></div>
+        <div class="empty-state" id="empty-state">
+          <div class="empty-icon">&#9660;</div>
+          <div class="empty-text">暂无下载任务</div>
+          <div class="empty-hint">在上方输入链接开始下载</div>
+        </div>
+      </div>
+
+      <!-- 嗅探视图 -->
+      <div class="sniffer-view" id="view-sniffer">
+        <div class="sniffer-header">
+          <h2 style="font-size: 18px; font-weight: 600;">资源嗅探</h2>
+          <span class="sniffer-status active" id="sniffer-status">监听中</span>
+          <button class="btn btn-ghost" onclick="toggleSniffer()" style="margin-left: auto;">暂停监听</button>
+        </div>
+        <div class="section-title">检测到的资源</div>
+        <div class="sniffer-list" id="sniffer-list"></div>
+        <div class="empty-state" id="sniffer-empty" style="min-height: 300px;">
+          <div class="empty-icon">&#128065;</div>
+          <div class="empty-text">正在监听浏览器流量...</div>
+          <div class="empty-hint">浏览包含视频、音频或文档的网页时,资源将自动显示在这里</div>
+        </div>
+      </div>
+
+      <!-- 设置视图 -->
+      <div class="settings-view" id="view-settings">
+        <h2 style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">设置</h2>
+        <div class="setting-group">
+          <div class="setting-group-title">下载设置</div>
+          <div class="setting-row">
+            <span class="setting-label">下载目录</span>
+            <input class="setting-input" id="cfg-download-dir" value="C:\Users\Downloads" />
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">最大并发任务数</span>
+            <input class="setting-input" type="number" id="cfg-max-tasks" value="3" min="1" max="10" style="width: 80px;" />
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">每任务最大分片数</span>
+            <input class="setting-input" type="number" id="cfg-max-fragments" value="16" min="1" max="64" style="width: 80px;" />
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">每主机最大连接数</span>
+            <input class="setting-input" type="number" id="cfg-max-connections" value="16" min="1" max="32" style="width: 80px;" />
+          </div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-group-title">协议设置</div>
+          <div class="setting-row">
+            <span class="setting-label">启用 QUIC 传输</span>
+            <div class="toggle on" id="cfg-quic" onclick="this.classList.toggle('on')"></div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">启用 HTTP/2 多路复用</span>
+            <div class="toggle on" id="cfg-http2" onclick="this.classList.toggle('on')"></div>
+          </div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-group-title">安全设置</div>
+          <div class="setting-row">
+            <span class="setting-label">下载后校验完整性</span>
+            <div class="toggle on" id="cfg-verify" onclick="this.classList.toggle('on')"></div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">校验算法</span>
+            <select class="setting-input" id="cfg-hash" style="width: 120px;">
+              <option value="blake3" selected>Blake3</option>
+              <option value="sha256">SHA-256</option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-group-title">浏览器嗅探</div>
+          <div class="setting-row">
+            <span class="setting-label">启用资源嗅探</span>
+            <div class="toggle on" id="cfg-sniffer" onclick="this.classList.toggle('on')"></div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">最小文件大小</span>
+            <select class="setting-input" id="cfg-min-size" style="width: 120px;">
+              <option value="0">不限制</option>
+              <option value="1024" selected>1 KB</option>
+              <option value="102400">100 KB</option>
+              <option value="1048576">1 MB</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top: 16px;">
+          <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+        </div>
       </div>
     </div>
   </div>
@@ -540,6 +741,87 @@
       if (e.key === 'Enter') startDownload();
     });
 
+    // 视图切换
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const view = item.dataset.view;
+        document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+        item.classList.add('active');
+        document.querySelectorAll('.downloads-view, .sniffer-view, .settings-view').forEach(v => v.classList.remove('active'));
+        document.getElementById(`view-${view}`).classList.add('active');
+        // 顶部栏只在下载视图显示
+        document.querySelector('.topbar').style.display = view === 'downloads' ? 'flex' : 'none';
+        // 详情面板只在下载视图显示
+        if (view !== 'downloads') document.getElementById('detail-panel').style.display = 'none';
+      });
+    });
+
+    // 嗅探面板模拟数据
+    const snifferItems = [
+      { type: 'video', name: 'lecture-recording.mp4', url: 'https://cdn.edu/lectures/2024/lecture-recording.mp4?token=abc123', size: 524288000 },
+      { type: 'video', name: 'tutorial.webm', url: 'https://videos.example.com/tutorial.webm', size: 104857600 },
+      { type: 'audio', name: 'podcast-ep42.mp3', url: 'https://podcast.fm/ep42.mp3', size: 52428800 },
+      { type: 'document', name: 'whitepaper.pdf', url: 'https://docs.example.com/whitepaper.pdf', size: 2097152 },
+      { type: 'archive', name: 'dataset-v2.zip', url: 'https://data.example.com/dataset-v2.zip', size: 1073741824 },
+      { type: 'executable', name: 'app-setup.exe', url: 'https://download.example.com/app-setup.exe', size: 104857600 },
+    ];
+    let snifferActive = true;
+
+    function renderSniffer() {
+      const list = document.getElementById('sniffer-list');
+      const empty = document.getElementById('sniffer-empty');
+      if (!snifferActive || snifferItems.length === 0) {
+        list.innerHTML = '';
+        empty.style.display = 'flex';
+        return;
+      }
+      empty.style.display = 'none';
+      list.innerHTML = snifferItems.map((item, i) => `
+        <div class="sniffer-item">
+          <span class="sniffer-type type-${item.type}">${item.type}</span>
+          <div class="sniffer-info">
+            <div class="sniffer-name">${item.name}</div>
+            <div class="sniffer-url">${item.url}</div>
+          </div>
+          <span class="sniffer-size">${formatSize(item.size)}</span>
+          <div class="sniffer-actions">
+            <button class="btn-sm btn-download-sm" onclick="downloadSnifferItem(${i})">下载</button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function downloadSnifferItem(index) {
+      const item = snifferItems[index];
+      const ext = item.name.split('.').pop().toUpperCase().slice(0, 4);
+      downloads.unshift({
+        id: String(Date.now()), name: item.name, ext, url: item.url,
+        size: item.size, downloaded: 0, speed: Math.floor(item.size * 0.02),
+        status: 'downloading', fragments: 8, fragmentsDone: 0, protocol: 'HTTPS',
+      });
+      snifferItems.splice(index, 1);
+      renderSniffer();
+      // 切换到下载视图
+      document.querySelector('[data-view="downloads"]').click();
+      renderList();
+    }
+
+    function toggleSniffer() {
+      snifferActive = !snifferActive;
+      const status = document.getElementById('sniffer-status');
+      status.textContent = snifferActive ? '监听中' : '已暂停';
+      status.className = 'sniffer-status ' + (snifferActive ? 'active' : 'inactive');
+      renderSniffer();
+    }
+
+    function saveSettings() {
+      // 模拟保存
+      const btn = event.target;
+      btn.textContent = '已保存';
+      btn.style.background = '#22c55e';
+      setTimeout(() => { btn.textContent = '保存设置'; btn.style.background = ''; }, 1500);
+    }
+
     // 模拟下载进度更新
     setInterval(() => {
       downloads.forEach(dl => {
@@ -558,6 +840,7 @@
 
     // 初始渲染
     renderList();
+    renderSniffer();
   </script>
 </body>
 </html>

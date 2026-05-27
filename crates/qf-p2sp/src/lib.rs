@@ -7,6 +7,8 @@
 
 pub mod dht;
 pub mod peer;
+pub mod source;
 
 pub use dht::KademliaDht;
 pub use peer::{PeerInfo, PeerScore};
+pub use source::{DownloadSource, SourceSelector};
