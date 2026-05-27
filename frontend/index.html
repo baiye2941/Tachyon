@@ -4,92 +4,128 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>QuantumFetch</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
   <style>
+    /* ===== 设计令牌 ===== */
     :root {
-      --bg-primary: #08080c;
-      --bg-secondary: #0f0f17;
-      --bg-tertiary: #161622;
-      --bg-card: #1a1a2a;
-      --border: #252540;
-      --border-active: #6366f1;
-      --text-primary: #e8e8f0;
-      --text-secondary: #8888a0;
-      --text-muted: #555570;
-      --accent: #6366f1;
-      --accent-hover: #7577f5;
-      --success: #22c55e;
-      --warning: #f59e0b;
-      --error: #ef4444;
-      --radius: 10px;
-      --radius-sm: 6px;
+      --bg: #0a0a0f;
+      --surface: #111118;
+      --border: #1a1a24;
+      --text: #d8d8e0;
+      --text-2: #6a6a78;
+      --text-3: #3a3a48;
+      --accent: #10b981;
+      --ok: #22c55e;
+      --warn: #eab308;
+      --err: #ef4444;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
     }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* ===== 基础重置 ===== */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      background: var(--bg-primary);
-      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--text);
       min-height: 100vh;
-      display: flex;
       overflow: hidden;
     }
 
-    /* 侧边栏 */
+    /* 等宽数字 */
+    .mono { font-family: var(--font-mono); }
+
+    /* ===== 全局网格布局 ===== */
+    .app {
+      display: grid;
+      grid-template-columns: 200px 1fr auto;
+      height: 100vh;
+    }
+
+    /* ===== 侧边栏 ===== */
     .sidebar {
-      width: 220px;
-      background: var(--bg-secondary);
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       flex-shrink: 0;
+      overflow: hidden;
     }
     .sidebar-logo {
-      padding: 20px;
-      font-size: 18px;
-      font-weight: 800;
-      background: linear-gradient(135deg, #6366f1, #a78bfa);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      letter-spacing: -0.5px;
+      padding: 20px 16px;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      color: var(--accent);
       border-bottom: 1px solid var(--border);
     }
-    .sidebar-nav { padding: 12px 8px; flex: 1; }
+    .sidebar-nav {
+      padding: 8px;
+      flex: 1;
+    }
     .nav-item {
-      padding: 10px 14px;
-      border-radius: var(--radius-sm);
-      color: var(--text-secondary);
+      padding: 8px 12px;
+      color: var(--text-2);
       cursor: pointer;
       font-size: 13px;
       display: flex;
       align-items: center;
       gap: 10px;
-      transition: all 0.15s;
+      transition: color 0.15s, background 0.15s;
       user-select: none;
+      border-radius: 4px;
     }
-    .nav-item:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .nav-item:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.03);
+    }
     .nav-item.active {
-      background: rgba(99, 102, 241, 0.12);
       color: var(--accent);
     }
-    .nav-icon { font-size: 16px; width: 20px; text-align: center; }
+    .nav-icon {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .nav-icon svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
     .sidebar-stats {
-      padding: 16px;
+      padding: 14px 16px;
       border-top: 1px solid var(--border);
       font-size: 11px;
-      color: var(--text-muted);
-      line-height: 1.8;
+      color: var(--text-3);
+      line-height: 2;
+    }
+    .sidebar-stats .mono {
+      color: var(--text-2);
     }
 
-    /* 主区域 */
-    .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    /* ===== 主区域 ===== */
+    .main {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
 
-    /* 顶部栏 */
+    /* ===== 顶部栏 ===== */
     .topbar {
-      padding: 14px 24px;
-      background: var(--bg-secondary);
+      padding: 12px 20px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
+      flex-shrink: 0;
     }
     .url-bar {
       flex: 1;
@@ -98,510 +134,709 @@
     }
     .url-bar input {
       flex: 1;
-      padding: 10px 14px;
-      background: var(--bg-tertiary);
+      padding: 8px 12px;
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      color: var(--text-primary);
+      border-radius: 4px;
+      color: var(--text);
       font-size: 13px;
+      font-family: var(--font-mono);
       outline: none;
-      transition: border-color 0.2s;
+      transition: border-color 0.15s;
     }
-    .url-bar input:focus { border-color: var(--border-active); }
-    .url-bar input::placeholder { color: var(--text-muted); }
+    .url-bar input:focus {
+      border-color: var(--accent);
+    }
+    .url-bar input::placeholder {
+      color: var(--text-3);
+      font-family: var(--font-sans);
+    }
+
+    /* ===== 按钮 ===== */
     .btn {
-      padding: 10px 20px;
+      padding: 8px 16px;
       border: none;
-      border-radius: var(--radius-sm);
-      font-size: 13px;
+      border-radius: 4px;
+      font-size: 12px;
       font-weight: 600;
+      font-family: var(--font-sans);
       cursor: pointer;
-      transition: all 0.15s;
+      transition: opacity 0.15s, transform 0.1s;
+      white-space: nowrap;
+    }
+    .btn:active {
+      transform: translateY(1px);
     }
     .btn-primary {
       background: var(--accent);
-      color: white;
+      color: #fff;
     }
-    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:hover {
+      opacity: 0.85;
+    }
     .btn-ghost {
       background: transparent;
-      color: var(--text-secondary);
+      color: var(--text-2);
       border: 1px solid var(--border);
     }
-    .btn-ghost:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .btn-ghost:hover {
+      color: var(--text);
+      border-color: var(--text-3);
+    }
 
-    /* 下载列表 */
-    .content { flex: 1; overflow-y: auto; padding: 16px 24px; }
+    /* ===== 内容区 ===== */
+    .content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+    }
+
+    /* 滚动条 */
+    .content::-webkit-scrollbar { width: 4px; }
+    .content::-webkit-scrollbar-track { background: transparent; }
+    .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
     .section-title {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
-      color: var(--text-muted);
+      color: var(--text-3);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 12px;
+      letter-spacing: 0.8px;
+      margin-bottom: 10px;
     }
 
-    /* 下载卡片 */
-    .download-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 16px 18px;
-      margin-bottom: 10px;
-      transition: border-color 0.2s;
+    /* ===== 视图切换 ===== */
+    .settings-view,
+    .sniffer-view {
+      display: none;
+      padding: 20px;
+      overflow-y: auto;
+      flex: 1;
     }
-    .download-card:hover { border-color: #353560; }
+    .settings-view.active,
+    .sniffer-view.active {
+      display: block;
+    }
+    .downloads-view {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .downloads-view.active {
+      display: flex;
+    }
+
+    /* ===== 下载条目 ===== */
+    .download-card {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .download-card:hover {
+      border-color: var(--text-3);
+    }
     .card-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 10px;
+      margin-bottom: 8px;
     }
     .card-name {
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 600;
-      color: var(--text-primary);
+      color: var(--text);
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
     }
     .card-name .ext {
       font-size: 10px;
-      padding: 2px 6px;
-      background: rgba(99, 102, 241, 0.15);
+      font-family: var(--font-mono);
+      font-weight: 600;
+      padding: 1px 5px;
+      background: rgba(16,185,129,0.1);
       color: var(--accent);
-      border-radius: 4px;
-      font-weight: 700;
+      border-radius: 2px;
       text-transform: uppercase;
+      flex-shrink: 0;
     }
     .card-status {
-      font-size: 12px;
-      padding: 4px 10px;
-      border-radius: 20px;
+      font-size: 11px;
       font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
     }
-    .status-downloading {
-      background: rgba(99, 102, 241, 0.12);
-      color: var(--accent);
-    }
-    .status-completed {
-      background: rgba(34, 197, 94, 0.12);
-      color: var(--success);
-    }
-    .status-paused {
-      background: rgba(245, 158, 11, 0.12);
-      color: var(--warning);
-    }
-    .status-failed {
-      background: rgba(239, 68, 68, 0.12);
-      color: var(--error);
-    }
-    .status-pending {
-      background: rgba(136, 136, 160, 0.12);
-      color: var(--text-secondary);
-    }
-    .status-cancelled {
-      background: rgba(136, 136, 160, 0.12);
-      color: var(--text-muted);
-      text-decoration: line-through;
+    .card-status::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
     }
 
-    /* 进度条 */
+    /* 状态圆点 + 颜色 */
+    .status-downloading { color: var(--accent); }
+    .status-downloading::before { background: var(--accent); animation: breathe 2s ease-in-out infinite; }
+    .status-completed { color: var(--ok); }
+    .status-completed::before { background: var(--ok); }
+    .status-paused { color: var(--warn); }
+    .status-paused::before { background: var(--warn); }
+    .status-failed { color: var(--err); }
+    .status-failed::before { background: var(--err); }
+    .status-pending { color: var(--text-2); }
+    .status-pending::before { background: var(--text-3); animation: breathe 3s ease-in-out infinite; }
+    .status-cancelled { color: var(--text-3); text-decoration: line-through; }
+    .status-cancelled::before { background: var(--text-3); }
+
+    @keyframes breathe {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* ===== 进度条 ===== */
     .progress-bar {
-      height: 4px;
-      background: var(--bg-tertiary);
-      border-radius: 2px;
+      height: 3px;
+      background: var(--border);
       overflow: hidden;
       margin-bottom: 10px;
     }
     .progress-fill {
       height: 100%;
-      border-radius: 2px;
-      transition: width 0.3s ease;
+      transition: width 0.3s linear;
     }
-    .progress-fill.downloading { background: linear-gradient(90deg, #6366f1, #a78bfa); }
-    .progress-fill.completed { background: var(--success); }
-    .progress-fill.paused { background: var(--warning); }
-    .progress-fill.failed { background: var(--error); }
+    .progress-fill.downloading { background: var(--accent); }
+    .progress-fill.completed { background: var(--ok); }
+    .progress-fill.paused { background: var(--warn); }
+    .progress-fill.failed { background: var(--err); }
+    .progress-fill.pending { background: var(--text-3); }
+    .progress-fill.cancelled { background: var(--text-3); }
 
-    /* 卡片详情 */
+    /* ===== 卡片详情行 ===== */
     .card-details {
       display: flex;
       align-items: center;
       gap: 16px;
-      font-size: 12px;
-      color: var(--text-secondary);
+      font-size: 11px;
+      color: var(--text-2);
     }
-    .detail-item { display: flex; align-items: center; gap: 4px; }
-    .detail-label { color: var(--text-muted); }
-    .speed-value { color: var(--accent); font-weight: 600; }
-
-    /* 空状态 */
-    .empty-state {
-      flex: 1;
+    .detail-item {
       display: flex;
-      flex-direction: column;
       align-items: center;
-      justify-content: center;
-      color: var(--text-muted);
-      gap: 16px;
+      gap: 4px;
     }
-    .empty-icon { font-size: 48px; opacity: 0.3; }
-    .empty-text { font-size: 14px; }
-    .empty-hint { font-size: 12px; color: var(--text-muted); }
-
-    /* 右侧详情面板 */
-    .detail-panel {
-      width: 280px;
-      background: var(--bg-secondary);
-      border-left: 1px solid var(--border);
-      padding: 20px;
-      flex-shrink: 0;
-      overflow-y: auto;
+    .detail-label {
+      color: var(--text-3);
     }
-    .panel-title { font-size: 14px; font-weight: 600; margin-bottom: 16px; }
-    .panel-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 8px 0;
-      font-size: 12px;
-      border-bottom: 1px solid var(--border);
+    .detail-item .mono {
+      color: var(--text-2);
     }
-    .panel-label { color: var(--text-muted); }
-    .panel-value { color: var(--text-primary); font-weight: 500; }
-
-    /* 设置面板 */
-    .settings-view, .sniffer-view { display: none; padding: 24px; overflow-y: auto; flex: 1; }
-    .settings-view.active, .sniffer-view.active { display: block; }
-    .downloads-view { display: none; flex: 1; flex-direction: column; overflow: hidden; }
-    .downloads-view.active { display: flex; }
-    .setting-group {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 20px;
-      margin-bottom: 16px;
-    }
-    .setting-group-title {
-      font-size: 14px;
+    .speed-value {
+      color: var(--accent);
       font-weight: 600;
-      margin-bottom: 16px;
-      color: var(--text-primary);
+      font-family: var(--font-mono);
     }
-    .setting-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .setting-row:last-child { border-bottom: none; }
-    .setting-label { font-size: 13px; color: var(--text-secondary); }
-    .setting-value { font-size: 13px; }
-    .setting-input {
-      padding: 8px 12px;
-      background: var(--bg-tertiary);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      color: var(--text-primary);
-      font-size: 13px;
-      outline: none;
-      width: 200px;
-    }
-    .setting-input:focus { border-color: var(--border-active); }
-    select.setting-input { cursor: pointer; }
-    .toggle {
-      width: 44px;
-      height: 24px;
-      background: var(--bg-tertiary);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      cursor: pointer;
-      position: relative;
-      transition: all 0.2s;
-    }
-    .toggle.on { background: var(--accent); border-color: var(--accent); }
-    .toggle::after {
-      content: '';
-      width: 18px;
-      height: 18px;
-      background: white;
-      border-radius: 50%;
-      position: absolute;
-      top: 2px;
-      left: 2px;
-      transition: transform 0.2s;
-    }
-    .toggle.on::after { transform: translateX(20px); }
 
-    /* 嗅探面板 */
-    .sniffer-header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 20px;
-    }
-    .sniffer-status {
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 500;
-    }
-    .sniffer-status.active { background: rgba(34, 197, 94, 0.12); color: var(--success); }
-    .sniffer-status.inactive { background: rgba(136, 136, 160, 0.12); color: var(--text-muted); }
-    .sniffer-list { display: flex; flex-direction: column; gap: 8px; }
-    .sniffer-item {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 12px 16px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      transition: border-color 0.15s;
-    }
-    .sniffer-item:hover { border-color: #353560; }
-    .sniffer-type {
-      font-size: 10px;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-weight: 700;
-      text-transform: uppercase;
-      min-width: 50px;
-      text-align: center;
-    }
-    .type-video { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
-    .type-audio { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
-    .type-document { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
-    .type-archive { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
-    .type-executable { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
-    .sniffer-info { flex: 1; min-width: 0; }
-    .sniffer-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sniffer-url { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sniffer-size { font-size: 12px; color: var(--text-secondary); min-width: 70px; text-align: right; }
-    .sniffer-actions { display: flex; gap: 6px; }
-    .btn-sm { padding: 6px 12px; font-size: 11px; border-radius: 4px; border: none; cursor: pointer; font-weight: 600; }
-    .btn-download-sm { background: var(--accent); color: white; }
-    .btn-download-sm:hover { background: var(--accent-hover); }
-
-    /* 任务操作按钮 */
+    /* ===== 操作按钮 ===== */
     .card-actions {
       display: flex;
       gap: 6px;
       margin-top: 10px;
     }
     .btn-card-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
       padding: 4px 10px;
       font-size: 11px;
       border-radius: 4px;
       border: 1px solid var(--border);
       background: transparent;
-      color: var(--text-secondary);
+      color: var(--text-2);
       cursor: pointer;
       font-weight: 500;
-      transition: all 0.15s;
+      font-family: var(--font-sans);
+      transition: color 0.15s, border-color 0.15s, transform 0.1s;
+    }
+    .btn-card-action:active {
+      transform: translateY(1px);
     }
     .btn-card-action:hover {
-      background: var(--bg-tertiary);
-      color: var(--text-primary);
-      border-color: #353560;
+      color: var(--text);
+      border-color: var(--text-3);
+    }
+    .btn-card-action svg {
+      width: 12px;
+      height: 12px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }
     .btn-card-action.action-danger:hover {
-      background: rgba(239, 68, 68, 0.12);
-      color: var(--error);
-      border-color: rgba(239, 68, 68, 0.3);
+      color: var(--err);
+      border-color: rgba(239,68,68,0.3);
     }
 
-    /* 分片进度 */
+    /* ===== 空状态 ===== */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-3);
+      gap: 12px;
+      padding: 40px 0;
+    }
+    .empty-icon {
+      width: 40px;
+      height: 40px;
+      stroke: var(--text-3);
+      fill: none;
+      stroke-width: 1;
+      opacity: 0.4;
+    }
+    .empty-text {
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    .empty-hint {
+      font-size: 11px;
+      color: var(--text-3);
+    }
+
+    /* ===== 右侧详情面板 ===== */
+    .detail-panel {
+      width: 260px;
+      border-left: 1px solid var(--border);
+      padding: 20px 16px;
+      flex-shrink: 0;
+      overflow-y: auto;
+      display: none;
+    }
+    .panel-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 16px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .panel-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 7px 0;
+      font-size: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-label {
+      color: var(--text-3);
+    }
+    .panel-value {
+      color: var(--text);
+      font-weight: 500;
+    }
+    .panel-value.mono {
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+    .speed-value {
+      color: var(--accent);
+    }
+
+    /* ===== 分片可视化 ===== */
     .fragment-grid {
-      display: grid;
-      grid-template-columns: repeat(8, 1fr);
-      gap: 3px;
+      display: flex;
+      gap: 2px;
+      flex-wrap: wrap;
       margin-top: 12px;
     }
     .fragment-block {
-      aspect-ratio: 1;
-      border-radius: 3px;
-      background: var(--bg-tertiary);
+      width: 100%;
+      height: 2px;
+      background: var(--border);
       transition: background 0.3s;
     }
-    .fragment-block.done { background: var(--success); }
-    .fragment-block.active { background: var(--accent); animation: pulse 1.5s infinite; }
-    .fragment-block.pending { background: var(--bg-tertiary); }
+    .fragment-block.done { background: var(--accent); }
+    .fragment-block.active { background: var(--accent); animation: breathe 1.5s ease-in-out infinite; }
+    .fragment-block.pending { background: var(--border); }
 
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
+    /* ===== 设置面板 ===== */
+    .setting-group {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .setting-group-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: var(--text);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .setting-row:last-child { border-bottom: none; }
+    .setting-label {
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    .setting-value {
+      font-size: 13px;
+    }
+    .setting-input {
+      padding: 6px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 12px;
+      font-family: var(--font-mono);
+      outline: none;
+      width: 200px;
+      transition: border-color 0.15s;
+    }
+    .setting-input:focus {
+      border-color: var(--accent);
+    }
+    select.setting-input {
+      cursor: pointer;
+      font-family: var(--font-sans);
+    }
+
+    /* ===== Toggle 开关 ===== */
+    .toggle {
+      width: 40px;
+      height: 22px;
+      background: var(--border);
+      border: 1px solid var(--text-3);
+      border-radius: 11px;
+      cursor: pointer;
+      position: relative;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .toggle.on {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .toggle::after {
+      content: '';
+      width: 16px;
+      height: 16px;
+      background: var(--text);
+      border-radius: 50%;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s;
+    }
+    .toggle.on::after {
+      transform: translateX(18px);
+    }
+
+    /* ===== 嗅探面板 ===== */
+    .sniffer-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .sniffer-header h2 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .sniffer-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .sniffer-status::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .sniffer-status.active { color: var(--ok); }
+    .sniffer-status.active::before { background: var(--ok); animation: breathe 2s ease-in-out infinite; }
+    .sniffer-status.inactive { color: var(--text-3); }
+    .sniffer-status.inactive::before { background: var(--text-3); }
+    .sniffer-list {
+      display: flex;
+      flex-direction: column;
+    }
+    .sniffer-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+      transition: border-color 0.15s;
+    }
+    .sniffer-item:hover {
+      border-color: var(--text-3);
+    }
+    .sniffer-type {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 2px;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      text-transform: uppercase;
+      min-width: 48px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    .type-video { background: rgba(239,68,68,0.1); color: var(--err); }
+    .type-audio { background: rgba(34,197,94,0.1); color: var(--ok); }
+    .type-document { background: rgba(14,165,233,0.1); color: #0ea5e9; }
+    .type-archive { background: rgba(234,179,8,0.1); color: var(--warn); }
+    .type-executable { background: rgba(168,85,247,0.1); color: #a855f7; }
+    .sniffer-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .sniffer-name {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sniffer-url {
+      font-size: 11px;
+      color: var(--text-3);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-family: var(--font-mono);
+    }
+    .sniffer-size {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--text-2);
+      min-width: 64px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .sniffer-actions {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 11px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      font-family: var(--font-sans);
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    .btn-sm:active { transform: translateY(1px); }
+    .btn-download-sm {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-download-sm:hover {
+      opacity: 0.85;
     }
   </style>
 </head>
 <body>
-  <!-- 侧边栏 -->
-  <div class="sidebar">
-    <div class="sidebar-logo">QuantumFetch</div>
-    <div class="sidebar-nav">
-      <div class="nav-item active" data-view="downloads">
-        <span class="nav-icon">&#9660;</span>
-        <span>下载列表</span>
+  <div class="app">
+    <!-- 侧边栏 -->
+    <div class="sidebar">
+      <div class="sidebar-logo">QuantumFetch</div>
+      <div class="sidebar-nav">
+        <div class="nav-item active" data-view="downloads">
+          <span class="nav-icon">
+            <svg viewBox="0 0 20 20"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
+          </span>
+          <span>下载列表</span>
+        </div>
+        <div class="nav-item" data-view="sniffer">
+          <span class="nav-icon">
+            <svg viewBox="0 0 20 20"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
+          </span>
+          <span>资源嗅探</span>
+        </div>
+        <div class="nav-item" data-view="settings">
+          <span class="nav-icon">
+            <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 1.5v2m0 13v2M18.5 10h-2m-13 0h-2M15.66 4.34l-1.42 1.42M5.76 14.24l-1.42 1.42m11.32 0l-1.42-1.42M5.76 5.76L4.34 4.34"/></svg>
+          </span>
+          <span>设置</span>
+        </div>
       </div>
-      <div class="nav-item" data-view="sniffer">
-        <span class="nav-icon">&#128065;</span>
-        <span>资源嗅探</span>
+      <div class="sidebar-stats">
+        <div>活跃连接 <span class="mono" id="stat-connections">0</span></div>
+        <div>总速度 <span class="mono" id="stat-speed">0 B/s</span></div>
+        <div>队列任务 <span class="mono" id="stat-queue">0</span></div>
       </div>
-      <div class="nav-item" data-view="settings">
-        <span class="nav-icon">&#9881;</span>
-        <span>设置</span>
-      </div>
-    </div>
-    <div class="sidebar-stats">
-      <div>活跃连接: <span id="stat-connections">0</span></div>
-      <div>总速度: <span id="stat-speed">0 B/s</span></div>
-      <div>队列任务: <span id="stat-queue">0</span></div>
-    </div>
-  </div>
-
-  <!-- 主区域 -->
-  <div class="main">
-    <!-- 顶部栏 -->
-    <div class="topbar">
-      <div class="url-bar">
-        <input type="text" id="url-input" placeholder="粘贴下载链接,支持 HTTP/HTTPS/FTP/QUIC..." />
-        <button class="btn btn-primary" id="btn-download">开始下载</button>
-      </div>
-      <button class="btn btn-ghost" id="btn-pause-all">全部暂停</button>
     </div>
 
-    <!-- 内容区 -->
-    <div class="content" id="content">
-      <!-- 下载列表视图 -->
-      <div class="downloads-view active" id="view-downloads">
-        <div class="section-title">下载中</div>
-        <div id="active-downloads"></div>
-        <div class="section-title" style="margin-top: 20px;">已完成</div>
-        <div id="completed-downloads"></div>
-        <div class="empty-state" id="empty-state">
-          <div class="empty-icon">&#9660;</div>
-          <div class="empty-text">暂无下载任务</div>
-          <div class="empty-hint">在上方输入链接开始下载</div>
+    <!-- 主区域 -->
+    <div class="main">
+      <!-- 顶部栏 -->
+      <div class="topbar">
+        <div class="url-bar">
+          <input type="text" id="url-input" placeholder="粘贴下载链接,支持 HTTP/HTTPS/FTP/QUIC..." />
+          <button class="btn btn-primary" id="btn-download">开始下载</button>
         </div>
+        <button class="btn btn-ghost" id="btn-pause-all">全部暂停</button>
       </div>
 
-      <!-- 嗅探视图 -->
-      <div class="sniffer-view" id="view-sniffer">
-        <div class="sniffer-header">
-          <h2 style="font-size: 18px; font-weight: 600;">资源嗅探</h2>
-          <span class="sniffer-status active" id="sniffer-status">监听中</span>
-          <button class="btn btn-ghost" onclick="toggleSniffer()" style="margin-left: auto;">暂停监听</button>
+      <!-- 内容区 -->
+      <div class="content" id="content">
+        <!-- 下载列表视图 -->
+        <div class="downloads-view active" id="view-downloads">
+          <div class="section-title">下载中</div>
+          <div id="active-downloads"></div>
+          <div class="section-title" style="margin-top: 20px;">已完成</div>
+          <div id="completed-downloads"></div>
+          <div class="empty-state" id="empty-state">
+            <svg class="empty-icon" viewBox="0 0 20 20"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
+            <div class="empty-text">暂无下载任务</div>
+            <div class="empty-hint">在上方输入链接开始下载</div>
+          </div>
         </div>
-        <div class="section-title">检测到的资源</div>
-        <div class="sniffer-list" id="sniffer-list"></div>
-        <div class="empty-state" id="sniffer-empty" style="min-height: 300px;">
-          <div class="empty-icon">&#128065;</div>
-          <div class="empty-text">正在监听浏览器流量...</div>
-          <div class="empty-hint">浏览包含视频、音频或文档的网页时,资源将自动显示在这里</div>
+
+        <!-- 嗅探视图 -->
+        <div class="sniffer-view" id="view-sniffer">
+          <div class="sniffer-header">
+            <h2>资源嗅探</h2>
+            <span class="sniffer-status active" id="sniffer-status">监听中</span>
+            <button class="btn btn-ghost" onclick="toggleSniffer()" style="margin-left: auto;">暂停监听</button>
+          </div>
+          <div class="section-title">检测到的资源</div>
+          <div class="sniffer-list" id="sniffer-list"></div>
+          <div class="empty-state" id="sniffer-empty" style="min-height: 300px;">
+            <svg class="empty-icon" viewBox="0 0 20 20"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
+            <div class="empty-text">正在监听浏览器流量...</div>
+            <div class="empty-hint">浏览包含视频、音频或文档的网页时,资源将自动显示在这里</div>
+          </div>
+        </div>
+
+        <!-- 设置视图 -->
+        <div class="settings-view" id="view-settings">
+          <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">设置</h2>
+          <div class="setting-group">
+            <div class="setting-group-title">下载设置</div>
+            <div class="setting-row">
+              <span class="setting-label">下载目录</span>
+              <input class="setting-input" id="cfg-download-dir" value="C:\Users\Downloads" />
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">最大并发任务数</span>
+              <input class="setting-input" type="number" id="cfg-max-tasks" value="3" min="1" max="10" style="width: 80px;" />
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">每任务最大分片数</span>
+              <input class="setting-input" type="number" id="cfg-max-fragments" value="16" min="1" max="64" style="width: 80px;" />
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">每主机最大连接数</span>
+              <input class="setting-input" type="number" id="cfg-max-connections" value="16" min="1" max="32" style="width: 80px;" />
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-group-title">协议设置</div>
+            <div class="setting-row">
+              <span class="setting-label">启用 QUIC 传输</span>
+              <div class="toggle on" id="cfg-quic" onclick="this.classList.toggle('on')"></div>
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">启用 HTTP/2 多路复用</span>
+              <div class="toggle on" id="cfg-http2" onclick="this.classList.toggle('on')"></div>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-group-title">安全设置</div>
+            <div class="setting-row">
+              <span class="setting-label">下载后校验完整性</span>
+              <div class="toggle on" id="cfg-verify" onclick="this.classList.toggle('on')"></div>
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">校验算法</span>
+              <select class="setting-input" id="cfg-hash" style="width: 120px;">
+                <option value="blake3" selected>Blake3</option>
+                <option value="sha256">SHA-256</option>
+              </select>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting-group-title">浏览器嗅探</div>
+            <div class="setting-row">
+              <span class="setting-label">启用资源嗅探</span>
+              <div class="toggle on" id="cfg-sniffer" onclick="this.classList.toggle('on')"></div>
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">最小文件大小</span>
+              <select class="setting-input" id="cfg-min-size" style="width: 120px;">
+                <option value="0">不限制</option>
+                <option value="1024" selected>1 KB</option>
+                <option value="102400">100 KB</option>
+                <option value="1048576">1 MB</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top: 16px;">
+            <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+          </div>
         </div>
       </div>
+    </div>
 
-      <!-- 设置视图 -->
-      <div class="settings-view" id="view-settings">
-        <h2 style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">设置</h2>
-        <div class="setting-group">
-          <div class="setting-group-title">下载设置</div>
-          <div class="setting-row">
-            <span class="setting-label">下载目录</span>
-            <input class="setting-input" id="cfg-download-dir" value="C:\Users\Downloads" />
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">最大并发任务数</span>
-            <input class="setting-input" type="number" id="cfg-max-tasks" value="3" min="1" max="10" style="width: 80px;" />
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">每任务最大分片数</span>
-            <input class="setting-input" type="number" id="cfg-max-fragments" value="16" min="1" max="64" style="width: 80px;" />
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">每主机最大连接数</span>
-            <input class="setting-input" type="number" id="cfg-max-connections" value="16" min="1" max="32" style="width: 80px;" />
-          </div>
-        </div>
-        <div class="setting-group">
-          <div class="setting-group-title">协议设置</div>
-          <div class="setting-row">
-            <span class="setting-label">启用 QUIC 传输</span>
-            <div class="toggle on" id="cfg-quic" onclick="this.classList.toggle('on')"></div>
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">启用 HTTP/2 多路复用</span>
-            <div class="toggle on" id="cfg-http2" onclick="this.classList.toggle('on')"></div>
-          </div>
-        </div>
-        <div class="setting-group">
-          <div class="setting-group-title">安全设置</div>
-          <div class="setting-row">
-            <span class="setting-label">下载后校验完整性</span>
-            <div class="toggle on" id="cfg-verify" onclick="this.classList.toggle('on')"></div>
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">校验算法</span>
-            <select class="setting-input" id="cfg-hash" style="width: 120px;">
-              <option value="blake3" selected>Blake3</option>
-              <option value="sha256">SHA-256</option>
-            </select>
-          </div>
-        </div>
-        <div class="setting-group">
-          <div class="setting-group-title">浏览器嗅探</div>
-          <div class="setting-row">
-            <span class="setting-label">启用资源嗅探</span>
-            <div class="toggle on" id="cfg-sniffer" onclick="this.classList.toggle('on')"></div>
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">最小文件大小</span>
-            <select class="setting-input" id="cfg-min-size" style="width: 120px;">
-              <option value="0">不限制</option>
-              <option value="1024" selected>1 KB</option>
-              <option value="102400">100 KB</option>
-              <option value="1048576">1 MB</option>
-            </select>
-          </div>
-        </div>
-        <div style="margin-top: 16px;">
-          <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
-        </div>
+    <!-- 右侧详情面板 -->
+    <div class="detail-panel" id="detail-panel">
+      <div class="panel-title" id="panel-filename">--</div>
+      <div class="panel-row">
+        <span class="panel-label">文件大小</span>
+        <span class="panel-value mono" id="panel-size">--</span>
       </div>
-    </div>
-  </div>
-
-  <!-- 右侧详情面板 -->
-  <div class="detail-panel" id="detail-panel" style="display: none;">
-    <div class="panel-title" id="panel-filename">--</div>
-    <div class="panel-row">
-      <span class="panel-label">文件大小</span>
-      <span class="panel-value" id="panel-size">--</span>
-    </div>
-    <div class="panel-row">
-      <span class="panel-label">已下载</span>
-      <span class="panel-value" id="panel-downloaded">--</span>
-    </div>
-    <div class="panel-row">
-      <span class="panel-label">速度</span>
-      <span class="panel-value speed-value" id="panel-speed">--</span>
-    </div>
-    <div class="panel-row">
-      <span class="panel-label">分片数</span>
-      <span class="panel-value" id="panel-fragments">--</span>
-    </div>
-    <div class="panel-row">
-      <span class="panel-label">协议</span>
-      <span class="panel-value" id="panel-protocol">--</span>
-    </div>
-    <div class="panel-row">
-      <span class="panel-label">状态</span>
-      <span class="panel-value" id="panel-status">--</span>
-    </div>
-    <div style="margin-top: 16px;">
-      <div class="section-title">分片进度</div>
-      <div class="fragment-grid" id="fragment-grid"></div>
+      <div class="panel-row">
+        <span class="panel-label">已下载</span>
+        <span class="panel-value mono" id="panel-downloaded">--</span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">速度</span>
+        <span class="panel-value mono speed-value" id="panel-speed">--</span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">分片数</span>
+        <span class="panel-value mono" id="panel-fragments">--</span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">协议</span>
+        <span class="panel-value" id="panel-protocol">--</span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">状态</span>
+        <span class="panel-value" id="panel-status">--</span>
+      </div>
+      <div style="margin-top: 16px;">
+        <div class="section-title">分片进度</div>
+        <div class="fragment-grid" id="fragment-grid"></div>
+      </div>
     </div>
   </div>
 
@@ -804,6 +1039,15 @@
     }
 
     // ======================================================================
+    // SVG 图标常量
+    // ======================================================================
+
+    const ICON_PAUSE = '<svg viewBox="0 0 12 12"><rect x="2" y="1" width="3" height="10" rx="0.5"/><rect x="7" y="1" width="3" height="10" rx="0.5"/></svg>';
+    const ICON_RESUME = '<svg viewBox="0 0 12 12"><path d="M3 1v10l8-5z"/></svg>';
+    const ICON_CANCEL = '<svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
+    const ICON_DELETE = '<svg viewBox="0 0 12 12"><path d="M1.5 3h9M4.5 3V1.5h3V3M3 3v7.5h6V3"/><path d="M5 5.5v3M7 5.5v3"/></svg>';
+
+    // ======================================================================
     // 渲染
     // ======================================================================
 
@@ -814,17 +1058,17 @@
       // 根据任务状态生成操作按钮
       let actionsHtml = '';
       if (dl.status === 'downloading' || dl.status === 'pending') {
-        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskPause(\'' + dl.id + '\')">暂停</button>';
+        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskPause(\'' + dl.id + '\')">' + ICON_PAUSE + '暂停</button>';
       } else if (dl.status === 'paused') {
-        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskResume(\'' + dl.id + '\')">恢复</button>';
+        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskResume(\'' + dl.id + '\')">' + ICON_RESUME + '恢复</button>';
       }
       // 活跃任务可取消
       if (dl.status !== 'completed' && dl.status !== 'cancelled') {
-        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskCancel(\'' + dl.id + '\')">取消</button>';
+        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskCancel(\'' + dl.id + '\')">' + ICON_CANCEL + '取消</button>';
       }
       // 非活跃任务可删除
       if (dl.status === 'completed' || dl.status === 'cancelled' || dl.status === 'failed') {
-        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskDelete(\'' + dl.id + '\')">删除</button>';
+        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskDelete(\'' + dl.id + '\')">' + ICON_DELETE + '删除</button>';
       }
 
       return `
@@ -842,16 +1086,16 @@
           <div class="card-details">
             <div class="detail-item">
               <span class="detail-label">进度</span>
-              <span>${progress}%</span>
+              <span class="mono">${progress}%</span>
             </div>
             <div class="detail-item">
               <span class="detail-label">大小</span>
-              <span>${formatSize(dl.size)}</span>
+              <span class="mono">${formatSize(dl.size)}</span>
             </div>
             ${dl.speed > 0 ? '<div class="detail-item"><span class="detail-label">速度</span><span class="speed-value">' + formatSpeed(dl.speed) + '</span></div>' : ''}
             <div class="detail-item">
               <span class="detail-label">分片</span>
-              <span>${dl.fragmentsDone}/${dl.fragments}</span>
+              <span class="mono">${dl.fragmentsDone}/${dl.fragments}</span>
             </div>
           </div>
           <div class="card-actions">${actionsHtml}</div>
@@ -898,7 +1142,7 @@
 
       // 高亮选中卡片
       document.querySelectorAll('.download-card').forEach(card => {
-        card.style.borderColor = card.dataset.id === id ? 'var(--border-active)' : '';
+        card.style.borderColor = card.dataset.id === id ? 'var(--accent)' : '';
       });
     }
 
@@ -1118,7 +1362,7 @@
             <div class="sniffer-name">${item.name}</div>
             <div class="sniffer-url">${item.url}</div>
           </div>
-          <span class="sniffer-size">${formatSize(item.size)}</span>
+          <span class="sniffer-size mono">${formatSize(item.size)}</span>
           <div class="sniffer-actions">
             <button class="btn-sm btn-download-sm" onclick="downloadSnifferItem(${i})">下载</button>
           </div>
