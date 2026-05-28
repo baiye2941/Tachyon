@@ -29,7 +29,10 @@ fn verifier() {
     let hash = match &v {
         VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
     };
-    assert!(v2.verify(data, &hash).is_ok(), "clone 后校验器应行为一致");
+    let hash2 = match &v2 {
+        VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
+    };
+    assert_eq!(hash, hash2, "clone 后校验器应行为一致");
 }
 
 /// 验证信号量关闭时返回错误而非 panic

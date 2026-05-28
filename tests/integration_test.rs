@@ -250,7 +250,7 @@ async fn integration_fragment_lifecycle_with_verification() {
     let data = Bytes::from(vec![42u8; 1000]);
 
     // Downloading -> Verifying
-    record.complete_download(data.clone(), std::time::Duration::from_millis(50));
+    record.complete_download(data.len() as u64, std::time::Duration::from_millis(50));
     assert_eq!(record.state, FragmentState::Verifying);
     assert_eq!(record.info.downloaded, 1000);
 
@@ -339,7 +339,7 @@ async fn integration_fragment_retry_and_verify() {
     // 第二次尝试: 成功
     record.start_download();
     let data = Bytes::from(vec![7u8; 100]);
-    record.complete_download(data.clone(), std::time::Duration::from_millis(10));
+    record.complete_download(data.len() as u64, std::time::Duration::from_millis(10));
     assert_eq!(record.state, FragmentState::Verifying);
 
     // 校验

@@ -3178,6 +3178,7 @@ dependencies = [
 name = "qf-engine"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "futures",
  "proptest",
@@ -3188,6 +3189,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tracing",
  "url",

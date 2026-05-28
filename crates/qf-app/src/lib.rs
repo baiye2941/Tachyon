@@ -77,7 +77,11 @@ async fn any_fragment() {
     }
     let store = state.tasks.lock().await;
     let t = store.get(&task_id).unwrap();
-    assert_eq!(t.status, qf_core::types::DownloadState::Failed, "分片失败应正确标记任务状态");
+    assert_eq!(
+        t.status,
+        qf_core::types::DownloadState::Failed,
+        "分片失败应正确标记任务状态"
+    );
 }
 
 /// 验证 max_concurrent 信号量门控
@@ -119,7 +123,10 @@ async fn max_concurrent() {
     let store = state.tasks.lock().await;
     let active = store
         .values()
-        .filter(|t| t.status == qf_core::types::DownloadState::Downloading || t.status == qf_core::types::DownloadState::Pending)
+        .filter(|t| {
+            t.status == qf_core::types::DownloadState::Downloading
+                || t.status == qf_core::types::DownloadState::Pending
+        })
         .count();
     let max = state.config.lock().await.max_concurrent_tasks as usize;
     assert!(

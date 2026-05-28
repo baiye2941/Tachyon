@@ -146,11 +146,7 @@ impl DownloadOrchestrator {
     /// 标记分片完成并更新带宽追踪(供上层在分片下载完成后调用)
     pub fn on_fragment_complete(&mut self, info: &FragmentInfo, duration: Duration) {
         self.on_fragment_done(info.size, duration);
-        if let Some(record) = self
-            .active_fragments
-            .iter_mut()
-            .find(|r| r.info.index == info.index)
-        {
+        if let Some(record) = self.active_fragments.get_mut(info.index as usize) {
             record.write_done();
         }
     }

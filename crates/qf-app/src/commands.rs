@@ -34,7 +34,11 @@ fn validate_download_url(url_str: &str) -> Result<(), AppError> {
 
     match url.scheme() {
         "http" | "https" => {}
-        scheme => return Err(AppError::Network(format!("不支持的协议: {scheme}，仅允许 http/https"))),
+        scheme => {
+            return Err(AppError::Network(format!(
+                "不支持的协议: {scheme}，仅允许 http/https"
+            )));
+        }
     }
 
     if !url.username().is_empty() || url.password().is_some() {
@@ -132,7 +136,7 @@ impl Default for AppState {
 }
 
 impl AppState {
-pub fn new() -> Self {
+    pub fn new() -> Self {
         let connection_pool = ConnectionPool::new(PoolConfig {
             max_per_host: 16,
             max_global: 256,
@@ -166,7 +170,9 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
             config.max_concurrent_tasks
         )));
     }
-    if config.download.max_concurrent_fragments == 0 || config.download.max_concurrent_fragments > 32 {
+    if config.download.max_concurrent_fragments == 0
+        || config.download.max_concurrent_fragments > 32
+    {
         return Err(AppError::Config(format!(
             "max_concurrent_fragments 必须在 1..=32 范围内,当前值: {}",
             config.download.max_concurrent_fragments
@@ -190,7 +196,11 @@ fn resource_type_to_string(rt: ResourceType) -> &'static str {
     }
 }
 
-fn update_task_status(store: &mut HashMap<String, TaskInfo>, task_id: &str, new_status: DownloadState) {
+fn update_task_status(
+    store: &mut HashMap<String, TaskInfo>,
+    task_id: &str,
+    new_status: DownloadState,
+) {
     if let Some(task) = store.get_mut(task_id) {
         task.status = new_status;
         if new_status == DownloadState::Completed
@@ -269,15 +279,16 @@ async fn task_fn(
         return;
     }
 
-    let mut download_task = match DownloadTask::with_pool(url.clone(), download_config, Some(connection_pool)).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
-            let mut store = state.tasks.lock().await;
-            update_task_status(&mut store, &task_id, DownloadState::Failed);
-            return;
-        }
-    };
+    let mut download_task =
+        match DownloadTask::with_pool(url.clone(), download_config, Some(connection_pool)).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
+                let mut store = state.tasks.lock().await;
+                update_task_status(&mut store, &task_id, DownloadState::Failed);
+                return;
+            }
+        };
 
     match download_task.probe().await {
         Ok(meta) => {
@@ -510,12 +521,16 @@ pub async fn create_task(
                 && t.status != DownloadState::Completed
                 && t.status != DownloadState::Failed
         }) {
-            return Err(AppError::TaskAlreadyExists("相同 URL 的下载任务已存在".to_string()));
+            return Err(AppError::TaskAlreadyExists(
+                "相同 URL 的下载任务已存在".to_string(),
+            ));
         }
         let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
         let active_count = store
             .values()
-            .filter(|t| t.status == DownloadState::Downloading || t.status == DownloadState::Pending)
+            .filter(|t| {
+                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
+            })
             .count();
         if active_count >= max_tasks {
             return Err(AppError::Config(format!(
@@ -568,7 +583,15 @@ pub async fn create_task(
     let url_clone = url.clone();
     let pool_clone = state_arc.connection_pool.clone();
     let handle = tokio::spawn(async move {
-        task_fn(state_arc, tid, url_clone, download_dir_str, download_config, pool_clone).await;
+        task_fn(
+            state_arc,
+            tid,
+            url_clone,
+            download_dir_str,
+            download_config,
+            pool_clone,
+        )
+        .await;
     });
 
     state.handles.insert(task_id.clone(), handle);
@@ -578,7 +601,10 @@ pub async fn create_task(
 }
 
 #[tauri::command]
-pub async fn pause_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), AppError> {
+pub async fn pause_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), AppError> {
     let mut store = state.tasks.lock().await;
 
     let task = store
@@ -597,7 +623,10 @@ pub async fn pause_task(state: tauri::State<'_, AppState>, task_id: String) -> R
 }
 
 #[tauri::command]
-pub async fn resume_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), AppError> {
+pub async fn resume_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), AppError> {
     let mut store = state.tasks.lock().await;
 
     let task = store
@@ -609,12 +638,18 @@ pub async fn resume_task(state: tauri::State<'_, AppState>, task_id: String) -> 
         tracing::info!(task_id = %task_id, "恢复任务");
         Ok(())
     } else {
-        Err(AppError::Config(format!("仅暂停状态可恢复,当前状态: '{}'", task.status)))
+        Err(AppError::Config(format!(
+            "仅暂停状态可恢复,当前状态: '{}'",
+            task.status
+        )))
     }
 }
 
 #[tauri::command]
-pub async fn cancel_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), AppError> {
+pub async fn cancel_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), AppError> {
     let mut store = state.tasks.lock().await;
 
     let task = store
@@ -622,7 +657,9 @@ pub async fn cancel_task(state: tauri::State<'_, AppState>, task_id: String) -> 
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
     match task.status {
-        DownloadState::Completed | DownloadState::Cancelled => Err(AppError::Config(format!("任务已{},无法取消", task.status))),
+        DownloadState::Completed | DownloadState::Cancelled => {
+            Err(AppError::Config(format!("任务已{},无法取消", task.status)))
+        }
         _ => {
             if let Some((_, handle)) = state.handles.remove(&task_id) {
                 handle.abort();
@@ -636,7 +673,10 @@ pub async fn cancel_task(state: tauri::State<'_, AppState>, task_id: String) -> 
 }
 
 #[tauri::command]
-pub async fn delete_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), AppError> {
+pub async fn delete_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), AppError> {
     let mut store = state.tasks.lock().await;
 
     let task = store
@@ -650,7 +690,10 @@ pub async fn delete_task(state: tauri::State<'_, AppState>, task_id: String) -> 
             tracing::info!(task_id = %task_id, "删除任务");
             Ok(())
         }
-        other => Err(AppError::Config(format!("当前状态 '{}' 不允许删除,请先取消任务", other))),
+        other => Err(AppError::Config(format!(
+            "当前状态 '{}' 不允许删除,请先取消任务",
+            other
+        ))),
     }
 }
 
@@ -850,12 +893,16 @@ async fn create_task_inner(
                 && t.status != DownloadState::Completed
                 && t.status != DownloadState::Failed
         }) {
-            return Err(AppError::TaskAlreadyExists("相同 URL 的下载任务已存在".to_string()));
+            return Err(AppError::TaskAlreadyExists(
+                "相同 URL 的下载任务已存在".to_string(),
+            ));
         }
         let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
         let active_count = store
             .values()
-            .filter(|t| t.status == DownloadState::Downloading || t.status == DownloadState::Pending)
+            .filter(|t| {
+                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
+            })
             .count();
         if active_count >= max_tasks {
             return Err(AppError::Config(format!(
@@ -915,7 +962,15 @@ async fn create_task_inner(
     let url_clone = url.clone();
     let pool_clone = state_arc.connection_pool.clone();
     let handle = tokio::spawn(async move {
-        task_fn(state_arc, tid, url_clone, download_dir_str, download_config, pool_clone).await;
+        task_fn(
+            state_arc,
+            tid,
+            url_clone,
+            download_dir_str,
+            download_config,
+            pool_clone,
+        )
+        .await;
     });
 
     state.handles.insert(task_id.clone(), handle);
@@ -950,7 +1005,10 @@ async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
         task.status = DownloadState::Downloading;
         Ok(())
     } else {
-        Err(AppError::Config(format!("仅暂停状态可恢复,当前状态: '{}'", task.status)))
+        Err(AppError::Config(format!(
+            "仅暂停状态可恢复,当前状态: '{}'",
+            task.status
+        )))
     }
 }
 
@@ -961,7 +1019,9 @@ async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
         .get_mut(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     match task.status {
-        DownloadState::Completed | DownloadState::Cancelled => Err(AppError::Config(format!("任务已{},无法取消", task.status))),
+        DownloadState::Completed | DownloadState::Cancelled => {
+            Err(AppError::Config(format!("任务已{},无法取消", task.status)))
+        }
         _ => {
             if let Some((_, handle)) = state.handles.remove(&task_id) {
                 handle.abort();
@@ -984,7 +1044,10 @@ async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
             state.handles.remove(&task_id);
             Ok(())
         }
-        other => Err(AppError::Config(format!("当前状态 '{}' 不允许删除,请先取消任务", other))),
+        other => Err(AppError::Config(format!(
+            "当前状态 '{}' 不允许删除,请先取消任务",
+            other
+        ))),
     }
 }
 
@@ -1654,7 +1717,10 @@ mod tests {
         let result = create_task_inner(&state, "http://example.com/gate3.bin".into(), None).await;
         assert!(result.is_err(), "超过 max_concurrent_tasks 应被拒绝");
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("最大并发任务数"), "错误应说明并发限制: {err}");
+        assert!(
+            err.to_string().contains("最大并发任务数"),
+            "错误应说明并发限制: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1681,25 +1747,29 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_rejects_zero_max_concurrent_tasks() {
         let state = test_state();
-        let result = update_config_inner(
-            &state,
-            make_test_app_config(0, "/tmp", 16, 16, false, true),
-        )
-        .await;
+        let result =
+            update_config_inner(&state, make_test_app_config(0, "/tmp", 16, 16, false, true)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_concurrent_tasks"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_tasks")
+        );
     }
 
     #[tokio::test]
     async fn test_update_config_rejects_zero_max_concurrent_fragments() {
         let state = test_state();
-        let result = update_config_inner(
-            &state,
-            make_test_app_config(5, "/tmp", 0, 16, false, true),
-        )
-        .await;
+        let result =
+            update_config_inner(&state, make_test_app_config(5, "/tmp", 0, 16, false, true)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_concurrent_fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_fragments")
+        );
     }
 
     #[tokio::test]
@@ -1711,29 +1781,33 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_concurrent_tasks"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_tasks")
+        );
     }
 
     #[tokio::test]
     async fn test_update_config_rejects_too_large_fragments() {
         let state = test_state();
-        let result = update_config_inner(
-            &state,
-            make_test_app_config(5, "/tmp", 33, 16, false, true),
-        )
-        .await;
+        let result =
+            update_config_inner(&state, make_test_app_config(5, "/tmp", 33, 16, false, true)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_concurrent_fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_fragments")
+        );
     }
 
     #[tokio::test]
     async fn test_update_config_rejects_empty_download_dir() {
         let state = test_state();
-        let result = update_config_inner(
-            &state,
-            make_test_app_config(5, "", 16, 16, false, true),
-        )
-        .await;
+        let result =
+            update_config_inner(&state, make_test_app_config(5, "", 16, 16, false, true)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("download_dir"));
     }
@@ -1741,11 +1815,8 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_accepts_valid_boundary_values() {
         let state = test_state();
-        let result = update_config_inner(
-            &state,
-            make_test_app_config(1, "/tmp", 1, 1, false, true),
-        )
-        .await;
+        let result =
+            update_config_inner(&state, make_test_app_config(1, "/tmp", 1, 1, false, true)).await;
         assert!(result.is_ok());
 
         let result = update_config_inner(
@@ -1763,16 +1834,14 @@ mod tests {
             let mut cfg = state.config.lock().await;
             cfg.download.max_concurrent_fragments = 0;
         }
-        let result = create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None).await;
+        let result =
+            create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None).await;
         assert!(
             result.is_err(),
             "max_concurrent_fragments=0 时应拒绝创建任务"
         );
         if let Err(e) = result {
-            assert!(
-                matches!(e, AppError::Config(_)),
-                "应为 Config 错误: {e}"
-            );
+            assert!(matches!(e, AppError::Config(_)), "应为 Config 错误: {e}");
         }
     }
 
@@ -1825,7 +1894,12 @@ mod tests {
 
         for id in &task_ids[..3] {
             let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
-            assert_eq!(task.status, DownloadState::Cancelled, "任务应已被取消: {}", id);
+            assert_eq!(
+                task.status,
+                DownloadState::Cancelled,
+                "任务应已被取消: {}",
+                id
+            );
         }
     }
 

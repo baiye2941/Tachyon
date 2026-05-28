@@ -3,7 +3,6 @@
 //! 测试分片大小计算、EWMA 带宽追踪、Holt-Winters 预测器的 CPU 性能,
 //! 以及调度器优先级队列的吞吐量。
 
-use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use qf_core::types::FragmentInfo;
 use qf_engine::fragment::compute_fragment_size;
@@ -192,10 +191,7 @@ fn bench_fragment_state_machine(c: &mut Criterion) {
             let info = make_fragment(0, 64 * 1024);
             let mut record = FragmentRecord::new(info, 3);
             record.start_download();
-            record.complete_download(
-                Bytes::from_static(b"benchmark_data"),
-                Duration::from_millis(50),
-            );
+            record.complete_download(14, Duration::from_millis(50));
             record.verify_ok();
             record.write_done();
             assert!(record.is_done());

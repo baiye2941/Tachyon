@@ -11,6 +11,8 @@ qf-io = { path = "../qf-io" }
 qf-protocol = { path = "../qf-protocol" }
 qf-crypto = { path = "../qf-crypto" }
 tokio.workspace = true
+tokio-stream = "0.1"
+blake3.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 futures.workspace = true

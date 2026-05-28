@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use qf_core::types::FragmentInfo;
 
 /// 分片状态
@@ -27,17 +26,10 @@ pub enum FragmentState {
 
 /// 分片下载记录
 pub struct FragmentRecord {
-    /// 分片信息
     pub info: FragmentInfo,
-    /// 当前状态
     pub state: FragmentState,
-    /// 已重试次数
     pub retry_count: u32,
-    /// 最大重试次数
     pub max_retries: u32,
-    /// 下载的数据
-    pub data: Option<Bytes>,
-    /// 最近一次下载耗时
     pub last_duration: Option<Duration>,
 }
 
@@ -49,7 +41,6 @@ impl FragmentRecord {
             state: FragmentState::Pending,
             retry_count: 0,
             max_retries,
-            data: None,
             last_duration: None,
         }
     }
@@ -65,14 +56,13 @@ impl FragmentRecord {
     }
 
     /// 下载完成,转换到校验状态(仅允许从 Downloading 进入)
-    pub fn complete_download(&mut self, data: Bytes, duration: Duration) {
+    pub fn complete_download(&mut self, downloaded: u64, duration: Duration) {
         debug_assert!(
             self.state == FragmentState::Downloading,
             "非法状态转换: {:?} -> Verifying",
             self.state
         );
-        self.info.downloaded = data.len() as u64;
-        self.data = Some(data);
+        self.info.downloaded = downloaded;
         self.last_duration = Some(duration);
         self.state = FragmentState::Verifying;
     }
@@ -108,7 +98,6 @@ impl FragmentRecord {
             self.state
         );
         self.retry_count += 1;
-        self.data = None;
         if self.retry_count <= self.max_retries {
             self.state = FragmentState::Pending;
             true
@@ -236,7 +225,7 @@ mod tests {
         record.start_download();
         assert_eq!(record.state, FragmentState::Downloading);
 
-        record.complete_download(Bytes::from_static(b"test"), Duration::from_millis(100));
+        record.complete_download(4, Duration::from_millis(100));
         assert_eq!(record.state, FragmentState::Verifying);
 
         record.verify_ok();
@@ -443,8 +432,8 @@ mod proptests {
                     prop_assert_eq!(record.state, FragmentState::Pending);
                 } else {
                     // 超过最大重试次数
-                    let data = Bytes::from_static(b"test data for fragment");
-                    record.complete_download(data, Duration::from_millis(10));
+                    let data_len = 22u64;
+                    record.complete_download(data_len, Duration::from_millis(10));
                     prop_assert_eq!(record.state, FragmentState::Verifying);
                     record.verify_ok();
                     prop_assert_eq!(record.state, FragmentState::Writing);

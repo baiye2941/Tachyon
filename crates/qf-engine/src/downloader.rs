@@ -16,9 +16,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use qf_core::config::DownloadConfig;
+use qf_core::traits::Protocol;
 #[cfg(test)]
 use qf_core::traits::Storage;
-use qf_core::traits::{Protocol, Verifier};
 use qf_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
 use qf_core::{QfError, QfResult};
 use qf_crypto::cpu::CpuVerifier;
@@ -134,16 +134,8 @@ pub enum VerifierKind {
 }
 
 impl VerifierKind {
-    /// 创建默认 CPU 校验器(blake3)
-    pub(crate) fn blake3() -> Self {
+    pub fn blake3() -> Self {
         VerifierKind::Cpu(CpuVerifier::blake3())
-    }
-
-    /// 校验数据是否匹配预期哈希
-    pub(crate) fn verify(&self, data: &[u8], expected: &str) -> QfResult<()> {
-        match self {
-            VerifierKind::Cpu(v) => v.verify(data, expected),
-        }
     }
 }
 
@@ -160,7 +152,6 @@ pub struct DownloadTask {
     pub config: DownloadConfig,
     protocol: Arc<dyn Protocol>,
     storage: Arc<StorageKind>,
-    verifier: VerifierKind,
     orchestrator: DownloadOrchestrator,
     #[allow(dead_code)]
     pool: Option<Arc<ConnectionPool>>,
@@ -181,8 +172,7 @@ impl DownloadTask {
     pub async fn with_pool(
         url: String,
         config: DownloadConfig,
-    #[allow(dead_code)]
-    pool: Option<Arc<ConnectionPool>>,
+        #[allow(dead_code)] pool: Option<Arc<ConnectionPool>>,
     ) -> QfResult<Self> {
         let _parsed = url::Url::parse(&url)?;
 
@@ -196,10 +186,7 @@ impl DownloadTask {
         let storage = Arc::new(StorageKind::open(&storage_path).await?);
 
         let orchestrator = match &pool {
-            Some(p) => DownloadOrchestrator::with_shared_pool(
-                p.clone(),
-                Default::default(),
-            ),
+            Some(p) => DownloadOrchestrator::with_shared_pool(p.clone(), Default::default()),
             None => DownloadOrchestrator::new(Default::default()),
         };
 
@@ -209,7 +196,6 @@ impl DownloadTask {
             config,
             protocol,
             storage,
-            verifier: VerifierKind::blake3(),
             orchestrator,
             pool,
             state: DownloadState::Pending,
@@ -231,7 +217,6 @@ impl DownloadTask {
             config,
             protocol,
             storage: Arc::new(storage),
-            verifier: VerifierKind::blake3(),
             orchestrator: DownloadOrchestrator::new(Default::default()),
             pool: None,
             state: DownloadState::Pending,
@@ -393,18 +378,38 @@ impl DownloadTask {
                     "开始下载分片"
                 );
 
-                let data = frag_protocol
-                    .download_range(&frag_url, frag_start, frag_end)
+                let stream = frag_protocol
+                    .download_range_stream(&frag_url, frag_start, frag_end)
                     .await?;
 
-                let written = frag_storage.write_at(frag_start, &data).await?;
+                let mut pos = frag_start;
+                let mut total_written: u64 = 0;
+                tokio::pin!(stream);
+                while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
+                    let chunk = chunk_result?;
+                    let written = frag_storage.write_at(pos, &chunk).await?;
+                    pos += written as u64;
+                    total_written += written as u64;
+                }
 
-                info!(index = frag_index, written, "分片下载完成");
-                Ok((frag_index, written as u64))
+                info!(
+                    index = frag_index,
+                    written = total_written as usize,
+                    "分片下载完成"
+                );
+                Ok((frag_index, total_written))
             });
 
             handles.push(handle);
         }
+
+        debug_assert_eq!(
+            self.fragments.len(),
+            self.fragments
+                .last()
+                .map(|f| f.info.index as usize + 1)
+                .unwrap_or(0),
+        );
 
         for handle in handles {
             let result = handle
@@ -413,10 +418,9 @@ impl DownloadTask {
 
             let (index, downloaded) = result?;
 
-            if let Some(frag) = self.fragments.iter_mut().find(|f| f.info.index == index) {
-                frag.info.downloaded = downloaded;
-                frag.state = crate::fragment::FragmentState::Done;
-            }
+            let frag = &mut self.fragments[index as usize];
+            frag.info.downloaded = downloaded;
+            frag.state = crate::fragment::FragmentState::Done;
         }
 
         self.storage.sync().await?;
@@ -442,26 +446,36 @@ impl DownloadTask {
 
         for frag in &self.fragments {
             if let Some(ref expected_hash) = frag.info.hash {
-                let mut buf = vec![0u8; frag.info.size as usize];
-                let read = self.storage.read_at(frag.info.start, &mut buf).await?;
-                buf.truncate(read);
+                let chunk_size = 1024 * 1024;
+                let mut hasher = blake3::Hasher::new();
+                let mut offset = frag.info.start;
+                let end = frag.info.start + frag.info.size;
 
-                match self.verifier.verify(&buf, expected_hash) {
-                    Ok(()) => {
-                        debug!(index = frag.info.index, "分片校验通过");
-                    }
-                    Err(QfError::ChecksumMismatch { expected, actual }) => {
-                        warn!(
-                            index = frag.info.index,
-                            expected = %expected,
-                            actual = %actual,
-                            "分片校验失败"
-                        );
-                        self.state = DownloadState::Failed;
-                        return Err(QfError::ChecksumMismatch { expected, actual });
-                    }
-                    Err(e) => return Err(e),
+                while offset < end {
+                    let read_len = ((end - offset).min(chunk_size as u64)) as usize;
+                    let mut buf = vec![0u8; read_len];
+                    let read = self.storage.read_at(offset, &mut buf).await?;
+                    hasher.update(&buf[..read]);
+                    offset += read as u64;
                 }
+
+                let computed = hasher.finalize();
+                let expected = blake3::Hash::from_hex(expected_hash)
+                    .map_err(|e| QfError::Protocol(format!("无效哈希值: {e}")))?;
+                if computed != expected {
+                    warn!(
+                        index = frag.info.index,
+                        expected = %expected_hash,
+                        actual = %computed.to_hex(),
+                        "分片校验失败"
+                    );
+                    self.state = DownloadState::Failed;
+                    return Err(QfError::ChecksumMismatch {
+                        expected: expected_hash.clone(),
+                        actual: computed.to_hex().to_string(),
+                    });
+                }
+                debug!(index = frag.info.index, "分片校验通过");
             }
         }
 
@@ -1097,12 +1111,14 @@ mod tests {
     fn test_verifier_kind_clone() {
         let v = VerifierKind::blake3();
         let v2 = v.clone();
-        // 验证 clone 后校验行为一致
         let data = b"test data for clone verification";
         let hash = match &v {
             VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
         };
-        assert!(v2.verify(data, &hash).is_ok());
+        let hash2 = match &v2 {
+            VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
+        };
+        assert_eq!(hash, hash2);
     }
 
     // ------ 补充: URL 解析校验 -----
@@ -1515,10 +1531,9 @@ mod tests {
         assert!(!record.is_done());
         assert!(!record.is_failed());
 
-        record.complete_download(Bytes::from(vec![0u8; 1000]), Duration::from_millis(50));
+        record.complete_download(1000, Duration::from_millis(50));
         assert_eq!(record.state, FragmentState::Verifying);
         assert_eq!(record.info.downloaded, 1000);
-        assert!(record.data.is_some());
         assert!(record.last_duration.is_some());
 
         record.verify_ok();
@@ -1561,27 +1576,6 @@ mod tests {
         assert_eq!(record.retry_count, 2);
     }
 
-    /// 验证 mark_failed 清除已下载数据
-    #[test]
-    fn test_fragment_mark_failed_clears_data() {
-        let info = FragmentInfo {
-            index: 0,
-            start: 0,
-            end: 99,
-            size: 100,
-            downloaded: 0,
-            hash: None,
-        };
-        let mut record = FragmentRecord::new(info, 5);
-
-        record.start_download();
-        record.complete_download(Bytes::from(vec![0xFF; 100]), Duration::from_millis(10));
-        assert!(record.data.is_some(), "下载完成后 data 应存在");
-
-        record.mark_failed();
-        assert!(record.data.is_none(), "失败后 data 应被清除");
-    }
-
     /// 验证 Verifying 和 Writing 阶段也可以标记失败
     #[test]
     fn test_fragment_fail_from_verifying_and_writing() {
@@ -1597,7 +1591,7 @@ mod tests {
         // 从 Verifying 阶段失败
         let mut record = FragmentRecord::new(info.clone(), 3);
         record.start_download();
-        record.complete_download(Bytes::from_static(b"test"), Duration::from_millis(5));
+        record.complete_download(4, Duration::from_millis(5));
         assert_eq!(record.state, FragmentState::Verifying);
         let can_retry = record.mark_failed();
         assert!(can_retry);
@@ -1606,7 +1600,7 @@ mod tests {
         // 从 Writing 阶段失败
         let mut record = FragmentRecord::new(info, 3);
         record.start_download();
-        record.complete_download(Bytes::from_static(b"test"), Duration::from_millis(5));
+        record.complete_download(4, Duration::from_millis(5));
         record.verify_ok();
         assert_eq!(record.state, FragmentState::Writing);
         let can_retry = record.mark_failed();
