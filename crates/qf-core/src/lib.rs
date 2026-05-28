@@ -23,7 +23,9 @@ pub use config::USER_AGENT;
 pub use error::{QfError, QfResult};
 pub use filename::{extract_filename, extract_filename_from_url, parse_content_disposition};
 pub use traits::{ByteStream, Protocol, Storage, Verifier};
-pub use types::{DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskId, TaskProgress};
+pub use types::{
+    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskId, TaskProgress,
+};
 
 /// 下载性能指标计数器
 ///

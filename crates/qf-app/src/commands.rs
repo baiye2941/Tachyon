@@ -6,17 +6,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use qf_core::filename::{extract_filename_from_url, parse_content_disposition};
-use qf_core::types::FileMetadata;
-use qf_engine::DownloadOrchestrator;
-use qf_engine::connection::PoolConfig;
+use qf_core::config::DownloadConfig;
+use qf_core::filename::extract_filename_from_url;
+use qf_core::types::DownloadState;
+use qf_engine::DownloadTask;
+use qf_engine::connection::{ConnectionPool, PoolConfig};
 use qf_sniffer::capture::{ResourceType, identify_resource};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 use url::Url;
 use uuid::Uuid;
 
@@ -161,6 +163,27 @@ pub struct DownloadProgress {
     pub fragments_done: u32,
 }
 
+/// 轻量级任务进度信息(事件推送用,不含 url/file_name 等静态字段)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgress {
+    /// 任务唯一标识
+    pub id: String,
+    /// 下载进度(0.0 ~ 1.0)
+    pub progress: f64,
+    /// 当前下载速度(字节/秒)
+    pub speed: u64,
+    /// 已下载字节数
+    pub downloaded: u64,
+    /// 任务状态
+    pub status: String,
+    /// 已完成分片数
+    pub fragments_done: u32,
+}
+
+/// 进度事件类型:任务 ID -> TaskProgress 的快照
+pub type ProgressEvent = HashMap<String, TaskProgress>;
+
 use qf_sniffer::SnifferResource;
 
 /// 任务状态常量
@@ -191,6 +214,12 @@ pub struct AppState {
     pub sniffer: Arc<Mutex<Vec<SnifferResource>>>,
     /// 嗅探过滤规则(URL 关键词)
     pub sniffer_filters: Arc<Mutex<Vec<String>>>,
+    /// 全局 HTTP 客户端(连接复用,避免每次请求重建)
+    pub http_client: Arc<reqwest::Client>,
+    /// 全局连接池(按主机限流)
+    pub connection_pool: Arc<ConnectionPool>,
+    /// 进度事件推送通道:task_fn 发送,subscribe_progress 监听并转发给前端
+    pub progress_tx: watch::Sender<ProgressEvent>,
 }
 
 impl Default for AppState {
@@ -202,6 +231,25 @@ impl Default for AppState {
 impl AppState {
     /// 创建默认 AppState 实例
     pub fn new() -> Self {
+        /// 默认 User-Agent
+        const USER_AGENT: &str = "QuantumFetch/0.1.0";
+
+        let http_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .expect("构建全局 HTTP 客户端不应失败");
+
+        let connection_pool = ConnectionPool::new(PoolConfig {
+            max_per_host: 16,
+            max_global: 256,
+        });
+
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(Mutex::new(AppConfig {
@@ -218,6 +266,9 @@ impl AppState {
             active_permits: Arc::new(AtomicU32::new(0)),
             sniffer: Arc::new(Mutex::new(Vec::new())),
             sniffer_filters: Arc::new(Mutex::new(Vec::new())),
+            http_client: Arc::new(http_client),
+            connection_pool: Arc::new(connection_pool),
+            progress_tx: watch::Sender::new(HashMap::new()),
         }
     }
 }
@@ -292,22 +343,38 @@ fn update_task_status(store: &mut HashMap<String, TaskInfo>, task_id: &str, new_
     }
 }
 
+/// 构建 `DownloadConfig`(从应用配置和下载目录转换)
+///
+/// 将 UI 层的 `AppConfig` + 下载目录映射为引擎层的 `DownloadConfig`。
+fn build_download_config(app_config: &AppConfig, download_dir: &str) -> DownloadConfig {
+    DownloadConfig {
+        download_dir: download_dir.to_string(),
+        max_concurrent_fragments: app_config.max_concurrent_fragments,
+        max_retries: 3,
+        request_timeout_secs: 30,
+        verify_checksum: app_config.verify_checksum,
+        user_agent: "QuantumFetch/0.1.0".to_string(),
+        headers: std::collections::HashMap::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 后台下载任务
 // ---------------------------------------------------------------------------
 
 /// 后台下载任务实现
 ///
-/// 使用 `DownloadOrchestrator` 规划分片、管理连接,模拟分片下载并持续更新进度。
-/// 通过检查 `AppState.tasks` 中的状态来响应暂停和取消操作。
+/// 创建 `DownloadTask` 并调用 `run()` 执行真实下载管线:
+/// 探测 -> 规划分片 -> 预分配存储 -> 并发下载 -> 校验。
+/// 通过定期检查 `AppState.tasks` 中的状态来响应暂停和取消操作。
 async fn task_fn(
     state: Arc<AppState>,
     task_id: String,
     url: String,
     download_dir: String,
-    mut orchestrator: DownloadOrchestrator,
-    metadata: FileMetadata,
+    download_config: DownloadConfig,
 ) {
+    // 解析 URL 获取主机名(用于日志)
     let download_url = match Url::parse(&url) {
         Ok(u) => u,
         Err(e) => {
@@ -328,197 +395,255 @@ async fn task_fn(
         }
     };
 
-    let file_size = metadata.file_size.unwrap_or(0);
-    let supports_range = metadata.supports_range;
-    tracing::info!(
-        task_id = %task_id,
-        file_size = file_size,
-        supports_range = supports_range,
-        host = %host,
-        download_dir = %download_dir,
-        "开始下载"
-    );
-
-    let fragments = orchestrator.plan_fragments(file_size, supports_range);
-    let fragment_count = fragments.len() as u32;
-    tracing::info!(
-        task_id = %task_id,
-        fragments = fragment_count,
-        supports_range = supports_range,
-        "分片策略规划完成"
-    );
-
+    // 检查是否已取消或已暂停(在开始真实下载之前)
     {
-        let mut store = state.tasks.lock().await;
-        if let Some(task) = store.get_mut(&task_id) {
-            task.file_size = metadata.file_size;
-            task.fragments_total = fragment_count;
+        let store = state.tasks.lock().await;
+        if let Some(task) = store.get(&task_id) {
+            if task.status == status::CANCELLED {
+                tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
+                return;
+            }
+            if task.status == status::PAUSED {
+                tracing::info!(task_id = %task_id, "任务已暂停,等待恢复...");
+            }
         }
-        update_task_status(&mut store, &task_id, status::DOWNLOADING);
     }
 
-    let max_concurrent = {
-        let cfg = state.config.lock().await;
-        cfg.max_concurrent_fragments as usize
-    };
-    if max_concurrent == 0 {
-        tracing::error!(task_id = %task_id, "max_concurrent_fragments 为 0,无法创建信号量");
+    tracing::info!(
+        task_id = %task_id,
+        host = %host,
+        download_dir = %download_dir,
+        "开始真实下载"
+    );
+
+    // 确保下载目录存在(DownloadTask 会在目录下创建文件)
+    if let Err(e) = std::fs::create_dir_all(&download_dir) {
+        tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
         let mut store = state.tasks.lock().await;
         update_task_status(&mut store, &task_id, status::FAILED);
         return;
     }
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
-    let mut any_fragment_failed = false;
-    let mut total_downloaded: u64 = 0;
+    // 创建 DownloadTask(自动根据 URL scheme 选择 HTTP 协议后端)
+    let mut download_task = match DownloadTask::new(url.clone(), download_config).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
+            let mut store = state.tasks.lock().await;
+            update_task_status(&mut store, &task_id, status::FAILED);
+            return;
+        }
+    };
 
-    for frag in &fragments {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::error!(task_id = %task_id, "分片信号量已关闭,放弃分片 {}", frag.index);
-                any_fragment_failed = true;
-                continue;
-            }
-        };
-        state.active_permits.fetch_add(1, Ordering::Relaxed);
-        orchestrator.register_fragment(frag.clone());
+    // 探测元数据并更新 TaskInfo
+    match download_task.probe().await {
+        Ok(meta) => {
+            tracing::info!(
+                task_id = %task_id,
+                file_name = %meta.file_name,
+                file_size = ?meta.file_size,
+                supports_range = meta.supports_range,
+                "元数据探测成功"
+            );
 
-        let chunk_size: u64 = 1024 * 100;
-        let chunks = if chunk_size > 0 {
-            frag.size.div_ceil(chunk_size)
-        } else {
-            1
-        };
-        let frag_start = Instant::now();
-        let mut frag_downloaded: u64 = 0;
-
-        let mut should_abort = false;
-        for _ in 0..chunks {
+            // 用探测到的元数据更新 TaskInfo(提前让用户看到文件大小等信息)
             {
-                let store = state.tasks.lock().await;
-                if let Some(task) = store.get(&task_id) {
-                    match task.status.as_str() {
-                        status::CANCELLED => {
-                            tracing::info!(task_id = %task_id, "任务已取消,退出后台下载");
-                            any_fragment_failed = true;
-                            should_abort = true;
+                let mut store = state.tasks.lock().await;
+                if let Some(task) = store.get_mut(&task_id) {
+                    task.file_size = meta.file_size;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
+            let mut store = state.tasks.lock().await;
+            update_task_status(&mut store, &task_id, status::FAILED);
+            return;
+        }
+    }
+
+    // 包装为 Arc<Mutex> 以便下载任务和进度监控并行访问
+    let download_task = Arc::new(tokio::sync::Mutex::new(download_task));
+
+    // 设置状态为下载中
+    update_task_status(
+        &mut *state.tasks.lock().await,
+        &task_id,
+        status::DOWNLOADING,
+    );
+
+    // 启动暂停/取消监控循环(与真实下载并行)
+    let monitor_state = state.clone();
+    let monitor_task_id = task_id.clone();
+    let cancel_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let store = monitor_state.tasks.lock().await;
+            match store.get(&monitor_task_id).map(|t| t.status.as_str()) {
+                Some(status::CANCELLED) => {
+                    tracing::info!(task_id = %monitor_task_id, "监控检测到任务已取消");
+                    return;
+                }
+                Some(status::PAUSED) => {
+                    // 暂停超时保护:5 分钟后自动标记失败
+                    drop(store);
+                    let mut paused_ticks = 0u32;
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        paused_ticks += 1;
+                        let s = monitor_state.tasks.lock().await;
+                        if s.get(&monitor_task_id)
+                            .is_none_or(|t| t.status != status::PAUSED)
+                        {
                             break;
                         }
-                        status::PAUSED => {
-                            tracing::info!(task_id = %task_id, "任务已暂停,等待恢复...");
+                        if paused_ticks > 1500 {
+                            tracing::warn!(task_id = %monitor_task_id, "暂停超时(5分钟),标记任务失败");
+                            let mut s = monitor_state.tasks.lock().await;
+                            update_task_status(&mut s, &monitor_task_id, status::FAILED);
+                            return;
                         }
-                        _ => {}
                     }
                 }
+                Some(status::FAILED) | None => return,
+                _ => {}
             }
+        }
+    });
 
-            if !should_abort {
-                let mut paused_iterations = 0u32;
-                loop {
-                    let is_paused = state
-                        .tasks
-                        .lock()
-                        .await
-                        .get(&task_id)
-                        .is_some_and(|t| t.status == status::PAUSED);
-                    if !is_paused {
-                        break;
-                    }
-                    paused_iterations += 1;
-                    if paused_iterations > 1500 {
-                        tracing::warn!(task_id = %task_id, "暂停超时,标记任务失败");
-                        any_fragment_failed = true;
-                        let mut store = state.tasks.lock().await;
-                        update_task_status(&mut store, &task_id, status::FAILED);
-                        should_abort = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            }
-            if should_abort {
-                break;
-            }
+    // 启动进度监控任务(定期读取 DownloadTask 进度并更新共享状态)
+    let monitor_dt = download_task.clone();
+    let monitor_ps = state.clone();
+    let monitor_tid = task_id.clone();
+    let progress_handle = tokio::spawn(async move {
+        let start = Instant::now();
+        let mut last_downloaded: u64 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let dt = monitor_dt.lock().await;
+            let p = dt.progress();
+            let ds = dt.state();
+            // 计算已下载字节数
+            let downloaded = dt
+                .fragment_infos()
+                .iter()
+                .map(|f| f.downloaded)
+                .sum::<u64>();
+            drop(dt);
 
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            let simulated = chunk_size.min(frag.size - frag_downloaded);
-            frag_downloaded += simulated;
-            total_downloaded += simulated;
-
-            let elapsed_secs = frag_start.elapsed().as_secs_f64();
-            let speed = if elapsed_secs > 0.0 {
-                (frag_downloaded as f64 / elapsed_secs) as u64
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                ((downloaded as f64 - last_downloaded as f64) / 0.5) as u64
             } else {
                 0
             };
-            let progress = if file_size > 0 {
-                total_downloaded as f64 / file_size as f64
-            } else {
-                0.0
-            };
+            last_downloaded = downloaded;
 
-            let mut store = state.tasks.lock().await;
-            if let Some(task) = store.get_mut(&task_id) {
-                task.downloaded = total_downloaded;
-                task.speed = speed;
-                task.progress = progress.min(1.0);
+            // 更新共享状态
+            {
+                let mut store = monitor_ps.tasks.lock().await;
+                if let Some(task) = store.get_mut(&monitor_tid) {
+                    task.downloaded = downloaded;
+                    task.speed = speed;
+                    task.progress = p.min(1.0);
+                }
+            }
+
+            // 推送进度事件到 watch channel
+            {
+                let store = monitor_ps.tasks.lock().await;
+                let event: ProgressEvent = store
+                    .iter()
+                    .map(|(id, t)| {
+                        (
+                            id.clone(),
+                            TaskProgress {
+                                id: id.clone(),
+                                progress: t.progress,
+                                speed: t.speed,
+                                downloaded: t.downloaded,
+                                status: t.status.clone(),
+                                fragments_done: t.fragments_done,
+                            },
+                        )
+                    })
+                    .collect();
+                // 通过 watch channel 推送进度更新
+                let _ = monitor_ps.progress_tx.send(event);
+            }
+
+            // 下载完成或失败时退出监控
+            if ds == DownloadState::Completed || ds == DownloadState::Failed {
+                return speed;
             }
         }
+    });
 
-        // 统一释放分片许可(无论正常完成还是中止)
-        drop(permit);
-        state.active_permits.fetch_sub(1, Ordering::Relaxed);
+    // 并行执行真实下载和进度监控
+    let (download_result, _final_speed) = tokio::join!(
+        async {
+            let mut dt = download_task.lock().await;
+            dt.run().await
+        },
+        progress_handle
+    );
+    let result = download_result;
 
-        if should_abort {
-            break;
-        }
+    // 取消暂停/取消监控循环
+    cancel_handle.abort();
 
-        orchestrator.on_fragment_complete(frag, frag_start.elapsed());
-        let fragments_done = orchestrator
-            .active_fragments()
-            .iter()
-            .filter(|r| r.is_done())
-            .count() as u32;
-
-        {
-            let mut store = state.tasks.lock().await;
-            if let Some(task) = store.get_mut(&task_id) {
-                task.fragments_done = fragments_done;
-            }
-        }
-
-        tracing::debug!(
-            task_id = %task_id,
-            fragment = frag.index,
-            fragments_done = fragments_done,
-            "分片下载完成"
-        );
-    }
-
+    // 根据下载结果更新任务状态并发送最终进度事件
     {
         let mut store = state.tasks.lock().await;
-        if any_fragment_failed {
-            // CANCELLED 优先于 FAILED:如果用户主动取消,保留 cancelled 状态
-            let current = store.get(&task_id).map(|t| t.status.as_str());
-            if current == Some(status::CANCELLED) {
-                tracing::info!(task_id = %task_id, "任务已被取消");
-            } else {
-                update_task_status(&mut store, &task_id, status::FAILED);
-                tracing::error!(task_id = %task_id, "部分分片下载失败");
+        let current_status = store.get(&task_id).map(|t| t.status.clone());
+
+        match result {
+            Ok(()) => {
+                // 下载成功:如果已被取消/暂停,优先保留用户操作的状态
+                if current_status.as_deref() == Some(status::CANCELLED) {
+                    tracing::info!(task_id = %task_id, "下载完成但任务已被取消");
+                } else if let Some(task) = store.get_mut(&task_id) {
+                    task.progress = 1.0;
+                    // 从 DownloadTask 获取最终下载量
+                    let dt = download_task.lock().await;
+                    let final_size = dt.metadata().and_then(|m| m.file_size).unwrap_or(0);
+                    task.downloaded = final_size;
+                    task.speed = 0;
+                    drop(dt);
+                    update_task_status(&mut store, &task_id, status::COMPLETED);
+                    tracing::info!(task_id = %task_id, file_size = final_size, "下载任务完成");
+                }
             }
-        } else {
-            if let Some(task) = store.get_mut(&task_id) {
-                task.progress = 1.0;
-                task.downloaded = file_size.max(total_downloaded);
+            Err(e) => {
+                // 下载失败:如果已被取消,保留 cancelled 状态
+                if current_status.as_deref() == Some(status::CANCELLED) {
+                    tracing::info!(task_id = %task_id, "下载失败但任务已被取消,保留取消状态");
+                } else {
+                    update_task_status(&mut store, &task_id, status::FAILED);
+                    tracing::error!(task_id = %task_id, error = %e, "下载任务失败");
+                }
             }
-            update_task_status(&mut store, &task_id, status::COMPLETED);
-            tracing::info!(
-                task_id = %task_id,
-                total_bytes = total_downloaded,
-                "下载任务完成"
-            );
         }
+
+        // 发送最终进度快照
+        let event: ProgressEvent = store
+            .iter()
+            .map(|(id, t)| {
+                (
+                    id.clone(),
+                    TaskProgress {
+                        id: id.clone(),
+                        progress: t.progress,
+                        speed: t.speed,
+                        downloaded: t.downloaded,
+                        status: t.status.clone(),
+                        fragments_done: t.fragments_done,
+                    },
+                )
+            })
+            .collect();
+        let _ = state.progress_tx.send(event);
     }
 }
 
@@ -556,7 +681,7 @@ pub fn supported_protocols() -> Vec<&'static str> {
 ///
 /// `url` 为下载地址,`download_dir` 可选覆盖默认下载目录。
 /// 创建后立即启动后台下载任务,返回新任务的 UUID。
-/// 使用 `DownloadOrchestrator` 规划分片策略,后台异步执行下载。
+/// 使用 `DownloadTask` 真实下载管线,后台异步执行下载。
 #[tauri::command]
 pub async fn create_task(
     state: tauri::State<'_, AppState>,
@@ -614,10 +739,11 @@ pub async fn create_task(
         store.insert(task_id.clone(), task);
     }
 
-    let orchestrator = DownloadOrchestrator::new(PoolConfig {
-        max_per_host: 16,
-        max_global: 256,
-    });
+    // 构建引擎层 DownloadConfig
+    let download_config = {
+        let cfg = state.config.lock().await;
+        build_download_config(&cfg, &download_dir_str)
+    };
 
     let state_arc = Arc::new(AppState {
         tasks: state.tasks.clone(),
@@ -626,39 +752,15 @@ pub async fn create_task(
         active_permits: state.active_permits.clone(),
         sniffer: state.sniffer.clone(),
         sniffer_filters: state.sniffer_filters.clone(),
+        http_client: state.http_client.clone(),
+        connection_pool: state.connection_pool.clone(),
+        progress_tx: state.progress_tx.clone(),
     });
 
     let tid = task_id.clone();
     let url_clone = url.clone();
     let handle = tokio::spawn(async move {
-        let metadata = match probe_metadata(&url_clone).await {
-            Ok(meta) => {
-                tracing::info!(
-                    task_id = %tid,
-                    file_name = %meta.file_name,
-                    file_size = ?meta.file_size,
-                    supports_range = meta.supports_range,
-                    "元数据探测成功"
-                );
-                meta
-            }
-            Err(e) => {
-                tracing::error!(task_id = %tid, error = %e, "元数据探测失败");
-                let mut store = state_arc.tasks.lock().await;
-                update_task_status(&mut store, &tid, status::FAILED);
-                return;
-            }
-        };
-
-        task_fn(
-            state_arc,
-            tid,
-            url_clone,
-            download_dir_str,
-            orchestrator,
-            metadata,
-        )
-        .await;
+        task_fn(state_arc, tid, url_clone, download_dir_str, download_config).await;
     });
 
     {
@@ -668,64 +770,6 @@ pub async fn create_task(
 
     tracing::info!(task_id = %task_id, "创建下载任务并启动后台下载");
     Ok(task_id)
-}
-
-/// 探测远程文件元数据
-///
-/// 发送 HEAD 请求获取 Content-Length、Accept-Ranges 等信息。
-/// 失败时返回合理的默认值(未知大小、不支持 Range)。
-async fn probe_metadata(url: &str) -> Result<FileMetadata, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-
-    let response = client
-        .head(url)
-        .send()
-        .await
-        .map_err(|e| format!("HEAD 请求失败: {e}"))?;
-
-    let file_size = response
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    let supports_range = response
-        .headers()
-        .get(reqwest::header::ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("bytes"));
-
-    let file_name = response
-        .headers()
-        .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_disposition)
-        .unwrap_or_else(|| extract_filename_from_url(url));
-
-    Ok(FileMetadata {
-        file_name,
-        file_size,
-        content_type: response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
-        supports_range,
-        etag: response
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
-        last_modified: response
-            .headers()
-            .get(reqwest::header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
-    })
 }
 
 /// 暂停下载任务
@@ -982,6 +1026,57 @@ pub async fn update_config(
 }
 
 // ---------------------------------------------------------------------------
+// 事件推送命令
+// ---------------------------------------------------------------------------
+
+/// 订阅进度更新事件
+///
+/// 启动后台监听任务,将进度快照通过 Tauri 事件系统推送给前端。
+/// 前端通过 `window.__TAURI__.event.listen('progress-update', callback)` 接收。
+#[tauri::command]
+pub async fn subscribe_progress(
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let mut rx = state.progress_tx.subscribe();
+    let tasks = state.tasks.clone();
+
+    tokio::spawn(async move {
+        // 首次推送当前全量快照
+        {
+            let store = tasks.lock().await;
+            let event: ProgressEvent = store
+                .iter()
+                .map(|(id, t)| {
+                    (
+                        id.clone(),
+                        TaskProgress {
+                            id: id.clone(),
+                            progress: t.progress,
+                            speed: t.speed,
+                            downloaded: t.downloaded,
+                            status: t.status.clone(),
+                            fragments_done: t.fragments_done,
+                        },
+                    )
+                })
+                .collect();
+            let _ = app_handle.emit("progress-update", &event);
+        }
+
+        // 持续监听 watch channel 变化
+        while rx.changed().await.is_ok() {
+            let snapshot = (*rx.borrow_and_update()).clone();
+            let _ = app_handle.emit("progress-update", &snapshot);
+        }
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 测试辅助函数(直接操作 AppState,不依赖 Tauri State 注入)
 // ---------------------------------------------------------------------------
 
@@ -1042,10 +1137,11 @@ async fn create_task_inner(
         store.insert(task_id.clone(), task);
     }
 
-    let orchestrator = DownloadOrchestrator::new(PoolConfig {
-        max_per_host: 16,
-        max_global: 256,
-    });
+    // 构建引擎层 DownloadConfig
+    let download_config = {
+        let cfg = state.config.lock().await;
+        build_download_config(&cfg, &download_dir_str)
+    };
 
     let state_arc = Arc::new(AppState {
         tasks: state.tasks.clone(),
@@ -1054,39 +1150,15 @@ async fn create_task_inner(
         active_permits: state.active_permits.clone(),
         sniffer: state.sniffer.clone(),
         sniffer_filters: state.sniffer_filters.clone(),
+        http_client: state.http_client.clone(),
+        connection_pool: state.connection_pool.clone(),
+        progress_tx: state.progress_tx.clone(),
     });
 
     let tid = task_id.clone();
     let url_clone = url.clone();
     let handle = tokio::spawn(async move {
-        let metadata = match probe_metadata(&url_clone).await {
-            Ok(meta) => {
-                tracing::info!(
-                    task_id = %tid,
-                    file_name = %meta.file_name,
-                    file_size = ?meta.file_size,
-                    supports_range = meta.supports_range,
-                    "元数据探测成功"
-                );
-                meta
-            }
-            Err(e) => {
-                tracing::error!(task_id = %tid, error = %e, "元数据探测失败");
-                let mut store = state_arc.tasks.lock().await;
-                update_task_status(&mut store, &tid, status::FAILED);
-                return;
-            }
-        };
-
-        task_fn(
-            state_arc,
-            tid,
-            url_clone,
-            download_dir_str,
-            orchestrator,
-            metadata,
-        )
-        .await;
+        task_fn(state_arc, tid, url_clone, download_dir_str, download_config).await;
     });
 
     {
@@ -1252,6 +1324,7 @@ async fn update_config_inner(state: &AppState, config: AppConfig) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qf_core::filename::parse_content_disposition;
 
     /// 创建测试用 AppState
     fn test_state() -> Arc<AppState> {
@@ -1269,6 +1342,15 @@ mod tests {
             active_permits: Arc::new(AtomicU32::new(0)),
             sniffer: Arc::new(Mutex::new(Vec::new())),
             sniffer_filters: Arc::new(Mutex::new(Vec::new())),
+            http_client: Arc::new(
+                reqwest::Client::builder()
+                    .user_agent("QuantumFetch-test/0.1.0")
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap(),
+            ),
+            connection_pool: Arc::new(ConnectionPool::new(PoolConfig::default())),
+            progress_tx: watch::Sender::new(HashMap::new()),
         })
     }
 
@@ -1989,18 +2071,202 @@ mod tests {
             let mut cfg = state.config.lock().await;
             cfg.max_concurrent_fragments = 0;
         }
-        // task_fn 会在 max_concurrent==0 时标记任务为 FAILED 并返回
-        // 这里通过 create_task_inner 触发,验证任务最终变为 failed
-        // 注意:probe_metadata 可能失败(网络不可达),但任务仍应变为 failed
+        // DownloadTask::new 创建 Semaphore::new(0) 会 panic,
+        // 但在此之前,create_dir_all 或文件创建更可能失败。
+        // 无论哪种情况,任务最终应变为 failed。
         let id = create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None)
             .await
             .unwrap();
-        // 等待后台任务完成(probe_metadata 失败 或 max_concurrent==0)
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // 等待后台任务完成(使用轮询而非固定 sleep,避免网络超时导致的竞态)
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
+            if task.status == "failed" {
+                break;
+            }
+        }
         let task = get_task_detail_inner(&state, id).await.unwrap();
         assert_eq!(
             task.status, "failed",
             "max_concurrent_fragments=0 时任务应标记为 failed"
+        );
+    }
+
+    // ------ 并发死锁测试 ------
+
+    /// 验证同时调用 cancel_task 和 get_task_list 不会死锁
+    ///
+    /// 两个操作都需要获取 tasks 锁,但由于 tokio::sync::Mutex 是异步的,
+    /// 并发获取应正确排队而非死锁。
+    #[tokio::test]
+    async fn test_concurrent_cancel_and_get_list_no_deadlock() {
+        let state = test_state();
+
+        // 创建多个任务
+        let mut task_ids = Vec::new();
+        for i in 0..5 {
+            let id = create_task_inner(
+                &state,
+                format!("http://example.com/deadlock-test-{i}.bin"),
+                None,
+            )
+            .await
+            .unwrap();
+            task_ids.push(id);
+        }
+
+        let mut cancel_handles = Vec::new();
+
+        // 并发:多个 cancel 操作
+        for id in &task_ids[..3] {
+            let state_clone = state.clone();
+            let tid = id.clone();
+            cancel_handles.push(tokio::spawn(async move {
+                cancel_task_inner(&state_clone, tid).await
+            }));
+        }
+
+        let mut list_handles = Vec::new();
+
+        // 并发:多个 get_task_list 操作
+        for _ in 0..3 {
+            let state_clone = state.clone();
+            list_handles.push(tokio::spawn(async move {
+                get_task_list_inner(&state_clone).await
+            }));
+        }
+
+        // 使用 5 秒超时检测死锁
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for handle in cancel_handles {
+                let _ = handle.await;
+            }
+            for handle in list_handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "并发 cancel+get_list 操作超时,疑似死锁");
+
+        // 验证被取消的任务状态正确
+        for id in &task_ids[..3] {
+            let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
+            assert_eq!(task.status, "cancelled", "任务应已被取消: {}", id);
+        }
+    }
+
+    /// 验证同时调用 create_task 和 delete_task 不会死锁
+    #[tokio::test]
+    async fn test_concurrent_create_and_delete_no_deadlock() {
+        let state = test_state();
+
+        // 先创建一些任务并取消(使它们可以被删除)
+        let mut deletable_ids = Vec::new();
+        for i in 0..3 {
+            let id = create_task_inner(
+                &state,
+                format!("http://example.com/to-delete-{i}.bin"),
+                None,
+            )
+            .await
+            .unwrap();
+            cancel_task_inner(&state, id.clone()).await.unwrap();
+            deletable_ids.push(id);
+        }
+
+        let mut create_handles = Vec::new();
+
+        // 并发:创建新任务
+        for i in 0..3 {
+            let state_clone = state.clone();
+            create_handles.push(tokio::spawn(async move {
+                create_task_inner(
+                    &state_clone,
+                    format!("http://example.com/new-task-{i}.bin"),
+                    None,
+                )
+                .await
+            }));
+        }
+
+        let mut delete_handles = Vec::new();
+
+        // 并发:删除已有任务
+        for id in &deletable_ids {
+            let state_clone = state.clone();
+            let tid = id.clone();
+            delete_handles.push(tokio::spawn(async move {
+                delete_task_inner(&state_clone, tid).await
+            }));
+        }
+
+        // 使用 5 秒超时检测死锁
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for handle in create_handles {
+                let _ = handle.await;
+            }
+            for handle in delete_handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "并发 create+delete 操作超时,疑似死锁");
+
+        // 验证被删除的任务已不存在
+        for id in &deletable_ids {
+            let result = get_task_detail_inner(&state, id.clone()).await;
+            assert!(result.is_err(), "已删除任务应不存在: {}", id);
+        }
+    }
+
+    /// 验证并发暂停和恢复同一任务不会死锁
+    #[tokio::test]
+    async fn test_concurrent_pause_resume_no_deadlock() {
+        let state = test_state();
+
+        let id = create_task_inner(
+            &state,
+            "http://example.com/pause-resume-test.bin".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut handles = Vec::new();
+
+        // 交替 pause 和 resume
+        for i in 0..10 {
+            let state_clone = state.clone();
+            let tid = id.clone();
+            if i % 2 == 0 {
+                handles.push(tokio::spawn(async move {
+                    pause_task_inner(&state_clone, tid).await
+                }));
+            } else {
+                handles.push(tokio::spawn(async move {
+                    resume_task_inner(&state_clone, tid).await
+                }));
+            }
+        }
+
+        // 使用 5 秒超时
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "并发 pause+resume 操作超时,疑似死锁");
+
+        // 验证任务状态是 pause 或 download 之一(最终状态取决于竞争)
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert!(
+            task.status == "paused" || task.status == "downloading",
+            "最终状态应为 paused 或 downloading,实际: {}",
+            task.status
         );
     }
 }

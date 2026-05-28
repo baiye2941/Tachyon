@@ -9,7 +9,11 @@ pub mod dht;
 pub mod peer;
 pub mod source;
 
-pub use dht::KademliaDht;
+pub use dht::DhtNode;
+pub use dht::{
+    ALPHA, K_BUCKET_SIZE, KBucket, KademliaDht, KademliaMessage, NodeId, RoutingTable,
+    generate_node_id, xor_distance,
+};
 pub use peer::{PeerInfo, PeerScore};
 pub use source::{DownloadSource, SourceSelector};
 
@@ -17,7 +21,7 @@ pub use source::{DownloadSource, SourceSelector};
 #[test]
 /// 测试 Kademlia DHT: XOR 距离度量与 k-bucket 节点管理
 fn kademlia() {
-    use dht::{DhtNode, KademliaDht, NodeId};
+    use dht::{DhtNode, KademliaDht, NodeId, xor_distance};
 
     // === XOR 距离度量 ===
     // 相同节点 XOR 距离为零
@@ -168,14 +172,4 @@ fn p2p_network() {
     // 移除最后一个源
     selector.remove_source("10.0.0.99:6881");
     assert!(selector.select_source().is_none(), "无源时应返回 None");
-}
-
-/// 计算两个 160-bit NodeId 的 XOR 距离
-#[cfg(test)]
-fn xor_distance(a: &dht::NodeId, b: &dht::NodeId) -> dht::NodeId {
-    let mut result = [0u8; 20];
-    for i in 0..20 {
-        result[i] = a[i] ^ b[i];
-    }
-    result
 }

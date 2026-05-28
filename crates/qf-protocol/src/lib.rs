@@ -22,7 +22,7 @@ mod protocol_tests {
 
     /// 辅助泛型函数:验证 Protocol trait 在所有协议上的一致行为
     ///
-    /// 对不可达地址调用 probe/download_range/download_full 均应返回错误。
+    /// 对不可达地址调用 probe/download_range/download_full/download_range_stream 均应返回错误。
     async fn verify_protocol_returns_error<P: Protocol>(proto: &P, url: &str) {
         let result = proto.probe(url).await;
         assert!(result.is_err(), "probe 应返回错误");
@@ -32,6 +32,9 @@ mod protocol_tests {
 
         let result = proto.download_full(url).await;
         assert!(result.is_err(), "download_full 应返回错误");
+
+        let result = proto.download_range_stream(url, 0, 1023).await;
+        assert!(result.is_err(), "download_range_stream 应返回错误");
     }
 
     #[tokio::test]
@@ -94,8 +97,9 @@ mod protocol_tests {
 #[tokio::test]
 async fn download_range_stream() {
     use bytes::Bytes;
+    use futures::StreamExt;
     use qf_core::error::QfResult;
-    use qf_core::traits::Protocol;
+    use qf_core::traits::{ByteStream, Protocol};
     use qf_core::types::FileMetadata;
 
     // 本地 mock:不依赖 qf-core 的 test-harness feature
@@ -136,9 +140,12 @@ async fn download_range_stream() {
             _url: &str,
             _start: u64,
             _end: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>>
+        {
             let data = self.data.clone();
-            Box::pin(async move { Ok(data) })
+            Box::pin(async move {
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            })
         }
         fn download_full(
             &self,
@@ -152,11 +159,19 @@ async fn download_range_stream() {
     let data = Bytes::from_static(b"stream test data for download_range_stream verification");
     let mock = LocalMock { data: data.clone() };
 
-    let result = mock
+    let stream = mock
         .download_range_stream("http://example.com/stream.bin", 0, data.len() as u64 - 1)
         .await;
-    assert!(result.is_ok(), "download_range_stream 应成功");
-    assert_eq!(result.unwrap(), data, "流式下载数据应与预期一致");
+    assert!(stream.is_ok(), "download_range_stream 应成功");
+
+    // 从流中收集所有数据块
+    let mut collected = bytes::BytesMut::new();
+    let mut stream = stream.unwrap();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("流式数据块不应出错");
+        collected.extend_from_slice(&chunk);
+    }
+    assert_eq!(collected.freeze(), data, "流式下载数据应与预期一致");
 }
 
 /// 验证 HTTP/3 协议基础类型和 QPACK 帧结构

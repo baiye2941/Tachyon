@@ -3,22 +3,39 @@
 //! 使用 wgpu compute shader 在 GPU 上并行计算 blake3 哈希。
 //! 适用场景:单分片数据量较大且 GPU 可用时。
 //!
-//! # 设计说明
+//! # 当前状态
 //!
 //! blake3 的完整 GPU compute shader 实现需要 7 轮 G 函数压缩,
 //! 工程复杂度极高。本模块搭建了完整的 wgpu compute pipeline 框架,
-//! 当前哈希计算回退到 CPU blake3,为后续完整 GPU 实现预留接口。
+//! 当前哈希计算全部回退到 CPU blake3。
+//!
+//! TODO(gpu-blake3): 在 WGSL 中实现完整的 blake3 压缩函数后,
+//!   `compute_blake3` 应读回 GPU output_buffer 作为最终哈希结果,
+//!   `auto_select_and_hash` 应恢复 GPU 大数据路径。
 
 use std::borrow::Cow;
 
 use qf_core::QfError;
 use qf_core::error::QfResult;
-use wgpu::util::DeviceExt;
 
 /// GPU 校验器
 ///
 /// 封装 wgpu device/queue 和 compute pipeline,提供 GPU 加速哈希。
 /// 当数据量小于阈值时自动回退到 CPU blake3。
+///
+/// TODO(gpu-blake3): 当 WGSL 压缩函数实现完成后,添加 `#[must_use]` 并
+///   确保 `compute_blake3` 真正使用 GPU 结果。
+// SAFETY: wgpu::Device 和 wgpu::Queue 均为 Send + Sync,
+// ComputePipeline 持有的引用也是 Send + Sync。
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _assert() {
+        _assert_send::<GpuVerifier>();
+        _assert_sync::<GpuVerifier>();
+    }
+};
+
 pub struct GpuVerifier {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -100,7 +117,7 @@ impl GpuVerifier {
             .is_some()
     }
 
-    /// 获取 GPU 设备名称
+    /// 获取 GPU 设备调试描述
     pub fn device_name(&self) -> String {
         format!("{:?}", self.device)
     }
@@ -110,92 +127,48 @@ impl GpuVerifier {
     /// # 行为
     ///
     /// - 数据量 < 64 MiB 时,直接使用 CPU blake3 计算(GPU 启动开销不划算)
-    /// - 数据量 >= 64 MiB 时,走 GPU compute pipeline
+    /// - 数据量 >= 64 MiB 时,当前同样使用 CPU blake3(GPU pipeline 待实现)
     ///
     /// # 注意
     ///
     /// 完整的 blake3 GPU 实现需要在 WGSL 中实现 7 轮 G 函数压缩,
-    /// 当前版本先搭建 pipeline 框架,实际哈希仍回退 CPU blake3。
-    /// 后续迭代将替换为真正的 GPU compute shader 实现。
+    /// 当前版本先搭建 pipeline 框架,实际哈希回退 CPU blake3。
+    ///
+    /// TODO(gpu-blake3): 实现 WGSL 压缩函数后,读回 output_buffer 替代 CPU 计算。
     pub async fn compute_blake3(&self, data: &[u8]) -> QfResult<String> {
+        // TODO(gpu-blake3): 当 WGSL 实现完整的 blake3 压缩后,以下代码应替换为:
+        //   1. 创建 input/output buffer
+        //   2. dispatch compute pass
+        //   3. 读回 output_buffer 并返回哈希
+        // 当前 GPU pipeline 仅写 IV 到 output_hash,不执行压缩,因此跳过 GPU 执行。
         if data.len() < GPU_MIN_SIZE {
-            tracing::debug!(data_len = data.len(), "数据量小于阈值,回退到 CPU blake3");
-            let hash = blake3::hash(data);
-            return Ok(hash.to_hex().to_string());
+            tracing::debug!(data_len = data.len(), "数据量小于阈值,使用 CPU blake3");
+        } else {
+            tracing::info!(
+                data_len = data.len(),
+                "GPU blake3 压缩尚未实现,回退到 CPU blake3"
+            );
         }
 
-        tracing::info!(data_len = data.len(), "使用 GPU compute pipeline 计算哈希");
-
-        // 1. 创建输入 storage buffer
-        let input_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blake3_input"),
-                contents: data,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // 2. 创建输出 storage buffer (blake3 哈希 32 字节 = 8 x u32)
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blake3_output"),
-            size: 32,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // 3. 创建 bind group layout 和 bind group
-        let bind_group_layout = self.blake3_pipeline.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blake3_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // 4. 调度 compute pass
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("blake3_encoder"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("blake3_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.blake3_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
-
-        // 5. 当前回退:GPU pipeline 已执行但 blake3 压缩函数尚未在 WGSL 中完整实现,
-        //    使用 CPU blake3 作为结果来源。后续迭代将读回 GPU 计算的 output_buffer。
         let hash = blake3::hash(data);
         Ok(hash.to_hex().to_string())
     }
 }
 
-/// 自动选择:大数据使用 GPU(如可用),小数据使用 CPU
+/// 自动选择并计算 blake3 哈希
 ///
-/// 此函数不持久化 GPU 设备,每次调用都会重新初始化。
-/// 适合单次或低频使用场景。高频场景建议复用 `GpuVerifier` 实例。
+/// 当前所有数据均使用 CPU blake3 计算。
+///
+/// TODO(gpu-blake3): WGSL 压缩实现完成后,恢复 GPU 大数据路径:
+///   - 数据量 >= 64 MiB 且 GPU 可用时,复用 `GpuVerifier` 实例(调用方应缓存)
+///   - 避免每次调用重建设备/队列/pipeline
 pub async fn auto_select_and_hash(data: &[u8]) -> QfResult<String> {
-    if data.len() >= GPU_MIN_SIZE && GpuVerifier::is_available().await {
-        let gpu = GpuVerifier::new().await?;
-        gpu.compute_blake3(data).await
-    } else {
-        let hash = blake3::hash(data);
-        Ok(hash.to_hex().to_string())
-    }
+    // TODO(gpu-blake3): 恢复 GPU 路径,注意:
+    //   - GpuVerifier::new() 开销大(设备/队列/pipeline),不应在热路径调用
+    //   - 调用方应缓存 GpuVerifier 实例,此处仅做兼容性路由
+    tracing::debug!(data_len = data.len(), "使用 CPU blake3 计算哈希");
+    let hash = blake3::hash(data);
+    Ok(hash.to_hex().to_string())
 }
 
 /// Blake3 WGSL compute shader
@@ -235,52 +208,41 @@ mod tests {
         let _available = GpuVerifier::is_available().await;
     }
 
-    /// 测试小数据回退到 CPU 计算且结果正确
+    /// 测试小数据直接使用 CPU blake3 且结果正确
     #[tokio::test]
-    async fn test_small_data_uses_cpu_fallback() {
+    async fn test_small_data_uses_cpu_blake3() {
         let data = b"hello world";
         let expected = blake3::hash(data).to_hex().to_string();
-
-        // 即使有 GPU,小数据也应走 CPU 路径
-        let result = if GpuVerifier::is_available().await {
-            let gpu = GpuVerifier::new().await.unwrap();
-            gpu.compute_blake3(data).await.unwrap()
-        } else {
-            // 无 GPU 环境,直接验证 CPU 路径
-            let hash = blake3::hash(data);
-            hash.to_hex().to_string()
-        };
-
+        let result = auto_select_and_hash(data).await.unwrap();
         assert_eq!(result, expected);
     }
 
-    /// 测试 auto_select_and_hash 小数据使用 CPU
+    /// 测试 auto_select_and_hash 始终使用 CPU blake3
     #[tokio::test]
-    async fn test_auto_select_small_data_cpu() {
+    async fn test_auto_select_uses_cpu() {
         let data = b"small data for cpu path";
         let expected = blake3::hash(data).to_hex().to_string();
         let result = auto_select_and_hash(data).await.unwrap();
         assert_eq!(result, expected);
     }
 
-    /// 测试 GPU feature 未启用时 GpuVerifier 类型不可用
+    /// 测试 GPU feature 未启用时编译正确(条件编译验证)
     #[test]
     fn test_gpu_feature_gate() {
         // 此测试验证编译时 feature gate 的正确性:
         // - 默认编译时 gpu 模块不存在
         // - 使用 --features gpu 时 gpu 模块才可用
-        // 如果此测试能编译通过,说明 feature gate 工作正常
         #[cfg(not(feature = "gpu"))]
         {
             // 默认 feature 下 GpuVerifier 不应存在于作用域
-            // 如果编译通过,说明条件编译正确
-            assert!(true, "GPU feature 未启用,gpu 模块被正确排除");
+            // 编译通过即表示条件编译正确
         }
 
         #[cfg(feature = "gpu")]
         {
-            // GPU feature 启用时,GpuVerifier 应可用
-            assert!(true, "GPU feature 已启用,gpu 模块可用");
+            // GPU feature 启用时,模块编译通过即表示可用
+            // 额外验证关键常量存在
+            let _ = GPU_MIN_SIZE;
         }
     }
 
@@ -296,18 +258,15 @@ mod tests {
         assert!(BLAKE3_SHADER.contains("input_data"));
     }
 
-    /// 测试 CPU blake3 与 GPU 路径对同一数据产生相同哈希
+    /// 测试 CPU blake3 与 auto_select_and_hash 对同一数据产生相同哈希
     #[tokio::test]
     async fn test_cpu_gpu_hash_consistency() {
         let data = b"consistency check data";
 
-        // CPU 哈希
         let cpu_hash = blake3::hash(data).to_hex().to_string();
+        let result = auto_select_and_hash(data).await.unwrap();
 
-        // GPU 路径(小数据会回退 CPU)
-        let gpu_result = auto_select_and_hash(data).await.unwrap();
-
-        assert_eq!(cpu_hash, gpu_result);
+        assert_eq!(cpu_hash, result);
         assert_eq!(cpu_hash.len(), 64); // blake3 256-bit = 64 hex chars
     }
 

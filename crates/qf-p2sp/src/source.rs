@@ -472,4 +472,142 @@ mod tests {
             "不存在的源不应影响已有评分"
         );
     }
+
+    // ------ 并发测试 ------
+
+    /// PRNG 并发唯一性:多线程同时生成随机数,不应全部相同
+    #[tokio::test]
+    async fn test_prng_concurrent_uniqueness() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        // 启动 16 个并发任务,每个生成 100 个随机数
+        for _ in 0..16 {
+            let results_clone = Arc::clone(&results);
+            handles.push(tokio::spawn(async move {
+                let mut local = Vec::new();
+                for _ in 0..100 {
+                    local.push(random_f64());
+                }
+                let mut r = results_clone.lock().await;
+                r.extend(local);
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let r = results.lock().await;
+        assert_eq!(r.len(), 1600, "应有 1600 个随机数");
+
+        // 验证所有值在 [0.0, 1.0) 范围内
+        for val in r.iter() {
+            assert!(*val >= 0.0 && *val < 1.0, "随机数 {} 应在 [0.0, 1.0)", val);
+        }
+
+        // 验证不是全部相同(概率极低)
+        let unique: HashSet<u64> = r.iter().map(|v| (v * 1e15) as u64).collect();
+        assert!(
+            unique.len() > 100,
+            "并发生成的随机数应有足够多样性,实际唯一值: {}",
+            unique.len()
+        );
+    }
+
+    /// random_index 并发安全性:多线程调用不 panic
+    #[tokio::test]
+    async fn test_random_index_concurrent_safety() {
+        let mut handles = Vec::new();
+
+        // 启动 16 个并发任务,每个调用 random_index 1000 次
+        for _ in 0..16 {
+            handles.push(tokio::spawn(async move {
+                for _ in 0..1000 {
+                    let idx = random_index(100);
+                    assert!(idx < 100, "random_index(100) 应返回 [0, 100),实际: {idx}");
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("并发 random_index 不应 panic");
+        }
+    }
+
+    /// SourceSelector 并发操作安全性:多个线程同时 select_source
+    #[tokio::test]
+    async fn test_source_selector_concurrent_select() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let selector = Arc::new(RwLock::new(SourceSelector::new()));
+        {
+            let mut s = selector.write().await;
+            s.add_source(
+                DownloadSource::Cdn {
+                    url: "https://fast.com/file".to_string(),
+                },
+                PeerScore {
+                    latency_ms: 10,
+                    bandwidth_bps: 100 * 1024 * 1024,
+                    stability: 0.95,
+                    distance: 5,
+                },
+            );
+            s.add_source(
+                DownloadSource::Peer {
+                    addr: "10.0.0.1:6881".to_string(),
+                },
+                PeerScore {
+                    latency_ms: 50,
+                    bandwidth_bps: 10 * 1024 * 1024,
+                    stability: 0.7,
+                    distance: 50,
+                },
+            );
+        }
+
+        let mut handles = Vec::new();
+
+        // 8 个并发读任务,每个选择 200 次
+        for _ in 0..8 {
+            let sel = Arc::clone(&selector);
+            handles.push(tokio::spawn(async move {
+                let mut cdn_count = 0;
+                let mut peer_count = 0;
+                for _ in 0..200 {
+                    let s = sel.read().await;
+                    if let Some(src) = s.select_source() {
+                        match src {
+                            DownloadSource::Cdn { .. } => cdn_count += 1,
+                            DownloadSource::Peer { .. } => peer_count += 1,
+                        }
+                    }
+                }
+                (cdn_count, peer_count)
+            }));
+        }
+
+        let mut total_cdn = 0;
+        let mut total_peer = 0;
+        for handle in handles {
+            let (cdn, peer) = handle.await.unwrap();
+            total_cdn += cdn;
+            total_peer += peer;
+        }
+
+        // 高带宽 CDN 应被选中更多
+        assert!(
+            total_cdn > total_peer,
+            "高带宽 CDN 应被优先选中: cdn={}, peer={}",
+            total_cdn,
+            total_peer
+        );
+        assert_eq!(total_cdn + total_peer, 1600, "总选择次数应为 1600");
+    }
 }

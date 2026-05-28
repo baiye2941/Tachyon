@@ -4,8 +4,8 @@
 //! - Linux:io_uring 零拷贝管道
 //! - Windows:WinFile 优化(NO_BUFFERING + SEQUENTIAL_SCAN)
 //! - macOS:tokio 标准异步文件 I/O
-//! - BufferPool 管理与 buffer 复用
-//! - 零拷贝写入管道(含批量写入)
+//! - BufferPool 管理与 buffer 复用(带 Semaphore 反压)
+//! - 零拷贝写入管道(含批量合并写入)
 
 pub mod buffer;
 pub mod iouring;
@@ -68,36 +68,57 @@ async fn write_pipeline() {
     assert_eq!(&buf, b"hello pipeline");
 }
 
-/// 验证 BufferPool 背压行为:耗尽后归还可复用
+/// 验证 BufferPool 反压行为:许可耗尽时 alloc 阻塞,归还后恢复
 #[cfg(test)]
-#[test]
-fn backpressure() {
+#[tokio::test]
+async fn backpressure() {
     // 创建小容量 buffer 池,模拟资源受限场景
-    let pool = BufferPool::with_prefill(1024, 2);
+    let pool = BufferPool::new(1024, 2);
     assert_eq!(pool.capacity(), 2);
     assert_eq!(pool.available(), 2);
 
-    // 分配所有 buffer,池应为空
-    let buf1 = pool.alloc();
-    let buf2 = pool.alloc();
+    // 分配所有许可,池许可耗尽
+    let buf1 = pool.alloc().await;
+    let buf2 = pool.alloc().await;
     assert_eq!(pool.available(), 0);
 
-    // 此时再分配会触发新建(池空但不阻塞)
-    let buf3 = pool.alloc();
-    // available 仍为 0,因为 buf3 是新建的不在池中
-    assert_eq!(pool.available(), 0);
+    // 第三次 alloc 应阻塞(反压生效)
+    let result = tokio::time::timeout(std::time::Duration::from_millis(50), pool.alloc()).await;
+    assert!(result.is_err(), "许可耗尽时 alloc 应阻塞");
 
-    // 归还第一个 buffer,验证可用数恢复
+    // 归还第一个 buffer,许可恢复
     pool.release(buf1);
     assert_eq!(pool.available(), 1);
 
-    // 归还第二个 buffer
-    pool.release(buf2);
-    assert_eq!(pool.available(), 2);
+    // 现在 alloc 应立即成功
+    let buf3 = pool.alloc().await;
+    assert_eq!(pool.available(), 0);
 
-    // 超出容量的归还会被丢弃(capacity=2,已有 2 个在池中)
+    // 归还剩余 buffer
+    pool.release(buf2);
     pool.release(buf3);
-    assert_eq!(pool.available(), 2); // 仍然为 2,不增长
+    assert_eq!(pool.available(), 2);
+}
+
+/// 验证 BufferPool 反压链路:归还后等待中的 alloc 被唤醒
+#[cfg(test)]
+#[tokio::test]
+async fn backpressure_wakes_waiter() {
+    let pool = BufferPool::new(1024, 1);
+    let buf = pool.alloc().await;
+    assert_eq!(pool.available(), 0);
+
+    // 在另一个任务中等待 alloc(会阻塞)
+    let pool_clone = pool.clone();
+    let alloc_task = tokio::spawn(async move { pool_clone.alloc().await });
+
+    // 短暂延迟后归还,唤醒等待任务
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    pool.release(buf);
+
+    // 等待任务完成
+    let buf2 = alloc_task.await.expect("任务应成功");
+    assert_eq!(buf2.capacity(), 1024);
 }
 
 /// 验证 WinFile NO_BUFFERING 对齐写入逻辑

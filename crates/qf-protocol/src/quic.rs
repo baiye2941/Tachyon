@@ -14,6 +14,7 @@
 //! - Range 请求(分片下载)
 //! - 全量下载
 
+use std::io::Write;
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use bytes::Bytes;
 use qf_core::filename::{extract_filename_from_url, parse_content_disposition};
 use qf_core::traits::Protocol;
 use qf_core::types::FileMetadata;
-use qf_core::{QfError, QfResult};
+use qf_core::{ByteStream, QfError, QfResult};
 use url::Url;
 
 /// QUIC 传输客户端
@@ -231,30 +232,23 @@ fn parse_head_response(response: &str, url: &str) -> QfResult<FileMetadata> {
 
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            let key_lower = key.trim().to_ascii_lowercase();
+            let key = key.trim();
             let value_trimmed = value.trim();
 
-            match key_lower.as_str() {
-                "content-length" => {
-                    file_size = value_trimmed.parse().ok();
-                }
-                "content-type" => {
-                    content_type = Some(value_trimmed.to_string());
-                }
-                "accept-ranges" => {
-                    supports_range = value_trimmed.contains("bytes");
-                }
-                "etag" => {
-                    etag = Some(value_trimmed.to_string());
-                }
-                "last-modified" => {
-                    last_modified = Some(value_trimmed.to_string());
-                }
-                "content-disposition" => {
-                    content_disposition_name =
-                        qf_core::filename::parse_content_disposition(value_trimmed);
-                }
-                _ => {}
+            // 使用 eq_ignore_ascii_case 避免每行分配一个新 String
+            if key.eq_ignore_ascii_case("content-length") {
+                file_size = value_trimmed.parse().ok();
+            } else if key.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value_trimmed.to_string());
+            } else if key.eq_ignore_ascii_case("accept-ranges") {
+                supports_range = value_trimmed.contains("bytes");
+            } else if key.eq_ignore_ascii_case("etag") {
+                etag = Some(value_trimmed.to_string());
+            } else if key.eq_ignore_ascii_case("last-modified") {
+                last_modified = Some(value_trimmed.to_string());
+            } else if key.eq_ignore_ascii_case("content-disposition") {
+                content_disposition_name =
+                    qf_core::filename::parse_content_disposition(value_trimmed);
             }
         }
     }
@@ -329,6 +323,133 @@ async fn send_request(conn: &quinn::Connection, request: &[u8]) -> QfResult<Vec<
         .map_err(|e| QfError::Network(format!("读取响应数据失败: {e}")))
 }
 
+/// 流式读取 QUIC 响应,分块返回数据
+///
+/// 使用 quinn `read_chunk` 进行零拷贝分块读取(默认 64KB/块),
+/// 先解析 HTTP 响应头并验证状态码,再逐块产出正文数据。
+///
+/// 消除 `read_to_end` 的 256MB 硬性上限和峰值内存问题。
+fn recv_streaming(recv: quinn::RecvStream) -> ByteStream {
+    const CHUNK_SIZE: usize = 64 * 1024; // 64KB per read_chunk
+    const MAX_HEADER_BUF: usize = 256 * 1024; // 头部缓冲区上限 256KB
+
+    /// 解析器状态:跟踪 HTTP 响应头解析进度
+    enum State {
+        /// 正在寻找 `\r\n\r\n` 头部终止符
+        FindHeader { header_buf: Vec<u8> },
+        /// 正在流式读取正文
+        Body,
+    }
+
+    let initial_state = State::FindHeader {
+        header_buf: Vec::with_capacity(4096),
+    };
+
+    // 使用 futures::stream::unfold 实现状态机驱动的 Stream
+    // recv 的所有权移入闭包,确保 Stream 结束时正确清理 QUIC 流
+    Box::pin(futures::stream::unfold(
+        (initial_state, recv, Bytes::new()),
+        |(mut state, mut recv, pending): (State, quinn::RecvStream, Bytes)| async move {
+            loop {
+                // 读取下一个 QUIC 数据块(零拷贝)
+                let chunk = match recv.read_chunk(CHUNK_SIZE, true).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => return None,
+                    Err(e) => {
+                        return Some((
+                            Err(QfError::Network(format!("QUIC 流读取失败: {e}"))),
+                            (state, recv, pending),
+                        ));
+                    }
+                };
+
+                match state {
+                    State::FindHeader { ref mut header_buf } => {
+                        header_buf.extend_from_slice(&chunk.bytes);
+
+                        // 在累积缓冲区中搜索分隔符
+                        if let Some(pos) = find_subsequence(&header_buf, b"\r\n\r\n") {
+                            let body_start = pos + 4;
+
+                            // 验证 HTTP 状态码
+                            if let Err(e) = validate_http_status(&header_buf[..pos]) {
+                                return Some((Err(e), (State::Body, recv, pending)));
+                            }
+
+                            // 提取尾部残余数据(分隔符之后的字节)
+                            let tail = Bytes::copy_from_slice(&header_buf[body_start..]);
+                            if !tail.is_empty() {
+                                return Some((Ok(tail), (State::Body, recv, pending)));
+                            }
+                            // 没有残余数据,继续读取 body
+                            continue;
+                        }
+
+                        if header_buf.len() > MAX_HEADER_BUF {
+                            return Some((
+                                Err(QfError::Protocol("HTTP 头部超过 256KB 上限".into())),
+                                (State::Body, recv, pending),
+                            ));
+                        }
+                        // 继续读取下一个 chunk
+                        continue;
+                    }
+                    State::Body => {
+                        let data = chunk.bytes;
+                        if !data.is_empty() {
+                            return Some((Ok(data), (State::Body, recv, pending)));
+                        }
+                        // 空 chunk,继续读取
+                    }
+                }
+            }
+        },
+    ))
+}
+
+/// 在字节切片中查找子序列位置
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// 从头部字节中解析并验证 HTTP 状态码(200-299)
+fn validate_http_status(header_bytes: &[u8]) -> QfResult<()> {
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|e| QfError::Protocol(format!("响应头部非有效 UTF-8: {e}")))?;
+
+    if let Some(status_line) = header_str.lines().next() {
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        if !(200..300).contains(&status_code) {
+            return Err(QfError::Protocol(format!("HTTP {status_code}")));
+        }
+    }
+
+    Ok(())
+}
+
+/// 从 URL 中提取路径(含查询字符串)
+///
+/// 返回格式: `/path?key=value`
+fn extract_path(url: &Url) -> String {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    }
+}
+
 /// 构造 HTTP/1.1 格式的 HEAD 请求
 fn build_head_request(url: &str) -> QfResult<Vec<u8>> {
     let parsed = Url::parse(url).map_err(|e| QfError::Network(format!("URL 解析失败: {e}")))?;
@@ -336,23 +457,16 @@ fn build_head_request(url: &str) -> QfResult<Vec<u8>> {
     let host = parsed
         .host_str()
         .ok_or_else(|| QfError::Network("URL 缺少主机名".into()))?;
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
+    let full_path = extract_path(&parsed);
 
-    // 拼接查询字符串
-    let full_path = if let Some(query) = parsed.query() {
-        format!("{path}?{query}")
-    } else {
-        path.to_string()
-    };
-
-    Ok(
-        format!("HEAD {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
-            .into_bytes(),
+    // 使用 write! 避免 format! 创建中间 String,直接写入预分配缓冲区
+    let mut buf = Vec::with_capacity(128 + full_path.len() + host.len());
+    write!(
+        buf,
+        "HEAD {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     )
+    .expect("写入 Vec 不会失败");
+    Ok(buf)
 }
 
 /// 构造 HTTP/1.1 格式的 GET 请求(带 Range 头)
@@ -362,22 +476,12 @@ fn build_range_request(url: &str, start: u64, end: u64) -> QfResult<Vec<u8>> {
     let host = parsed
         .host_str()
         .ok_or_else(|| QfError::Network("URL 缺少主机名".into()))?;
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
+    let full_path = extract_path(&parsed);
 
-    let full_path = if let Some(query) = parsed.query() {
-        format!("{path}?{query}")
-    } else {
-        path.to_string()
-    };
-
-    Ok(format!(
-        "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n"
-    )
-    .into_bytes())
+    let mut buf = Vec::with_capacity(160 + full_path.len() + host.len());
+    write!(buf, "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n")
+        .expect("写入 Vec 不会失败");
+    Ok(buf)
 }
 
 /// 构造 HTTP/1.1 格式的 GET 请求(全量下载)
@@ -387,22 +491,15 @@ fn build_full_request(url: &str) -> QfResult<Vec<u8>> {
     let host = parsed
         .host_str()
         .ok_or_else(|| QfError::Network("URL 缺少主机名".into()))?;
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
+    let full_path = extract_path(&parsed);
 
-    let full_path = if let Some(query) = parsed.query() {
-        format!("{path}?{query}")
-    } else {
-        path.to_string()
-    };
-
-    Ok(
-        format!("GET {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
-            .into_bytes(),
+    let mut buf = Vec::with_capacity(128 + full_path.len() + host.len());
+    write!(
+        buf,
+        "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     )
+    .expect("写入 Vec 不会失败");
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +601,7 @@ impl Protocol for QuicTransport {
         url: &str,
         start: u64,
         end: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>> {
         let conn = match self.require_connection() {
             Ok(c) => c.clone(),
             Err(e) => return Box::pin(async move { Err(e) }),
@@ -512,8 +609,22 @@ impl Protocol for QuicTransport {
         let url = url.to_owned();
         Box::pin(async move {
             let request = build_range_request(&url, start, end)?;
-            let response_bytes = send_request(&conn, &request).await?;
-            parse_body_response(&response_bytes)
+
+            // 打开双向流并发送请求
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| QfError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+
+            send.write_all(&request)
+                .await
+                .map_err(|e| QfError::Network(format!("发送请求数据失败: {e}")))?;
+
+            send.finish()
+                .map_err(|e| QfError::Network(format!("关闭发送流失败: {e}")))?;
+
+            // 返回流式读取器:逐块读取响应,避免一次性缓冲整个响应
+            Ok(recv_streaming(recv))
         })
     }
 
@@ -926,5 +1037,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, QfError::Protocol(_)));
+    }
+
+    // --- 辅助函数测试 ---
+
+    #[test]
+    fn test_find_subsequence_found() {
+        assert_eq!(
+            find_subsequence(b"hello\r\n\r\nworld", b"\r\n\r\n"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn test_find_subsequence_not_found() {
+        assert_eq!(find_subsequence(b"hello world", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn test_find_subsequence_at_start() {
+        assert_eq!(find_subsequence(b"\r\n\r\ndata", b"\r\n\r\n"), Some(0));
+    }
+
+    #[test]
+    fn test_find_subsequence_at_end() {
+        assert_eq!(find_subsequence(b"data\r\n\r\n", b"\r\n\r\n"), Some(4));
+    }
+
+    #[test]
+    fn test_validate_http_status_200() {
+        assert!(validate_http_status(b"HTTP/1.1 200 OK\r\nContent-Length: 10").is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_status_206_partial() {
+        assert!(validate_http_status(b"HTTP/1.1 206 Partial Content").is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_status_404() {
+        let result = validate_http_status(b"HTTP/1.1 404 Not Found");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("404"));
+    }
+
+    #[test]
+    fn test_validate_http_status_500() {
+        let result = validate_http_status(b"HTTP/1.1 500 Internal Server Error");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("500"));
+    }
+
+    #[test]
+    fn test_extract_path_basic() {
+        let url = Url::parse("https://example.com/file.bin").unwrap();
+        assert_eq!(extract_path(&url), "/file.bin");
+    }
+
+    #[test]
+    fn test_extract_path_root() {
+        let url = Url::parse("https://example.com/").unwrap();
+        assert_eq!(extract_path(&url), "/");
+    }
+
+    #[test]
+    fn test_extract_path_with_query() {
+        let url = Url::parse("https://example.com/path?key=value").unwrap();
+        assert_eq!(extract_path(&url), "/path?key=value");
+    }
+
+    #[test]
+    fn test_extract_path_no_path() {
+        let url = Url::parse("https://example.com").unwrap();
+        assert_eq!(extract_path(&url), "/");
+    }
+
+    // --- download_range_stream 未连接错误测试 ---
+
+    #[tokio::test]
+    async fn test_download_range_stream_returns_error_when_not_connected() {
+        let transport = QuicTransport::new_insecure().await.unwrap();
+        let result = transport
+            .download_range_stream("https://example.com/file.bin", 0, 1023)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("未连接"), "应提示未连接,实际: {err_msg}");
     }
 }

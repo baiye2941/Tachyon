@@ -17,11 +17,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use qf_core::traits::Protocol;
 use qf_core::types::FileMetadata;
-use qf_core::{QfError, QfResult};
+use qf_core::{ByteStream, QfError, QfResult};
 use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::types::FileType;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// FTP 连接状态
 ///
@@ -55,13 +55,12 @@ struct ConnectionState {
 
 /// FTP 协议客户端
 ///
-/// 内部使用 `Arc<Mutex>` 保护连接状态,使 `Protocol` trait 的 `&self`
-/// 方法可安全地执行需要 `&mut FtpStream` 的 FTP 操作。
-/// `Clone` 实现共享同一底层连接状态。
+/// 内部使用 `Arc<RwLock>` 保护连接状态,读操作使用共享读锁,
+/// 写操作使用排他写锁。`Clone` 实现共享同一底层连接状态。
 #[derive(Clone)]
 pub struct FtpClient {
-    /// 持久连接状态(通过 Arc<Mutex> 实现内部可变性与共享)
-    inner: Arc<Mutex<ConnectionState>>,
+    /// 持久连接状态(通过 Arc<RwLock> 实现读写分离与共享)
+    inner: Arc<RwLock<ConnectionState>>,
 }
 
 impl FtpClient {
@@ -70,7 +69,7 @@ impl FtpClient {
     /// 初始状态为 `Disconnected`,不建立任何网络连接。
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ConnectionState {
+            inner: Arc::new(RwLock::new(ConnectionState {
                 state: FtpState::Disconnected,
                 stream: None,
                 host: String::new(),
@@ -90,7 +89,7 @@ impl FtpClient {
             .await
             .map_err(|e| QfError::Network(format!("FTP 连接失败: {e}")))?;
 
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         guard.stream = Some(stream);
         guard.host = host.to_string();
         guard.port = port;
@@ -104,7 +103,7 @@ impl FtpClient {
     /// 发送 USER 和 PASS 命令完成认证。
     /// 必须在 `connect()` 成功后调用。
     pub async fn login(&self, user: &str, pass: &str) -> QfResult<()> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         if guard.state != FtpState::Connected {
             return Err(QfError::Protocol(
                 "FTP 未连接,无法登录 -- 请先调用 connect()".into(),
@@ -131,7 +130,7 @@ impl FtpClient {
     /// 发送 SIZE 命令获取指定路径文件的字节数。
     /// 必须在 `login()` 成功后调用。
     pub async fn file_size(&self, path: &str) -> QfResult<u64> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         Self::require_stream(&guard)?;
         let stream = guard.stream.as_mut().expect("require_stream 已验证流存在");
 
@@ -148,7 +147,7 @@ impl FtpClient {
     /// FTP 不原生支持 Range 请求,此方法始终下载完整文件。
     /// 必须在 `login()` 成功后调用。
     pub async fn retrieve(&self, path: &str) -> QfResult<Bytes> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         Self::require_stream(&guard)?;
         let stream = guard.stream.as_mut().expect("require_stream 已验证流存在");
 
@@ -185,7 +184,7 @@ impl FtpClient {
     /// 我们从 `start` 偏移处开始下载,读取 `end - start + 1` 字节后关闭数据连接。
     /// 必须在 `login()` 成功后调用。
     pub async fn retrieve_range(&self, path: &str, start: u64, end: u64) -> QfResult<Bytes> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         Self::require_stream(&guard)?;
         let stream = guard
             .stream
@@ -234,31 +233,31 @@ impl FtpClient {
 
     /// 当前是否已连接(包含已认证状态)
     pub async fn is_connected(&self) -> bool {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         matches!(guard.state, FtpState::Connected | FtpState::Authenticated)
     }
 
     /// 当前是否已登录
     pub async fn is_authenticated(&self) -> bool {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard.state == FtpState::Authenticated
     }
 
     /// 获取远程主机地址
     pub async fn host(&self) -> String {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard.host.clone()
     }
 
     /// 获取远程端口
     pub async fn port(&self) -> u16 {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard.port
     }
 
     /// 获取登录用户名
     pub async fn username(&self) -> Option<String> {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard.username.clone()
     }
 
@@ -266,7 +265,7 @@ impl FtpClient {
     ///
     /// 发送 QUIT 命令优雅关闭控制连接,重置所有内部状态。
     pub async fn disconnect(&self) {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.write().await;
         if let Some(mut stream) = guard.stream.take() {
             let _ = stream.quit().await;
         }
@@ -431,10 +430,14 @@ impl Protocol for FtpClient {
         url: &str,
         start: u64,
         end: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>> {
         let url = url.to_owned();
         let this = self.clone();
-        Box::pin(async move { this.download_range(&url, start, end).await })
+        // TODO: FTP 实现仍为整块缓冲,后续改为按 chunk 流式读取 FTP 数据连接
+        Box::pin(async move {
+            let data = this.download_range(&url, start, end).await?;
+            Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+        })
     }
 
     fn download_full(
@@ -473,7 +476,7 @@ mod tests {
     impl FtpClient {
         /// [仅测试] 直接将状态设为 Connected,跳过真实 TCP 连接
         async fn set_connected_for_test(&self, host: &str, port: u16) {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.inner.write().await;
             guard.state = FtpState::Connected;
             guard.host = host.to_string();
             guard.port = port;
@@ -481,7 +484,7 @@ mod tests {
 
         /// [仅测试] 直接将状态设为 Authenticated,跳过真实连接和登录
         async fn set_authenticated_for_test(&self, host: &str, port: u16, user: &str) {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.inner.write().await;
             guard.state = FtpState::Authenticated;
             guard.host = host.to_string();
             guard.port = port;
@@ -490,7 +493,7 @@ mod tests {
 
         /// [仅测试] 直接将状态设为 Disconnected,重置所有字段
         async fn set_disconnected_for_test(&self) {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.inner.write().await;
             guard.state = FtpState::Disconnected;
             guard.stream = None;
             guard.host = String::new();

@@ -544,9 +544,12 @@ impl DownloadTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fragment::FragmentState;
     use bytes::Bytes;
     use qf_core::test_harness::harness::{test_config, test_metadata};
-    use qf_core::traits::Verifier as VerifierTrait;
+    use qf_core::traits::{ByteStream, Verifier as VerifierTrait};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::time::Duration;
 
     /// 辅助函数:创建带 mock 协议和存储的测试任务
     fn make_task(
@@ -1115,5 +1118,485 @@ mod tests {
         let result = task.run().await;
         assert!(result.is_err());
         assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    // ------ 补充: 并发下载失败场景(mock protocol 返回错误) ------
+
+    /// 验证并发分片下载时,协议层返回错误会正确传播
+    #[tokio::test]
+    async fn test_concurrent_download_failure() {
+        let total_size = 400u64;
+        let frag_size = 100u64;
+
+        let meta = test_metadata("fail_conc.bin", total_size);
+
+        // 自定义协议:第 2 次调用返回错误(并发场景中某个分片会失败)
+        struct FailOnSecondProtocol {
+            meta: FileMetadata,
+            call_count: Arc<AtomicU32>,
+            frag_data: Bytes,
+        }
+
+        impl Clone for FailOnSecondProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    call_count: Arc::clone(&self.call_count),
+                    frag_data: self.frag_data.clone(),
+                }
+            }
+        }
+
+        impl Protocol for FailOnSecondProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<FileMetadata>> + Send>>
+            {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                _start: u64,
+                _end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                let count = self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
+                let data = self.frag_data.clone();
+                Box::pin(async move {
+                    if count == 1 {
+                        Err(QfError::Network("分片 1 下载失败".into()))
+                    } else {
+                        Ok(data)
+                    }
+                })
+            }
+
+            fn download_range_stream(
+                &self,
+                url: &str,
+                start: u64,
+                end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>>
+            {
+                let this = self.clone();
+                let url = url.to_owned();
+                Box::pin(async move {
+                    let data = this.download_range(&url, start, end).await?;
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                let data = self.frag_data.clone();
+                Box::pin(async move { Ok(data) })
+            }
+        }
+
+        let protocol: Arc<dyn Protocol> = Arc::new(FailOnSecondProtocol {
+            meta: meta.clone(),
+            call_count: Arc::new(AtomicU32::new(0)),
+            frag_data: Bytes::from(vec![0xAA; frag_size as usize]),
+        });
+
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let sched_config = qf_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+        };
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/fail.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // 执行应失败(分片 1 下载错误)
+        let result = task.execute().await;
+        assert!(result.is_err(), "并发分片下载中任一分片失败应导致整体失败");
+        // 验证错误信息包含网络故障描述
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("分片") || err_msg.contains("网络") || err_msg.contains("失败"),
+            "错误信息应包含故障描述: {err_msg}"
+        );
+    }
+
+    // ------ 补充: 分片重试韧性(第一次失败,第二次成功) ------
+
+    /// 验证:协议首次调用失败后,重试可以成功
+    /// 模拟 DownloadTask 的 run() 失败后,用户重试 run() 成功的场景
+    #[tokio::test]
+    async fn test_fragment_retry_resilience() {
+        struct FailOnceProtocol {
+            meta: FileMetadata,
+            data: Bytes,
+            fail_count: AtomicU32,
+            max_failures: u32,
+        }
+
+        impl Clone for FailOnceProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    data: self.data.clone(),
+                    fail_count: AtomicU32::new(self.fail_count.load(AtomicOrdering::SeqCst)),
+                    max_failures: self.max_failures,
+                }
+            }
+        }
+
+        impl Protocol for FailOnceProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<FileMetadata>> + Send>>
+            {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                _start: u64,
+                _end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                let count = self.fail_count.fetch_add(1, AtomicOrdering::SeqCst);
+                let data = self.data.clone();
+                let max_f = self.max_failures;
+                Box::pin(async move {
+                    if count < max_f {
+                        Err(QfError::Network(format!("模拟故障 #{}", count)))
+                    } else {
+                        Ok(data)
+                    }
+                })
+            }
+
+            fn download_range_stream(
+                &self,
+                url: &str,
+                start: u64,
+                end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>>
+            {
+                let this = self.clone();
+                let url = url.to_owned();
+                Box::pin(async move {
+                    let data = this.download_range(&url, start, end).await?;
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                let data = self.data.clone();
+                Box::pin(async move { Ok(data) })
+            }
+        }
+
+        let total_size = 400u64;
+        let frag_data = Bytes::from(vec![0xBB; total_size as usize]);
+
+        // 使用小分片配置确保产生多个分片
+        let sched_config = qf_core::config::SchedulerConfig {
+            min_fragment_size: 100,
+            max_fragment_size: 200,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+        };
+
+        // 第一次协议:前 2 次调用失败(模拟并发分片场景中部分分片失败)
+        let protocol1: Arc<dyn Protocol> = Arc::new(FailOnceProtocol {
+            meta: test_metadata("retry.bin", total_size),
+            data: frag_data.clone(),
+            fail_count: AtomicU32::new(0),
+            max_failures: 2,
+        });
+
+        let storage1 = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task1 = DownloadTask::new_for_test(
+            "http://example.com/retry.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol1,
+            storage1,
+        );
+        task1.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config.clone());
+
+        task1.probe().await.unwrap();
+        task1.plan().unwrap();
+        task1.prepare_storage().await.unwrap();
+        assert!(
+            task1.fragment_infos().len() > 1,
+            "应产生多个分片以测试并发失败"
+        );
+
+        // 第一次执行:应失败(前 2 次协议调用返回错误)
+        let result1 = task1.execute().await;
+        assert!(result1.is_err(), "首次执行应因协议故障而失败");
+
+        // 第二次协议:所有调用都成功(模拟重试)
+        let protocol2: Arc<dyn Protocol> = Arc::new(FailOnceProtocol {
+            meta: test_metadata("retry.bin", total_size),
+            data: frag_data.clone(),
+            fail_count: AtomicU32::new(0),
+            max_failures: 0, // 不失败
+        });
+
+        let storage2 = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task2 = DownloadTask::new_for_test(
+            "http://example.com/retry.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol2,
+            storage2,
+        );
+        task2.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task2.probe().await.unwrap();
+        task2.plan().unwrap();
+        task2.prepare_storage().await.unwrap();
+
+        // 第二次执行:应成功
+        task2.execute().await.expect("重试执行应成功");
+        assert_eq!(task2.state(), DownloadState::Completed);
+        assert!((task2.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ------ 补充: DownloadTask::progress() 正确性(更多场景) ------
+
+    /// 验证 progress() 在多种分片状态下的准确性
+    #[test]
+    fn test_progress_various_fragment_states() {
+        let protocol = Arc::new(MockProto::new(test_metadata("prog.bin", 300)));
+        let storage = StorageKind::memory();
+        let mut task = make_task(protocol, storage, test_config());
+
+        // 场景 1:无分片 -> 0.0
+        assert!((task.progress() - 0.0).abs() < f64::EPSILON);
+
+        // 场景 2:单分片,下载一半
+        task.fragments = vec![FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 299,
+                size: 300,
+                downloaded: 150,
+                hash: None,
+            },
+            3,
+        )];
+        let p = task.progress();
+        assert!((p - 0.5).abs() < 0.001, "单分片下载一半应为 0.5,实际: {p}");
+
+        // 场景 3:多分片,不同进度
+        task.fragments = vec![
+            FragmentRecord::new(
+                FragmentInfo {
+                    index: 0,
+                    start: 0,
+                    end: 99,
+                    size: 100,
+                    downloaded: 100, // 完成
+                    hash: None,
+                },
+                3,
+            ),
+            FragmentRecord::new(
+                FragmentInfo {
+                    index: 1,
+                    start: 100,
+                    end: 199,
+                    size: 100,
+                    downloaded: 50, // 一半
+                    hash: None,
+                },
+                3,
+            ),
+            FragmentRecord::new(
+                FragmentInfo {
+                    index: 2,
+                    start: 200,
+                    end: 299,
+                    size: 100,
+                    downloaded: 0, // 未开始
+                    hash: None,
+                },
+                3,
+            ),
+        ];
+        let p = task.progress();
+        assert!(
+            (p - 0.5).abs() < 0.001,
+            "三分片(100+50+0)/300 应为 0.5,实际: {p}"
+        );
+
+        // 场景 4:全部完成
+        for frag in &mut task.fragments {
+            frag.info.downloaded = frag.info.size;
+        }
+        let p = task.progress();
+        assert!((p - 1.0).abs() < f64::EPSILON, "全部完成应为 1.0,实际: {p}");
+
+        // 场景 5:状态为 Completed 时强制返回 1.0
+        task.state = DownloadState::Completed;
+        task.fragments[1].info.downloaded = 0; // 人为清零
+        let p = task.progress();
+        assert!(
+            (p - 1.0).abs() < f64::EPSILON,
+            "Completed 状态应强制返回 1.0"
+        );
+    }
+
+    // ------ 补充: FragmentRecord 状态转换(更完整的覆盖) ------
+
+    /// 验证 Pending -> Downloading -> Done 完整路径
+    #[test]
+    fn test_fragment_record_pending_to_done() {
+        let info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: 999,
+            size: 1000,
+            downloaded: 0,
+            hash: None,
+        };
+        let mut record = FragmentRecord::new(info, 3);
+        assert_eq!(record.state, FragmentState::Pending);
+
+        record.start_download();
+        assert_eq!(record.state, FragmentState::Downloading);
+        assert!(!record.is_done());
+        assert!(!record.is_failed());
+
+        record.complete_download(Bytes::from(vec![0u8; 1000]), Duration::from_millis(50));
+        assert_eq!(record.state, FragmentState::Verifying);
+        assert_eq!(record.info.downloaded, 1000);
+        assert!(record.data.is_some());
+        assert!(record.last_duration.is_some());
+
+        record.verify_ok();
+        assert_eq!(record.state, FragmentState::Writing);
+
+        record.write_done();
+        assert_eq!(record.state, FragmentState::Done);
+        assert!(record.is_done());
+    }
+
+    /// 验证 Downloading -> Failed(超过最大重试)
+    #[test]
+    fn test_fragment_record_to_failed() {
+        let info = FragmentInfo {
+            index: 1,
+            start: 1000,
+            end: 1999,
+            size: 1000,
+            downloaded: 0,
+            hash: None,
+        };
+        let mut record = FragmentRecord::new(info, 1); // 最多重试 1 次
+
+        record.start_download();
+        assert_eq!(record.state, FragmentState::Downloading);
+
+        // 第一次失败:可以重试
+        let can_retry = record.mark_failed();
+        assert!(can_retry, "首次失败应可重试");
+        assert_eq!(record.state, FragmentState::Pending);
+        assert_eq!(record.retry_count, 1);
+
+        record.start_download();
+
+        // 第二次失败:超过重试次数
+        let can_retry = record.mark_failed();
+        assert!(!can_retry, "超过重试次数应不可重试");
+        assert_eq!(record.state, FragmentState::Failed);
+        assert!(record.is_failed());
+        assert_eq!(record.retry_count, 2);
+    }
+
+    /// 验证 mark_failed 清除已下载数据
+    #[test]
+    fn test_fragment_mark_failed_clears_data() {
+        let info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: 99,
+            size: 100,
+            downloaded: 0,
+            hash: None,
+        };
+        let mut record = FragmentRecord::new(info, 5);
+
+        record.start_download();
+        record.complete_download(Bytes::from(vec![0xFF; 100]), Duration::from_millis(10));
+        assert!(record.data.is_some(), "下载完成后 data 应存在");
+
+        record.mark_failed();
+        assert!(record.data.is_none(), "失败后 data 应被清除");
+    }
+
+    /// 验证 Verifying 和 Writing 阶段也可以标记失败
+    #[test]
+    fn test_fragment_fail_from_verifying_and_writing() {
+        let info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: 99,
+            size: 100,
+            downloaded: 0,
+            hash: None,
+        };
+
+        // 从 Verifying 阶段失败
+        let mut record = FragmentRecord::new(info.clone(), 3);
+        record.start_download();
+        record.complete_download(Bytes::from_static(b"test"), Duration::from_millis(5));
+        assert_eq!(record.state, FragmentState::Verifying);
+        let can_retry = record.mark_failed();
+        assert!(can_retry);
+        assert_eq!(record.state, FragmentState::Pending);
+
+        // 从 Writing 阶段失败
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download();
+        record.complete_download(Bytes::from_static(b"test"), Duration::from_millis(5));
+        record.verify_ok();
+        assert_eq!(record.state, FragmentState::Writing);
+        let can_retry = record.mark_failed();
+        assert!(can_retry);
+        assert_eq!(record.state, FragmentState::Pending);
     }
 }

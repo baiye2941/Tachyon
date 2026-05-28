@@ -4,9 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>QuantumFetch</title>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
   <style>
-    /* ===== 设计令牌 ===== */
+    /* ======================================================================
+     * 设计令牌 (Design Tokens)
+     * ====================================================================== */
     :root {
       --bg: #0a0a0f;
       --surface: #111118;
@@ -19,10 +20,12 @@
       --warn: #eab308;
       --err: #ef4444;
       --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
     }
 
-    /* ===== 基础重置 ===== */
+    /* ======================================================================
+     * 基础重置
+     * ====================================================================== */
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: var(--font-sans);
@@ -34,17 +37,20 @@
       overflow: hidden;
     }
 
-    /* 等宽数字 */
     .mono { font-family: var(--font-mono); }
 
-    /* ===== 全局网格布局 ===== */
+    /* ======================================================================
+     * 全局网格布局
+     * ====================================================================== */
     .app {
       display: grid;
       grid-template-columns: 200px 1fr auto;
       height: 100vh;
     }
 
-    /* ===== 侧边栏 ===== */
+    /* ======================================================================
+     * 侧边栏
+     * ====================================================================== */
     .sidebar {
       border-right: 1px solid var(--border);
       display: flex;
@@ -111,14 +117,18 @@
       color: var(--text-2);
     }
 
-    /* ===== 主区域 ===== */
+    /* ======================================================================
+     * 主区域
+     * ====================================================================== */
     .main {
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
-    /* ===== 顶部栏 ===== */
+    /* ======================================================================
+     * 顶部栏
+     * ====================================================================== */
     .topbar {
       padding: 12px 20px;
       border-bottom: 1px solid var(--border);
@@ -152,7 +162,9 @@
       font-family: var(--font-sans);
     }
 
-    /* ===== 按钮 ===== */
+    /* ======================================================================
+     * 按钮
+     * ====================================================================== */
     .btn {
       padding: 8px 16px;
       border: none;
@@ -184,14 +196,15 @@
       border-color: var(--text-3);
     }
 
-    /* ===== 内容区 ===== */
+    /* ======================================================================
+     * 内容区
+     * ====================================================================== */
     .content {
       flex: 1;
       overflow-y: auto;
       padding: 16px 20px;
     }
 
-    /* 滚动条 */
     .content::-webkit-scrollbar { width: 4px; }
     .content::-webkit-scrollbar-track { background: transparent; }
     .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -205,7 +218,9 @@
       margin-bottom: 10px;
     }
 
-    /* ===== 视图切换 ===== */
+    /* ======================================================================
+     * 视图切换
+     * ====================================================================== */
     .settings-view,
     .sniffer-view {
       display: none;
@@ -227,7 +242,9 @@
       display: flex;
     }
 
-    /* ===== 下载条目 ===== */
+    /* ======================================================================
+     * 下载条目
+     * ====================================================================== */
     .download-card {
       padding: 14px 0;
       border-bottom: 1px solid var(--border);
@@ -298,7 +315,9 @@
       50% { opacity: 0.3; }
     }
 
-    /* ===== 进度条 ===== */
+    /* ======================================================================
+     * 进度条
+     * ====================================================================== */
     .progress-bar {
       height: 3px;
       background: var(--border);
@@ -316,7 +335,9 @@
     .progress-fill.pending { background: var(--text-3); }
     .progress-fill.cancelled { background: var(--text-3); }
 
-    /* ===== 卡片详情行 ===== */
+    /* ======================================================================
+     * 卡片详情行
+     * ====================================================================== */
     .card-details {
       display: flex;
       align-items: center;
@@ -341,7 +362,9 @@
       font-family: var(--font-mono);
     }
 
-    /* ===== 操作按钮 ===== */
+    /* ======================================================================
+     * 操作按钮
+     * ====================================================================== */
     .card-actions {
       display: flex;
       gap: 6px;
@@ -383,7 +406,9 @@
       border-color: rgba(239,68,68,0.3);
     }
 
-    /* ===== 空状态 ===== */
+    /* ======================================================================
+     * 空状态
+     * ====================================================================== */
     .empty-state {
       flex: 1;
       display: flex;
@@ -411,7 +436,9 @@
       color: var(--text-3);
     }
 
-    /* ===== 右侧详情面板 ===== */
+    /* ======================================================================
+     * 右侧详情面板
+     * ====================================================================== */
     .detail-panel {
       width: 260px;
       border-left: 1px solid var(--border);
@@ -448,11 +475,10 @@
       font-family: var(--font-mono);
       font-size: 11px;
     }
-    .speed-value {
-      color: var(--accent);
-    }
 
-    /* ===== 分片可视化 ===== */
+    /* ======================================================================
+     * 分片可视化
+     * ====================================================================== */
     .fragment-grid {
       display: flex;
       gap: 2px;
@@ -469,7 +495,9 @@
     .fragment-block.active { background: var(--accent); animation: breathe 1.5s ease-in-out infinite; }
     .fragment-block.pending { background: var(--border); }
 
-    /* ===== 设置面板 ===== */
+    /* ======================================================================
+     * 设置面板
+     * ====================================================================== */
     .setting-group {
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -519,7 +547,9 @@
       font-family: var(--font-sans);
     }
 
-    /* ===== Toggle 开关 ===== */
+    /* ======================================================================
+     * Toggle 开关
+     * ====================================================================== */
     .toggle {
       width: 40px;
       height: 22px;
@@ -549,7 +579,9 @@
       transform: translateX(18px);
     }
 
-    /* ===== 嗅探面板 ===== */
+    /* ======================================================================
+     * 嗅探面板
+     * ====================================================================== */
     .sniffer-header {
       display: flex;
       align-items: center;
@@ -665,29 +697,29 @@
 <body>
   <div class="app">
     <!-- 侧边栏 -->
-    <div class="sidebar">
+    <div class="sidebar" role="navigation" aria-label="主导航">
       <div class="sidebar-logo">QuantumFetch</div>
       <div class="sidebar-nav">
-        <div class="nav-item active" data-view="downloads">
+        <div class="nav-item active" data-view="downloads" role="button" tabindex="0" aria-current="page" aria-label="下载列表">
           <span class="nav-icon">
-            <svg viewBox="0 0 20 20"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
           </span>
           <span>下载列表</span>
         </div>
-        <div class="nav-item" data-view="sniffer">
+        <div class="nav-item" data-view="sniffer" role="button" tabindex="0" aria-label="资源嗅探">
           <span class="nav-icon">
-            <svg viewBox="0 0 20 20"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
           </span>
           <span>资源嗅探</span>
         </div>
-        <div class="nav-item" data-view="settings">
+        <div class="nav-item" data-view="settings" role="button" tabindex="0" aria-label="设置">
           <span class="nav-icon">
-            <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 1.5v2m0 13v2M18.5 10h-2m-13 0h-2M15.66 4.34l-1.42 1.42M5.76 14.24l-1.42 1.42m11.32 0l-1.42-1.42M5.76 5.76L4.34 4.34"/></svg>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3"/><path d="M10 1.5v2m0 13v2M18.5 10h-2m-13 0h-2M15.66 4.34l-1.42 1.42M5.76 14.24l-1.42 1.42m11.32 0l-1.42-1.42M5.76 5.76L4.34 4.34"/></svg>
           </span>
           <span>设置</span>
         </div>
       </div>
-      <div class="sidebar-stats">
+      <div class="sidebar-stats" aria-live="polite" aria-label="全局统计">
         <div>活跃连接 <span class="mono" id="stat-connections">0</span></div>
         <div>总速度 <span class="mono" id="stat-speed">0 B/s</span></div>
         <div>队列任务 <span class="mono" id="stat-queue">0</span></div>
@@ -699,22 +731,22 @@
       <!-- 顶部栏 -->
       <div class="topbar">
         <div class="url-bar">
-          <input type="text" id="url-input" placeholder="粘贴下载链接,支持 HTTP/HTTPS/FTP/QUIC..." />
-          <button class="btn btn-primary" id="btn-download">开始下载</button>
+          <input type="text" id="url-input" placeholder="粘贴下载链接,支持 HTTP/HTTPS/FTP/QUIC..." aria-label="下载链接输入" />
+          <button class="btn btn-primary" id="btn-download" aria-label="开始下载">开始下载</button>
         </div>
-        <button class="btn btn-ghost" id="btn-pause-all">全部暂停</button>
+        <button class="btn btn-ghost" id="btn-pause-all" aria-label="暂停所有下载任务">全部暂停</button>
       </div>
 
       <!-- 内容区 -->
       <div class="content" id="content">
         <!-- 下载列表视图 -->
-        <div class="downloads-view active" id="view-downloads">
+        <div class="downloads-view active" id="view-downloads" role="list" aria-label="下载任务列表">
           <div class="section-title">下载中</div>
           <div id="active-downloads"></div>
           <div class="section-title" style="margin-top: 20px;">已完成</div>
           <div id="completed-downloads"></div>
           <div class="empty-state" id="empty-state">
-            <svg class="empty-icon" viewBox="0 0 20 20"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
+            <svg class="empty-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4 17h12"/></svg>
             <div class="empty-text">暂无下载任务</div>
             <div class="empty-hint">在上方输入链接开始下载</div>
           </div>
@@ -725,12 +757,12 @@
           <div class="sniffer-header">
             <h2>资源嗅探</h2>
             <span class="sniffer-status active" id="sniffer-status">监听中</span>
-            <button class="btn btn-ghost" onclick="toggleSniffer()" style="margin-left: auto;">暂停监听</button>
+            <button class="btn btn-ghost" id="btn-toggle-sniffer" style="margin-left: auto;" aria-label="暂停或恢复嗅探监听">暂停监听</button>
           </div>
           <div class="section-title">检测到的资源</div>
-          <div class="sniffer-list" id="sniffer-list"></div>
+          <div class="sniffer-list" id="sniffer-list" role="list" aria-label="嗅探到的资源列表"></div>
           <div class="empty-state" id="sniffer-empty" style="min-height: 300px;">
-            <svg class="empty-icon" viewBox="0 0 20 20"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
+            <svg class="empty-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4C6 4 3 7.5 3 10.5S6 17 10 17s7-3.5 7-6.5S14 4 10 4z"/><circle cx="10" cy="10.5" r="2.5"/></svg>
             <div class="empty-text">正在监听浏览器流量...</div>
             <div class="empty-hint">浏览包含视频、音频或文档的网页时,资源将自动显示在这里</div>
           </div>
@@ -743,41 +775,41 @@
             <div class="setting-group-title">下载设置</div>
             <div class="setting-row">
               <span class="setting-label">下载目录</span>
-              <input class="setting-input" id="cfg-download-dir" value="C:\Users\Downloads" />
+              <input class="setting-input" id="cfg-download-dir" value="C:\Users\Downloads" aria-label="下载目录" />
             </div>
             <div class="setting-row">
               <span class="setting-label">最大并发任务数</span>
-              <input class="setting-input" type="number" id="cfg-max-tasks" value="3" min="1" max="10" style="width: 80px;" />
+              <input class="setting-input" type="number" id="cfg-max-tasks" value="3" min="1" max="10" style="width: 80px;" aria-label="最大并发任务数" />
             </div>
             <div class="setting-row">
               <span class="setting-label">每任务最大分片数</span>
-              <input class="setting-input" type="number" id="cfg-max-fragments" value="16" min="1" max="64" style="width: 80px;" />
+              <input class="setting-input" type="number" id="cfg-max-fragments" value="16" min="1" max="64" style="width: 80px;" aria-label="每任务最大分片数" />
             </div>
             <div class="setting-row">
               <span class="setting-label">每主机最大连接数</span>
-              <input class="setting-input" type="number" id="cfg-max-connections" value="16" min="1" max="32" style="width: 80px;" />
+              <input class="setting-input" type="number" id="cfg-max-connections" value="16" min="1" max="32" style="width: 80px;" aria-label="每主机最大连接数" />
             </div>
           </div>
           <div class="setting-group">
             <div class="setting-group-title">协议设置</div>
             <div class="setting-row">
               <span class="setting-label">启用 QUIC 传输</span>
-              <div class="toggle on" id="cfg-quic" onclick="this.classList.toggle('on')"></div>
+              <div class="toggle on" id="cfg-quic" role="switch" aria-checked="true" aria-label="启用 QUIC 传输" tabindex="0"></div>
             </div>
             <div class="setting-row">
               <span class="setting-label">启用 HTTP/2 多路复用</span>
-              <div class="toggle on" id="cfg-http2" onclick="this.classList.toggle('on')"></div>
+              <div class="toggle on" id="cfg-http2" role="switch" aria-checked="true" aria-label="启用 HTTP/2 多路复用" tabindex="0"></div>
             </div>
           </div>
           <div class="setting-group">
             <div class="setting-group-title">安全设置</div>
             <div class="setting-row">
               <span class="setting-label">下载后校验完整性</span>
-              <div class="toggle on" id="cfg-verify" onclick="this.classList.toggle('on')"></div>
+              <div class="toggle on" id="cfg-verify" role="switch" aria-checked="true" aria-label="下载后校验完整性" tabindex="0"></div>
             </div>
             <div class="setting-row">
               <span class="setting-label">校验算法</span>
-              <select class="setting-input" id="cfg-hash" style="width: 120px;">
+              <select class="setting-input" id="cfg-hash" style="width: 120px;" aria-label="校验算法">
                 <option value="blake3" selected>Blake3</option>
                 <option value="sha256">SHA-256</option>
               </select>
@@ -787,11 +819,11 @@
             <div class="setting-group-title">浏览器嗅探</div>
             <div class="setting-row">
               <span class="setting-label">启用资源嗅探</span>
-              <div class="toggle on" id="cfg-sniffer" onclick="this.classList.toggle('on')"></div>
+              <div class="toggle on" id="cfg-sniffer" role="switch" aria-checked="true" aria-label="启用资源嗅探" tabindex="0"></div>
             </div>
             <div class="setting-row">
               <span class="setting-label">最小文件大小</span>
-              <select class="setting-input" id="cfg-min-size" style="width: 120px;">
+              <select class="setting-input" id="cfg-min-size" style="width: 120px;" aria-label="最小文件大小">
                 <option value="0">不限制</option>
                 <option value="1024" selected>1 KB</option>
                 <option value="102400">100 KB</option>
@@ -800,14 +832,14 @@
             </div>
           </div>
           <div style="margin-top: 16px;">
-            <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+            <button class="btn btn-primary" id="btn-save-settings" aria-label="保存设置">保存设置</button>
           </div>
         </div>
       </div>
     </div>
 
     <!-- 右侧详情面板 -->
-    <div class="detail-panel" id="detail-panel">
+    <div class="detail-panel" id="detail-panel" role="complementary" aria-label="下载详情">
       <div class="panel-title" id="panel-filename">--</div>
       <div class="panel-row">
         <span class="panel-label">文件大小</span>
@@ -838,618 +870,900 @@
         <div class="fragment-grid" id="fragment-grid"></div>
       </div>
     </div>
-  </div>
+</div>
 
-  <script>
-    // ======================================================================
-    // 安全: HTML 转义函数 - 防止 XSS 注入
-    // ======================================================================
+<script>
+'use strict';
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+/* ======================================================================
+ * 第一部分: 安全工具函数
+ * ====================================================================== */
+
+/** HTML 正文转义 - 防止 XSS 注入 */
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** HTML 属性值转义 */
+function escapeAttr(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/* ======================================================================
+ * 第二部分: 格式化工具函数
+ * ====================================================================== */
+
+/** 字节数格式化为人类可读大小 */
+function formatSize(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return (bytes / Math.pow(k, i)).toFixed(i > 1 ? 1 : 0) + ' ' + sizes[i];
+}
+
+/** 字节速率格式化 */
+function formatSpeed(bytes) {
+  return formatSize(bytes) + '/s';
+}
+
+/** 计算百分比进度 */
+function getProgress(dl) {
+  return dl.size > 0 ? Math.round((dl.downloaded / dl.size) * 100) : 0;
+}
+
+/** 从文件名推断扩展名标签 */
+function guessExtFromName(name) {
+  const parts = name.split('.');
+  return parts.length > 1 ? parts.pop().toUpperCase().slice(0, 4) : 'FILE';
+}
+
+/** 从 URL 提取文件名 */
+function extractFileName(url) {
+  try {
+    const u = new URL(url);
+    const seg = u.pathname.split('/').pop();
+    return seg || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** 状态码映射为中文文本 */
+function statusText(status) {
+  return {
+    downloading: '下载中',
+    completed: '已完成',
+    paused: '已暂停',
+    failed: '失败',
+    pending: '等待中',
+    cancelled: '已取消',
+  }[status] || status;
+}
+
+/* ======================================================================
+ * 第三部分: SVG 图标常量
+ * ====================================================================== */
+
+const ICON_PAUSE = '<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2" y="1" width="3" height="10" rx="0.5"/><rect x="7" y="1" width="3" height="10" rx="0.5"/></svg>';
+const ICON_RESUME = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1v10l8-5z"/></svg>';
+const ICON_CANCEL = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
+const ICON_DELETE = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3h9M4.5 3V1.5h3V3M3 3v7.5h6V3"/><path d="M5 5.5v3M7 5.5v3"/></svg>';
+
+/* ======================================================================
+ * 第四部分: DOM 缓存引用
+ *
+ * 缓存频繁访问的 DOM 元素引用,避免重复 getElementById 调用。
+ * ====================================================================== */
+
+const dom = {
+  urlInput: null,
+  activeDownloads: null,
+  completedDownloads: null,
+  emptyState: null,
+  statSpeed: null,
+  statConnections: null,
+  statQueue: null,
+  detailPanel: null,
+  panelFilename: null,
+  panelSize: null,
+  panelDownloaded: null,
+  panelSpeed: null,
+  panelFragments: null,
+  panelProtocol: null,
+  panelStatus: null,
+  fragmentGrid: null,
+};
+
+function cacheDomRefs() {
+  dom.urlInput = document.getElementById('url-input');
+  dom.activeDownloads = document.getElementById('active-downloads');
+  dom.completedDownloads = document.getElementById('completed-downloads');
+  dom.emptyState = document.getElementById('empty-state');
+  dom.statSpeed = document.getElementById('stat-speed');
+  dom.statConnections = document.getElementById('stat-connections');
+  dom.statQueue = document.getElementById('stat-queue');
+  dom.detailPanel = document.getElementById('detail-panel');
+  dom.panelFilename = document.getElementById('panel-filename');
+  dom.panelSize = document.getElementById('panel-size');
+  dom.panelDownloaded = document.getElementById('panel-downloaded');
+  dom.panelSpeed = document.getElementById('panel-speed');
+  dom.panelFragments = document.getElementById('panel-fragments');
+  dom.panelProtocol = document.getElementById('panel-protocol');
+  dom.panelStatus = document.getElementById('panel-status');
+  dom.fragmentGrid = document.getElementById('fragment-grid');
+}
+
+/* ======================================================================
+ * 第五部分: Tauri API 桥接层
+ * ====================================================================== */
+
+const isTauri = window.__TAURI__ !== undefined;
+
+/**
+ * 调用 Tauri 后端命令。
+ * Tauri 环境下调用真实命令,浏览器环境下返回模拟数据。
+ */
+async function invoke(cmd, args) {
+  if (isTauri) {
+    return await window.__TAURI__.core.invoke(cmd, args || {});
+  }
+  return mockInvoke(cmd, args || {});
+}
+
+/* ======================================================================
+ * 第六部分: 浏览器预览模拟层 (仅非 Tauri 环境)
+ * ====================================================================== */
+
+let mockTasks = [];
+let mockIdCounter = 1;
+
+function mockGuessExt(name) {
+  const parts = name.split('.');
+  return parts.length > 1 ? parts.pop().toUpperCase().slice(0, 4) : 'FILE';
+}
+
+async function mockInvoke(cmd, args) {
+  switch (cmd) {
+    case 'get_app_info':
+      return { version: '0.1.0', name: 'QuantumFetch' };
+
+    case 'supported_protocols':
+      return ['HTTP', 'HTTPS', 'FTP', 'QUIC'];
+
+    case 'create_task': {
+      const id = 'mock-' + String(mockIdCounter++).padStart(4, '0');
+      mockTasks.push({
+        id,
+        url: args.url,
+        file_name: extractFileName(args.url),
+        file_size: 0,
+        downloaded: 0,
+        speed: 0,
+        status: 'pending',
+        progress: 0.0,
+        fragments_total: 0,
+        fragments_done: 0,
+        created_at: new Date().toISOString(),
+      });
+      return id;
     }
 
-    function escapeAttr(str) {
-      if (!str) return '';
-      return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    case 'get_task_list':
+      return mockTasks.map(t => ({ ...t }));
+
+    case 'get_task_detail': {
+      const t = mockTasks.find(t => t.id === args.taskId);
+      if (!t) throw new Error('任务不存在: ' + args.taskId);
+      return { ...t };
     }
 
-    // ======================================================================
-    // Tauri API 桥接层 - 自动检测环境
-    // ======================================================================
-
-    const isTauri = window.__TAURI__ !== undefined;
-
-    /**
-     * 调用 Tauri 后端命令。
-     * Tauri 环境下调用真实命令,浏览器环境下返回模拟数据。
-     */
-    async function invoke(cmd, args = {}) {
-      if (isTauri) {
-        return await window.__TAURI__.core.invoke(cmd, args);
+    case 'pause_task': {
+      const t = mockTasks.find(t => t.id === args.taskId);
+      if (!t) throw new Error('任务不存在: ' + args.taskId);
+      if (t.status === 'pending' || t.status === 'downloading') {
+        t.status = 'paused';
+        t.speed = 0;
+      } else {
+        throw new Error("当前状态 '" + t.status + "' 不允许暂停");
       }
-      return mockInvoke(cmd, args);
+      return null;
     }
 
-    // ======================================================================
-    // 浏览器预览模拟层 (mockInvoke)
-    // ======================================================================
-
-    /** 模拟任务存储 */
-    let mockTasks = [];
-    /** 模拟 UUID 计数器 */
-    let mockIdCounter = 1;
-
-    /** 从 URL 提取文件名 */
-    function extractFileName(url) {
-      try {
-        const u = new URL(url);
-        const seg = u.pathname.split('/').pop();
-        return seg || 'unknown';
-      } catch {
-        return 'unknown';
+    case 'resume_task': {
+      const t = mockTasks.find(t => t.id === args.taskId);
+      if (!t) throw new Error('任务不存在: ' + args.taskId);
+      if (t.status === 'paused') {
+        t.status = 'downloading';
+      } else {
+        throw new Error("仅暂停状态可恢复,当前状态: '" + t.status + "'");
       }
+      return null;
     }
 
-    /** 从文件名提取扩展名 */
-    function guessExt(name) {
-      const parts = name.split('.');
-      return parts.length > 1 ? parts.pop().toUpperCase().slice(0, 4) : 'FILE';
-    }
-
-    /**
-     * 模拟 Tauri 命令调用 - 仅在非 Tauri 浏览器环境下使用。
-     * 复刻后端 commands.rs 的业务逻辑。
-     */
-    async function mockInvoke(cmd, args = {}) {
-      switch (cmd) {
-        case 'get_app_info':
-          return { version: '0.1.0', name: 'QuantumFetch' };
-
-        case 'supported_protocols':
-          return ['HTTP', 'HTTPS', 'FTP', 'QUIC'];
-
-        case 'create_task': {
-          const id = 'mock-' + String(mockIdCounter++).padStart(4, '0');
-          mockTasks.push({
-            id,
-            url: args.url,
-            file_name: extractFileName(args.url),
-            file_size: 0,
-            downloaded: 0,
-            speed: 0,
-            status: 'pending',
-            progress: 0.0,
-            fragments_total: 0,
-            fragments_done: 0,
-            created_at: new Date().toISOString(),
-          });
-          return id;
-        }
-
-        case 'get_task_list':
-          return [...mockTasks];
-
-        case 'get_task_detail': {
-          const t = mockTasks.find(t => t.id === args.taskId);
-          if (!t) throw new Error('任务不存在: ' + args.taskId);
-          return { ...t };
-        }
-
-        case 'pause_task': {
-          const t = mockTasks.find(t => t.id === args.taskId);
-          if (!t) throw new Error('任务不存在: ' + args.taskId);
-          if (t.status === 'pending' || t.status === 'downloading') {
-            t.status = 'paused';
-            t.speed = 0;
-          } else {
-            throw new Error("当前状态 '" + t.status + "' 不允许暂停");
-          }
-          return null;
-        }
-
-        case 'resume_task': {
-          const t = mockTasks.find(t => t.id === args.taskId);
-          if (!t) throw new Error('任务不存在: ' + args.taskId);
-          if (t.status === 'paused') {
-            t.status = 'downloading';
-          } else {
-            throw new Error("仅暂停状态可恢复,当前状态: '" + t.status + "'");
-          }
-          return null;
-        }
-
-        case 'cancel_task': {
-          const t = mockTasks.find(t => t.id === args.taskId);
-          if (!t) throw new Error('任务不存在: ' + args.taskId);
-          if (t.status === 'completed' || t.status === 'cancelled') {
-            throw new Error('任务已' + t.status + ',无法取消');
-          }
-          t.status = 'cancelled';
-          t.speed = 0;
-          return null;
-        }
-
-        case 'delete_task': {
-          const idx = mockTasks.findIndex(t => t.id === args.taskId);
-          if (idx === -1) throw new Error('任务不存在: ' + args.taskId);
-          const t = mockTasks[idx];
-          if (t.status === 'completed' || t.status === 'cancelled' || t.status === 'failed') {
-            mockTasks.splice(idx, 1);
-          } else {
-            throw new Error("当前状态 '" + t.status + "' 不允许删除,请先取消任务");
-          }
-          return null;
-        }
-
-        case 'get_config':
-          return {
-            download_dir: 'C:\\Users\\Downloads',
-            max_concurrent_tasks: 5,
-            max_concurrent_fragments: 16,
-            max_connections_per_host: 16,
-            enable_quic: false,
-            verify_checksum: true,
-          };
-
-        case 'update_config':
-          // 模拟保存成功
-          return null;
-
-        default:
-          console.warn('未知命令:', cmd);
-          return null;
+    case 'cancel_task': {
+      const t = mockTasks.find(t => t.id === args.taskId);
+      if (!t) throw new Error('任务不存在: ' + args.taskId);
+      if (t.status === 'completed' || t.status === 'cancelled') {
+        throw new Error('任务已' + t.status + ',无法取消');
       }
+      t.status = 'cancelled';
+      t.speed = 0;
+      return null;
     }
 
-    // ======================================================================
-    // 下载数据与状态
-    // ======================================================================
-
-    const downloads = [];
-    let selectedId = null;
-
-    // ======================================================================
-    // 格式化工具
-    // ======================================================================
-
-    function formatSize(bytes) {
-      if (!bytes || bytes === 0) return '0 B';
-      const k = 1024;
-      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
-      return (bytes / Math.pow(k, i)).toFixed(i > 1 ? 1 : 0) + ' ' + sizes[i];
+    case 'delete_task': {
+      const idx = mockTasks.findIndex(t => t.id === args.taskId);
+      if (idx === -1) throw new Error('任务不存在: ' + args.taskId);
+      const t = mockTasks[idx];
+      if (t.status === 'completed' || t.status === 'cancelled' || t.status === 'failed') {
+        mockTasks.splice(idx, 1);
+      } else {
+        throw new Error("当前状态 '" + t.status + "' 不允许删除,请先取消任务");
+      }
+      return null;
     }
 
-    function formatSpeed(bytes) {
-      return formatSize(bytes) + '/s';
-    }
-
-    function getProgress(dl) {
-      return dl.size > 0 ? Math.round((dl.downloaded / dl.size) * 100) : 0;
-    }
-
-    /**
-     * 从文件名推断扩展名标签
-     */
-    function guessExtFromName(name) {
-      const parts = name.split('.');
-      return parts.length > 1 ? parts.pop().toUpperCase().slice(0, 4) : 'FILE';
-    }
-
-    /**
-     * 状态码映射为中文文本
-     */
-    function statusText(status) {
+    case 'get_config':
       return {
-        downloading: '下载中',
-        completed: '已完成',
-        paused: '已暂停',
-        failed: '失败',
-        pending: '等待中',
-        cancelled: '已取消',
-      }[status] || status;
+        download_dir: 'C:\\Users\\Downloads',
+        max_concurrent_tasks: 5,
+        max_concurrent_fragments: 16,
+        max_connections_per_host: 16,
+        enable_quic: false,
+        verify_checksum: true,
+      };
+
+    case 'update_config':
+      return null;
+
+    case 'subscribe_progress':
+      // 浏览器预览模式下无实际事件推送,静默忽略
+      return null;
+
+    default:
+      console.warn('未知命令:', cmd);
+      return null;
+  }
+}
+
+/* ======================================================================
+ * 第七部分: 应用状态
+ * ====================================================================== */
+
+const downloads = [];
+let selectedId = null;
+
+/* ======================================================================
+ * 第八部分: requestAnimationFrame 批量渲染
+ *
+ * 将多次状态变更合并到单次 DOM 更新中,避免中间状态的重复重绘。
+ * ====================================================================== */
+
+let renderScheduled = false;
+
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    renderList();
+    refreshDetailPanel();
+  });
+}
+
+/* ======================================================================
+ * 第九部分: 增量 DOM 更新
+ *
+ * 对比现有 DOM 和新数据,只更新变化的元素属性,
+ * 避免每次刷新都重建全部 DOM (innerHTML = ...)。
+ * 仅在任务数量变化时才重建卡片 DOM。
+ * ====================================================================== */
+
+/** 上一次渲染时的卡片 ID 集合,用于检测结构变化 */
+let prevActiveIds = '';
+let prevCompletedIds = '';
+
+/**
+ * 根据任务状态生成操作按钮 HTML
+ */
+function buildActionsHtml(dl) {
+  const safeId = escapeAttr(dl.id);
+  let html = '';
+  if (dl.status === 'downloading' || dl.status === 'pending') {
+    html += '<button class="btn-card-action" aria-label="暂停下载 ' + escapeAttr(dl.name) + '" onclick="event.stopPropagation(); taskPause(\'' + safeId + '\')">' + ICON_PAUSE + '暂停</button>';
+  } else if (dl.status === 'paused') {
+    html += '<button class="btn-card-action" aria-label="恢复下载 ' + escapeAttr(dl.name) + '" onclick="event.stopPropagation(); taskResume(\'' + safeId + '\')">' + ICON_RESUME + '恢复</button>';
+  }
+  if (dl.status !== 'completed' && dl.status !== 'cancelled') {
+    html += '<button class="btn-card-action action-danger" aria-label="取消下载 ' + escapeAttr(dl.name) + '" onclick="event.stopPropagation(); taskCancel(\'' + safeId + '\')">' + ICON_CANCEL + '取消</button>';
+  }
+  if (dl.status === 'completed' || dl.status === 'cancelled' || dl.status === 'failed') {
+    html += '<button class="btn-card-action action-danger" aria-label="删除任务 ' + escapeAttr(dl.name) + '" onclick="event.stopPropagation(); taskDelete(\'' + safeId + '\')">' + ICON_DELETE + '删除</button>';
+  }
+  return html;
+}
+
+/**
+ * 渲染单张卡片的完整 HTML
+ */
+function renderCard(dl) {
+  const progress = getProgress(dl);
+  const safeId = escapeAttr(dl.id);
+  const safeName = escapeHtml(dl.name);
+  const safeExt = escapeHtml(dl.ext);
+  const safeStatusClass = 'status-' + escapeAttr(dl.status);
+  const safeProgressClass = escapeAttr(dl.status);
+  const actionsHtml = buildActionsHtml(dl);
+
+  return '<div class="download-card" data-id="' + safeId + '" role="listitem" onclick="selectDownload(\'' + safeId + '\')">'
+    + '<div class="card-header">'
+    + '<div class="card-name">' + safeName + '<span class="ext">' + safeExt + '</span></div>'
+    + '<span class="card-status ' + safeStatusClass + '">' + escapeHtml(statusText(dl.status)) + '</span>'
+    + '</div>'
+    + '<div class="progress-bar" role="progressbar" aria-valuenow="' + progress + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + safeName + ' 下载进度">'
+    + '<div class="progress-fill ' + safeProgressClass + '" style="width: ' + progress + '%"></div>'
+    + '</div>'
+    + '<div class="card-details">'
+    + '<div class="detail-item"><span class="detail-label">进度</span><span class="mono">' + progress + '%</span></div>'
+    + '<div class="detail-item"><span class="detail-label">大小</span><span class="mono">' + escapeHtml(formatSize(dl.size)) + '</span></div>'
+    + (dl.speed > 0 ? '<div class="detail-item"><span class="detail-label">速度</span><span class="speed-value">' + escapeHtml(formatSpeed(dl.speed)) + '</span></div>' : '')
+    + '<div class="detail-item"><span class="detail-label">分片</span><span class="mono">' + dl.fragmentsDone + '/' + dl.fragments + '</span></div>'
+    + '</div>'
+    + '<div class="card-actions">' + actionsHtml + '</div>'
+    + '</div>';
+}
+
+/**
+ * 更新单张已存在卡片的增量属性 (避免重建 DOM)
+ */
+function updateCardInPlace(card, dl) {
+  const progress = getProgress(dl);
+
+  // 更新状态文本
+  const statusEl = card.querySelector('.card-status');
+  if (statusEl) {
+    const newClass = 'card-status status-' + dl.status;
+    if (statusEl.className !== newClass) {
+      statusEl.className = newClass;
     }
-
-    // ======================================================================
-    // SVG 图标常量
-    // ======================================================================
-
-    const ICON_PAUSE = '<svg viewBox="0 0 12 12"><rect x="2" y="1" width="3" height="10" rx="0.5"/><rect x="7" y="1" width="3" height="10" rx="0.5"/></svg>';
-    const ICON_RESUME = '<svg viewBox="0 0 12 12"><path d="M3 1v10l8-5z"/></svg>';
-    const ICON_CANCEL = '<svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
-    const ICON_DELETE = '<svg viewBox="0 0 12 12"><path d="M1.5 3h9M4.5 3V1.5h3V3M3 3v7.5h6V3"/><path d="M5 5.5v3M7 5.5v3"/></svg>';
-
-    // ======================================================================
-    // 渲染
-    // ======================================================================
-
-    function renderCard(dl) {
-      const progress = getProgress(dl);
-
-      const safeId = escapeAttr(dl.id);
-      const safeName = escapeHtml(dl.name);
-      const safeExt = escapeHtml(dl.ext);
-      const safeStatusClass = 'status-' + escapeAttr(dl.status);
-      const safeProgressClass = escapeAttr(dl.status);
-
-      // 根据任务状态生成操作按钮
-      let actionsHtml = '';
-      if (dl.status === 'downloading' || dl.status === 'pending') {
-        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskPause(\'' + safeId + '\')">' + ICON_PAUSE + '暂停</button>';
-      } else if (dl.status === 'paused') {
-        actionsHtml += '<button class="btn-card-action" onclick="event.stopPropagation(); taskResume(\'' + safeId + '\')">' + ICON_RESUME + '恢复</button>';
-      }
-      // 活跃任务可取消
-      if (dl.status !== 'completed' && dl.status !== 'cancelled') {
-        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskCancel(\'' + safeId + '\')">' + ICON_CANCEL + '取消</button>';
-      }
-      // 非活跃任务可删除
-      if (dl.status === 'completed' || dl.status === 'cancelled' || dl.status === 'failed') {
-        actionsHtml += '<button class="btn-card-action action-danger" onclick="event.stopPropagation(); taskDelete(\'' + safeId + '\')">' + ICON_DELETE + '删除</button>';
-      }
-
-      return `
-        <div class="download-card" data-id="${safeId}" onclick="selectDownload('${safeId}')">
-          <div class="card-header">
-            <div class="card-name">
-              ${safeName}
-              <span class="ext">${safeExt}</span>
-            </div>
-            <span class="card-status ${safeStatusClass}">${escapeHtml(statusText(dl.status))}</span>
-          </div>
-          <div class="progress-bar">
-            <div class="progress-fill ${safeProgressClass}" style="width: ${progress}%"></div>
-          </div>
-          <div class="card-details">
-            <div class="detail-item">
-              <span class="detail-label">进度</span>
-              <span class="mono">${progress}%</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">大小</span>
-              <span class="mono">${escapeHtml(formatSize(dl.size))}</span>
-            </div>
-            ${dl.speed > 0 ? '<div class="detail-item"><span class="detail-label">速度</span><span class="speed-value">' + escapeHtml(formatSpeed(dl.speed)) + '</span></div>' : ''}
-            <div class="detail-item">
-              <span class="detail-label">分片</span>
-              <span class="mono">${dl.fragmentsDone}/${dl.fragments}</span>
-            </div>
-          </div>
-          <div class="card-actions">${actionsHtml}</div>
-        </div>
-      `;
+    const newText = statusText(dl.status);
+    if (statusEl.textContent !== newText) {
+      statusEl.textContent = newText;
     }
+  }
 
-    function renderList() {
-      const active = downloads.filter(d => d.status === 'downloading' || d.status === 'paused' || d.status === 'pending');
-      const completed = downloads.filter(d => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled');
-      document.getElementById('active-downloads').innerHTML = active.map(renderCard).join('');
-      document.getElementById('completed-downloads').innerHTML = completed.map(renderCard).join('');
-      document.getElementById('empty-state').style.display = downloads.length === 0 ? 'flex' : 'none';
-
-      // 更新侧边栏统计
-      const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0);
-      document.getElementById('stat-speed').textContent = formatSpeed(totalSpeed);
-      document.getElementById('stat-connections').textContent = downloads.filter(d => d.status === 'downloading').length;
-      document.getElementById('stat-queue').textContent = active.length;
+  // 更新进度条
+  const progressFill = card.querySelector('.progress-fill');
+  if (progressFill) {
+    const newClass = 'progress-fill ' + dl.status;
+    if (progressFill.className !== newClass) {
+      progressFill.className = newClass;
     }
+    progressFill.style.width = progress + '%';
+  }
+  const progressBar = card.querySelector('.progress-bar');
+  if (progressBar) {
+    progressBar.setAttribute('aria-valuenow', String(progress));
+  }
 
-    function selectDownload(id) {
-      selectedId = id;
-      const dl = downloads.find(d => d.id === id);
-      if (!dl) return;
-      const panel = document.getElementById('detail-panel');
-      panel.style.display = 'block';
-      document.getElementById('panel-filename').textContent = dl.name;
-      document.getElementById('panel-size').textContent = formatSize(dl.size);
-      document.getElementById('panel-downloaded').textContent = formatSize(dl.downloaded);
-      document.getElementById('panel-speed').textContent = dl.speed > 0 ? formatSpeed(dl.speed) : '--';
-      document.getElementById('panel-fragments').textContent = dl.fragments;
-      document.getElementById('panel-protocol').textContent = dl.protocol;
-      document.getElementById('panel-status').textContent = statusText(dl.status);
+  // 更新详情数值 (通过 data 属性定位)
+  const progressVal = card.querySelector('[data-field="progress"]');
+  if (progressVal) progressVal.textContent = progress + '%';
+  const sizeVal = card.querySelector('[data-field="size"]');
+  if (sizeVal) sizeVal.textContent = formatSize(dl.size);
+  const speedItem = card.querySelector('[data-field="speed-item"]');
+  if (dl.speed > 0) {
+    if (!speedItem) {
+      // 速度行不存在,需要重建详情区
+      rebuildCardDetails(card, dl, progress);
+    } else {
+      const speedVal = card.querySelector('[data-field="speed"]');
+      if (speedVal) speedVal.textContent = formatSpeed(dl.speed);
+    }
+  } else if (speedItem) {
+    speedItem.remove();
+  }
+  const fragmentsVal = card.querySelector('[data-field="fragments"]');
+  if (fragmentsVal) fragmentsVal.textContent = dl.fragmentsDone + '/' + dl.fragments;
 
-      // 分片可视化
-      const grid = document.getElementById('fragment-grid');
-      grid.innerHTML = '';
-      for (let i = 0; i < dl.fragments; i++) {
-        const block = document.createElement('div');
-        block.className = 'fragment-block ' + (i < dl.fragmentsDone ? 'done' : (i === dl.fragmentsDone && dl.status === 'downloading' ? 'active' : 'pending'));
-        grid.appendChild(block);
-      }
+  // 更新操作按钮
+  const actionsEl = card.querySelector('.card-actions');
+  if (actionsEl) {
+    actionsEl.innerHTML = buildActionsHtml(dl);
+  }
+}
 
-      // 高亮选中卡片
-      document.querySelectorAll('.download-card').forEach(card => {
-        card.style.borderColor = card.dataset.id === id ? 'var(--accent)' : '';
+/** 重建卡片详情行 */
+function rebuildCardDetails(card, dl, progress) {
+  const detailsEl = card.querySelector('.card-details');
+  if (!detailsEl) return;
+  detailsEl.innerHTML = '<div class="detail-item"><span class="detail-label">进度</span><span class="mono" data-field="progress">' + progress + '%</span></div>'
+    + '<div class="detail-item"><span class="detail-label">大小</span><span class="mono" data-field="size">' + escapeHtml(formatSize(dl.size)) + '</span></div>'
+    + (dl.speed > 0 ? '<div class="detail-item" data-field="speed-item"><span class="detail-label">速度</span><span class="speed-value" data-field="speed">' + escapeHtml(formatSpeed(dl.speed)) + '</span></div>' : '')
+    + '<div class="detail-item"><span class="detail-label">分片</span><span class="mono" data-field="fragments">' + dl.fragmentsDone + '/' + dl.fragments + '</span></div>';
+}
+
+/**
+ * 渲染带 data-field 属性的卡片 HTML (支持后续增量更新)
+ */
+function renderCardWithFields(dl) {
+  const progress = getProgress(dl);
+  const safeId = escapeAttr(dl.id);
+  const safeName = escapeHtml(dl.name);
+  const safeExt = escapeHtml(dl.ext);
+  const safeStatusClass = 'status-' + escapeAttr(dl.status);
+  const safeProgressClass = escapeAttr(dl.status);
+  const actionsHtml = buildActionsHtml(dl);
+
+  return '<div class="download-card" data-id="' + safeId + '" role="listitem" onclick="selectDownload(\'' + safeId + '\')">'
+    + '<div class="card-header">'
+    + '<div class="card-name">' + safeName + '<span class="ext">' + safeExt + '</span></div>'
+    + '<span class="card-status ' + safeStatusClass + '">' + escapeHtml(statusText(dl.status)) + '</span>'
+    + '</div>'
+    + '<div class="progress-bar" role="progressbar" aria-valuenow="' + progress + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + safeName + ' 下载进度">'
+    + '<div class="progress-fill ' + safeProgressClass + '" style="width: ' + progress + '%"></div>'
+    + '</div>'
+    + '<div class="card-details">'
+    + '<div class="detail-item"><span class="detail-label">进度</span><span class="mono" data-field="progress">' + progress + '%</span></div>'
+    + '<div class="detail-item"><span class="detail-label">大小</span><span class="mono" data-field="size">' + escapeHtml(formatSize(dl.size)) + '</span></div>'
+    + (dl.speed > 0 ? '<div class="detail-item" data-field="speed-item"><span class="detail-label">速度</span><span class="speed-value" data-field="speed">' + escapeHtml(formatSpeed(dl.speed)) + '</span></div>' : '')
+    + '<div class="detail-item"><span class="detail-label">分片</span><span class="mono" data-field="fragments">' + dl.fragmentsDone + '/' + dl.fragments + '</span></div>'
+    + '</div>'
+    + '<div class="card-actions">' + actionsHtml + '</div>'
+    + '</div>';
+}
+
+/**
+ * 增量渲染列表: 仅在任务数量变化时重建 DOM,否则就地更新属性
+ */
+function renderList() {
+  const active = downloads.filter(d => d.status === 'downloading' || d.status === 'paused' || d.status === 'pending');
+  const completed = downloads.filter(d => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled');
+
+  const activeIds = active.map(d => d.id).join(',');
+  const completedIds = completed.map(d => d.id).join(',');
+
+  // 检测是否需要完整重建 (任务新增/删除)
+  if (activeIds !== prevActiveIds) {
+    dom.activeDownloads.innerHTML = active.map(renderCardWithFields).join('');
+    prevActiveIds = activeIds;
+  } else {
+    // 仅更新已有卡片的属性
+    const cards = dom.activeDownloads.querySelectorAll('.download-card');
+    for (let i = 0; i < active.length; i++) {
+      updateCardInPlace(cards[i], active[i]);
+    }
+  }
+
+  if (completedIds !== prevCompletedIds) {
+    dom.completedDownloads.innerHTML = completed.map(renderCardWithFields).join('');
+    prevCompletedIds = completedIds;
+  } else {
+    const cards = dom.completedDownloads.querySelectorAll('.download-card');
+    for (let i = 0; i < completed.length; i++) {
+      updateCardInPlace(cards[i], completed[i]);
+    }
+  }
+
+  // 空状态
+  dom.emptyState.style.display = downloads.length === 0 ? 'flex' : 'none';
+
+  // 侧边栏统计
+  const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0);
+  dom.statSpeed.textContent = formatSpeed(totalSpeed);
+  dom.statConnections.textContent = String(downloads.filter(d => d.status === 'downloading').length);
+  dom.statQueue.textContent = String(active.length);
+}
+
+/* ======================================================================
+ * 第十部分: 详情面板
+ * ====================================================================== */
+
+function selectDownload(id) {
+  selectedId = id;
+  refreshDetailPanel();
+
+  // 高亮选中卡片
+  document.querySelectorAll('.download-card').forEach(card => {
+    card.style.borderColor = card.dataset.id === id ? 'var(--accent)' : '';
+  });
+}
+
+/** 刷新详情面板内容 (增量) */
+function refreshDetailPanel() {
+  if (!selectedId) return;
+  const dl = downloads.find(d => d.id === selectedId);
+  if (!dl) {
+    dom.detailPanel.style.display = 'none';
+    selectedId = null;
+    return;
+  }
+
+  dom.detailPanel.style.display = 'block';
+  dom.panelFilename.textContent = dl.name;
+  dom.panelSize.textContent = formatSize(dl.size);
+  dom.panelDownloaded.textContent = formatSize(dl.downloaded);
+  dom.panelSpeed.textContent = dl.speed > 0 ? formatSpeed(dl.speed) : '--';
+  dom.panelFragments.textContent = String(dl.fragments);
+  dom.panelProtocol.textContent = dl.protocol;
+  dom.panelStatus.textContent = statusText(dl.status);
+
+  // 分片可视化 (仅在分片数量变化时重建)
+  const grid = dom.fragmentGrid;
+  const existing = grid.children.length;
+  if (existing !== dl.fragments) {
+    grid.innerHTML = '';
+    for (let i = 0; i < dl.fragments; i++) {
+      const block = document.createElement('div');
+      block.className = 'fragment-block';
+      grid.appendChild(block);
+    }
+  }
+  // 更新分片状态
+  for (let i = 0; i < dl.fragments; i++) {
+    const block = grid.children[i];
+    const desiredClass = 'fragment-block ' + (i < dl.fragmentsDone ? 'done' : (i === dl.fragmentsDone && dl.status === 'downloading' ? 'active' : 'pending'));
+    if (block.className !== desiredClass) {
+      block.className = desiredClass;
+    }
+  }
+}
+
+/* ======================================================================
+ * 第十一部分: Tauri 后端交互
+ * ====================================================================== */
+
+/** 创建下载任务 */
+async function startDownload() {
+  const url = dom.urlInput.value.trim();
+  if (!url) return;
+  try {
+    await invoke('create_task', { url });
+    await refreshTaskList();
+    dom.urlInput.value = '';
+  } catch (e) {
+    console.error('创建任务失败:', e);
+  }
+}
+
+/**
+ * 从后端刷新任务列表,同步到前端 downloads 数组。
+ * 使用 scheduleRender() 合并同一帧内的多次调用。
+ */
+async function refreshTaskList() {
+  try {
+    const tasks = await invoke('get_task_list');
+    downloads.length = 0;
+    if (Array.isArray(tasks)) {
+      tasks.forEach(t => {
+        downloads.push({
+          id: t.id,
+          name: t.file_name,
+          ext: guessExtFromName(t.file_name),
+          url: t.url,
+          size: t.file_size || 0,
+          downloaded: t.downloaded || 0,
+          speed: t.speed || 0,
+          status: t.status,
+          fragments: t.fragments_total || 0,
+          fragmentsDone: t.fragments_done || 0,
+          protocol: 'HTTPS',
+        });
       });
     }
+    scheduleRender();
+  } catch (e) {
+    console.error('刷新任务列表失败:', e);
+  }
+}
 
-    // ======================================================================
-    // Tauri 命令交互
-    // ======================================================================
+/** 暂停任务 */
+async function taskPause(taskId) {
+  try {
+    await invoke('pause_task', { taskId });
+    await refreshTaskList();
+  } catch (e) {
+    console.error('暂停任务失败:', e);
+  }
+}
 
-    /**
-     * 创建下载任务 - 调用 Tauri create_task 命令
-     */
-    async function startDownload() {
-      const url = document.getElementById('url-input').value.trim();
-      if (!url) return;
-      try {
-        const taskId = await invoke('create_task', { url });
-        // 刷新任务列表以获取后端最新数据
-        await refreshTaskList();
-        document.getElementById('url-input').value = '';
-      } catch (e) {
-        console.error('创建任务失败:', e);
+/** 恢复任务 */
+async function taskResume(taskId) {
+  try {
+    await invoke('resume_task', { taskId });
+    await refreshTaskList();
+  } catch (e) {
+    console.error('恢复任务失败:', e);
+  }
+}
+
+/** 取消任务 */
+async function taskCancel(taskId) {
+  try {
+    await invoke('cancel_task', { taskId });
+    await refreshTaskList();
+  } catch (e) {
+    console.error('取消任务失败:', e);
+  }
+}
+
+/** 删除任务 */
+async function taskDelete(taskId) {
+  try {
+    await invoke('delete_task', { taskId });
+    await refreshTaskList();
+  } catch (e) {
+    console.error('删除任务失败:', e);
+  }
+}
+
+/** 暂停所有活跃任务 */
+async function pauseAll() {
+  const active = downloads.filter(d => d.status === 'downloading' || d.status === 'pending');
+  const promises = active.map(dl => invoke('pause_task', { taskId: dl.id }).catch(e => console.error('暂停任务 ' + dl.id + ' 失败:', e)));
+  await Promise.allSettled(promises);
+  await refreshTaskList();
+}
+
+/* ======================================================================
+ * 第十二部分: 设置面板
+ * ====================================================================== */
+
+/** 设置 toggle 开关状态 */
+function setToggle(id, value) {
+  const el = document.getElementById(id);
+  if (value) {
+    el.classList.add('on');
+    el.setAttribute('aria-checked', 'true');
+  } else {
+    el.classList.remove('on');
+    el.setAttribute('aria-checked', 'false');
+  }
+}
+
+/** 获取 toggle 开关状态 */
+function getToggle(id) {
+  return document.getElementById(id).classList.contains('on');
+}
+
+/** 从后端加载配置并填充设置面板 */
+async function loadSettings() {
+  try {
+    const config = await invoke('get_config');
+    document.getElementById('cfg-download-dir').value = config.download_dir || '';
+    document.getElementById('cfg-max-tasks').value = config.max_concurrent_tasks || 5;
+    document.getElementById('cfg-max-fragments').value = config.max_concurrent_fragments || 16;
+    document.getElementById('cfg-max-connections').value = config.max_connections_per_host || 16;
+    setToggle('cfg-quic', config.enable_quic);
+    setToggle('cfg-verify', config.verify_checksum);
+  } catch (e) {
+    console.error('加载设置失败:', e);
+  }
+}
+
+/** 收集设置面板的值并保存到后端 */
+async function saveSettings() {
+  const config = {
+    download_dir: document.getElementById('cfg-download-dir').value,
+    max_concurrent_tasks: parseInt(document.getElementById('cfg-max-tasks').value) || 5,
+    max_concurrent_fragments: parseInt(document.getElementById('cfg-max-fragments').value) || 16,
+    max_connections_per_host: parseInt(document.getElementById('cfg-max-connections').value) || 16,
+    enable_quic: getToggle('cfg-quic'),
+    verify_checksum: getToggle('cfg-verify'),
+  };
+  try {
+    await invoke('update_config', { config });
+    const btn = document.getElementById('btn-save-settings');
+    btn.textContent = '已保存';
+    btn.style.background = '#22c55e';
+    setTimeout(() => { btn.textContent = '保存设置'; btn.style.background = ''; }, 1500);
+  } catch (e) {
+    console.error('保存设置失败:', e);
+  }
+}
+
+/* ======================================================================
+ * 第十三部分: 嗅探面板
+ * ====================================================================== */
+
+const snifferItems = [
+  { type: 'video', name: 'lecture-recording.mp4', url: 'https://cdn.edu/lectures/2024/lecture-recording.mp4?token=abc123', size: 524288000 },
+  { type: 'video', name: 'tutorial.webm', url: 'https://videos.example.com/tutorial.webm', size: 104857600 },
+  { type: 'audio', name: 'podcast-ep42.mp3', url: 'https://podcast.fm/ep42.mp3', size: 52428800 },
+  { type: 'document', name: 'whitepaper.pdf', url: 'https://docs.example.com/whitepaper.pdf', size: 2097152 },
+  { type: 'archive', name: 'dataset-v2.zip', url: 'https://data.example.com/dataset-v2.zip', size: 1073741824 },
+  { type: 'executable', name: 'app-setup.exe', url: 'https://download.example.com/app-setup.exe', size: 104857600 },
+];
+let snifferActive = true;
+
+function renderSniffer() {
+  const list = document.getElementById('sniffer-list');
+  const empty = document.getElementById('sniffer-empty');
+  if (!snifferActive || snifferItems.length === 0) {
+    list.innerHTML = '';
+    empty.style.display = 'flex';
+    return;
+  }
+  empty.style.display = 'none';
+  list.innerHTML = snifferItems.map((item, i) =>
+    '<div class="sniffer-item" role="listitem">'
+    + '<span class="sniffer-type type-' + escapeAttr(item.type) + '">' + escapeHtml(item.type) + '</span>'
+    + '<div class="sniffer-info">'
+    + '<div class="sniffer-name">' + escapeHtml(item.name) + '</div>'
+    + '<div class="sniffer-url">' + escapeHtml(item.url) + '</div>'
+    + '</div>'
+    + '<span class="sniffer-size mono">' + escapeHtml(formatSize(item.size)) + '</span>'
+    + '<div class="sniffer-actions">'
+    + '<button class="btn-sm btn-download-sm" aria-label="下载 ' + escapeAttr(item.name) + '" onclick="downloadSnifferItem(' + i + ')">下载</button>'
+    + '</div>'
+    + '</div>'
+  ).join('');
+}
+
+async function downloadSnifferItem(index) {
+  const item = snifferItems[index];
+  try {
+    await invoke('create_task', { url: item.url });
+    snifferItems.splice(index, 1);
+    renderSniffer();
+    await refreshTaskList();
+    document.querySelector('[data-view="downloads"]').click();
+  } catch (e) {
+    console.error('从嗅探面板创建任务失败:', e);
+  }
+}
+
+function toggleSniffer() {
+  snifferActive = !snifferActive;
+  const status = document.getElementById('sniffer-status');
+  status.textContent = snifferActive ? '监听中' : '已暂停';
+  status.className = 'sniffer-status ' + (snifferActive ? 'active' : 'inactive');
+  renderSniffer();
+}
+
+/* ======================================================================
+ * 第十四部分: 事件绑定
+ * ====================================================================== */
+
+function bindEvents() {
+  // 下载操作
+  document.getElementById('btn-download').addEventListener('click', startDownload);
+  dom.urlInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') startDownload();
+  });
+  document.getElementById('btn-pause-all').addEventListener('click', pauseAll);
+
+  // 保存设置
+  document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+
+  // 嗅探切换
+  document.getElementById('btn-toggle-sniffer').addEventListener('click', toggleSniffer);
+
+  // Toggle 开关支持键盘操作 (Space / Enter)
+  document.querySelectorAll('.toggle[role="switch"]').forEach(toggle => {
+    toggle.addEventListener('keydown', e => {
+      if (e.key === ' ' || e.key === 'Enter') {
+        e.preventDefault();
+        toggle.classList.toggle('on');
+        const isOn = toggle.classList.contains('on');
+        toggle.setAttribute('aria-checked', isOn ? 'true' : 'false');
       }
-    }
+    });
+    toggle.addEventListener('click', () => {
+      const isOn = toggle.classList.contains('on');
+      toggle.setAttribute('aria-checked', isOn ? 'true' : 'false');
+    });
+  });
 
-    /**
-     * 从后端刷新任务列表,同步到前端 downloads 数组
-     */
-    async function refreshTaskList() {
-      try {
-        const tasks = await invoke('get_task_list');
-        // 将后端 TaskInfo 转换为前端格式
-        downloads.length = 0;
-        if (Array.isArray(tasks)) {
-          tasks.forEach(t => {
-            downloads.push({
-              id: t.id,
-              name: t.file_name,
-              ext: guessExtFromName(t.file_name),
-              url: t.url,
-              size: t.file_size || 0,
-              downloaded: t.downloaded || 0,
-              speed: t.speed || 0,
-              status: t.status,
-              fragments: t.fragments_total || 0,
-              fragmentsDone: t.fragments_done || 0,
-              protocol: 'HTTPS',
-            });
-          });
+  // 视图切换
+  document.querySelectorAll('.nav-item').forEach(item => {
+    const handler = () => {
+      const view = item.dataset.view;
+      document.querySelectorAll('.nav-item').forEach(i => {
+        i.classList.remove('active');
+        i.removeAttribute('aria-current');
+      });
+      item.classList.add('active');
+      item.setAttribute('aria-current', 'page');
+      document.querySelectorAll('.downloads-view, .sniffer-view, .settings-view').forEach(v => v.classList.remove('active'));
+      document.getElementById('view-' + view).classList.add('active');
+      document.querySelector('.topbar').style.display = view === 'downloads' ? 'flex' : 'none';
+      if (view !== 'downloads') dom.detailPanel.style.display = 'none';
+      if (view === 'settings') loadSettings();
+    };
+    item.addEventListener('click', handler);
+    item.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        handler();
+      }
+    });
+  });
+}
+
+/* ======================================================================
+ * 第十五部分: 事件驱动更新 + 兜底轮询
+ *
+ * 优先使用 Tauri 事件系统接收后端推送;当后端尚未实现事件推送时,
+ * 回退到低频率轮询 (10 秒一次) 作为保底。
+ * ====================================================================== */
+
+const POLL_INTERVAL_MS = 10000; // 兜底轮询间隔: 10 秒
+
+function setupUpdateSource() {
+  if (isTauri && window.__TAURI__.event) {
+    // 监听后端推送的进度更新事件(task_fn 通过 watch channel 触发)
+    window.__TAURI__.event.listen('progress-update', (event) => {
+      const progressMap = event.payload;
+      if (!progressMap || typeof progressMap !== 'object') return;
+
+      // 增量合并:仅更新有变化的任务,避免全量替换
+      let changed = false;
+      for (const [taskId, p] of Object.entries(progressMap)) {
+        const dl = downloads.find(d => d.id === taskId);
+        if (dl) {
+          if (dl.downloaded !== p.downloaded || dl.speed !== p.speed ||
+              dl.status !== p.status || dl.progress !== p.progress) {
+            dl.downloaded = p.downloaded || 0;
+            dl.speed = p.speed || 0;
+            dl.status = p.status || dl.status;
+            dl.fragmentsDone = p.fragmentsDone || dl.fragmentsDone;
+            changed = true;
+          }
+        } else {
+          // 新任务:需要完整刷新列表
+          refreshTaskList();
+          return;
         }
+      }
+      if (changed) {
         renderList();
         // 如果当前有选中任务,刷新详情面板
-        if (selectedId) {
-          const exists = downloads.find(d => d.id === selectedId);
-          if (exists) {
-            selectDownload(selectedId);
-          } else {
-            // 选中的任务已被删除,隐藏面板
-            document.getElementById('detail-panel').style.display = 'none';
-            selectedId = null;
-          }
-        }
-      } catch (e) {
-        console.error('刷新任务列表失败:', e);
-      }
-    }
-
-    /**
-     * 暂停任务
-     */
-    async function taskPause(taskId) {
-      try {
-        await invoke('pause_task', { taskId });
-        await refreshTaskList();
-      } catch (e) {
-        console.error('暂停任务失败:', e);
-      }
-    }
-
-    /**
-     * 恢复任务
-     */
-    async function taskResume(taskId) {
-      try {
-        await invoke('resume_task', { taskId });
-        await refreshTaskList();
-      } catch (e) {
-        console.error('恢复任务失败:', e);
-      }
-    }
-
-    /**
-     * 取消任务
-     */
-    async function taskCancel(taskId) {
-      try {
-        await invoke('cancel_task', { taskId });
-        await refreshTaskList();
-      } catch (e) {
-        console.error('取消任务失败:', e);
-      }
-    }
-
-    /**
-     * 删除任务
-     */
-    async function taskDelete(taskId) {
-      try {
-        await invoke('delete_task', { taskId });
-        await refreshTaskList();
-      } catch (e) {
-        console.error('删除任务失败:', e);
-      }
-    }
-
-    /**
-     * 全部暂停 - 暂停所有活跃任务
-     */
-    async function pauseAll() {
-      const active = downloads.filter(d => d.status === 'downloading' || d.status === 'pending');
-      for (const dl of active) {
-        try {
-          await invoke('pause_task', { taskId: dl.id });
-        } catch (e) {
-          console.error('暂停任务 ' + dl.id + ' 失败:', e);
+        if (selectedId && progressMap[selectedId]) {
+          selectDownload(selectedId);
         }
       }
-      await refreshTaskList();
-    }
-
-    // ======================================================================
-    // 设置面板
-    // ======================================================================
-
-    /**
-     * 从后端加载配置并填充设置面板
-     */
-    async function loadSettings() {
-      try {
-        const config = await invoke('get_config');
-        document.getElementById('cfg-download-dir').value = config.download_dir || '';
-        document.getElementById('cfg-max-tasks').value = config.max_concurrent_tasks || 5;
-        document.getElementById('cfg-max-fragments').value = config.max_concurrent_fragments || 16;
-        document.getElementById('cfg-max-connections').value = config.max_connections_per_host || 16;
-        // 开关状态
-        setToggle('cfg-quic', config.enable_quic);
-        setToggle('cfg-verify', config.verify_checksum);
-      } catch (e) {
-        console.error('加载设置失败:', e);
-      }
-    }
-
-    /**
-     * 收集设置面板的值并保存到后端
-     */
-    async function saveSettings() {
-      const config = {
-        download_dir: document.getElementById('cfg-download-dir').value,
-        max_concurrent_tasks: parseInt(document.getElementById('cfg-max-tasks').value) || 5,
-        max_concurrent_fragments: parseInt(document.getElementById('cfg-max-fragments').value) || 16,
-        max_connections_per_host: parseInt(document.getElementById('cfg-max-connections').value) || 16,
-        enable_quic: getToggle('cfg-quic'),
-        verify_checksum: getToggle('cfg-verify'),
-      };
-      try {
-        await invoke('update_config', { config });
-        // 保存成功的视觉反馈
-        const btn = event.target;
-        btn.textContent = '已保存';
-        btn.style.background = '#22c55e';
-        setTimeout(() => { btn.textContent = '保存设置'; btn.style.background = ''; }, 1500);
-      } catch (e) {
-        console.error('保存设置失败:', e);
-      }
-    }
-
-    /** 设置 toggle 开关状态 */
-    function setToggle(id, value) {
-      const el = document.getElementById(id);
-      if (value) {
-        el.classList.add('on');
-      } else {
-        el.classList.remove('on');
-      }
-    }
-
-    /** 获取 toggle 开关状态 */
-    function getToggle(id) {
-      return document.getElementById(id).classList.contains('on');
-    }
-
-    // ======================================================================
-    // 嗅探面板
-    // ======================================================================
-
-    const snifferItems = [
-      { type: 'video', name: 'lecture-recording.mp4', url: 'https://cdn.edu/lectures/2024/lecture-recording.mp4?token=abc123', size: 524288000 },
-      { type: 'video', name: 'tutorial.webm', url: 'https://videos.example.com/tutorial.webm', size: 104857600 },
-      { type: 'audio', name: 'podcast-ep42.mp3', url: 'https://podcast.fm/ep42.mp3', size: 52428800 },
-      { type: 'document', name: 'whitepaper.pdf', url: 'https://docs.example.com/whitepaper.pdf', size: 2097152 },
-      { type: 'archive', name: 'dataset-v2.zip', url: 'https://data.example.com/dataset-v2.zip', size: 1073741824 },
-      { type: 'executable', name: 'app-setup.exe', url: 'https://download.example.com/app-setup.exe', size: 104857600 },
-    ];
-    let snifferActive = true;
-
-    function renderSniffer() {
-      const list = document.getElementById('sniffer-list');
-      const empty = document.getElementById('sniffer-empty');
-      if (!snifferActive || snifferItems.length === 0) {
-        list.innerHTML = '';
-        empty.style.display = 'flex';
-        return;
-      }
-      empty.style.display = 'none';
-      list.innerHTML = snifferItems.map((item, i) => `
-        <div class="sniffer-item">
-          <span class="sniffer-type type-${escapeAttr(item.type)}">${escapeHtml(item.type)}</span>
-          <div class="sniffer-info">
-            <div class="sniffer-name">${escapeHtml(item.name)}</div>
-            <div class="sniffer-url">${escapeHtml(item.url)}</div>
-          </div>
-          <span class="sniffer-size mono">${escapeHtml(formatSize(item.size))}</span>
-          <div class="sniffer-actions">
-            <button class="btn-sm btn-download-sm" onclick="downloadSnifferItem(${i})">下载</button>
-          </div>
-        </div>
-      `).join('');
-    }
-
-    async function downloadSnifferItem(index) {
-      const item = snifferItems[index];
-      try {
-        await invoke('create_task', { url: item.url });
-        snifferItems.splice(index, 1);
-        renderSniffer();
-        await refreshTaskList();
-        // 切换到下载视图
-        document.querySelector('[data-view="downloads"]').click();
-      } catch (e) {
-        console.error('从嗅探面板创建任务失败:', e);
-      }
-    }
-
-    function toggleSniffer() {
-      snifferActive = !snifferActive;
-      const status = document.getElementById('sniffer-status');
-      status.textContent = snifferActive ? '监听中' : '已暂停';
-      status.className = 'sniffer-status ' + (snifferActive ? 'active' : 'inactive');
-      renderSniffer();
-    }
-
-    // ======================================================================
-    // 事件绑定
-    // ======================================================================
-
-    document.getElementById('btn-download').addEventListener('click', startDownload);
-    document.getElementById('url-input').addEventListener('keydown', e => {
-      if (e.key === 'Enter') startDownload();
-    });
-    document.getElementById('btn-pause-all').addEventListener('click', pauseAll);
-
-    // 视图切换
-    document.querySelectorAll('.nav-item').forEach(item => {
-      item.addEventListener('click', () => {
-        const view = item.dataset.view;
-        document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
-        item.classList.add('active');
-        document.querySelectorAll('.downloads-view, .sniffer-view, .settings-view').forEach(v => v.classList.remove('active'));
-        document.getElementById('view-' + view).classList.add('active');
-        // 顶部栏只在下载视图显示
-        document.querySelector('.topbar').style.display = view === 'downloads' ? 'flex' : 'none';
-        // 详情面板只在下载视图显示
-        if (view !== 'downloads') document.getElementById('detail-panel').style.display = 'none';
-        // 切换到设置视图时加载最新配置
-        if (view === 'settings') loadSettings();
-      });
     });
 
-    // ======================================================================
-    // 初始化
-    // ======================================================================
+    // 通知后端启动进度推送
+    invoke('subscribe_progress').catch(e => {
+      console.warn('[QuantumFetch] 订阅进度事件失败:', e);
+    });
 
-    async function init() {
-      await loadSettings();
-      await refreshTaskList();
-      renderSniffer();
-      // 定时从后端刷新活跃任务状态
-      setInterval(refreshTaskList, 2000);
-    }
-    init();
-  </script>
+    console.log('[QuantumFetch] 已注册 Tauri 事件监听,兜底轮询间隔: ' + POLL_INTERVAL_MS + 'ms');
+  }
+
+  // 兜底轮询 (无论是否有事件系统都启用,保证数据最终一致)
+  setInterval(refreshTaskList, POLL_INTERVAL_MS);
+}
+
+/* ======================================================================
+ * 第十六部分: 初始化
+ * ====================================================================== */
+
+async function init() {
+  cacheDomRefs();
+  bindEvents();
+  await loadSettings();
+  await refreshTaskList();
+  renderSniffer();
+  setupUpdateSource();
+}
+
+init();
+</script>
 </body>
 </html>

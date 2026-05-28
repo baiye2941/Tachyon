@@ -65,6 +65,9 @@ bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# 并发
+crossbeam-queue = "0.3"
+
 # 网络
 url = "2"
 

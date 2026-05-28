@@ -8,11 +8,13 @@
 use std::pin::Pin;
 
 use bytes::Bytes;
+use futures::StreamExt;
 use qf_core::filename::extract_filename;
 use qf_core::traits::Protocol;
 use qf_core::types::FileMetadata;
-use qf_core::{QfError, QfResult};
+use qf_core::{ByteStream, QfError, QfResult};
 use reqwest::Client;
+use tracing::{debug, info, warn};
 
 /// HTTP/HTTPS 协议客户端
 pub struct HttpClient {
@@ -52,14 +54,15 @@ impl Protocol for HttpClient {
         let client = self.client.clone();
         let url = url.to_owned();
         Box::pin(async move {
-            let response = client
-                .head(&url)
-                .send()
-                .await
-                .map_err(|e| QfError::Network(format!("HEAD 请求失败: {e}")))?;
+            debug!(url = %url, "HTTP HEAD 探测开始");
+            let response = client.head(&url).send().await.map_err(|e| {
+                warn!(url = %url, error = %e, "HEAD 请求连接失败");
+                QfError::Network(format!("HEAD 请求失败: {e}"))
+            })?;
 
             let status = response.status();
             if !status.is_success() {
+                warn!(url = %url, status = %status, "HEAD 请求返回非成功状态码");
                 return Err(QfError::Protocol(format!("HTTP {status}")));
             }
 
@@ -90,6 +93,14 @@ impl Protocol for HttpClient {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.to_string());
 
+            info!(
+                url = %url,
+                file_size = ?file_size,
+                supports_range = supports_range,
+                content_type = ?content_type,
+                "HTTP HEAD 探测完成"
+            );
+
             Ok(FileMetadata {
                 file_name,
                 file_size,
@@ -111,27 +122,42 @@ impl Protocol for HttpClient {
         let url = url.to_owned();
         Box::pin(async move {
             let range = format!("bytes={start}-{end}");
+            debug!(url = %url, start, end, "HTTP Range 请求开始");
             let response = client
                 .get(&url)
-                .header("Range", range)
+                .header("Range", &range)
                 .send()
                 .await
-                .map_err(|e| QfError::Network(format!("Range 请求失败: {e}")))?;
+                .map_err(|e| {
+                    warn!(url = %url, start, end, error = %e, "Range 请求连接失败");
+                    QfError::Network(format!("Range 请求失败: {e}"))
+                })?;
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
+                warn!(url = %url, "服务器忽略 Range 头,返回 HTTP 200");
                 return Err(QfError::Protocol(
                     "服务器忽略 Range 头,返回 HTTP 200(不支持分片下载)".into(),
                 ));
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                warn!(url = %url, status = %status, "Range 请求返回非预期状态码");
                 return Err(QfError::Protocol(format!("HTTP {status}")));
             }
 
-            response
+            let bytes = response
                 .bytes()
                 .await
-                .map_err(|e| QfError::Network(format!("读取响应体失败: {e}")))
+                .map_err(|e| QfError::Network(format!("读取响应体失败: {e}")))?;
+
+            info!(
+                url = %url,
+                start,
+                end,
+                bytes = bytes.len(),
+                "HTTP Range 下载完成"
+            );
+            Ok(bytes)
         })
     }
 
@@ -140,32 +166,43 @@ impl Protocol for HttpClient {
         url: &str,
         start: u64,
         end: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>> {
         let client = self.client.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let range = format!("bytes={start}-{end}");
+            debug!(url = %url, start, end, "HTTP 流式 Range 请求开始");
             let response = client
                 .get(&url)
                 .header("Range", range)
                 .send()
                 .await
-                .map_err(|e| QfError::Network(format!("Range 请求失败: {e}")))?;
+                .map_err(|e| {
+                    warn!(url = %url, start, end, error = %e, "流式 Range 请求连接失败");
+                    QfError::Network(format!("Range 请求失败: {e}"))
+                })?;
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
+                warn!(url = %url, "服务器忽略 Range 头,返回 HTTP 200");
                 return Err(QfError::Protocol(
                     "服务器忽略 Range 头,返回 HTTP 200(不支持分片下载)".into(),
                 ));
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                warn!(url = %url, status = %status, "流式 Range 请求返回非预期状态码");
                 return Err(QfError::Protocol(format!("HTTP {status}")));
             }
 
-            response
-                .bytes()
-                .await
-                .map_err(|e| QfError::Network(format!("读取响应体失败: {e}")))
+            info!(url = %url, start, end, "HTTP 流式 Range 响应头已接收,开始流式传输");
+
+            // 使用 bytes_stream() 获取真正的数据流,
+            // 调用方通过 StreamExt::next() 逐块消费,峰值内存仅包含单个 chunk
+            let stream = response.bytes_stream().map(|result| {
+                result.map_err(|e| QfError::Network(format!("读取响应流数据失败: {e}")))
+            });
+
+            Ok(Box::pin(stream) as ByteStream)
         })
     }
 

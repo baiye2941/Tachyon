@@ -93,10 +93,15 @@ pub mod harness {
             url: &str,
             start: u64,
             end: u64,
-        ) -> Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+        ) -> Pin<Box<dyn std::future::Future<Output = QfResult<crate::traits::ByteStream>> + Send>>
+        {
             let this = self.clone();
             let url = url.to_owned();
-            Box::pin(async move { this.download_range(&url, start, end).await })
+            Box::pin(async move {
+                let data = this.download_range(&url, start, end).await?;
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
+                    as crate::traits::ByteStream)
+            })
         }
 
         fn download_full(

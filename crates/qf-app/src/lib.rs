@@ -7,7 +7,7 @@ pub use commands::AppError;
 use commands::{
     AppState, add_sniffer_filter, cancel_task, create_task, delete_task, get_app_info, get_config,
     get_download_progress, get_sniffer_resources, get_task_detail, get_task_list, pause_task,
-    resume_task, supported_protocols, update_config,
+    resume_task, subscribe_progress, supported_protocols, update_config,
 };
 
 /// 构建并运行 Tauri 应用
@@ -28,6 +28,7 @@ pub fn run() {
             get_task_detail,
             // 进度查询
             get_download_progress,
+            subscribe_progress,
             // 嗅探
             get_sniffer_resources,
             add_sniffer_filter,

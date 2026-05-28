@@ -1,21 +1,29 @@
 //! QuantumFetch 持久化存储层
 //!
-//! 嵌入式 KV 存储,用于持久化:
+//! 嵌入式 KV 存储，用于持久化:
 //! - 下载任务状态
 //! - 分片进度
 //! - 配置
 //! - DHT 节点
 //!
-//! 实现基于文件系统的简单 KV 存储,无需外部数据库依赖。
-//! 每个 key 对应一个 JSON 文件,存放在指定目录下。
+//! 实现基于文件系统的简单 KV 存储，无需外部数据库依赖。
+//! 每个 key 对应一个 JSON 文件，存放在指定目录下。
+//!
+//! ## 模块结构
+//!
+//! - [`store`]: `Store` trait 抽象、`MemoryStore`（内存）、`FileStore`（文件）
+//! - [`kv`]: `KvStore` 旧接口（向后兼容，内部委托给 `FileStore`）
+//! - [`recovery`][]: 断点续传恢复管理（`TaskSnapshot`、`RecoveryManager`）
 
 pub mod kv;
 pub mod recovery;
+pub mod store;
 
 pub use kv::KvStore;
-pub use recovery::RecoveryManager;
+pub use recovery::{RecoveryManager, TaskRecord, TaskSnapshot};
+pub use store::{FileStore, MemoryStore, Store};
 
-// 验证测试:放在 crate 根级别,以便 `--exact` 匹配
+// 验证测试:放在 crate 根级别，以便 `--exact` 匹配
 
 /// 验证断点续传恢复:保存任务 -> 模拟崩溃 -> 恢复未完成任务
 #[cfg(test)]
@@ -25,7 +33,7 @@ fn recovery() {
 
     let tmp = tempfile::tempdir().unwrap();
 
-    // 阶段 1:保存 3 个任务(2 个未完成,1 个已完成)
+    // 阶段 1:保存 3 个任务（2 个未完成，1 个已完成）
     {
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);
@@ -64,7 +72,7 @@ fn recovery() {
         .unwrap();
     }
 
-    // 阶段 2:模拟重启,从存储中恢复
+    // 阶段 2:模拟重启，从存储中恢复
     {
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);

@@ -171,4 +171,201 @@ mod tests {
         let _second = sched.pop().unwrap();
         assert!(sched.is_empty());
     }
+
+    // ------ 并发测试 ------
+
+    /// 并发 push/pop 压力测试:多个 tokio 任务同时操作调度器
+    #[tokio::test]
+    async fn test_concurrent_push_pop_stress() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let sched = Arc::new(Mutex::new(Scheduler::new()));
+        let mut handles = Vec::new();
+
+        // 启动 10 个生产者,每个推入 20 个任务
+        for i in 0..10 {
+            let sched_clone = Arc::clone(&sched);
+            handles.push(tokio::spawn(async move {
+                for j in 0..20 {
+                    let task = ScheduledTask {
+                        task_id: TaskId::new_v4(),
+                        priority: Priority::Queue,
+                        file_size: (i * 20 + j) as u64,
+                        progress: 0.0,
+                    };
+                    let mut s = sched_clone.lock().await;
+                    s.push(task);
+                }
+            }));
+        }
+
+        // 等待所有生产者完成
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let s = sched.lock().await;
+        assert_eq!(s.len(), 200, "应有 200 个任务");
+        drop(s);
+
+        // 启动 10 个消费者,每个弹出任务
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let sched_clone = Arc::clone(&sched);
+            handles.push(tokio::spawn(async move {
+                let mut count = 0;
+                loop {
+                    let mut s = sched_clone.lock().await;
+                    if s.pop().is_some() {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                count
+            }));
+        }
+
+        let mut total_popped = 0;
+        for handle in handles {
+            total_popped += handle.await.unwrap();
+        }
+
+        assert_eq!(total_popped, 200, "应弹出全部 200 个任务");
+
+        let s = sched.lock().await;
+        assert!(s.is_empty(), "队列应为空");
+    }
+
+    /// 大队列排序正确性:100+ 任务按优先级弹出
+    #[tokio::test]
+    async fn test_large_queue_priority_ordering() {
+        let mut sched = Scheduler::new();
+
+        // 添加 300 个任务:100 个 Prefetch, 100 个 Queue, 100 个 UserInitiated
+        // 故意打乱插入顺序
+        for i in 0..100u64 {
+            sched.push(ScheduledTask {
+                task_id: TaskId::new_v4(),
+                priority: Priority::Prefetch,
+                file_size: 1000 - i, // 递减大小
+                progress: 0.0,
+            });
+            sched.push(ScheduledTask {
+                task_id: TaskId::new_v4(),
+                priority: Priority::Queue,
+                file_size: 1000 - i,
+                progress: 0.0,
+            });
+            sched.push(ScheduledTask {
+                task_id: TaskId::new_v4(),
+                priority: Priority::UserInitiated,
+                file_size: 1000 - i,
+                progress: 0.0,
+            });
+        }
+
+        assert_eq!(sched.len(), 300);
+
+        // 弹出前 100 个应全部是 UserInitiated
+        for _ in 0..100 {
+            let task = sched.pop().unwrap();
+            assert_eq!(
+                task.priority,
+                Priority::UserInitiated,
+                "前 100 个应为 UserInitiated"
+            );
+        }
+
+        // 接下来 100 个应全部是 Queue
+        for _ in 0..100 {
+            let task = sched.pop().unwrap();
+            assert_eq!(task.priority, Priority::Queue, "101-200 个应为 Queue");
+        }
+
+        // 最后 100 个应全部是 Prefetch
+        for _ in 0..100 {
+            let task = sched.pop().unwrap();
+            assert_eq!(task.priority, Priority::Prefetch, "201-300 个应为 Prefetch");
+        }
+
+        assert!(sched.is_empty());
+    }
+
+    /// 同优先级内按进度排序(高进度优先)
+    #[tokio::test]
+    async fn test_same_priority_progress_ordering() {
+        let mut sched = Scheduler::new();
+
+        // 添加 5 个同优先级同大小但不同进度的任务
+        let progresses = [0.1, 0.9, 0.3, 0.7, 0.5];
+        for p in progresses {
+            sched.push(ScheduledTask {
+                task_id: TaskId::new_v4(),
+                priority: Priority::Queue,
+                file_size: 1000,
+                progress: p,
+            });
+        }
+
+        // 弹出顺序应按进度降序:0.9, 0.7, 0.5, 0.3, 0.1
+        let mut prev_progress = 2.0; // 初始值大于任何可能的进度
+        for _ in 0..5 {
+            let task = sched.pop().unwrap();
+            assert!(
+                task.progress <= prev_progress,
+                "进度应单调递减: {} <= {}",
+                task.progress,
+                prev_progress
+            );
+            prev_progress = task.progress;
+        }
+    }
+
+    /// 并发压测:高竞争场景下不 panic
+    #[tokio::test]
+    async fn test_concurrent_high_contention() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let sched = Arc::new(Mutex::new(Scheduler::new()));
+        let mut handles = Vec::new();
+
+        // 20 个任务同时 push 和 pop
+        for i in 0..20 {
+            let sched_clone = Arc::clone(&sched);
+            handles.push(tokio::spawn(async move {
+                for j in 0..50 {
+                    // 交替 push 和 pop
+                    {
+                        let mut s = sched_clone.lock().await;
+                        s.push(ScheduledTask {
+                            task_id: TaskId::new_v4(),
+                            priority: match (i + j) % 3 {
+                                0 => Priority::Prefetch,
+                                1 => Priority::Queue,
+                                _ => Priority::UserInitiated,
+                            },
+                            file_size: (i * 50 + j) as u64,
+                            progress: 0.0,
+                        });
+                    }
+                    {
+                        let mut s = sched_clone.lock().await;
+                        let _ = s.pop();
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // 最终队列状态应一致(不 panic 即可)
+        let s = sched.lock().await;
+        let _len = s.len();
+        // 队列中剩余的任务数取决于 push/pop 的竞争结果,但不应 panic
+    }
 }

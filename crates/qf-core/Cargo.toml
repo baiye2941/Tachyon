@@ -17,6 +17,7 @@ tracing.workspace = true
 uuid.workspace = true
 url.workspace = true
 bytes.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

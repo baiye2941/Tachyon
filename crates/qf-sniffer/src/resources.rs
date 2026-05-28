@@ -3,7 +3,7 @@
 //! 管理浏览器嗅探到的可下载资源列表,提供增删查和过滤功能。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qf_core::filename::extract_filename_from_url;
@@ -33,8 +33,11 @@ pub struct SnifferResource {
 }
 
 /// 资源管理器
+///
+/// 使用 `RwLock` 实现读写分离:读取操作(如列出资源)不阻塞写入操作。
+/// `std::sync::RwLock` 不会因 panic 而毒化锁。
 pub struct ResourceManager {
-    resources: Arc<Mutex<HashMap<String, SnifferResource>>>,
+    resources: RwLock<HashMap<String, SnifferResource>>,
     config: CaptureConfig,
 }
 
@@ -42,7 +45,7 @@ impl ResourceManager {
     /// 创建新的资源管理器
     pub fn new(config: CaptureConfig) -> Self {
         Self {
-            resources: Arc::new(Mutex::new(HashMap::new())),
+            resources: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -73,7 +76,7 @@ impl ResourceManager {
         }
 
         let id = generate_id(url);
-        let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
 
         if resources.contains_key(&id) {
             return false;
@@ -103,7 +106,7 @@ impl ResourceManager {
 
     /// 获取所有已发现的资源
     pub fn get_all(&self) -> Vec<SnifferResource> {
-        let resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        let resources = self.resources.read().expect("RwLock 不应被毒化");
         let mut list: Vec<_> = resources.values().cloned().collect();
         list.sort_by_key(|r| std::cmp::Reverse(r.discovered_at));
         list
@@ -119,19 +122,19 @@ impl ResourceManager {
 
     /// 移除资源
     pub fn remove(&self, id: &str) -> bool {
-        let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
         resources.remove(id).is_some()
     }
 
     /// 清空所有资源
     pub fn clear(&self) {
-        let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
         resources.clear();
     }
 
     /// 资源数量
     pub fn count(&self) -> usize {
-        let resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        let resources = self.resources.read().expect("RwLock 不应被毒化");
         resources.len()
     }
 

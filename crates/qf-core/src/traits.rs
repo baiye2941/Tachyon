@@ -6,10 +6,17 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
+use futures::Stream;
 
 use crate::config::DownloadConfig;
 use crate::error::QfResult;
 use crate::types::{FileMetadata, FragmentInfo, TaskId};
+
+/// 字节流类型别名
+///
+/// 用于 `download_range_stream` 的返回值,逐块产出 `QfResult<Bytes>`。
+/// 调用方应使用 `StreamExt::next()` 逐块消费,避免将整个响应缓冲到内存。
+pub type ByteStream = Pin<Box<dyn Stream<Item = QfResult<Bytes>> + Send>>;
 
 /// 协议层 trait:负责与远程服务器通信
 ///
@@ -34,12 +41,13 @@ pub trait Protocol: Send + Sync {
     ///
     /// 与 `download_range` 不同,此方法以流式方式返回数据块,
     /// 允许调用方边接收边写入存储,降低峰值内存占用。
+    /// 调用方应使用 `StreamExt::next()` 逐块消费。
     fn download_range_stream(
         &self,
         url: &str,
         start: u64,
         end: u64,
-    ) -> Pin<Box<dyn Future<Output = QfResult<Bytes>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = QfResult<ByteStream>> + Send>>;
 
     /// 下载整个文件(不支持 Range 时使用)
     fn download_full(&self, url: &str) -> Pin<Box<dyn Future<Output = QfResult<Bytes>> + Send>>;
