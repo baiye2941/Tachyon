@@ -13,7 +13,6 @@ frontend/.svelte-kit/
 .claude/
 .mcp.json
 CLAUDE.md
-CLAUDE.local.md
 
 # 文档（不跟踪）
 docx/

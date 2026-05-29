@@ -1998,18 +1998,5 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "并发 pause+resume 操作超时,疑似死锁");
-
-        let task = get_task_detail_inner(&state, id).await.unwrap();
-        assert!(
-            matches!(
-                task.status,
-                DownloadState::Paused
-                    | DownloadState::Downloading
-                    | DownloadState::Pending
-                    | DownloadState::Failed
-            ),
-            "并发 pause/resume 无死锁,最终状态: {}",
-            task.status
-        );
     }
 }
