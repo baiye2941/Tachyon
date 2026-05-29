@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -160,8 +160,8 @@ pub struct DownloadTask {
     storage: Option<Arc<StorageKind>>,
     orchestrator: DownloadOrchestrator,
     scheduler: Arc<dyn DownloadScheduler>,
-    #[allow(dead_code)]
     pool: Option<Arc<ConnectionPool>>,
+    control_rx: Option<watch::Receiver<DownloadState>>,
     state: DownloadState,
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
@@ -193,7 +193,7 @@ impl DownloadTask {
     pub async fn with_pool(
         url: String,
         config: DownloadConfig,
-        #[allow(dead_code)] pool: Option<Arc<ConnectionPool>>,
+        pool: Option<Arc<ConnectionPool>>,
     ) -> QfResult<Self> {
         Self::with_pool_and_scheduler(
             url,
@@ -207,7 +207,7 @@ impl DownloadTask {
     pub async fn with_pool_and_scheduler(
         url: String,
         config: DownloadConfig,
-        #[allow(dead_code)] pool: Option<Arc<ConnectionPool>>,
+        pool: Option<Arc<ConnectionPool>>,
         scheduler: Arc<dyn DownloadScheduler>,
     ) -> QfResult<Self> {
         let _parsed = url::Url::parse(&url)?;
@@ -234,6 +234,7 @@ impl DownloadTask {
             orchestrator,
             scheduler,
             pool,
+            control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
             fragments: Vec::new(),
@@ -256,10 +257,46 @@ impl DownloadTask {
             orchestrator: DownloadOrchestrator::new(Default::default()),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool: None,
+            control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
             fragments: Vec::new(),
         }
+    }
+
+    pub fn set_control_rx(&mut self, control_rx: watch::Receiver<DownloadState>) {
+        self.control_rx = Some(control_rx);
+    }
+
+    async fn wait_control_rx(rx: &mut watch::Receiver<DownloadState>) -> QfResult<()> {
+        loop {
+            let state = *rx.borrow_and_update();
+            match state {
+                DownloadState::Cancelled => return Err(QfError::Cancelled),
+                DownloadState::Failed => return Err(QfError::Other("任务已失败".into())),
+                DownloadState::Paused => {
+                    rx.changed()
+                        .await
+                        .map_err(|_| QfError::Other("控制通道已关闭".into()))?;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    async fn wait_control(control_rx: &mut Option<watch::Receiver<DownloadState>>) -> QfResult<()> {
+        if let Some(rx) = control_rx.as_mut() {
+            Self::wait_control_rx(rx).await?;
+        }
+        Ok(())
+    }
+
+    fn request_host(&self) -> QfResult<String> {
+        let parsed = url::Url::parse(&self.url)?;
+        parsed
+            .host_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| QfError::Config("URL 主机为空".into()))
     }
 
     // ----- 步骤 1: 探测 -----
@@ -423,7 +460,24 @@ impl DownloadTask {
 
     /// 整块下载(不支持 Range 或单分片)
     async fn execute_full_download(&mut self) -> QfResult<()> {
-        let data = self.protocol.download_full(&self.url).await?;
+        Self::wait_control(&mut self.control_rx).await?;
+        let host = self.request_host()?;
+        let _pool_permit = match &self.pool {
+            Some(pool) => Some(pool.acquire(&host).await?),
+            None => None,
+        };
+        let start_instant = std::time::Instant::now();
+        let data = if let Some(rx) = self.control_rx.as_mut() {
+            tokio::select! {
+                result = self.protocol.download_full(&self.url) => result?,
+                control = Self::wait_control_rx(rx) => {
+                    control?;
+                    return Err(QfError::Other("控制信号异常结束".into()));
+                }
+            }
+        } else {
+            self.protocol.download_full(&self.url).await?
+        };
         let storage = self
             .storage
             .as_ref()
@@ -432,7 +486,10 @@ impl DownloadTask {
         debug!(written, "整块下载写入完成");
 
         if let Some(frag) = self.fragments.first_mut() {
-            frag.info.downloaded = written as u64;
+            if frag.state == crate::fragment::FragmentState::Pending {
+                frag.start_download();
+            }
+            frag.complete_download_fast(written as u64, start_instant.elapsed());
         }
         self.state = DownloadState::Completed;
         Ok(())
@@ -481,17 +538,31 @@ impl DownloadTask {
             .clone()
             .ok_or_else(|| QfError::Config("存储未初始化".into()))?;
         let protocol = self.protocol.clone();
+        let pool = self.pool.clone();
+        let host = self.request_host()?;
+        let control_rx = self.control_rx.clone();
 
         let mut handles: Vec<JoinHandle<QfResult<(u32, u64, Duration)>>> = Vec::new();
 
-        for frag in &self.fragments {
+        let fragment_specs: Vec<(u32, u64, u64)> = self
+            .fragments
+            .iter()
+            .map(|frag| (frag.info.index, frag.info.start, frag.info.end))
+            .collect();
+
+        for (frag_index, frag_start, frag_end) in fragment_specs {
             let frag_url = url.clone();
             let frag_storage = storage.clone();
             let frag_protocol = protocol.clone();
-            let frag_index = frag.info.index;
-            let frag_start = frag.info.start;
-            let frag_end = frag.info.end;
             let frag_semaphore = semaphore.clone();
+            let frag_pool = pool.clone();
+            let frag_host = host.clone();
+            let mut frag_control_rx = control_rx.clone();
+
+            if frag_index as usize >= self.fragments.len() {
+                return Err(QfError::Config("分片索引越界".into()));
+            }
+            self.fragments[frag_index as usize].start_download();
 
             let handle = tokio::spawn(async move {
                 // 信号量获取移入 spawn 内部:分片任务立即启动,
@@ -500,6 +571,15 @@ impl DownloadTask {
                     .acquire_owned()
                     .await
                     .map_err(|e| QfError::Other(format!("信号量获取失败: {e}").into()))?;
+
+                if let Some(rx) = frag_control_rx.as_mut() {
+                    DownloadTask::wait_control_rx(rx).await?;
+                }
+
+                let _pool_permit = match &frag_pool {
+                    Some(pool) => Some(pool.acquire(&frag_host).await?),
+                    None => None,
+                };
 
                 let start_instant = std::time::Instant::now();
 
@@ -510,14 +590,27 @@ impl DownloadTask {
                     "开始下载分片"
                 );
 
-                let stream = frag_protocol
-                    .download_range_stream(&frag_url, frag_start, frag_end)
-                    .await?;
+                let stream = if let Some(rx) = frag_control_rx.as_mut() {
+                    tokio::select! {
+                        result = frag_protocol.download_range_stream(&frag_url, frag_start, frag_end) => result?,
+                        control = DownloadTask::wait_control_rx(rx) => {
+                            control?;
+                            return Err(QfError::Other("控制信号异常结束".into()));
+                        }
+                    }
+                } else {
+                    frag_protocol
+                        .download_range_stream(&frag_url, frag_start, frag_end)
+                        .await?
+                };
 
                 let mut pos = frag_start;
                 let mut total_written: u64 = 0;
                 tokio::pin!(stream);
                 while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
+                    if let Some(rx) = frag_control_rx.as_mut() {
+                        DownloadTask::wait_control_rx(rx).await?;
+                    }
                     let chunk = chunk_result?;
                     let written = frag_storage.write_at(pos, &chunk).await?;
                     pos += written as u64;
@@ -554,10 +647,23 @@ impl DownloadTask {
                 .await
                 .map_err(|e| QfError::Other(format!("分片任务 panic: {e}").into()))?;
 
-            let (index, downloaded, duration) = result?;
+            let (index, downloaded, duration) = match result {
+                Ok(result) => result,
+                Err(e) => {
+                    let failed_index = self
+                        .fragments
+                        .iter()
+                        .position(|frag| frag.state == crate::fragment::FragmentState::Downloading)
+                        .unwrap_or(0);
+                    if let Some(frag) = self.fragments.get_mut(failed_index) {
+                        frag.mark_failed();
+                    }
+                    self.state = DownloadState::Failed;
+                    return Err(e);
+                }
+            };
 
             let frag = &mut self.fragments[index as usize];
-            frag.start_download();
             frag.complete_download_fast(downloaded, duration);
 
             // 将带宽数据反馈给调度器
@@ -1602,6 +1708,230 @@ mod tests {
         task2.execute().await.expect("重试执行应成功");
         assert_eq!(task2.state(), DownloadState::Completed);
         assert!((task2.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_permit_limits_real_range_requests() {
+        struct BlockingProtocol {
+            meta: FileMetadata,
+            active: Arc<AtomicU32>,
+            peak: Arc<AtomicU32>,
+            release_rx: tokio::sync::watch::Receiver<bool>,
+        }
+
+        impl Clone for BlockingProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    active: Arc::clone(&self.active),
+                    peak: Arc::clone(&self.peak),
+                    release_rx: self.release_rx.clone(),
+                }
+            }
+        }
+
+        impl Protocol for BlockingProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<FileMetadata>> + Send>>
+            {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::from(vec![0xDD; (end - start + 1) as usize])) })
+            }
+
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>>
+            {
+                let active = Arc::clone(&self.active);
+                let peak = Arc::clone(&self.peak);
+                let mut release_rx = self.release_rx.clone();
+                Box::pin(async move {
+                    let now = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    peak.fetch_max(now, AtomicOrdering::SeqCst);
+                    while !*release_rx.borrow() {
+                        release_rx
+                            .changed()
+                            .await
+                            .map_err(|_| QfError::Other("释放信号关闭".into()))?;
+                    }
+                    active.fetch_sub(1, AtomicOrdering::SeqCst);
+                    let data = Bytes::from(vec![0xDD; (end - start + 1) as usize]);
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::new()) })
+            }
+        }
+
+        let active = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let protocol: Arc<dyn Protocol> = Arc::new(BlockingProtocol {
+            meta: test_metadata("pool.bin", 400),
+            active,
+            peak: Arc::clone(&peak),
+            release_rx,
+        });
+        let storage = StorageKind::memory_with_capacity(400);
+        let pool = Arc::new(ConnectionPool::new(crate::connection::PoolConfig {
+            max_per_host: 1,
+            max_global: 4,
+        }));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/pool.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 4,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.pool = Some(pool);
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            qf_core::config::SchedulerConfig {
+                min_fragment_size: 100,
+                max_fragment_size: 100,
+                ..Default::default()
+            },
+        );
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        let run = tokio::time::timeout(std::time::Duration::from_millis(200), task.execute()).await;
+        assert!(run.is_err(), "无释放信号时应仍有分片等待连接许可");
+        assert_eq!(peak.load(AtomicOrdering::SeqCst), 1);
+        release_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_paused_control_prevents_fragment_writes() {
+        let data = Bytes::from(vec![0xEE; 100]);
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(test_metadata("paused.bin", 100)).with_range_data(0, 99, data));
+        let storage = StorageKind::memory_with_capacity(100);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/paused.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        let (control_tx, control_rx) = watch::channel(DownloadState::Paused);
+        task.set_control_rx(control_rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let paused_result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), task.execute()).await;
+        assert!(paused_result.is_err(), "暂停状态下执行应等待控制信号");
+        let stored = if let Some(storage) = &task.storage {
+            if let StorageKind::Memory(memory) = storage.as_ref() {
+                memory.get_data()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        assert!(stored.iter().all(|byte| *byte == 0), "暂停期间不应写入数据");
+        control_tx.send(DownloadState::Cancelled).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fragment_failure_records_failed_state_and_run_fails() {
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(test_metadata("missing.bin", 200)));
+        let storage = StorageKind::memory_with_capacity(200);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/missing.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            qf_core::config::SchedulerConfig {
+                min_fragment_size: 100,
+                max_fragment_size: 100,
+                ..Default::default()
+            },
+        );
+
+        let result = task.run().await;
+        assert!(result.is_err(), "缺失分片数据应导致 run 失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+        assert!(
+            task.fragments
+                .iter()
+                .any(|frag| frag.state == FragmentState::Failed),
+            "至少一个失败分片应记录 Failed 状态"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_download_uses_fragment_state_machine() {
+        let data = Bytes::from_static(b"full state machine");
+        let meta = FileMetadata {
+            file_name: "full.bin".into(),
+            file_size: Some(data.len() as u64),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+        );
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.unwrap();
+
+        let frag = task.fragments.first().expect("整块下载应保留首分片记录");
+        assert_eq!(frag.state, FragmentState::Done);
+        assert!(frag.last_duration.is_some());
+        assert_eq!(frag.info.downloaded, data.len() as u64);
     }
 
     // ------ 补充: DownloadTask::progress() 正确性(更多场景) ------

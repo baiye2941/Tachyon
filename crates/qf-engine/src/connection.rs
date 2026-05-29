@@ -54,7 +54,7 @@ impl From<PoolConfig> for ConnectionConfig {
 pub struct ConnectionPool {
     config: PoolConfig,
     pub(crate) global_semaphore: Arc<Semaphore>,
-    active_count: AtomicU32,
+    active_count: Arc<AtomicU32>,
     host_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
@@ -64,7 +64,7 @@ impl ConnectionPool {
         Self {
             global_semaphore: Arc::new(Semaphore::new(config.max_global as usize)),
             config,
-            active_count: AtomicU32::new(0),
+            active_count: Arc::new(AtomicU32::new(0)),
             host_semaphores: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -78,7 +78,7 @@ impl ConnectionPool {
     }
 
     /// 获取连接许可(全局 + 主机级别双重限制)
-    pub async fn acquire(&self, host: &str) -> Result<ConnectionPermit<'_>, QfError> {
+    pub async fn acquire(&self, host: &str) -> Result<ConnectionPermit, QfError> {
         let global_permit = self
             .global_semaphore
             .clone()
@@ -94,7 +94,7 @@ impl ConnectionPool {
         Ok(ConnectionPermit {
             _global_permit: global_permit,
             _host_permit: host_permit,
-            active_count: &self.active_count,
+            active_count: Arc::clone(&self.active_count),
         })
     }
 
@@ -114,10 +114,7 @@ impl ConnectionPool {
     /// 建议在下载任务完成后定期调用,避免内存泄漏。
     pub async fn cleanup_idle_hosts(&self) {
         let mut map = self.host_semaphores.lock().await;
-        map.retain(|_, sem| {
-            // 保留还有未归还许可(即有活跃连接)的主机
-            sem.available_permits() < self.config.max_per_host as usize
-        });
+        map.retain(|_, sem| sem.available_permits() < self.config.max_per_host as usize);
     }
 
     /// 当前跟踪的主机数量
@@ -128,13 +125,13 @@ impl ConnectionPool {
 }
 
 /// 连接许可,Drop 时自动归还连接
-pub struct ConnectionPermit<'a> {
+pub struct ConnectionPermit {
     _global_permit: tokio::sync::OwnedSemaphorePermit,
     _host_permit: tokio::sync::OwnedSemaphorePermit,
-    active_count: &'a AtomicU32,
+    active_count: Arc<AtomicU32>,
 }
 
-impl<'a> Drop for ConnectionPermit<'a> {
+impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.active_count.fetch_sub(1, Ordering::Relaxed);
     }

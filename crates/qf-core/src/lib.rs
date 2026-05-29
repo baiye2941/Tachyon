@@ -90,8 +90,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         buf[i * 2] = HEX_TABLE[(b >> 4) as usize];
         buf[i * 2 + 1] = HEX_TABLE[(b & 0x0f) as usize];
     }
-    // Safety: 所有字节均为有效 ASCII hex 字符
-    unsafe { String::from_utf8_unchecked(buf) }
+    String::from_utf8(buf).expect("hex 编码只产生有效 ASCII 字符")
 }
 
 /// 事件广播可观测性验证测试

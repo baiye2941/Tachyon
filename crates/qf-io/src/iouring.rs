@@ -126,6 +126,25 @@ pub struct IoUringStorage {
     ring: Option<IoUringHandle>,
 }
 
+/// 地址对齐的缓冲区(Linux only)
+#[cfg(target_os = "linux")]
+struct AlignedBuffer {
+    storage: Vec<u8>,
+    offset: usize,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl AlignedBuffer {
+    fn as_ptr(&self) -> *const u8 {
+        self.storage.as_ptr().wrapping_add(self.offset)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 /// io_uring 实例持有者(Linux only)
 ///
 /// 封装 `io_uring::IoUring` 实例及其注册的 fixed buffers。
@@ -135,31 +154,40 @@ struct IoUringHandle {
     /// io_uring 实例(通过 IoUringStorage 的 submit 路径间接使用)
     _ring: io_uring::IoUring,
     /// 注册的 fixed buffers (保持内存不被释放)
-    _buffers: Vec<Vec<u8>>,
+    _buffers: Vec<AlignedBuffer>,
 }
 
-/// 将 buffer 大小向上对齐到指定对齐边界
-#[cfg(target_os = "linux")]
-fn align_buffer_size(size: usize, align: usize) -> usize {
-    (size + align - 1) & !(align - 1)
-}
-
-/// 分配对齐的 Vec<u8>(O_DIRECT/io_uring 要求)
+/// 分配地址对齐的缓冲区(O_DIRECT/io_uring 要求)
 ///
-/// 使用 Layout 保证内存地址按 align 字节对齐,满足内核对 fixed buffer 的对齐要求。
-/// 返回的 Vec 长度保证为 align 的整数倍。
+/// 通过过量分配 Vec 并选择对齐的内部起点,保证暴露给 io_uring 的地址满足 align 对齐。
+/// 对外暴露的逻辑长度保持为调用方请求的 size。
 #[cfg(target_os = "linux")]
-fn aligned_alloc(size: usize, align: usize) -> Vec<u8> {
-    let aligned_size = align_buffer_size(size, align);
-    let layout =
-        std::alloc::Layout::from_size_align(aligned_size, align).expect("无效的对齐分配布局");
-    // Safety: layout 非零且有效,由 Layout::from_size_align 保证
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        std::alloc::handle_alloc_error(layout);
+fn aligned_alloc(size: usize, align: usize) -> AlignedBuffer {
+    assert!(size > 0, "buffer size must be non-zero");
+    assert!(
+        align.is_power_of_two(),
+        "buffer align must be a power of two"
+    );
+
+    let padding = align - 1;
+    let storage_len = size.checked_add(padding).expect("对齐缓冲区大小溢出");
+    let storage = vec![0u8; storage_len];
+    let base = storage.as_ptr() as usize;
+    let misalignment = base & padding;
+    let offset = if misalignment == 0 {
+        0
+    } else {
+        align - misalignment
+    };
+
+    debug_assert!(offset < align);
+    debug_assert!(offset + size <= storage.len());
+
+    AlignedBuffer {
+        storage,
+        offset,
+        len: size,
     }
-    // Safety: ptr 由 alloc_zeroed 分配,大小为 aligned_size,全部初始化为零
-    unsafe { Vec::from_raw_parts(ptr, aligned_size, aligned_size) }
 }
 
 impl IoUringStorage {
@@ -217,10 +245,9 @@ impl IoUringStorage {
 
         // 步骤 2: 分配 fixed buffers(对齐分配,O_DIRECT 需要 4096 字节对齐)
         let align = 4096; // 现代 Linux 内核 O_DIRECT 最小对齐要求
-        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(self.config.buffer_count);
+        let mut buffers: Vec<AlignedBuffer> = Vec::with_capacity(self.config.buffer_count);
         for _ in 0..self.config.buffer_count {
-            let buf_size = align_buffer_size(self.config.buffer_size, align);
-            let buf = aligned_alloc(buf_size, align);
+            let buf = aligned_alloc(self.config.buffer_size, align);
             buffers.push(buf);
         }
 
@@ -459,22 +486,6 @@ impl AsyncStorage for IoUringStorage {
     }
 }
 
-// Safety:
-// IoUringStorage 可以安全地跨线程使用,基于以下不变量:
-// - IoUringConfig: 所有字段为 Copy 类型(Send+Sync)
-// - PathBuf: Send+Sync
-// - Option<std::fs::File>: Send+Sync
-// - IoUringState: Copy 枚举(Send+Sync)
-// - IoUringHandle (Linux): io_uring::IoUring 内部使用 Mutex 保护共享状态,
-//   实际上可安全跨线程访问; Vec<Vec<u8>> 为注册 buffer, 仅在 init 时写入,
-//   之后只读访问,无数据竞争风险
-// - 所有公开方法均通过 &self 访问,内部可变性通过 Mutex 或原子操作保证
-//
-// 注意: 如果未来在 Ready 状态下允许多线程并发提交 SQE,
-// 需要额外同步机制保护提交队列的并发访问
-unsafe impl Send for IoUringStorage {}
-unsafe impl Sync for IoUringStorage {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,9 +676,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_aligned_alloc_rounds_up_size() {
+    fn test_aligned_alloc_keeps_logical_len() {
         let buf = aligned_alloc(100, 512);
-        assert_eq!(buf.len(), 512, "100 字节应向上对齐到 512");
+        assert_eq!(buf.len(), 100, "逻辑长度应保持调用方请求的大小");
+        assert!(
+            (buf.as_ptr() as usize).is_multiple_of(512),
+            "buffer 地址未按 512 字节对齐"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

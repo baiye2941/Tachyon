@@ -127,6 +127,7 @@ pub struct AppState {
     pub sniffer_filters: Arc<Mutex<Vec<String>>>,
     pub progress_tx: watch::Sender<ProgressEvent>,
     pub connection_pool: Arc<ConnectionPool>,
+    pub controls: Arc<DashMap<String, watch::Sender<DownloadState>>>,
 }
 
 impl Default for AppState {
@@ -137,24 +138,23 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let connection_pool = ConnectionPool::new(PoolConfig {
-            max_per_host: 16,
-            max_global: 256,
-        });
+        let config = AppConfig {
+            max_concurrent_tasks: 5,
+            download: DownloadConfig::default(),
+            connection: ConnectionConfig::default(),
+            scheduler: Default::default(),
+        };
+        let connection_pool = ConnectionPool::new(PoolConfig::from(config.connection.clone()));
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
-            config: Arc::new(Mutex::new(AppConfig {
-                max_concurrent_tasks: 5,
-                download: DownloadConfig::default(),
-                connection: ConnectionConfig::default(),
-                scheduler: Default::default(),
-            })),
+            config: Arc::new(Mutex::new(config)),
             handles: Arc::new(DashMap::new()),
             active_permits: Arc::new(AtomicU32::new(0)),
             sniffer: Arc::new(Mutex::new(Vec::new())),
             sniffer_filters: Arc::new(Mutex::new(Vec::new())),
             progress_tx: watch::Sender::new(HashMap::new()),
             connection_pool: Arc::new(connection_pool),
+            controls: Arc::new(DashMap::new()),
         }
     }
 }
@@ -212,6 +212,27 @@ fn update_task_status(
     }
 }
 
+fn cleanup_runtime(state: &AppState, task_id: &str) {
+    state.controls.remove(task_id);
+    state.handles.remove(task_id);
+}
+
+async fn wait_for_cancel_signal(
+    control_rx: &mut watch::Receiver<DownloadState>,
+) -> Result<(), qf_core::QfError> {
+    loop {
+        let state = *control_rx.borrow_and_update();
+        match state {
+            DownloadState::Cancelled => return Err(qf_core::QfError::Cancelled),
+            DownloadState::Failed => return Err(qf_core::QfError::Other("任务已失败".into())),
+            _ => control_rx
+                .changed()
+                .await
+                .map_err(|_| qf_core::QfError::Other("控制通道已关闭".into()))?,
+        }
+    }
+}
+
 fn build_download_config(app_config: &AppConfig, download_dir: &str) -> DownloadConfig {
     DownloadConfig {
         download_dir: download_dir.to_string(),
@@ -231,6 +252,7 @@ async fn task_fn(
     download_dir: String,
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
+    control_rx: watch::Receiver<DownloadState>,
 ) {
     let download_url = match Url::parse(&url) {
         Ok(u) => u,
@@ -238,6 +260,7 @@ async fn task_fn(
             tracing::error!(task_id = %task_id, error = %e, "URL 解析失败");
             let mut store = state.tasks.lock().await;
             update_task_status(&mut store, &task_id, DownloadState::Failed);
+            cleanup_runtime(&state, &task_id);
             return;
         }
     };
@@ -248,6 +271,7 @@ async fn task_fn(
             tracing::error!(task_id = %task_id, "URL 主机为空");
             let mut store = state.tasks.lock().await;
             update_task_status(&mut store, &task_id, DownloadState::Failed);
+            cleanup_runtime(&state, &task_id);
             return;
         }
     };
@@ -257,6 +281,7 @@ async fn task_fn(
         if let Some(task) = store.get(&task_id) {
             if task.status == DownloadState::Cancelled {
                 tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
+                cleanup_runtime(&state, &task_id);
                 return;
             }
             if task.status == DownloadState::Paused {
@@ -276,6 +301,7 @@ async fn task_fn(
         tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
         let mut store = state.tasks.lock().await;
         update_task_status(&mut store, &task_id, DownloadState::Failed);
+        cleanup_runtime(&state, &task_id);
         return;
     }
 
@@ -289,8 +315,23 @@ async fn task_fn(
                 return;
             }
         };
+    download_task.set_control_rx(control_rx.clone());
 
-    match download_task.probe().await {
+    if *control_rx.borrow() == DownloadState::Cancelled {
+        cleanup_runtime(&state, &task_id);
+        return;
+    }
+
+    let mut probe_cancel_rx = control_rx.clone();
+    match tokio::select! {
+        result = download_task.probe() => result,
+        cancel = wait_for_cancel_signal(&mut probe_cancel_rx) => {
+            match cancel {
+                Err(e) => Err(e),
+                Ok(()) => Err(qf_core::QfError::Other("控制信号异常结束".into())),
+            }
+        }
+    } {
         Ok(meta) => {
             tracing::info!(
                 task_id = %task_id,
@@ -307,68 +348,57 @@ async fn task_fn(
                 }
             }
         }
+        Err(e) if matches!(e, qf_core::QfError::Cancelled) => {
+            cleanup_runtime(&state, &task_id);
+            return;
+        }
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
             let mut store = state.tasks.lock().await;
             update_task_status(&mut store, &task_id, DownloadState::Failed);
+            cleanup_runtime(&state, &task_id);
             return;
         }
     }
 
     let download_task = Arc::new(tokio::sync::Mutex::new(download_task));
 
-    update_task_status(
-        &mut *state.tasks.lock().await,
-        &task_id,
-        DownloadState::Downloading,
-    );
-
-    let monitor_state = state.clone();
-    let monitor_task_id = task_id.clone();
-    let cancel_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            let store = monitor_state.tasks.lock().await;
-            match store.get(&monitor_task_id).map(|t| t.status) {
-                Some(DownloadState::Cancelled) => {
-                    tracing::info!(task_id = %monitor_task_id, "监控检测到任务已取消");
-                    return;
-                }
-                Some(DownloadState::Paused) => {
-                    drop(store);
-                    let mut paused_ticks = 0u32;
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        paused_ticks += 1;
-                        let s = monitor_state.tasks.lock().await;
-                        if s.get(&monitor_task_id)
-                            .is_none_or(|t| t.status != DownloadState::Paused)
-                        {
-                            break;
-                        }
-                        if paused_ticks > 1500 {
-                            tracing::warn!(task_id = %monitor_task_id, "暂停超时(5分钟),标记任务失败");
-                            let mut s = monitor_state.tasks.lock().await;
-                            update_task_status(&mut s, &monitor_task_id, DownloadState::Failed);
-                            return;
-                        }
-                    }
-                }
-                Some(DownloadState::Failed) | None => return,
-                _ => {}
-            }
-        }
-    });
+    if *control_rx.borrow() == DownloadState::Cancelled {
+        cleanup_runtime(&state, &task_id);
+        return;
+    }
 
     let monitor_dt = download_task.clone();
     let monitor_ps = state.clone();
     let monitor_tid = task_id.clone();
+    let mut progress_control_rx = control_rx.clone();
     let progress_handle = tokio::spawn(async move {
         let start = Instant::now();
         let mut last_downloaded: u64 = 0;
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                changed = progress_control_rx.changed() => {
+                    if changed.is_err() {
+                        return 0;
+                    }
+                    let control_state = {
+                        let borrowed = progress_control_rx.borrow_and_update();
+                        *borrowed
+                    };
+                    match control_state {
+                        DownloadState::Cancelled => return 0,
+                        DownloadState::Paused => {
+                            let mut store = monitor_ps.tasks.lock().await;
+                            if let Some(task) = store.get_mut(&monitor_tid) {
+                                task.speed = 0;
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
+            }
             let dt = monitor_dt.lock().await;
             let p = dt.progress();
             let ds = dt.state();
@@ -432,7 +462,7 @@ async fn task_fn(
     );
     let result = download_result;
 
-    cancel_handle.abort();
+    cleanup_runtime(&state, &task_id);
 
     {
         let mut store = state.tasks.lock().await;
@@ -577,7 +607,11 @@ pub async fn create_task(
         sniffer_filters: state.sniffer_filters.clone(),
         progress_tx: state.progress_tx.clone(),
         connection_pool: state.connection_pool.clone(),
+        controls: state.controls.clone(),
     });
+
+    let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
+    state.controls.insert(task_id.clone(), control_tx);
 
     let tid = task_id.clone();
     let url_clone = url.clone();
@@ -590,6 +624,7 @@ pub async fn create_task(
             download_dir_str,
             download_config,
             pool_clone,
+            control_rx,
         )
         .await;
     });
@@ -615,6 +650,9 @@ pub async fn pause_task(
         DownloadState::Pending | DownloadState::Downloading => {
             task.status = DownloadState::Paused;
             task.speed = 0;
+            if let Some(control) = state.controls.get(&task_id) {
+                let _ = control.send(DownloadState::Paused);
+            }
             tracing::info!(task_id = %task_id, "暂停任务");
             Ok(())
         }
@@ -635,6 +673,9 @@ pub async fn resume_task(
 
     if task.status == DownloadState::Paused {
         task.status = DownloadState::Downloading;
+        if let Some(control) = state.controls.get(&task_id) {
+            let _ = control.send(DownloadState::Downloading);
+        }
         tracing::info!(task_id = %task_id, "恢复任务");
         Ok(())
     } else {
@@ -661,8 +702,8 @@ pub async fn cancel_task(
             Err(AppError::Config(format!("任务已{},无法取消", task.status)))
         }
         _ => {
-            if let Some((_, handle)) = state.handles.remove(&task_id) {
-                handle.abort();
+            if let Some(control) = state.controls.get(&task_id) {
+                let _ = control.send(DownloadState::Cancelled);
             }
 
             update_task_status(&mut store, &task_id, DownloadState::Cancelled);
@@ -687,6 +728,7 @@ pub async fn delete_task(
         DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
             store.remove(&task_id);
             state.handles.remove(&task_id);
+            state.controls.remove(&task_id);
             tracing::info!(task_id = %task_id, "删除任务");
             Ok(())
         }
@@ -956,7 +998,11 @@ async fn create_task_inner(
         sniffer_filters: state.sniffer_filters.clone(),
         progress_tx: state.progress_tx.clone(),
         connection_pool: state.connection_pool.clone(),
+        controls: state.controls.clone(),
     });
+
+    let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
+    state.controls.insert(task_id.clone(), control_tx);
 
     let tid = task_id.clone();
     let url_clone = url.clone();
@@ -969,6 +1015,7 @@ async fn create_task_inner(
             download_dir_str,
             download_config,
             pool_clone,
+            control_rx,
         )
         .await;
     });
@@ -989,6 +1036,9 @@ async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppEr
         DownloadState::Pending | DownloadState::Downloading => {
             task.status = DownloadState::Paused;
             task.speed = 0;
+            if let Some(control) = state.controls.get(&task_id) {
+                let _ = control.send(DownloadState::Paused);
+            }
             Ok(())
         }
         other => Err(AppError::Config(format!("当前状态 '{}' 不允许暂停", other))),
@@ -1003,6 +1053,9 @@ async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     if task.status == DownloadState::Paused {
         task.status = DownloadState::Downloading;
+        if let Some(control) = state.controls.get(&task_id) {
+            let _ = control.send(DownloadState::Downloading);
+        }
         Ok(())
     } else {
         Err(AppError::Config(format!(
@@ -1023,8 +1076,8 @@ async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
             Err(AppError::Config(format!("任务已{},无法取消", task.status)))
         }
         _ => {
-            if let Some((_, handle)) = state.handles.remove(&task_id) {
-                handle.abort();
+            if let Some(control) = state.controls.get(&task_id) {
+                let _ = control.send(DownloadState::Cancelled);
             }
             update_task_status(&mut store, &task_id, DownloadState::Cancelled);
             Ok(())
@@ -1177,6 +1230,7 @@ mod tests {
                 max_per_host: 16,
                 max_global: 256,
             })),
+            controls: Arc::new(DashMap::new()),
         })
     }
 
@@ -1998,5 +2052,72 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "并发 pause+resume 操作超时,疑似死锁");
+    }
+
+    #[tokio::test]
+    async fn test_pause_resume_send_cooperative_control_signal() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "http://example.com/control-pause.bin".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut rx = state.controls.get(&id).unwrap().subscribe();
+
+        pause_task_inner(&state, id.clone()).await.unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), DownloadState::Paused);
+
+        resume_task_inner(&state, id).await.unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), DownloadState::Downloading);
+    }
+
+    #[tokio::test]
+    async fn test_failed_download_updates_task_info_status_failed() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/status-failed.bin".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        {
+            let mut store = state.tasks.lock().await;
+            update_task_status(&mut store, &id, DownloadState::Failed);
+        }
+
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.status, DownloadState::Failed);
+        assert_eq!(task.speed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_sends_signal_and_background_task_exits() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "http://example.com/control-cancel.bin".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut rx = state.controls.get(&id).unwrap().subscribe();
+
+        cancel_task_inner(&state, id.clone()).await.unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), DownloadState::Cancelled);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.handles.contains_key(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("取消后后台任务应有序退出并清理句柄");
     }
 }
