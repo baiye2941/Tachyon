@@ -142,6 +142,23 @@ impl VerifierKind {
 }
 
 // ---------------------------------------------------------------------------
+// FragmentProgress: 分片进度回调消息
+// ---------------------------------------------------------------------------
+
+/// 分片进度回调消息
+///
+/// 通过 `progress_tx` 通道发送给上层(qf-app),用于:
+/// - `completed == false`:增量进度更新(每写一个 chunk 发一次)
+/// - `completed == true`:分片整体下载完成,触发上层 checkpoint 落盘(断点续传)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentProgress {
+    /// 分片索引
+    pub fragment_index: u32,
+    /// 该分片是否已整体完成
+    pub completed: bool,
+}
+
+// ---------------------------------------------------------------------------
 // DownloadTask: 下载任务执行器
 // ---------------------------------------------------------------------------
 
@@ -165,7 +182,9 @@ pub struct DownloadTask {
     state: DownloadState,
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<FragmentProgress>>,
+    /// 断点续传:已完成的分片索引,plan() 后据此跳过这些分片
+    completed_fragments: Vec<u32>,
 }
 
 impl DownloadTask {
@@ -240,6 +259,7 @@ impl DownloadTask {
             metadata: None,
             fragments: Vec::new(),
             progress_tx: None,
+            completed_fragments: Vec::new(),
         })
     }
 
@@ -264,6 +284,7 @@ impl DownloadTask {
             metadata: None,
             fragments: Vec::new(),
             progress_tx: None,
+            completed_fragments: Vec::new(),
         }
     }
 
@@ -271,8 +292,18 @@ impl DownloadTask {
         self.control_rx = Some(control_rx);
     }
 
-    pub fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) {
+    pub fn set_progress_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<FragmentProgress>,
+    ) {
         self.progress_tx = Some(tx);
+    }
+
+    /// 设置已完成分片索引列表(断点续传)
+    ///
+    /// 必须在 `plan()` 之前调用。`plan()` 会据此把对应分片标记为已完成并跳过下载。
+    pub fn set_completed_fragments(&mut self, completed: Vec<u32>) {
+        self.completed_fragments = completed;
     }
 
     async fn wait_control_rx(
@@ -305,6 +336,43 @@ impl DownloadTask {
             Self::wait_control_rx(rx, pause_timeout).await?;
         }
         Ok(())
+    }
+
+    /// 在下载进行期间监视中断信号(取消/暂停),供 `tokio::select!` 分支使用。
+    ///
+    /// 与 `wait_control_rx` 的关键区别:正常运行状态(Downloading 等)下**不会立即返回**,
+    /// 而是挂起等待状态变化,因此不会在 `select!` 中抢占正在进行的下载分支。
+    /// 只有在出现 Cancelled/Failed 时返回 `Err`,出现 Paused 时按暂停语义阻塞/超时。
+    /// 若控制通道关闭,则永久挂起(交由对端的下载分支决定结果)。
+    async fn watch_for_interrupt(
+        rx: &mut watch::Receiver<DownloadState>,
+        pause_timeout: Duration,
+    ) -> QfResult<()> {
+        loop {
+            let state = *rx.borrow_and_update();
+            match state {
+                DownloadState::Cancelled => return Err(QfError::Cancelled),
+                DownloadState::Failed => return Err(QfError::Other("任务已失败".into())),
+                DownloadState::Paused => {
+                    // 暂停:等待恢复信号,超时则视为暂停超时错误
+                    tokio::time::timeout(pause_timeout, rx.changed())
+                        .await
+                        .map_err(|_| {
+                            QfError::Timeout(format!("暂停超过 {} 秒", pause_timeout.as_secs()))
+                        })?
+                        .map_err(|_| QfError::Other("控制通道已关闭".into()))?;
+                }
+                _ => {
+                    // 正常运行:挂起等待下一次状态变化,绝不主动返回 Ok,
+                    // 避免在 select! 中抢占下载分支。
+                    if rx.changed().await.is_err() {
+                        // 通道关闭:对端 sender 已 drop,不再有控制信号。
+                        // 永久挂起,让 select! 选择下载分支的结果。
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
     }
 
     fn request_host(&self) -> QfResult<String> {
@@ -414,6 +482,23 @@ impl DownloadTask {
             .map(|info| FragmentRecord::new(info.clone(), self.config.max_retries))
             .collect();
 
+        // 断点续传:把已完成分片标记为 Done 并跳过后续下载
+        if !self.completed_fragments.is_empty() {
+            let mut resumed = 0u32;
+            for &done_index in &self.completed_fragments {
+                if let Some(frag) = self.fragments.get_mut(done_index as usize) {
+                    // 仅对仍处于 Pending 的分片执行恢复,避免重复迁移状态
+                    if frag.state == crate::fragment::FragmentState::Pending {
+                        frag.info.downloaded = frag.info.size;
+                        frag.start_download();
+                        frag.complete_download_fast(frag.info.size, Duration::ZERO);
+                        resumed += 1;
+                    }
+                }
+            }
+            info!(resumed, "断点续传:跳过已完成分片");
+        }
+
         Ok(fragments)
     }
 
@@ -487,7 +572,7 @@ impl DownloadTask {
         let data = if let Some(rx) = self.control_rx.as_mut() {
             tokio::select! {
                 result = self.protocol.download_full(&self.url) => result?,
-                control = Self::wait_control_rx(rx, pause_timeout) => {
+                control = Self::watch_for_interrupt(rx, pause_timeout) => {
                     control?;
                     return Err(QfError::Other("控制信号异常结束".into()));
                 }
@@ -517,6 +602,9 @@ impl DownloadTask {
     /// 将信号量获取移入 spawn 任务内部,确保分片任务立即启动网络请求,
     /// 仅在实际占用并发槽位时才等待信号量,最大化网络并发。
     /// 使用调度器的带宽预测动态调整并发度。
+    ///
+    /// 每个分片 spawn 内部自带重试循环:单次尝试失败后按指数退避重试,
+    /// 直到 `max_retries` 耗尽才整体失败。已完成的分片(断点续传)直接跳过。
     async fn execute_fragmented_download(&mut self) -> QfResult<()> {
         if self.config.max_concurrent_fragments == 0 {
             return Err(QfError::Config(
@@ -560,12 +648,18 @@ impl DownloadTask {
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
         let control_rx = self.control_rx.clone();
         let progress_tx = self.progress_tx.clone();
+        let max_retries = self.config.max_retries;
 
-        let mut handles: Vec<JoinHandle<QfResult<(u32, u64, Duration)>>> = Vec::new();
+        // spawn 成功返回 (index, downloaded, duration);失败返回 (index, error)
+        type FragOk = (u32, u64, Duration);
+        type FragErr = (u32, QfError);
+        let mut handles: Vec<JoinHandle<Result<FragOk, FragErr>>> = Vec::new();
 
+        // 仅对未完成(Pending)的分片下载,已完成分片(断点续传)跳过
         let fragment_specs: Vec<(u32, u64, u64)> = self
             .fragments
             .iter()
+            .filter(|frag| frag.state == crate::fragment::FragmentState::Pending)
             .map(|frag| (frag.info.index, frag.info.start, frag.info.end))
             .collect();
 
@@ -576,7 +670,7 @@ impl DownloadTask {
             let frag_semaphore = semaphore.clone();
             let frag_pool = pool.clone();
             let frag_host = host.clone();
-            let mut frag_control_rx = control_rx.clone();
+            let frag_control_rx = control_rx.clone();
             let frag_progress_tx = progress_tx.clone();
 
             if frag_index as usize >= self.fragments.len() {
@@ -587,83 +681,68 @@ impl DownloadTask {
             let handle = tokio::spawn(async move {
                 // 信号量获取移入 spawn 内部:分片任务立即启动,
                 // 仅在需要实际占用并发槽位时才等待
-                let permit = frag_semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| QfError::Other(format!("信号量获取失败: {e}").into()))?;
-
-                if let Some(rx) = frag_control_rx.as_mut() {
-                    DownloadTask::wait_control_rx(rx, pause_timeout).await?;
-                }
-
-                let _pool_permit = match &frag_pool {
-                    Some(pool) => Some(pool.acquire(&frag_host).await?),
-                    None => None,
+                let permit = match frag_semaphore.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Err((
+                            frag_index,
+                            QfError::Other(format!("信号量获取失败: {e}").into()),
+                        ));
+                    }
                 };
 
-                let start_instant = std::time::Instant::now();
-
-                debug!(
-                    index = frag_index,
-                    start = frag_start,
-                    end = frag_end,
-                    "开始下载分片"
-                );
-
-                let stream = if let Some(rx) = frag_control_rx.as_mut() {
-                    tokio::select! {
-                        result = frag_protocol.download_range_stream(&frag_url, frag_start, frag_end) => result?,
-                        control = DownloadTask::wait_control_rx(rx, pause_timeout) => {
-                            control?;
-                            return Err(QfError::Other("控制信号异常结束".into()));
+                // spawn 内部重试循环:单次尝试失败后指数退避重试,
+                // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
+                let mut attempt: u32 = 0;
+                loop {
+                    match Self::download_single_fragment(
+                        &frag_protocol,
+                        &frag_storage,
+                        &frag_pool,
+                        &frag_host,
+                        &frag_url,
+                        frag_index,
+                        frag_start,
+                        frag_end,
+                        pause_timeout,
+                        &frag_control_rx,
+                        &frag_progress_tx,
+                    )
+                    .await
+                    {
+                        Ok((downloaded, duration)) => {
+                            drop(permit);
+                            return Ok((frag_index, downloaded, duration));
+                        }
+                        Err(e) => {
+                            // 取消/暂停超时等控制类错误不重试,直接上报
+                            if matches!(e, QfError::Cancelled | QfError::Timeout(_)) {
+                                drop(permit);
+                                return Err((frag_index, e));
+                            }
+                            if attempt >= max_retries {
+                                drop(permit);
+                                return Err((frag_index, e));
+                            }
+                            // 指数退避:1s, 2s, 4s, ...(上限 1024s)
+                            let backoff = Duration::from_secs(1u64 << attempt.min(10));
+                            warn!(
+                                index = frag_index,
+                                attempt = attempt + 1,
+                                max_retries,
+                                backoff_secs = backoff.as_secs(),
+                                error = %e,
+                                "分片下载失败,退避后重试"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            attempt += 1;
                         }
                     }
-                } else {
-                    frag_protocol
-                        .download_range_stream(&frag_url, frag_start, frag_end)
-                        .await?
-                };
-
-                let mut pos = frag_start;
-                let mut total_written: u64 = 0;
-                tokio::pin!(stream);
-                while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
-                    if let Some(rx) = frag_control_rx.as_mut() {
-                        DownloadTask::wait_control_rx(rx, pause_timeout).await?;
-                    }
-                    let chunk = chunk_result?;
-                    let written = frag_storage.write_at(pos, &chunk).await?;
-                    pos += written as u64;
-                    total_written += written as u64;
-                    if let Some(tx) = &frag_progress_tx {
-                        let _ = tx.send(());
-                    }
                 }
-
-                let elapsed = start_instant.elapsed();
-
-                // 持有 permit 直到下载完成,确保并发限制生效
-                drop(permit);
-
-                info!(
-                    index = frag_index,
-                    written = total_written as usize,
-                    elapsed_ms = elapsed.as_millis(),
-                    "分片下载完成"
-                );
-                Ok((frag_index, total_written, elapsed))
             });
 
             handles.push(handle);
         }
-
-        debug_assert_eq!(
-            self.fragments.len(),
-            self.fragments
-                .last()
-                .map(|f| f.info.index as usize + 1)
-                .unwrap_or(0),
-        );
 
         for handle in handles {
             let result = handle
@@ -671,15 +750,11 @@ impl DownloadTask {
                 .map_err(|e| QfError::Other(format!("分片任务 panic: {e}").into()))?;
 
             let (index, downloaded, duration) = match result {
-                Ok(result) => result,
-                Err(e) => {
-                    let failed_index = self
-                        .fragments
-                        .iter()
-                        .position(|frag| frag.state == crate::fragment::FragmentState::Downloading)
-                        .unwrap_or(0);
-                    if let Some(frag) = self.fragments.get_mut(failed_index) {
-                        frag.mark_failed();
+                Ok(ok) => ok,
+                Err((failed_index, e)) => {
+                    // spawn 内部已耗尽重试,这里精确标记真正失败的分片为终态
+                    if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
+                        frag.force_fail();
                     }
                     self.state = DownloadState::Failed;
                     return Err(e);
@@ -711,6 +786,99 @@ impl DownloadTask {
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");
         Ok(())
+    }
+
+    /// 下载单个分片(一次尝试)
+    ///
+    /// 由 `execute_fragmented_download` 的 spawn 重试循环调用。
+    /// 成功返回 `(已写入字节数, 耗时)`;失败返回错误(由调用方决定是否重试)。
+    /// 分片整体完成时通过 `progress_tx` 发送 `completed: true`,触发上层 checkpoint。
+    #[allow(clippy::too_many_arguments)]
+    async fn download_single_fragment(
+        protocol: &Arc<dyn Protocol>,
+        storage: &Arc<StorageKind>,
+        pool: &Option<Arc<ConnectionPool>>,
+        host: &str,
+        url: &str,
+        frag_index: u32,
+        frag_start: u64,
+        frag_end: u64,
+        pause_timeout: Duration,
+        control_rx: &Option<watch::Receiver<DownloadState>>,
+        progress_tx: &Option<tokio::sync::mpsc::UnboundedSender<FragmentProgress>>,
+    ) -> QfResult<(u64, Duration)> {
+        let mut control_rx = control_rx.clone();
+
+        // 真实 I/O 前检查暂停/取消
+        if let Some(rx) = control_rx.as_mut() {
+            Self::wait_control_rx(rx, pause_timeout).await?;
+        }
+
+        // 获取连接许可,持有到本次尝试结束(全局 + 单主机限流真实生效)
+        let _pool_permit = match pool {
+            Some(pool) => Some(pool.acquire(host).await?),
+            None => None,
+        };
+
+        let start_instant = std::time::Instant::now();
+        debug!(
+            index = frag_index,
+            start = frag_start,
+            end = frag_end,
+            "开始下载分片"
+        );
+
+        let stream = if let Some(rx) = control_rx.as_mut() {
+            tokio::select! {
+                result = protocol.download_range_stream(url, frag_start, frag_end) => result?,
+                control = Self::watch_for_interrupt(rx, pause_timeout) => {
+                    control?;
+                    return Err(QfError::Other("控制信号异常结束".into()));
+                }
+            }
+        } else {
+            protocol
+                .download_range_stream(url, frag_start, frag_end)
+                .await?
+        };
+
+        let mut pos = frag_start;
+        let mut total_written: u64 = 0;
+        tokio::pin!(stream);
+        while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
+            if let Some(rx) = control_rx.as_mut() {
+                Self::wait_control_rx(rx, pause_timeout).await?;
+            }
+            let chunk = chunk_result?;
+            let written = storage.write_at(pos, &chunk).await?;
+            pos += written as u64;
+            total_written += written as u64;
+            // 增量进度回调(非完成)
+            if let Some(tx) = progress_tx {
+                let _ = tx.send(FragmentProgress {
+                    fragment_index: frag_index,
+                    completed: false,
+                });
+            }
+        }
+
+        let elapsed = start_instant.elapsed();
+
+        // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
+        if let Some(tx) = progress_tx {
+            let _ = tx.send(FragmentProgress {
+                fragment_index: frag_index,
+                completed: true,
+            });
+        }
+
+        info!(
+            index = frag_index,
+            written = total_written as usize,
+            elapsed_ms = elapsed.as_millis(),
+            "分片下载完成"
+        );
+        Ok((total_written, elapsed))
     }
 
     // ----- 步骤 5: 校验 -----
@@ -1564,6 +1732,7 @@ mod tests {
         let mut task = DownloadTask::new_for_test(
             "http://example.com/fail.bin".into(),
             DownloadConfig {
+                max_retries: 0, // 禁用重试:验证"分片失败即整体失败"的传播契约
                 verify_checksum: false,
                 ..test_config()
             },
@@ -1577,7 +1746,7 @@ mod tests {
         task.plan().unwrap();
         task.prepare_storage().await.unwrap();
 
-        // 执行应失败(分片 1 下载错误)
+        // 执行应失败(分片 1 下载错误,max_retries=0 不重试)
         let result = task.execute().await;
         assert!(result.is_err(), "并发分片下载中任一分片失败应导致整体失败");
         // 验证错误信息包含网络故障描述
@@ -2178,5 +2347,319 @@ mod tests {
         let can_retry = record.mark_failed();
         assert!(can_retry);
         assert_eq!(record.state, FragmentState::Pending);
+    }
+
+    // ------ 回归: control_rx=Downloading 时下载不应被误判为"控制信号异常结束" ------
+
+    /// 回归测试 P0-1:协作式控制通道初始值为 Downloading(生产路径如此),
+    /// 此前 `wait_control_rx` 在 Downloading 下同步立即返回 Ok,
+    /// 导致 `tokio::select!` 抢占下载分支并误判失败。
+    /// 修复后 `watch_for_interrupt` 在正常状态下挂起,下载应正常完成。
+    #[tokio::test]
+    async fn test_control_downloading_does_not_abort_fragmented_download() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 3;
+        let meta = test_metadata("ctrl.bin", total_size);
+        let mut mock = MockProto::new(meta);
+        for i in 0..3u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xC0 | i as u8; frag_size as usize]),
+            );
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/ctrl.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 3,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            qf_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                ..Default::default()
+            },
+        );
+        // 生产路径的初始控制状态正是 Downloading
+        let (_tx, rx) = watch::channel(DownloadState::Downloading);
+        task.set_control_rx(rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute()
+            .await
+            .expect("Downloading 控制状态不应导致下载失败");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// 回归测试 P0-1(整块下载路径):不支持 Range + control_rx=Downloading 时应正常完成。
+    #[tokio::test]
+    async fn test_control_downloading_does_not_abort_full_download() {
+        let data = Bytes::from_static(b"control downloading full path");
+        let meta = FileMetadata {
+            file_name: "ctrl_full.bin".into(),
+            file_size: Some(data.len() as u64),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+        );
+        let (_tx, rx) = watch::channel(DownloadState::Downloading);
+        task.set_control_rx(rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute()
+            .await
+            .expect("Downloading 控制状态不应导致整块下载失败");
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    // ====== P0-2 重试 / P0-3 续传 / P1-6 失败归因 独立验证 ======
+
+    /// 测试协议:指定分片索引的前 N 次 range 请求失败,之后成功。
+    /// 用于验证 spawn 内部重试循环。
+    struct FlakyFragmentProtocol {
+        meta: FileMetadata,
+        frag_size: u64,
+        /// 对哪个分片(按 start 偏移判定)注入失败
+        fail_start: u64,
+        /// 该分片失败几次后转为成功
+        fail_times: u32,
+        attempts: Arc<AtomicU32>,
+    }
+
+    impl Clone for FlakyFragmentProtocol {
+        fn clone(&self) -> Self {
+            Self {
+                meta: self.meta.clone(),
+                frag_size: self.frag_size,
+                fail_start: self.fail_start,
+                fail_times: self.fail_times,
+                attempts: Arc::clone(&self.attempts),
+            }
+        }
+    }
+
+    impl Protocol for FlakyFragmentProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+            let fail_start = self.fail_start;
+            let fail_times = self.fail_times;
+            let attempts = Arc::clone(&self.attempts);
+            let size = (end - start + 1) as usize;
+            Box::pin(async move {
+                if start == fail_start {
+                    let n = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                    if n < fail_times {
+                        return Err(QfError::Network(format!("分片 {start} 模拟故障 #{n}")));
+                    }
+                }
+                Ok(Bytes::from(vec![0xAB; size]))
+            })
+        }
+
+        fn download_range_stream(
+            &self,
+            url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<ByteStream>> + Send>>
+        {
+            let this = self.clone();
+            let url = url.to_owned();
+            Box::pin(async move {
+                let data = this.download_range(&url, start, end).await?;
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QfResult<Bytes>> + Send>> {
+            Box::pin(async move { Ok(Bytes::new()) })
+        }
+    }
+
+    fn flaky_task(
+        protocol: Arc<dyn Protocol>,
+        total: u64,
+        frag_size: u64,
+        max_retries: u32,
+    ) -> DownloadTask {
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/flaky.bin".into(),
+            DownloadConfig {
+                max_retries,
+                max_concurrent_fragments: 4,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            qf_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                ..Default::default()
+            },
+        );
+        task
+    }
+
+    /// P0-2:单个分片前 2 次失败、第 3 次成功,在 max_retries=3 下应整体成功。
+    #[tokio::test]
+    async fn test_fragment_auto_retry_succeeds_within_limit() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("flaky.bin", total),
+            frag_size,
+            fail_start: frag_size, // 第 2 个分片失败
+            fail_times: 2,
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 3);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("重试上限内应自动恢复并成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// P0-2 + P1-6:失败次数超过 max_retries,应整体失败,
+    /// 且被标记 Failed 的恰好是真正失败的那个分片(归因正确)。
+    #[tokio::test]
+    async fn test_fragment_retry_exhausted_marks_correct_fragment() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        // 第 3 个分片(start=200)始终失败,超过 max_retries=1(共 2 次尝试)
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("flaky.bin", total),
+            frag_size,
+            fail_start: 2 * frag_size,
+            fail_times: u32::MAX, // 永远失败
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 1);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        let result = task.execute().await;
+        assert!(result.is_err(), "重试耗尽应整体失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+
+        // 失败的应是 index=2 那个分片(start=200),而非张冠李戴到 index 0
+        let failed: Vec<u32> = task
+            .fragments
+            .iter()
+            .filter(|f| f.state == FragmentState::Failed)
+            .map(|f| f.info.index)
+            .collect();
+        assert_eq!(failed, vec![2], "应精确标记真正失败的分片 index=2");
+    }
+
+    /// P0-3:注入已完成分片后,plan() 应跳过它们的下载,且 progress 反映已完成部分。
+    #[tokio::test]
+    async fn test_resume_skips_completed_fragments() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        // 协议对"被跳过的分片"若被请求会 panic 计数;这里让 start=0 分片一旦被下载就失败,
+        // 用以证明它确实未被下载(已通过续传跳过)。
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("flaky.bin", total),
+            frag_size,
+            fail_start: 0,        // 若 index 0 被真实下载会失败
+            fail_times: u32::MAX, // 始终失败
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 0);
+
+        task.probe().await.unwrap();
+        // 注入:index 0 已完成 → 应跳过下载(否则会因 fail_start=0 失败)
+        task.set_completed_fragments(vec![0]);
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute()
+            .await
+            .expect("已完成分片应被跳过,其余分片成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+
+        // index 0 应为 Done 且 downloaded == size(续传标记)
+        let frag0 = &task.fragments[0];
+        assert_eq!(frag0.state, FragmentState::Done);
+        assert_eq!(frag0.info.downloaded, frag0.info.size);
+    }
+
+    /// P0-3:续传后整体 progress 正确(已完成分片计入)。
+    #[tokio::test]
+    async fn test_resume_progress_reflects_completed() {
+        let frag_size = 100u64;
+        let total = frag_size * 4;
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("flaky.bin", total),
+            frag_size,
+            fail_start: u64::MAX, // 不注入失败
+            fail_times: 0,
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 0);
+
+        task.probe().await.unwrap();
+        task.set_completed_fragments(vec![0, 1]); // 一半已完成
+        task.plan().unwrap();
+        // 下载前进度应已反映 2/4 完成
+        assert!(
+            (task.progress() - 0.5).abs() < 0.001,
+            "续传后下载前进度应为 0.5,实际 {}",
+            task.progress()
+        );
+
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("其余分片应成功下载");
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON);
     }
 }

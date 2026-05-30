@@ -122,6 +122,14 @@ impl FragmentRecord {
         }
     }
 
+    /// 强制标记为最终失败状态(不可重试)
+    ///
+    /// 用于上层(如 spawn 内部重试循环)已确认重试耗尽、需要将分片置为终态时。
+    /// 与 `mark_failed` 不同,本方法不参与"是否可重试"判定,直接转入 `Failed`。
+    pub fn force_fail(&mut self) {
+        self.state = FragmentState::Failed;
+    }
+
     /// 是否已完成
     pub fn is_done(&self) -> bool {
         self.state == FragmentState::Done

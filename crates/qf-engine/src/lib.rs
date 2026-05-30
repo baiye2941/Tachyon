@@ -12,7 +12,7 @@ pub mod fragment;
 pub mod orchestrator;
 
 pub use connection::{ConnectionPool, PoolConfig};
-pub use downloader::{DownloadTask, StorageKind, VerifierKind};
+pub use downloader::{DownloadTask, FragmentProgress, StorageKind, VerifierKind};
 pub use fragment::{BandwidthTracker, FragmentRecord, FragmentState};
 pub use orchestrator::DownloadOrchestrator;
 

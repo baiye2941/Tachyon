@@ -353,6 +353,18 @@ async fn task_fn(
         };
     download_task.set_control_rx(control_rx.clone());
 
+    // 断点续传:若存在已保存快照,注入已完成分片索引,plan() 后将跳过这些分片
+    if let Ok(Some(snapshot)) = state.task_store.load_snapshot(&task_id)
+        && !snapshot.completed_fragments.is_empty()
+    {
+        tracing::info!(
+            task_id = %task_id,
+            completed = snapshot.completed_fragments.len(),
+            "断点续传:注入已完成分片"
+        );
+        download_task.set_completed_fragments(snapshot.completed_fragments);
+    }
+
     if *control_rx.borrow() == DownloadState::Cancelled {
         cleanup_runtime(&state, &task_id);
         return;
@@ -419,7 +431,8 @@ async fn task_fn(
         }
     }
 
-    let (chunk_progress_tx, mut chunk_progress_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (chunk_progress_tx, mut chunk_progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<qf_engine::FragmentProgress>();
     download_task.set_progress_sender(chunk_progress_tx);
 
     let download_task = Arc::new(tokio::sync::Mutex::new(download_task));
@@ -433,7 +446,9 @@ async fn task_fn(
     let chunk_tid = task_id.clone();
     let chunk_dt = download_task.clone();
     tokio::spawn(async move {
-        while chunk_progress_rx.recv().await.is_some() {
+        // 已完成分片集合,用于断点续传 checkpoint
+        let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        while let Some(progress) = chunk_progress_rx.recv().await {
             let dt = chunk_dt.lock().await;
             let downloaded = dt
                 .fragment_infos()
@@ -441,9 +456,23 @@ async fn task_fn(
                 .map(|f| f.downloaded)
                 .sum::<u64>();
             drop(dt);
-            let mut store = chunk_state.tasks.lock().await;
-            if let Some(task) = store.get_mut(&chunk_tid) {
-                task.downloaded = downloaded;
+            {
+                let mut store = chunk_state.tasks.lock().await;
+                if let Some(task) = store.get_mut(&chunk_tid) {
+                    task.downloaded = downloaded;
+                }
+            }
+
+            // 分片整体完成:更新 completed_fragments 并 checkpoint 落盘(断点续传)
+            if progress.completed {
+                completed.insert(progress.fragment_index);
+                if let Ok(Some(mut snapshot)) = chunk_state.task_store.load_snapshot(&chunk_tid) {
+                    snapshot.completed_fragments = completed.iter().copied().collect();
+                    snapshot.downloaded = downloaded;
+                    if let Err(e) = chunk_state.task_store.save_snapshot(&snapshot) {
+                        tracing::warn!(task_id = %chunk_tid, error = %e, "checkpoint 落盘失败");
+                    }
+                }
             }
         }
     });
