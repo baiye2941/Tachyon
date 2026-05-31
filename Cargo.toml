@@ -49,7 +49,7 @@ blake3 = "1"
 sha2 = "0.10"
 
 # GPU
-wgpu = "24"
+wgpu = "29"
 
 # FTP
 suppaftp = { version = "8", features = ["tokio"] }
