@@ -134,6 +134,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "amd-hub"
+version = "0.1.0"
+dependencies = [
+ "amd-core",
+ "amd-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "amd-io"
 version = "0.1.0"
 dependencies = [

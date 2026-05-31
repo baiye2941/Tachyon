@@ -23,6 +23,14 @@ impl DownloadSource {
             DownloadSource::Peer { addr } => addr,
         }
     }
+
+    /// 获取 CDN 源的下载 URL，Peer 源返回 None
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            DownloadSource::Cdn { url } => Some(url),
+            DownloadSource::Peer { .. } => None,
+        }
+    }
 }
 
 /// 源选择器,为每个分片选择最优下载源

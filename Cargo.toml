@@ -10,6 +10,7 @@ members = [
     "crates/amd-crypto",
     "crates/amd-p2sp",
     "crates/amd-store",
+    "crates/amd-hub",
     "crates/amd-app",
 ]
 
