@@ -1370,6 +1370,13 @@ mod tests {
     use amd_core::config::USER_AGENT;
     use amd_core::filename::parse_content_disposition;
 
+    /// 创建临时测试路径，在所有平台上均有效
+    fn test_tmp_path(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("amd-test-{name}"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.to_string_lossy().to_string()
+    }
+
     fn make_test_app_config(
         max_concurrent_tasks: u32,
         download_dir: &str,
@@ -2119,7 +2126,7 @@ mod tests {
     async fn test_update_config_rejects_zero_max_concurrent_tasks() {
         let state = test_state();
         let result =
-            update_config_inner(&state, make_test_app_config(0, "/tmp", 16, 16, false, true)).await;
+            update_config_inner(&state, make_test_app_config(0, &test_tmp_path("z"), 16, 16, false, true)).await;
         assert!(result.is_err());
         assert!(
             result
@@ -2133,7 +2140,7 @@ mod tests {
     async fn test_update_config_rejects_zero_max_concurrent_fragments() {
         let state = test_state();
         let result =
-            update_config_inner(&state, make_test_app_config(5, "/tmp", 0, 16, false, true)).await;
+            update_config_inner(&state, make_test_app_config(5, &test_tmp_path("a"), 0, 16, false, true)).await;
         assert!(result.is_err());
         assert!(
             result
@@ -2148,7 +2155,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(65, "/tmp", 16, 16, false, true),
+            make_test_app_config(65, &test_tmp_path("b"), 16, 16, false, true),
         )
         .await;
         assert!(result.is_err());
@@ -2164,7 +2171,7 @@ mod tests {
     async fn test_update_config_rejects_too_large_fragments() {
         let state = test_state();
         let result =
-            update_config_inner(&state, make_test_app_config(5, "/tmp", 33, 16, false, true)).await;
+            update_config_inner(&state, make_test_app_config(5, &test_tmp_path("c"), 33, 16, false, true)).await;
         assert!(result.is_err());
         assert!(
             result
@@ -2187,12 +2194,12 @@ mod tests {
     async fn test_update_config_accepts_valid_boundary_values() {
         let state = test_state();
         let result =
-            update_config_inner(&state, make_test_app_config(1, "/tmp", 1, 1, false, true)).await;
+            update_config_inner(&state, make_test_app_config(1, &test_tmp_path("d"), 1, 1, false, true)).await;
         assert!(result.is_ok());
 
         let result = update_config_inner(
             &state,
-            make_test_app_config(64, "/tmp", 32, 16, false, true),
+            make_test_app_config(64, &test_tmp_path("e"), 32, 16, false, true),
         )
         .await;
         assert!(result.is_ok());
@@ -2502,7 +2509,7 @@ mod tests {
     fn test_authorize_download_dir_rejects_nonexistent_dir() {
         let mut config = AppConfig::default();
         config.download.download_dir = "/nonexistent/path".to_string();
-        config.download.authorized_dirs = vec!["/tmp".to_string()];
+        config.download.authorized_dirs = vec![test_tmp_path("nonexist")];
 
         let err = authorize_download_dir(&config, "/nonexistent/path").unwrap_err();
         // 当请求目录不存在且不在授权列表中时,应拒绝
