@@ -2066,6 +2066,12 @@ mod tests {
         {
             let mut cfg = state.config.lock().await;
             cfg.max_concurrent_tasks = 2;
+            // 设置有效下载目录，确保 authorized_dirs 校验通过
+            let test_dir = std::env::temp_dir().join("amd-test-concurrent");
+            let test_dir_str = test_dir.to_string_lossy().to_string();
+            let _ = std::fs::create_dir_all(&test_dir);
+            cfg.download.download_dir = test_dir_str.clone();
+            cfg.download.authorized_dirs = vec![test_dir_str];
         }
         let _id1 = create_task_inner(&state, "http://example.com/gate1.bin".into(), None)
             .await
@@ -2088,6 +2094,12 @@ mod tests {
         {
             let mut cfg = state.config.lock().await;
             cfg.max_concurrent_tasks = 2;
+            // 设置有效下载目录，确保 authorized_dirs 校验通过
+            let test_dir = std::env::temp_dir().join("amd-test-rejects");
+            let test_dir_str = test_dir.to_string_lossy().to_string();
+            let _ = std::fs::create_dir_all(&test_dir);
+            cfg.download.download_dir = test_dir_str.clone();
+            cfg.download.authorized_dirs = vec![test_dir_str];
         }
         let _id1 = create_task_inner(&state, "http://example.com/file1.bin".into(), None)
             .await
