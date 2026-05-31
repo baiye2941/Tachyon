@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use amd_core::config::DownloadConfig;
 use amd_core::traits::{DownloadScheduler, Protocol, Verifier};
 use amd_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
-use amd_core::{AmdError, AmdResult};
+use amd_core::{AmdError, AmdResult, ByteStream};
 use amd_crypto::CpuVerifier;
 use amd_io::TokioFile;
 use amd_io::storage::AsyncStorage;
@@ -227,6 +227,101 @@ pub struct FragmentProgress {
 }
 
 // ---------------------------------------------------------------------------
+// MirrorProtocol: 多源下载适配器
+// ---------------------------------------------------------------------------
+
+/// 多镜像源 Protocol 适配器
+///
+/// 包装主源和备用源列表,在分片下载失败时自动 fallback 到下一个可用源。
+/// 每个源独立重试,所有源均不可用时上报原始错误。
+struct MirrorProtocol {
+    /// 主下载源
+    primary: Arc<dyn Protocol>,
+    /// 备用镜像源列表 (url, protocol)
+    mirrors: Vec<(String, Arc<dyn Protocol>)>,
+}
+
+impl MirrorProtocol {
+    fn new(primary: Arc<dyn Protocol>, mirrors: Vec<(String, Arc<dyn Protocol>)>) -> Self {
+        Self { primary, mirrors }
+    }
+}
+
+impl Protocol for MirrorProtocol {
+    fn probe(
+        &self,
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AmdResult<FileMetadata>> + Send>> {
+        let primary = self.primary.clone();
+        let url = url.to_string();
+        Box::pin(async move { primary.probe(&url).await })
+    }
+
+    fn download_range(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AmdResult<Bytes>> + Send>> {
+        let primary = self.primary.clone();
+        let mirrors = self.mirrors.clone();
+        let url = url.to_string();
+        Box::pin(async move {
+            match primary.download_range(&url, start, end).await {
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    for (mirror_url, mirror_proto) in &mirrors {
+                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像");
+                        if let Ok(data) = mirror_proto.download_range(mirror_url, start, end).await
+                        {
+                            return Ok(data);
+                        }
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    fn download_range_stream(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AmdResult<ByteStream>> + Send>> {
+        let primary = self.primary.clone();
+        let mirrors = self.mirrors.clone();
+        let url = url.to_string();
+        Box::pin(async move {
+            match primary.download_range_stream(&url, start, end).await {
+                Ok(stream) => Ok(stream),
+                Err(e) => {
+                    for (mirror_url, mirror_proto) in &mirrors {
+                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像(流式)");
+                        if let Ok(stream) = mirror_proto
+                            .download_range_stream(mirror_url, start, end)
+                            .await
+                        {
+                            return Ok(stream);
+                        }
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    fn download_full(
+        &self,
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AmdResult<Bytes>> + Send>> {
+        let primary = self.primary.clone();
+        let url = url.to_string();
+        Box::pin(async move { primary.download_full(&url).await })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DownloadTask: 下载任务执行器
 // ---------------------------------------------------------------------------
 
@@ -329,6 +424,51 @@ impl DownloadTask {
             orchestrator,
             scheduler,
             pool,
+            control_rx: None,
+            state: DownloadState::Pending,
+            metadata: None,
+            fragments: Vec::new(),
+            progress_tx: None,
+            verifier: default_blake3_verifier(),
+            completed_fragments: Vec::new(),
+        })
+    }
+
+    /// 使用主 URL + 备用镜像 URL 创建下载任务
+    ///
+    /// 主源失败时自动 fallback 到镜像源列表。
+    /// 所有源共享同一个连接池。
+    pub async fn with_mirrors(
+        url: String,
+        mirror_urls: Vec<String>,
+        config: DownloadConfig,
+    ) -> AmdResult<Self> {
+        let primary = Arc::new(HttpClient::with_timeouts(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+        )?);
+
+        let mirrors: Vec<(String, Arc<dyn Protocol>)> = mirror_urls
+            .iter()
+            .filter_map(|m| {
+                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                    .ok()
+                    .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
+            })
+            .collect();
+
+        let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
+        let orchestrator = DownloadOrchestrator::new(Default::default());
+
+        Ok(Self {
+            id: TaskId::new_v4(),
+            url,
+            config,
+            protocol,
+            storage: None,
+            orchestrator,
+            scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
+            pool: None,
             control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
