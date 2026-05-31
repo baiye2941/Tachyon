@@ -362,31 +362,23 @@ impl IoUringStorage {
                 .build();
 
         // 提交 SQ (Mutex lock 提供内部可变性)
-        let mut uring = ring.ring.lock().map_err(|e| {
-            AmdError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        let mut uring = ring
+            .ring
+            .lock()
+            .map_err(|e| AmdError::Io(std::io::Error::other(e.to_string())))?;
         let mut sq = uring.submission();
         unsafe {
-            sq.push(&write_op).map_err(|_| {
-                AmdError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "io_uring 提交队列已满",
-                ))
-            })?;
+            sq.push(&write_op)
+                .map_err(|_| AmdError::Io(std::io::Error::other("io_uring 提交队列已满")))?;
         }
         sq.sync();
         drop(sq);
 
         // 等待 CQE
-        let cqe = uring.completion().next().ok_or_else(|| {
-            AmdError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "io_uring 完成队列已关闭",
-            ))
-        })?;
+        let cqe = uring
+            .completion()
+            .next()
+            .ok_or_else(|| AmdError::Io(std::io::Error::other("io_uring 完成队列已关闭")))?;
         let result = cqe.result();
         if result < 0 {
             return Err(AmdError::Io(std::io::Error::from_raw_os_error(-result)));
