@@ -15,7 +15,7 @@ export default function Sidebar(props: {
 }) {
   const [hovered, setHovered] = createSignal(false)
   const activeTasks = $activeTasks.get()
-  const totalSpeed = $totalSpeed()
+  const totalSpeed = $totalSpeed.get()
 
   return (
     <div
