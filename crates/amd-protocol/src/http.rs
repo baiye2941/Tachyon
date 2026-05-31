@@ -40,6 +40,19 @@ impl HttpClient {
     /// - 连接超时防止连接黑洞 IP 永久挂起
     /// - 读取超时防止连接后静默断流,但不会误杀正常的长下载
     pub fn with_timeouts(connect_secs: u64, read_secs: u64) -> AmdResult<Self> {
+        Self::build_client(connect_secs, read_secs, false)
+    }
+
+    /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制)
+    pub fn with_connection_config(
+        config: &amd_core::config::ConnectionConfig,
+        connect_secs: u64,
+        read_secs: u64,
+    ) -> AmdResult<Self> {
+        Self::build_client(connect_secs, read_secs, config.enable_http2)
+    }
+
+    fn build_client(connect_secs: u64, read_secs: u64, enable_http2: bool) -> AmdResult<Self> {
         let mut builder = Client::builder()
             .user_agent(amd_core::config::USER_AGENT)
             .pool_max_idle_per_host(16)
@@ -53,6 +66,9 @@ impl HttpClient {
         }
         if read_secs > 0 {
             builder = builder.read_timeout(std::time::Duration::from_secs(read_secs));
+        }
+        if enable_http2 {
+            builder = builder.http2_adaptive_window(true);
         }
 
         let client = builder

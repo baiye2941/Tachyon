@@ -1397,6 +1397,7 @@ mod tests {
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
+                rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec![download_dir.to_string()],
             },
             connection: amd_core::config::ConnectionConfig {
@@ -1669,6 +1670,7 @@ mod tests {
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
+                rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec![dl_dir_str.clone()],
             },
             connection: amd_core::config::ConnectionConfig {
@@ -1993,6 +1995,7 @@ mod tests {
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
+                rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec!["/tmp".to_string()],
             },
             connection: amd_core::config::ConnectionConfig {

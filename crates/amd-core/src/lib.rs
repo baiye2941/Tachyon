@@ -187,6 +187,7 @@ fn app_config() {
         user_agent: "AI Model Downloader/Test".to_string(),
         headers: std::collections::HashMap::new(),
         pause_timeout_secs: 300,
+        rate_limit_bytes_per_sec: None,
         authorized_dirs: vec!["/tmp/test".to_string()],
     };
     assert_eq!(cfg.download_dir, "/tmp/test");

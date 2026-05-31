@@ -245,6 +245,7 @@ pub mod harness {
             user_agent: "AI Model Downloader-Test/0.1.0".into(),
             headers: HashMap::new(),
             pause_timeout_secs: 300,
+            rate_limit_bytes_per_sec: None,
             authorized_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
         }
     }

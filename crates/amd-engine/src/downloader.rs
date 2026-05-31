@@ -251,6 +251,7 @@ pub struct DownloadTask {
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
     progress_tx: Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
+    #[allow(dead_code)]
     verifier: VerifierKind,
     completed_fragments: Vec<u32>,
 }
@@ -1032,16 +1033,16 @@ impl DownloadTask {
                 let mut offset = frag.info.start;
                 let end = frag.info.start + frag.info.size;
                 let mut buf = vec![0u8; chunk_size];
-                let mut hash_data = Vec::new();
+                let mut hasher = blake3::Hasher::new();
 
                 while offset < end {
                     let read_len = ((end - offset).min(chunk_size as u64)) as usize;
                     let read = storage.read_at(offset, &mut buf[..read_len]).await?;
-                    hash_data.extend_from_slice(&buf[..read]);
+                    hasher.update(&buf[..read]);
                     offset += read as u64;
                 }
 
-                let computed = self.verifier.compute_hash(&hash_data)?;
+                let computed = hasher.finalize().to_hex().to_string();
 
                 if computed != *expected_hash {
                     warn!(

@@ -28,6 +28,9 @@ pub struct DownloadConfig {
     pub pause_timeout_secs: u64,
     /// 后端允许写入的下载目录列表
     pub authorized_dirs: Vec<String>,
+    /// 全局下载限速(字节/秒)，None 表示不限速
+    #[serde(default)]
+    pub rate_limit_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +48,8 @@ struct DownloadConfigSerde {
     #[serde(default = "default_pause_timeout_secs")]
     pause_timeout_secs: u64,
     authorized_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    rate_limit_bytes_per_sec: Option<u64>,
 }
 
 fn default_pause_timeout_secs() -> u64 {
@@ -70,6 +75,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             user_agent: value.user_agent,
             headers: value.headers,
             pause_timeout_secs: value.pause_timeout_secs,
+            rate_limit_bytes_per_sec: value.rate_limit_bytes_per_sec,
             authorized_dirs,
         }
     }
@@ -90,6 +96,7 @@ impl Default for DownloadConfig {
             user_agent: USER_AGENT.to_string(),
             headers: std::collections::HashMap::new(),
             pause_timeout_secs: 300,
+            rate_limit_bytes_per_sec: None,
             authorized_dirs: vec![download_dir],
         }
     }
@@ -273,6 +280,43 @@ mod tests {
     fn test_download_config_pause_timeout_default() {
         let config = DownloadConfig::default();
         assert_eq!(config.pause_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_download_config_rate_limit_default_is_none() {
+        let config = DownloadConfig::default();
+        assert_eq!(config.rate_limit_bytes_per_sec, None);
+    }
+
+    #[test]
+    fn test_download_config_deserializes_with_rate_limit() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "rateLimitBytesPerSec":1048576
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.rate_limit_bytes_per_sec, Some(1_048_576));
+    }
+
+    #[test]
+    fn test_download_config_deserializes_without_rate_limit() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.rate_limit_bytes_per_sec, None);
     }
 
     #[test]
