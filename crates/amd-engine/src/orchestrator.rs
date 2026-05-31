@@ -86,7 +86,7 @@ impl DownloadOrchestrator {
                     bandwidth_bps,
                     self.scheduler_config.min_fragment_size,
                     self.scheduler_config.max_fragment_size,
-                    self.pool.config().max_global,
+                    self.scheduler_config.default_target_fragments,
                 )
             }
         };
@@ -338,6 +338,7 @@ mod tests {
             max_fragment_size: 32 * 1024 * 1024, // 32MB
             sampling_interval_secs: 30,
             ewma_alpha: 0.5,
+            ..Default::default()
         };
         let orch =
             DownloadOrchestrator::with_scheduler_config(PoolConfig::default(), config.clone());
@@ -403,6 +404,30 @@ mod tests {
             frags_zero.len(),
             frags_none.len(),
             "suggested=0 应与 None 结果一致"
+        );
+    }
+
+    #[test]
+    fn test_plan_fragments_uses_scheduler_target_not_pool_max() {
+        let config = SchedulerConfig {
+            min_fragment_size: 1024 * 1024,
+            max_fragment_size: 64 * 1024 * 1024,
+            default_target_fragments: 100,
+            ..Default::default()
+        };
+        let pool_config = PoolConfig {
+            max_per_host: 8,
+            max_global: 4,
+        };
+        let orch = DownloadOrchestrator::with_scheduler_config(pool_config, config);
+
+        // 10MB file, 100 target fragments -> 102KB per fragment -> clamped to min 1MB -> 10 fragments
+        // If max_global=4 was used as target_fragments: 10MB/4 = 2.5MB -> still clamped -> 4 fragments
+        let frags = orch.plan_fragments(10 * 1024 * 1024, true, None);
+        assert_eq!(
+            frags.len(),
+            10,
+            "应使用 SchedulerConfig::default_target_fragments 而非 PoolConfig::max_global"
         );
     }
 }
