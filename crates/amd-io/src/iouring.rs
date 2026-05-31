@@ -357,13 +357,13 @@ impl IoUringStorage {
         // 构造 IORING_OP_WRITE SQE
         let write_op =
             io_uring::opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), len as u32)
-                .offset(offset as i64)
+                .offset(offset)
                 .build();
 
         // 提交 SQ
         let mut sq = ring._ring.submission();
         unsafe {
-            sq.push(write_op).map_err(|_| {
+            sq.push(&write_op).map_err(|_| {
                 AmdError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "io_uring 提交队列已满",
