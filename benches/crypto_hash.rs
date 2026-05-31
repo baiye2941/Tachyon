@@ -3,9 +3,9 @@
 //! 对比不同数据大小下 blake3 和 sha256 的吞吐量,
 //! 用于验证 blake3 在大数据量下的性能优势。
 
+use amd_core::traits::Verifier;
+use amd_crypto::cpu::CpuVerifier;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use qf_core::traits::Verifier;
-use qf_crypto::cpu::CpuVerifier;
 
 /// 测试数据大小(字节):1KB / 64KB / 1MB / 16MB
 const DATA_SIZES: &[usize] = &[1024, 65536, 1048576, 16777216];

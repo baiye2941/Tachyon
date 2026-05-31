@@ -1,6 +1,6 @@
 import { createSignal } from 'solid-js'
 import { api } from '../api/invoke'
-import { $tasks } from '../stores/downloads'
+import { $tasks, setTasks } from '../stores/downloads'
 
 export default function Topbar() {
   const [url, setUrl] = createSignal('')
@@ -8,7 +8,7 @@ export default function Topbar() {
   async function refreshTaskList() {
     try {
       const tasks = await api.getTaskList()
-      $tasks.set(tasks)
+      setTasks(tasks)
     } catch (e) {
       console.error('刷新任务列表失败:', e)
     }
@@ -33,19 +33,32 @@ export default function Topbar() {
   }
 
   return (
-    <div class="topbar">
-      <div class="url-bar">
+    <div class="flex items-center gap-2.5 px-5 py-3 border-b border-white/6">
+      <div class="flex-1 flex gap-2">
         <input
           type="text"
           value={url()}
           onInput={(e) => setUrl(e.currentTarget.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') startDownload() }}
-          placeholder="粘贴下载链接,支持 HTTP/HTTPS/FTP/QUIC..."
+          placeholder="粘贴下载链接,支持 HTTP/HTTPS"
           aria-label="下载链接输入"
+          class="flex-1 px-3 py-2 bg-surface border border-white/6 rounded text-[13px] font-mono text-text-primary placeholder:text-text-tertiary placeholder:font-sans outline-none focus:border-accent transition-colors duration-150"
         />
-        <button class="btn btn-primary" onClick={startDownload} aria-label="开始下载">开始下载</button>
+        <button
+          class="px-4 py-2 bg-accent text-canvas text-[12px] font-semibold rounded hover:opacity-85 active:scale-[0.98] transition-all duration-100"
+          onClick={startDownload}
+          aria-label="开始下载"
+        >
+          开始下载
+        </button>
       </div>
-      <button class="btn btn-ghost" onClick={pauseAll} aria-label="暂停所有下载任务">全部暂停</button>
+      <button
+        class="px-3 py-2 text-[12px] font-semibold text-text-secondary border border-white/6 rounded hover:text-text-primary hover:border-white/12 active:scale-[0.98] transition-all duration-100"
+        onClick={pauseAll}
+        aria-label="暂停所有下载任务"
+      >
+        全部暂停
+      </button>
     </div>
   )
 }

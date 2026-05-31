@@ -1,0 +1,45 @@
+# cargo-deny 配置
+# 参考: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# 全平台检查
+all-features = true
+
+[advisories]
+# 使用 RustSec 漏洞数据库
+version = 2
+# 忽略的已知漏洞(如需添加,格式如下)
+# ignore = ["RUSTSEC-2024-XXXX"]
+
+[licenses]
+version = 2
+# 允许的宽松许可证
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# 对未列出的许可证发出警告而非报错
+confidence-threshold = 0.8
+
+[bans]
+# 宽松模式:允许重复依赖(Rust 生态常见)
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# 仅允许来自 crates.io 的依赖
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-git = []

@@ -1,4 +1,4 @@
-import { Show, createSignal, onMount } from 'solid-js'
+import { For, Show, createSignal, onMount } from 'solid-js'
 import { api } from '../api/invoke'
 import { $config, $configLoading } from '../stores/settings'
 import Toggle from './Toggle'
@@ -134,9 +134,9 @@ export default function SettingsPanel() {
               onChange={(e) => setMinSize(Number(e.currentTarget.value))}
               style={{ width: '120px' }}
             >
-              {MIN_SIZE_OPTIONS.map((opt) => (
-                <option value={opt.value}>{opt.label}</option>
-              ))}
+              <For each={MIN_SIZE_OPTIONS}>
+                {(opt) => <option value={opt.value}>{opt.label}</option>}
+              </For>
             </select>
           </div>
         </div>
@@ -179,9 +179,9 @@ export default function SettingsPanel() {
               onChange={(e) => setAlgorithm(e.currentTarget.value)}
               style={{ width: '120px' }}
             >
-              {ALGORITHMS.map((alg) => (
-                <option value={alg}>{alg === 'blake3' ? 'Blake3' : 'SHA-256'}</option>
-              ))}
+              <For each={ALGORITHMS}>
+                {(alg) => <option value={alg}>{alg === 'blake3' ? 'Blake3' : 'SHA-256'}</option>}
+              </For>
             </select>
           </div>
         </div>

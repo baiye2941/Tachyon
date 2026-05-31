@@ -3,12 +3,12 @@
 //! 测试分片大小计算、EWMA 带宽追踪、Holt-Winters 预测器的 CPU 性能,
 //! 以及调度器优先级队列的吞吐量。
 
+use amd_core::types::FragmentInfo;
+use amd_engine::fragment::compute_fragment_size;
+use amd_engine::fragment::{BandwidthTracker, FragmentRecord};
+use amd_scheduler::predictor::HoltWintersPredictor;
+use amd_scheduler::scheduler::{Priority, ScheduledTask, Scheduler};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use qf_core::types::FragmentInfo;
-use qf_engine::fragment::compute_fragment_size;
-use qf_engine::fragment::{BandwidthTracker, FragmentRecord};
-use qf_scheduler::predictor::HoltWintersPredictor;
-use qf_scheduler::scheduler::{Priority, ScheduledTask, Scheduler};
 use std::time::Duration;
 
 // ---------- 辅助函数 ----------
@@ -28,7 +28,7 @@ fn make_fragment(index: u32, size: u64) -> FragmentInfo {
 /// 构造 ScheduledTask
 fn make_task(priority: Priority, size: u64, progress: f64) -> ScheduledTask {
     ScheduledTask {
-        task_id: qf_core::TaskId::new_v4(),
+        task_id: amd_core::TaskId::new_v4(),
         priority,
         file_size: size,
         progress,

@@ -1,0 +1,40 @@
+[package]
+name = "amd-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI Model Downloader Tauri 应用入口"
+
+[lib]
+name = "amd_app_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "aimd"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+amd-core = { path = "../amd-core" }
+amd-engine = { path = "../amd-engine" }
+amd-scheduler = { path = "../amd-scheduler" }
+amd-sniffer = { path = "../amd-sniffer" }
+amd-store = { path = "../amd-store" }
+tauri.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+uuid.workspace = true
+chrono.workspace = true
+url.workspace = true
+reqwest.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

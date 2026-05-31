@@ -1,32 +1,32 @@
 //! 端到端集成测试
 //!
 //! 测试跨 crate 交互:
-//! - qf-core 类型 -> qf-io 存储写入 -> qf-crypto 校验
+//! - amd-core 类型 -> amd-io 存储写入 -> amd-crypto 校验
 //! - 模拟完整下载流程: 创建分片 -> 写入数据 -> 校验哈希 -> 验证完成
 
-use bytes::Bytes;
-use qf_core::QfError;
-use qf_core::test_harness::harness::{
+use amd_core::AmdError;
+use amd_core::test_harness::harness::{
     MemoryStorage, MockProtocol, test_config, test_fragments, test_metadata,
 };
-use qf_core::traits::{Protocol, Storage, Verifier};
-use qf_core::types::{DownloadState, FragmentInfo};
-use qf_crypto::CpuVerifier;
-use qf_engine::fragment::compute_fragment_size;
-use qf_engine::fragment::{BandwidthTracker, FragmentRecord, FragmentState};
-use qf_io::AsyncStorage;
-use qf_io::buffer::BufferPool;
-use qf_io::pipeline::WritePipeline;
-use qf_io::tokio_file::TokioFile;
+use amd_core::traits::{Protocol, Storage, Verifier};
+use amd_core::types::{DownloadState, FragmentInfo};
+use amd_crypto::CpuVerifier;
+use amd_engine::fragment::compute_fragment_size;
+use amd_engine::fragment::{BandwidthTracker, FragmentRecord, FragmentState};
+use amd_io::AsyncStorage;
+use amd_io::buffer::BufferPool;
+use amd_io::pipeline::WritePipeline;
+use amd_io::tokio_file::TokioFile;
+use bytes::Bytes;
 use tempfile::NamedTempFile;
 
 // ============================================================
-// 跨 crate 流程: qf-core 类型 -> qf-io 存储 -> qf-crypto 校验
+// 跨 crate 流程: amd-core 类型 -> amd-io 存储 -> amd-crypto 校验
 // ============================================================
 
 /// 测试完整流程:创建分片 -> 写入存储 -> 计算哈希 -> 校验通过
 ///
-/// 验证 qf-core 的 FragmentInfo 与 qf-io 的 TokioFile 和 qf-crypto 的 CpuVerifier
+/// 验证 amd-core 的 FragmentInfo 与 amd-io 的 TokioFile 和 amd-crypto 的 CpuVerifier
 /// 协同工作。
 #[tokio::test]
 async fn integration_fragment_write_and_verify() {
@@ -42,7 +42,7 @@ async fn integration_fragment_write_and_verify() {
     for frag in &fragments {
         let data = vec![frag.index as u8; frag.size as usize];
         let written = storage
-            .write_at(frag.start, &data)
+            .write_at(frag.start, Bytes::copy_from_slice(&data))
             .await
             .expect("写入分片数据失败");
         assert_eq!(written, frag.size as usize);
@@ -98,7 +98,10 @@ async fn integration_memory_storage_full_flow() {
             .collect();
         expected_data[frag.start as usize..frag.start as usize + frag.size as usize]
             .copy_from_slice(&data);
-        let written = storage.write_at(frag.start, &data).await.unwrap();
+        let written = storage
+            .write_at(frag.start, Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
         assert_eq!(written, frag.size as usize);
     }
 
@@ -121,7 +124,7 @@ async fn integration_memory_storage_full_flow() {
     }
 }
 
-/// 测试数据篡改检测: 跨 qf-io 和 qf-crypto 验证
+/// 测试数据篡改检测: 跨 amd-io 和 amd-crypto 验证
 #[tokio::test]
 async fn integration_tamper_detection() {
     let tmp = NamedTempFile::new().unwrap();
@@ -129,7 +132,10 @@ async fn integration_tamper_detection() {
     let verifier = CpuVerifier::sha256();
 
     let original_data = b"integrity test data payload";
-    storage.write_at(0, original_data).await.unwrap();
+    storage
+        .write_at(0, Bytes::from_static(original_data))
+        .await
+        .unwrap();
     storage.sync().await.unwrap();
 
     // 计算原始哈希
@@ -172,8 +178,11 @@ async fn integration_mock_protocol_to_storage() {
 
     // 模拟每个分片的下载与写入
     for frag in &fragments {
-        let data = vec![0xAB_u8; frag.size as usize];
-        storage.write_at(frag.start, &data).await.unwrap();
+        let _data = vec![0xAB_u8; frag.size as usize];
+        storage
+            .write_at(frag.start, Bytes::from(vec![0xAB_u8; frag.size as usize]))
+            .await
+            .unwrap();
     }
 
     // 验证写入总大小
@@ -222,7 +231,7 @@ async fn integration_pipeline_write_and_crypto_verify() {
 }
 
 // ============================================================
-// 跨 crate 流程: qf-engine 分片管理 + qf-core 类型 + qf-crypto 校验
+// 跨 crate 流程: amd-engine 分片管理 + amd-core 类型 + amd-crypto 校验
 // ============================================================
 
 /// 测试分片状态机与校验的完整流程
@@ -268,7 +277,7 @@ async fn integration_fragment_lifecycle_with_verification() {
     // 写入存储
     let storage = MemoryStorage::with_capacity(1000);
     storage.allocate(1000).await.unwrap();
-    storage.write_at(0, &data).await.unwrap();
+    storage.write_at(0, data.clone()).await.unwrap();
 
     // Writing -> Done
     record.write_done();
@@ -300,7 +309,10 @@ async fn integration_multi_fragment_concurrent() {
     }
 
     for (frag, data) in &handles {
-        storage.write_at(frag.start, data).await.unwrap();
+        storage
+            .write_at(frag.start, Bytes::copy_from_slice(data))
+            .await
+            .unwrap();
     }
 
     // 校验每个分片
@@ -350,7 +362,7 @@ async fn integration_fragment_retry_and_verify() {
     assert!(record.is_done());
 }
 
-/// 测试 qf-engine 带宽追踪影响分片大小计算
+/// 测试 amd-engine 带宽追踪影响分片大小计算
 #[test]
 fn integration_bandwidth_affects_fragment_size() {
     let min_size = 1024 * 1024; // 1MB
@@ -438,12 +450,12 @@ fn integration_download_state_cancel_path() {
 /// 测试协议错误能正确传播到上层
 #[tokio::test]
 async fn integration_error_propagation() {
-    let protocol = MockProtocol::failing(QfError::Network("连接被拒绝".into()));
+    let protocol = MockProtocol::failing(AmdError::Network("连接被拒绝".into()));
     let result = protocol.probe("http://example.com/file.bin").await;
     assert!(result.is_err());
 
     match result.unwrap_err() {
-        QfError::Network(msg) => assert!(msg.contains("连接被拒绝")),
+        AmdError::Network(msg) => assert!(msg.contains("连接被拒绝")),
         other => panic!("期望 Network 错误, 实际: {:?}", other),
     }
 }
@@ -453,7 +465,7 @@ async fn integration_error_propagation() {
 async fn integration_storage_boundary_error() {
     let storage = MemoryStorage::new();
     // 不 allocate,直接写入高位偏移,验证不会 panic
-    let result = storage.write_at(0, b"hello").await;
+    let result = storage.write_at(0, Bytes::from_static(b"hello")).await;
     assert!(result.is_ok());
 
     // 读取超出实际写入范围
@@ -465,7 +477,7 @@ async fn integration_storage_boundary_error() {
 /// 测试校验不匹配时能正确报告错误
 #[test]
 fn integration_checksum_mismatch_error() {
-    let err = QfError::ChecksumMismatch {
+    let err = AmdError::ChecksumMismatch {
         expected: "abc123".into(),
         actual: "def456".into(),
     };
@@ -476,12 +488,12 @@ fn integration_checksum_mismatch_error() {
 }
 
 // ============================================================
-// 集成测试:下载器完整流程(qf-engine/downloader.rs)
+// 集成测试:下载器完整流程(amd-engine/downloader.rs)
 // ============================================================
 
-use qf_core::config::DownloadConfig;
-use qf_sniffer::CaptureConfig;
-use qf_sniffer::resources::ResourceManager;
+use amd_core::config::DownloadConfig;
+use amd_sniffer::CaptureConfig;
+use amd_sniffer::resources::ResourceManager;
 
 /// 下载器完整流程:probe -> plan -> prepare -> execute -> verify
 #[tokio::test]
@@ -510,7 +522,10 @@ async fn integration_downloader_full_pipeline() {
     let fragments = test_fragments(file_size, 3);
     for frag in &fragments {
         let data = vec![0xAB_u8; frag.size as usize];
-        storage.write_at(frag.start, &data).await.unwrap();
+        storage
+            .write_at(frag.start, Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
     }
 
     // 校验

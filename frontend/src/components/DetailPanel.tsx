@@ -1,58 +1,56 @@
 import { Show } from 'solid-js'
-import { useStore } from '@nanostores/solid'
 import { $tasks, $selectedId } from '../stores/downloads'
 import { formatSize, formatSpeed, statusText } from '../utils/format'
 import FragmentGrid from './FragmentGrid'
 
 export default function DetailPanel() {
-  const tasks = useStore($tasks)
-  const selectedId = useStore($selectedId)
-
   const selectedTask = () => {
-    const id = selectedId()
+    const id = $selectedId.get()
     if (!id) return null
-    return tasks().find(t => t.id === id) ?? null
+    return $tasks.get().find(t => t.id === id) ?? null
   }
 
   return (
     <Show when={selectedTask()} keyed>
       {(task) => (
-        <div class="detail-panel" style={{ display: 'block' }}>
-          <div class="panel-title">{task.fileName}</div>
+        <div class="space-y-0">
+          <div class="text-[13px] font-semibold text-text-primary mb-4 truncate">{task.fileName}</div>
 
-          <div class="panel-row">
-            <span class="panel-label">状态</span>
-            <span class={`panel-value status-${task.status}`}>{statusText(task.status)}</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">状态</span>
+            <span class={`status-${task.status}`}>{statusText(task.status)}</span>
           </div>
-          <div class="panel-row">
-            <span class="panel-label">大小</span>
-            <span class="panel-value mono">{formatSize(task.fileSize)}</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">大小</span>
+            <span class="font-mono text-[11px]">{formatSize(task.fileSize)}</span>
           </div>
-          <div class="panel-row">
-            <span class="panel-label">已下载</span>
-            <span class="panel-value mono">{formatSize(task.downloaded)}</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">已下载</span>
+            <span class="font-mono text-[11px]">{formatSize(task.downloaded)}</span>
           </div>
-          <div class="panel-row">
-            <span class="panel-label">进度</span>
-            <span class="panel-value mono">{task.progress.toFixed(1)}%</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">进度</span>
+            <span class="font-mono text-[11px]">{task.progress.toFixed(1)}%</span>
           </div>
           <Show when={task.speed > 0}>
-            <div class="panel-row">
-              <span class="panel-label">速度</span>
-              <span class="panel-value mono speed-value">{formatSpeed(task.speed)}</span>
+            <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+              <span class="text-text-tertiary">速度</span>
+              <span class="font-mono text-[11px] text-accent">{formatSpeed(task.speed)}</span>
             </div>
           </Show>
-          <div class="panel-row">
-            <span class="panel-label">分片</span>
-            <span class="panel-value mono">{task.fragmentsDone} / {task.fragmentsTotal}</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">分片</span>
+            <span class="font-mono text-[11px]">{task.fragmentsDone} / {task.fragmentsTotal}</span>
           </div>
-          <div class="panel-row">
-            <span class="panel-label">协议</span>
-            <span class="panel-value mono">{new URL(task.url).protocol.replace(':', '').toUpperCase()}</span>
+          <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
+            <span class="text-text-tertiary">协议</span>
+            <span class="font-mono text-[11px]">{new URL(task.url).protocol.replace(':', '').toUpperCase()}</span>
           </div>
 
           <Show when={task.fragmentsTotal > 0}>
-            <FragmentGrid total={task.fragmentsTotal} done={task.fragmentsDone} status={task.status} />
+            <div class="mt-3">
+              <FragmentGrid total={task.fragmentsTotal} done={task.fragmentsDone} status={task.status} />
+            </div>
           </Show>
         </div>
       )}

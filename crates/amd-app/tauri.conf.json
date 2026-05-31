@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "AI Model Downloader",
+  "version": "0.1.0",
+  "identifier": "com.aimd.app",
+  "build": {
+    "frontendDist": "../../frontend/dist",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "cd ../../frontend && bun run dev",
+    "beforeBuildCommand": "cd ../../frontend && bun run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AI Model Downloader - 模型下载器",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "devtools": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

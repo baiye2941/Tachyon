@@ -1,4 +1,4 @@
-# QuantumFetch
+# AI Model Downloader
 
 > 基于 Rust + Tauri 构建的新一代超高性能下载器。
 
@@ -32,8 +32,8 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/user/QuantumFetch.git
-cd QuantumFetch
+git clone https://github.com/user/AI-Model-Downloader.git
+cd AI-Model-Downloader
 
 # 构建(调试模式)
 cargo build
@@ -71,19 +71,19 @@ claude
 +------------------------------------------+
 |  GUI (Tauri + 前端)                       |
 +------------------------------------------+
-|  qf-app        应用层:任务管理、配置、UI 绑定  |
+|  amd-app        应用层:任务管理、配置、UI 绑定  |
 +------------------------------------------+
-|  qf-scheduler  调度层:智能调度、带宽分配、预测   |
+|  amd-scheduler  调度层:智能调度、带宽分配、预测   |
 +------------------------------------------+
-|  qf-engine     引擎层:分片引擎、连接池、P2SP   |
+|  amd-engine     引擎层:分片引擎、连接池、P2SP   |
 +------------------------------------------+
-|  qf-protocol   协议层:HTTP/HTTPS/QUIC/FTP   |
+|  amd-protocol   协议层:HTTP/HTTPS/QUIC/FTP   |
 +------------------------------------------+
-|  qf-io         I/O 层:io_uring、零拷贝、落盘   |
+|  amd-io         I/O 层:io_uring、零拷贝、落盘   |
 +------------------------------------------+
-|  qf-sniffer    嗅探层:浏览器资源拦截与解析      |
+|  amd-sniffer    嗅探层:浏览器资源拦截与解析      |
 +------------------------------------------+
-|  qf-crypto     校验层:GPU 加速哈希、完整性校验  |
+|  amd-crypto     校验层:GPU 加速哈希、完整性校验  |
 +------------------------------------------+
 ```
 
@@ -91,34 +91,34 @@ claude
 
 | Crate         | 职责                                        | 关键技术                        |
 |---------------|---------------------------------------------|---------------------------------|
-| `qf-core`     | 核心类型、trait 定义、错误体系、配置与事件   | thiserror, serde                |
-| `qf-engine`   | 分片引擎、连接管理、MP-QUIC 多路径传输       | tokio, quinn, bytes             |
-| `qf-scheduler`| 智能调度器、带宽预测、优先级队列             | Holt-Winters, BinaryHeap        |
-| `qf-io`       | 跨平台异步文件 I/O、缓冲区池管理             | tokio, bytes, io-uring(可选)    |
-| `qf-protocol` | HTTP/HTTPS/QUIC/FTP 协议适配与实现           | reqwest, quinn, url             |
-| `qf-sniffer`  | 浏览器资源嗅探、流量拦截与解析               | url, playwright MCP             |
-| `qf-crypto`   | CPU/GPU 哈希校验、完整性验证                 | blake3, sha2, wgpu(可选)        |
-| `qf-p2sp`     | P2SP 混合下载、DHT 网络、Peer 发现           | 自研 Kademlia DHT, Xorshift64   |
-| `qf-app`      | Tauri 应用入口、命令注册、GUI 事件桥接       | tauri v2                        |
+| `amd-core`     | 核心类型、trait 定义、错误体系、配置与事件   | thiserror, serde                |
+| `amd-engine`   | 分片引擎、连接管理、MP-QUIC 多路径传输       | tokio, quinn, bytes             |
+| `amd-scheduler`| 智能调度器、带宽预测、优先级队列             | Holt-Winters, BinaryHeap        |
+| `amd-io`       | 跨平台异步文件 I/O、缓冲区池管理             | tokio, bytes, io-uring(可选)    |
+| `amd-protocol` | HTTP/HTTPS/QUIC/FTP 协议适配与实现           | reqwest, quinn, url             |
+| `amd-sniffer`  | 浏览器资源嗅探、流量拦截与解析               | url, playwright MCP             |
+| `amd-crypto`   | CPU/GPU 哈希校验、完整性验证                 | blake3, sha2, wgpu(可选)        |
+| `amd-p2sp`     | P2SP 混合下载、DHT 网络、Peer 发现           | 自研 Kademlia DHT, Xorshift64   |
+| `amd-app`      | Tauri 应用入口、命令注册、GUI 事件桥接       | tauri v2                        |
 
 ## 项目结构
 
 ```
-QuantumFetch/
+AI-Model-Downloader/
   Cargo.toml              # workspace 根配置
   LICENSE                 # MIT 许可证
   README.md               # 项目说明(本文件)
   .claude/                # AI 辅助配置(skills + agents)
   crates/
-    qf-core/              # 核心类型与 trait 定义
-    qf-engine/            # 分片引擎与连接管理
-    qf-scheduler/         # 智能调度器
-    qf-io/                # 跨平台异步文件 I/O
-    qf-protocol/          # 多协议适配
-    qf-sniffer/           # 浏览器资源嗅探
-    qf-crypto/            # CPU/GPU 哈希校验
-    qf-p2sp/              # P2SP 混合下载
-    qf-app/               # Tauri 应用入口
+    amd-core/              # 核心类型与 trait 定义
+    amd-engine/            # 分片引擎与连接管理
+    amd-scheduler/         # 智能调度器
+    amd-io/                # 跨平台异步文件 I/O
+    amd-protocol/          # 多协议适配
+    amd-sniffer/           # 浏览器资源嗅探
+    amd-crypto/            # CPU/GPU 哈希校验
+    amd-p2sp/              # P2SP 混合下载
+    amd-app/               # Tauri 应用入口
   frontend/               # Tauri 前端(Bun)
   tests/                  # 集成测试
   benches/                # criterion 基准测试(3组)
@@ -132,10 +132,10 @@ QuantumFetch/
 cargo test --all
 
 # 运行指定 crate 的单元测试
-cargo test -p qf-core --lib
+cargo test -p amd-core --lib
 
 # 运行指定测试(精确匹配)
-cargo test -p qf-core -- test_name --exact
+cargo test -p amd-core -- test_name --exact
 
 # 代码检查(clippy 零警告)
 cargo clippy --all-targets --all-features -- -D warnings

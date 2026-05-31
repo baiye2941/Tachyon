@@ -6,7 +6,7 @@ fn bench_hex_encode(c: &mut Criterion) {
     for size in [16, 64, 256, 1024, 4096] {
         let data = vec![0xABu8; size];
         group.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, d| {
-            b.iter(|| qf_core::hex_encode(d));
+            b.iter(|| amd_core::hex_encode(d));
         });
     }
 

@@ -1,7 +1,7 @@
 mod common;
 
-use qf_core::DownloadState;
-use qf_store::{KvStore, RecoveryManager, TaskSnapshot};
+use amd_core::DownloadState;
+use amd_store::{KvStore, RecoveryManager, TaskSnapshot};
 use std::path::PathBuf;
 use tempfile::TempDir;
 

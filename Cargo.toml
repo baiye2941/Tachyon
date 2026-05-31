@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/qf-core",
-    "crates/qf-engine",
-    "crates/qf-scheduler",
-    "crates/qf-io",
-    "crates/qf-protocol",
-    "crates/qf-sniffer",
-    "crates/qf-crypto",
-    "crates/qf-p2sp",
-    "crates/qf-store",
-    "crates/qf-app",
+    "crates/amd-core",
+    "crates/amd-engine",
+    "crates/amd-scheduler",
+    "crates/amd-io",
+    "crates/amd-protocol",
+    "crates/amd-sniffer",
+    "crates/amd-crypto",
+    "crates/amd-p2sp",
+    "crates/amd-store",
+    "crates/amd-app",
 ]
 
 [workspace.package]
@@ -26,10 +26,10 @@ serde_json = "1"
 
 # 错误处理
 thiserror = "2"
-anyhow = "1"
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 
 # 日志
 tracing = "0.1"
@@ -41,6 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # QUIC
 quinn = "0.11"
 rustls = "0.23"
+rustls-native-certs = "0.8"
 rcgen = "0.13"
 
 # 哈希
@@ -81,21 +82,21 @@ tempfile = "3"
 tokio-test = "0.4"
 
 [package]
-name = "quantum-fetch"
+name = "ai-model-downloader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "QuantumFetch 基准测试与集成测试入口"
+description = "AI Model Downloader 基准测试与集成测试入口"
 
 [dev-dependencies]
 criterion = { workspace = true }
-qf-core = { path = "crates/qf-core", features = ["test-harness"] }
-qf-io = { path = "crates/qf-io" }
-qf-engine = { path = "crates/qf-engine" }
-qf-crypto = { path = "crates/qf-crypto" }
-qf-scheduler = { path = "crates/qf-scheduler" }
-qf-sniffer = { path = "crates/qf-sniffer" }
-qf-store = { path = "crates/qf-store" }
+amd-core = { path = "crates/amd-core", features = ["test-harness"] }
+amd-io = { path = "crates/amd-io" }
+amd-engine = { path = "crates/amd-engine" }
+amd-crypto = { path = "crates/amd-crypto" }
+amd-scheduler = { path = "crates/amd-scheduler" }
+amd-sniffer = { path = "crates/amd-sniffer" }
+amd-store = { path = "crates/amd-store" }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }
