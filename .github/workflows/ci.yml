@@ -63,6 +63,16 @@ jobs:
       - run: cargo install cargo-deny
       - run: cargo deny check
 
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit
+      - run: cargo audit
+
   coverage:
     name: 覆盖率检查
     runs-on: ubuntu-latest
