@@ -766,6 +766,7 @@ impl DownloadTask {
             let frag_semaphore = semaphore.clone();
             let frag_pool = pool.clone();
             let frag_host = host.clone();
+            let rate_limit_bps = self.config.rate_limit_bytes_per_sec;
             let frag_control_rx = control_rx.clone();
             let frag_progress_tx = progress_tx.clone();
 
@@ -801,6 +802,7 @@ impl DownloadTask {
                         frag_start,
                         frag_end,
                         pause_timeout,
+                        rate_limit_bps,
                         &frag_control_rx,
                         &frag_progress_tx,
                     )
@@ -911,6 +913,7 @@ impl DownloadTask {
         frag_start: u64,
         frag_end: u64,
         pause_timeout: Duration,
+        rate_limit_bps: Option<u64>,
         control_rx: &Option<watch::Receiver<DownloadState>>,
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) -> AmdResult<(u64, Duration)> {
@@ -962,6 +965,7 @@ impl DownloadTask {
             }
             let chunk = chunk_result?;
             write_buf.extend_from_slice(&chunk);
+            chunk_count += 1;
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 let batch = write_buf.split().freeze();
@@ -969,7 +973,6 @@ impl DownloadTask {
                 let w = written as u64;
                 pos += w;
                 total_written += w;
-                chunk_count += 1;
                 if let Some(tx) = progress_tx
                     && chunk_count.is_multiple_of(5)
                 {
@@ -989,6 +992,18 @@ impl DownloadTask {
         }
 
         let elapsed = start_instant.elapsed();
+
+        // 限速: 若配置了 rate_limit_bytes_per_sec, 确保实际速率不超过限制
+        if let Some(limit) = rate_limit_bps
+            && limit > 0
+        {
+            let expected_secs = total_written as f64 / limit as f64;
+            let actual_secs = elapsed.as_secs_f64();
+            if actual_secs < expected_secs {
+                let sleep_dur = Duration::from_secs_f64(expected_secs - actual_secs);
+                tokio::time::sleep(sleep_dur).await;
+            }
+        }
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx {

@@ -332,15 +332,58 @@ impl IoUringStorage {
     /// 提交后阻塞等待 CQE 返回,获取实际写入字节数。
     #[cfg(target_os = "linux")]
     async fn submit_write(&self, offset: u64, data: Bytes) -> AmdResult<usize> {
-        // 暂未实现原因:io_uring 异步提交需要独立的完成事件循环线程,
-        // 当前阶段优先使用 tokio::fs 路径验证下载管线正确性。
-        // 待 Linux CI 环境就绪后实现:buffer 池管理 + SQE 构造 + CQE 等待。
-        // TODO: 实现 io_uring SQE/CQE 生命周期管理(Linux CI 就绪后)
-        let _ = (offset, data);
-        Err(AmdError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "io_uring 写入尚未实现,请使用 TokioFile",
-        )))
+        let ring = match &self.ring {
+            Some(h) => h,
+            None => {
+                return Err(AmdError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 未初始化",
+                )));
+            }
+        };
+        let file = match &self.file_fd {
+            Some(f) => f,
+            None => {
+                return Err(AmdError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "文件未打开",
+                )));
+            }
+        };
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        let len = data.len();
+
+        // 构造 IORING_OP_WRITE SQE
+        let write_op =
+            io_uring::opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), len as u32)
+                .offset(offset as i64)
+                .build();
+
+        // 提交 SQ
+        let mut sq = ring._ring.submission();
+        unsafe {
+            sq.push(write_op).map_err(|_| {
+                AmdError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "io_uring 提交队列已满",
+                ))
+            })?;
+        }
+        sq.sync();
+
+        // 等待 CQE
+        let cqe = ring._ring.completion().next().ok_or_else(|| {
+            AmdError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "io_uring 完成队列已关闭",
+            ))
+        })?;
+        let result = cqe.result();
+        if result < 0 {
+            return Err(AmdError::Io(std::io::Error::from_raw_os_error(-result)));
+        }
+        Ok(result as usize)
     }
 }
 
