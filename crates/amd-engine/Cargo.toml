@@ -19,6 +19,7 @@ tracing.workspace = true
 futures.workspace = true
 serde.workspace = true
 url.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 amd-core = { path = "../amd-core", features = ["test-harness"] }

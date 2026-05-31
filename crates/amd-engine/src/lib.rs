@@ -12,7 +12,9 @@ pub mod fragment;
 pub mod orchestrator;
 
 pub use connection::{ConnectionPool, PoolConfig};
-pub use downloader::{DownloadTask, FragmentProgress, StorageKind, VerifierKind};
+pub use downloader::{
+    DownloadTask, FragmentProgress, StorageKind, VerifierKind, default_blake3_verifier,
+};
 pub use fragment::{BandwidthTracker, FragmentRecord, FragmentState};
 pub use orchestrator::DownloadOrchestrator;
 
@@ -22,16 +24,11 @@ pub use orchestrator::DownloadOrchestrator;
 #[cfg(test)]
 #[test]
 fn verifier() {
-    let v = VerifierKind::blake3();
+    let v = downloader::default_blake3_verifier();
     let v2 = v.clone();
-    use amd_core::traits::Verifier;
     let data = b"verifier clone test data";
-    let hash = match &v {
-        VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
-    };
-    let hash2 = match &v2 {
-        VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
-    };
+    let hash = v.compute_hash(data).unwrap();
+    let hash2 = v2.compute_hash(data).unwrap();
     assert_eq!(hash, hash2, "clone 后校验器应行为一致");
 }
 
@@ -65,13 +62,13 @@ fn resume_download() {
     // 模拟一个 4 分片的下载任务,其中分片 0 和 1 已完成
     let frag_size = 1000u64;
     let all_fragments: Vec<FragmentInfo> = (0..4)
-        .map(|i| FragmentInfo {
-            index: i,
-            start: i as u64 * frag_size,
-            end: (i as u64 + 1) * frag_size - 1,
-            size: frag_size,
-            downloaded: 0,
-            hash: None,
+        .map(|i| {
+            FragmentInfo::new(
+                i,
+                i as u64 * frag_size,
+                (i as u64 + 1) * frag_size - 1,
+                frag_size,
+            )
         })
         .collect();
 

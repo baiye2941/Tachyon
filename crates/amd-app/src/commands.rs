@@ -12,7 +12,6 @@ use amd_sniffer::capture::{ResourceType, identify_resource};
 use chrono::Local;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tokio::sync::watch;
 use url::Url;
 use uuid::Uuid;
@@ -127,12 +126,12 @@ use amd_sniffer::SnifferResource;
 use crate::task_store::TaskStore;
 
 pub struct AppState {
-    pub tasks: Arc<Mutex<HashMap<String, TaskInfo>>>,
-    pub config: Arc<Mutex<AppConfig>>,
+    pub tasks: DashMap<String, TaskInfo>,
+    pub config: Arc<tokio::sync::Mutex<AppConfig>>,
     pub handles: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     pub active_permits: Arc<AtomicU32>,
-    pub sniffer: Arc<Mutex<Vec<SnifferResource>>>,
-    pub sniffer_filters: Arc<Mutex<Vec<String>>>,
+    pub sniffer: Arc<tokio::sync::Mutex<Vec<SnifferResource>>>,
+    pub sniffer_filters: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub progress_tx: watch::Sender<ProgressEvent>,
     pub connection_pool: Arc<ConnectionPool>,
     pub controls: Arc<DashMap<String, watch::Sender<DownloadState>>>,
@@ -160,12 +159,12 @@ impl AppState {
             .join("store");
         let task_store = Arc::new(TaskStore::open(&store_dir).expect("任务存储初始化失败"));
         Self {
-            tasks: Arc::new(Mutex::new(HashMap::new())),
-            config: Arc::new(Mutex::new(config)),
+            tasks: DashMap::new(),
+            config: Arc::new(tokio::sync::Mutex::new(config)),
             handles: Arc::new(DashMap::new()),
             active_permits: Arc::new(AtomicU32::new(0)),
-            sniffer: Arc::new(Mutex::new(Vec::new())),
-            sniffer_filters: Arc::new(Mutex::new(Vec::new())),
+            sniffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            sniffer_filters: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             progress_tx: watch::Sender::new(HashMap::new()),
             connection_pool: Arc::new(connection_pool),
             controls: Arc::new(DashMap::new()),
@@ -175,10 +174,9 @@ impl AppState {
 
     pub async fn load_recovered_tasks(&self) -> Result<(), AppError> {
         let snapshots = self.task_store.load_recoverable()?;
-        let mut store = self.tasks.lock().await;
         for snapshot in snapshots {
             let task = crate::task_store::snapshot_to_task_info(&snapshot);
-            store.insert(task.id.clone(), task);
+            self.tasks.insert(task.id.clone(), task);
         }
         Ok(())
     }
@@ -206,6 +204,41 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
     if config.download.download_dir.is_empty() {
         return Err(AppError::Config("download_dir 不能为空".to_string()));
     }
+
+    // 校验 authorized_dirs:每个目录必须存在且不能是系统根目录
+    for dir in &config.download.authorized_dirs {
+        let path = std::path::Path::new(dir);
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "authorized_dirs 路径不存在: {dir}"
+            )));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| AppError::Config(format!("authorized_dirs 路径无法解析: {dir}")))?;
+        // 禁止系统根目录
+        let canonical_str = canonical.to_string_lossy();
+        let forbidden = canonical_str == "/"
+            || canonical_str == "C:\\"
+            || canonical_str == "C:/"
+            || canonical.starts_with("/usr")
+            || canonical.starts_with("/etc")
+            || canonical.starts_with("/System");
+        if forbidden {
+            return Err(AppError::Config(format!(
+                "authorized_dirs 不允许包含系统根目录: {dir}"
+            )));
+        }
+    }
+
+    // 校验 headers:禁止设置敏感请求头
+    for key in config.download.headers.keys() {
+        let lower = key.to_lowercase();
+        if ["authorization", "cookie", "proxy-authorization"].contains(&lower.as_str()) {
+            return Err(AppError::Config(format!("headers 不允许设置敏感头: {key}")));
+        }
+    }
+
     Ok(())
 }
 
@@ -213,12 +246,14 @@ fn authorize_download_dir(config: &AppConfig, requested_dir: &str) -> Result<Str
     let requested = std::path::Path::new(requested_dir);
     let requested_canonical = requested
         .canonicalize()
-        .unwrap_or_else(|_| requested.to_path_buf());
+        .map_err(|_| AppError::Config(format!("下载目录不存在: {}", requested.display())))?;
 
     let authorized = config.download.authorized_dirs.iter().any(|dir| {
         let path = std::path::Path::new(dir);
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        requested_canonical == canonical
+        path.canonicalize()
+            .ok()
+            .map(|canonical| requested_canonical.starts_with(&canonical))
+            .unwrap_or(false)
     });
 
     if !authorized {
@@ -242,12 +277,8 @@ fn resource_type_to_string(rt: ResourceType) -> &'static str {
     }
 }
 
-fn update_task_status(
-    store: &mut HashMap<String, TaskInfo>,
-    task_id: &str,
-    new_status: DownloadState,
-) {
-    if let Some(task) = store.get_mut(task_id) {
+fn update_task_status(store: &DashMap<String, TaskInfo>, task_id: &str, new_status: DownloadState) {
+    if let Some(mut task) = store.get_mut(task_id) {
         task.status = new_status;
         if new_status == DownloadState::Completed
             || new_status == DownloadState::Failed
@@ -264,10 +295,7 @@ fn cleanup_runtime(state: &AppState, task_id: &str) {
 }
 
 async fn persist_task_snapshot(state: &AppState, task_id: &str, fail_reason: Option<String>) {
-    let task = {
-        let store = state.tasks.lock().await;
-        store.get(task_id).cloned()
-    };
+    let task = { state.tasks.get(task_id).map(|r| r.value().clone()) };
     if let Some(task) = task {
         let existing = state.task_store.load_snapshot(task_id).ok().flatten();
         let save_path = if let Some(snapshot) = existing.as_ref() {
@@ -330,8 +358,7 @@ async fn task_fn(
         Ok(u) => u,
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "URL 解析失败");
-            let mut store = state.tasks.lock().await;
-            update_task_status(&mut store, &task_id, DownloadState::Failed);
+            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
             cleanup_runtime(&state, &task_id);
             return;
         }
@@ -341,16 +368,14 @@ async fn task_fn(
         Some(h) => h.to_string(),
         None => {
             tracing::error!(task_id = %task_id, "URL 主机为空");
-            let mut store = state.tasks.lock().await;
-            update_task_status(&mut store, &task_id, DownloadState::Failed);
+            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
             cleanup_runtime(&state, &task_id);
             return;
         }
     };
 
     {
-        let store = state.tasks.lock().await;
-        if let Some(task) = store.get(&task_id) {
+        if let Some(task) = state.tasks.get(&task_id) {
             if task.status == DownloadState::Cancelled {
                 tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
                 cleanup_runtime(&state, &task_id);
@@ -371,8 +396,7 @@ async fn task_fn(
 
     if let Err(e) = std::fs::create_dir_all(&download_dir) {
         tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
-        let mut store = state.tasks.lock().await;
-        update_task_status(&mut store, &task_id, DownloadState::Failed);
+        update_task_status(&state.tasks, &task_id, DownloadState::Failed);
         cleanup_runtime(&state, &task_id);
         return;
     }
@@ -382,8 +406,7 @@ async fn task_fn(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
-                let mut store = state.tasks.lock().await;
-                update_task_status(&mut store, &task_id, DownloadState::Failed);
+                update_task_status(&state.tasks, &task_id, DownloadState::Failed);
                 return;
             }
         };
@@ -426,16 +449,12 @@ async fn task_fn(
             );
 
             {
-                let mut store = state.tasks.lock().await;
-                if let Some(task) = store.get_mut(&task_id) {
+                if let Some(mut task) = state.tasks.get_mut(&task_id) {
                     task.file_size = meta.file_size;
                 }
             }
 
-            let snapshot_task = {
-                let store = state.tasks.lock().await;
-                store.get(&task_id).cloned()
-            };
+            let snapshot_task = { state.tasks.get(&task_id).map(|r| r.value().clone()) };
             if let Some(task) = snapshot_task {
                 let save_path = std::path::Path::new(&download_dir)
                     .join(&meta.file_name)
@@ -460,15 +479,14 @@ async fn task_fn(
         }
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
-            let mut store = state.tasks.lock().await;
-            update_task_status(&mut store, &task_id, DownloadState::Failed);
+            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
             cleanup_runtime(&state, &task_id);
             return;
         }
     }
 
     let (chunk_progress_tx, mut chunk_progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<amd_engine::FragmentProgress>();
+        tokio::sync::mpsc::channel::<amd_engine::FragmentProgress>(256);
     download_task.set_progress_sender(chunk_progress_tx);
 
     let download_task = Arc::new(tokio::sync::Mutex::new(download_task));
@@ -493,8 +511,7 @@ async fn task_fn(
                 .sum::<u64>();
             drop(dt);
             {
-                let mut store = chunk_state.tasks.lock().await;
-                if let Some(task) = store.get_mut(&chunk_tid) {
+                if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
                     task.downloaded = downloaded;
                 }
             }
@@ -534,8 +551,7 @@ async fn task_fn(
                     match control_state {
                         DownloadState::Cancelled => return 0,
                         DownloadState::Paused => {
-                            let mut store = monitor_ps.tasks.lock().await;
-                            if let Some(task) = store.get_mut(&monitor_tid) {
+                            if let Some(mut task) = monitor_ps.tasks.get_mut(&monitor_tid) {
                                 task.speed = 0;
                             }
                             continue;
@@ -563,8 +579,7 @@ async fn task_fn(
             last_downloaded = downloaded;
 
             {
-                let mut store = monitor_ps.tasks.lock().await;
-                if let Some(task) = store.get_mut(&monitor_tid) {
+                if let Some(mut task) = monitor_ps.tasks.get_mut(&monitor_tid) {
                     task.downloaded = downloaded;
                     task.speed = speed;
                     task.progress = p.min(1.0);
@@ -572,10 +587,12 @@ async fn task_fn(
             }
 
             {
-                let store = monitor_ps.tasks.lock().await;
-                let event: ProgressEvent = store
+                let event: ProgressEvent = monitor_ps
+                    .tasks
                     .iter()
-                    .map(|(id, t)| {
+                    .map(|r| {
+                        let id = r.key();
+                        let t = r.value();
                         (
                             id.clone(),
                             TaskProgress {
@@ -609,38 +626,41 @@ async fn task_fn(
 
     cleanup_runtime(&state, &task_id);
 
-    {
-        let mut store = state.tasks.lock().await;
-        let current_status = store.get(&task_id).map(|t| t.status);
+    let current_status = state.tasks.get(&task_id).map(|t| t.status);
 
-        match result {
-            Ok(()) => {
-                if current_status == Some(DownloadState::Cancelled) {
-                    tracing::info!(task_id = %task_id, "下载完成但任务已被取消");
-                } else if let Some(task) = store.get_mut(&task_id) {
-                    task.progress = 1.0;
-                    let dt = download_task.lock().await;
-                    let final_size = dt.metadata().and_then(|m| m.file_size).unwrap_or(0);
-                    task.downloaded = final_size;
-                    task.speed = 0;
-                    drop(dt);
-                    update_task_status(&mut store, &task_id, DownloadState::Completed);
-                    tracing::info!(task_id = %task_id, file_size = final_size, "下载任务完成");
-                }
-            }
-            Err(e) => {
-                if current_status == Some(DownloadState::Cancelled) {
-                    tracing::info!(task_id = %task_id, "下载失败但任务已被取消,保留取消状态");
-                } else {
-                    update_task_status(&mut store, &task_id, DownloadState::Failed);
-                    tracing::error!(task_id = %task_id, error = %e, "下载任务失败");
-                }
+    match result {
+        Ok(()) => {
+            if current_status == Some(DownloadState::Cancelled) {
+                tracing::info!(task_id = %task_id, "下载完成但任务已被取消");
+            } else if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                task.progress = 1.0;
+                let dt = download_task.lock().await;
+                let final_size = dt.metadata().and_then(|m| m.file_size).unwrap_or(0);
+                task.downloaded = final_size;
+                task.speed = 0;
+                drop(dt);
+                drop(task);
+                update_task_status(&state.tasks, &task_id, DownloadState::Completed);
+                tracing::info!(task_id = %task_id, file_size = final_size, "下载任务完成");
             }
         }
+        Err(e) => {
+            if current_status == Some(DownloadState::Cancelled) {
+                tracing::info!(task_id = %task_id, "下载失败但任务已被取消,保留取消状态");
+            } else {
+                update_task_status(&state.tasks, &task_id, DownloadState::Failed);
+                tracing::error!(task_id = %task_id, error = %e, "下载任务失败");
+            }
+        }
+    }
 
-        let event: ProgressEvent = store
+    {
+        let event: ProgressEvent = state
+            .tasks
             .iter()
-            .map(|(id, t)| {
+            .map(|r| {
+                let id = r.key();
+                let t = r.value();
                 (
                     id.clone(),
                     TaskProgress {
@@ -691,8 +711,8 @@ pub async fn create_task(
     let created_at = now_iso8601();
 
     {
-        let store = state.tasks.lock().await;
-        if store.values().any(|t| {
+        if state.tasks.iter().any(|r| {
+            let t = r.value();
             t.url == url
                 && t.status != DownloadState::Cancelled
                 && t.status != DownloadState::Completed
@@ -703,9 +723,11 @@ pub async fn create_task(
             ));
         }
         let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
-        let active_count = store
-            .values()
-            .filter(|t| {
+        let active_count = state
+            .tasks
+            .iter()
+            .filter(|r| {
+                let t = r.value();
                 t.status == DownloadState::Downloading || t.status == DownloadState::Pending
             })
             .count();
@@ -737,11 +759,10 @@ pub async fn create_task(
     };
 
     {
-        let mut store = state.tasks.lock().await;
-        store.insert(task_id.clone(), task);
+        state.tasks.insert(task_id.clone(), task);
     }
 
-    if let Some(task) = state.tasks.lock().await.get(&task_id).cloned() {
+    if let Some(task) = state.tasks.get(&task_id).map(|r| r.value().clone()) {
         let save_path = std::path::Path::new(&download_dir_str)
             .join(&task.file_name)
             .to_string_lossy()
@@ -802,9 +823,8 @@ pub async fn pause_task(
     task_id: String,
 ) -> Result<(), AppError> {
     {
-        let mut store = state.tasks.lock().await;
-
-        let task = store
+        let mut task = state
+            .tasks
             .get_mut(&task_id)
             .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
@@ -830,9 +850,8 @@ pub async fn resume_task(
     task_id: String,
 ) -> Result<(), AppError> {
     {
-        let mut store = state.tasks.lock().await;
-
-        let task = store
+        let mut task = state
+            .tasks
             .get_mut(&task_id)
             .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
@@ -859,9 +878,8 @@ pub async fn cancel_task(
     task_id: String,
 ) -> Result<(), AppError> {
     {
-        let mut store = state.tasks.lock().await;
-
-        let task = store
+        let mut task = state
+            .tasks
             .get_mut(&task_id)
             .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
@@ -874,7 +892,8 @@ pub async fn cancel_task(
                     let _ = control.send(DownloadState::Cancelled);
                 }
 
-                update_task_status(&mut store, &task_id, DownloadState::Cancelled);
+                task.status = DownloadState::Cancelled;
+                task.speed = 0;
                 tracing::info!(task_id = %task_id, "取消任务");
             }
         }
@@ -888,15 +907,15 @@ pub async fn delete_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    let mut store = state.tasks.lock().await;
-
-    let task = store
+    let task = state
+        .tasks
         .get(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
     match task.status {
         DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
-            store.remove(&task_id);
+            drop(task);
+            state.tasks.remove(&task_id);
             state.handles.remove(&task_id);
             state.controls.remove(&task_id);
             tracing::info!(task_id = %task_id, "删除任务");
@@ -911,8 +930,7 @@ pub async fn delete_task(
 
 #[tauri::command]
 pub async fn get_task_list(state: tauri::State<'_, AppState>) -> Result<Vec<TaskInfo>, AppError> {
-    let store = state.tasks.lock().await;
-    Ok(store.values().cloned().collect())
+    Ok(state.tasks.iter().map(|r| r.value().clone()).collect())
 }
 
 #[tauri::command]
@@ -920,11 +938,10 @@ pub async fn get_task_detail(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<TaskInfo, AppError> {
-    let store = state.tasks.lock().await;
-
-    store
+    state
+        .tasks
         .get(&task_id)
-        .cloned()
+        .map(|r| r.value().clone())
         .ok_or(AppError::TaskNotFound(task_id))
 }
 
@@ -933,9 +950,8 @@ pub async fn get_download_progress(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<DownloadProgress, AppError> {
-    let store = state.tasks.lock().await;
-
-    let task = store
+    let task = state
+        .tasks
         .get(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
@@ -1045,10 +1061,11 @@ pub async fn subscribe_progress(
 
     tokio::spawn(async move {
         {
-            let store = tasks.lock().await;
-            let event: ProgressEvent = store
+            let event: ProgressEvent = tasks
                 .iter()
-                .map(|(id, t)| {
+                .map(|r| {
+                    let id = r.key();
+                    let t = r.value();
                     (
                         id.clone(),
                         TaskProgress {
@@ -1085,8 +1102,8 @@ async fn create_task_inner(
     let created_at = now_iso8601();
 
     {
-        let store = state.tasks.lock().await;
-        if store.values().any(|t| {
+        if state.tasks.iter().any(|r| {
+            let t = r.value();
             t.url == url
                 && t.status != DownloadState::Cancelled
                 && t.status != DownloadState::Completed
@@ -1097,9 +1114,11 @@ async fn create_task_inner(
             ));
         }
         let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
-        let active_count = store
-            .values()
-            .filter(|t| {
+        let active_count = state
+            .tasks
+            .iter()
+            .filter(|r| {
+                let t = r.value();
                 t.status == DownloadState::Downloading || t.status == DownloadState::Pending
             })
             .count();
@@ -1131,11 +1150,10 @@ async fn create_task_inner(
     };
 
     {
-        let mut store = state.tasks.lock().await;
-        store.insert(task_id.clone(), task);
+        state.tasks.insert(task_id.clone(), task);
     }
 
-    if let Some(task) = state.tasks.lock().await.get(&task_id).cloned() {
+    if let Some(task) = state.tasks.get(&task_id).map(|r| r.value().clone()) {
         let save_path = std::path::Path::new(&download_dir_str)
             .join(&task.file_name)
             .to_string_lossy()
@@ -1150,8 +1168,7 @@ async fn create_task_inner(
     let download_config = {
         let cfg = state.config.lock().await;
         if cfg.download.max_concurrent_fragments == 0 {
-            let mut store = state.tasks.lock().await;
-            store.remove(&task_id);
+            state.tasks.remove(&task_id);
             return Err(AppError::Config(
                 "max_concurrent_fragments 不能为 0".to_string(),
             ));
@@ -1199,8 +1216,8 @@ async fn create_task_inner(
 
 #[cfg(test)]
 async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut store = state.tasks.lock().await;
-    let task = store
+    let mut task = state
+        .tasks
         .get_mut(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     match task.status {
@@ -1218,8 +1235,8 @@ async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppEr
 
 #[cfg(test)]
 async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut store = state.tasks.lock().await;
-    let task = store
+    let mut task = state
+        .tasks
         .get_mut(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     if task.status == DownloadState::Paused {
@@ -1238,8 +1255,8 @@ async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
 
 #[cfg(test)]
 async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut store = state.tasks.lock().await;
-    let task = store
+    let mut task = state
+        .tasks
         .get_mut(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     match task.status {
@@ -1250,7 +1267,8 @@ async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
             if let Some(control) = state.controls.get(&task_id) {
                 let _ = control.send(DownloadState::Cancelled);
             }
-            update_task_status(&mut store, &task_id, DownloadState::Cancelled);
+            task.status = DownloadState::Cancelled;
+            task.speed = 0;
             Ok(())
         }
     }
@@ -1258,13 +1276,14 @@ async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
 
 #[cfg(test)]
 async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut store = state.tasks.lock().await;
-    let task = store
+    let task = state
+        .tasks
         .get(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     match task.status {
         DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
-            store.remove(&task_id);
+            drop(task);
+            state.tasks.remove(&task_id);
             state.handles.remove(&task_id);
             Ok(())
         }
@@ -1277,16 +1296,15 @@ async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
 
 #[cfg(test)]
 async fn get_task_list_inner(state: &AppState) -> Result<Vec<TaskInfo>, AppError> {
-    let store = state.tasks.lock().await;
-    Ok(store.values().cloned().collect())
+    Ok(state.tasks.iter().map(|r| r.value().clone()).collect())
 }
 
 #[cfg(test)]
 async fn get_task_detail_inner(state: &AppState, task_id: String) -> Result<TaskInfo, AppError> {
-    let store = state.tasks.lock().await;
-    store
+    state
+        .tasks
         .get(&task_id)
-        .cloned()
+        .map(|r| r.value().clone())
         .ok_or(AppError::TaskNotFound(task_id))
 }
 
@@ -1295,8 +1313,8 @@ async fn get_download_progress_inner(
     state: &AppState,
     task_id: String,
 ) -> Result<DownloadProgress, AppError> {
-    let store = state.tasks.lock().await;
-    let task = store
+    let task = state
+        .tasks
         .get(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     Ok(DownloadProgress {
@@ -1387,8 +1405,8 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         let tmp = tempfile::tempdir().unwrap();
         Arc::new(AppState {
-            tasks: Arc::new(Mutex::new(HashMap::new())),
-            config: Arc::new(Mutex::new(AppConfig {
+            tasks: DashMap::new(),
+            config: Arc::new(tokio::sync::Mutex::new(AppConfig {
                 max_concurrent_tasks: 5,
                 download: DownloadConfig {
                     download_dir: "/default".to_string(),
@@ -1400,8 +1418,8 @@ mod tests {
             })),
             handles: Arc::new(DashMap::new()),
             active_permits: Arc::new(AtomicU32::new(0)),
-            sniffer: Arc::new(Mutex::new(Vec::new())),
-            sniffer_filters: Arc::new(Mutex::new(Vec::new())),
+            sniffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            sniffer_filters: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             progress_tx: watch::Sender::new(HashMap::new()),
             connection_pool: Arc::new(ConnectionPool::new(PoolConfig {
                 max_per_host: 16,
@@ -1610,10 +1628,15 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_roundtrip() {
         let state = test_state();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dl_dir = temp_dir.path().join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        let dl_dir_str = dl_dir.to_string_lossy().to_string();
+
         let new_cfg = AppConfig {
             max_concurrent_tasks: 10,
             download: amd_core::config::DownloadConfig {
-                download_dir: "/data/downloads".to_string(),
+                download_dir: dl_dir_str.clone(),
                 max_concurrent_fragments: 32,
                 max_retries: 3,
                 request_timeout_secs: 30,
@@ -1622,7 +1645,7 @@ mod tests {
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
-                authorized_dirs: vec!["/data/downloads".to_string()],
+                authorized_dirs: vec![dl_dir_str.clone()],
             },
             connection: amd_core::config::ConnectionConfig {
                 max_connections_per_host: 8,
@@ -1636,7 +1659,7 @@ mod tests {
         };
         update_config_inner(&state, new_cfg).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
-        assert_eq!(cfg.download.download_dir, "/data/downloads");
+        assert_eq!(cfg.download.download_dir, dl_dir_str);
         assert_eq!(cfg.max_concurrent_tasks, 10);
         assert_eq!(cfg.download.max_concurrent_fragments, 32);
         assert_eq!(cfg.connection.max_connections_per_host, 8);
@@ -1704,11 +1727,7 @@ mod tests {
             fragments_done: 1,
             created_at: "2026-05-29T00:00:00Z".to_string(),
         };
-        state
-            .tasks
-            .lock()
-            .await
-            .insert(task.id.clone(), task.clone());
+        state.tasks.insert(task.id.clone(), task.clone());
         let original_snapshot = crate::task_store::task_info_to_snapshot(
             &task,
             "/custom/file.bin".to_string(),
@@ -2356,8 +2375,7 @@ mod tests {
         .unwrap();
 
         {
-            let mut store = state.tasks.lock().await;
-            update_task_status(&mut store, &id, DownloadState::Failed);
+            update_task_status(&state.tasks, &id, DownloadState::Failed);
         }
 
         let task = get_task_detail_inner(&state, id).await.unwrap();
@@ -2392,23 +2410,72 @@ mod tests {
 
     #[test]
     fn test_authorize_download_dir_rejects_unlisted_dir() {
-        let mut config = AppConfig::default();
-        config.download.download_dir = "/safe/downloads".to_string();
-        config.download.authorized_dirs = vec!["/safe/downloads".to_string()];
+        let safe_dir = tempfile::tempdir().unwrap();
+        let evil_dir = tempfile::tempdir().unwrap();
+        let evil_path = evil_dir.path().to_string_lossy().to_string();
 
-        let err = authorize_download_dir(&config, "/tmp/evil").unwrap_err();
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_dir.path().to_string_lossy().to_string();
+        config.download.authorized_dirs = vec![safe_dir.path().to_string_lossy().to_string()];
+
+        let err = authorize_download_dir(&config, &evil_path).unwrap_err();
         assert!(err.to_string().contains("未授权"));
     }
 
     #[test]
     fn test_authorize_download_dir_accepts_default_dir() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+
         let mut config = AppConfig::default();
-        config.download.download_dir = "/safe/downloads".to_string();
-        config.download.authorized_dirs = vec!["/safe/downloads".to_string()];
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path.clone()];
 
         assert_eq!(
-            authorize_download_dir(&config, "/safe/downloads").unwrap(),
-            "/safe/downloads"
+            authorize_download_dir(&config, &safe_path).unwrap(),
+            safe_path
         );
+    }
+
+    #[test]
+    fn test_authorize_download_dir_accepts_subdir() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+        let sub_path = safe_dir.path().join("sub").to_string_lossy().to_string();
+        std::fs::create_dir_all(&sub_path).unwrap();
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path.clone()];
+
+        assert_eq!(
+            authorize_download_dir(&config, &sub_path).unwrap(),
+            sub_path
+        );
+    }
+
+    #[test]
+    fn test_authorize_download_dir_rejects_path_traversal() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let evil_dir = tempfile::tempdir().unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+        let evil_path = evil_dir.path().to_string_lossy().to_string();
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path.clone()];
+
+        let err = authorize_download_dir(&config, &evil_path).unwrap_err();
+        assert!(err.to_string().contains("未授权"));
+    }
+
+    #[test]
+    fn test_authorize_download_dir_rejects_nonexistent_dir() {
+        let mut config = AppConfig::default();
+        config.download.download_dir = "/nonexistent/path".to_string();
+        config.download.authorized_dirs = vec!["/nonexistent/path".to_string()];
+
+        let err = authorize_download_dir(&config, "/nonexistent/path").unwrap_err();
+        assert!(err.to_string().contains("不存在"));
     }
 }

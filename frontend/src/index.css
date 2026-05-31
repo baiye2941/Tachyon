@@ -38,8 +38,3 @@ body {
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 2px; }
-
-@keyframes breathe {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}

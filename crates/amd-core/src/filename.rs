@@ -183,9 +183,13 @@ pub fn validate_save_path(
 ///
 /// `filename*` 优先于 `filename`。
 pub fn parse_content_disposition(value: &str) -> Option<String> {
-    if let Some(pos) = value.find("filename*=") {
-        let rest = &value[pos + 10..];
-        if let Some(encoded) = rest.split(';').next() {
+    // 使用分号分割参数后精确匹配参数名,避免子串匹配误提取
+    // 先遍历查找 filename*= (优先),再回退 filename= (低优先级)
+    let mut fallback: Option<String> = None;
+
+    for param in value.split(';') {
+        let param = param.trim();
+        if let Some(encoded) = param.strip_prefix("filename*=") {
             let mut parts = encoded.splitn(3, '\'');
             let _charset = parts.next(); // 编码名称(如 UTF-8),当前不使用
             let _encoding = parts.next(); // 编码方式(如 '', 当前不使用
@@ -195,17 +199,15 @@ pub fn parse_content_disposition(value: &str) -> Option<String> {
             {
                 return Some(decoded);
             }
+        } else if let Some(name) = param.strip_prefix("filename=") {
+            let name = name.trim().trim_matches('"');
+            if !name.is_empty() && fallback.is_none() {
+                fallback = Some(name.to_string());
+            }
         }
     }
-    if let Some(pos) = value.find("filename=") {
-        let rest = &value[pos + 9..];
-        let name = rest.trim_start().split(';').next().unwrap_or(rest);
-        let name = name.trim_matches('"').trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    None
+
+    fallback
 }
 
 fn percent_decode(input: &str) -> Option<String> {
@@ -400,6 +402,20 @@ mod tests {
         assert_eq!(
             parse_content_disposition("attachment; filename=test.zip;"),
             Some("test.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_content_disposition_rejects_substring_attack() {
+        // "xfilename*=" 不应被错误匹配为 "filename*="
+        assert_eq!(
+            parse_content_disposition("attachment; xfilename*=UTF-8''evil.exe; filename=safe.pdf"),
+            Some("safe.pdf".to_string())
+        );
+        // "xfilename=" 不应被错误匹配为 "filename="
+        assert_eq!(
+            parse_content_disposition("attachment; xfilename=evil.exe; filename=safe.pdf"),
+            Some("safe.pdf".to_string())
         );
     }
 
@@ -658,16 +674,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_validate_save_path_symlink_to_outside_windows() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("downloads");
+        let base_temp = tempfile::tempdir().unwrap();
+        let base = base_temp.path().join("downloads");
         std::fs::create_dir(&base).unwrap();
 
-        let outside_file = temp.path().join("secret.txt");
+        let outside_temp = tempfile::tempdir().unwrap();
+        let outside_file = outside_temp.path().join("secret.txt");
         std::fs::write(&outside_file, b"secret data").unwrap();
         let evil_link = base.join("innocent.txt");
 
-        // Windows 符号链接创建可能需要权限,失败时跳过
-        if std::os::windows::fs::symlink_file(&outside_file, &evil_link).is_ok() {
+        if std::os::windows::fs::symlink_file(&outside_file, &evil_link).is_ok()
+            && evil_link.is_symlink()
+        {
             let result = validate_save_path(&evil_link, &base);
             assert!(result.is_err(), "符号链接指向外部应被阻止");
         }

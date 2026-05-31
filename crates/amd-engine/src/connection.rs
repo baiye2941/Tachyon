@@ -1,11 +1,12 @@
 //! 连接池管理
 //!
 //! 每个主机维护独立连接池,支持连接复用和并发控制。
+//! 使用 DashMap 实现无锁主机信号量索引,避免高并发下的锁竞争。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use amd_core::AmdError;
@@ -55,7 +56,7 @@ pub struct ConnectionPool {
     config: PoolConfig,
     pub(crate) global_semaphore: Arc<Semaphore>,
     active_count: Arc<AtomicU32>,
-    host_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
+    host_semaphores: DashMap<String, Arc<Semaphore>>,
 }
 
 impl ConnectionPool {
@@ -65,19 +66,23 @@ impl ConnectionPool {
             global_semaphore: Arc::new(Semaphore::new(config.max_global as usize)),
             config,
             active_count: Arc::new(AtomicU32::new(0)),
-            host_semaphores: tokio::sync::Mutex::new(HashMap::new()),
+            host_semaphores: DashMap::new(),
         }
     }
 
-    /// 获取主机级别的信号量
-    async fn host_semaphore(&self, host: &str) -> Arc<Semaphore> {
-        let mut map = self.host_semaphores.lock().await;
-        map.entry(host.to_string())
+    /// 获取主机级别的信号量(无锁读取)
+    fn host_semaphore(&self, host: &str) -> Arc<Semaphore> {
+        if let Some(sem) = self.host_semaphores.get(host) {
+            return sem.clone();
+        }
+        self.host_semaphores
+            .entry(host.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_per_host as usize)))
             .clone()
     }
 
     /// 获取连接许可(全局 + 主机级别双重限制)
+    #[tracing::instrument(skip(self), fields(host = %host))]
     pub async fn acquire(&self, host: &str) -> Result<ConnectionPermit, AmdError> {
         let global_permit = self
             .global_semaphore
@@ -85,7 +90,7 @@ impl ConnectionPool {
             .acquire_owned()
             .await
             .map_err(|_| AmdError::Network("全局连接信号量已关闭".into()))?;
-        let host_sem = self.host_semaphore(host).await;
+        let host_sem = self.host_semaphore(host);
         let host_permit = host_sem
             .acquire_owned()
             .await
@@ -112,15 +117,14 @@ impl ConnectionPool {
     ///
     /// 遍历所有主机信号量,移除那些所有许可都可用(即无活跃连接)的条目。
     /// 建议在下载任务完成后定期调用,避免内存泄漏。
-    pub async fn cleanup_idle_hosts(&self) {
-        let mut map = self.host_semaphores.lock().await;
-        map.retain(|_, sem| sem.available_permits() < self.config.max_per_host as usize);
+    pub fn cleanup_idle_hosts(&self) {
+        self.host_semaphores
+            .retain(|_, sem| sem.available_permits() < self.config.max_per_host as usize);
     }
 
     /// 当前跟踪的主机数量
-    pub async fn host_count(&self) -> usize {
-        let map = self.host_semaphores.lock().await;
-        map.len()
+    pub fn host_count(&self) -> usize {
+        self.host_semaphores.len()
     }
 }
 
@@ -195,15 +199,13 @@ mod tests {
             max_per_host: 2,
             max_global: 10,
         });
-        // 触发主机条目创建
         {
             let _p1 = pool.acquire("example.com").await.unwrap();
             let _p2 = pool.acquire("other.com").await.unwrap();
         }
-        // 所有连接已释放,主机应为空闲
-        assert_eq!(pool.host_count().await, 2);
-        pool.cleanup_idle_hosts().await;
-        assert_eq!(pool.host_count().await, 0);
+        assert_eq!(pool.host_count(), 2);
+        pool.cleanup_idle_hosts();
+        assert_eq!(pool.host_count(), 0);
     }
 
     #[tokio::test]
@@ -213,33 +215,30 @@ mod tests {
             max_global: 10,
         });
         let _active = pool.acquire("busy.com").await.unwrap();
-        // 空闲主机
         {
             let _p = pool.acquire("idle.com").await.unwrap();
         }
-        pool.cleanup_idle_hosts().await;
-        // busy.com 仍有活跃连接,应保留;idle.com 应被清理
-        assert_eq!(pool.host_count().await, 1);
+        pool.cleanup_idle_hosts();
+        assert_eq!(pool.host_count(), 1);
     }
 
     #[tokio::test]
     async fn test_cleanup_idle_hosts_empty_pool() {
         let pool = ConnectionPool::new(PoolConfig::default());
-        pool.cleanup_idle_hosts().await;
-        assert_eq!(pool.host_count().await, 0);
+        pool.cleanup_idle_hosts();
+        assert_eq!(pool.host_count(), 0);
     }
 
     #[tokio::test]
     async fn test_host_count() {
         let pool = ConnectionPool::new(PoolConfig::default());
-        assert_eq!(pool.host_count().await, 0);
+        assert_eq!(pool.host_count(), 0);
         let _p1 = pool.acquire("a.com").await.unwrap();
         let _p2 = pool.acquire("b.com").await.unwrap();
         let _p3 = pool.acquire("c.com").await.unwrap();
-        assert_eq!(pool.host_count().await, 3);
+        assert_eq!(pool.host_count(), 3);
     }
 
-    /// 验证信号量关闭时返回错误而非 panic
     #[tokio::test]
     async fn test_semaphore() {
         let pool = ConnectionPool::new(PoolConfig {
@@ -266,7 +265,6 @@ mod tests {
             max_per_host: 1,
             max_global: 1,
         });
-        // 关闭全局信号量
         pool.global_semaphore.close();
         let result = pool.acquire("test.com").await;
         assert!(result.is_err(), "关闭的信号量应返回错误而非 panic");
@@ -305,7 +303,6 @@ mod tests {
         let conn_cfg: amd_core::config::ConnectionConfig = pool_cfg.into();
         assert_eq!(conn_cfg.max_connections_per_host, 4);
         assert_eq!(conn_cfg.max_global_connections, 64);
-        // 未指定的字段应使用默认值
         assert_eq!(conn_cfg.keep_alive_timeout_secs, 30);
         assert_eq!(conn_cfg.connect_timeout_secs, 10);
     }

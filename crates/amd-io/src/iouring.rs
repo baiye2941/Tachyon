@@ -255,11 +255,24 @@ impl IoUringStorage {
 
         // 步骤 3: 注册 fixed buffers 到内核
         // 注册后内核持有这些页面的映射,SQE 中使用 buf_index 引用
+        // Safety:
+        // 1. `buf` 是 AlignedBuffer 持有的 Vec<u8>,其内存地址在 AlignedBuffer
+        //    生命周期内保持有效(io_uring 固定缓冲区注册期间不会释放)。
+        // 2. `buf.as_ptr()` 返回的对齐地址满足 io_uring O_DIRECT 的对齐要求
+        //   (由 aligned_alloc 保证 4096 字节对齐)。
+        // 3. `as *mut c_void` 转换安全,因为内核仅通过 io_uring 操作写入该缓冲区,
+        //    不会与 Rust 侧的共享引用同时存在(由 io_uring 提交/完成队列的
+        //    单生产者-单消费者模型保证)。
+        // 4. iovec 的生命周期短于 AlignedBuffer 的生命周期——iovecs 在函数末尾
+        //    被 drop,buffers 在 IoUringHandle 被 drop 前一直有效。
         let iovecs: Vec<libc::iovec> = buffers
             .iter()
-            .map(|buf| libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
+            .map(|buf| {
+                // Safety: 满足以上第 1-4 条 Safety 条件
+                libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                }
             })
             .collect();
 

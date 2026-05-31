@@ -30,7 +30,8 @@ async function fetchResources() {
   try {
     const list = await api.getSnifferResources()
     $snifferResources.set(list)
-  } catch {
+  } catch (e) {
+    console.error('获取嗅探资源失败:', e)
   }
 }
 
@@ -39,7 +40,8 @@ async function handleDownload(url: string) {
     await api.createTask(url)
     const list = await api.getTaskList()
     setTasks(list)
-  } catch {
+  } catch (e) {
+    console.error('下载嗅探资源失败:', e)
   }
 }
 
@@ -56,7 +58,7 @@ export default function SnifferPanel() {
           {$snifferActive.get() ? '监听中' : '已停止'}
         </span>
         <Toggle
-          initial={$snifferActive.get()}
+          checked={$snifferActive.get()}
           ariaLabel="嗅探开关"
           onChange={(val) => $snifferActive.set(val)}
         />

@@ -9,7 +9,6 @@ description = "AI Model Downloader 校验层:GPU 加速哈希与完整性校验"
 amd-core = { path = "../amd-core" }
 blake3.workspace = true
 sha2.workspace = true
-tokio.workspace = true
 bytes.workspace = true
 serde.workspace = true
 tracing.workspace = true
@@ -17,8 +16,11 @@ wgpu = { workspace = true, optional = true }
 
 [features]
 default = []
+# experimental: GPU 加速 blake3 哈希校验，当前为空壳实现
+# 需要 wgpu 支持的环境（Vulkan/Metal/DX12）
 gpu = ["dep:wgpu"]
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+tokio.workspace = true

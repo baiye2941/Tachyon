@@ -30,6 +30,9 @@ Thumbs.db
 .idea/
 *.iml
 
+# Reasonix 工具运行时数据
+.reasonix/
+
 # 环境变量
 .env
 .env.local

@@ -1,18 +1,9 @@
 import { createSignal } from 'solid-js'
 import { api } from '../api/invoke'
-import { $tasks, setTasks } from '../stores/downloads'
+import { $tasks, refreshTaskList } from '../stores/downloads'
 
 export default function Topbar() {
   const [url, setUrl] = createSignal('')
-
-  async function refreshTaskList() {
-    try {
-      const tasks = await api.getTaskList()
-      setTasks(tasks)
-    } catch (e) {
-      console.error('刷新任务列表失败:', e)
-    }
-  }
 
   async function startDownload() {
     const u = url().trim()

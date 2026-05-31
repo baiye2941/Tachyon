@@ -14,7 +14,6 @@ use amd_crypto::CpuVerifier;
 use amd_engine::fragment::compute_fragment_size;
 use amd_engine::fragment::{BandwidthTracker, FragmentRecord, FragmentState};
 use amd_io::AsyncStorage;
-use amd_io::buffer::BufferPool;
 use amd_io::pipeline::WritePipeline;
 use amd_io::tokio_file::TokioFile;
 use bytes::Bytes;
@@ -199,8 +198,7 @@ async fn integration_mock_protocol_to_storage() {
 async fn integration_pipeline_write_and_crypto_verify() {
     let tmp = NamedTempFile::new().unwrap();
     let tokio_file = TokioFile::open(tmp.path()).await.unwrap();
-    let pool = BufferPool::new(4096, 4);
-    let pipeline = WritePipeline::new(tokio_file, pool);
+    let pipeline = WritePipeline::new(tokio_file, 4096, 4);
     let verifier = CpuVerifier::blake3();
 
     // 写入多段数据

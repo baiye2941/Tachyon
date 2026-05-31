@@ -7,12 +7,14 @@
 
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use amd_core::filename::extract_filename;
 use amd_core::traits::Protocol;
 use amd_core::types::FileMetadata;
 use amd_core::{AmdError, AmdResult, ByteStream};
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::StreamExt;
 use reqwest::Client;
 use tracing::{debug, info, warn};
@@ -43,7 +45,7 @@ impl HttpClient {
             .pool_max_idle_per_host(16)
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .no_proxy()
-            .dns_resolver(std::sync::Arc::new(PublicDnsResolver))
+            .dns_resolver(std::sync::Arc::new(PublicDnsResolver::new()))
             .redirect(safe_redirect_policy());
 
         if connect_secs > 0 {
@@ -72,24 +74,40 @@ impl HttpClient {
 
 // Default 实现已移除 — TLS 初始化可能失败,请使用 HttpClient::new()
 
-#[derive(Debug)]
-struct PublicDnsResolver;
+const DNS_CACHE_TTL_SECS: u64 = 60;
+
+#[derive(Debug, Clone)]
+struct PublicDnsResolver {
+    cache: DashMap<String, (Vec<std::net::SocketAddr>, Instant)>,
+}
+
+impl PublicDnsResolver {
+    fn new() -> Self {
+        Self {
+            cache: DashMap::new(),
+        }
+    }
+}
 
 impl reqwest::dns::Resolve for PublicDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let cache = self.cache.clone();
+
+        if let Some(entry) = cache.get(&host)
+            && entry.value().1.elapsed() < Duration::from_secs(DNS_CACHE_TTL_SECS)
+        {
+            let addrs = entry.value().0.clone();
+            return Box::pin(async move { Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs) });
+        }
+
         Box::pin(async move {
-            let addrs: Vec<std::net::SocketAddr> = (host.as_str(), 0)
-                .to_socket_addrs()?
-                .map(|mut addr| {
-                    addr.set_port(0);
-                    addr
-                })
-                .collect();
+            let addrs: Vec<std::net::SocketAddr> = (host.as_str(), 0).to_socket_addrs()?.collect();
             for addr in &addrs {
                 amd_core::reject_forbidden_ip(addr.ip())
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
+            cache.insert(host, (addrs.clone(), Instant::now()));
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -320,6 +338,17 @@ impl Protocol for HttpClient {
                 return Err(classify_http_error(status, response.headers()));
             }
 
+            // 限制非流式响应大小，防止 OOM
+            const MAX_DOWNLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+            if let Some(content_length) = response.content_length()
+                && content_length > MAX_DOWNLOAD_SIZE
+            {
+                return Err(AmdError::Protocol(format!(
+                    "响应体过大: {} > 最大允许 {} 字节",
+                    content_length, MAX_DOWNLOAD_SIZE
+                )));
+            }
+
             response
                 .bytes()
                 .await
@@ -425,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_public_dns_resolver_rejects_localhost() {
-        let resolver = super::PublicDnsResolver;
+        let resolver = super::PublicDnsResolver::new();
         let name: reqwest::dns::Name = "localhost".parse().unwrap();
         let result = reqwest::dns::Resolve::resolve(&resolver, name).await;
         assert!(result.is_err());

@@ -2,8 +2,9 @@
 //!
 //! 基于 Holt-Winters 带宽预测实现 `DownloadScheduler` trait,
 //! 为下载引擎提供动态的并发度和分片大小建议。
+//! 使用 parking_lot::RwLock 实现读多写少的高效并发访问。
 
-use std::sync::Mutex;
+use parking_lot::RwLock;
 
 use amd_core::config::SchedulerConfig;
 use amd_core::traits::{DownloadScheduler, ScheduleRecommendation};
@@ -15,7 +16,7 @@ use crate::predictor::HoltWintersPredictor;
 /// 使用 Holt-Winters 指数平滑模型预测带宽,
 /// 并根据预测结果动态调整并发度和分片大小。
 pub struct AdaptiveDownloadScheduler {
-    predictor: Mutex<HoltWintersPredictor>,
+    predictor: RwLock<HoltWintersPredictor>,
     config: SchedulerConfig,
 }
 
@@ -23,7 +24,7 @@ impl AdaptiveDownloadScheduler {
     /// 创建新的自适应调度器
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
-            predictor: Mutex::new(HoltWintersPredictor::new(
+            predictor: RwLock::new(HoltWintersPredictor::new(
                 config.ewma_alpha,
                 config.ewma_alpha * 0.3, // beta 通常小于 alpha
             )),
@@ -40,14 +41,13 @@ impl AdaptiveDownloadScheduler {
 impl DownloadScheduler for AdaptiveDownloadScheduler {
     fn observe_bandwidth(&self, bytes_per_sec: u64) {
         tracing::info!(bandwidth = bytes_per_sec, "带宽分配更新");
-        if let Ok(mut pred) = self.predictor.lock() {
-            pred.observe(bytes_per_sec as f64);
-        }
+        let mut pred = self.predictor.write();
+        pred.observe(bytes_per_sec as f64);
     }
 
     fn recommend(&self, file_size: u64, max_concurrency: u32) -> ScheduleRecommendation {
         let (predicted_bw, confidence) = {
-            let pred = self.predictor.lock().unwrap_or_else(|e| e.into_inner());
+            let pred = self.predictor.read();
             (pred.predict(1), pred.confidence())
         };
 
@@ -96,7 +96,7 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
     }
 
     fn predicted_bandwidth(&self) -> u64 {
-        let pred = self.predictor.lock().unwrap_or_else(|e| e.into_inner());
+        let pred = self.predictor.read();
         pred.predict(1) as u64
     }
 }

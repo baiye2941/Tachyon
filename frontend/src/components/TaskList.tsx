@@ -7,27 +7,44 @@ async function refreshTasks() {
   try {
     const list = await api.getTaskList()
     setTasks(list)
-  } catch {
+  } catch (e) {
+    console.error('刷新任务列表失败:', e)
   }
 }
 
 async function handlePause(id: string) {
-  await api.pauseTask(id)
+  try {
+    await api.pauseTask(id)
+  } catch (e) {
+    console.error('暂停任务失败:', e)
+  }
 }
 
 async function handleResume(id: string) {
-  await api.resumeTask(id)
+  try {
+    await api.resumeTask(id)
+  } catch (e) {
+    console.error('恢复任务失败:', e)
+  }
 }
 
 async function handleCancel(id: string) {
-  await api.cancelTask(id)
+  try {
+    await api.cancelTask(id)
+  } catch (e) {
+    console.error('取消任务失败:', e)
+  }
 }
 
 async function handleDelete(id: string) {
-  await api.deleteTask(id)
-  const selected = $selectedId.get()
-  if (selected === id) setSelectedId(null)
-  await refreshTasks()
+  try {
+    await api.deleteTask(id)
+    const selected = $selectedId.get()
+    if (selected === id) setSelectedId(null)
+    await refreshTasks()
+  } catch (e) {
+    console.error('删除任务失败:', e)
+  }
 }
 
 export default function TaskList() {

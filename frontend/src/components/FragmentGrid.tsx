@@ -18,10 +18,18 @@ export default function FragmentGrid(props: FragmentGridProps) {
     return arr
   }
 
+  const blockClass = (cls: 'done' | 'active' | 'pending') => {
+    switch (cls) {
+      case 'done': return 'bg-accent'
+      case 'active': return 'bg-accent animate-pulse'
+      case 'pending': return 'bg-white/10'
+    }
+  }
+
   return (
-    <div class="fragment-grid">
+    <div class="grid grid-cols-8 gap-0.5">
       <For each={blocks()}>
-        {(cls) => <div class={`fragment-block ${cls}`} />}
+        {(cls) => <div class={`w-2 h-2 rounded-sm ${blockClass(cls)}`} />}
       </For>
     </div>
   )

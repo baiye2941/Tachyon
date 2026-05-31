@@ -9,7 +9,6 @@ description = "AI Model Downloader P2SP 混合下载、DHT、Peer 发现"
 amd-core = { path = "../amd-core" }
 amd-protocol = { path = "../amd-protocol" }
 tokio.workspace = true
-bytes.workspace = true
 tracing.workspace = true
 serde.workspace = true
 

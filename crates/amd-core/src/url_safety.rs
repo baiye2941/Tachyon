@@ -36,11 +36,28 @@ pub fn reject_forbidden_ip(ip: IpAddr) -> AmdResult<()> {
 }
 
 fn reject_forbidden_ipv4(ip: Ipv4Addr) -> AmdResult<()> {
+    let octets = ip.octets();
+
     if ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip == Ipv4Addr::new(169, 254, 169, 254)
+    {
+        return Err(AmdError::Config(format!("不允许访问受限 IPv4 地址: {ip}")));
+    }
+    // 组播(224.0.0.0/4)和保留地址(240.0.0.0/4,含广播 255.255.255.255)
+    if octets[0] >= 224 {
+        return Err(AmdError::Config(format!("不允许访问受限 IPv4 地址: {ip}")));
+    }
+    // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+    if octets[0] == 100 && (octets[1] & 0xC0) == 0x40 {
+        return Err(AmdError::Config(format!("不允许访问受限 IPv4 地址: {ip}")));
+    }
+    // RFC 5737 文档地址
+    if ip == Ipv4Addr::new(192, 0, 2, 0)
+        || ip == Ipv4Addr::new(198, 51, 100, 0)
+        || ip == Ipv4Addr::new(203, 0, 113, 0)
     {
         return Err(AmdError::Config(format!("不允许访问受限 IPv4 地址: {ip}")));
     }
@@ -52,10 +69,15 @@ fn reject_forbidden_ipv6(ip: Ipv6Addr) -> AmdResult<()> {
         return reject_forbidden_ipv4(mapped);
     }
 
-    let first_segment = ip.segments()[0];
+    let segments = ip.segments();
+    let first_segment = segments[0];
     let unique_local = (first_segment & 0xfe00) == 0xfc00;
     let link_local = (first_segment & 0xffc0) == 0xfe80;
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || unique_local || link_local {
+        return Err(AmdError::Config(format!("不允许访问受限 IPv6 地址: {ip}")));
+    }
+    // 站点本地地址 fec0::/10 (RFC 3879 已弃用但仍可能被解析)
+    if (segments[0] & 0xFFC0) == 0xFEC0 {
         return Err(AmdError::Config(format!("不允许访问受限 IPv6 地址: {ip}")));
     }
     Ok(())
@@ -105,6 +127,70 @@ mod tests {
             IpAddr::V6("::ffff:10.0.0.1".parse().unwrap()),
         ] {
             assert!(reject_forbidden_ip(ip).is_err(), "{ip} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_multicast_and_broadcast_ipv4() {
+        // 组播地址 (224.0.0.0/4)
+        for ip in [
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(239, 255, 255, 250), // SSDP
+            Ipv4Addr::new(240, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 255), // 广播
+        ] {
+            assert!(
+                reject_forbidden_ipv4(ip).is_err(),
+                "{ip} should be rejected as multicast/broadcast"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cgnat_range() {
+        // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 127, 255, 255),
+            Ipv4Addr::new(100, 80, 0, 1),
+        ] {
+            assert!(
+                reject_forbidden_ipv4(ip).is_err(),
+                "{ip} should be rejected as CGNAT"
+            );
+        }
+        // 100.63.255.255 不应被拦截(CGNAT 范围前)
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(100, 63, 255, 255)).is_ok());
+    }
+
+    #[test]
+    fn rejects_documentation_range() {
+        // RFC 5737 文档地址
+        for ip in [
+            Ipv4Addr::new(192, 0, 2, 0),
+            Ipv4Addr::new(198, 51, 100, 0),
+            Ipv4Addr::new(203, 0, 113, 0),
+        ] {
+            assert!(
+                reject_forbidden_ipv4(ip).is_err(),
+                "{ip} should be rejected as documentation range"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ipv6_site_local() {
+        // fec0::/10 (已弃用的站点本地地址)
+        for ip in [
+            Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xfeb0, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xfeff, 0, 0, 0, 0, 0, 0, 1),
+        ] {
+            let ip_addr = IpAddr::V6(ip);
+            assert!(
+                reject_forbidden_ip(ip_addr).is_err(),
+                "{ip} should be rejected as site-local"
+            );
         }
     }
 

@@ -133,14 +133,17 @@ impl Store for MemoryStore {
 /// 键经过安全转换后作为文件名（仅保留字母、数字和下划线）。
 pub struct FileStore {
     dir: PathBuf,
+    write_lock: RwLock<()>,
 }
 
 impl FileStore {
-    /// 创建或打开一个文件存储
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            write_lock: RwLock::new(()),
+        })
     }
 
     /// 获取存储目录
@@ -151,11 +154,11 @@ impl FileStore {
     /// 将键转换为安全的文件名
     fn safe_key(key: &str) -> String {
         key.chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
+            .flat_map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    vec![c]
                 } else {
-                    '_'
+                    format!("%{:02X}", c as u32).chars().collect()
                 }
             })
             .collect()
@@ -181,6 +184,10 @@ impl Store for FileStore {
     }
 
     fn set(&self, key: &str, value: String) -> std::io::Result<()> {
+        let _guard = self.write_lock.write().map_err(|e| {
+            tracing::warn!(key, error = %e, "KV 操作失败");
+            std::io::Error::other(e.to_string())
+        })?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(self.path_for(key), &value).map_err(|e| {
             tracing::warn!(key, error = %e, "KV 操作失败");
@@ -189,9 +196,12 @@ impl Store for FileStore {
     }
 
     fn delete(&self, key: &str) -> std::io::Result<bool> {
+        let _guard = self.write_lock.write().map_err(|e| {
+            tracing::warn!(key, error = %e, "KV 操作失败");
+            std::io::Error::other(e.to_string())
+        })?;
         let path = self.path_for(key);
         if path.exists() {
-            // Windows 上文件可能被其他进程/句柄占用,短暂重试
             #[cfg(target_os = "windows")]
             {
                 let mut attempts = 0;

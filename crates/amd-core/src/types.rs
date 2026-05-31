@@ -77,6 +77,50 @@ impl DownloadState {
     }
 }
 
+/// 暂停状态信息，用于跟踪暂停超时
+///
+/// CLAUDE.md 要求: paused 状态 MUST 有时间上限，不能永久暂停
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PauseInfo {
+    /// 暂停开始时间(UNIX 时间戳，秒)
+    pub paused_at_secs: u64,
+    /// 最大暂停持续时间(秒)
+    pub max_duration_secs: u64,
+}
+
+impl PauseInfo {
+    /// 创建新的暂停信息
+    pub fn new(max_duration_secs: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            paused_at_secs: now,
+            max_duration_secs,
+        }
+    }
+
+    /// 暂停是否已超时
+    pub fn is_expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(self.paused_at_secs) >= self.max_duration_secs
+    }
+
+    /// 剩余暂停时间(秒)，超时返回 0
+    pub fn remaining_secs(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let elapsed = now.saturating_sub(self.paused_at_secs);
+        self.max_duration_secs.saturating_sub(elapsed)
+    }
+}
+
 /// 文件元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -111,6 +155,24 @@ pub struct FragmentInfo {
     pub hash: Option<String>,
 }
 
+impl FragmentInfo {
+    pub fn new(index: u32, start: u64, end: u64, size: u64) -> Self {
+        debug_assert_eq!(
+            end + 1,
+            start + size,
+            "FragmentInfo invariant: end + 1 == start + size, got end={end}, start={start}, size={size}"
+        );
+        Self {
+            index,
+            start,
+            end,
+            size,
+            downloaded: 0,
+            hash: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskProgress {
     pub downloaded: u64,
@@ -129,6 +191,33 @@ pub struct DownloadStateChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pause_info_creation() {
+        let info = PauseInfo::new(300);
+        assert_eq!(info.max_duration_secs, 300);
+        assert!(!info.is_expired(), "新创建的暂停信息不应过期");
+        assert!(info.remaining_secs() <= 300);
+        assert!(info.remaining_secs() > 0);
+    }
+
+    #[test]
+    fn test_pause_info_expired() {
+        let info = PauseInfo {
+            paused_at_secs: 0, // UNIX 纪元
+            max_duration_secs: 1,
+        };
+        assert!(info.is_expired(), "很久以前的暂停应已过期");
+        assert_eq!(info.remaining_secs(), 0);
+    }
+
+    #[test]
+    fn test_pause_info_serialization() {
+        let info = PauseInfo::new(600);
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: PauseInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.max_duration_secs, 600);
+    }
 
     #[test]
     fn test_download_state_variants() {

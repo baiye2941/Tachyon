@@ -33,6 +33,11 @@ impl HoltWintersPredictor {
 
     /// 记录新的带宽观测值(字节/秒)
     pub fn observe(&mut self, value: f64) {
+        // 跳过无效值，防止 NaN/Inf 传播污染 EMA
+        if !value.is_finite() || value < 0.0 {
+            tracing::warn!("无效的速度值: {}, 跳过 EMA 更新", value);
+            return;
+        }
         self.sample_count += 1;
         if !self.initialized {
             self.level = value;
@@ -103,6 +108,28 @@ mod tests {
         pred.observe(100.0);
         assert_eq!(pred.current_level(), 100.0);
         assert_eq!(pred.predict(1), 100.0); // trend = 0
+    }
+
+    #[test]
+    fn test_predictor_ignores_nan() {
+        let mut pred = HoltWintersPredictor::default();
+        pred.observe(100.0);
+        pred.observe(f64::NAN);
+        pred.observe(f64::INFINITY);
+        pred.observe(f64::NEG_INFINITY);
+        // NaN/Inf 应被跳过，level 仍为首次观测值
+        assert_eq!(pred.current_level(), 100.0);
+        assert_eq!(pred.sample_count(), 1);
+    }
+
+    #[test]
+    fn test_predictor_ignores_negative() {
+        let mut pred = HoltWintersPredictor::default();
+        pred.observe(100.0);
+        pred.observe(-50.0);
+        // 负值应被跳过
+        assert_eq!(pred.current_level(), 100.0);
+        assert_eq!(pred.sample_count(), 1);
     }
 
     #[test]

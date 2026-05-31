@@ -62,6 +62,7 @@ impl DownloadOrchestrator {
     /// - 服务端不支持 Range 时返回单个分片覆盖整个文件
     /// - 当 `suggested_frag_size` 为 `Some(size)` 且 `size > 0` 时,优先使用调度器建议的分片大小
     /// - 否则调用 `compute_fragment_size` 计算动态分片大小
+    #[tracing::instrument(skip(self))]
     pub fn plan_fragments(
         &self,
         file_size: u64,
@@ -73,14 +74,7 @@ impl DownloadOrchestrator {
         }
 
         if !supports_range {
-            return vec![FragmentInfo {
-                index: 0,
-                start: 0,
-                end: file_size - 1,
-                size: file_size,
-                downloaded: 0,
-                hash: None,
-            }];
+            return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
         }
 
         let frag_size = match suggested_frag_size {
@@ -99,14 +93,7 @@ impl DownloadOrchestrator {
 
         // frag_size 为 0 的防御(理论上 file_size > 0 时不会发生)
         if frag_size == 0 {
-            return vec![FragmentInfo {
-                index: 0,
-                start: 0,
-                end: file_size - 1,
-                size: file_size,
-                downloaded: 0,
-                hash: None,
-            }];
+            return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
         }
 
         let mut fragments = Vec::new();
@@ -118,14 +105,7 @@ impl DownloadOrchestrator {
             let size = remaining.min(frag_size);
             let end = offset + size - 1;
 
-            fragments.push(FragmentInfo {
-                index,
-                start: offset,
-                end,
-                size,
-                downloaded: 0,
-                hash: None,
-            });
+            fragments.push(FragmentInfo::new(index, offset, end, size));
 
             offset += size;
             index += 1;

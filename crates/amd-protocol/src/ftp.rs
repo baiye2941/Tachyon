@@ -11,11 +11,13 @@
 //! 均建立独立连接,操作完成后自动断开,适合无状态调用场景。
 //! `connect`/`login`/`retrieve` 等实例方法维护持久连接状态。
 
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use amd_core::traits::Protocol;
 use amd_core::types::FileMetadata;
+use amd_core::url_safety::reject_forbidden_ip;
 use amd_core::{AmdError, AmdResult, ByteStream};
 use bytes::Bytes;
 use suppaftp::tokio::AsyncFtpStream;
@@ -84,6 +86,18 @@ impl FtpClient {
     /// 建立 TCP 控制连接并读取服务器 220 欢迎消息。
     /// 地址格式: `host:port`(如 `"ftp.example.com:21"`)。
     pub async fn connect(&self, host: &str, port: u16) -> AmdResult<()> {
+        let normalized_host = host.trim_end_matches('.');
+        if normalized_host.eq_ignore_ascii_case("localhost") {
+            return Err(AmdError::Protocol("FTP 不允许访问 localhost".into()));
+        }
+        // IPv6 地址可能带方括号(如 "[::1]"),需先去除再解析
+        let stripped = normalized_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if let Ok(ip) = stripped.parse::<IpAddr>() {
+            reject_forbidden_ip(ip).map_err(|e| AmdError::Protocol(e.to_string()))?;
+        }
+
         let addr = format!("{host}:{port}");
         let stream = AsyncFtpStream::connect(&addr)
             .await
@@ -307,6 +321,30 @@ impl FtpClient {
                 "URL 方案不是 ftp: {}",
                 parsed.scheme()
             )));
+        }
+
+        // SSRF 防护:直接使用 url crate 解析后的 Host 枚举,
+        // 避免 host_str() 对 IPv6 返回带方括号的字符串导致解析失败
+        match parsed.host() {
+            Some(url::Host::Ipv4(v4)) => {
+                reject_forbidden_ip(IpAddr::V4(v4))
+                    .map_err(|e| AmdError::Protocol(e.to_string()))?;
+            }
+            Some(url::Host::Ipv6(v6)) => {
+                reject_forbidden_ip(IpAddr::V6(v6))
+                    .map_err(|e| AmdError::Protocol(e.to_string()))?;
+            }
+            Some(url::Host::Domain(domain)) => {
+                let normalized = domain.trim_end_matches('.');
+                if normalized.eq_ignore_ascii_case("localhost") {
+                    return Err(AmdError::Protocol("FTP 不允许访问 localhost".into()));
+                }
+                // 域名可能解析为受限 IP,但此处在 URL 解析阶段无法验证,
+                // 需在 DNS 解析阶段(如 connect)再次检查
+            }
+            None => {
+                return Err(AmdError::Protocol("FTP URL 缺少主机名".into()));
+            }
         }
 
         let host = parsed
@@ -734,14 +772,68 @@ mod tests {
     }
 
     // =========================================================================
+    // 4.5 SSRF 防护
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_loopback_ipv4() {
+        let result = FtpClient::parse_ftp_url("ftp://127.0.0.1/file.zip");
+        assert!(result.is_err(), "FTP 不允许访问 127.0.0.1");
+        assert!(result.unwrap_err().to_string().contains("受限"));
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_cloud_metadata() {
+        let result = FtpClient::parse_ftp_url("ftp://169.254.169.254/metadata");
+        assert!(result.is_err(), "FTP 不允许访问云元数据端点");
+        assert!(result.unwrap_err().to_string().contains("受限"));
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_private_ipv4() {
+        let result = FtpClient::parse_ftp_url("ftp://10.0.0.1/file.zip");
+        assert!(result.is_err(), "FTP 不允许访问私有 IPv4");
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_link_local_ipv4() {
+        let result = FtpClient::parse_ftp_url("ftp://169.254.1.1/file.zip");
+        assert!(result.is_err(), "FTP 不允许访问链路本地 IPv4");
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_loopback_ipv6() {
+        let result = FtpClient::parse_ftp_url("ftp://[::1]/file.zip");
+        assert!(result.is_err(), "FTP 不允许访问 IPv6 回环地址");
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_localhost() {
+        let result = FtpClient::parse_ftp_url("ftp://localhost/file.zip");
+        assert!(result.is_err(), "FTP 不允许访问 localhost");
+        assert!(result.unwrap_err().to_string().contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_rejects_localhost_trailing_dot() {
+        let result = FtpClient::parse_ftp_url("ftp://localhost./file.zip");
+        assert!(result.is_err(), "FTP 不允许访问 localhost.(尾部点号绕过)");
+    }
+
+    #[tokio::test]
+    async fn test_ftp_url_accepts_public_host() {
+        let result = FtpClient::parse_ftp_url("ftp://ftp.example.com/pub/file.zip");
+        assert!(result.is_ok(), "公网 FTP 主机应允许访问");
+    }
+
+    // =========================================================================
     // 5. Protocol trait 一致性
     // =========================================================================
 
     #[tokio::test]
     async fn test_ftp_protocol_probe_returns_error_for_unreachable() {
         let client = FtpClient::new();
-        // 不可达地址,应返回 Network 错误
-        let result = client.probe("ftp://127.0.0.1:1/file.zip").await;
+        let result = client.probe("ftp://192.0.2.1:1/file.zip").await;
         assert!(result.is_err(), "不可达服务器 probe 应返回错误");
     }
 
@@ -749,7 +841,7 @@ mod tests {
     async fn test_ftp_protocol_download_range_returns_error_for_unreachable() {
         let client = FtpClient::new();
         let result = client
-            .download_range("ftp://127.0.0.1:1/file.zip", 0, 1023)
+            .download_range("ftp://192.0.2.1:1/file.zip", 0, 1023)
             .await;
         assert!(result.is_err(), "不可达服务器 download_range 应返回错误");
     }
@@ -757,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn test_ftp_protocol_download_full_returns_error_for_unreachable() {
         let client = FtpClient::new();
-        let result = client.download_full("ftp://127.0.0.1:1/file.zip").await;
+        let result = client.download_full("ftp://192.0.2.1:1/file.zip").await;
         assert!(result.is_err(), "不可达服务器 download_full 应返回错误");
     }
 
@@ -800,7 +892,7 @@ mod tests {
     async fn test_file_size_formatting_in_error_message() {
         // 验证 Protocol 方法在不可达地址上生成包含有意义上下文的错误消息
         let client = FtpClient::new();
-        let result = client.probe("ftp://127.0.0.1:1/large-file.bin").await;
+        let result = client.probe("ftp://192.0.2.1:1/large-file.bin").await;
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
@@ -875,9 +967,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_message_connect_unreachable() {
-        // 使用 localhost 不可达端口,验证连接错误包含地址信息
         let client = FtpClient::new();
-        let result = client.connect("127.0.0.1", 1).await;
+        let result = client.connect("192.0.2.1", 1).await;
         assert!(result.is_err());
 
         let msg = result.unwrap_err().to_string();

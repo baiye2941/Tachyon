@@ -26,3 +26,15 @@ export function guessExt(name: string): string {
   const parts = name.split('.')
   return parts.length > 1 ? parts.pop()!.toUpperCase().slice(0, 4) : 'FILE'
 }
+
+export function statusClass(status: string): string {
+  const map: Record<string, string> = {
+    downloading: 'text-accent bg-accent/10',
+    completed: 'text-success bg-success/10',
+    paused: 'text-text-secondary bg-white/5',
+    failed: 'text-error bg-error/10',
+    pending: 'text-warning bg-warning/10',
+    cancelled: 'text-text-tertiary bg-white/5',
+  }
+  return map[status] || 'text-text-secondary bg-white/5'
+}

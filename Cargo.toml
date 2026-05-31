@@ -36,7 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 
 # QUIC
 quinn = "0.11"
@@ -69,6 +69,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # 并发
 crossbeam-queue = "0.3"
 dashmap = "6"
+parking_lot = "0.12"
 
 # 网络
 url = "2"

@@ -18,7 +18,12 @@ export default function Layout(props: LayoutProps) {
 
   return (
     <div class="min-h-[100dvh] bg-canvas text-text-primary">
-      <Sidebar currentView={props.currentView} onViewChange={props.onViewChange} />
+      <Sidebar
+        currentView={props.currentView}
+        onViewChange={props.onViewChange}
+        hovered={sidebarHovered()}
+        onHoverChange={setSidebarHovered}
+      />
       <div
         class="transition-[margin-left] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
         style={{ 'margin-left': `${sidebarWidth()}px` }}

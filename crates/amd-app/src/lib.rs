@@ -15,6 +15,18 @@ use commands::{
 /// 构建并运行 Tauri 应用
 pub fn run() {
     use tauri::Manager;
+
+    // 设置全局 panic hook，确保 panic 信息被 tracing 捕获
+    std::panic::set_hook(Box::new(|panic_info| {
+        tracing::error!(
+            target = "panic",
+            panic.file = panic_info.location().map(|l| l.file()),
+            panic.line = panic_info.location().map(|l| l.line()),
+            panic.column = panic_info.location().map(|l| l.column()),
+            "应用 panic: {panic_info}",
+        );
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -85,17 +97,14 @@ async fn any_fragment() {
         fragments_done: 0,
         created_at: chrono::Local::now().to_rfc3339(),
     };
-    state.tasks.lock().await.insert(task_id.clone(), task);
+    state.tasks.insert(task_id.clone(), task);
 
-    // 模拟分片失败:标记为 failed
     {
-        let mut store = state.tasks.lock().await;
-        if let Some(t) = store.get_mut(&task_id) {
+        if let Some(mut t) = state.tasks.get_mut(&task_id) {
             t.status = amd_core::types::DownloadState::Failed;
         }
     }
-    let store = state.tasks.lock().await;
-    let t = store.get(&task_id).unwrap();
+    let t = state.tasks.get(&task_id).unwrap();
     assert_eq!(
         t.status,
         amd_core::types::DownloadState::Failed,
@@ -117,9 +126,8 @@ async fn max_concurrent() {
 
     // 插入 2 个活跃任务
     {
-        let mut store = state.tasks.lock().await;
         for i in 0..2 {
-            store.insert(
+            state.tasks.insert(
                 format!("task-{i}"),
                 TaskInfo {
                     id: format!("task-{i}"),
@@ -138,11 +146,11 @@ async fn max_concurrent() {
         }
     }
 
-    // 验证活跃任务数已达到上限
-    let store = state.tasks.lock().await;
-    let active = store
-        .values()
-        .filter(|t| {
+    let active = state
+        .tasks
+        .iter()
+        .filter(|r| {
+            let t = r.value();
             t.status == amd_core::types::DownloadState::Downloading
                 || t.status == amd_core::types::DownloadState::Pending
         })

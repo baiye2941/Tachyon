@@ -174,7 +174,6 @@ pub mod harness {
         }
 
         async fn sync(&self) -> AmdResult<()> {
-            // 内存存储无需 sync
             Ok(())
         }
 

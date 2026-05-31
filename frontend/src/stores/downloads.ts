@@ -1,6 +1,9 @@
 import { createSignal, batch } from 'solid-js'
 import { createStore, reconcile } from 'solid-js/store'
 import type { TaskInfo, DownloadStatus, ProgressPayload } from '../types'
+import { api } from '../api/invoke'
+
+const VALID_STATUSES = new Set<string>(['pending', 'downloading', 'paused', 'completed', 'failed', 'cancelled'])
 
 const [tasks, setTasksRaw] = createStore<TaskInfo[]>([])
 const [selectedId, setSelectedId] = createSignal<string | null>(null)
@@ -46,7 +49,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           ...t,
           downloaded: p.downloaded ?? t.downloaded,
           speed: p.speed ?? t.speed,
-          status: (p.status as DownloadStatus) ?? t.status,
+          status: VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : t.status,
           progress: p.progress ?? t.progress,
           fragmentsDone: p.fragmentsDone ?? t.fragmentsDone,
         }
@@ -54,4 +57,13 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       { key: 'id' }
     ))
   })
+}
+
+export async function refreshTaskList() {
+  try {
+    const tasks = await api.getTaskList()
+    setTasks(tasks)
+  } catch (e) {
+    console.error('刷新任务列表失败:', e)
+  }
 }

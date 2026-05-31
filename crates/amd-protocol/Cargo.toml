@@ -13,6 +13,7 @@ bytes.workspace = true
 url.workspace = true
 tracing.workspace = true
 futures.workspace = true
+dashmap.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

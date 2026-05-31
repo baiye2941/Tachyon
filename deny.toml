@@ -36,7 +36,7 @@ confidence-threshold = 0.8
 [bans]
 # 宽松模式:允许重复依赖(Rust 生态常见)
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 
 [sources]
 # 仅允许来自 crates.io 的依赖

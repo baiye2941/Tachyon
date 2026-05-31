@@ -1,6 +1,6 @@
 import { Show } from 'solid-js'
 import { $tasks, $selectedId } from '../stores/downloads'
-import { formatSize, formatSpeed, statusText } from '../utils/format'
+import { formatSize, formatSpeed, statusText, statusClass } from '../utils/format'
 import FragmentGrid from './FragmentGrid'
 
 export default function DetailPanel() {
@@ -18,7 +18,7 @@ export default function DetailPanel() {
 
           <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
             <span class="text-text-tertiary">状态</span>
-            <span class={`status-${task.status}`}>{statusText(task.status)}</span>
+            <span class={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${statusClass(task.status)}`}>{statusText(task.status)}</span>
           </div>
           <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
             <span class="text-text-tertiary">大小</span>
@@ -44,7 +44,7 @@ export default function DetailPanel() {
           </div>
           <div class="flex justify-between items-center py-1.5 border-b border-white/6 text-[12px]">
             <span class="text-text-tertiary">协议</span>
-            <span class="font-mono text-[11px]">{new URL(task.url).protocol.replace(':', '').toUpperCase()}</span>
+            <span class="font-mono text-[11px]">{(() => { try { return new URL(task.url).protocol.replace(':', '').toUpperCase() } catch { return 'UNKNOWN' } })()}</span>
           </div>
 
           <Show when={task.fragmentsTotal > 0}>

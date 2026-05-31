@@ -1,29 +1,26 @@
-import { createSignal } from 'solid-js'
-
 interface ToggleProps {
-  initial?: boolean
+  checked: boolean
   ariaLabel: string
   onChange?: (value: boolean) => void
 }
 
 export default function Toggle(props: ToggleProps) {
-  const [on, setOn] = createSignal(props.initial ?? false)
-
-  function toggle() {
-    const next = !on()
-    setOn(next)
-    props.onChange?.(next)
-  }
-
   return (
     <div
-      class={`toggle ${on() ? 'on' : ''}`}
+      class={`relative w-9 h-5 rounded-full cursor-pointer transition-colors duration-150 ${props.checked ? 'bg-accent' : 'bg-white/10'}`}
       role="switch"
-      aria-checked={on()}
+      aria-checked={props.checked}
       aria-label={props.ariaLabel}
-      tabindex="0"
-      onClick={toggle}
-      onKeyDown={(e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle() } }}
-    />
+      tabIndex={0}
+      onClick={() => props.onChange?.(!props.checked)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          props.onChange?.(!props.checked)
+        }
+      }}
+    >
+      <div class={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform duration-150 ${props.checked ? 'translate-x-4' : ''}`} />
+    </div>
   )
 }

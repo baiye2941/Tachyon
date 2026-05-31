@@ -1,6 +1,6 @@
-import { For, createSignal, createEffect } from 'solid-js'
+import { For } from 'solid-js'
 import type { ViewName } from '../types'
-import { $activeTasks, $totalSpeed } from '../stores/downloads'
+import { $totalSpeed } from '../stores/downloads'
 import { formatSpeed } from '../utils/format'
 
 const NAV_ITEMS: { view: ViewName; label: string; iconPath: string }[] = [
@@ -12,22 +12,20 @@ const NAV_ITEMS: { view: ViewName; label: string; iconPath: string }[] = [
 export default function Sidebar(props: {
   currentView: ViewName
   onViewChange: (view: ViewName) => void
+  hovered: boolean
+  onHoverChange: (hovered: boolean) => void
 }) {
-  const [hovered, setHovered] = createSignal(false)
-  const activeTasks = $activeTasks.get()
-  const totalSpeed = $totalSpeed.get()
-
   return (
     <div
       class="fixed top-0 left-0 bottom-0 z-30 overflow-hidden bg-surface backdrop-blur-md border-r border-white/[0.06] transition-[width] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)"
-      style={{ width: hovered() ? '240px' : '48px' }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      style={{ width: props.hovered ? '240px' : '48px' }}
+      onMouseEnter={() => props.onHoverChange(true)}
+      onMouseLeave={() => props.onHoverChange(false)}
     >
       <div
         class="h-full flex flex-col"
         style={{
-          transform: hovered() ? 'translate3d(0, 0, 0)' : 'translate3d(-192px, 0, 0)',
+          transform: props.hovered ? 'translate3d(0, 0, 0)' : 'translate3d(-192px, 0, 0)',
           transition: 'transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)',
         }}
       >
@@ -46,7 +44,7 @@ export default function Sidebar(props: {
                 <svg viewBox="0 0 24 24" class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5">
                   <path d={item.iconPath} />
                 </svg>
-                {hovered() ? item.label : null}
+                {props.hovered ? item.label : null}
               </button>
             )}
           </For>
@@ -54,7 +52,7 @@ export default function Sidebar(props: {
         <div class="px-4 py-3 border-t border-white/6 text-xs text-text-tertiary">
           <div class="flex justify-between">
             <span>速度</span>
-            <span class="font-mono">{formatSpeed(totalSpeed)}</span>
+            <span class="font-mono">{formatSpeed($totalSpeed.get())}</span>
           </div>
         </div>
       </div>

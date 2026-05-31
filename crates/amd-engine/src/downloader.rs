@@ -9,6 +9,8 @@
 //!
 //! `run()` 方法一键执行上述全部步骤。
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,16 +20,25 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use amd_core::config::DownloadConfig;
-#[cfg(test)]
-use amd_core::traits::Storage;
-use amd_core::traits::{DownloadScheduler, Protocol};
+use amd_core::traits::{DownloadScheduler, Protocol, Verifier};
 use amd_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
 use amd_core::{AmdError, AmdResult};
-use amd_crypto::cpu::CpuVerifier;
+use amd_crypto::CpuVerifier;
 use amd_io::TokioFile;
 use amd_io::storage::AsyncStorage;
 use amd_protocol::http::HttpClient;
 use amd_scheduler::AdaptiveDownloadScheduler;
+
+/// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
+/// 添加新校验后端只需实现 Verifier trait,无需修改引擎层枚举。
+pub type VerifierKind = Arc<dyn Verifier>;
+
+/// 创建默认的 blake3 CPU 校验器
+pub fn default_blake3_verifier() -> VerifierKind {
+    Arc::new(CpuVerifier::blake3())
+}
+
+pub type StorageKind = DynStorage;
 
 use crate::connection::ConnectionPool;
 use crate::fragment::FragmentRecord;
@@ -39,106 +50,162 @@ use amd_core::test_harness::harness::MemoryStorage as MemStorage;
 use amd_core::test_harness::harness::MockProtocol as MockProto;
 
 // ---------------------------------------------------------------------------
-// StorageKind: 存储类型枚举
+// DynStorage: 类型擦除存储包装器
 // ---------------------------------------------------------------------------
 
-/// 存储类型枚举
-///
-/// 封装不同存储后端,统一提供读写接口。后续可扩展 io_uring 等变体。
-/// 内部使用 `Arc` 包装以支持克隆(共享同一底层存储)。
-pub enum StorageKind {
-    /// 基于 tokio 的异步文件存储
-    Tokio(Arc<TokioFile>),
-    #[cfg(test)]
-    /// 内存存储,仅在测试模式下可用
-    Memory(Arc<MemStorage>),
+trait ErasedStorage: Send + Sync {
+    fn write_at_erased(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = AmdResult<usize>> + Send + '_>>;
+    fn read_at_erased<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = AmdResult<usize>> + Send + 'a>>;
+    fn allocate_erased(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = AmdResult<()>> + Send + '_>>;
+    fn sync_erased(&self) -> Pin<Box<dyn Future<Output = AmdResult<()>> + Send + '_>>;
+    fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = AmdResult<u64>> + Send + '_>>;
 }
 
-impl Clone for StorageKind {
-    fn clone(&self) -> Self {
-        match self {
-            StorageKind::Tokio(s) => StorageKind::Tokio(Arc::clone(s)),
-            #[cfg(test)]
-            StorageKind::Memory(s) => StorageKind::Memory(Arc::clone(s)),
-        }
+impl<S: AsyncStorage + 'static> ErasedStorage for S {
+    fn write_at_erased(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = AmdResult<usize>> + Send + '_>> {
+        Box::pin(self.write_at(offset, data))
+    }
+
+    fn read_at_erased<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = AmdResult<usize>> + Send + 'a>> {
+        Box::pin(self.read_at(offset, buf))
+    }
+
+    fn allocate_erased(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = AmdResult<()>> + Send + '_>> {
+        Box::pin(self.allocate(size))
+    }
+
+    fn sync_erased(&self) -> Pin<Box<dyn Future<Output = AmdResult<()>> + Send + '_>> {
+        Box::pin(self.sync())
+    }
+
+    fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = AmdResult<u64>> + Send + '_>> {
+        Box::pin(self.file_size())
     }
 }
 
-impl StorageKind {
-    /// 打开或创建存储
-    ///
-    /// - `Tokio`: 在 `path` 创建/打开文件
-    /// - `Memory`: 创建空内存缓冲区(测试用)
+/// 类型擦除存储包装器
+///
+/// 通过 `Arc<dyn ErasedStorage>` 实现动态分发,添加新存储后端只需
+/// 实现 `AsyncStorage` trait,无需修改引擎层枚举定义和 match 分支。
+#[derive(Clone)]
+pub struct DynStorage(Arc<dyn ErasedStorage>);
+
+impl DynStorage {
+    /// 从任意 AsyncStorage 实现创建
+    pub fn new<S: AsyncStorage + 'static>(storage: S) -> Self {
+        Self(Arc::new(storage))
+    }
+
+    /// 从 Arc 包装的 AsyncStorage 创建
+    pub fn from_arc<S: AsyncStorage + 'static>(storage: Arc<S>) -> Self {
+        Self(storage)
+    }
+
+    /// 打开或创建 TokioFile 存储
     async fn open(path: &std::path::Path) -> AmdResult<Self> {
         let storage = TokioFile::open(path).await?;
-        Ok(StorageKind::Tokio(Arc::new(storage)))
-    }
-
-    /// 创建内存存储(测试辅助)
-    #[cfg(test)]
-    fn memory() -> Self {
-        StorageKind::Memory(Arc::new(MemStorage::new()))
-    }
-
-    /// 创建指定容量的内存存储(测试辅助)
-    #[cfg(test)]
-    fn memory_with_capacity(cap: usize) -> Self {
-        StorageKind::Memory(Arc::new(MemStorage::with_capacity(cap)))
+        Ok(Self::new(storage))
     }
 
     /// 写入数据到指定偏移
     pub async fn write_at(&self, offset: u64, data: Bytes) -> AmdResult<usize> {
-        match self {
-            StorageKind::Tokio(s) => s.write_at(offset, data).await,
-            #[cfg(test)]
-            StorageKind::Memory(s) => s.write_at(offset, data).await,
-        }
+        self.0.write_at_erased(offset, data).await
     }
 
     /// 从指定偏移读取数据
-    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> AmdResult<usize> {
-        match self {
-            StorageKind::Tokio(s) => s.read_at(offset, buf).await,
-            #[cfg(test)]
-            StorageKind::Memory(s) => s.read_at(offset, buf).await,
-        }
+    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> AmdResult<usize> {
+        self.0.read_at_erased(offset, buf).await
     }
 
     /// 预分配文件空间
-    async fn allocate(&self, size: u64) -> AmdResult<()> {
-        match self {
-            StorageKind::Tokio(s) => s.allocate(size).await,
-            #[cfg(test)]
-            StorageKind::Memory(s) => s.allocate(size).await,
-        }
+    pub async fn allocate(&self, size: u64) -> AmdResult<()> {
+        self.0.allocate_erased(size).await
     }
 
     /// 同步数据到磁盘
-    async fn sync(&self) -> AmdResult<()> {
-        match self {
-            StorageKind::Tokio(s) => s.sync().await,
-            #[cfg(test)]
-            StorageKind::Memory(s) => s.sync().await,
-        }
+    pub async fn sync(&self) -> AmdResult<()> {
+        self.0.sync_erased().await
+    }
+
+    pub async fn file_size(&self) -> AmdResult<u64> {
+        self.0.file_size_erased().await
     }
 }
 
-// ---------------------------------------------------------------------------
-// VerifierKind: 校验器类型枚举
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+struct AsyncMemWrapper(MemStorage);
 
-/// 校验器类型枚举
-///
-/// 封装不同的哈希校验实现。后续可扩展 GPU 校验等变体。
-#[derive(Clone)]
-pub enum VerifierKind {
-    /// CPU 校验器(blake3/sha256)
-    Cpu(CpuVerifier),
+#[cfg(test)]
+impl AsyncStorage for AsyncMemWrapper {
+    fn write_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> impl std::future::Future<Output = AmdResult<usize>> + Send {
+        use amd_core::traits::Storage;
+        self.0.write_at(offset, data)
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = AmdResult<usize>> + Send {
+        use amd_core::traits::Storage;
+        self.0.read_at(offset, buf)
+    }
+
+    fn sync(&self) -> impl std::future::Future<Output = AmdResult<()>> + Send {
+        use amd_core::traits::Storage;
+        self.0.sync()
+    }
+
+    fn allocate(&self, size: u64) -> impl std::future::Future<Output = AmdResult<()>> + Send {
+        use amd_core::traits::Storage;
+        self.0.allocate(size)
+    }
+
+    fn file_size(&self) -> impl std::future::Future<Output = AmdResult<u64>> + Send {
+        use amd_core::traits::Storage;
+        self.0.file_size()
+    }
+
+    fn close(&self) -> impl std::future::Future<Output = AmdResult<()>> + Send {
+        use amd_core::traits::Storage;
+        self.0.close()
+    }
 }
 
-impl VerifierKind {
-    pub fn blake3() -> Self {
-        VerifierKind::Cpu(CpuVerifier::blake3())
+#[cfg(test)]
+impl DynStorage {
+    fn memory() -> Self {
+        Self::new(AsyncMemWrapper(MemStorage::new()))
+    }
+
+    fn memory_with_capacity(cap: usize) -> Self {
+        Self::new(AsyncMemWrapper(MemStorage::with_capacity(cap)))
     }
 }
 
@@ -175,7 +242,7 @@ pub struct DownloadTask {
     pub config: DownloadConfig,
     protocol: Arc<dyn Protocol>,
     /// 延迟初始化:probe() 后通过 init_storage() 创建
-    storage: Option<Arc<StorageKind>>,
+    storage: Option<Arc<DynStorage>>,
     orchestrator: DownloadOrchestrator,
     scheduler: Arc<dyn DownloadScheduler>,
     pool: Option<Arc<ConnectionPool>>,
@@ -183,8 +250,8 @@ pub struct DownloadTask {
     state: DownloadState,
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<FragmentProgress>>,
-    /// 断点续传:已完成的分片索引,plan() 后据此跳过这些分片
+    progress_tx: Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
+    verifier: VerifierKind,
     completed_fragments: Vec<u32>,
 }
 
@@ -266,6 +333,7 @@ impl DownloadTask {
             metadata: None,
             fragments: Vec::new(),
             progress_tx: None,
+            verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
         })
     }
@@ -291,6 +359,7 @@ impl DownloadTask {
             metadata: None,
             fragments: Vec::new(),
             progress_tx: None,
+            verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
         }
     }
@@ -299,10 +368,7 @@ impl DownloadTask {
         self.control_rx = Some(control_rx);
     }
 
-    pub fn set_progress_sender(
-        &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<FragmentProgress>,
-    ) {
+    pub fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
         self.progress_tx = Some(tx);
     }
 
@@ -350,7 +416,7 @@ impl DownloadTask {
     /// 与 `wait_control_rx` 的关键区别:正常运行状态(Downloading 等)下**不会立即返回**,
     /// 而是挂起等待状态变化,因此不会在 `select!` 中抢占正在进行的下载分支。
     /// 只有在出现 Cancelled/Failed 时返回 `Err`,出现 Paused 时按暂停语义阻塞/超时。
-    /// 若控制通道关闭,则永久挂起(交由对端的下载分支决定结果)。
+    /// 控制通道关闭时返回错误,避免任务永久挂起。
     async fn watch_for_interrupt(
         rx: &mut watch::Receiver<DownloadState>,
         pause_timeout: Duration,
@@ -361,7 +427,6 @@ impl DownloadTask {
                 DownloadState::Cancelled => return Err(AmdError::Cancelled),
                 DownloadState::Failed => return Err(AmdError::Other("任务已失败".into())),
                 DownloadState::Paused => {
-                    // 暂停:等待恢复信号,超时则视为暂停超时错误
                     tokio::time::timeout(pause_timeout, rx.changed())
                         .await
                         .map_err(|_| {
@@ -370,12 +435,8 @@ impl DownloadTask {
                         .map_err(|_| AmdError::Other("控制通道已关闭".into()))?;
                 }
                 _ => {
-                    // 正常运行:挂起等待下一次状态变化,绝不主动返回 Ok,
-                    // 避免在 select! 中抢占下载分支。
                     if rx.changed().await.is_err() {
-                        // 通道关闭:对端 sender 已 drop,不再有控制信号。
-                        // 永久挂起,让 select! 选择下载分支的结果。
-                        std::future::pending::<()>().await;
+                        return Err(AmdError::Other("控制通道意外关闭".into()));
                     }
                 }
             }
@@ -437,7 +498,7 @@ impl DownloadTask {
             "路径安全校验通过,创建存储"
         );
 
-        let storage = StorageKind::open(&canonical_path).await?;
+        let storage = DynStorage::open(&canonical_path).await?;
         self.storage = Some(Arc::new(storage));
         Ok(())
     }
@@ -538,6 +599,7 @@ impl DownloadTask {
     ///
     /// 根据配置的最大并发数使用信号量控制并发,每个分片独立下载并写入存储。
     /// 不支持 Range 请求时退化为整块下载。
+    #[tracing::instrument(skip(self), fields(task_id = %self.id))]
     pub async fn execute(&mut self) -> AmdResult<()> {
         self.state = DownloadState::Downloading;
         info!("开始执行下载任务");
@@ -609,6 +671,16 @@ impl DownloadTask {
             pos += written as u64;
         }
         debug!(written = pos, "整块流式下载写入完成");
+
+        if let Some(md) = &self.metadata
+            && let Some(expected_size) = md.file_size
+            && pos != expected_size
+        {
+            return Err(AmdError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("下载数据不完整: 预期 {expected_size} 字节, 实际写入 {pos} 字节"),
+            )));
+        }
 
         if let Some(frag) = self.fragments.first_mut() {
             if frag.state == crate::fragment::FragmentState::Pending {
@@ -839,7 +911,7 @@ impl DownloadTask {
         frag_end: u64,
         pause_timeout: Duration,
         control_rx: &Option<watch::Receiver<DownloadState>>,
-        progress_tx: &Option<tokio::sync::mpsc::UnboundedSender<FragmentProgress>>,
+        progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) -> AmdResult<(u64, Duration)> {
         let mut control_rx = control_rx.clone();
 
@@ -878,29 +950,48 @@ impl DownloadTask {
 
         let mut pos = frag_start;
         let mut total_written: u64 = 0;
+        let mut chunk_count: u64 = 0;
+        // 批量写入缓冲区:累积碎片,达到阈值后一次性写入
+        const WRITE_BATCH_BYTES: usize = 256 * 1024; // 256KB 批量写入阈值
+        let mut write_buf = bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES);
         tokio::pin!(stream);
         while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
             if let Some(rx) = control_rx.as_mut() {
                 Self::wait_control_rx(rx, pause_timeout).await?;
             }
             let chunk = chunk_result?;
-            let written = storage.write_at(pos, chunk).await?;
-            pos += written as u64;
-            total_written += written as u64;
-            // 增量进度回调(非完成)
-            if let Some(tx) = progress_tx {
-                let _ = tx.send(FragmentProgress {
-                    fragment_index: frag_index,
-                    completed: false,
-                });
+            write_buf.extend_from_slice(&chunk);
+            // 达到阈值时批量刷写
+            if write_buf.len() >= WRITE_BATCH_BYTES {
+                let batch = write_buf.split().freeze();
+                let written = storage.write_at(pos, batch).await?;
+                let w = written as u64;
+                pos += w;
+                total_written += w;
+                chunk_count += 1;
+                if let Some(tx) = progress_tx
+                    && chunk_count.is_multiple_of(5)
+                {
+                    let _ = tx.try_send(FragmentProgress {
+                        fragment_index: frag_index,
+                        completed: false,
+                    });
+                }
             }
+        }
+        // 刷写剩余数据
+        if !write_buf.is_empty() {
+            let batch = write_buf.freeze();
+            let written = storage.write_at(pos, batch).await?;
+            let w = written as u64;
+            total_written += w;
         }
 
         let elapsed = start_instant.elapsed();
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx {
-            let _ = tx.send(FragmentProgress {
+            let _ = tx.try_send(FragmentProgress {
                 fragment_index: frag_index,
                 completed: true,
             });
@@ -938,32 +1029,31 @@ impl DownloadTask {
         for frag in &self.fragments {
             if let Some(ref expected_hash) = frag.info.hash {
                 let chunk_size = 1024 * 1024;
-                let mut hasher = blake3::Hasher::new();
                 let mut offset = frag.info.start;
                 let end = frag.info.start + frag.info.size;
+                let mut buf = vec![0u8; chunk_size];
+                let mut hash_data = Vec::new();
 
                 while offset < end {
                     let read_len = ((end - offset).min(chunk_size as u64)) as usize;
-                    let mut buf = vec![0u8; read_len];
-                    let read = storage.read_at(offset, &mut buf).await?;
-                    hasher.update(&buf[..read]);
+                    let read = storage.read_at(offset, &mut buf[..read_len]).await?;
+                    hash_data.extend_from_slice(&buf[..read]);
                     offset += read as u64;
                 }
 
-                let computed = hasher.finalize();
-                let expected = blake3::Hash::from_hex(expected_hash)
-                    .map_err(|e| AmdError::Protocol(format!("无效哈希值: {e}")))?;
-                if computed != expected {
+                let computed = self.verifier.compute_hash(&hash_data)?;
+
+                if computed != *expected_hash {
                     warn!(
                         index = frag.info.index,
                         expected = %expected_hash,
-                        actual = %computed.to_hex(),
+                        actual = %computed,
                         "分片校验失败"
                     );
                     self.state = DownloadState::Failed;
                     return Err(AmdError::ChecksumMismatch {
                         expected: expected_hash.clone(),
-                        actual: computed.to_hex().to_string(),
+                        actual: computed,
                     });
                 }
                 debug!(index = frag.info.index, "分片校验通过");
@@ -980,6 +1070,7 @@ impl DownloadTask {
     ///
     /// 依次执行: 探测 -> 规划 -> 预分配 -> 下载 -> 校验
     /// 任一步骤失败将标记任务为 `Failed` 并返回错误。
+    #[tracing::instrument(skip(self), fields(url = %self.url))]
     pub async fn run(&mut self) -> AmdResult<()> {
         info!(url = %self.url, "启动下载任务");
 
@@ -1184,10 +1275,8 @@ mod tests {
         task.prepare_storage().await.unwrap();
 
         // 验证内存存储已分配
-        if let Some(ref storage) = task.storage
-            && let StorageKind::Memory(ref s) = **storage
-        {
-            assert_eq!(s.file_size().await.unwrap(), file_size);
+        if let Some(ref storage) = task.storage {
+            assert_eq!(storage.file_size().await.unwrap(), file_size);
         }
     }
 
@@ -1628,15 +1717,11 @@ mod tests {
 
     #[test]
     fn test_verifier_kind_clone() {
-        let v = VerifierKind::blake3();
+        let v = default_blake3_verifier();
         let v2 = v.clone();
         let data = b"test data for clone verification";
-        let hash = match &v {
-            VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
-        };
-        let hash2 = match &v2 {
-            VerifierKind::Cpu(cv) => cv.compute_hash(data).unwrap(),
-        };
+        let hash = v.compute_hash(data).unwrap();
+        let hash2 = v2.compute_hash(data).unwrap();
         assert_eq!(hash, hash2);
     }
 
@@ -2088,11 +2173,9 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(100), task.execute()).await;
         assert!(paused_result.is_err(), "暂停状态下执行应等待控制信号");
         let stored = if let Some(storage) = &task.storage {
-            if let StorageKind::Memory(memory) = storage.as_ref() {
-                memory.get_data()
-            } else {
-                Vec::new()
-            }
+            let mut buf = vec![0u8; 100];
+            let _ = storage.read_at(0, &mut buf).await;
+            buf
         } else {
             Vec::new()
         };

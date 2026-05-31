@@ -47,21 +47,16 @@ fn buffer_align() {
 #[cfg(test)]
 #[tokio::test]
 async fn write_pipeline() {
-    // 创建临时文件作为存储后端
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let storage = TokioFile::open(tmp.path()).await.unwrap();
-    let pool = BufferPool::new(4096, 4);
-    let pipeline = WritePipeline::new(storage, pool);
+    let pipeline = WritePipeline::new(storage, 4096, 4);
 
-    // 验证 buffer 池引用可访问
-    assert_eq!(pipeline.buffer_pool().capacity(), 4);
-    assert_eq!(pipeline.buffer_pool().buffer_size(), 4096);
+    assert_eq!(pipeline.available_permits(), 4);
+    assert_eq!(pipeline.buffer_size(), 4096);
 
-    // 写入数据并验证返回的字节数
     let written = pipeline.write(0, b"hello pipeline").await.unwrap();
     assert_eq!(written, 14);
 
-    // 从存储回读数据,验证内容一致
     let mut buf = [0u8; 14];
     let read = pipeline.storage().read_at(0, &mut buf).await.unwrap();
     assert_eq!(read, 14);

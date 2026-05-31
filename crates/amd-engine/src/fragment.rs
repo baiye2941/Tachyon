@@ -229,14 +229,12 @@ mod tests {
     use amd_core::types::FragmentInfo;
 
     fn make_frag(index: u32, size: u64) -> FragmentInfo {
-        FragmentInfo {
+        FragmentInfo::new(
             index,
-            start: index as u64 * size,
-            end: (index as u64 + 1) * size - 1,
+            index as u64 * size,
+            (index as u64 + 1) * size - 1,
             size,
-            downloaded: 0,
-            hash: None,
-        }
+        )
     }
 
     #[test]

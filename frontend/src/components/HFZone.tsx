@@ -1,4 +1,5 @@
-import { For, createSignal, createResource, Show, onCleanup } from 'solid-js'
+import { For, createSignal, createResource, Show, onMount, onCleanup } from 'solid-js'
+import { formatSize } from '../utils/format'
 
 interface LFSFileNode {
   name: string
@@ -45,13 +46,6 @@ const MOCK_SLOTS: ConnectionSlot[] = [
   { id: 's6', state: 'idle', speed: 0 },
 ]
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
-}
-
 function TreeNode(props: { node: LFSFileNode; depth: number }) {
   const [expanded, setExpanded] = createSignal(false)
   const hasChildren = () => props.node.children.length > 0
@@ -73,7 +67,7 @@ function TreeNode(props: { node: LFSFileNode; depth: number }) {
         </Show>
         <span class={hasChildren() ? 'text-text-primary font-medium' : 'text-text-secondary'}>{props.node.name}</span>
         <Show when={props.node.size > 0}>
-          <span class="ml-auto text-[11px] font-mono text-text-tertiary">{formatBytes(props.node.size)}</span>
+          <span class="ml-auto text-[11px] font-mono text-text-tertiary">{formatSize(props.node.size)}</span>
         </Show>
       </button>
       <Show when={hasChildren() && expanded()}>
@@ -108,8 +102,29 @@ function ThroughputWave() {
   const [offset, setOffset] = createSignal(0)
 
   let frameId: number
+  let visible = true
+  let containerRef: HTMLDivElement | undefined
+  let observer: IntersectionObserver | undefined
+
+  onMount(() => {
+    if (containerRef) {
+      observer = new IntersectionObserver(([entry]) => {
+        visible = entry.isIntersecting
+      }, { threshold: 0 })
+      observer.observe(containerRef)
+    }
+  })
+
+  onCleanup(() => {
+    cancelAnimationFrame(frameId)
+    observer?.disconnect()
+  })
 
   const animate = () => {
+    if (!visible) {
+      frameId = requestAnimationFrame(animate)
+      return
+    }
     setOffset(prev => prev + 0.8)
     const w = 280
     const h = 60
@@ -124,36 +139,37 @@ function ThroughputWave() {
   }
 
   animate()
-  onCleanup(() => cancelAnimationFrame(frameId))
 
   const gradientId = 'throughput-grad'
 
   return (
-    <svg viewBox="0 0 280 60" class="w-full h-[60px]" preserveAspectRatio="none" aria-label="吞吐量波形">
-      <defs>
-        <linearGradient id="throughput-area" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stop-color="var(--color-accent)" />
-          <stop offset="100%" stop-color="transparent" />
-        </linearGradient>
-        <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="var(--color-accent)" />
-          <stop offset="100%" stop-color="var(--color-aurora)" />
-        </linearGradient>
-      </defs>
-      <path
-        d={`M${points()} L280,60 L0,60 Z`}
-        fill="url(#throughput-area)"
-        opacity="0.08"
-      />
-      <path
-        d={`M${points()}`}
-        fill="none"
-        stroke={`url(#${gradientId})`}
-        stroke-width="1.5"
-        stroke-dasharray="4 2"
-        stroke-linecap="round"
-      />
-    </svg>
+    <div ref={containerRef}>
+      <svg viewBox="0 0 280 60" class="w-full h-[60px]" preserveAspectRatio="none" aria-label="吞吐量波形">
+        <defs>
+          <linearGradient id="throughput-area" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="var(--color-accent)" />
+            <stop offset="100%" stop-color="transparent" />
+          </linearGradient>
+          <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="var(--color-accent)" />
+            <stop offset="100%" stop-color="var(--color-aurora)" />
+          </linearGradient>
+        </defs>
+        <path
+          d={`M${points()} L280,60 L0,60 Z`}
+          fill="url(#throughput-area)"
+          opacity="0.08"
+        />
+        <path
+          d={`M${points()}`}
+          fill="none"
+          stroke={`url(#${gradientId})`}
+          stroke-width="1.5"
+          stroke-dasharray="4 2"
+          stroke-linecap="round"
+        />
+      </svg>
+    </div>
   )
 }
 
