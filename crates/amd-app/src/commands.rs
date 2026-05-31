@@ -2125,8 +2125,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_rejects_zero_max_concurrent_tasks() {
         let state = test_state();
-        let result =
-            update_config_inner(&state, make_test_app_config(0, &test_tmp_path("z"), 16, 16, false, true)).await;
+        let result = update_config_inner(
+            &state,
+            make_test_app_config(0, &test_tmp_path("z"), 16, 16, false, true),
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2139,8 +2142,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_rejects_zero_max_concurrent_fragments() {
         let state = test_state();
-        let result =
-            update_config_inner(&state, make_test_app_config(5, &test_tmp_path("a"), 0, 16, false, true)).await;
+        let result = update_config_inner(
+            &state,
+            make_test_app_config(5, &test_tmp_path("a"), 0, 16, false, true),
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2170,8 +2176,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_rejects_too_large_fragments() {
         let state = test_state();
-        let result =
-            update_config_inner(&state, make_test_app_config(5, &test_tmp_path("c"), 33, 16, false, true)).await;
+        let result = update_config_inner(
+            &state,
+            make_test_app_config(5, &test_tmp_path("c"), 33, 16, false, true),
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2193,8 +2202,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_accepts_valid_boundary_values() {
         let state = test_state();
-        let result =
-            update_config_inner(&state, make_test_app_config(1, &test_tmp_path("d"), 1, 1, false, true)).await;
+        let result = update_config_inner(
+            &state,
+            make_test_app_config(1, &test_tmp_path("d"), 1, 1, false, true),
+        )
+        .await;
         assert!(result.is_ok());
 
         let result = update_config_inner(
