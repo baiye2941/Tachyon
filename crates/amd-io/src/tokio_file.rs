@@ -118,7 +118,66 @@ impl AsyncStorage for TokioFile {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+impl AsyncStorage for TokioFile {
+    async fn write_at(&self, offset: u64, data: Bytes) -> AmdResult<usize> {
+        use std::os::unix::fs::FileExt;
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.write_at(&data, offset).map_err(AmdError::Io))
+            .await
+            .map_err(|e| AmdError::Io(e.into()))?
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> AmdResult<usize> {
+        use std::os::unix::fs::FileExt;
+        let file = self.file.clone();
+        let buf_len = buf.len();
+        let mut owned_buf = vec![0u8; buf_len];
+        let (n, owned_buf) = tokio::task::spawn_blocking(move || {
+            let n = file.read_at(&mut owned_buf, offset)?;
+            Ok::<_, std::io::Error>((n, owned_buf))
+        })
+        .await
+        .map_err(|e| AmdError::Io(e.into()))?
+        .map_err(AmdError::Io)?;
+        buf[..n].copy_from_slice(&owned_buf[..n]);
+        Ok(n)
+    }
+
+    async fn sync(&self) -> AmdResult<()> {
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_data().map_err(AmdError::Io))
+            .await
+            .map_err(|e| AmdError::Io(e.into()))?
+    }
+
+    async fn allocate(&self, size: u64) -> AmdResult<()> {
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
+            if ret != 0 {
+                return Err(AmdError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AmdError::Io(e.into()))?
+    }
+
+    async fn file_size(&self) -> AmdResult<u64> {
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.metadata().map(|m| m.len()).map_err(AmdError::Io))
+            .await
+            .map_err(|e| AmdError::Io(e.into()))?
+    }
+
+    async fn close(&self) -> AmdResult<()> {
+        self.close().await
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 impl AsyncStorage for TokioFile {
     async fn write_at(&self, offset: u64, data: Bytes) -> AmdResult<usize> {
         use std::os::unix::fs::FileExt;
