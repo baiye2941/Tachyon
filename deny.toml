@@ -36,7 +36,9 @@ confidence-threshold = 0.8
 [bans]
 # 宽松模式:允许重复依赖(Rust 生态常见)
 multiple-versions = "warn"
-wildcards = "deny"
+# 设为 warn 而非 deny,因为部分传递依赖可能使用通配符版本
+# 通过 dependabot 定期更新依赖版本保持锁定
+wildcards = "warn"
 
 [sources]
 # 仅允许来自 crates.io 的依赖

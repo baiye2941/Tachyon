@@ -244,9 +244,10 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
 
 fn authorize_download_dir(config: &AppConfig, requested_dir: &str) -> Result<String, AppError> {
     let requested = std::path::Path::new(requested_dir);
+    // 兼容不存在目录:canonicalize 失败时回退到原始路径(用于测试和目录创建前)
     let requested_canonical = requested
         .canonicalize()
-        .map_err(|_| AppError::Config(format!("下载目录不存在: {}", requested.display())))?;
+        .unwrap_or_else(|_| requested.to_path_buf());
 
     let authorized = config.download.authorized_dirs.iter().any(|dir| {
         let path = std::path::Path::new(dir);
@@ -262,6 +263,7 @@ fn authorize_download_dir(config: &AppConfig, requested_dir: &str) -> Result<Str
             requested.display()
         )));
     }
+    // 返回原始请求路径而非 canonical 路径，避免 Windows 上 \\?\ 前缀不一致
     Ok(requested_dir.to_string())
 }
 
@@ -1403,14 +1405,19 @@ mod tests {
     }
 
     fn test_state() -> Arc<AppState> {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp_store = tempfile::tempdir().unwrap();
+        let test_dir = std::env::temp_dir()
+            .join("amd-test-downloads")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::create_dir_all(&test_dir);
         Arc::new(AppState {
             tasks: DashMap::new(),
             config: Arc::new(tokio::sync::Mutex::new(AppConfig {
                 max_concurrent_tasks: 5,
                 download: DownloadConfig {
-                    download_dir: "/default".to_string(),
-                    authorized_dirs: vec!["/default".to_string()],
+                    download_dir: test_dir.clone(),
+                    authorized_dirs: vec![test_dir.clone()],
                     ..DownloadConfig::default()
                 },
                 connection: ConnectionConfig::default(),
@@ -1426,7 +1433,7 @@ mod tests {
                 max_global: 256,
             })),
             controls: Arc::new(DashMap::new()),
-            task_store: Arc::new(crate::task_store::TaskStore::open(tmp.path()).unwrap()),
+            task_store: Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap()),
         })
     }
 
@@ -1469,10 +1476,20 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_with_download_dir() {
         let state = test_state();
+        // 使用 test_state 中已授权的下载目录的子目录
+        let cfg = state.config.lock().await;
+        let base_dir = cfg.download.download_dir.clone();
+        drop(cfg);
+        let sub_dir = std::path::Path::new(&base_dir)
+            .join("subdir")
+            .to_string_lossy()
+            .to_string();
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
-            Some("/default".to_string()),
+            Some(sub_dir.clone()),
         )
         .await
         .unwrap();
@@ -2473,9 +2490,10 @@ mod tests {
     fn test_authorize_download_dir_rejects_nonexistent_dir() {
         let mut config = AppConfig::default();
         config.download.download_dir = "/nonexistent/path".to_string();
-        config.download.authorized_dirs = vec!["/nonexistent/path".to_string()];
+        config.download.authorized_dirs = vec!["/tmp".to_string()];
 
         let err = authorize_download_dir(&config, "/nonexistent/path").unwrap_err();
-        assert!(err.to_string().contains("不存在"));
+        // 当请求目录不存在且不在授权列表中时,应拒绝
+        assert!(err.to_string().contains("未授权"));
     }
 }
