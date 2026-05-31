@@ -12,7 +12,7 @@ let channelInstance: Channel<ProgressEvent> | null = null
 function ensureChannel(): Channel<ProgressEvent> {
   if (channelInstance) return channelInstance
 
-  channelInstance = new Channel<ProgressEvent>('progress-update')
+  channelInstance = new Channel<ProgressEvent>()
 
   channelInstance.onmessage = (payload: ProgressEvent) => {
     batch(() => {
