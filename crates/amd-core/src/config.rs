@@ -138,6 +138,13 @@ pub struct SchedulerConfig {
     pub sampling_interval_secs: u64,
     /// EWMA 平滑因子(0.0 ~ 1.0)
     pub ewma_alpha: f64,
+    /// 默认目标分片数(无调度器建议时使用)
+    #[serde(default = "default_target_fragments")]
+    pub default_target_fragments: u32,
+}
+
+fn default_target_fragments() -> u32 {
+    16
 }
 
 impl Default for SchedulerConfig {
@@ -147,6 +154,7 @@ impl Default for SchedulerConfig {
             max_fragment_size: 64 * 1024 * 1024, // 64MB
             sampling_interval_secs: 60,
             ewma_alpha: 0.3,
+            default_target_fragments: 16,
         }
     }
 }
@@ -235,6 +243,19 @@ mod tests {
         assert_eq!(config.max_fragment_size, 64 * 1024 * 1024);
         assert_eq!(config.sampling_interval_secs, 60);
         assert!((config.ewma_alpha - 0.3).abs() < f64::EPSILON);
+        assert_eq!(config.default_target_fragments, 16);
+    }
+
+    #[test]
+    fn test_scheduler_config_deserializes_legacy_without_target_fragments() {
+        let json = r#"{
+            "minFragmentSize":1048576,
+            "maxFragmentSize":67108864,
+            "samplingIntervalSecs":60,
+            "ewmaAlpha":0.3
+        }"#;
+        let config: SchedulerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.default_target_fragments, 16);
     }
 
     #[test]
@@ -294,5 +315,9 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SchedulerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.min_fragment_size, config.min_fragment_size);
+        assert_eq!(
+            deserialized.default_target_fragments,
+            config.default_target_fragments
+        );
     }
 }
