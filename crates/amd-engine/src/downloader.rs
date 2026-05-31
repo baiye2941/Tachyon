@@ -1316,6 +1316,7 @@ mod tests {
             max_fragment_size: frag_size,
             sampling_interval_secs: 60,
             ewma_alpha: 0.3,
+            ..Default::default()
         };
         let config = DownloadConfig {
             verify_checksum: false, // 本测试不校验哈希
@@ -1846,6 +1847,7 @@ mod tests {
             max_fragment_size: frag_size,
             sampling_interval_secs: 60,
             ewma_alpha: 0.3,
+            ..Default::default()
         };
 
         let mut task = DownloadTask::new_for_test(
@@ -1963,6 +1965,7 @@ mod tests {
             max_fragment_size: 200,
             sampling_interval_secs: 60,
             ewma_alpha: 0.3,
+            ..Default::default()
         };
 
         // 第一次协议:前 2 次调用失败(模拟并发分片场景中部分分片失败)
