@@ -150,11 +150,12 @@ impl AlignedBuffer {
 /// io_uring 实例持有者(Linux only)
 ///
 /// 封装 `io_uring::IoUring` 实例及其注册的 fixed buffers。
-/// 使用单独的结构体以便在 `IoUringStorage` 中通过 `Option` 管理生命周期。
+/// 使用 `Mutex` 包裹以实现内部可变性——`submission()` 和 `completion()`
+/// 需要 `&mut self`，而 `AsyncStorage` trait 方法签名使用 `&self`。
 #[cfg(target_os = "linux")]
 struct IoUringHandle {
-    /// io_uring 实例(通过 IoUringStorage 的 submit 路径间接使用)
-    _ring: io_uring::IoUring,
+    /// io_uring 实例(Mutex 包裹以支持内部可变性)
+    ring: std::sync::Mutex<io_uring::IoUring>,
     /// 注册的 fixed buffers (保持内存不被释放)
     _buffers: Vec<AlignedBuffer>,
 }
@@ -293,7 +294,7 @@ impl IoUringStorage {
 
         self.file_fd = Some(file);
         self.ring = Some(IoUringHandle {
-            _ring: ring,
+            ring: std::sync::Mutex::new(ring),
             _buffers: buffers,
         });
         self.state = IoUringState::Ready;
@@ -360,8 +361,14 @@ impl IoUringStorage {
                 .offset(offset)
                 .build();
 
-        // 提交 SQ
-        let mut sq = ring._ring.submission();
+        // 提交 SQ (Mutex lock 提供内部可变性)
+        let mut uring = ring.ring.lock().map_err(|e| {
+            AmdError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+        let mut sq = uring.submission();
         unsafe {
             sq.push(&write_op).map_err(|_| {
                 AmdError::Io(std::io::Error::new(
@@ -371,9 +378,10 @@ impl IoUringStorage {
             })?;
         }
         sq.sync();
+        drop(sq);
 
         // 等待 CQE
-        let cqe = ring._ring.completion().next().ok_or_else(|| {
+        let cqe = uring.completion().next().ok_or_else(|| {
             AmdError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "io_uring 完成队列已关闭",
