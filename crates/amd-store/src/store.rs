@@ -152,7 +152,7 @@ impl FileStore {
     }
 
     /// 将键转换为安全的文件名
-    fn safe_key(key: &str) -> String {
+    pub(crate) fn safe_key(key: &str) -> String {
         key.chars()
             .flat_map(|c| {
                 if c.is_alphanumeric() || c == '_' || c == '-' {
@@ -165,7 +165,7 @@ impl FileStore {
     }
 
     /// 键对应的文件路径
-    fn path_for(&self, key: &str) -> PathBuf {
+    pub(crate) fn path_for(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{}.json", Self::safe_key(key)))
     }
 }
@@ -189,8 +189,15 @@ impl Store for FileStore {
             std::io::Error::other(e.to_string())
         })?;
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(self.path_for(key), &value).map_err(|e| {
+        let final_path = self.path_for(key);
+        let temp_path = final_path.with_extension("tmp");
+        std::fs::write(&temp_path, &value).map_err(|e| {
             tracing::warn!(key, error = %e, "KV 操作失败");
+            e
+        })?;
+        std::fs::rename(&temp_path, &final_path).map_err(|e| {
+            tracing::warn!(key, error = %e, "KV rename 失败");
+            let _ = std::fs::remove_file(&temp_path);
             e
         })
     }
@@ -497,6 +504,65 @@ mod tests {
         let store = FileStore::open(tmp.path()).unwrap();
         store.set("k", String::new()).unwrap();
         assert_eq!(store.get("k").unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn file_atomic_write_survives_crash_simulation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        // 预写入旧值
+        store
+            .set("crash_key", r#"{"version":1}"#.to_string())
+            .unwrap();
+
+        // 模拟崩溃:写入 .tmp 文件(模拟半写),验证旧值仍可读
+        let final_path = store.path_for("crash_key");
+        let temp_path = final_path.with_extension("tmp");
+        std::fs::write(&temp_path, "partial data").unwrap();
+        // 不执行 rename,模拟进程崩溃
+
+        // 旧值应仍然存在且完整
+        let loaded = store.get("crash_key").unwrap();
+        assert_eq!(loaded, Some(r#"{"version":1}"#.to_string()));
+
+        // 清理残留 tmp
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn file_atomic_write_no_temp_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        store.set("new_key", r#"{"value":42}"#.to_string()).unwrap();
+
+        let loaded = store.get("new_key").unwrap();
+        assert_eq!(loaded, Some(r#"{"value":42}"#.to_string()));
+
+        // 不应残留 .tmp 文件
+        let tmp_path = store.path_for("new_key").with_extension("tmp");
+        assert!(!tmp_path.exists(), "临时文件应已被 rename 清理");
+    }
+
+    #[test]
+    fn file_atomic_write_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        store
+            .set("overwrite_key", r#"{"version":1}"#.to_string())
+            .unwrap();
+        store
+            .set("overwrite_key", r#"{"version":2}"#.to_string())
+            .unwrap();
+
+        let loaded = store.get("overwrite_key").unwrap();
+        assert_eq!(loaded, Some(r#"{"version":2}"#.to_string()));
+
+        // 不应残留 .tmp 文件
+        let tmp_path = store.path_for("overwrite_key").with_extension("tmp");
+        assert!(!tmp_path.exists(), "覆盖后不应残留临时文件");
     }
 
     // ── KvStore 旧接口测试 ──
