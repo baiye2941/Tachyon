@@ -4,17 +4,18 @@
 
 ## 核心能力
 
-- **多线程分片下载** -- 自动将文件拆分为多个分片并行下载,最大化带宽利用率
-- **超分片引擎** -- 动态粒度分片,根据带宽反馈实时调整分片大小与并发数
-- **动态连接管理** -- 智能维护连接池,自动扩缩连接数以适配网络状况
+- **多线程分片下载** -- 16 并发动态分片，Holt-Winters 带宽预测自适应调整，支持 HTTP Range 断点续传
+- **限速控制** -- 全局下载速度限制（字节/秒），不占用额外带宽
+- **HTTP/2 支持** -- 自适应窗口调优，单连接多路复用，减少 TLS 握手开销
+- **流式哈希校验** -- 分片数据流式 BLAKE3 增量校验，峰值内存 O(chunk) 而非 O(fragment)
 - **QUIC + 0-RTT** -- 基于 QUIC 协议实现零往返时间建连,降低连接延迟
 - **MP-QUIC 多路径传输** -- 单连接多路径传输,自动在 WiFi/5G/有线间切换与聚合
-- **零拷贝存储引擎** -- 通过 io_uring 实现网络收包到文件写入全程无用户态拷贝
+- **零拷贝存储引擎** -- io_uring SQE/CQE 写入路径已实现，Linux 上网络收包到文件写入全程无用户态拷贝
+- **磁盘空间预分配** -- Linux 上通过 `fallocate` 预分配真实磁盘块，防止 ENOSPC
 - **P2SP 混合下载** -- CDN + DHT Peer 双源下载,自动测速选择最优源
-- **GPU 加速校验** -- 通过 Vulkan Compute 或 CUDA 对分片做并行哈希校验
-- **内核网络栈旁路** -- Linux 下可选 XDP/AF_XDP 旁路内核协议栈,进一步提升吞吐
-- **智能调度与预测** -- 基于历史数据的带宽预测模型,提前分配连接资源
-- **协议级优化** -- 支持 HTTP/HTTPS/QUIC/FTP 等多协议,针对每种协议做专项优化
+- **GPU 加速校验** -- 通过 Vulkan Compute 或 CUDA 对分片做并行哈希校验（框架就绪）
+- **智能调度与预测** -- 基于 Holt-Winters 的带宽预测模型,提前分配连接资源
+- **协议级优化** -- 支持 HTTP/HTTPS（含 HTTP/2）/ QUIC / FTP 等多协议,针对每种协议做专项优化
 - **浏览器资源嗅探** -- 通过 Playwright MCP 拦截浏览器流量,自动捕获下载资源
 
 ## 快速开始
@@ -99,6 +100,7 @@ claude
 | `amd-sniffer`  | 浏览器资源嗅探、流量拦截与解析               | url, playwright MCP             |
 | `amd-crypto`   | CPU/GPU 哈希校验、完整性验证                 | blake3, sha2, wgpu(可选)        |
 | `amd-p2sp`     | P2SP 混合下载、DHT 网络、Peer 发现           | 自研 Kademlia DHT, Xorshift64   |
+| `amd-store`    | 断点续传持久化、KV 存储、任务快照管理        | JSON 文件存储, 原子写入         |
 | `amd-app`      | Tauri 应用入口、命令注册、GUI 事件桥接       | tauri v2                        |
 
 ## 项目结构
@@ -160,7 +162,7 @@ cargo llvm-cov --fail-under-lines 95
 
 使用 `proptest` 进行属性测试,`tokio::test` 进行异步测试,`mockall` 隔离外部依赖。
 
-项目结构代码检查清单: `cargo clippy` (零警告)、`cargo fmt` (合规)、`cargo test` (通过)。
+项目结构代码检查清单: `cargo clippy` (零警告)、`cargo fmt` (合规)、`cargo test` (通过)、`cargo audit` (无已知漏洞)。
 
 ## 基准测试
 
@@ -226,7 +228,7 @@ strip = true        # 剥离符号表(减小二进制体积)
 | 代码质量   | `cargo clippy` 零警告 |
 | 测试       | 单元 + 集成 + 属性测试全部通过 |
 | 覆盖率目标 | 95%+(行覆盖率) |
-| Crate 数量 | 9 个 workspace crate |
+| Crate 数量 | 10 个 workspace crate |
 | 基准测试   | 3 组 criterion 基准测试 |
 
 ## 许可证
