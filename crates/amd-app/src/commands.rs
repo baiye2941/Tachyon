@@ -539,6 +539,7 @@ async fn task_fn(
             .get(&chunk_tid)
             .map(|t| t.fragments_total)
             .unwrap_or(0);
+        tracing::info!(task_id = %chunk_tid, total_frags, "chunk reader 启动,等待进度事件");
         // 跟踪每个分片的已下载字节数
         let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let mut total_downloaded: u64 = 0;
