@@ -543,13 +543,25 @@ async fn task_fn(
         // 跟踪每个分片的已下载字节数
         let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let mut total_downloaded: u64 = 0;
+        let mut event_count: u64 = 0;
         while let Some(progress) = chunk_progress_rx.recv().await {
+            event_count += 1;
             if progress.completed {
                 completed.insert(progress.fragment_index);
             }
             // 增量更新: 替换旧值,差值累加到总数
             let old = frag_bytes.insert(progress.fragment_index, progress.fragment_downloaded).unwrap_or(0);
             total_downloaded = total_downloaded.saturating_add(progress.fragment_downloaded.saturating_sub(old));
+            if event_count == 1 || event_count % 50 == 0 {
+                tracing::info!(
+                    event = event_count,
+                    idx = progress.fragment_index,
+                    done = completed.len(),
+                    total_frags,
+                    total_downloaded,
+                    "chunk reader 进度更新"
+                );
+            }
             let frags_done = completed.len() as u32;
             {
                 if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
@@ -633,26 +645,33 @@ async fn task_fn(
             }
 
             {
-                let event: ProgressEvent = monitor_ps
-                    .tasks
-                    .iter()
-                    .map(|r| {
-                        let id = r.key();
-                        let t = r.value();
-                        (
-                            id.clone(),
-                            TaskProgress {
-                                id: id.clone(),
-                                progress: t.progress,
-                                speed: t.speed,
-                                downloaded: t.downloaded,
-                                status: t.status,
-                                fragments_done: t.fragments_done,
-                            },
-                        )
-                    })
-                    .collect();
-                let _ = monitor_ps.progress_tx.send(event);
+                let t = match monitor_ps.tasks.get(&monitor_tid) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let event: ProgressEvent = std::iter::once((
+                    monitor_tid.clone(),
+                    TaskProgress {
+                        id: monitor_tid.clone(),
+                        progress: t.progress,
+                        speed,
+                        downloaded,
+                        status: t.status,
+                        fragments_done: t.fragments_done,
+                    },
+                ))
+                .collect();
+                tracing::debug!(
+                    tid = %monitor_tid,
+                    downloaded,
+                    speed,
+                    progress = t.progress,
+                    frags = t.fragments_done,
+                    "广播进度事件"
+                );
+                if monitor_ps.progress_tx.send(event).is_err() {
+                    tracing::warn!("broadcast send 失败(无接收者)");
+                }
             }
 
             if ds == DownloadState::Completed || ds == DownloadState::Failed {
@@ -1131,6 +1150,11 @@ pub async fn subscribe_progress(
 
         while rx.changed().await.is_ok() {
             let snapshot = (*rx.borrow_and_update()).clone();
+            for (tid, tp) in &snapshot {
+                if tp.downloaded > 0 || tp.speed > 0 {
+                    tracing::info!(tid, downloaded = tp.downloaded, speed = tp.speed, "emit progress-update");
+                }
+            }
             let _ = app_handle.emit("progress-update", &snapshot);
         }
     });
