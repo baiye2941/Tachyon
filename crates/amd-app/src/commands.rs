@@ -531,26 +531,36 @@ async fn task_fn(
     tokio::spawn(async move {
         // 已完成分片集合,用于断点续传 checkpoint
         let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        // 跟踪分片完成数(不锁 Mutex)
+        let total_frags = {
+            let dt = chunk_dt.lock().await;
+            let total = dt.fragment_infos().len() as u32;
+            drop(dt);
+            total
+        };
         while let Some(progress) = chunk_progress_rx.recv().await {
-            let (downloaded, frags_done, frags_total) = {
-                let dt = chunk_dt.lock().await;
-                let downloaded = dt
-                    .fragment_infos()
-                    .iter()
-                    .map(|f| f.downloaded)
-                    .sum::<u64>();
-                let frags = dt.fragment_infos();
-                let done = frags.iter().filter(|f| f.downloaded >= f.size && f.size > 0).count();
-                let total = frags.len();
-                (downloaded, done as u32, total as u32)
+            if progress.completed {
+                completed.insert(progress.fragment_index);
+            }
+            let frags_done = completed.len() as u32;
+            // 从 state.tasks 读取 file_size 估算已下载字节数
+            let file_size = chunk_state
+                .tasks
+                .get(&chunk_tid)
+                .and_then(|t| t.file_size)
+                .unwrap_or(1);
+            let downloaded = if total_frags > 0 {
+                (file_size as f64 * frags_done as f64 / total_frags as f64) as u64
+            } else {
+                0
             };
             {
                 if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
                     task.downloaded = downloaded;
                     task.fragments_done = frags_done;
-                    task.fragments_total = frags_total;
-                    if frags_total > 0 {
-                        task.progress = frags_done as f64 / frags_total as f64;
+                    task.fragments_total = total_frags;
+                    if total_frags > 0 {
+                        task.progress = frags_done as f64 / total_frags as f64;
                     }
                 }
             }
