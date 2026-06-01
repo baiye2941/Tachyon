@@ -532,16 +532,26 @@ async fn task_fn(
         // 已完成分片集合,用于断点续传 checkpoint
         let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         while let Some(progress) = chunk_progress_rx.recv().await {
-            let dt = chunk_dt.lock().await;
-            let downloaded = dt
-                .fragment_infos()
-                .iter()
-                .map(|f| f.downloaded)
-                .sum::<u64>();
-            drop(dt);
+            let (downloaded, frags_done, frags_total) = {
+                let dt = chunk_dt.lock().await;
+                let downloaded = dt
+                    .fragment_infos()
+                    .iter()
+                    .map(|f| f.downloaded)
+                    .sum::<u64>();
+                let frags = dt.fragment_infos();
+                let done = frags.iter().filter(|f| f.downloaded >= f.size && f.size > 0).count();
+                let total = frags.len();
+                (downloaded, done as u32, total as u32)
+            };
             {
                 if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
                     task.downloaded = downloaded;
+                    task.fragments_done = frags_done;
+                    task.fragments_total = frags_total;
+                    if frags_total > 0 {
+                        task.progress = frags_done as f64 / frags_total as f64;
+                    }
                 }
             }
 
@@ -559,7 +569,6 @@ async fn task_fn(
         }
     });
 
-    let monitor_dt = download_task.clone();
     let monitor_ps = state.clone();
     let monitor_tid = task_id.clone();
     let mut progress_control_rx = control_rx.clone();
@@ -589,15 +598,14 @@ async fn task_fn(
                     }
                 }
             }
-            let dt = monitor_dt.lock().await;
-            let p = dt.progress();
-            let ds = dt.state();
-            let downloaded = dt
-                .fragment_infos()
-                .iter()
-                .map(|f| f.downloaded)
-                .sum::<u64>();
-            drop(dt);
+            // 从 state.tasks 读取进度(chunk reader 已写入),不锁 download_task
+            let (downloaded, ds) = {
+                if let Some(task) = monitor_ps.tasks.get(&monitor_tid) {
+                    (task.downloaded, task.status)
+                } else {
+                    continue;
+                }
+            };
 
             let elapsed = start.elapsed().as_secs_f64();
             let speed = if elapsed > 0.0 {
@@ -609,10 +617,12 @@ async fn task_fn(
 
             {
                 if let Some(mut task) = monitor_ps.tasks.get_mut(&monitor_tid) {
-                    task.downloaded = downloaded;
                     task.speed = speed;
-                    task.progress = p.min(1.0);
                 }
+            }
+
+            if ds == DownloadState::Completed || ds == DownloadState::Failed {
+                return speed;
             }
 
             {
