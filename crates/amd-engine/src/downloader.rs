@@ -891,6 +891,11 @@ impl DownloadTask {
         let control_rx = self.control_rx.clone();
         let progress_tx = self.progress_tx.clone();
         let max_retries = self.config.max_retries;
+        tracing::info!(
+            has_progress_tx = progress_tx.is_some(),
+            frag_count = self.fragments.len(),
+            "分片下载准备就绪"
+        );
 
         // spawn 成功返回 (index, downloaded, duration);失败返回 (index, error)
         type FragOk = (u32, u64, Duration);
@@ -1127,6 +1132,7 @@ impl DownloadTask {
                         completed: false,
                         fragment_downloaded: total_written,
                     });
+                    tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
                 }
             }
         }
