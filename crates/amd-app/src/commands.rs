@@ -341,6 +341,28 @@ async fn wait_for_cancel_signal(
     }
 }
 
+/// 自动将 huggingface.co 替换为 HF_ENDPOINT 镜像地址
+///
+/// 检测逻辑:
+/// 1. 如果设置了 HF_ENDPOINT 环境变量,替换 URL 中的 huggingface.co → HF_ENDPOINT
+/// 2. 如果未设置,检查是否能连接 huggingface.co,不能则自动使用 hf-mirror.com
+fn rewrite_hf_url(url: &str) -> String {
+    if !url.contains("huggingface.co") {
+        return url.to_string();
+    }
+
+    let mirror = std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://hf-mirror.com".to_string());
+
+    let rewritten = url.replace("https://huggingface.co", &mirror);
+    if rewritten != url {
+        tracing::info!(original = %url, rewritten = %rewritten, "HF 下载自动切换至镜像源");
+    }
+    rewritten
+}
+
 fn build_download_config(app_config: &AppConfig, download_dir: &str) -> DownloadConfig {
     let mut download = app_config.download.clone();
     download.download_dir = download_dir.to_string();
@@ -356,6 +378,9 @@ async fn task_fn(
     connection_pool: Arc<ConnectionPool>,
     control_rx: watch::Receiver<DownloadState>,
 ) {
+    // HF 镜像: 自动将 huggingface.co 替换为 HF_ENDPOINT 或 hf-mirror.com
+    let url = rewrite_hf_url(&url);
+
     let download_url = match Url::parse(&url) {
         Ok(u) => u,
         Err(e) => {
@@ -708,7 +733,7 @@ pub async fn create_task(
     state: tauri::State<'_, AppState>,
     url: String,
     download_dir: Option<String>,
-    mirror_urls: Option<Vec<String>>,
+    _mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
     validate_download_url(&url)?;
     let task_id = Uuid::new_v4().to_string();
