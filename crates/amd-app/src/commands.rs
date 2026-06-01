@@ -478,8 +478,11 @@ async fn task_fn(
             );
 
             {
+                // 预计算总分段数(基于最小分片1MB),供进度显示使用
+                let total_frags = meta.file_size.map(|s| (s.max(1) + 1024 * 1024 - 1) / (1024 * 1024)).unwrap_or(0) as u32;
                 if let Some(mut task) = state.tasks.get_mut(&task_id) {
                     task.file_size = meta.file_size;
+                    task.fragments_total = total_frags;
                 }
             }
 
@@ -527,17 +530,15 @@ async fn task_fn(
 
     let chunk_state = state.clone();
     let chunk_tid = task_id.clone();
-    let chunk_dt = download_task.clone();
     tokio::spawn(async move {
         // 已完成分片集合,用于断点续传 checkpoint
         let mut completed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-        // 跟踪分片完成数(不锁 Mutex)
-        let total_frags = {
-            let dt = chunk_dt.lock().await;
-            let total = dt.fragment_infos().len() as u32;
-            drop(dt);
-            total
-        };
+        // 从 state.tasks 读取 probe 阶段已写入的 total_frags (零锁)
+        let total_frags = chunk_state
+            .tasks
+            .get(&chunk_tid)
+            .map(|t| t.fragments_total)
+            .unwrap_or(0);
         // 跟踪每个分片的已下载字节数
         let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let mut total_downloaded: u64 = 0;
