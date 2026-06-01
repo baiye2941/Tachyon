@@ -597,7 +597,11 @@ impl DownloadTask {
     /// 探测文件元数据
     ///
     /// 向服务端发送 HEAD 请求,获取文件名、大小、Range 支持等信息。
+    /// 如果元数据已缓存(例如 task_fn 已调用过),直接返回缓存值,避免重复网络请求。
     pub async fn probe(&mut self) -> AmdResult<&FileMetadata> {
+        if let Some(ref meta) = self.metadata {
+            return Ok(meta);
+        }
         info!(url = %self.url, "开始探测文件元数据");
         let metadata = self.protocol.probe(&self.url).await?;
         info!(
