@@ -538,25 +538,20 @@ async fn task_fn(
             drop(dt);
             total
         };
+        // 跟踪每个分片的已下载字节数
+        let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut total_downloaded: u64 = 0;
         while let Some(progress) = chunk_progress_rx.recv().await {
             if progress.completed {
                 completed.insert(progress.fragment_index);
             }
+            // 增量更新: 替换旧值,差值累加到总数
+            let old = frag_bytes.insert(progress.fragment_index, progress.fragment_downloaded).unwrap_or(0);
+            total_downloaded = total_downloaded.saturating_add(progress.fragment_downloaded.saturating_sub(old));
             let frags_done = completed.len() as u32;
-            // 从 state.tasks 读取 file_size 估算已下载字节数
-            let file_size = chunk_state
-                .tasks
-                .get(&chunk_tid)
-                .and_then(|t| t.file_size)
-                .unwrap_or(1);
-            let downloaded = if total_frags > 0 {
-                (file_size as f64 * frags_done as f64 / total_frags as f64) as u64
-            } else {
-                0
-            };
             {
                 if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
-                    task.downloaded = downloaded;
+                    task.downloaded = total_downloaded;
                     task.fragments_done = frags_done;
                     task.fragments_total = total_frags;
                     if total_frags > 0 {
@@ -570,7 +565,7 @@ async fn task_fn(
                 completed.insert(progress.fragment_index);
                 if let Ok(Some(mut snapshot)) = chunk_state.task_store.load_snapshot(&chunk_tid) {
                     snapshot.completed_fragments = completed.iter().copied().collect();
-                    snapshot.downloaded = downloaded;
+                    snapshot.downloaded = total_downloaded;
                     if let Err(e) = chunk_state.task_store.save_snapshot(&snapshot) {
                         tracing::warn!(task_id = %chunk_tid, error = %e, "checkpoint 落盘失败");
                     }

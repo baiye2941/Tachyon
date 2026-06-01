@@ -224,6 +224,8 @@ pub struct FragmentProgress {
     pub fragment_index: u32,
     /// 该分片是否已整体完成
     pub completed: bool,
+    /// 该分片当前已下载字节数
+    pub fragment_downloaded: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1125,7 @@ impl DownloadTask {
                     let _ = tx.try_send(FragmentProgress {
                         fragment_index: frag_index,
                         completed: false,
+                        fragment_downloaded: total_written,
                     });
                 }
             }
@@ -1154,6 +1157,7 @@ impl DownloadTask {
             let _ = tx.try_send(FragmentProgress {
                 fragment_index: frag_index,
                 completed: true,
+                fragment_downloaded: total_written,
             });
         }
 
