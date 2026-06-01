@@ -1,19 +1,24 @@
 import { createSignal } from 'solid-js'
 import { api } from '../api/invoke'
 import { $tasks, refreshTaskList } from '../stores/downloads'
+import { addToast } from '../stores/toast'
 
 export default function Topbar() {
   const [url, setUrl] = createSignal('')
+  const [mirrorUrl, setMirrorUrl] = createSignal('')
+  const [showMirror, setShowMirror] = createSignal(false)
 
   async function startDownload() {
     const u = url().trim()
     if (!u) return
     try {
-      await api.createTask(u)
+      const mirrors = showMirror() ? [mirrorUrl().trim()].filter(Boolean) : []
+      await api.createTask(u, mirrors.length > 0 ? mirrors : undefined)
       setUrl('')
+      setMirrorUrl('')
       refreshTaskList()
     } catch (e) {
-      console.error('创建任务失败:', e)
+      addToast(String(e), 'error')
     }
   }
 
@@ -24,7 +29,7 @@ export default function Topbar() {
   }
 
   return (
-    <div class="flex items-center gap-2.5 px-5 py-3 border-b border-white/6">
+    <div class="flex flex-col gap-2.5 px-5 py-3 border-b border-white/6">
       <div class="flex-1 flex gap-2">
         <input
           type="text"
@@ -43,8 +48,25 @@ export default function Topbar() {
           开始下载
         </button>
       </div>
+      <div class="flex items-center gap-2">
+        <button
+          class="text-[11px] text-text-tertiary hover:text-text-secondary transition-colors"
+          onClick={() => setShowMirror(!showMirror())}
+        >
+          {showMirror() ? '隐藏镜像' : '使用镜像站'}
+        </button>
+        {showMirror() && (
+          <input
+            type="text"
+            value={mirrorUrl()}
+            onInput={(e) => setMirrorUrl(e.currentTarget.value)}
+            placeholder="镜像站 URL,例如 https://hf-mirror.com/..."
+            class="flex-1 px-3 py-1.5 bg-surface border border-white/6 rounded text-[12px] font-mono text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent transition-colors duration-150"
+          />
+        )}
+      </div>
       <button
-        class="px-3 py-2 text-[12px] font-semibold text-text-secondary border border-white/6 rounded hover:text-text-primary hover:border-white/12 active:scale-[0.98] transition-all duration-100"
+        class="px-3 py-2 text-[12px] font-semibold text-text-secondary border border-white/6 rounded hover:text-text-primary hover:border-white/12 active:scale-[0.98] transition-all duration-100 self-start"
         onClick={pauseAll}
         aria-label="暂停所有下载任务"
       >

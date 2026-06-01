@@ -12,11 +12,14 @@ export function formatSpeed(bytes: number): string {
 
 export function statusText(status: string): string {
   const map: Record<string, string> = {
-    downloading: '下载中',
-    completed: '已完成',
-    paused: '已暂停',
-    failed: '失败',
     pending: '等待中',
+    connecting: '连接中',
+    downloading: '下载中',
+    paused: '已暂停',
+    resuming: '恢复中',
+    verifying: '校验中',
+    completed: '已完成',
+    failed: '失败',
     cancelled: '已取消',
   }
   return map[status] || status
@@ -29,11 +32,14 @@ export function guessExt(name: string): string {
 
 export function statusClass(status: string): string {
   const map: Record<string, string> = {
-    downloading: 'text-accent bg-accent/10',
-    completed: 'text-success bg-success/10',
-    paused: 'text-text-secondary bg-white/5',
-    failed: 'text-error bg-error/10',
     pending: 'text-warning bg-warning/10',
+    connecting: 'text-accent bg-accent/10',
+    downloading: 'text-accent bg-accent/10',
+    paused: 'text-text-secondary bg-white/5',
+    resuming: 'text-accent bg-accent/10',
+    verifying: 'text-aurora bg-aurora/10',
+    completed: 'text-success bg-success/10',
+    failed: 'text-error bg-error/10',
     cancelled: 'text-text-tertiary bg-white/5',
   }
   return map[status] || 'text-text-secondary bg-white/5'

@@ -1,6 +1,7 @@
 import { For, Show } from 'solid-js'
 import { $tasks, $activeTasks, $completedTasks, $selectedId, setTasks, setSelectedId } from '../stores/downloads'
 import { api } from '../api/invoke'
+import { addToast } from '../stores/toast'
 import DownloadCard from './DownloadCard'
 
 async function refreshTasks() {
@@ -8,7 +9,7 @@ async function refreshTasks() {
     const list = await api.getTaskList()
     setTasks(list)
   } catch (e) {
-    console.error('刷新任务列表失败:', e)
+    addToast('刷新任务列表失败: ' + String(e), 'error')
   }
 }
 
@@ -16,7 +17,7 @@ async function handlePause(id: string) {
   try {
     await api.pauseTask(id)
   } catch (e) {
-    console.error('暂停任务失败:', e)
+    addToast('暂停任务失败: ' + String(e), 'error')
   }
 }
 
@@ -24,7 +25,7 @@ async function handleResume(id: string) {
   try {
     await api.resumeTask(id)
   } catch (e) {
-    console.error('恢复任务失败:', e)
+    addToast('恢复任务失败: ' + String(e), 'error')
   }
 }
 
@@ -32,7 +33,7 @@ async function handleCancel(id: string) {
   try {
     await api.cancelTask(id)
   } catch (e) {
-    console.error('取消任务失败:', e)
+    addToast('取消任务失败: ' + String(e), 'error')
   }
 }
 
@@ -43,7 +44,7 @@ async function handleDelete(id: string) {
     if (selected === id) setSelectedId(null)
     await refreshTasks()
   } catch (e) {
-    console.error('删除任务失败:', e)
+    addToast('删除任务失败: ' + String(e), 'error')
   }
 }
 

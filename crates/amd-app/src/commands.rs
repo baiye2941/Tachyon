@@ -396,6 +396,8 @@ async fn task_fn(
         "开始真实下载"
     );
 
+    update_task_status(&state.tasks, &task_id, DownloadState::Downloading);
+
     if let Err(e) = std::fs::create_dir_all(&download_dir) {
         tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
         update_task_status(&state.tasks, &task_id, DownloadState::Failed);
@@ -706,6 +708,7 @@ pub async fn create_task(
     state: tauri::State<'_, AppState>,
     url: String,
     download_dir: Option<String>,
+    mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
     validate_download_url(&url)?;
     let task_id = Uuid::new_v4().to_string();

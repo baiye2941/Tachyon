@@ -1250,27 +1250,101 @@ impl DownloadTask {
 
     /// 内部执行逻辑,便于 run() 统一处理错误状态
     async fn run_inner(&mut self) -> AmdResult<()> {
-        // 步骤 1: 探测
-        self.probe().await?;
+        // 步骤 1: 探测 (与取消信号竞速: HEAD 请求可能长时间挂起)
+        {
+            let mut rx = self.control_rx.take();
+            match rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        r = self.probe() => { r?; }
+                        _ = Self::wait_for_cancel(rx) => {
+                            self.state = DownloadState::Cancelled;
+                            return Err(AmdError::Cancelled);
+                        }
+                    }
+                }
+                None => {
+                    self.probe().await?;
+                }
+            }
+            self.control_rx = rx;
+        }
 
-        // 步骤 1.5: 初始化存储(使用真实文件名 + validate_save_path 纵深防御)
+        // 步骤 1.5: 初始化存储
         self.init_storage().await?;
 
-        // 步骤 2: 规划分片
+        // 步骤 2: 规划分片 (纯 CPU, 不阻塞)
+        self.check_cancelled()?;
         self.plan()?;
 
-        // 步骤 3: 预分配存储
-        self.prepare_storage().await?;
+        // 步骤 3: 预分配存储 (与取消信号竞速)
+        {
+            let mut rx = self.control_rx.take();
+            match rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        r = self.prepare_storage() => { r?; }
+                        _ = Self::wait_for_cancel(rx) => {
+                            self.state = DownloadState::Cancelled;
+                            return Err(AmdError::Cancelled);
+                        }
+                    }
+                }
+                None => {
+                    self.prepare_storage().await?;
+                }
+            }
+            self.control_rx = rx;
+        }
 
-        // 步骤 4: 执行下载
+        // 步骤 4: 执行下载 (内部已有 cancel/pause 中断处理)
         self.execute().await?;
 
-        // 步骤 5: 校验
-        self.verify().await?;
+        // 步骤 5: 校验 (与取消信号竞速)
+        {
+            let mut rx = self.control_rx.take();
+            match rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        r = self.verify() => { r?; }
+                        _ = Self::wait_for_cancel(rx) => {
+                            self.state = DownloadState::Cancelled;
+                            return Err(AmdError::Cancelled);
+                        }
+                    }
+                }
+                None => {
+                    self.verify().await?;
+                }
+            }
+            self.control_rx = rx;
+        }
 
         self.state = DownloadState::Completed;
         info!("下载任务完成");
         Ok(())
+    }
+
+    /// 检查是否已被取消,若已取消则立即返回错误
+    fn check_cancelled(&self) -> AmdResult<()> {
+        if let Some(rx) = &self.control_rx
+            && matches!(*rx.borrow(), DownloadState::Cancelled)
+        {
+            return Err(AmdError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// 等待取消信号 (仅关注 Cancelled 状态)
+    async fn wait_for_cancel(rx: &mut watch::Receiver<DownloadState>) {
+        loop {
+            if matches!(*rx.borrow_and_update(), DownloadState::Cancelled) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return; // 通道关闭
+            }
+        }
     }
 
     // ----- 状态查询 -----

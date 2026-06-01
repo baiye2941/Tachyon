@@ -1,24 +1,23 @@
 import type { TaskInfo, AppConfig, SnifferResource } from '../types'
 
-declare global {
-  interface Window {
-    __TAURI__?: {
-      core: {
-        invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>
-      }
-    }
+async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
+  try {
+    const mod = await import('@tauri-apps/api/core')
+    return mod.invoke
+  } catch {
+    throw new Error(
+      'Tauri API 不可用 -- 请通过 `cargo tauri dev` 启动应用,不要直接在浏览器打开',
+    )
   }
 }
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!window.__TAURI__) {
-    throw new Error('Tauri API not available')
-  }
-  return window.__TAURI__.core.invoke(cmd, args) as Promise<T>
+  const fn = await getInvoke()
+  return fn(cmd, args) as Promise<T>
 }
 
 export const api = {
-  createTask: (url: string, downloadDir?: string) => invoke<string>('create_task', { url, downloadDir }),
+  createTask: (url: string, mirrorUrls?: string[]) => invoke<string>('create_task', { url, mirrorUrls }),
   getTaskList: () => invoke<TaskInfo[]>('get_task_list'),
   getTaskDetail: (taskId: string) => invoke<TaskInfo>('get_task_detail', { taskId }),
   pauseTask: (taskId: string) => invoke<void>('pause_task', { taskId }),

@@ -58,7 +58,6 @@ impl HttpClient {
             .pool_max_idle_per_host(16)
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .no_proxy()
-            .dns_resolver(std::sync::Arc::new(PublicDnsResolver::new()))
             .redirect(safe_redirect_policy());
 
         if connect_secs > 0 {
@@ -98,6 +97,7 @@ struct PublicDnsResolver {
 }
 
 impl PublicDnsResolver {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             cache: DashMap::new(),
@@ -180,8 +180,15 @@ impl Protocol for HttpClient {
             amd_core::validate_public_http_url(&parsed_url)?;
             debug!(url = %amd_core::redact_url_for_log(&url), "HTTP HEAD 探测开始");
             let response = client.head(&url).send().await.map_err(|e| {
-                warn!(url = %amd_core::redact_url_for_log(&url), error = %e, "HEAD 请求连接失败");
-                AmdError::Network(format!("HEAD 请求失败: {e}"))
+                let mut chain = String::new();
+                let mut current: Option<&dyn std::error::Error> = Some(&e);
+                while let Some(err) = current {
+                    if !chain.is_empty() { chain.push_str(" -> "); }
+                    chain.push_str(&err.to_string());
+                    current = err.source();
+                }
+                warn!(url = %amd_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "HEAD 请求连接失败");
+                AmdError::Network(format!("HEAD 请求失败: {chain}"))
             })?;
 
             let status = response.status();
@@ -255,8 +262,15 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    warn!(url = %amd_core::redact_url_for_log(&url), start, end, error = %e, "Range 请求连接失败");
-                    AmdError::Network(format!("Range 请求失败: {e}"))
+                    let mut chain = String::new();
+                    let mut current: Option<&dyn std::error::Error> = Some(&e);
+                    while let Some(err) = current {
+                        if !chain.is_empty() { chain.push_str(" -> "); }
+                        chain.push_str(&err.to_string());
+                        current = err.source();
+                    }
+                    warn!(url = %amd_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "Range 请求连接失败");
+                    AmdError::Network(format!("Range 请求失败: {chain}"))
                 })?;
 
             let status = response.status();
@@ -306,8 +320,15 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    warn!(url = %amd_core::redact_url_for_log(&url), start, end, error = %e, "流式 Range 请求连接失败");
-                    AmdError::Network(format!("Range 请求失败: {e}"))
+                    let mut chain = String::new();
+                    let mut current: Option<&dyn std::error::Error> = Some(&e);
+                    while let Some(err) = current {
+                        if !chain.is_empty() { chain.push_str(" -> "); }
+                        chain.push_str(&err.to_string());
+                        current = err.source();
+                    }
+                    warn!(url = %amd_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "流式 Range 请求连接失败");
+                    AmdError::Network(format!("Range 请求失败: {chain}"))
                 })?;
 
             let status = response.status();
@@ -347,7 +368,17 @@ impl Protocol for HttpClient {
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| AmdError::Network(format!("下载请求失败: {e}")))?;
+                .map_err(|e| {
+                    let mut chain = String::new();
+                    let mut current: Option<&dyn std::error::Error> = Some(&e);
+                    while let Some(err) = current {
+                        if !chain.is_empty() { chain.push_str(" -> "); }
+                        chain.push_str(&err.to_string());
+                        current = err.source();
+                    }
+                    warn!(url = %amd_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
+                    AmdError::Network(format!("下载请求失败: {chain}"))
+                })?;
 
             let status = response.status();
             if !status.is_success() {
@@ -386,7 +417,17 @@ impl Protocol for HttpClient {
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| AmdError::Network(format!("下载请求失败: {e}")))?;
+                .map_err(|e| {
+                    let mut chain = String::new();
+                    let mut current: Option<&dyn std::error::Error> = Some(&e);
+                    while let Some(err) = current {
+                        if !chain.is_empty() { chain.push_str(" -> "); }
+                        chain.push_str(&err.to_string());
+                        current = err.source();
+                    }
+                    warn!(url = %amd_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
+                    AmdError::Network(format!("下载请求失败: {chain}"))
+                })?;
 
             let status = response.status();
             if !status.is_success() {

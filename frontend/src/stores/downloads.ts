@@ -3,7 +3,7 @@ import { createStore, reconcile } from 'solid-js/store'
 import type { TaskInfo, DownloadStatus, ProgressPayload } from '../types'
 import { api } from '../api/invoke'
 
-const VALID_STATUSES = new Set<string>(['pending', 'downloading', 'paused', 'completed', 'failed', 'cancelled'])
+const VALID_STATUSES = new Set<string>(['pending', 'connecting', 'downloading', 'paused', 'resuming', 'verifying', 'completed', 'failed', 'cancelled'])
 
 const [tasks, setTasksRaw] = createStore<TaskInfo[]>([])
 const [selectedId, setSelectedId] = createSignal<string | null>(null)
