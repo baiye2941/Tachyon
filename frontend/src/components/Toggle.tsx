@@ -7,7 +7,7 @@ interface ToggleProps {
 export default function Toggle(props: ToggleProps) {
   return (
     <div
-      class={`relative w-9 h-5 rounded-full cursor-pointer transition-colors duration-150 ${props.checked ? 'bg-accent' : 'bg-white/10'}`}
+      class={`relative w-9 h-5 rounded-full cursor-pointer transition-colors duration-150 ${props.checked ? 'bg-accent' : 'bg-surface-elevated'}`}
       role="switch"
       aria-checked={props.checked}
       aria-label={props.ariaLabel}

@@ -1,9 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "AI Model Downloader 主窗口默认权限: 仅授予核心事件监听、窗口管理和应用生命周期权限,不包含文件系统或 shell 访问",
-  "windows": ["main"],
-  "permissions": [
-    "core:default"
-  ]
-}

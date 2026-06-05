@@ -1,0 +1,18 @@
+[package]
+name = "tachyon-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HuggingFace Hub API 客户端: 模型文件列表、LFS 解析、Token 管理"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-protocol = { path = "../tachyon-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

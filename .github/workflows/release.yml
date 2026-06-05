@@ -49,8 +49,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'AI Model Downloader ${{ github.ref_name }}'
+          releaseName: 'Tachyon ${{ github.ref_name }}'
           releaseBody: '详见 CHANGELOG.md'
           releaseDraft: true
           prerelease: false
-          projectPath: crates/amd-app
+          projectPath: crates/tachyon-app

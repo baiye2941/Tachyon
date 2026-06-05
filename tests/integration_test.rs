@@ -1,31 +1,31 @@
 //! 端到端集成测试
 //!
 //! 测试跨 crate 交互:
-//! - amd-core 类型 -> amd-io 存储写入 -> amd-crypto 校验
+//! - tachyon-core 类型 -> tachyon-io 存储写入 -> tachyon-crypto 校验
 //! - 模拟完整下载流程: 创建分片 -> 写入数据 -> 校验哈希 -> 验证完成
 
-use amd_core::AmdError;
-use amd_core::test_harness::harness::{
+use bytes::Bytes;
+use tachyon_core::DownloadError;
+use tachyon_core::test_harness::harness::{
     MemoryStorage, MockProtocol, test_config, test_fragments, test_metadata,
 };
-use amd_core::traits::{Protocol, Storage, Verifier};
-use amd_core::types::{DownloadState, FragmentInfo};
-use amd_crypto::CpuVerifier;
-use amd_engine::fragment::compute_fragment_size;
-use amd_engine::fragment::{BandwidthTracker, FragmentRecord, FragmentState};
-use amd_io::AsyncStorage;
-use amd_io::pipeline::WritePipeline;
-use amd_io::tokio_file::TokioFile;
-use bytes::Bytes;
+use tachyon_core::traits::{Protocol, Storage, Verifier};
+use tachyon_core::types::{DownloadState, FragmentInfo};
+use tachyon_crypto::CpuVerifier;
+use tachyon_engine::fragment::compute_fragment_size;
+use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord, FragmentState};
+use tachyon_io::AsyncStorage;
+use tachyon_io::pipeline::WritePipeline;
+use tachyon_io::tokio_file::TokioFile;
 use tempfile::NamedTempFile;
 
 // ============================================================
-// 跨 crate 流程: amd-core 类型 -> amd-io 存储 -> amd-crypto 校验
+// 跨 crate 流程: tachyon-core 类型 -> tachyon-io 存储 -> tachyon-crypto 校验
 // ============================================================
 
 /// 测试完整流程:创建分片 -> 写入存储 -> 计算哈希 -> 校验通过
 ///
-/// 验证 amd-core 的 FragmentInfo 与 amd-io 的 TokioFile 和 amd-crypto 的 CpuVerifier
+/// 验证 tachyon-core 的 FragmentInfo 与 tachyon-io 的 TokioFile 和 tachyon-crypto 的 CpuVerifier
 /// 协同工作。
 #[tokio::test]
 async fn integration_fragment_write_and_verify() {
@@ -123,7 +123,7 @@ async fn integration_memory_storage_full_flow() {
     }
 }
 
-/// 测试数据篡改检测: 跨 amd-io 和 amd-crypto 验证
+/// 测试数据篡改检测: 跨 tachyon-io 和 tachyon-crypto 验证
 #[tokio::test]
 async fn integration_tamper_detection() {
     let tmp = NamedTempFile::new().unwrap();
@@ -229,7 +229,7 @@ async fn integration_pipeline_write_and_crypto_verify() {
 }
 
 // ============================================================
-// 跨 crate 流程: amd-engine 分片管理 + amd-core 类型 + amd-crypto 校验
+// 跨 crate 流程: tachyon-engine 分片管理 + tachyon-core 类型 + tachyon-crypto 校验
 // ============================================================
 
 /// 测试分片状态机与校验的完整流程
@@ -360,7 +360,7 @@ async fn integration_fragment_retry_and_verify() {
     assert!(record.is_done());
 }
 
-/// 测试 amd-engine 带宽追踪影响分片大小计算
+/// 测试 tachyon-engine 带宽追踪影响分片大小计算
 #[test]
 fn integration_bandwidth_affects_fragment_size() {
     let min_size = 1024 * 1024; // 1MB
@@ -448,12 +448,12 @@ fn integration_download_state_cancel_path() {
 /// 测试协议错误能正确传播到上层
 #[tokio::test]
 async fn integration_error_propagation() {
-    let protocol = MockProtocol::failing(AmdError::Network("连接被拒绝".into()));
+    let protocol = MockProtocol::failing(DownloadError::Network("连接被拒绝".into()));
     let result = protocol.probe("http://example.com/file.bin").await;
     assert!(result.is_err());
 
     match result.unwrap_err() {
-        AmdError::Network(msg) => assert!(msg.contains("连接被拒绝")),
+        DownloadError::Network(msg) => assert!(msg.contains("连接被拒绝")),
         other => panic!("期望 Network 错误, 实际: {:?}", other),
     }
 }
@@ -475,7 +475,7 @@ async fn integration_storage_boundary_error() {
 /// 测试校验不匹配时能正确报告错误
 #[test]
 fn integration_checksum_mismatch_error() {
-    let err = AmdError::ChecksumMismatch {
+    let err = DownloadError::ChecksumMismatch {
         expected: "abc123".into(),
         actual: "def456".into(),
     };
@@ -486,12 +486,12 @@ fn integration_checksum_mismatch_error() {
 }
 
 // ============================================================
-// 集成测试:下载器完整流程(amd-engine/downloader.rs)
+// 集成测试:下载器完整流程(tachyon-engine/downloader.rs)
 // ============================================================
 
-use amd_core::config::DownloadConfig;
-use amd_sniffer::CaptureConfig;
-use amd_sniffer::resources::ResourceManager;
+use tachyon_core::config::DownloadConfig;
+use tachyon_sniffer::CaptureConfig;
+use tachyon_sniffer::resources::ResourceManager;
 
 /// 下载器完整流程:probe -> plan -> prepare -> execute -> verify
 #[tokio::test]

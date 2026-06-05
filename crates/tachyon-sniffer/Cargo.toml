@@ -1,0 +1,16 @@
+[package]
+name = "tachyon-sniffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon 嗅探层:浏览器资源拦截与解析"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true

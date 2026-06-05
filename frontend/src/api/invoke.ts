@@ -6,7 +6,7 @@ async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke
     return mod.invoke
   } catch {
     throw new Error(
-      'Tauri API 不可用 -- 请通过 `cargo tauri dev` 启动应用,不要直接在浏览器打开',
+      'Tauri API 不可用。请通过 `cargo tauri dev` 启动应用，不要直接在浏览器中打开。',
     )
   }
 }

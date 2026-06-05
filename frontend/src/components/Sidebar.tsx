@@ -1,61 +1,298 @@
-import { For } from 'solid-js'
-import type { ViewName } from '../types'
-import { $totalSpeed } from '../stores/downloads'
+/**
+ * Overlay 模式侧边栏
+ *
+ * 默认完全隐藏，鼠标移至左边缘 8px 触发区展开。
+ * 展开时为 fixed 覆盖层（不推挤内容），Pin 后始终显示并推挤。
+ */
+import { Show, For, createSignal, createEffect } from 'solid-js'
+import type { ViewName, DownloadFilter } from '../types'
+import {
+  $currentFilter,
+  $filterCounts,
+  $totalSpeed,
+  setCurrentFilter,
+} from '../stores/downloads'
+import { historyRecords } from '../stores/history'
 import { formatSpeed } from '../utils/format'
+import { Icon } from '../utils/icons'
+import { btnIcon, labelCaption } from '../utils/styles'
 
-const NAV_ITEMS: { view: ViewName; label: string; iconPath: string }[] = [
-  { view: 'downloads', label: '下载列表', iconPath: 'M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z' },
-  { view: 'sniffer', label: '资源嗅探', iconPath: 'M9 20l-5.447-2.724A1 1 0 013 16.38V5.618a1 1 0 011.768-.384l2.694 2.986a1 1 0 001.632-.09l.733-1.104A1 1 0 0110 6.5V4a1 1 0 012 0v.5a1 1 0 001 1h1.5a1 1 0 011 1v4.35a4.028 4.028 0 01-1.106 2.874l-.637.631a4 4 0 01-5.322.276' },
-  { view: 'settings', label: '设置', iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.066z' },
+/* ---- 配置 ---- */
+const STORAGE_KEY = 'aimd.sidebar.pinned'
+const SIDEBAR_WIDTH = 220
+const CLOSE_DELAY = 300
+
+/* ---- 导航数据 ---- */
+const FILTER_ITEMS: { filter: DownloadFilter; label: string; icon: string }[] =
+  [
+    { filter: 'all', label: '全部', icon: 'list-bullet' },
+    { filter: 'downloading', label: '下载中', icon: 'arrow-down-tray' },
+    { filter: 'completed', label: '已完成', icon: 'check-circle' },
+    { filter: 'incomplete', label: '未完成', icon: 'clock' },
+  ]
+
+const TOOL_ITEMS: { view: ViewName; label: string; icon: string }[] = [
+  { view: 'sniffer', label: '资源嗅探', icon: 'magnifying-glass' },
+  { view: 'settings', label: '设置', icon: 'cog-6-tooth' },
 ]
 
+const DATA_ITEMS: { view: ViewName; label: string; icon: string }[] = [
+  { view: 'history', label: '历史', icon: 'clock' },
+  { view: 'stats', label: '统计', icon: 'chart-bar' },
+]
+
+/* ---- 组件 ---- */
 export default function Sidebar(props: {
   currentView: ViewName
   onViewChange: (view: ViewName) => void
-  hovered: boolean
-  onHoverChange: (hovered: boolean) => void
 }) {
+  /* -- 状态 -- */
+  const [hovered, setHovered] = createSignal(false)
+  const initialPinned = (() => {
+    try {
+      return localStorage.getItem(STORAGE_KEY) === 'true'
+    } catch {
+      return false
+    }
+  })()
+  const [pinned, setPinned] = createSignal(initialPinned)
+
+  let closeTimer: ReturnType<typeof setTimeout> | undefined
+
+  const sidebarVisible = () => pinned() || hovered()
+
+  createEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, String(pinned()))
+    } catch {
+      /* ignore */
+    }
+  })
+
+  /* -- 计时器 -- */
+  function cancelClose() {
+    if (closeTimer !== undefined) {
+      clearTimeout(closeTimer)
+      closeTimer = undefined
+    }
+  }
+
+  function startClose() {
+    cancelClose()
+    closeTimer = setTimeout(() => {
+      setHovered(false)
+      closeTimer = undefined
+    }, CLOSE_DELAY)
+  }
+
+  function handleMouseEnter() {
+    cancelClose()
+    setHovered(true)
+  }
+
+  function handleMouseLeave() {
+    if (!pinned()) startClose()
+  }
+
+  function handleBackdropClick() {
+    if (!pinned()) {
+      setHovered(false)
+      cancelClose()
+    }
+  }
+
+  function togglePin(e: Event) {
+    e.stopPropagation()
+    setPinned((prev) => !prev)
+  }
+
+  /* -- 导航操作 -- */
+  function handleFilterClick(filter: DownloadFilter) {
+    setCurrentFilter(filter)
+    props.onViewChange('downloads')
+    if (!pinned()) {
+      setHovered(false)
+      cancelClose()
+    }
+  }
+
+  function handleNavClick(view: ViewName) {
+    props.onViewChange(view)
+    if (!pinned()) {
+      setHovered(false)
+      cancelClose()
+    }
+  }
+
+  const counts = () => $filterCounts.get()
+  const historyCount = () => historyRecords.length
+
+  /* -- 渲染 -- */
   return (
-    <div
-      class="fixed top-0 left-0 bottom-0 z-30 overflow-hidden bg-surface backdrop-blur-md border-r border-white/[0.06] transition-[width] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)"
-      style={{ width: props.hovered ? '240px' : '48px' }}
-      onMouseEnter={() => props.onHoverChange(true)}
-      onMouseLeave={() => props.onHoverChange(false)}
-    >
+    <>
+      {/* 8px 隐形触发区 */}
       <div
-        class="h-full flex flex-col"
+        class="fixed left-0 w-2 z-30"
+        style={{ top: '36px', height: 'calc(100dvh - 36px)' }}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+      />
+
+      {/* Pin 模式占位（推挤内容区） */}
+      <Show when={pinned()}>
+        <div style={{ width: `${SIDEBAR_WIDTH}px`, 'flex-shrink': '0' }} />
+      </Show>
+
+      {/* 遮罩层（仅 overlay 模式） */}
+      <Show when={sidebarVisible() && !pinned()}>
+        <div
+          class="fixed inset-0 bg-black/50 z-40"
+          style={{ top: '36px' }}
+          onClick={handleBackdropClick}
+        />
+      </Show>
+
+      {/* 侧边栏面板 */}
+      <div
+        class="fixed flex flex-col bg-surface backdrop-blur-xl border-r border-border overflow-hidden z-40"
         style={{
-          transform: props.hovered ? 'translate3d(0, 0, 0)' : 'translate3d(-192px, 0, 0)',
-          transition: 'transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)',
+          top: '36px',
+          left: '0',
+          width: sidebarVisible() ? `${SIDEBAR_WIDTH}px` : '0',
+          height: 'calc(100dvh - 36px)',
+          'transition-property': 'width',
+          'transition-duration': '250ms',
+          'transition-timing-function': 'cubic-bezier(0.16, 1, 0.3, 1)',
         }}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
       >
-        <div class="px-4 py-3 font-bold text-accent">AI Model Downloader</div>
-        <nav class="flex-1 px-2 py-2 space-y-1">
-          <For each={NAV_ITEMS}>
+        {/* 标题栏 */}
+        <div class="flex items-center justify-between px-3 h-9 border-b border-border shrink-0">
+          <span class="text-[12px] font-bold text-accent tracking-tight whitespace-nowrap overflow-hidden">
+            Tachyon
+          </span>
+          <button
+            class={`${btnIcon} w-5 h-5 shrink-0`}
+            onClick={togglePin}
+            aria-label={pinned() ? '取消固定侧边栏' : '固定侧边栏'}
+            title={pinned() ? '取消固定' : '固定侧边栏'}
+          >
+            <Icon
+              name={pinned() ? 'pause-circle' : 'plus'}
+              class="w-3.5 h-3.5"
+            />
+          </button>
+        </div>
+
+        {/* 导航区域 */}
+        <div class="flex-1 overflow-y-auto py-1">
+          {/* 下载过滤 */}
+          <div class={`px-3 py-1 ${labelCaption}`}>下载</div>
+          <For each={FILTER_ITEMS}>
             {(item) => (
               <button
-                class={`w-full flex items-center gap-3 px-3 py-2 rounded text-[13px] transition-colors duration-150 ${
-                  props.currentView === item.view
-                    ? 'text-accent bg-accent/12'
-                    : 'text-text-secondary hover:bg-white/3'
+                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
+                  props.currentView === 'downloads' &&
+                  $currentFilter.get() === item.filter
+                    ? 'text-accent bg-accent-muted'
+                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
                 }`}
-                onClick={() => props.onViewChange(item.view)}
+                onClick={() => handleFilterClick(item.filter)}
+                aria-pressed={
+                  props.currentView === 'downloads' &&
+                  $currentFilter.get() === item.filter
+                }
               >
-                <svg viewBox="0 0 24 24" class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <path d={item.iconPath} />
-                </svg>
-                {props.hovered ? item.label : null}
+                <Show
+                  when={
+                    props.currentView === 'downloads' &&
+                    $currentFilter.get() === item.filter
+                  }
+                >
+                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
+                </Show>
+                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
+                <span class="flex-1 text-left whitespace-nowrap">
+                  {item.label}
+                </span>
+                <Show when={counts()[item.filter] !== undefined}>
+                  <span class="text-[10px] font-mono text-text-tertiary">
+                    {counts()[item.filter]}
+                  </span>
+                </Show>
               </button>
             )}
           </For>
-        </nav>
-        <div class="px-4 py-3 border-t border-white/6 text-xs text-text-tertiary">
-          <div class="flex justify-between">
-            <span>速度</span>
-            <span class="font-mono">{formatSpeed($totalSpeed.get())}</span>
+
+          <div class="mx-2 my-1.5 h-px bg-border" />
+
+          {/* 工具 */}
+          <div class={`px-3 py-1 ${labelCaption}`}>工具</div>
+          <For each={TOOL_ITEMS}>
+            {(item) => (
+              <button
+                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
+                  props.currentView === item.view
+                    ? 'text-accent bg-accent-muted'
+                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
+                }`}
+                onClick={() => handleNavClick(item.view)}
+                aria-pressed={props.currentView === item.view}
+              >
+                <Show when={props.currentView === item.view}>
+                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
+                </Show>
+                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
+                <span class="flex-1 text-left whitespace-nowrap">
+                  {item.label}
+                </span>
+              </button>
+            )}
+          </For>
+
+          <div class="mx-2 my-1.5 h-px bg-border" />
+
+          {/* 数据 */}
+          <div class={`px-3 py-1 ${labelCaption}`}>数据</div>
+          <For each={DATA_ITEMS}>
+            {(item) => (
+              <button
+                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
+                  props.currentView === item.view
+                    ? 'text-accent bg-accent-muted'
+                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
+                }`}
+                onClick={() => handleNavClick(item.view)}
+                aria-pressed={props.currentView === item.view}
+              >
+                <Show when={props.currentView === item.view}>
+                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
+                </Show>
+                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
+                <span class="flex-1 text-left whitespace-nowrap">
+                  {item.label}
+                </span>
+                <Show when={item.view === 'history' && historyCount() > 0}>
+                  <span class="text-[10px] font-mono text-text-tertiary">
+                    {historyCount()}
+                  </span>
+                </Show>
+              </button>
+            )}
+          </For>
+        </div>
+
+        {/* 底部总速度 */}
+        <div class="px-3 py-2 border-t border-border shrink-0">
+          <div class="flex items-center justify-between text-[10px]">
+            <span class="text-text-tertiary">总速度</span>
+            <span class="font-mono text-accent">
+              {formatSpeed($totalSpeed.get())}
+            </span>
           </div>
         </div>
       </div>
-    </div>
+    </>
   )
 }

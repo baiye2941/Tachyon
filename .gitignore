@@ -11,8 +11,12 @@ frontend/.svelte-kit/
 
 # Claude Code 项目配置（不提交）
 .claude/
+.agents/
+.codex/
 .mcp.json
 CLAUDE.md
+AGENTS.md
+
 
 # 文档（不跟踪）
 docx/

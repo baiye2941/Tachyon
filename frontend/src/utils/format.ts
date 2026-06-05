@@ -30,6 +30,25 @@ export function guessExt(name: string): string {
   return parts.length > 1 ? parts.pop()!.toUpperCase().slice(0, 4) : 'FILE'
 }
 
+export type ColorVariant = 'fill' | 'badge'
+
+// 统一状态颜色映射。fill 返回 bg-* 填充色，badge 返回 text-+bg- 组合
+export function statusColor(status: string, variant: ColorVariant = 'fill'): string {
+  if (variant === 'badge') return statusClass(status)
+  const map: Record<string, string> = {
+    downloading: 'bg-accent',
+    connecting: 'bg-accent',
+    resuming: 'bg-accent',
+    verifying: 'bg-accent',
+    pending: 'bg-warning',
+    paused: 'bg-text-secondary',
+    completed: 'bg-success',
+    failed: 'bg-error',
+    cancelled: 'bg-text-tertiary',
+  }
+  return map[status] || 'bg-text-secondary'
+}
+
 export function statusClass(status: string): string {
   const map: Record<string, string> = {
     pending: 'text-warning bg-warning/10',
@@ -37,7 +56,7 @@ export function statusClass(status: string): string {
     downloading: 'text-accent bg-accent/10',
     paused: 'text-text-secondary bg-white/5',
     resuming: 'text-accent bg-accent/10',
-    verifying: 'text-aurora bg-aurora/10',
+    verifying: 'text-accent bg-accent/10',
     completed: 'text-success bg-success/10',
     failed: 'text-error bg-error/10',
     cancelled: 'text-text-tertiary bg-white/5',

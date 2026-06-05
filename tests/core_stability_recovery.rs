@@ -1,8 +1,8 @@
 mod common;
 
-use amd_core::DownloadState;
-use amd_store::{KvStore, RecoveryManager, TaskSnapshot};
 use std::path::PathBuf;
+use tachyon_core::DownloadState;
+use tachyon_store::{KvStore, RecoveryManager, TaskSnapshot};
 use tempfile::TempDir;
 
 fn temp_store_dir() -> PathBuf {

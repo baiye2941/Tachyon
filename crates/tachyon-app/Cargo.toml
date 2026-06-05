@@ -1,0 +1,39 @@
+[package]
+name = "tachyon-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon Tauri 应用入口"
+
+[lib]
+name = "tachyon_app_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-engine = { path = "../tachyon-engine" }
+tachyon-scheduler = { path = "../tachyon-scheduler" }
+tachyon-sniffer = { path = "../tachyon-sniffer" }
+tachyon-store = { path = "../tachyon-store" }
+tauri.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+uuid.workspace = true
+chrono.workspace = true
+url.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

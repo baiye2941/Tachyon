@@ -1,0 +1,16 @@
+[package]
+name = "tachyon-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon 持久化存储层:嵌入式 KV 存储与断点续传"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "tachyon-p2sp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon P2SP 混合下载、DHT、Peer 发现"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-protocol = { path = "../tachyon-protocol" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true

@@ -4,11 +4,11 @@
 //! 快照序列化/反序列化、恢复加载等。所有测试使用内存或本地文件系统，
 //! 不进行真实 HTTP 请求。
 
-use amd_core::DownloadState;
-use amd_engine::fragment::{BandwidthTracker, FragmentRecord, compute_fragment_size};
-use amd_store::{KvStore, RecoveryManager, TaskSnapshot};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::path::PathBuf;
+use tachyon_core::DownloadState;
+use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord, compute_fragment_size};
+use tachyon_store::{KvStore, RecoveryManager, TaskSnapshot};
 use tempfile::TempDir;
 
 fn temp_dir() -> PathBuf {
@@ -39,7 +39,7 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
 }
 
 fn make_fragment_record(index: u32, size: u64) -> FragmentRecord {
-    let info = amd_core::types::FragmentInfo {
+    let info = tachyon_core::types::FragmentInfo {
         index,
         start: index as u64 * size,
         end: (index as u64 + 1) * size - 1,

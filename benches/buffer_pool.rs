@@ -2,8 +2,8 @@
 //!
 //! 测试不同 buffer 大小和池容量下的分配/回收性能。
 
-use amd_io::BufferPool;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use tachyon_io::BufferPool;
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()

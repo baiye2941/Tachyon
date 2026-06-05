@@ -18,26 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-model-downloader"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "amd-crypto",
- "amd-engine",
- "amd-io",
- "amd-scheduler",
- "amd-sniffer",
- "amd-store",
- "blake3",
- "bytes",
- "criterion",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -50,185 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94fb8275041c72129eb51b7d0322c29b8387a0386127718b096429201a5d6ece"
 dependencies = [
  "alloc-no-stdlib",
-]
-
-[[package]]
-name = "amd-app"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "amd-engine",
- "amd-scheduler",
- "amd-sniffer",
- "amd-store",
- "chrono",
- "dashmap",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "amd-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "proptest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "amd-crypto"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "blake3",
- "bytes",
- "serde",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "amd-engine"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "amd-crypto",
- "amd-io",
- "amd-protocol",
- "amd-scheduler",
- "blake3",
- "bytes",
- "dashmap",
- "futures",
- "proptest",
- "serde",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-test",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "amd-hub"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "amd-protocol",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "amd-io"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "bytes",
- "crossbeam-queue",
- "io-uring",
- "libc",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "amd-p2sp"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "amd-protocol",
- "serde",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "amd-protocol"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "bytes",
- "dashmap",
- "futures",
- "quinn",
- "rcgen",
- "reqwest",
- "rustls",
- "rustls-native-certs",
- "suppaftp",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "amd-scheduler"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "parking_lot",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "amd-sniffer"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "serde",
- "tokio",
- "tokio-test",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "amd-store"
-version = "0.1.0"
-dependencies = [
- "amd-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4367,6 +4168,205 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
+]
+
+[[package]]
+name = "tachyon"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "criterion",
+ "serde_json",
+ "sha2",
+ "tachyon-core",
+ "tachyon-crypto",
+ "tachyon-engine",
+ "tachyon-io",
+ "tachyon-scheduler",
+ "tachyon-sniffer",
+ "tachyon-store",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "tachyon-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "tachyon-core",
+ "tachyon-engine",
+ "tachyon-scheduler",
+ "tachyon-sniffer",
+ "tachyon-store",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "tachyon-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "tachyon-crypto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "serde",
+ "sha2",
+ "tachyon-core",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "tachyon-engine"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "dashmap",
+ "futures",
+ "proptest",
+ "serde",
+ "tachyon-core",
+ "tachyon-crypto",
+ "tachyon-io",
+ "tachyon-protocol",
+ "tachyon-scheduler",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "tachyon-hub"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tachyon-core",
+ "tachyon-protocol",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tachyon-io"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crossbeam-queue",
+ "io-uring",
+ "libc",
+ "tachyon-core",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "tachyon-p2sp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tachyon-core",
+ "tachyon-protocol",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "tachyon-protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "futures",
+ "quinn",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "suppaftp",
+ "tachyon-core",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "tachyon-scheduler"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tachyon-core",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "tachyon-sniffer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tachyon-core",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "tachyon-store"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tachyon-core",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/amd-core",
-    "crates/amd-engine",
-    "crates/amd-scheduler",
-    "crates/amd-io",
-    "crates/amd-protocol",
-    "crates/amd-sniffer",
-    "crates/amd-crypto",
-    "crates/amd-p2sp",
-    "crates/amd-store",
-    "crates/amd-hub",
-    "crates/amd-app",
+    "crates/tachyon-core",
+    "crates/tachyon-engine",
+    "crates/tachyon-scheduler",
+    "crates/tachyon-io",
+    "crates/tachyon-protocol",
+    "crates/tachyon-sniffer",
+    "crates/tachyon-crypto",
+    "crates/tachyon-p2sp",
+    "crates/tachyon-store",
+    "crates/tachyon-hub",
+    "crates/tachyon-app",
 ]
 
 [workspace.package]
@@ -84,21 +84,21 @@ tempfile = "3"
 tokio-test = "0.4"
 
 [package]
-name = "ai-model-downloader"
+name = "tachyon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "AI Model Downloader 基准测试与集成测试入口"
+description = "Tachyon 超高性能下载器 基准测试与集成测试入口"
 
 [dev-dependencies]
 criterion = { workspace = true }
-amd-core = { path = "crates/amd-core", features = ["test-harness"] }
-amd-io = { path = "crates/amd-io" }
-amd-engine = { path = "crates/amd-engine" }
-amd-crypto = { path = "crates/amd-crypto" }
-amd-scheduler = { path = "crates/amd-scheduler" }
-amd-sniffer = { path = "crates/amd-sniffer" }
-amd-store = { path = "crates/amd-store" }
+tachyon-core = { path = "crates/tachyon-core", features = ["test-harness"] }
+tachyon-io = { path = "crates/tachyon-io" }
+tachyon-engine = { path = "crates/tachyon-engine" }
+tachyon-crypto = { path = "crates/tachyon-crypto" }
+tachyon-scheduler = { path = "crates/tachyon-scheduler" }
+tachyon-sniffer = { path = "crates/tachyon-sniffer" }
+tachyon-store = { path = "crates/tachyon-store" }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }

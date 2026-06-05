@@ -1,0 +1,28 @@
+[package]
+name = "tachyon-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon 引擎层:分片引擎、连接管理"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-io = { path = "../tachyon-io" }
+tachyon-protocol = { path = "../tachyon-protocol" }
+tachyon-crypto = { path = "../tachyon-crypto" }
+tachyon-scheduler = { path = "../tachyon-scheduler" }
+tokio.workspace = true
+tokio-stream.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+futures.workspace = true
+serde.workspace = true
+url.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tachyon-core = { path = "../tachyon-core", features = ["test-harness"] }
+tempfile.workspace = true
+tokio-test.workspace = true
+proptest.workspace = true

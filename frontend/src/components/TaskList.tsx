@@ -1,17 +1,10 @@
 import { For, Show } from 'solid-js'
-import { $tasks, $activeTasks, $completedTasks, $selectedId, setTasks, setSelectedId } from '../stores/downloads'
+import { $filteredTasks, $selectedId, setSelectedId } from '../stores/downloads'
+import { toggleSelection, isSelected } from '../stores/selection'
 import { api } from '../api/invoke'
 import { addToast } from '../stores/toast'
 import DownloadCard from './DownloadCard'
-
-async function refreshTasks() {
-  try {
-    const list = await api.getTaskList()
-    setTasks(list)
-  } catch (e) {
-    addToast('刷新任务列表失败: ' + String(e), 'error')
-  }
-}
+import { Icon } from '../utils/icons'
 
 async function handlePause(id: string) {
   try {
@@ -42,7 +35,6 @@ async function handleDelete(id: string) {
     await api.deleteTask(id)
     const selected = $selectedId.get()
     if (selected === id) setSelectedId(null)
-    await refreshTasks()
   } catch (e) {
     addToast('删除任务失败: ' + String(e), 'error')
   }
@@ -51,51 +43,30 @@ async function handleDelete(id: string) {
 export default function TaskList() {
   return (
     <Show
-      when={$tasks.get().length > 0}
+      when={$filteredTasks.get().length > 0}
       fallback={
-        <div class="flex flex-col items-center justify-center gap-3 py-10 text-text-tertiary">
-          <svg class="w-10 h-10 opacity-40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
-            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-          </svg>
-          <div class="text-[13px] text-text-secondary">暂无下载任务</div>
-          <div class="text-[11px] text-text-tertiary">在顶部输入链接开始下载</div>
+        <div class="flex flex-col items-center justify-center gap-2 py-16 text-text-tertiary">
+          <Icon name="arrow-down-tray" class="w-12 h-12 text-text-tertiary mx-auto" />
+          <div class="text-[14px] font-medium text-text-secondary">暂无下载任务</div>
+          <div class="text-[12px] text-text-tertiary mt-1">粘贴 URL 开始下载，或拖拽文件到窗口</div>
         </div>
       }
     >
-      <div>
-        <Show when={$activeTasks.get().length > 0}>
-          <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-2">活跃</div>
-          <For each={$activeTasks.get()}>
-            {(task) => (
-              <DownloadCard
-                task={task}
-                selected={$selectedId.get() === task.id}
-                onSelect={(id) => setSelectedId(id)}
-                onPause={handlePause}
-                onResume={handleResume}
-                onCancel={handleCancel}
-                onDelete={handleDelete}
-              />
-            )}
-          </For>
-        </Show>
-
-        <Show when={$completedTasks.get().length > 0}>
-          <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-2 mt-5">已完成</div>
-          <For each={$completedTasks.get()}>
-            {(task) => (
-              <DownloadCard
-                task={task}
-                selected={$selectedId.get() === task.id}
-                onSelect={(id) => setSelectedId(id)}
-                onPause={handlePause}
-                onResume={handleResume}
-                onCancel={handleCancel}
-                onDelete={handleDelete}
-              />
-            )}
-          </For>
-        </Show>
+      <div class="flex flex-col" role="list" aria-label="下载任务列表">
+        <For each={$filteredTasks.get()}>
+          {(task) => (
+            <DownloadCard
+              task={task}
+              selected={isSelected(task.id)}
+              onSelect={(id) => setSelectedId(id)}
+              onToggleSelect={(id) => toggleSelection(id)}
+              onPause={handlePause}
+              onResume={handleResume}
+              onCancel={handleCancel}
+              onDelete={handleDelete}
+            />
+          )}
+        </For>
       </div>
     </Show>
   )

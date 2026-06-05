@@ -1,4 +1,5 @@
 import type { DownloadStatus } from '../types'
+import { statusColor } from '../utils/format'
 
 interface ProgressBarProps {
   progress: number
@@ -7,17 +8,8 @@ interface ProgressBarProps {
 }
 
 export default function ProgressBar(props: ProgressBarProps) {
-  const fillColor = () => {
-    switch (props.status) {
-      case 'downloading': return 'bg-accent'
-      case 'pending': return 'bg-warning'
-      case 'paused': return 'bg-text-secondary'
-      case 'completed': return 'bg-success'
-      case 'failed': return 'bg-error'
-      case 'cancelled': return 'bg-text-tertiary'
-      default: return 'bg-text-secondary'
-    }
-  }
+  const isDownloading = () => props.status === 'downloading'
+  const isCompleted = () => props.status === 'completed'
 
   return (
     <div
@@ -28,7 +20,10 @@ export default function ProgressBar(props: ProgressBarProps) {
       aria-valuemax={100}
       aria-label={props.label}
     >
-      <div class={`h-full rounded-full transition-all duration-300 ${fillColor()}`} style={{ width: `${props.progress}%` }} />
+      <div
+        class={`h-full rounded-full transition-[width] duration-300 ${statusColor(props.status)} ${isDownloading() ? 'progress-striped' : ''} ${isCompleted() ? 'animate-flash' : ''}`}
+        style={{ width: `${props.progress}%` }}
+      />
     </div>
   )
 }

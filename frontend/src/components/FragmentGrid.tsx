@@ -21,7 +21,7 @@ export default function FragmentGrid(props: FragmentGridProps) {
   const blockClass = (cls: 'done' | 'active' | 'pending') => {
     switch (cls) {
       case 'done': return 'bg-accent'
-      case 'active': return 'bg-accent animate-pulse'
+      case 'active': return 'bg-accent animate-pulse-subtle'
       case 'pending': return 'bg-white/10'
     }
   }

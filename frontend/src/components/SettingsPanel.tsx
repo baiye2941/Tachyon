@@ -1,8 +1,10 @@
 import { For, Show, createSignal, onMount } from 'solid-js'
 import { api } from '../api/invoke'
 import { $config, $configLoading } from '../stores/settings'
+import { addToast } from '../stores/toast'
 import Toggle from './Toggle'
 import type { AppConfig } from '../types'
+import { inputBase, btnPrimary } from '../utils/styles'
 
 const ALGORITHMS = ['blake3', 'sha256'] as const
 const MIN_SIZE_OPTIONS = [
@@ -36,42 +38,58 @@ export default function SettingsPanel() {
       setMaxFragments(cfg.download.maxConcurrentFragments)
       setMaxConnections(cfg.connection.maxConnectionsPerHost)
       setQuicEnabled(cfg.connection.enableQuic)
+      setHttp2Enabled(cfg.connection.enableHttp2)
       setVerifyEnabled(cfg.download.verifyChecksum)
+      // 如果后端返回 minFragmentSize，映射到 minSize 选择器
+      setMinSize(cfg.scheduler.minFragmentSize)
     } catch (e) {
-      console.error('加载配置失败:', e)
+      addToast('加载配置失败: ' + String(e), 'error')
     } finally {
       $configLoading.set(false)
     }
   })
 
   async function handleSave() {
-    const cfg: Partial<AppConfig> = {
+    const base = $config.get()
+    if (!base) return
+
+    const cfg: AppConfig = {
       maxConcurrentTasks: maxTasks(),
       download: {
         downloadDir: dir(),
         maxConcurrentFragments: maxFragments(),
         verifyChecksum: verifyEnabled(),
-        maxRetries: 3,
-        requestTimeoutSecs: 30,
-        userAgent: '',
+        maxRetries: base.download.maxRetries,
+        requestTimeoutSecs: base.download.requestTimeoutSecs,
+        userAgent: base.download.userAgent,
       },
       connection: {
         maxConnectionsPerHost: maxConnections(),
         enableQuic: quicEnabled(),
-        maxGlobalConnections: 256,
-        keepAliveTimeoutSecs: 30,
-        connectTimeoutSecs: 10,
         enableHttp2: http2Enabled(),
+        maxGlobalConnections: base.connection.maxGlobalConnections,
+        keepAliveTimeoutSecs: base.connection.keepAliveTimeoutSecs,
+        connectTimeoutSecs: base.connection.connectTimeoutSecs,
+      },
+      scheduler: {
+        minFragmentSize: base.scheduler.minFragmentSize,
+        maxFragmentSize: base.scheduler.maxFragmentSize,
+        samplingIntervalSecs: base.scheduler.samplingIntervalSecs,
+        ewmaAlpha: base.scheduler.ewmaAlpha,
       },
     }
     try {
       await api.updateConfig(cfg)
+      $config.set(cfg)
       setSaved(true)
       setTimeout(() => setSaved(false), 1500)
+      addToast('配置已保存', 'success')
     } catch (e) {
-      console.error('保存配置失败:', e)
+      addToast('保存配置失败: ' + String(e), 'error')
     }
   }
+
+  const fieldClass = `${inputBase} w-20 text-center`
 
   return (
     <Show
@@ -83,60 +101,57 @@ export default function SettingsPanel() {
       }
     >
       <div>
-        <div class="mb-6">
+        {/* 下载 */}
+        <div class="glass-panel rounded-lg p-4 mb-4">
           <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">下载</div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">下载目录</span>
             <input
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={inputBase}
               type="text"
               value={dir()}
               onInput={(e) => setDir(e.currentTarget.value)}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">最大并发任务</span>
             <input
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={fieldClass}
               type="number"
               min="1"
               max="20"
               value={maxTasks()}
               onInput={(e) => setMaxTasks(Number(e.currentTarget.value) || 1)}
-              style={{ width: '80px', 'text-align': 'center' }}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">最大分片数</span>
             <input
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={fieldClass}
               type="number"
               min="1"
               max="128"
               value={maxFragments()}
               onInput={(e) => setMaxFragments(Number(e.currentTarget.value) || 1)}
-              style={{ width: '80px', 'text-align': 'center' }}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">每主机最大连接数</span>
             <input
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={fieldClass}
               type="number"
               min="1"
               max="32"
               value={maxConnections()}
               onInput={(e) => setMaxConnections(Number(e.currentTarget.value) || 1)}
-              style={{ width: '80px', 'text-align': 'center' }}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
             <span class="text-[13px] text-text-secondary">最小文件大小</span>
             <select
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={`${inputBase} w-28`}
               value={minSize()}
               onChange={(e) => setMinSize(Number(e.currentTarget.value))}
-              style={{ width: '120px' }}
             >
               <For each={MIN_SIZE_OPTIONS}>
                 {(opt) => <option value={opt.value}>{opt.label}</option>}
@@ -145,9 +160,10 @@ export default function SettingsPanel() {
           </div>
         </div>
 
-        <div class="mb-6">
+        {/* 协议 */}
+        <div class="glass-panel rounded-lg p-4 mb-4">
           <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">协议</div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">QUIC 多路径</span>
             <Toggle
               checked={quicEnabled()}
@@ -155,7 +171,7 @@ export default function SettingsPanel() {
               onChange={setQuicEnabled}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
             <span class="text-[13px] text-text-secondary">HTTP/2</span>
             <Toggle
               checked={http2Enabled()}
@@ -165,9 +181,10 @@ export default function SettingsPanel() {
           </div>
         </div>
 
-        <div class="mb-6">
+        {/* 校验 */}
+        <div class="glass-panel rounded-lg p-4 mb-4">
           <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">校验</div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
             <span class="text-[13px] text-text-secondary">启用校验</span>
             <Toggle
               checked={verifyEnabled()}
@@ -175,13 +192,12 @@ export default function SettingsPanel() {
               onChange={setVerifyEnabled}
             />
           </div>
-          <div class="flex items-center justify-between py-2.5 border-b border-white/5">
+          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
             <span class="text-[13px] text-text-secondary">校验算法</span>
             <select
-              class="px-3 py-1.5 bg-surface border border-white/6 rounded text-[13px] text-text-primary outline-none focus:border-accent transition-colors duration-150"
+              class={`${inputBase} w-28`}
               value={algorithm()}
               onChange={(e) => setAlgorithm(e.currentTarget.value)}
-              style={{ width: '120px' }}
             >
               <For each={ALGORITHMS}>
                 {(alg) => <option value={alg}>{alg === 'blake3' ? 'Blake3' : 'SHA-256'}</option>}
@@ -192,7 +208,7 @@ export default function SettingsPanel() {
 
         <div class="flex items-center gap-3 mt-2">
           <button
-            class="px-4 py-2 bg-accent text-canvas text-[12px] font-semibold rounded hover:opacity-85 active:scale-[0.98] transition-all duration-100"
+            class={btnPrimary}
             onClick={handleSave}
           >
             保存配置

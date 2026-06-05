@@ -70,4 +70,6 @@ export interface ProgressPayload {
 
 export type ProgressEvent = Record<string, ProgressPayload>
 
-export type ViewName = 'downloads' | 'sniffer' | 'settings'
+export type ViewName = 'downloads' | 'sniffer' | 'settings' | 'history' | 'stats'
+
+export type DownloadFilter = 'all' | 'downloading' | 'completed' | 'incomplete'

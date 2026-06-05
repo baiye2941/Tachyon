@@ -15,11 +15,19 @@ interface ConnectionSlot {
 }
 
 const SLOT_STATE_COLORS: Record<ConnectionSlot['state'], string> = {
-  handshake: 'text-warning',
-  downloading: 'text-accent',
-  writing: 'text-aurora',
-  verifying: 'text-success',
-  idle: 'text-text-tertiary',
+  handshake: 'bg-warning',
+  downloading: 'bg-accent',
+  writing: 'bg-accent',
+  verifying: 'bg-success',
+  idle: 'bg-text-tertiary',
+}
+
+const SLOT_STATE_LABELS: Record<ConnectionSlot['state'], string> = {
+  handshake: '握手',
+  downloading: '下载',
+  writing: '写入',
+  verifying: '校验',
+  idle: '空闲',
 }
 
 const MOCK_TREE: LFSFileNode[] = [
@@ -53,7 +61,7 @@ function TreeNode(props: { node: LFSFileNode; depth: number }) {
   return (
     <div>
       <button
-        class="w-full flex items-center gap-2 px-2 py-1.5 text-left text-[13px] hover:bg-white/[0.03] transition-colors duration-150 rounded"
+        class="w-full flex items-center gap-2 px-2 py-1.5 text-left text-[13px] hover:bg-white/[0.04] transition-colors duration-150 rounded"
         style={{ 'padding-left': `${props.depth * 16 + 8}px` }}
         onClick={() => setExpanded(!expanded())}
       >
@@ -81,15 +89,21 @@ function TreeNode(props: { node: LFSFileNode; depth: number }) {
 
 function SlotMap(props: { slots: ConnectionSlot[] }) {
   return (
-    <div class="grid grid-cols-6 gap-1.5">
+    <div class="grid grid-cols-3 gap-2">
       <For each={props.slots}>
         {(slot) => (
           <div
-            class={`flex flex-col items-center justify-center p-2 rounded text-[10px] font-mono transition-colors duration-300 bg-surface-elevated ${SLOT_STATE_COLORS[slot.state]}`}
+            class="glass-panel rounded p-2 flex items-center gap-2 transition-colors duration-200"
             title={`${slot.id}: ${slot.state}`}
           >
-            <span class="w-2 h-2 rounded-full mb-1 bg-current" />
-            <span class="truncate">{slot.state.slice(0, 3)}</span>
+            <div class={`w-[3px] h-6 rounded-full ${SLOT_STATE_COLORS[slot.state]}`} />
+            <div class="flex flex-col">
+              <span class="text-[10px] font-mono text-text-secondary">{slot.id}</span>
+              <span class="text-[10px] font-mono text-text-primary">{SLOT_STATE_LABELS[slot.state]}</span>
+            </div>
+            <Show when={slot.speed > 0}>
+              <span class="ml-auto text-[10px] font-mono text-accent">{formatSize(slot.speed)}/s</span>
+            </Show>
           </div>
         )}
       </For>
@@ -138,7 +152,9 @@ function ThroughputWave() {
     frameId = requestAnimationFrame(animate)
   }
 
-  animate()
+  onMount(() => {
+    animate()
+  })
 
   const gradientId = 'throughput-grad'
 
@@ -152,7 +168,7 @@ function ThroughputWave() {
           </linearGradient>
           <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="0%">
             <stop offset="0%" stop-color="var(--color-accent)" />
-            <stop offset="100%" stop-color="var(--color-aurora)" />
+            <stop offset="100%" stop-color="var(--color-accent)" />
           </linearGradient>
         </defs>
         <path
@@ -212,7 +228,7 @@ export default function HFZone() {
       </form>
 
       <Show when={expanded()}>
-        <div class="border border-white/[0.06] rounded-lg overflow-hidden">
+        <div class="border border-white/[0.06] rounded-lg overflow-hidden glass-panel">
           <div class="px-3 py-2 border-b border-white/[0.06] text-[11px] font-semibold text-text-tertiary uppercase tracking-wider">
             文件树
           </div>
@@ -234,7 +250,7 @@ export default function HFZone() {
 
         <div>
           <h3 class="text-[15px] font-medium text-text-primary mb-3">吞吐量</h3>
-          <div class="border border-white/[0.06] rounded-lg p-3 bg-surface">
+          <div class="glass-panel rounded-lg p-3">
             <ThroughputWave />
           </div>
         </div>
