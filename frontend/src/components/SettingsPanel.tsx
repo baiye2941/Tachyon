@@ -1,47 +1,100 @@
-import { For, Show, createSignal, onMount } from 'solid-js'
+import { createSignal, createEffect, For, Show, onMount } from 'solid-js'
 import { api } from '../api/invoke'
 import { $config, $configLoading } from '../stores/settings'
 import { addToast } from '../stores/toast'
-import Toggle from './Toggle'
 import type { AppConfig } from '../types'
-import { inputBase, btnPrimary } from '../utils/styles'
+import { CloseIcon } from './icons'
 
-const ALGORITHMS = ['blake3', 'sha256'] as const
-const MIN_SIZE_OPTIONS = [
-  { value: 0, label: '无限制' },
-  { value: 1048576, label: '1 MB' },
-  { value: 5242880, label: '5 MB' },
-  { value: 10485760, label: '10 MB' },
-  { value: 52428800, label: '50 MB' },
-] as const
+type SettingsTab = 'general' | 'download' | 'connection' | 'scheduler' | 'about'
 
-export default function SettingsPanel() {
-  const loading = () => $configLoading.get()
+interface SettingsPanelProps {
+  visible: boolean
+  onClose: () => void
+}
 
-  const [dir, setDir] = createSignal('')
-  const [maxTasks, setMaxTasks] = createSignal(3)
-  const [maxFragments, setMaxFragments] = createSignal(8)
-  const [maxConnections, setMaxConnections] = createSignal(4)
-  const [quicEnabled, setQuicEnabled] = createSignal(false)
-  const [http2Enabled, setHttp2Enabled] = createSignal(true)
-  const [verifyEnabled, setVerifyEnabled] = createSignal(true)
-  const [algorithm, setAlgorithm] = createSignal('blake3')
-  const [minSize, setMinSize] = createSignal(0)
-  const [saved, setSaved] = createSignal(false)
+export default function SettingsPanel(props: SettingsPanelProps) {
+  const [activeTab, setActiveTab] = createSignal<SettingsTab>('general')
+  const [shouldRender, setShouldRender] = createSignal(false)
+  const [visible, setVisible] = createSignal(false)
+
+  let closeTimer: number | null = null
+
+  const cancelCloseTimer = () => {
+    if (closeTimer !== null) {
+      clearTimeout(closeTimer)
+      closeTimer = null
+    }
+  }
+
+  createEffect(() => {
+    if (props.visible) {
+      cancelCloseTimer()
+      if (!shouldRender()) {
+        setShouldRender(true)
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            setVisible(true)
+          })
+        })
+      } else {
+        setVisible(true)
+      }
+    } else if (shouldRender() && visible()) {
+      setVisible(false)
+      cancelCloseTimer()
+      closeTimer = window.setTimeout(() => {
+        setShouldRender(false)
+        closeTimer = null
+      }, 250)
+    }
+  })
+
+  const tabs: { id: SettingsTab; label: string }[] = [
+    { id: 'general', label: '通用' },
+    { id: 'download', label: '下载' },
+    { id: 'connection', label: '连接' },
+    { id: 'scheduler', label: '调度' },
+    { id: 'about', label: '关于' },
+  ]
+
+  // 真实 AppConfig 字段
+  const [downloadDir, setDownloadDir] = createSignal('')
+  const [maxConcurrentTasks, setMaxConcurrentTasks] = createSignal(3)
+  const [maxConcurrentFragments, setMaxConcurrentFragments] = createSignal(8)
+  const [maxRetries, setMaxRetries] = createSignal(3)
+  const [verifyChecksum, setVerifyChecksum] = createSignal(true)
+  const [userAgent, setUserAgent] = createSignal('')
+  const [maxConnectionsPerHost, setMaxConnectionsPerHost] = createSignal(4)
+  const [enableHttp2, setEnableHttp2] = createSignal(true)
+  const [enableQuic, setEnableQuic] = createSignal(false)
+  const [connectTimeoutSecs, setConnectTimeoutSecs] = createSignal(30)
+  const [minFragmentSize, setMinFragmentSize] = createSignal(1048576)
+  const [maxFragmentSize, setMaxFragmentSize] = createSignal(67108864)
+  const [ewmaAlpha, setEwmaAlpha] = createSignal(0.3)
+  const [saving, setSaving] = createSignal(false)
+
+  const applyConfig = (cfg: AppConfig) => {
+    setMaxConcurrentTasks(cfg.maxConcurrentTasks)
+    setDownloadDir(cfg.download.downloadDir)
+    setMaxConcurrentFragments(cfg.download.maxConcurrentFragments)
+    setMaxRetries(cfg.download.maxRetries)
+    setVerifyChecksum(cfg.download.verifyChecksum)
+    setUserAgent(cfg.download.userAgent)
+    setMaxConnectionsPerHost(cfg.connection.maxConnectionsPerHost)
+    setEnableHttp2(cfg.connection.enableHttp2)
+    setEnableQuic(cfg.connection.enableQuic)
+    setConnectTimeoutSecs(cfg.connection.connectTimeoutSecs)
+    setMinFragmentSize(cfg.scheduler.minFragmentSize)
+    setMaxFragmentSize(cfg.scheduler.maxFragmentSize)
+    setEwmaAlpha(cfg.scheduler.ewmaAlpha)
+  }
 
   onMount(async () => {
+    $configLoading.set(true)
     try {
       const cfg = await api.getConfig()
       $config.set(cfg)
-      setDir(cfg.download.downloadDir)
-      setMaxTasks(cfg.maxConcurrentTasks)
-      setMaxFragments(cfg.download.maxConcurrentFragments)
-      setMaxConnections(cfg.connection.maxConnectionsPerHost)
-      setQuicEnabled(cfg.connection.enableQuic)
-      setHttp2Enabled(cfg.connection.enableHttp2)
-      setVerifyEnabled(cfg.download.verifyChecksum)
-      // 如果后端返回 minFragmentSize，映射到 minSize 选择器
-      setMinSize(cfg.scheduler.minFragmentSize)
+      applyConfig(cfg)
     } catch (e) {
       addToast('加载配置失败: ' + String(e), 'error')
     } finally {
@@ -49,177 +102,355 @@ export default function SettingsPanel() {
     }
   })
 
-  async function handleSave() {
+  const buildConfig = (): AppConfig | null => {
     const base = $config.get()
-    if (!base) return
+    if (!base) return null
 
-    const cfg: AppConfig = {
-      maxConcurrentTasks: maxTasks(),
+    return {
+      maxConcurrentTasks: maxConcurrentTasks(),
       download: {
-        downloadDir: dir(),
-        maxConcurrentFragments: maxFragments(),
-        verifyChecksum: verifyEnabled(),
-        maxRetries: base.download.maxRetries,
-        requestTimeoutSecs: base.download.requestTimeoutSecs,
-        userAgent: base.download.userAgent,
+        ...base.download,
+        downloadDir: downloadDir(),
+        maxConcurrentFragments: maxConcurrentFragments(),
+        maxRetries: maxRetries(),
+        verifyChecksum: verifyChecksum(),
+        userAgent: userAgent(),
       },
       connection: {
-        maxConnectionsPerHost: maxConnections(),
-        enableQuic: quicEnabled(),
-        enableHttp2: http2Enabled(),
-        maxGlobalConnections: base.connection.maxGlobalConnections,
-        keepAliveTimeoutSecs: base.connection.keepAliveTimeoutSecs,
-        connectTimeoutSecs: base.connection.connectTimeoutSecs,
+        ...base.connection,
+        maxConnectionsPerHost: maxConnectionsPerHost(),
+        enableHttp2: enableHttp2(),
+        enableQuic: enableQuic(),
+        connectTimeoutSecs: connectTimeoutSecs(),
       },
       scheduler: {
-        minFragmentSize: base.scheduler.minFragmentSize,
-        maxFragmentSize: base.scheduler.maxFragmentSize,
-        samplingIntervalSecs: base.scheduler.samplingIntervalSecs,
-        ewmaAlpha: base.scheduler.ewmaAlpha,
+        ...base.scheduler,
+        minFragmentSize: minFragmentSize(),
+        maxFragmentSize: maxFragmentSize(),
+        ewmaAlpha: ewmaAlpha(),
       },
-    }
-    try {
-      await api.updateConfig(cfg)
-      $config.set(cfg)
-      setSaved(true)
-      setTimeout(() => setSaved(false), 1500)
-      addToast('配置已保存', 'success')
-    } catch (e) {
-      addToast('保存配置失败: ' + String(e), 'error')
     }
   }
 
-  const fieldClass = `${inputBase} w-20 text-center`
+  const handleSave = async () => {
+    const cfg = buildConfig()
+    if (!cfg) {
+      addToast('配置尚未加载', 'error')
+      return
+    }
+
+    setSaving(true)
+    try {
+      await api.updateConfig(cfg)
+      $config.set(cfg)
+      addToast('配置已保存', 'success')
+    } catch (e) {
+      addToast('保存配置失败: ' + String(e), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleChooseDownloadDir = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog')
+      const selected = await open({ directory: true, multiple: false })
+      if (typeof selected === 'string') {
+        setDownloadDir(selected)
+      }
+    } catch (e) {
+      addToast('无法打开目录选择器: ' + String(e), 'error')
+    }
+  }
 
   return (
-    <Show
-      when={!loading()}
-      fallback={
-        <div class="flex flex-col items-center justify-center py-10">
-          <div class="text-text-secondary text-[13px]">加载配置中...</div>
-        </div>
-      }
-    >
-      <div>
-        {/* 下载 */}
-        <div class="glass-panel rounded-lg p-4 mb-4">
-          <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">下载</div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">下载目录</span>
-            <input
-              class={inputBase}
-              type="text"
-              value={dir()}
-              onInput={(e) => setDir(e.currentTarget.value)}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">最大并发任务</span>
-            <input
-              class={fieldClass}
-              type="number"
-              min="1"
-              max="20"
-              value={maxTasks()}
-              onInput={(e) => setMaxTasks(Number(e.currentTarget.value) || 1)}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">最大分片数</span>
-            <input
-              class={fieldClass}
-              type="number"
-              min="1"
-              max="128"
-              value={maxFragments()}
-              onInput={(e) => setMaxFragments(Number(e.currentTarget.value) || 1)}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">每主机最大连接数</span>
-            <input
-              class={fieldClass}
-              type="number"
-              min="1"
-              max="32"
-              value={maxConnections()}
-              onInput={(e) => setMaxConnections(Number(e.currentTarget.value) || 1)}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
-            <span class="text-[13px] text-text-secondary">最小文件大小</span>
-            <select
-              class={`${inputBase} w-28`}
-              value={minSize()}
-              onChange={(e) => setMinSize(Number(e.currentTarget.value))}
-            >
-              <For each={MIN_SIZE_OPTIONS}>
-                {(opt) => <option value={opt.value}>{opt.label}</option>}
-              </For>
-            </select>
-          </div>
+    <Show when={shouldRender()}>
+      {/* Overlay */}
+      <div
+        class="panel-overlay"
+        style={{
+          opacity: visible() ? 1 : 0,
+          transition: 'opacity 250ms ease',
+        }}
+        onClick={props.onClose}
+      />
+
+      {/* Panel */}
+      <div
+        class="fixed z-[210]"
+        style={{
+          top: '50%',
+          left: '50%',
+          transform: `translate(-50%, -50%) scale(${visible() ? 1 : 0.95})`,
+          opacity: visible() ? 1 : 0,
+          transition: 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1), opacity 250ms ease',
+          width: '640px',
+          height: '520px',
+          background: 'rgba(18, 18, 26, 0.98)',
+          'backdrop-filter': 'blur(20px) saturate(1.5)',
+          'border-radius': '16px',
+          border: '1px solid rgba(255, 255, 255, 0.08)',
+          'box-shadow': '0 16px 48px rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Sidebar */}
+        <div style={{
+          width: '160px',
+          background: 'rgba(255, 255, 255, 0.02)',
+          'border-right': '1px solid rgba(255, 255, 255, 0.05)',
+          padding: '16px 8px',
+          display: 'flex',
+          'flex-direction': 'column',
+          gap: '2px',
+        }}>
+          <For each={tabs}>
+            {(tab) => (
+              <button
+                class="text-left"
+                style={{
+                  padding: '8px 12px',
+                  'border-radius': '6px',
+                  'font-size': '13px',
+                  background: activeTab() === tab.id ? 'rgba(0, 212, 170, 0.1)' : 'transparent',
+                  color: activeTab() === tab.id ? '#00D4AA' : '#A0A0B0',
+                  border: 'none',
+                  cursor: 'pointer',
+                  transition: 'all 150ms ease',
+                  'font-weight': activeTab() === tab.id ? 600 : 400,
+                }}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            )}
+          </For>
         </div>
 
-        {/* 协议 */}
-        <div class="glass-panel rounded-lg p-4 mb-4">
-          <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">协议</div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">QUIC 多路径</span>
-            <Toggle
-              checked={quicEnabled()}
-              ariaLabel="QUIC 开关"
-              onChange={setQuicEnabled}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
-            <span class="text-[13px] text-text-secondary">HTTP/2</span>
-            <Toggle
-              checked={http2Enabled()}
-              ariaLabel="HTTP/2 开关"
-              onChange={setHttp2Enabled}
-            />
-          </div>
-        </div>
-
-        {/* 校验 */}
-        <div class="glass-panel rounded-lg p-4 mb-4">
-          <div class="text-[11px] font-semibold text-text-tertiary uppercase tracking-wider mb-3">校验</div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5 border-b border-white/5">
-            <span class="text-[13px] text-text-secondary">启用校验</span>
-            <Toggle
-              checked={verifyEnabled()}
-              ariaLabel="校验开关"
-              onChange={setVerifyEnabled}
-            />
-          </div>
-          <div class="grid grid-cols-[1fr_auto] gap-4 items-center py-2.5">
-            <span class="text-[13px] text-text-secondary">校验算法</span>
-            <select
-              class={`${inputBase} w-28`}
-              value={algorithm()}
-              onChange={(e) => setAlgorithm(e.currentTarget.value)}
-            >
-              <For each={ALGORITHMS}>
-                {(alg) => <option value={alg}>{alg === 'blake3' ? 'Blake3' : 'SHA-256'}</option>}
-              </For>
-            </select>
-          </div>
-        </div>
-
-        <div class="flex items-center gap-3 mt-2">
-          <button
-            class={btnPrimary}
-            onClick={handleSave}
-          >
-            保存配置
-          </button>
-          <Show when={saved()}>
-            <span class="text-success text-[12px] font-semibold">
-              已保存
+        {/* Content */}
+        <div class="flex-1 flex flex-col" style={{ overflow: 'hidden' }}>
+          {/* Header */}
+          <div class="panel-header">
+            <span style={{ 'font-size': '15px', 'font-weight': 600, color: '#F0F0F5' }}>
+              {tabs.find(t => t.id === activeTab())?.label}设置
             </span>
-          </Show>
+            <button
+              class="icon-btn-sm hover-light"
+              onClick={props.onClose}
+            >
+              <CloseIcon />
+            </button>
+          </div>
+
+          {/* Scrollable content */}
+          <div class="flex-1 overflow-y-auto" style={{ padding: '20px' }}>
+            <Show when={activeTab() === 'general'}>
+              <div class="flex flex-col gap-5">
+                <div>
+                  <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>默认下载路径</div>
+                  <div class="flex items-center gap-2">
+                    <input
+                      type="text"
+                      class="input flex-1"
+                      value={downloadDir()}
+                      onInput={e => setDownloadDir(e.currentTarget.value)}
+                      style={{ 'font-size': '13px' }}
+                    />
+                    <button
+                      class="btn btn-secondary"
+                      style={{ 'font-size': '12px', padding: '6px 12px' }}
+                      onClick={handleChooseDownloadDir}
+                    >
+                      浏览
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </Show>
+
+            <Show when={activeTab() === 'download'}>
+              <div class="flex flex-col gap-5">
+                <SliderItem
+                  label="最大并发任务数"
+                  value={maxConcurrentTasks()}
+                  min={1}
+                  max={16}
+                  onChange={setMaxConcurrentTasks}
+                  displayValue={`${maxConcurrentTasks()}`}
+                />
+                <SliderItem
+                  label="最大并发分片数"
+                  value={maxConcurrentFragments()}
+                  min={1}
+                  max={32}
+                  onChange={setMaxConcurrentFragments}
+                  displayValue={`${maxConcurrentFragments()}`}
+                />
+                <SliderItem
+                  label="最大重试次数"
+                  value={maxRetries()}
+                  min={0}
+                  max={10}
+                  onChange={setMaxRetries}
+                  displayValue={`${maxRetries()} 次`}
+                />
+                <ToggleItem label="校验文件完整性" value={verifyChecksum()} onChange={setVerifyChecksum} />
+                <div>
+                  <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>User-Agent</div>
+                  <input
+                    type="text"
+                    class="input"
+                    value={userAgent()}
+                    onInput={e => setUserAgent(e.currentTarget.value)}
+                    placeholder="默认 User-Agent"
+                    style={{ width: '100%', 'font-size': '13px' }}
+                  />
+                </div>
+              </div>
+            </Show>
+
+            <Show when={activeTab() === 'connection'}>
+              <div class="flex flex-col gap-5">
+                <SliderItem
+                  label="每个主机最大连接数"
+                  value={maxConnectionsPerHost()}
+                  min={1}
+                  max={16}
+                  onChange={setMaxConnectionsPerHost}
+                  displayValue={`${maxConnectionsPerHost()}`}
+                />
+                <SliderItem
+                  label="连接超时"
+                  value={connectTimeoutSecs()}
+                  min={5}
+                  max={120}
+                  onChange={setConnectTimeoutSecs}
+                  displayValue={`${connectTimeoutSecs()} 秒`}
+                />
+                <ToggleItem label="启用 HTTP/2" value={enableHttp2()} onChange={setEnableHttp2} />
+                <ToggleItem label="启用 QUIC" value={enableQuic()} onChange={setEnableQuic} />
+              </div>
+            </Show>
+
+            <Show when={activeTab() === 'scheduler'}>
+              <div class="flex flex-col gap-5">
+                <SliderItem
+                  label="最小分片大小"
+                  value={minFragmentSize()}
+                  min={262144}
+                  max={10485760}
+                  onChange={setMinFragmentSize}
+                  displayValue={`${(minFragmentSize() / 1048576).toFixed(1)} MB`}
+                />
+                <SliderItem
+                  label="最大分片大小"
+                  value={maxFragmentSize()}
+                  min={10485760}
+                  max={134217728}
+                  onChange={setMaxFragmentSize}
+                  displayValue={`${(maxFragmentSize() / 1048576).toFixed(0)} MB`}
+                />
+                <SliderItem
+                  label="EWMA 平滑系数"
+                  value={ewmaAlpha()}
+                  min={0.1}
+                  max={0.9}
+                  onChange={setEwmaAlpha}
+                  displayValue={ewmaAlpha().toFixed(2)}
+                />
+              </div>
+            </Show>
+
+            <Show when={activeTab() === 'about'}>
+              <div class="flex flex-col items-center gap-3" style={{ padding: '40px 20px' }}>
+                <div style={{
+                  width: '48px',
+                  height: '48px',
+                  background: 'linear-gradient(135deg, #00D4AA 0%, #00B4D8 100%)',
+                  'border-radius': '12px',
+                  display: 'flex',
+                  'align-items': 'center',
+                  'justify-content': 'center',
+                  color: '#0A0A0F',
+                  'font-size': '24px',
+                  'font-weight': 700,
+                }}>
+                  T
+                </div>
+                <div style={{ 'font-size': '18px', 'font-weight': 600, color: '#F0F0F5' }}>Tachyon</div>
+                <div style={{ 'font-size': '13px', color: '#6B7280' }}>版本 0.1.0 · Rust + Tauri</div>
+                <div style={{ 'font-size': '12px', color: '#4A4A5A', 'margin-top': '8px' }}>
+                  高性能多线程下载加速器
+                </div>
+              </div>
+            </Show>
+          </div>
         </div>
       </div>
     </Show>
+  )
+}
+
+function ToggleItem(props: { label: string; value: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <div class="flex items-center justify-between">
+      <span style={{ 'font-size': '13px', color: '#F0F0F5' }}>{props.label}</span>
+      <button
+        class="relative"
+        style={{
+          width: '40px',
+          height: '22px',
+          'border-radius': '11px',
+          background: props.value ? '#00D4AA' : '#2A2A3A',
+          border: 'none',
+          cursor: 'pointer',
+          transition: 'background 200ms ease',
+        }}
+        onClick={() => props.onChange(!props.value)}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            width: '18px',
+            height: '18px',
+            'border-radius': '50%',
+            background: 'white',
+            top: '2px',
+            left: '2px',
+            transform: props.value ? 'translateX(18px)' : 'translateX(0)',
+            transition: 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)',
+          }}
+        />
+      </button>
+    </div>
+  )
+}
+
+function SliderItem(props: {
+  label: string
+  value: number
+  min: number
+  max: number
+  onChange: (v: number) => void
+  displayValue: string
+}) {
+  return (
+    <div>
+      <div class="flex items-center justify-between" style={{ 'margin-bottom': '8px' }}>
+        <span style={{ 'font-size': '13px', color: '#A0A0B0' }}>{props.label}</span>
+        <span class="mono" style={{ 'font-size': '13px', color: '#F0F0F5' }}>
+          {props.displayValue}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={props.min}
+        max={props.max}
+        value={props.value}
+        onInput={e => props.onChange(parseInt(e.currentTarget.value))}
+        style={{ width: '100%' }}
+      />
+    </div>
   )
 }

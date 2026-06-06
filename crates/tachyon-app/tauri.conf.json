@@ -5,7 +5,7 @@
   "identifier": "com.tachyon.app",
   "build": {
     "frontendDist": "../../frontend/dist",
-    "devUrl": "http://localhost:3000",
+    "devUrl": "http://localhost:5173",
     "beforeDevCommand": "cd ../frontend && bun run dev",
     "beforeBuildCommand": "cd ../frontend && bun run build"
   },

@@ -3,6 +3,7 @@ import { createStore, reconcile } from 'solid-js/store'
 import type { TaskInfo, DownloadStatus, ProgressPayload, DownloadFilter } from '../types'
 import { api } from '../api/invoke'
 import { addToast } from './toast'
+import { addHistoryRecord } from './history'
 
 const VALID_STATUSES = new Set<string>(['pending', 'connecting', 'downloading', 'paused', 'resuming', 'verifying', 'completed', 'failed', 'cancelled'])
 
@@ -124,17 +125,38 @@ export const $activeCount = {
 }
 
 export function updateProgress(payload: Record<string, ProgressPayload>) {
+  const TERMINAL_STATUSES = new Set<DownloadStatus>(['completed', 'failed', 'cancelled'])
+
   batch(() => {
     for (const [id, p] of Object.entries(payload)) {
       const idx = taskIndexMap.get(id)    // O(1) 查找
       if (idx !== undefined) {
+        const oldStatus = tasks[idx].status
+        const newStatus = VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : oldStatus
+
         setTasksRaw(idx, {
           downloaded: p.downloaded ?? tasks[idx].downloaded,
           speed: p.speed ?? tasks[idx].speed,
-          status: VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : tasks[idx].status,
+          status: newStatus,
           progress: p.progress ?? tasks[idx].progress,
           fragmentsDone: p.fragmentsDone ?? tasks[idx].fragmentsDone,
         })
+
+        // 检测状态转 terminal：写入历史
+        if (!TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(newStatus)) {
+          const task = tasks[idx]
+          const duration = task.createdAt ? Date.now() - new Date(task.createdAt).getTime() : 0
+          const avgSpeed = duration > 0 ? (task.downloaded || 0) / (duration / 1000) : 0
+
+          addHistoryRecord({
+            url: task.url,
+            fileName: task.fileName,
+            fileSize: task.fileSize || 0,
+            status: newStatus as 'completed' | 'failed' | 'cancelled',
+            duration: Math.floor(duration / 1000), // 秒
+            avgSpeed,
+          })
+        }
       }
     }
   })

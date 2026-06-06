@@ -1,5 +1,8 @@
 export type DownloadStatus = 'pending' | 'connecting' | 'downloading' | 'paused' | 'resuming' | 'verifying' | 'completed' | 'failed' | 'cancelled'
 
+/** 原型组件沿用的别名，与 DownloadStatus 等价 */
+export type DownloadState = DownloadStatus
+
 export interface TaskInfo {
   id: string
   url: string
@@ -73,3 +76,25 @@ export type ProgressEvent = Record<string, ProgressPayload>
 export type ViewName = 'downloads' | 'sniffer' | 'settings' | 'history' | 'stats'
 
 export type DownloadFilter = 'all' | 'downloading' | 'completed' | 'incomplete'
+
+/** ---- 原型 UI 状态类型 ---- */
+
+export type ListDensity = 'comfortable' | 'compact'
+
+export type SidebarFilter = 'all' | 'downloading' | 'completed' | 'paused' | 'failed'
+
+export type FileTypeFilter = 'all' | 'video' | 'audio' | 'document' | 'image' | 'archive' | 'executable' | 'other'
+
+export interface ToastMessage {
+  id: string
+  type: 'success' | 'error' | 'warning' | 'info'
+  title: string
+  description?: string
+  actions?: { label: string; onClick: () => void }[]
+  duration?: number
+}
+
+export interface SpeedDataPoint {
+  timestamp: number
+  speed: number
+}

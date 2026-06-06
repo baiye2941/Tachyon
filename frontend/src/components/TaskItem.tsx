@@ -1,0 +1,214 @@
+import { createMemo, Show } from 'solid-js'
+import type { TaskInfo, ListDensity } from '../types'
+import { CheckboxIcon } from './icons'
+import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel, THREAD_COLORS } from '../utils/format'
+
+interface TaskItemProps {
+  task: TaskInfo
+  isSelected: boolean
+  isMultiSelected: boolean
+  isMultiSelectMode: boolean
+  onClick: () => void
+  onContextMenu?: (e: MouseEvent) => void
+  density: ListDensity
+  searchQuery?: string
+  staggerIndex?: number
+}
+
+function HighlightedText(props: { text: string; query: string }) {
+  if (!props.query.trim()) return <>{props.text}</>
+
+  const lowerText = props.text.toLowerCase()
+  const lowerQuery = props.query.toLowerCase()
+  const parts: { text: string; highlight: boolean }[] = []
+
+  let i = 0
+  while (i < props.text.length) {
+    const idx = lowerText.indexOf(lowerQuery, i)
+    if (idx === -1) {
+      parts.push({ text: props.text.slice(i), highlight: false })
+      break
+    }
+    if (idx > i) {
+      parts.push({ text: props.text.slice(i, idx), highlight: false })
+    }
+    parts.push({ text: props.text.slice(idx, idx + props.query.length), highlight: true })
+    i = idx + props.query.length
+  }
+
+  return (
+    <>
+      {parts.map((part, idx) =>
+        part.highlight ? (
+          <span
+            style={{
+              background: 'rgba(0, 212, 170, 0.2)',
+              color: '#00D4AA',
+              'border-radius': '2px',
+              padding: '0 2px',
+            }}
+          >
+            {part.text}
+          </span>
+        ) : (
+          <>{part.text}</>
+        )
+      )}
+    </>
+  )
+}
+
+export default function TaskItem(props: TaskItemProps) {
+  const fileInfo = createMemo(() => getFileType(props.task.fileName))
+  const isCompact = () => props.density === 'compact'
+
+  return (
+    <div
+      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter"
+      style={{
+        padding: isCompact() ? '8px 16px' : '12px 16px',
+        background: props.isMultiSelected
+          ? 'rgba(0, 212, 170, 0.08)'
+          : props.isSelected
+            ? 'rgba(0, 212, 170, 0.04)'
+            : 'transparent',
+        'border-left': props.isMultiSelected ? '2px solid #00D4AA' : '2px solid transparent',
+        '--stagger-index': props.staggerIndex ?? 0,
+      }}
+      onClick={props.onClick}
+      onContextMenu={props.onContextMenu}
+    >
+      <div class="flex items-center gap-3">
+        <Show when={props.isMultiSelectMode}>
+          <div
+            class="flex items-center justify-center flex-shrink-0"
+            style={{
+              width: '20px',
+              height: '20px',
+              color: props.isMultiSelected ? '#00D4AA' : '#6B7280',
+            }}
+          >
+            <CheckboxIcon checked={props.isMultiSelected} />
+          </div>
+        </Show>
+
+        <div
+          class="flex items-center justify-center flex-shrink-0"
+          style={{
+            width: isCompact() ? '32px' : '40px',
+            height: isCompact() ? '32px' : '40px',
+            color: fileInfo().color,
+          }}
+        >
+          {(() => {
+            const Icon = fileInfo().icon
+            return <Icon />
+          })()}
+        </div>
+
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center justify-between min-w-0">
+            <div class="flex-1 min-w-0">
+              <div
+                class="truncate"
+                style={{
+                  'font-size': '14px',
+                  'font-weight': 500,
+                  color: '#F0F0F5',
+                }}
+              >
+                <HighlightedText text={props.task.fileName} query={props.searchQuery || ''} />
+              </div>
+              <Show when={!isCompact()}>
+                <div
+                  class="truncate"
+                  style={{
+                    'font-size': '12px',
+                    color: '#A0A0B0',
+                    'margin-top': '2px',
+                  }}
+                >
+                  {props.task.fileSize ? formatSize(props.task.fileSize) : '未知大小'}
+                  {' · '}
+                  {props.task.url.split(':')[0].toUpperCase()}
+                  {props.task.speed > 0 && ` · ${formatSpeed(props.task.speed)}`}
+                </div>
+              </Show>
+            </div>
+
+            <div
+              class="flex-shrink-0"
+              style={{
+                'min-width': '60px',
+                width: '120px',
+                'text-align': 'right',
+                'font-size': '14px',
+                color: '#A0A0B0',
+                'font-family': "'Geist Mono', monospace",
+              }}
+            >
+              {(props.task.progress * 100).toFixed(1)}%
+            </div>
+
+            <div
+              class="flex-shrink-0"
+              style={{
+                'min-width': '60px',
+                width: '100px',
+                'text-align': 'right',
+                'font-size': '13px',
+                color: props.task.status === 'downloading' ? '#00D4AA' : '#A0A0B0',
+                'font-family': "'Geist Mono', monospace",
+                'overflow': 'hidden',
+                'text-overflow': 'ellipsis',
+                'white-space': 'nowrap',
+              }}
+            >
+              {formatSpeed(props.task.speed)}
+            </div>
+
+            <div
+              class="flex-shrink-0"
+              style={{
+                'min-width': '40px',
+                width: '80px',
+                'text-align': 'right',
+                'font-size': '12px',
+                color: getStatusColor(props.task.status),
+                'overflow': 'hidden',
+                'text-overflow': 'ellipsis',
+                'white-space': 'nowrap',
+              }}
+            >
+              {getStatusLabel(props.task.status)}
+            </div>
+          </div>
+
+          <div
+            class="relative overflow-hidden"
+            style={{
+              height: isCompact() ? '2px' : '3px',
+              'margin-top': isCompact() ? '6px' : '8px',
+              'border-radius': '9999px',
+              background: '#1A1A25',
+            }}
+          >
+            <div
+              class={`absolute left-0 top-0 bottom-0${props.task.status === 'downloading' ? ' progress-bar-active' : ''}`}
+              style={{
+                width: `${props.task.progress * 100}%`,
+                'border-radius': '9999px',
+                background: props.task.status === 'failed'
+                  ? '#EF4444'
+                  : props.task.status === 'downloading'
+                    ? undefined
+                    : 'linear-gradient(90deg, #00D4AA 0%, #00B4D8 100%)',
+                transition: 'width 300ms ease-out',
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
