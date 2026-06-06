@@ -133,7 +133,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
             <input
               ref={inputRef}
               type="text"
-              class="flex-1 bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary outline-none"
+              class="flex-1 bg-transparent text-[14px] text-text-primary placeholder:text-text-tertiary focus-visible:outline-2 focus-visible:outline-accent-primary focus-visible:outline-offset-2"
               placeholder="搜索命令或导航..."
               value={query()}
               onInput={(e) => {

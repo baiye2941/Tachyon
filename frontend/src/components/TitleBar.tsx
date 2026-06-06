@@ -116,18 +116,24 @@ export default function TitleBar(props: TitleBarProps) {
         <button
           class="win-btn"
           onClick={handleMinimize}
+          aria-label="最小化窗口"
+          title="最小化"
         >
           <MinimizeIcon />
         </button>
         <button
           class="win-btn"
           onClick={handleMaximize}
+          aria-label={isMaximized() ? '恢复窗口' : '最大化窗口'}
+          title={isMaximized() ? '恢复' : '最大化'}
         >
           {isMaximized() ? <RestoreIcon /> : <MaximizeIcon />}
         </button>
         <button
           class="win-btn win-btn-close"
           onClick={handleClose}
+          aria-label="关闭窗口"
+          title="关闭"
         >
           <CloseIcon />
         </button>
