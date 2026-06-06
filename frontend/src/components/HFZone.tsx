@@ -217,7 +217,7 @@ export default function HFZone() {
           value={repoId()}
           onInput={(e) => setRepoId(e.currentTarget.value)}
           placeholder="bert-base-uncased"
-          class="flex-1 px-3 py-2 bg-surface border border-white/[0.06] rounded text-[13px] font-mono text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent transition-colors duration-150"
+          class="flex-1 px-3 py-2 bg-surface border border-white/[0.06] rounded text-[13px] font-mono text-text-primary placeholder:text-text-tertiary focus-visible:outline-2 focus-visible:outline-accent-primary focus-visible:outline-offset-2 focus:border-accent transition-colors duration-150"
         />
         <button
           type="submit"

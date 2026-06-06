@@ -62,9 +62,25 @@ export default function TaskItem(props: TaskItemProps) {
   const fileInfo = createMemo(() => getFileType(props.task.fileName))
   const isCompact = () => props.density === 'compact'
 
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      props.onClick()
+    }
+  }
+
+  const ariaLabel = () => {
+    const progress = (props.task.progress * 100).toFixed(1)
+    const status = getStatusLabel(props.task.status)
+    return `任务：${props.task.fileName}，进度 ${progress}%，状态 ${status}`
+  }
+
   return (
     <div
-      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter"
+      role="button"
+      tabindex="0"
+      aria-label={ariaLabel()}
+      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00D4AA] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A12]"
       style={{
         padding: isCompact() ? '8px 16px' : '12px 16px',
         background: props.isMultiSelected
@@ -76,12 +92,15 @@ export default function TaskItem(props: TaskItemProps) {
         '--stagger-index': props.staggerIndex ?? 0,
       }}
       onClick={props.onClick}
+      onKeyDown={handleKeyDown}
       onContextMenu={props.onContextMenu}
     >
       <div class="flex items-center gap-3">
         <Show when={props.isMultiSelectMode}>
           <div
             class="flex items-center justify-center flex-shrink-0"
+            role="checkbox"
+            aria-checked={props.isMultiSelected}
             style={{
               width: '20px',
               height: '20px',

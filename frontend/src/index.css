@@ -25,7 +25,7 @@
 
     --color-text-primary: #F0F0F5;
     --color-text-secondary: #A0A0B0;
-    --color-text-tertiary: #6B7280;
+    --color-text-tertiary: #7B8290;
     --color-text-disabled: #4B5563;
 
     /* Thread Colors for ChunkMatrix */
@@ -133,6 +133,13 @@ body {
 /* ============================================
    Utility Classes
    ============================================ */
+
+/* Global focus-visible utility for keyboard navigation */
+.focus-visible:focus-visible {
+    outline: 2px solid var(--color-accent-primary);
+    outline-offset: 2px;
+}
+
 .glass {
     background: rgba(18, 18, 26, 0.85);
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -157,6 +164,19 @@ body {
 /* ============================================
    Animations
    ============================================ */
+
+/* Respect user's motion preferences */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
 @keyframes logo-shimmer {
 
     0%,
@@ -486,9 +506,10 @@ body {
 }
 
 .input:focus {
-    border-color: rgba(0, 212, 170, 0.4);
-    box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.1);
+    border-color: rgba(0, 212, 170, 0.6);
+    box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.2);
     background: rgba(255, 255, 255, 0.06);
+    outline: 2px solid transparent;
 }
 
 .input::placeholder {
@@ -613,7 +634,7 @@ body {
     background: rgba(255, 255, 255, 0.06);
 }
 
-/* Small icon button (28x28) */
+/* Small icon button (28x28 visual, 44x44 touch target) */
 .icon-btn-sm {
     display: flex;
     align-items: center;
@@ -626,6 +647,13 @@ body {
     color: var(--color-text-tertiary);
     background: transparent;
     transition: color 150ms ease, background 150ms ease;
+    position: relative;
+}
+.icon-btn-sm::before {
+    content: '';
+    position: absolute;
+    inset: -8px;
+    border-radius: var(--radius-sm);
 }
 .icon-btn-sm:hover {
     color: var(--color-text-primary);
