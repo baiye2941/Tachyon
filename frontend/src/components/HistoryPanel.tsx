@@ -1,85 +1,253 @@
-import { createSignal, For, Show } from 'solid-js'
-import type { HistoryRecord, HistoryFilter } from '../stores/history'
-import { formatSize, statusText, statusClass } from '../utils/format'
-import { Icon } from '../utils/icons'
+import { createSignal, createMemo, For, Show } from 'solid-js'
+import type { TaskInfo } from '../types'
+import {
+  CloseIcon, HistoryIcon, FolderOpenIcon, RefreshIcon, TrashIcon,
+  TrophyIcon, PackageIcon, GlobeIcon, ClockIcon,
+} from './icons'
+import { formatSize, formatSpeed } from '../utils/format'
 
 interface HistoryPanelProps {
-  records: HistoryRecord[]
-  onClear: () => void
-}
-
-const filterLabels: Record<HistoryFilter, string> = {
-  all: '全部',
-  completed: '已完成',
-  failed: '失败',
-  cancelled: '已取消',
+  visible: boolean
+  tasks: TaskInfo[]
+  onClose: () => void
+  onOpenFolder: (taskId: string) => void
+  onRedownload: (task: TaskInfo) => void
+  onDeleteRecord: (taskId: string) => void
 }
 
 export default function HistoryPanel(props: HistoryPanelProps) {
-  const [filter, setFilter] = createSignal<HistoryFilter>('all')
+  const [timeRange, setTimeRange] = createSignal<'7d' | '30d' | 'all'>('all')
+  const [searchQuery, setSearchQuery] = createSignal('')
 
-  const filtered = () => {
-    if (filter() === 'all') return props.records
-    return props.records.filter(r => r.status === filter())
+  const completedTasks = createMemo(() => {
+    return props.tasks.filter(t => t.status === 'completed')
+  })
+
+  const filteredTasks = createMemo(() => {
+    let result = completedTasks()
+    const sq = searchQuery().trim().toLowerCase()
+    if (sq) {
+      result = result.filter(t => t.fileName.toLowerCase().includes(sq))
+    }
+    return result
+  })
+
+  const stats = createMemo(() => {
+    const tasks = completedTasks()
+    const totalDownloaded = tasks.reduce((sum, t) => sum + (t.fileSize || 0), 0)
+    const totalCount = tasks.length
+    const avgSpeed = tasks.length > 0
+      ? tasks.reduce((sum, t) => sum + t.speed, 0) / tasks.length
+      : 0
+    const maxFile = tasks.length > 0
+      ? tasks.reduce((max, t) => (t.fileSize || 0) > (max.fileSize || 0) ? t : max, tasks[0])
+      : null
+    const maxSpeed = tasks.length > 0
+      ? Math.max(...tasks.map(t => t.speed))
+      : 0
+    return { totalDownloaded, totalCount, avgSpeed, maxFile, maxSpeed }
+  })
+
+  function timeAgo(dateStr: string): string {
+    const diff = Date.now() - new Date(dateStr).getTime()
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24))
+    if (days === 0) return '今天'
+    if (days === 1) return '昨天'
+    if (days < 7) return `${days}天前`
+    if (days < 30) return `${Math.floor(days / 7)}周前`
+    return `${Math.floor(days / 30)}月前`
   }
 
+  const trendData = createMemo(() => {
+    const days = 30
+    const data: { day: string; size: number }[] = []
+    for (let i = days - 1; i >= 0; i--) {
+      const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+      const dayStr = date.toISOString().slice(0, 10)
+      const dayTasks = completedTasks().filter(t => t.createdAt.startsWith(dayStr))
+      const size = dayTasks.reduce((sum, t) => sum + (t.fileSize || 0), 0)
+      data.push({ day: dayStr.slice(5), size })
+    }
+    return data
+  })
+
+  const maxTrendSize = createMemo(() => {
+    return Math.max(...trendData().map(d => d.size), 1)
+  })
+
   return (
-    <div class="flex flex-col gap-3">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-1.5">
-          <For each={Object.keys(filterLabels) as HistoryFilter[]}>
-            {(f) => (
+    <div
+      class="slide-panel"
+      style={{
+        width: '480px',
+        transform: props.visible ? 'translateX(0)' : 'translateX(100%)',
+        overflow: 'hidden',
+      }}
+    >
+      {/* Header */}
+      <div class="panel-header">
+        <div class="panel-title">
+          <HistoryIcon />
+          <span>实验数据</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <For each={(['7d', '30d', 'all'] as const)}>
+            {(range) => (
               <button
-                class={`px-2.5 py-1 text-[10px] rounded transition-colors duration-100 ${
-                  filter() === f
-                    ? 'bg-accent text-canvas font-medium'
-                    : 'bg-white/5 text-text-secondary hover:bg-white/10 hover:text-text-primary'
-                }`}
-                onClick={() => setFilter(f)}
-                aria-label={`过滤${filterLabels[f]}`}
+                class={timeRange() === range ? 'pill-btn pill-btn-active' : 'pill-btn pill-btn-default'}
+                onClick={() => setTimeRange(range)}
               >
-                {filterLabels[f]}
+                {range === '7d' ? '近7天' : range === '30d' ? '近30天' : '全部'}
               </button>
             )}
           </For>
+          <button
+            class="icon-btn-sm hover-light"
+            onClick={props.onClose}
+          >
+            <CloseIcon />
+          </button>
         </div>
-        <button
-          class="px-2.5 py-1 text-[10px] rounded bg-white/5 text-text-secondary hover:bg-error/10 hover:text-error transition-colors duration-100"
-          onClick={() => props.onClear()}
-          aria-label="清除历史"
-        >
-          清除历史
-        </button>
       </div>
 
-      <Show
-        when={filtered().length > 0}
-        fallback={
-          <div class="flex flex-col items-center justify-center gap-2 py-8 text-text-tertiary">
-            <Icon name="clock" class="w-12 h-12 text-text-tertiary mx-auto" />
-            <div class="text-[12px]">暂无历史记录</div>
-            <div class="text-[11px] text-text-tertiary">完成的下载任务将自动记录在此</div>
+      <div class="flex-1 overflow-y-auto" style={{ padding: '20px' }}>
+        {/* Stats Grid */}
+        <div style={{
+          display: 'grid',
+          'grid-template-columns': 'repeat(3, 1fr)',
+          gap: '12px',
+          'margin-bottom': '20px',
+        }}>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="mono" style={{ 'font-size': '20px', 'font-weight': 700, color: '#F0F0F5' }}>
+              {formatSize(stats().totalDownloaded)}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>总下载量</div>
           </div>
-        }
-      >
-        <div class="glass-panel rounded-lg overflow-hidden flex flex-col">
-          <For each={filtered()}>
-            {(record) => (
-              <div class="flex items-center gap-3 px-3 py-2 border-b border-white/5 hover:bg-white/[0.03] transition-colors duration-150">
-                <span class="truncate text-[12px] font-medium flex-1 min-w-0 text-text-primary">
-                  {record.fileName}
-                </span>
-                <span class={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${statusClass(record.status)}`}>
-                  {statusText(record.status)}
-                </span>
-                <span class="text-[10px] font-mono text-text-secondary shrink-0">{formatSize(record.fileSize)}</span>
-                <span class="text-[10px] font-mono text-text-tertiary shrink-0">{(record.avgSpeed / 1024).toFixed(1)} KB/s</span>
-                <span class="text-[10px] font-mono text-text-tertiary shrink-0">{(record.duration / 1000).toFixed(1)}s</span>
-              </div>
-            )}
-          </For>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="mono" style={{ 'font-size': '20px', 'font-weight': 700, color: '#00B4D8' }}>
+              {stats().totalCount}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>任务总数</div>
+          </div>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="mono" style={{ 'font-size': '20px', 'font-weight': 700, color: '#F0F0F5' }}>
+              {formatSpeed(stats().avgSpeed)}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>平均速度</div>
+          </div>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="mono" style={{ 'font-size': '20px', 'font-weight': 700, color: '#00D4AA' }}>
+              {formatSpeed(stats().maxSpeed)}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>最快记录</div>
+          </div>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="mono" style={{ 'font-size': '20px', 'font-weight': 700, color: '#00D4AA' }}>
+              {stats().totalCount > 0 ? '100%' : '0%'}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>成功率</div>
+          </div>
+          <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'text-align': 'center' }}>
+            <div class="truncate mono" style={{ 'font-size': '14px', 'font-weight': 700, color: '#F59E0B' }}>
+              {stats().maxFile ? formatSize(stats().maxFile!.fileSize || 0) : '-'}
+            </div>
+            <div style={{ 'font-size': '11px', color: '#6B7280', 'margin-top': '4px' }}>最大文件</div>
+          </div>
         </div>
-      </Show>
+
+        {/* Trend Chart */}
+        <div class="glass" style={{ padding: '16px', 'border-radius': '10px', 'margin-bottom': '20px' }}>
+          <div style={{ 'font-size': '12px', 'font-weight': 600, color: '#6B7280', 'margin-bottom': '12px' }}>下载量趋势</div>
+          <div class="flex items-end gap-1" style={{ height: '120px' }}>
+            <For each={trendData()}>
+              {(item) => {
+                const height = () => item.size > 0 ? Math.max((item.size / maxTrendSize()) * 100, 1) : 1
+                return (
+                  <div class="flex-1 flex flex-col items-center gap-1 group" style={{ height: '100%', 'justify-content': 'flex-end' }}>
+                    <div
+                      style={{
+                        width: '100%',
+                        height: `${height()}%`,
+                        'min-height': item.size > 0 ? '2px' : '1px',
+                        'border-radius': '2px 2px 0 0',
+                        background: item.size > 0
+                          ? 'linear-gradient(to top, #00D4AA, #00B4D8)'
+                          : 'rgba(255,255,255,0.05)',
+                        transition: 'height 300ms ease-out',
+                      }}
+                    />
+                  </div>
+                )
+              }}
+            </For>
+          </div>
+        </div>
+
+        {/* Fun Facts */}
+        <Show when={stats().maxFile}>
+          <div class="glass" style={{ padding: '14px', 'border-radius': '8px', 'margin-bottom': '20px' }}>
+            <div class="flex items-center gap-2" style={{ color: '#00D4AA' }}>
+              <TrophyIcon />
+              <span style={{ 'font-size': '12px', color: '#6B7280' }}>最快记录</span>
+            </div>
+            <div class="mono" style={{ 'font-size': '14px', color: '#F0F0F5', 'margin-top': '4px' }}>
+              {formatSpeed(stats().maxSpeed)} — {stats().maxFile?.fileName}
+            </div>
+          </div>
+        </Show>
+
+        {/* Records */}
+        <div class="section-label" style={{ 'margin-bottom': '12px' }}>历史记录</div>
+        <input
+          type="text"
+          placeholder="搜索历史记录..."
+          value={searchQuery()}
+          onInput={e => setSearchQuery(e.currentTarget.value)}
+          class="input"
+          style={{ width: '100%', 'margin-bottom': '12px', 'font-size': '13px' }}
+        />
+        <For each={filteredTasks()}>
+          {(task) => (
+            <div
+              class="flex items-center gap-3 hover-row"
+              style={{
+                padding: '10px 12px',
+                'border-radius': '8px',
+                transition: 'all 150ms ease',
+              }}
+            >
+              <PackageIcon />
+              <div class="flex-1 min-w-0">
+                <div class="truncate" style={{ 'font-size': '14px', color: '#F0F0F5' }}>{task.fileName}</div>
+                <div style={{ 'font-size': '12px', color: '#6B7280' }}>
+                  {formatSize(task.fileSize || 0)} · 已完成 · {timeAgo(task.createdAt)}
+                </div>
+              </div>
+              <div class="flex items-center gap-1">
+                <button
+                  class="icon-btn-sm hover-light"
+                  onClick={() => props.onOpenFolder(task.id)}
+                >
+                  <FolderOpenIcon />
+                </button>
+                <button
+                  class="icon-btn-sm hover-light"
+                  onClick={() => props.onRedownload(task)}
+                >
+                  <RefreshIcon />
+                </button>
+                <button
+                  class="icon-btn-sm hover-danger"
+                  onClick={() => props.onDeleteRecord(task.id)}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            </div>
+          )}
+        </For>
+      </div>
     </div>
   )
 }

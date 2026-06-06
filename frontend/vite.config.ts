@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [solidPlugin(), tailwindcss()],
   clearScreen: false,
   server: {
-    port: 3000,
+    port: 5173,
     strictPort: true,
     host: '127.0.0.1',
   },

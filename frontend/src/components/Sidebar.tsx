@@ -1,298 +1,315 @@
-/**
- * Overlay 模式侧边栏
- *
- * 默认完全隐藏，鼠标移至左边缘 8px 触发区展开。
- * 展开时为 fixed 覆盖层（不推挤内容），Pin 后始终显示并推挤。
- */
-import { Show, For, createSignal, createEffect } from 'solid-js'
-import type { ViewName, DownloadFilter } from '../types'
+import { createSignal, createEffect, onCleanup, Show, For } from 'solid-js'
+import type { SidebarFilter } from '../types'
 import {
-  $currentFilter,
-  $filterCounts,
-  $totalSpeed,
-  setCurrentFilter,
-} from '../stores/downloads'
-import { historyRecords } from '../stores/history'
-import { formatSpeed } from '../utils/format'
-import { Icon } from '../utils/icons'
-import { btnIcon, labelCaption } from '../utils/styles'
+    FileIcon, VideoIcon, AudioIcon, DocumentIcon, ImageIcon,
+    ArchiveIcon, AttachmentIcon, PinIcon, PinOffIcon,
+    HistoryIcon,
+} from './icons'
 
-/* ---- 配置 ---- */
-const STORAGE_KEY = 'aimd.sidebar.pinned'
-const SIDEBAR_WIDTH = 220
-const CLOSE_DELAY = 300
+interface SidebarProps {
+    filter: SidebarFilter
+    onFilterChange: (filter: SidebarFilter) => void
+    taskCounts: {
+        all: number
+        downloading: number
+        completed: number
+        paused: number
+        failed: number
+    }
+    onOpenSniffer: () => void
+    onOpenHistory: () => void
+}
 
-/* ---- 导航数据 ---- */
-const FILTER_ITEMS: { filter: DownloadFilter; label: string; icon: string }[] =
-  [
-    { filter: 'all', label: '全部', icon: 'list-bullet' },
-    { filter: 'downloading', label: '下载中', icon: 'arrow-down-tray' },
-    { filter: 'completed', label: '已完成', icon: 'check-circle' },
-    { filter: 'incomplete', label: '未完成', icon: 'clock' },
-  ]
+const SIDEBAR_STORAGE_KEY = 'tachyon-sidebar-state'
+const MIN_WIDTH = 60
+const MAX_WIDTH = 300
+const DEFAULT_WIDTH = 200
+const COLLAPSE_THRESHOLD = 120
+const EDGE_ZONE_WIDTH = 20
 
-const TOOL_ITEMS: { view: ViewName; label: string; icon: string }[] = [
-  { view: 'sniffer', label: '资源嗅探', icon: 'magnifying-glass' },
-  { view: 'settings', label: '设置', icon: 'cog-6-tooth' },
+const statusItems: { key: SidebarFilter; label: string; icon: any }[] = [
+    { key: 'all', label: '\u5168\u90E8\u6587\u4EF6', icon: FileIcon },
+    { key: 'downloading', label: '\u4E0B\u8F7D\u4E2D', icon: FileIcon },
+    { key: 'completed', label: '\u5DF2\u5B8C\u6210', icon: FileIcon },
+    { key: 'paused', label: '\u5DF2\u6682\u505C', icon: FileIcon },
+    { key: 'failed', label: '\u5931\u8D25', icon: FileIcon },
 ]
 
-const DATA_ITEMS: { view: ViewName; label: string; icon: string }[] = [
-  { view: 'history', label: '历史', icon: 'clock' },
-  { view: 'stats', label: '统计', icon: 'chart-bar' },
+const typeItems = [
+    { key: 'video', label: '\u89C6\u9891', icon: VideoIcon },
+    { key: 'audio', label: '\u97F3\u9891', icon: AudioIcon },
+    { key: 'document', label: '\u6587\u6863', icon: DocumentIcon },
+    { key: 'image', label: '\u56FE\u7247', icon: ImageIcon },
+    { key: 'archive', label: '\u538B\u7F29\u5305', icon: ArchiveIcon },
+    { key: 'other', label: '\u5176\u4ED6', icon: AttachmentIcon },
 ]
 
-/* ---- 组件 ---- */
-export default function Sidebar(props: {
-  currentView: ViewName
-  onViewChange: (view: ViewName) => void
-}) {
-  /* -- 状态 -- */
-  const [hovered, setHovered] = createSignal(false)
-  const initialPinned = (() => {
+function loadSidebarState() {
     try {
-      return localStorage.getItem(STORAGE_KEY) === 'true'
-    } catch {
-      return false
-    }
-  })()
-  const [pinned, setPinned] = createSignal(initialPinned)
+        const raw = localStorage.getItem(SIDEBAR_STORAGE_KEY)
+        if (raw) return JSON.parse(raw) as { width: number; pinned: boolean }
+    } catch { /* ignore */ }
+    return { width: DEFAULT_WIDTH, pinned: false }
+}
 
-  let closeTimer: ReturnType<typeof setTimeout> | undefined
-
-  const sidebarVisible = () => pinned() || hovered()
-
-  createEffect(() => {
+function saveSidebarState(w: number, pinned: boolean) {
     try {
-      localStorage.setItem(STORAGE_KEY, String(pinned()))
-    } catch {
-      /* ignore */
+        localStorage.setItem(SIDEBAR_STORAGE_KEY, JSON.stringify({ width: w, pinned }))
+    } catch { /* ignore */ }
+}
+
+export default function Sidebar(props: SidebarProps) {
+    const saved = loadSidebarState()
+    const [width, setWidth] = createSignal(saved.width)
+    const [isPinned, setIsPinned] = createSignal(saved.pinned)
+    const [isHovering, setIsHovering] = createSignal(false)
+    const [isDragging, setIsDragging] = createSignal(false)
+    let hideTimer: number | null = null
+
+    const isExpanded = () => isPinned() || isHovering()
+    const displayWidth = () => isExpanded() ? Math.max(width(), DEFAULT_WIDTH) : MIN_WIDTH
+
+    const showSidebar = () => {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null }
+        setIsHovering(true)
     }
-  })
 
-  /* -- 计时器 -- */
-  function cancelClose() {
-    if (closeTimer !== undefined) {
-      clearTimeout(closeTimer)
-      closeTimer = undefined
+    const hideSidebar = () => {
+        if (isPinned() || isDragging()) return
+        hideTimer = window.setTimeout(() => setIsHovering(false), 300)
     }
-  }
 
-  function startClose() {
-    cancelClose()
-    closeTimer = setTimeout(() => {
-      setHovered(false)
-      closeTimer = undefined
-    }, CLOSE_DELAY)
-  }
+    const handleDragStart = (e: MouseEvent) => {
+        e.preventDefault()
+        setIsDragging(true)
+        const startX = e.clientX
+        const startWidth = width()
 
-  function handleMouseEnter() {
-    cancelClose()
-    setHovered(true)
-  }
+        const handleMove = (ev: MouseEvent) => {
+            const newWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, startWidth + ev.clientX - startX))
+            setWidth(newWidth)
+        }
 
-  function handleMouseLeave() {
-    if (!pinned()) startClose()
-  }
+        const handleUp = () => {
+            setIsDragging(false)
+            saveSidebarState(width(), isPinned())
+            document.removeEventListener('mousemove', handleMove)
+            document.removeEventListener('mouseup', handleUp)
+        }
 
-  function handleBackdropClick() {
-    if (!pinned()) {
-      setHovered(false)
-      cancelClose()
+        document.addEventListener('mousemove', handleMove)
+        document.addEventListener('mouseup', handleUp)
     }
-  }
 
-  function togglePin(e: Event) {
-    e.stopPropagation()
-    setPinned((prev) => !prev)
-  }
-
-  /* -- 导航操作 -- */
-  function handleFilterClick(filter: DownloadFilter) {
-    setCurrentFilter(filter)
-    props.onViewChange('downloads')
-    if (!pinned()) {
-      setHovered(false)
-      cancelClose()
+    const togglePin = () => {
+        const next = !isPinned()
+        setIsPinned(next)
+        if (next && width() < DEFAULT_WIDTH) setWidth(DEFAULT_WIDTH)
+        saveSidebarState(width(), next)
     }
-  }
 
-  function handleNavClick(view: ViewName) {
-    props.onViewChange(view)
-    if (!pinned()) {
-      setHovered(false)
-      cancelClose()
+    const NavItem = (p: { icon: any; label: string; count: number; active: boolean; onClick: () => void }) => {
+        const Icon = p.icon
+        const showText = () => isExpanded()
+        return (
+            <div
+                class={`flex items-center justify-between cursor-pointer select-none ${p.active ? '' : 'hover-light'}`}
+                style={{
+                    height: '36px',
+                    padding: showText() ? '0 12px' : '0',
+                    'border-radius': '8px',
+                    background: p.active ? 'rgba(0,212,170,0.1)' : 'transparent',
+                    'border-left': p.active ? '2px solid #00D4AA' : '2px solid transparent',
+                    color: p.active ? '#00D4AA' : '#A0A0B0',
+                    transition: 'all 200ms ease',
+                    'justify-content': showText() ? 'space-between' : 'center',
+                }}
+                onClick={p.onClick}
+            >
+                <div class="flex items-center min-w-0" style={{ gap: showText() ? '12px' : '0' }}>
+                    <div style={{ width: '20px', height: '20px', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'flex-shrink': 0 }}>
+                        <Icon />
+                    </div>
+                    <Show when={showText()}>
+                        <span class="truncate" style={{ 'font-size': '14px' }}>{p.label}</span>
+                    </Show>
+                </div>
+                <Show when={showText()}>
+                    <span style={{ 'font-size': '12px', color: '#6B7280', 'flex-shrink': 0 }}>{p.count}</span>
+                </Show>
+            </div>
+        )
     }
-  }
 
-  const counts = () => $filterCounts.get()
-  const historyCount = () => historyRecords.length
+    return (
+        <>
+            {/* Edge trigger zone - only when collapsed and not pinned */}
+            <Show when={!isPinned() && !isHovering()}>
+                <div
+                    class="fixed left-0 top-0 bottom-0 z-[5]"
+                    style={{ width: `${EDGE_ZONE_WIDTH}px` }}
+                    onMouseEnter={showSidebar}
+                    onMouseLeave={hideSidebar}
+                />
+            </Show>
 
-  /* -- 渲染 -- */
-  return (
-    <>
-      {/* 8px 隐形触发区 */}
-      <div
-        class="fixed left-0 w-2 z-30"
-        style={{ top: '36px', height: 'calc(100dvh - 36px)' }}
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-      />
-
-      {/* Pin 模式占位（推挤内容区） */}
-      <Show when={pinned()}>
-        <div style={{ width: `${SIDEBAR_WIDTH}px`, 'flex-shrink': '0' }} />
-      </Show>
-
-      {/* 遮罩层（仅 overlay 模式） */}
-      <Show when={sidebarVisible() && !pinned()}>
-        <div
-          class="fixed inset-0 bg-black/50 z-40"
-          style={{ top: '36px' }}
-          onClick={handleBackdropClick}
-        />
-      </Show>
-
-      {/* 侧边栏面板 */}
-      <div
-        class="fixed flex flex-col bg-surface backdrop-blur-xl border-r border-border overflow-hidden z-40"
-        style={{
-          top: '36px',
-          left: '0',
-          width: sidebarVisible() ? `${SIDEBAR_WIDTH}px` : '0',
-          height: 'calc(100dvh - 36px)',
-          'transition-property': 'width',
-          'transition-duration': '250ms',
-          'transition-timing-function': 'cubic-bezier(0.16, 1, 0.3, 1)',
-        }}
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-      >
-        {/* 标题栏 */}
-        <div class="flex items-center justify-between px-3 h-9 border-b border-border shrink-0">
-          <span class="text-[12px] font-bold text-accent tracking-tight whitespace-nowrap overflow-hidden">
-            Tachyon
-          </span>
-          <button
-            class={`${btnIcon} w-5 h-5 shrink-0`}
-            onClick={togglePin}
-            aria-label={pinned() ? '取消固定侧边栏' : '固定侧边栏'}
-            title={pinned() ? '取消固定' : '固定侧边栏'}
-          >
-            <Icon
-              name={pinned() ? 'pause-circle' : 'plus'}
-              class="w-3.5 h-3.5"
-            />
-          </button>
-        </div>
-
-        {/* 导航区域 */}
-        <div class="flex-1 overflow-y-auto py-1">
-          {/* 下载过滤 */}
-          <div class={`px-3 py-1 ${labelCaption}`}>下载</div>
-          <For each={FILTER_ITEMS}>
-            {(item) => (
-              <button
-                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
-                  props.currentView === 'downloads' &&
-                  $currentFilter.get() === item.filter
-                    ? 'text-accent bg-accent-muted'
-                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
-                }`}
-                onClick={() => handleFilterClick(item.filter)}
-                aria-pressed={
-                  props.currentView === 'downloads' &&
-                  $currentFilter.get() === item.filter
-                }
-              >
-                <Show
-                  when={
-                    props.currentView === 'downloads' &&
-                    $currentFilter.get() === item.filter
-                  }
+            {/* Sidebar panel */}
+            <div
+                class="relative flex-shrink-0 h-full overflow-hidden"
+                style={{
+                    width: `${displayWidth()}px`,
+                    transition: isDragging() ? 'none' : 'width 250ms cubic-bezier(0.32, 0.72, 0, 1)',
+                    'will-change': 'width',
+                }}
+                onMouseEnter={showSidebar}
+                onMouseLeave={hideSidebar}
+            >
+                <div
+                    class="h-full flex flex-col"
+                    style={{
+                        width: `${Math.max(displayWidth(), DEFAULT_WIDTH)}px`,
+                        background: '#12121A',
+                        'border-right': '1px solid rgba(255,255,255,0.05)',
+                        'pointer-events': isExpanded() ? 'auto' : 'none',
+                        opacity: isExpanded() ? 1 : 0,
+                        transition: 'opacity 200ms ease',
+                        position: 'absolute',
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                    }}
                 >
-                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
-                </Show>
-                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
-                <span class="flex-1 text-left whitespace-nowrap">
-                  {item.label}
-                </span>
-                <Show when={counts()[item.filter] !== undefined}>
-                  <span class="text-[10px] font-mono text-text-tertiary">
-                    {counts()[item.filter]}
-                  </span>
-                </Show>
-              </button>
-            )}
-          </For>
+                    {/* Pin header */}
+                    <div
+                        class="flex items-center justify-between flex-shrink-0"
+                        style={{
+                            height: '40px',
+                            padding: isExpanded() ? '0 12px' : '0 4px',
+                            'border-bottom': '1px solid rgba(255,255,255,0.05)',
+                        }}
+                    >
+                        <Show when={isExpanded()}>
+                            <span style={{ 'font-size': '11px', 'font-weight': 600, color: '#6B7280', 'letter-spacing': '0.5px' }}>
+                                {'\u5BFC\u822A'}
+                            </span>
+                        </Show>
+                        <button
+                            class="icon-btn-sm"
+                            style={{
+                                color: isPinned() ? '#00D4AA' : '#6B7280',
+                                margin: !isExpanded() ? '0 auto' : '0',
+                            }}
+                            onClick={togglePin}
+                            title={isPinned() ? '\u53D6\u6D88\u56FA\u5B9A' : '\u56FA\u5B9A\u4FA7\u8FB9\u680F'}
+                        >
+                            {isPinned() ? <PinIcon /> : <PinOffIcon />}
+                        </button>
+                    </div>
 
-          <div class="mx-2 my-1.5 h-px bg-border" />
+                    {/* Status section */}
+                    <div class="flex flex-col gap-1" style={{ padding: '8px 6px' }}>
+                        <Show when={isExpanded()}>
+                            <div
+                                style={{
+                                    'font-size': '11px',
+                                    'font-weight': 600,
+                                    color: '#6B7280',
+                                    'text-transform': 'uppercase',
+                                    'letter-spacing': '0.5px',
+                                    padding: '0 8px',
+                                    'margin-bottom': '4px',
+                                }}
+                            >
+                                {'\u72B6\u6001'}
+                            </div>
+                        </Show>
+                        <For each={statusItems}>
+                            {(item) => (
+                                <NavItem
+                                    icon={item.icon}
+                                    label={item.label}
+                                    count={props.taskCounts[item.key]}
+                                    active={props.filter === item.key}
+                                    onClick={() => props.onFilterChange(item.key)}
+                                />
+                            )}
+                        </For>
+                    </div>
 
-          {/* 工具 */}
-          <div class={`px-3 py-1 ${labelCaption}`}>工具</div>
-          <For each={TOOL_ITEMS}>
-            {(item) => (
-              <button
-                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
-                  props.currentView === item.view
-                    ? 'text-accent bg-accent-muted'
-                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
-                }`}
-                onClick={() => handleNavClick(item.view)}
-                aria-pressed={props.currentView === item.view}
-              >
-                <Show when={props.currentView === item.view}>
-                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
-                </Show>
-                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
-                <span class="flex-1 text-left whitespace-nowrap">
-                  {item.label}
-                </span>
-              </button>
-            )}
-          </For>
+                    <div style={{ height: '1px', background: 'rgba(255,255,255,0.05)', margin: '4px 10px' }} />
 
-          <div class="mx-2 my-1.5 h-px bg-border" />
+                    {/* Type section */}
+                    <div class="flex flex-col gap-1" style={{ padding: '8px 6px' }}>
+                        <Show when={isExpanded()}>
+                            <div
+                                style={{
+                                    'font-size': '11px',
+                                    'font-weight': 600,
+                                    color: '#6B7280',
+                                    'text-transform': 'uppercase',
+                                    'letter-spacing': '0.5px',
+                                    padding: '0 8px',
+                                    'margin-bottom': '4px',
+                                }}
+                            >
+                                {'\u5206\u7C7B'}
+                            </div>
+                        </Show>
+                        <For each={typeItems}>
+                            {(item) => (
+                                <NavItem
+                                    icon={item.icon}
+                                    label={item.label}
+                                    count={0}
+                                    active={false}
+                                    onClick={() => { }}
+                                />
+                            )}
+                        </For>
+                    </div>
 
-          {/* 数据 */}
-          <div class={`px-3 py-1 ${labelCaption}`}>数据</div>
-          <For each={DATA_ITEMS}>
-            {(item) => (
-              <button
-                class={`relative w-full flex items-center gap-2.5 px-3 py-1.5 text-[12px] transition-all duration-150 ${
-                  props.currentView === item.view
-                    ? 'text-accent bg-accent-muted'
-                    : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary hover:translate-x-[1px]'
-                }`}
-                onClick={() => handleNavClick(item.view)}
-                aria-pressed={props.currentView === item.view}
-              >
-                <Show when={props.currentView === item.view}>
-                  <div class="absolute left-0 top-1/2 -translate-y-1/2 w-[2px] h-4 bg-accent rounded-full" />
-                </Show>
-                <Icon name={item.icon} class="w-4 h-4 shrink-0" />
-                <span class="flex-1 text-left whitespace-nowrap">
-                  {item.label}
-                </span>
-                <Show when={item.view === 'history' && historyCount() > 0}>
-                  <span class="text-[10px] font-mono text-text-tertiary">
-                    {historyCount()}
-                  </span>
-                </Show>
-              </button>
-            )}
-          </For>
-        </div>
+                    <div style={{ height: '1px', background: 'rgba(255,255,255,0.05)', margin: '4px 10px' }} />
 
-        {/* 底部总速度 */}
-        <div class="px-3 py-2 border-t border-border shrink-0">
-          <div class="flex items-center justify-between text-[10px]">
-            <span class="text-text-tertiary">总速度</span>
-            <span class="font-mono text-accent">
-              {formatSpeed($totalSpeed.get())}
-            </span>
-          </div>
-        </div>
-      </div>
-    </>
-  )
+                    {/* Lab section */}
+                    <div class="flex flex-col gap-1" style={{ padding: '8px 6px' }}>
+                        <Show when={isExpanded()}>
+                            <div
+                                style={{
+                                    'font-size': '11px',
+                                    'font-weight': 600,
+                                    color: '#6B7280',
+                                    'text-transform': 'uppercase',
+                                    'letter-spacing': '0.5px',
+                                    padding: '0 8px',
+                                    'margin-bottom': '4px',
+                                }}
+                            >
+                                {'\u5B9E\u9A8C\u5BA4'}
+                            </div>
+                        </Show>
+                        <NavItem
+                            icon={HistoryIcon}
+                            label={'\u5386\u53F2'}
+                            count={0}
+                            active={false}
+                            onClick={props.onOpenHistory}
+                        />
+                    </div>
+
+                    <div class="flex-1" />
+
+                    {/* Resize handle */}
+                    <div
+                        class="resize-handle absolute right-0 top-0 bottom-0 cursor-col-resize z-10"
+                        style={{
+                            width: '4px',
+                            background: isDragging() ? 'rgba(0,212,170,0.4)' : 'transparent',
+                            transition: 'background 150ms ease',
+                        }}
+                        onMouseDown={handleDragStart}
+                    />
+                </div>
+            </div>
+        </>
+    )
 }
