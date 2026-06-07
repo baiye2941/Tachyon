@@ -4,6 +4,22 @@ use serde::{Deserialize, Serialize};
 
 pub const USER_AGENT: &str = "Tachyon/0.1.0";
 
+/// I/O 存储后端策略
+///
+/// 控制下载写入时使用的文件 I/O 后端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IoStrategy {
+    /// 标准 TokioFile 后端（跨平台稳定路径）
+    #[default]
+    Standard,
+    /// Windows 优化后端（NO_BUFFERING + SEQUENTIAL_SCAN）
+    ///
+    /// 仅在 Windows 上生效；其他平台自动回退到 Standard。
+    /// 要求写入偏移和长度对齐到 512 字节边界。
+    WinAligned,
+}
+
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "DownloadConfigSerde")]
@@ -31,6 +47,9 @@ pub struct DownloadConfig {
     /// 全局下载限速(字节/秒)，None 表示不限速
     #[serde(default)]
     pub rate_limit_bytes_per_sec: Option<u64>,
+    /// I/O 存储后端策略
+    #[serde(default)]
+    pub io_strategy: IoStrategy,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +69,8 @@ struct DownloadConfigSerde {
     authorized_dirs: Option<Vec<String>>,
     #[serde(default)]
     rate_limit_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    io_strategy: IoStrategy,
 }
 
 fn default_pause_timeout_secs() -> u64 {
@@ -77,6 +98,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             pause_timeout_secs: value.pause_timeout_secs,
             rate_limit_bytes_per_sec: value.rate_limit_bytes_per_sec,
             authorized_dirs,
+            io_strategy: value.io_strategy,
         }
     }
 }
@@ -98,6 +120,7 @@ impl Default for DownloadConfig {
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
             authorized_dirs: vec![download_dir],
+            io_strategy: IoStrategy::default(),
         }
     }
 }
@@ -363,5 +386,62 @@ mod tests {
             deserialized.default_target_fragments,
             config.default_target_fragments
         );
+    }
+
+    #[test]
+    fn test_io_strategy_default_is_standard() {
+        assert_eq!(IoStrategy::default(), IoStrategy::Standard);
+    }
+
+    #[test]
+    fn test_io_strategy_serialization_roundtrip() {
+        for strategy in [IoStrategy::Standard, IoStrategy::WinAligned] {
+            let json = serde_json::to_string(&strategy).unwrap();
+            let deserialized: IoStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, strategy);
+        }
+    }
+
+    #[test]
+    fn test_io_strategy_deserializes_from_json() {
+        assert_eq!(
+            serde_json::from_str::<IoStrategy>("\"standard\"").unwrap(),
+            IoStrategy::Standard
+        );
+        assert_eq!(
+            serde_json::from_str::<IoStrategy>("\"winAligned\"").unwrap(),
+            IoStrategy::WinAligned
+        );
+    }
+
+    #[test]
+    fn test_download_config_io_strategy_defaults_to_standard() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.io_strategy, IoStrategy::Standard);
+    }
+
+    #[test]
+    fn test_download_config_io_strategy_from_json() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "ioStrategy":"winAligned"
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.io_strategy, IoStrategy::WinAligned);
     }
 }

@@ -45,11 +45,12 @@ impl<S: AsyncStorage> WritePipeline<S> {
         self
     }
 
-    /// 将数据写入指定偏移位置
+    /// 通过缓冲管道写入指定偏移位置
     ///
     /// 通过信号量获取许可后写入,实现反压控制。
     /// 当许可耗尽时(磁盘慢,写入未完成),此方法会阻塞。
-    /// 直接传递 Bytes 引用,避免 BufferPool 的无效 alloc/dealloc 和额外拷贝。
+    /// 内部使用 `Bytes::copy_from_slice()` 创建独立缓冲区,
+    /// 与 `spawn_blocking` + `FileExt` 的 ownership 模型兼容性最佳。
     pub async fn write(&self, offset: u64, data: &[u8]) -> DownloadResult<usize> {
         let _permit = self
             .semaphore
@@ -61,6 +62,12 @@ impl<S: AsyncStorage> WritePipeline<S> {
             .await
     }
 
+    /// 通过 Bytes 引用写入指定偏移位置
+    ///
+    /// 使用 `Bytes::clone()` (refcount bump) 避免数据拷贝。
+    /// 适用于已持有 `Bytes` 且不需要独立缓冲区的场景。
+    /// 注意:在 `spawn_blocking` + `FileExt` 后端下,此路径可能比 `write()` 略慢,
+    /// 因为共享引用的 Arc 开销。在零拷贝后端(io_uring)下收益更明显。
     pub async fn write_bytes(&self, offset: u64, data: &Bytes) -> DownloadResult<usize> {
         let _permit = self
             .semaphore

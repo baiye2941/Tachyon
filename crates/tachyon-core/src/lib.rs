@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // 重新导出核心类型
 pub use config::AppConfig;
+pub use config::IoStrategy;
 pub use config::SchedulerConfig;
 pub use config::USER_AGENT;
 pub use error::{DownloadError, DownloadResult};
@@ -189,6 +190,7 @@ fn app_config() {
         pause_timeout_secs: 300,
         rate_limit_bytes_per_sec: None,
         authorized_dirs: vec!["/tmp/test".to_string()],
+        io_strategy: config::IoStrategy::default(),
     };
     assert_eq!(cfg.download_dir, "/tmp/test");
     assert_eq!(cfg.max_concurrent_fragments, 8);

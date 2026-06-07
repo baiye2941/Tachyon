@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -24,8 +24,8 @@ use tachyon_core::traits::{DownloadScheduler, Protocol, Verifier};
 use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use tachyon_crypto::CpuVerifier;
-use tachyon_io::TokioFile;
 use tachyon_io::storage::AsyncStorage;
+use tachyon_io::{TokioFile, WinFile};
 use tachyon_protocol::http::HttpClient;
 use tachyon_scheduler::AdaptiveDownloadScheduler;
 
@@ -127,6 +127,35 @@ impl DynStorage {
     async fn open(path: &std::path::Path) -> DownloadResult<Self> {
         let storage = TokioFile::open(path).await?;
         Ok(Self::new(storage))
+    }
+
+    /// 根据 I/O 策略打开存储后端
+    ///
+    /// - `Standard`: TokioFile（跨平台稳定路径）
+    /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
+    async fn open_with_strategy(
+        path: &std::path::Path,
+        strategy: tachyon_core::config::IoStrategy,
+    ) -> DownloadResult<Self> {
+        match strategy {
+            tachyon_core::config::IoStrategy::Standard => Self::open(path).await,
+            tachyon_core::config::IoStrategy::WinAligned => {
+                #[cfg(target_os = "windows")]
+                {
+                    tracing::info!(path = %path.display(), "使用 WinFile NO_BUFFERING 后端");
+                    let storage = WinFile::open_optimized(path).await?;
+                    Ok(Self::new(storage))
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "WinAligned 策略在非 Windows 平台不可用,回退到 Standard"
+                    );
+                    Self::open(path).await
+                }
+            }
+        }
     }
 
     /// 写入数据到指定偏移
@@ -650,10 +679,12 @@ impl DownloadTask {
         info!(
             safe_name = %safe_name,
             save_path = %canonical_path.display(),
+            io_strategy = ?self.config.io_strategy,
             "路径安全校验通过,创建存储"
         );
 
-        let storage = DynStorage::open(&canonical_path).await?;
+        let storage =
+            DynStorage::open_with_strategy(&canonical_path, self.config.io_strategy).await?;
         self.storage = Some(Arc::new(storage));
         Ok(())
     }
@@ -935,23 +966,20 @@ impl DownloadTask {
             self.fragments[frag_index as usize].start_download();
 
             let handle = tokio::spawn(async move {
-                // 信号量获取移入 spawn 内部:分片任务立即启动,
-                // 仅在需要实际占用并发槽位时才等待
-                let permit = match frag_semaphore.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Err((
-                            frag_index,
-                            DownloadError::Other(format!("信号量获取失败: {e}").into()),
-                        ));
-                    }
-                };
-
                 // spawn 内部重试循环:单次尝试失败后指数退避重试,
                 // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
                 let mut attempt: u32 = 0;
                 loop {
-                    match Self::download_single_fragment(
+                    let permit = match frag_semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Err((
+                                frag_index,
+                                DownloadError::Other(format!("信号量获取失败: {e}").into()),
+                            ));
+                        }
+                    };
+                    let result = Self::download_single_fragment(
                         &frag_protocol,
                         &frag_storage,
                         &frag_pool,
@@ -965,25 +993,23 @@ impl DownloadTask {
                         &frag_control_rx,
                         &frag_progress_tx,
                     )
-                    .await
-                    {
+                    .await;
+                    drop(permit);
+
+                    match result {
                         Ok((downloaded, duration)) => {
-                            drop(permit);
                             return Ok((frag_index, downloaded, duration));
                         }
                         Err(e) => {
                             // 取消/暂停超时等控制类错误不重试,直接上报
                             if matches!(e, DownloadError::Cancelled | DownloadError::Timeout(_)) {
-                                drop(permit);
                                 return Err((frag_index, e));
                             }
                             // 权限错误(401/403)重试无意义,立即终止该分片
                             if matches!(e, DownloadError::Forbidden { .. }) {
-                                drop(permit);
                                 return Err((frag_index, e));
                             }
                             if attempt >= max_retries {
-                                drop(permit);
                                 return Err((frag_index, e));
                             }
                             // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
@@ -1050,10 +1076,41 @@ impl DownloadTask {
             }
         }
 
-        self.storage.as_ref().unwrap().sync().await?;
+        storage.sync().await?;
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");
         Ok(())
+    }
+
+    async fn write_all_at(
+        storage: &StorageKind,
+        mut pos: u64,
+        mut batch: Bytes,
+    ) -> DownloadResult<u64> {
+        let mut total_written = 0u64;
+        while !batch.is_empty() {
+            let written = storage.write_at(pos, batch.clone()).await?;
+            if written == 0 {
+                return Err(DownloadError::Fragment(format!(
+                    "存储短写未前进: offset={pos}, remaining={}",
+                    batch.len()
+                )));
+            }
+            let written_u64 = u64::try_from(written)
+                .map_err(|_| DownloadError::Fragment("存储写入长度溢出".into()))?;
+            pos = pos.checked_add(written_u64).ok_or_else(|| {
+                DownloadError::Fragment(format!(
+                    "存储写入偏移溢出: offset={pos}, len={written_u64}"
+                ))
+            })?;
+            total_written = total_written.checked_add(written_u64).ok_or_else(|| {
+                DownloadError::Fragment(format!(
+                    "存储写入总长度溢出: written={total_written}, len={written_u64}"
+                ))
+            })?;
+            batch.advance(written);
+        }
+        Ok(total_written)
     }
 
     /// 下载单个分片(一次尝试)
@@ -1111,6 +1168,12 @@ impl DownloadTask {
                 .await?
         };
 
+        let expected_len = frag_end
+            .checked_sub(frag_start)
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| {
+                DownloadError::Fragment(format!("分片范围非法: {frag_start}..={frag_end}"))
+            })?;
         let mut pos = frag_start;
         let mut total_written: u64 = 0;
         let mut chunk_count: u64 = 0;
@@ -1128,9 +1191,24 @@ impl DownloadTask {
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 let batch = write_buf.split().freeze();
-                let written = storage.write_at(pos, batch).await?;
-                let w = written as u64;
-                pos += w;
+                let batch_len = u64::try_from(batch.len())
+                    .map_err(|_| DownloadError::Fragment("分片批量写入长度溢出".into()))?;
+                let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
+                    DownloadError::Fragment(format!(
+                        "分片写入长度溢出: index={frag_index}, written={total_written}, len={batch_len}"
+                    ))
+                })?;
+                if attempted_written > expected_len {
+                    return Err(DownloadError::Fragment(format!(
+                        "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
+                    )));
+                }
+                let w = Self::write_all_at(storage, pos, batch).await?;
+                pos = pos.checked_add(w).ok_or_else(|| {
+                    DownloadError::Fragment(format!(
+                        "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
+                    ))
+                })?;
                 total_written += w;
                 if let Some(tx) = progress_tx
                     && chunk_count.is_multiple_of(5)
@@ -1147,9 +1225,26 @@ impl DownloadTask {
         // 刷写剩余数据
         if !write_buf.is_empty() {
             let batch = write_buf.freeze();
-            let written = storage.write_at(pos, batch).await?;
-            let w = written as u64;
+            let batch_len = u64::try_from(batch.len())
+                .map_err(|_| DownloadError::Fragment("分片剩余写入长度溢出".into()))?;
+            let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
+                DownloadError::Fragment(format!(
+                    "分片写入长度溢出: index={frag_index}, written={total_written}, len={batch_len}"
+                ))
+            })?;
+            if attempted_written > expected_len {
+                return Err(DownloadError::Fragment(format!(
+                    "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
+                )));
+            }
+            let w = Self::write_all_at(storage, pos, batch).await?;
             total_written += w;
+        }
+
+        if total_written != expected_len {
+            return Err(DownloadError::Fragment(format!(
+                "分片下载数据不完整: index={frag_index}, 预期 {expected_len} 字节, 实际写入 {total_written} 字节"
+            )));
         }
 
         let elapsed = start_instant.elapsed();
@@ -1607,6 +1702,290 @@ mod tests {
             &frag_b[..]
         );
         assert_eq!(&buf[2 * frag_size as usize..], &frag_c[..]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_fragmented_download_short_range_stream_errors() {
+        let frag_size = 128u64;
+        let total_size = frag_size * 2;
+
+        let meta = FileMetadata {
+            file_name: "short-frag.bin".into(),
+            file_size: Some(total_size),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        };
+
+        let frag_a = Bytes::from(vec![0x11; frag_size as usize]);
+        let short_frag_b = Bytes::from(vec![0x22; frag_size as usize - 1]);
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_range_data(0, frag_size - 1, frag_a)
+                .with_range_data(frag_size, total_size - 1, short_frag_b),
+        );
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/short-frag.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(
+            result.is_err(),
+            "分片流返回字节少于分片大小时必须报错，不能误判为成功"
+        );
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_execute_fragmented_download_overlong_range_stream_errors() {
+        let frag_size = 128u64;
+        let total_size = frag_size * 2;
+
+        let meta = FileMetadata {
+            file_name: "overlong-frag.bin".into(),
+            file_size: Some(total_size),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        };
+
+        let overlong_frag_a = Bytes::from(vec![0x11; frag_size as usize + 1]);
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_range_data(0, frag_size - 1, overlong_frag_a));
+        let memory = MemStorage::with_capacity(total_size as usize + 1);
+        let storage = StorageKind::new(AsyncMemWrapper(memory.clone()));
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/overlong-frag.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(
+            result.is_err(),
+            "分片流返回字节多于分片大小时必须报错，不能误判为成功"
+        );
+        assert_eq!(task.state(), DownloadState::Failed);
+        let data = memory.get_data();
+        assert_eq!(
+            data[frag_size as usize], 0,
+            "超长分片失败前不得写入下一个分片的首字节"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_fragmented_download_overlong_batch_flush_does_not_cross_boundary() {
+        let frag_size = 256 * 1024 - 1;
+        let total_size = frag_size * 2;
+
+        let meta = FileMetadata {
+            file_name: "overlong-batch-frag.bin".into(),
+            file_size: Some(total_size),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        };
+
+        let overlong_frag_a = Bytes::from(vec![0x33; frag_size as usize + 1]);
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_range_data(0, frag_size - 1, overlong_frag_a));
+        let memory = MemStorage::with_capacity(total_size as usize + 1);
+        let storage = StorageKind::new(AsyncMemWrapper(memory.clone()));
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/overlong-batch-frag.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(result.is_err(), "分片批量刷写越界时必须在写入前报错");
+        assert_eq!(task.state(), DownloadState::Failed);
+        let data = memory.get_data();
+        assert_eq!(
+            data[frag_size as usize], 0,
+            "批量刷写失败前不得写入下一个分片的首字节"
+        );
+    }
+
+    #[derive(Clone)]
+    struct ShortWriteStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        max_write_len: usize,
+    }
+
+    impl ShortWriteStorage {
+        fn with_capacity(capacity: usize, max_write_len: usize) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0; capacity])),
+                max_write_len,
+            }
+        }
+
+        fn data(&self) -> Vec<u8> {
+            self.data.lock().unwrap().clone()
+        }
+    }
+
+    impl AsyncStorage for ShortWriteStorage {
+        async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
+            let len = data.len().min(self.max_write_len);
+            let start = offset as usize;
+            let end = start + len;
+            let mut buf = self.data.lock().unwrap();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[start..end].copy_from_slice(&data[..len]);
+            Ok(len)
+        }
+
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
+            let data = self.data.lock().unwrap();
+            let start = offset as usize;
+            let available = data.len().saturating_sub(start);
+            let to_read = buf.len().min(available);
+            if to_read > 0 {
+                buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+            }
+            Ok(to_read)
+        }
+
+        async fn sync(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+
+        async fn allocate(&self, size: u64) -> DownloadResult<()> {
+            let mut data = self.data.lock().unwrap();
+            data.resize(size as usize, 0);
+            Ok(())
+        }
+
+        async fn file_size(&self) -> DownloadResult<u64> {
+            Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        async fn close(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_fragmented_download_handles_storage_short_writes() {
+        let frag_size = 128u64;
+        let total_size = frag_size * 2;
+        let first = Bytes::from(vec![0x44; frag_size as usize]);
+        let second = Bytes::from(vec![0x55; frag_size as usize]);
+
+        let meta = FileMetadata {
+            file_name: "short-write.bin".into(),
+            file_size: Some(total_size),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_range_data(0, frag_size - 1, first.clone())
+                .with_range_data(frag_size, total_size - 1, second.clone()),
+        );
+        let short_storage = ShortWriteStorage::with_capacity(total_size as usize, 17);
+        let storage = StorageKind::new(short_storage.clone());
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/short-write.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator =
+            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        task.execute()
+            .await
+            .expect("短写存储应通过循环补写完成分片");
+        assert_eq!(task.state(), DownloadState::Completed);
+        let data = short_storage.data();
+        assert_eq!(&data[..frag_size as usize], &first[..]);
+        assert_eq!(&data[frag_size as usize..], &second[..]);
     }
 
     /// 不支持 Range 请求时使用整块下载
@@ -2142,8 +2521,7 @@ mod tests {
     async fn test_fragment_retry_resilience() {
         struct FailOnceProtocol {
             meta: FileMetadata,
-            data: Bytes,
-            fail_count: AtomicU32,
+            fail_count: Arc<AtomicU32>,
             max_failures: u32,
         }
 
@@ -2151,8 +2529,7 @@ mod tests {
             fn clone(&self) -> Self {
                 Self {
                     meta: self.meta.clone(),
-                    data: self.data.clone(),
-                    fail_count: AtomicU32::new(self.fail_count.load(AtomicOrdering::SeqCst)),
+                    fail_count: Arc::clone(&self.fail_count),
                     max_failures: self.max_failures,
                 }
             }
@@ -2172,18 +2549,17 @@ mod tests {
             fn download_range(
                 &self,
                 _url: &str,
-                _start: u64,
-                _end: u64,
+                start: u64,
+                end: u64,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
                 let count = self.fail_count.fetch_add(1, AtomicOrdering::SeqCst);
-                let data = self.data.clone();
                 let max_f = self.max_failures;
                 Box::pin(async move {
                     if count < max_f {
                         Err(DownloadError::Network(format!("模拟故障 #{}", count)))
                     } else {
-                        Ok(data)
+                        Ok(Bytes::from(vec![0xBB; (end - start + 1) as usize]))
                     }
                 })
             }
@@ -2209,13 +2585,12 @@ mod tests {
                 _url: &str,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
-                let data = self.data.clone();
-                Box::pin(async move { Ok(data) })
+                let size = self.meta.file_size.unwrap_or(0) as usize;
+                Box::pin(async move { Ok(Bytes::from(vec![0xBB; size])) })
             }
         }
 
         let total_size = 400u64;
-        let frag_data = Bytes::from(vec![0xBB; total_size as usize]);
 
         // 使用小分片配置确保产生多个分片
         let sched_config = tachyon_core::config::SchedulerConfig {
@@ -2226,11 +2601,10 @@ mod tests {
             ..Default::default()
         };
 
-        // 第一次协议:前 2 次调用失败(模拟并发分片场景中部分分片失败)
+        // 第一次协议:前 2 次调用失败；禁用任务内重试以模拟用户重新启动前的失败场景。
         let protocol1: Arc<dyn Protocol> = Arc::new(FailOnceProtocol {
             meta: test_metadata("retry.bin", total_size),
-            data: frag_data.clone(),
-            fail_count: AtomicU32::new(0),
+            fail_count: Arc::new(AtomicU32::new(0)),
             max_failures: 2,
         });
 
@@ -2238,6 +2612,7 @@ mod tests {
         let mut task1 = DownloadTask::new_for_test(
             "http://example.com/retry.bin".into(),
             DownloadConfig {
+                max_retries: 0,
                 verify_checksum: false,
                 ..test_config()
             },
@@ -2262,8 +2637,7 @@ mod tests {
         // 第二次协议:所有调用都成功(模拟重试)
         let protocol2: Arc<dyn Protocol> = Arc::new(FailOnceProtocol {
             meta: test_metadata("retry.bin", total_size),
-            data: frag_data.clone(),
-            fail_count: AtomicU32::new(0),
+            fail_count: Arc::new(AtomicU32::new(0)),
             max_failures: 0, // 不失败
         });
 
@@ -3185,6 +3559,30 @@ mod tests {
             attempts.load(AtomicOrdering::SeqCst),
             2,
             "限流分片应被尝试 2 次(首次限流 + 重试成功)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_with_strategy_standard() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage =
+            DynStorage::open_with_strategy(tmp.path(), tachyon_core::config::IoStrategy::Standard)
+                .await;
+        assert!(storage.is_ok(), "Standard 策略应成功打开存储");
+    }
+
+    #[tokio::test]
+    async fn test_open_with_strategy_win_aligned_fallback_on_non_windows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(
+            tmp.path(),
+            tachyon_core::config::IoStrategy::WinAligned,
+        )
+        .await;
+        // 非 Windows 平台应回退到 Standard 并成功
+        assert!(
+            storage.is_ok(),
+            "WinAligned 在非 Windows 平台应回退到 Standard"
         );
     }
 }

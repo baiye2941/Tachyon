@@ -122,6 +122,10 @@ harness = false
 name = "hex_encode"
 harness = false
 
+[[bench]]
+name = "write_pipeline"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true

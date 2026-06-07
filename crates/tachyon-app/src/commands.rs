@@ -1449,7 +1449,7 @@ async fn update_config_inner(state: &AppState, config: AppConfig) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tachyon_core::config::USER_AGENT;
+    use tachyon_core::config::{IoStrategy, USER_AGENT};
     use tachyon_core::filename::parse_content_disposition;
 
     /// 创建临时测试路径，在所有平台上均有效
@@ -1481,6 +1481,7 @@ mod tests {
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec![download_dir.to_string()],
+                io_strategy: IoStrategy::default(),
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host,
@@ -1754,6 +1755,7 @@ mod tests {
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec![dl_dir_str.clone()],
+                io_strategy: IoStrategy::default(),
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host: 8,
@@ -2079,6 +2081,7 @@ mod tests {
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
                 authorized_dirs: vec!["/tmp".to_string()],
+                io_strategy: IoStrategy::default(),
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host: 4,

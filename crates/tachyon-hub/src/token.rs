@@ -44,9 +44,59 @@ pub fn hf_endpoint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvSnapshot {
+        key: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn isolate_token_fallbacks() -> Vec<EnvSnapshot> {
+        let snapshots = vec![
+            EnvSnapshot::capture("HF_TOKEN"),
+            EnvSnapshot::capture("HUGGINGFACE_HUB_TOKEN"),
+            EnvSnapshot::capture("HOME"),
+            EnvSnapshot::capture("USERPROFILE"),
+        ];
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_TOKEN") };
+        let isolated_home =
+            std::env::temp_dir().join(format!("tachyon-hub-token-test-{}", std::process::id()));
+        unsafe { std::env::set_var("HOME", isolated_home) };
+        unsafe { std::env::remove_var("USERPROFILE") };
+        snapshots
+    }
 
     #[test]
     fn test_load_token_from_env() {
+        let _guard = env_lock();
+        let _env = isolate_token_fallbacks();
         unsafe { std::env::set_var("HF_TOKEN", "hf_test_token_123") };
         let result = load_token();
         unsafe { std::env::remove_var("HF_TOKEN") };
@@ -55,6 +105,8 @@ mod tests {
 
     #[test]
     fn test_load_token_empty_env_returns_none() {
+        let _guard = env_lock();
+        let _env = isolate_token_fallbacks();
         unsafe { std::env::set_var("HF_TOKEN", "") };
         let result = load_token();
         unsafe { std::env::remove_var("HF_TOKEN") };
@@ -63,12 +115,16 @@ mod tests {
 
     #[test]
     fn test_hf_endpoint_default() {
+        let _guard = env_lock();
+        let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         assert_eq!(hf_endpoint(), "https://huggingface.co");
     }
 
     #[test]
     fn test_hf_endpoint_custom() {
+        let _guard = env_lock();
+        let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
         unsafe { std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com") };
         assert_eq!(hf_endpoint(), "https://hf-mirror.com");
         unsafe { std::env::remove_var("HF_ENDPOINT") };

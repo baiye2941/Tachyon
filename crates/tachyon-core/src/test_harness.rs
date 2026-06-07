@@ -10,7 +10,7 @@ pub mod harness {
 
     use std::pin::Pin;
 
-    use crate::config::DownloadConfig;
+    use crate::config::{DownloadConfig, IoStrategy};
     use crate::error::{DownloadError, DownloadResult};
     use crate::traits::{Protocol, Storage};
     use crate::types::{FileMetadata, FragmentInfo, TaskId};
@@ -249,6 +249,7 @@ pub mod harness {
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
             authorized_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            io_strategy: IoStrategy::default(),
         }
     }
 

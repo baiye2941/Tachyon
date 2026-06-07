@@ -44,10 +44,10 @@ pub fn parse_lfs_pointer(data: &[u8]) -> Option<LfsPointer> {
     for line in text.lines() {
         if let Some(hash) = line.strip_prefix("oid sha256:") {
             oid = Some(hash.trim().to_string());
-        } else if let Some(s) = line.strip_prefix("size ") {
-            if let Ok(n) = s.trim().parse::<u64>() {
-                size = Some(n);
-            }
+        } else if let Some(s) = line.strip_prefix("size ")
+            && let Ok(n) = s.trim().parse::<u64>()
+        {
+            size = Some(n);
         }
     }
 

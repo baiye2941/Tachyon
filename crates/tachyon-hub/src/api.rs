@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 use tachyon_core::DownloadResult;
+use tachyon_protocol::HttpClient;
 
 use crate::lfs;
 use crate::token;
@@ -35,6 +36,11 @@ pub struct HfLfsInfo {
 pub struct HubApi {
     endpoint: String,
     token: Option<String>,
+    http: HttpClient,
+}
+
+fn new_http_client() -> HttpClient {
+    HttpClient::new().expect("创建 Hub HTTP 客户端失败")
 }
 
 impl HubApi {
@@ -43,6 +49,7 @@ impl HubApi {
         Self {
             endpoint: token::hf_endpoint(),
             token: token::load_token(),
+            http: new_http_client(),
         }
     }
 
@@ -51,6 +58,7 @@ impl HubApi {
         Self {
             endpoint,
             token: token::load_token(),
+            http: new_http_client(),
         }
     }
 
@@ -71,8 +79,11 @@ impl HubApi {
         let url = lfs::build_tree_url(&self.endpoint, repo_id, revision);
         tracing::info!(url = %url, "获取 HF 仓库文件树");
 
-        let client = reqwest::Client::new();
-        let mut req = client.get(&url).header("User-Agent", "tachyon-hub/0.1.0");
+        let mut req = self
+            .http
+            .inner()
+            .get(&url)
+            .header("User-Agent", "tachyon-hub/0.1.0");
 
         if let Some(ref token) = self.token {
             req = req.header("Authorization", format!("Bearer {token}"));
@@ -93,8 +104,8 @@ impl HubApi {
         let body = resp.text().await.map_err(|e| {
             tachyon_core::DownloadError::Network(format!("读取 HF API 响应失败: {e}"))
         })?;
-        let files: Vec<HfFile> = serde_json::from_str(&body)
-            .map_err(|e| tachyon_core::DownloadError::Serialization(e.into()))?;
+        let files: Vec<HfFile> =
+            serde_json::from_str(&body).map_err(tachyon_core::DownloadError::Serialization)?;
 
         tracing::info!(count = files.len(), repo_id = %repo_id, "获取文件列表成功");
         Ok(files)
