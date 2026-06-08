@@ -1,6 +1,6 @@
 # Tachyon
 
-> 基于 Rust + Tauri 构建的新一代超高性能下载器。
+> 基于 Rust + Tauri 构建的高性能下载器。
 
 ## 核心能力
 
