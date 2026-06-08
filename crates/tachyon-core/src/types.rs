@@ -88,34 +88,41 @@ pub struct PauseInfo {
     pub max_duration_secs: u64,
 }
 
+/// 获取当前 UNIX 时间戳(秒)。
+///
+/// Miri 隔离模式下 `clock_gettime` 不可用，返回确定性默认值以确保测试可运行。
+#[cfg(not(miri))]
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(miri)]
+fn now_unix_secs() -> u64 {
+    // Miri 隔离模式: 返回一个固定的"当前"时间戳 (2024-01-01T00:00:00 UTC)
+    1_704_067_200
+}
+
 impl PauseInfo {
     /// 创建新的暂停信息
     pub fn new(max_duration_secs: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         Self {
-            paused_at_secs: now,
+            paused_at_secs: now_unix_secs(),
             max_duration_secs,
         }
     }
 
     /// 暂停是否已超时
     pub fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_unix_secs();
         now.saturating_sub(self.paused_at_secs) >= self.max_duration_secs
     }
 
     /// 剩余暂停时间(秒)，超时返回 0
     pub fn remaining_secs(&self) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_unix_secs();
         let elapsed = now.saturating_sub(self.paused_at_secs);
         self.max_duration_secs.saturating_sub(elapsed)
     }
