@@ -52,17 +52,6 @@ cd frontend && bun install && bun run dev
 cargo tauri dev
 ```
 
-### AI 辅助开发(可选)
-
-本项目包含 Claude Code 智能体配置,提供 Rust 代码审查、TDD 引导、架构设计等 AI 辅助能力:
-
-```bash
-# 安装 Claude Code 后,进入项目目录即可自动加载配置
-claude
-```
-
-`.claude/` 目录中的技能(skills)和智能体(agents)会自动注入至 AI 会话,提供 Rust 模式检查、性能审查、测试策略指导等上下文。
-
 ## 架构
 
 ### 分层架构
@@ -109,7 +98,6 @@ Tachyon/
   Cargo.toml              # workspace 根配置
   LICENSE                 # MIT 许可证
   README.md               # 项目说明(本文件)
-  .claude/                # AI 辅助配置(skills + agents)
   crates/
     tachyon-core/              # 核心类型与 trait 定义
     tachyon-engine/            # 分片引擎与连接管理
