@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod filename;
+pub mod rate_limit;
 pub mod test_harness;
 pub mod traits;
 pub mod types;

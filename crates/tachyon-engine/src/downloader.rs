@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use tachyon_core::config::DownloadConfig;
+use tachyon_core::rate_limit::RateLimiter;
 use tachyon_core::traits::{DownloadScheduler, Protocol, Verifier};
 use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
@@ -39,6 +40,10 @@ pub fn default_blake3_verifier() -> VerifierKind {
 }
 
 pub type StorageKind = DynStorage;
+
+type FragmentTaskOk = (u32, u64, Duration);
+type FragmentTaskErr = (u32, DownloadError);
+type FragmentTaskResult = Result<FragmentTaskOk, FragmentTaskErr>;
 
 use crate::connection::ConnectionPool;
 use crate::fragment::FragmentRecord;
@@ -133,6 +138,7 @@ impl DynStorage {
     ///
     /// - `Standard`: TokioFile（跨平台稳定路径）
     /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
+    /// - `Iocp`: IOCP 异步后端（仅 Windows；其他平台回退到 Standard）
     async fn open_with_strategy(
         path: &std::path::Path,
         strategy: tachyon_core::config::IoStrategy,
@@ -151,6 +157,32 @@ impl DynStorage {
                     tracing::warn!(
                         path = %path.display(),
                         "WinAligned 策略在非 Windows 平台不可用,回退到 Standard"
+                    );
+                    Self::open(path).await
+                }
+            }
+            tachyon_core::config::IoStrategy::Iocp => {
+                #[cfg(target_os = "windows")]
+                {
+                    tracing::info!(path = %path.display(), "使用 IOCP 后端");
+                    let mut storage = tachyon_io::IoCpStorage::new(path);
+                    match storage.init() {
+                        Ok(()) => Ok(Self::new(storage)),
+                        Err(error) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %error,
+                                "IOCP 后端初始化失败,回退到 Standard"
+                            );
+                            Self::open(path).await
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Iocp 策略在非 Windows 平台不可用,回退到 Standard"
                     );
                     Self::open(path).await
                 }
@@ -827,6 +859,13 @@ impl DownloadTask {
         };
         let start_instant = std::time::Instant::now();
 
+        // 创建限速器(如配置了速率限制)
+        let rate_limiter: Option<Arc<RateLimiter>> = self
+            .config
+            .rate_limit_bytes_per_sec
+            .filter(|&bps| bps > 0)
+            .map(|bps| Arc::new(RateLimiter::new(bps)));
+
         // 获取流式响应(控制信号可在建立连接阶段中断)
         let stream = if let Some(rx) = self.control_rx.as_mut() {
             tokio::select! {
@@ -855,6 +894,10 @@ impl DownloadTask {
             let chunk = chunk_result?;
             let written = storage.write_at(pos, chunk).await?;
             pos += written as u64;
+            // 实时令牌桶限速
+            if let Some(ref limiter) = rate_limiter {
+                limiter.acquire(written as u64).await;
+            }
         }
         debug!(written = pos, "整块流式下载写入完成");
 
@@ -930,16 +973,18 @@ impl DownloadTask {
         let control_rx = self.control_rx.clone();
         let progress_tx = self.progress_tx.clone();
         let max_retries = self.config.max_retries;
+        let rate_limiter: Option<Arc<RateLimiter>> = self
+            .config
+            .rate_limit_bytes_per_sec
+            .filter(|&bps| bps > 0)
+            .map(|bps| Arc::new(RateLimiter::new(bps)));
         tracing::info!(
             has_progress_tx = progress_tx.is_some(),
             frag_count = self.fragments.len(),
             "分片下载准备就绪"
         );
 
-        // spawn 成功返回 (index, downloaded, duration);失败返回 (index, error)
-        type FragOk = (u32, u64, Duration);
-        type FragErr = (u32, DownloadError);
-        let mut handles: Vec<JoinHandle<Result<FragOk, FragErr>>> = Vec::new();
+        let mut handles: JoinSet<FragmentTaskResult> = JoinSet::new();
 
         // 仅对未完成(Pending)的分片下载,已完成分片(断点续传)跳过
         let fragment_specs: Vec<(u32, u64, u64)> = self
@@ -956,7 +1001,7 @@ impl DownloadTask {
             let frag_semaphore = semaphore.clone();
             let frag_pool = pool.clone();
             let frag_host = host.clone();
-            let rate_limit_bps = self.config.rate_limit_bytes_per_sec;
+            let frag_limiter = rate_limiter.clone();
             let frag_control_rx = control_rx.clone();
             let frag_progress_tx = progress_tx.clone();
 
@@ -965,7 +1010,7 @@ impl DownloadTask {
             }
             self.fragments[frag_index as usize].start_download();
 
-            let handle = tokio::spawn(async move {
+            handles.spawn(async move {
                 // spawn 内部重试循环:单次尝试失败后指数退避重试,
                 // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
                 let mut attempt: u32 = 0;
@@ -989,7 +1034,7 @@ impl DownloadTask {
                         frag_start,
                         frag_end,
                         pause_timeout,
-                        rate_limit_bps,
+                        frag_limiter.clone(),
                         &frag_control_rx,
                         &frag_progress_tx,
                     )
@@ -1034,18 +1079,24 @@ impl DownloadTask {
                     }
                 }
             });
-
-            handles.push(handle);
         }
 
-        for handle in handles {
-            let result = handle
-                .await
-                .map_err(|e| DownloadError::Other(format!("分片任务 panic: {e}").into()))?;
+        while let Some(joined) = handles.join_next().await {
+            let result = match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    Self::abort_remaining_fragment_tasks(&mut handles).await;
+                    self.state = DownloadState::Failed;
+                    return Err(DownloadError::Other(
+                        format!("分片任务 panic: {error}").into(),
+                    ));
+                }
+            };
 
             let (index, downloaded, duration) = match result {
                 Ok(ok) => ok,
                 Err((failed_index, e)) => {
+                    Self::abort_remaining_fragment_tasks(&mut handles).await;
                     // spawn 内部已耗尽重试,这里精确标记真正失败的分片为终态
                     if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
                         frag.force_fail();
@@ -1082,14 +1133,38 @@ impl DownloadTask {
         Ok(())
     }
 
+    async fn abort_remaining_fragment_tasks(handles: &mut JoinSet<FragmentTaskResult>) {
+        handles.abort_all();
+        while let Some(joined) = handles.join_next().await {
+            if let Err(error) = joined
+                && !error.is_cancelled()
+            {
+                warn!(error = %error, "分片任务 abort 后异常结束");
+            }
+        }
+    }
+
     async fn write_all_at(
         storage: &StorageKind,
         mut pos: u64,
         mut batch: Bytes,
+        control_rx: &mut Option<watch::Receiver<DownloadState>>,
+        pause_timeout: Duration,
     ) -> DownloadResult<u64> {
         let mut total_written = 0u64;
         while !batch.is_empty() {
-            let written = storage.write_at(pos, batch.clone()).await?;
+            let write = storage.write_at(pos, batch.clone());
+            let written = if let Some(rx) = control_rx.as_mut() {
+                tokio::select! {
+                    result = write => result?,
+                    control = Self::watch_for_interrupt(rx, pause_timeout) => {
+                        control?;
+                        return Err(DownloadError::Other("控制信号异常结束".into()));
+                    }
+                }
+            } else {
+                write.await?
+            };
             if written == 0 {
                 return Err(DownloadError::Fragment(format!(
                     "存储短写未前进: offset={pos}, remaining={}",
@@ -1129,7 +1204,7 @@ impl DownloadTask {
         frag_start: u64,
         frag_end: u64,
         pause_timeout: Duration,
-        rate_limit_bps: Option<u64>,
+        rate_limiter: Option<Arc<RateLimiter>>,
         control_rx: &Option<watch::Receiver<DownloadState>>,
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) -> DownloadResult<(u64, Duration)> {
@@ -1203,13 +1278,18 @@ impl DownloadTask {
                         "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
                     )));
                 }
-                let w = Self::write_all_at(storage, pos, batch).await?;
+                let w =
+                    Self::write_all_at(storage, pos, batch, &mut control_rx, pause_timeout).await?;
                 pos = pos.checked_add(w).ok_or_else(|| {
                     DownloadError::Fragment(format!(
                         "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
                     ))
                 })?;
                 total_written += w;
+                // 实时令牌桶限速
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.acquire(w).await;
+                }
                 if let Some(tx) = progress_tx
                     && chunk_count.is_multiple_of(5)
                 {
@@ -1237,8 +1317,12 @@ impl DownloadTask {
                     "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
                 )));
             }
-            let w = Self::write_all_at(storage, pos, batch).await?;
+            let w = Self::write_all_at(storage, pos, batch, &mut control_rx, pause_timeout).await?;
             total_written += w;
+            // 实时令牌桶限速(最终刷写)
+            if let Some(ref limiter) = rate_limiter {
+                limiter.acquire(w).await;
+            }
         }
 
         if total_written != expected_len {
@@ -1248,18 +1332,6 @@ impl DownloadTask {
         }
 
         let elapsed = start_instant.elapsed();
-
-        // 限速: 若配置了 rate_limit_bytes_per_sec, 确保实际速率不超过限制
-        if let Some(limit) = rate_limit_bps
-            && limit > 0
-        {
-            let expected_secs = total_written as f64 / limit as f64;
-            let actual_secs = elapsed.as_secs_f64();
-            if actual_secs < expected_secs {
-                let sleep_dur = Duration::from_secs_f64(expected_secs - actual_secs);
-                tokio::time::sleep(sleep_dur).await;
-            }
-        }
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx {
@@ -2851,6 +2923,395 @@ mod tests {
         assert!(result.unwrap().is_err(), "暂停超时应返回错误");
     }
 
+    #[derive(Clone)]
+    struct NotifyingStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        write_notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl NotifyingStorage {
+        fn with_capacity(capacity: usize) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0; capacity])),
+                write_notify: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn data(&self) -> Vec<u8> {
+            self.data.lock().unwrap().clone()
+        }
+
+        fn write_notify(&self) -> Arc<tokio::sync::Notify> {
+            Arc::clone(&self.write_notify)
+        }
+    }
+
+    impl AsyncStorage for NotifyingStorage {
+        async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
+            let start = offset as usize;
+            let end = start + data.len();
+            let mut buf = self.data.lock().unwrap();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[start..end].copy_from_slice(&data);
+            self.write_notify.notify_waiters();
+            Ok(data.len())
+        }
+
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
+            let data = self.data.lock().unwrap();
+            let start = offset as usize;
+            let available = data.len().saturating_sub(start);
+            let to_read = buf.len().min(available);
+            if to_read > 0 {
+                buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+            }
+            Ok(to_read)
+        }
+
+        async fn sync(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+
+        async fn allocate(&self, size: u64) -> DownloadResult<()> {
+            self.data.lock().unwrap().resize(size as usize, 0);
+            Ok(())
+        }
+
+        async fn file_size(&self) -> DownloadResult<u64> {
+            Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        async fn close(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingWriteStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        write_started: Arc<tokio::sync::Notify>,
+        release_rx: watch::Receiver<bool>,
+    }
+
+    impl BlockingWriteStorage {
+        fn with_capacity(capacity: usize, release_rx: watch::Receiver<bool>) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0; capacity])),
+                write_started: Arc::new(tokio::sync::Notify::new()),
+                release_rx,
+            }
+        }
+
+        fn write_started(&self) -> Arc<tokio::sync::Notify> {
+            Arc::clone(&self.write_started)
+        }
+    }
+
+    impl AsyncStorage for BlockingWriteStorage {
+        async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
+            self.write_started.notify_waiters();
+            let mut release_rx = self.release_rx.clone();
+            while !*release_rx.borrow() {
+                release_rx
+                    .changed()
+                    .await
+                    .map_err(|_| DownloadError::Other("写入释放信号关闭".into()))?;
+            }
+
+            let start = offset as usize;
+            let end = start + data.len();
+            let mut buf = self.data.lock().unwrap();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[start..end].copy_from_slice(&data);
+            Ok(data.len())
+        }
+
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
+            let data = self.data.lock().unwrap();
+            let start = offset as usize;
+            let available = data.len().saturating_sub(start);
+            let to_read = buf.len().min(available);
+            if to_read > 0 {
+                buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+            }
+            Ok(to_read)
+        }
+
+        async fn sync(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+
+        async fn allocate(&self, size: u64) -> DownloadResult<()> {
+            self.data.lock().unwrap().resize(size as usize, 0);
+            Ok(())
+        }
+
+        async fn file_size(&self) -> DownloadResult<u64> {
+            Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        async fn close(&self) -> DownloadResult<()> {
+            Ok(())
+        }
+    }
+
+    struct FailAfterPeerStartsProtocol {
+        meta: FileMetadata,
+        started: Arc<AtomicU32>,
+        both_started: Arc<tokio::sync::Notify>,
+        release_rx: watch::Receiver<bool>,
+        panic_first_fragment: bool,
+    }
+
+    impl Clone for FailAfterPeerStartsProtocol {
+        fn clone(&self) -> Self {
+            Self {
+                meta: self.meta.clone(),
+                started: Arc::clone(&self.started),
+                both_started: Arc::clone(&self.both_started),
+                release_rx: self.release_rx.clone(),
+                panic_first_fragment: self.panic_first_fragment,
+            }
+        }
+    }
+
+    impl Protocol for FailAfterPeerStartsProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async move { Ok(Bytes::from(vec![0xF1; (end - start + 1) as usize])) })
+        }
+
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
+        {
+            let started = Arc::clone(&self.started);
+            let both_started = Arc::clone(&self.both_started);
+            let mut release_rx = self.release_rx.clone();
+            let panic_first_fragment = self.panic_first_fragment;
+            Box::pin(async move {
+                let current = started.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                if current >= 2 {
+                    both_started.notify_waiters();
+                }
+                if start == 0 {
+                    while started.load(AtomicOrdering::SeqCst) < 2 {
+                        both_started.notified().await;
+                    }
+                    if panic_first_fragment {
+                        panic!("首分片模拟 panic");
+                    }
+                    return Err(DownloadError::Network("首分片模拟失败".into()));
+                }
+
+                while !*release_rx.borrow() {
+                    release_rx
+                        .changed()
+                        .await
+                        .map_err(|_| DownloadError::Other("释放信号关闭".into()))?;
+                }
+                let data = Bytes::from(vec![0xF2; (end - start + 1) as usize]);
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async move { Ok(Bytes::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fragment_failure_aborts_and_drains_remaining_tasks_before_returning() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 2;
+        let (release_tx, release_rx) = watch::channel(false);
+        let protocol: Arc<dyn Protocol> = Arc::new(FailAfterPeerStartsProtocol {
+            meta: test_metadata("abort-remaining.bin", total_size),
+            started: Arc::new(AtomicU32::new(0)),
+            both_started: Arc::new(tokio::sync::Notify::new()),
+            release_rx,
+            panic_first_fragment: false,
+        });
+        let notifying_storage = NotifyingStorage::with_capacity(total_size as usize);
+        let write_notify = notifying_storage.write_notify();
+        let storage = StorageKind::new(notifying_storage.clone());
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/abort-remaining.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            tachyon_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                ..Default::default()
+            },
+        );
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(result.is_err(), "首分片失败应导致执行失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+
+        let leaked_write = write_notify.notified();
+        release_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), leaked_write)
+                .await
+                .is_err(),
+            "失败返回后剩余分片必须已 abort/drain,不得继续写入存储"
+        );
+        assert!(
+            notifying_storage.data().iter().all(|byte| *byte == 0),
+            "失败后的后台分片不应在返回后继续写入"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_panic_aborts_and_drains_remaining_tasks_before_returning() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 2;
+        let (release_tx, release_rx) = watch::channel(false);
+        let protocol: Arc<dyn Protocol> = Arc::new(FailAfterPeerStartsProtocol {
+            meta: test_metadata("panic-remaining.bin", total_size),
+            started: Arc::new(AtomicU32::new(0)),
+            both_started: Arc::new(tokio::sync::Notify::new()),
+            release_rx,
+            panic_first_fragment: true,
+        });
+        let notifying_storage = NotifyingStorage::with_capacity(total_size as usize);
+        let write_notify = notifying_storage.write_notify();
+        let storage = StorageKind::new(notifying_storage.clone());
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/panic-remaining.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            tachyon_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                ..Default::default()
+            },
+        );
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(result.is_err(), "首分片 panic 应导致执行失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+
+        let leaked_write = write_notify.notified();
+        release_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), leaked_write)
+                .await
+                .is_err(),
+            "panic 返回后剩余分片必须已 abort/drain,不得继续写入存储"
+        );
+        assert!(
+            notifying_storage.data().iter().all(|byte| *byte == 0),
+            "panic 后的后台分片不应在返回后继续写入"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_signal_interrupts_blocked_fragment_storage_write() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 2;
+        let mut mock = MockProto::new(test_metadata("cancel-write.bin", total_size));
+        for i in 0..2u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(start, end, Bytes::from(vec![0xA0 | i as u8; 100]));
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let (_release_tx, release_rx) = watch::channel(false);
+        let blocking_storage = BlockingWriteStorage::with_capacity(total_size as usize, release_rx);
+        let write_started = blocking_storage.write_started();
+        let storage = StorageKind::new(blocking_storage);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/cancel-write.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
+            Default::default(),
+            tachyon_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                ..Default::default()
+            },
+        );
+        let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
+        task.set_control_rx(control_rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let cancel_on_write = tokio::spawn(async move {
+            write_started.notified().await;
+            control_tx.send(DownloadState::Cancelled).unwrap();
+        });
+        let result = tokio::time::timeout(Duration::from_millis(500), task.execute())
+            .await
+            .expect("取消信号应中断阻塞中的存储写入");
+        cancel_on_write.await.unwrap();
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
     #[tokio::test]
     async fn test_fragment_failure_records_failed_state_and_run_fails() {
         let protocol: Arc<dyn Protocol> =
@@ -3584,5 +4045,14 @@ mod tests {
             storage.is_ok(),
             "WinAligned 在非 Windows 平台应回退到 Standard"
         );
+    }
+
+    #[tokio::test]
+    async fn test_open_with_strategy_iocp() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage =
+            DynStorage::open_with_strategy(tmp.path(), tachyon_core::config::IoStrategy::Iocp)
+                .await;
+        assert!(storage.is_ok(), "Iocp 策略应成功打开存储");
     }
 }

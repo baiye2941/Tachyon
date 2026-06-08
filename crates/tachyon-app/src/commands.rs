@@ -216,14 +216,18 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
         let canonical = path
             .canonicalize()
             .map_err(|_| AppError::Config(format!("authorized_dirs 路径无法解析: {dir}")))?;
-        // 禁止系统根目录
-        let canonical_str = canonical.to_string_lossy();
-        let forbidden = canonical_str == "/"
-            || canonical_str == "C:\\"
-            || canonical_str == "C:/"
-            || canonical.starts_with("/usr")
-            || canonical.starts_with("/etc")
-            || canonical.starts_with("/System");
+        // 禁止系统根目录和 Unix 系统顶层目录
+        let is_root = canonical.parent().is_none();
+        let first_normal_component = canonical.components().find_map(|component| {
+            if let std::path::Component::Normal(name) = component {
+                name.to_str()
+            } else {
+                None
+            }
+        });
+        let is_unix_system_top_dir =
+            matches!(first_normal_component, Some("usr" | "etc" | "System"));
+        let forbidden = is_root || is_unix_system_top_dir;
         if forbidden {
             return Err(AppError::Config(format!(
                 "authorized_dirs 不允许包含系统根目录: {dir}"
@@ -779,116 +783,7 @@ pub async fn create_task(
     download_dir: Option<String>,
     _mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
-    validate_download_url(&url)?;
-    let task_id = Uuid::new_v4().to_string();
-    let file_name = extract_filename_from_url(&url);
-    let created_at = now_iso8601();
-
-    {
-        if state.tasks.iter().any(|r| {
-            let t = r.value();
-            t.url == url
-                && t.status != DownloadState::Cancelled
-                && t.status != DownloadState::Completed
-                && t.status != DownloadState::Failed
-        }) {
-            return Err(AppError::TaskAlreadyExists(
-                "相同 URL 的下载任务已存在".to_string(),
-            ));
-        }
-        let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
-        let active_count = state
-            .tasks
-            .iter()
-            .filter(|r| {
-                let t = r.value();
-                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
-            })
-            .count();
-        if active_count >= max_tasks {
-            return Err(AppError::Config(format!(
-                "已达最大并发任务数({max_tasks}),请等待现有任务完成"
-            )));
-        }
-    }
-
-    let download_dir_str = {
-        let cfg = state.config.lock().await;
-        let requested = download_dir.unwrap_or_else(|| cfg.download.download_dir.clone());
-        authorize_download_dir(&cfg, &requested)?
-    };
-
-    let task = TaskInfo {
-        id: task_id.clone(),
-        url: url.clone(),
-        file_name,
-        file_size: None,
-        downloaded: 0,
-        speed: 0,
-        status: DownloadState::Pending,
-        progress: 0.0,
-        fragments_total: 0,
-        fragments_done: 0,
-        created_at,
-    };
-
-    {
-        state.tasks.insert(task_id.clone(), task);
-    }
-
-    if let Some(task) = state.tasks.get(&task_id).map(|r| r.value().clone()) {
-        let save_path = std::path::Path::new(&download_dir_str)
-            .join(&task.file_name)
-            .to_string_lossy()
-            .to_string();
-        let snapshot =
-            crate::task_store::task_info_to_snapshot(&task, save_path, 0, vec![], None, None);
-        if let Err(e) = state.task_store.save_snapshot(&snapshot) {
-            tracing::warn!(task_id = %task_id, error = %e, "保存初始快照失败");
-        }
-    }
-
-    let download_config = {
-        let cfg = state.config.lock().await;
-        build_download_config(&cfg, &download_dir_str)
-    };
-
-    let state_arc = Arc::new(AppState {
-        tasks: state.tasks.clone(),
-        config: state.config.clone(),
-        handles: state.handles.clone(),
-        active_permits: state.active_permits.clone(),
-        sniffer: state.sniffer.clone(),
-        sniffer_filters: state.sniffer_filters.clone(),
-        progress_tx: state.progress_tx.clone(),
-        connection_pool: state.connection_pool.clone(),
-        controls: state.controls.clone(),
-        task_store: state.task_store.clone(),
-    });
-
-    let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
-    state.controls.insert(task_id.clone(), control_tx);
-
-    let tid = task_id.clone();
-    let url_clone = url.clone();
-    let pool_clone = state_arc.connection_pool.clone();
-    let handle = tokio::spawn(async move {
-        task_fn(
-            state_arc,
-            tid,
-            url_clone,
-            download_dir_str,
-            download_config,
-            pool_clone,
-            control_rx,
-        )
-        .await;
-    });
-
-    state.handles.insert(task_id.clone(), handle);
-
-    tracing::info!(task_id = %task_id, "创建下载任务并启动后台下载");
-    Ok(task_id)
+    create_task_inner(&state, url, download_dir).await
 }
 
 #[tauri::command]
@@ -896,26 +791,7 @@ pub async fn pause_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-
-        match task.status {
-            DownloadState::Pending | DownloadState::Downloading => {
-                task.status = DownloadState::Paused;
-                task.speed = 0;
-                if let Some(control) = state.controls.get(&task_id) {
-                    let _ = control.send(DownloadState::Paused);
-                }
-                tracing::info!(task_id = %task_id, "暂停任务");
-            }
-            other => return Err(AppError::Config(format!("当前状态 '{}' 不允许暂停", other))),
-        }
-    }
-    persist_task_snapshot(&state, &task_id, None).await;
-    Ok(())
+    pause_task_inner(&state, task_id).await
 }
 
 #[tauri::command]
@@ -923,27 +799,7 @@ pub async fn resume_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-
-        if task.status == DownloadState::Paused {
-            task.status = DownloadState::Downloading;
-            if let Some(control) = state.controls.get(&task_id) {
-                let _ = control.send(DownloadState::Downloading);
-            }
-            tracing::info!(task_id = %task_id, "恢复任务");
-        } else {
-            return Err(AppError::Config(format!(
-                "仅暂停状态可恢复,当前状态: '{}'",
-                task.status
-            )));
-        }
-    }
-    persist_task_snapshot(&state, &task_id, None).await;
-    Ok(())
+    resume_task_inner(&state, task_id).await
 }
 
 #[tauri::command]
@@ -951,29 +807,7 @@ pub async fn cancel_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-
-        match task.status {
-            DownloadState::Completed | DownloadState::Cancelled => {
-                return Err(AppError::Config(format!("任务已{},无法取消", task.status)));
-            }
-            _ => {
-                if let Some(control) = state.controls.get(&task_id) {
-                    let _ = control.send(DownloadState::Cancelled);
-                }
-
-                task.status = DownloadState::Cancelled;
-                task.speed = 0;
-                tracing::info!(task_id = %task_id, "取消任务");
-            }
-        }
-    }
-    persist_task_snapshot(&state, &task_id, None).await;
-    Ok(())
+    cancel_task_inner(&state, task_id).await
 }
 
 #[tauri::command]
@@ -981,30 +815,12 @@ pub async fn delete_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    let task = state
-        .tasks
-        .get(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-
-    match task.status {
-        DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
-            drop(task);
-            state.tasks.remove(&task_id);
-            state.handles.remove(&task_id);
-            state.controls.remove(&task_id);
-            tracing::info!(task_id = %task_id, "删除任务");
-            Ok(())
-        }
-        other => Err(AppError::Config(format!(
-            "当前状态 '{}' 不允许删除,请先取消任务",
-            other
-        ))),
-    }
+    delete_task_inner(&state, task_id).await
 }
 
 #[tauri::command]
 pub async fn get_task_list(state: tauri::State<'_, AppState>) -> Result<Vec<TaskInfo>, AppError> {
-    Ok(state.tasks.iter().map(|r| r.value().clone()).collect())
+    get_task_list_inner(&state).await
 }
 
 #[tauri::command]
@@ -1012,11 +828,7 @@ pub async fn get_task_detail(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<TaskInfo, AppError> {
-    state
-        .tasks
-        .get(&task_id)
-        .map(|r| r.value().clone())
-        .ok_or(AppError::TaskNotFound(task_id))
+    get_task_detail_inner(&state, task_id).await
 }
 
 #[tauri::command]
@@ -1024,29 +836,14 @@ pub async fn get_download_progress(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<DownloadProgress, AppError> {
-    let task = state
-        .tasks
-        .get(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-
-    Ok(DownloadProgress {
-        task_id: task.id.clone(),
-        status: task.status,
-        progress: task.progress,
-        downloaded: task.downloaded,
-        file_size: task.file_size,
-        speed: task.speed,
-        fragments_total: task.fragments_total,
-        fragments_done: task.fragments_done,
-    })
+    get_download_progress_inner(&state, task_id).await
 }
 
 #[tauri::command]
 pub async fn get_sniffer_resources(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SnifferResource>, AppError> {
-    let store = state.sniffer.lock().await;
-    Ok(store.iter().rev().cloned().collect())
+    get_sniffer_resources_inner(&state).await
 }
 
 #[tauri::command]
@@ -1054,16 +851,7 @@ pub async fn add_sniffer_filter(
     state: tauri::State<'_, AppState>,
     filter: String,
 ) -> Result<(), AppError> {
-    if filter.is_empty() {
-        return Err(AppError::Config("过滤规则不能为空".to_string()));
-    }
-    let mut filters = state.sniffer_filters.lock().await;
-    if filters.contains(&filter) {
-        return Err(AppError::Config("过滤规则已存在".to_string()));
-    }
-    tracing::info!(filter = %filter, "添加嗅探过滤规则");
-    filters.push(filter);
-    Ok(())
+    add_sniffer_filter_inner(&state, filter).await
 }
 
 pub async fn add_sniffer_resource(state: &AppState, url: String) {
@@ -1107,8 +895,7 @@ pub async fn add_sniffer_resource(state: &AppState, url: String) {
 
 #[tauri::command]
 pub async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, AppError> {
-    let cfg = state.config.lock().await;
-    Ok(cfg.clone())
+    get_config_inner(&state).await
 }
 
 #[tauri::command]
@@ -1116,11 +903,7 @@ pub async fn update_config(
     state: tauri::State<'_, AppState>,
     config: AppConfig,
 ) -> Result<(), AppError> {
-    validate_config(&config)?;
-    let mut cfg = state.config.lock().await;
-    *cfg = config;
-    tracing::info!("应用配置已更新");
-    Ok(())
+    update_config_inner(&state, config).await
 }
 
 #[tauri::command]
@@ -1175,12 +958,12 @@ pub async fn subscribe_progress(
     Ok(())
 }
 
-#[cfg(test)]
 async fn create_task_inner(
     state: &AppState,
     url: String,
     download_dir: Option<String>,
 ) -> Result<String, AppError> {
+    validate_download_url(&url)?;
     let task_id = Uuid::new_v4().to_string();
     let file_name = extract_filename_from_url(&url);
     let created_at = now_iso8601();
@@ -1298,67 +1081,75 @@ async fn create_task_inner(
     Ok(task_id)
 }
 
-#[cfg(test)]
 async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut task = state
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-    match task.status {
-        DownloadState::Pending | DownloadState::Downloading => {
-            task.status = DownloadState::Paused;
-            task.speed = 0;
-            if let Some(control) = state.controls.get(&task_id) {
-                let _ = control.send(DownloadState::Paused);
+    {
+        let mut task = state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+        match task.status {
+            DownloadState::Pending | DownloadState::Downloading => {
+                task.status = DownloadState::Paused;
+                task.speed = 0;
+                if let Some(control) = state.controls.get(&task_id) {
+                    let _ = control.send(DownloadState::Paused);
+                }
+                tracing::info!(task_id = %task_id, "暂停任务");
             }
-            Ok(())
+            other => return Err(AppError::Config(format!("当前状态 '{}' 不允许暂停", other))),
         }
-        other => Err(AppError::Config(format!("当前状态 '{}' 不允许暂停", other))),
     }
+    persist_task_snapshot(state, &task_id, None).await;
+    Ok(())
 }
 
-#[cfg(test)]
 async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut task = state
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-    if task.status == DownloadState::Paused {
-        task.status = DownloadState::Downloading;
-        if let Some(control) = state.controls.get(&task_id) {
-            let _ = control.send(DownloadState::Downloading);
-        }
-        Ok(())
-    } else {
-        Err(AppError::Config(format!(
-            "仅暂停状态可恢复,当前状态: '{}'",
-            task.status
-        )))
-    }
-}
-
-#[cfg(test)]
-async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let mut task = state
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-    match task.status {
-        DownloadState::Completed | DownloadState::Cancelled => {
-            Err(AppError::Config(format!("任务已{},无法取消", task.status)))
-        }
-        _ => {
+    {
+        let mut task = state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+        if task.status == DownloadState::Paused {
+            task.status = DownloadState::Downloading;
             if let Some(control) = state.controls.get(&task_id) {
-                let _ = control.send(DownloadState::Cancelled);
+                let _ = control.send(DownloadState::Downloading);
             }
-            task.status = DownloadState::Cancelled;
-            task.speed = 0;
-            Ok(())
+            tracing::info!(task_id = %task_id, "恢复任务");
+        } else {
+            return Err(AppError::Config(format!(
+                "仅暂停状态可恢复,当前状态: '{}'",
+                task.status
+            )));
         }
     }
+    persist_task_snapshot(state, &task_id, None).await;
+    Ok(())
 }
 
-#[cfg(test)]
+async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
+    {
+        let mut task = state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+        match task.status {
+            DownloadState::Completed | DownloadState::Cancelled => {
+                return Err(AppError::Config(format!("任务已{},无法取消", task.status)));
+            }
+            _ => {
+                if let Some(control) = state.controls.get(&task_id) {
+                    let _ = control.send(DownloadState::Cancelled);
+                }
+                task.status = DownloadState::Cancelled;
+                task.speed = 0;
+                tracing::info!(task_id = %task_id, "取消任务");
+            }
+        }
+    }
+    persist_task_snapshot(state, &task_id, None).await;
+    Ok(())
+}
+
 async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
     let task = state
         .tasks
@@ -1369,6 +1160,8 @@ async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
             drop(task);
             state.tasks.remove(&task_id);
             state.handles.remove(&task_id);
+            state.controls.remove(&task_id);
+            tracing::info!(task_id = %task_id, "删除任务");
             Ok(())
         }
         other => Err(AppError::Config(format!(
@@ -1378,12 +1171,10 @@ async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppE
     }
 }
 
-#[cfg(test)]
 async fn get_task_list_inner(state: &AppState) -> Result<Vec<TaskInfo>, AppError> {
     Ok(state.tasks.iter().map(|r| r.value().clone()).collect())
 }
 
-#[cfg(test)]
 async fn get_task_detail_inner(state: &AppState, task_id: String) -> Result<TaskInfo, AppError> {
     state
         .tasks
@@ -1392,7 +1183,6 @@ async fn get_task_detail_inner(state: &AppState, task_id: String) -> Result<Task
         .ok_or(AppError::TaskNotFound(task_id))
 }
 
-#[cfg(test)]
 async fn get_download_progress_inner(
     state: &AppState,
     task_id: String,
@@ -1413,13 +1203,11 @@ async fn get_download_progress_inner(
     })
 }
 
-#[cfg(test)]
 async fn get_sniffer_resources_inner(state: &AppState) -> Result<Vec<SnifferResource>, AppError> {
     let store = state.sniffer.lock().await;
     Ok(store.iter().rev().cloned().collect())
 }
 
-#[cfg(test)]
 async fn add_sniffer_filter_inner(state: &AppState, filter: String) -> Result<(), AppError> {
     if filter.is_empty() {
         return Err(AppError::Config("过滤规则不能为空".to_string()));
@@ -1428,21 +1216,21 @@ async fn add_sniffer_filter_inner(state: &AppState, filter: String) -> Result<()
     if filters.contains(&filter) {
         return Err(AppError::Config("过滤规则已存在".to_string()));
     }
+    tracing::info!(filter = %filter, "添加嗅探过滤规则");
     filters.push(filter);
     Ok(())
 }
 
-#[cfg(test)]
 async fn get_config_inner(state: &AppState) -> Result<AppConfig, AppError> {
     let cfg = state.config.lock().await;
     Ok(cfg.clone())
 }
 
-#[cfg(test)]
 async fn update_config_inner(state: &AppState, config: AppConfig) -> Result<(), AppError> {
     validate_config(&config)?;
     let mut cfg = state.config.lock().await;
     *cfg = config;
+    tracing::info!("应用配置已更新");
     Ok(())
 }
 
@@ -2303,6 +2091,54 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_sensitive_headers() {
+        let download_dir = test_tmp_path("sensitive-headers");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        config
+            .download
+            .headers
+            .insert("Authorization".to_string(), "secret".to_string());
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("敏感头"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_nonexistent_authorized_dir() {
+        let download_dir = test_tmp_path("missing-authorized-base");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        config.download.authorized_dirs = vec![
+            std::env::temp_dir()
+                .join("tachyon-missing-authorized-dir")
+                .join(uuid::Uuid::new_v4().to_string())
+                .to_string_lossy()
+                .to_string(),
+        ];
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("路径不存在"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_root_authorized_dir() {
+        let download_dir = test_tmp_path("root-authorized-base");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        let root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("temp dir should have a root")
+            .to_string_lossy()
+            .to_string();
+        config.download.authorized_dirs = vec![root];
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("系统根目录"));
     }
 
     #[tokio::test]

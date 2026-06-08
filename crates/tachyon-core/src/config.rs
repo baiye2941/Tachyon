@@ -18,6 +18,10 @@ pub enum IoStrategy {
     /// 仅在 Windows 上生效；其他平台自动回退到 Standard。
     /// 要求写入偏移和长度对齐到 512 字节边界。
     WinAligned,
+    /// Windows IOCP 异步 I/O 后端
+    ///
+    /// 仅在 Windows 上生效；非 Windows 平台自动回退到 Standard。
+    Iocp,
 }
 
 /// 下载配置
@@ -395,7 +399,11 @@ mod tests {
 
     #[test]
     fn test_io_strategy_serialization_roundtrip() {
-        for strategy in [IoStrategy::Standard, IoStrategy::WinAligned] {
+        for strategy in [
+            IoStrategy::Standard,
+            IoStrategy::WinAligned,
+            IoStrategy::Iocp,
+        ] {
             let json = serde_json::to_string(&strategy).unwrap();
             let deserialized: IoStrategy = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, strategy);
@@ -412,6 +420,24 @@ mod tests {
             serde_json::from_str::<IoStrategy>("\"winAligned\"").unwrap(),
             IoStrategy::WinAligned
         );
+        assert_eq!(
+            serde_json::from_str::<IoStrategy>("\"iocp\"").unwrap(),
+            IoStrategy::Iocp
+        );
+    }
+
+    #[test]
+    fn test_io_strategy_iocp_serialization() {
+        // 序列化为 camelCase
+        assert_eq!(
+            serde_json::to_string(&IoStrategy::Iocp).unwrap(),
+            "\"iocp\""
+        );
+        // 反序列化
+        let deserialized: IoStrategy = serde_json::from_str("\"iocp\"").unwrap();
+        assert_eq!(deserialized, IoStrategy::Iocp);
+        // 默认值不受影响
+        assert_ne!(IoStrategy::Iocp, IoStrategy::default());
     }
 
     #[test]

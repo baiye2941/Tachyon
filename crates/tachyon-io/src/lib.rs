@@ -8,6 +8,7 @@
 //! - 零拷贝写入管道(含批量合并写入)
 
 pub mod buffer;
+pub mod iocp;
 pub mod iouring;
 pub mod pipeline;
 pub mod storage;
@@ -15,6 +16,7 @@ pub mod tokio_file;
 pub mod winio;
 
 pub use buffer::{BufferGuard, BufferPool, BufferPoolStats};
+pub use iocp::IoCpStorage;
 pub use iouring::{IoUringConfig, IoUringState, IoUringStorage};
 pub use pipeline::WritePipeline;
 pub use storage::AsyncStorage;

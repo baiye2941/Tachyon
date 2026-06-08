@@ -414,6 +414,26 @@ mod tests {
         assert_eq!(store.get("k").unwrap(), Some(String::new()));
     }
 
+    #[test]
+    fn memory_poisoned_lock_returns_io_error_for_all_operations() {
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryStore::new());
+        let poisoned = Arc::clone(&store);
+        let result = std::thread::spawn(move || {
+            let _guard = poisoned.data.write().unwrap();
+            panic!("poison memory store lock");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(store.get("k").is_err());
+        assert!(store.set("k", "v".to_string()).is_err());
+        assert!(store.delete("k").is_err());
+        assert!(store.exists("k").is_err());
+        assert!(store.keys("").is_err());
+    }
+
     // ── FileStore 测试 ──
 
     #[test]
@@ -504,6 +524,72 @@ mod tests {
         let store = FileStore::open(tmp.path()).unwrap();
         store.set("k", String::new()).unwrap();
         assert_eq!(store.get("k").unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn file_and_kv_dir_return_configured_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_store = FileStore::open(tmp.path()).unwrap();
+        let kv_store = KvStore::open(tmp.path()).unwrap();
+
+        assert_eq!(file_store.dir(), tmp.path());
+        assert_eq!(kv_store.dir(), tmp.path());
+    }
+
+    #[test]
+    fn file_safe_key_escapes_path_sensitive_characters() {
+        assert_eq!(FileStore::safe_key("task/a:b c"), "task%2Fa%3Ab%20c");
+    }
+
+    #[test]
+    fn file_keys_ignore_non_json_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        store.set("task_a", "1".to_string()).unwrap();
+        std::fs::write(tmp.path().join("task_b.tmp"), "ignored").unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "ignored").unwrap();
+
+        let keys = store.keys("task_").unwrap();
+        assert_eq!(keys, vec!["task_a"]);
+    }
+
+    #[test]
+    fn file_get_errors_when_key_path_is_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        std::fs::create_dir(store.path_for("as_dir")).unwrap();
+
+        assert!(store.get("as_dir").is_err());
+    }
+
+    #[test]
+    fn file_set_cleans_temp_when_rename_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        let final_path = store.path_for("blocked");
+        let temp_path = final_path.with_extension("tmp");
+        std::fs::create_dir(&final_path).unwrap();
+
+        assert!(store.set("blocked", "value".to_string()).is_err());
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn file_poisoned_write_lock_returns_io_error() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileStore::open(tmp.path()).unwrap());
+        let poisoned = Arc::clone(&store);
+        let result = std::thread::spawn(move || {
+            let _guard = poisoned.write_lock.write().unwrap();
+            panic!("poison file store lock");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(store.set("k", "v".to_string()).is_err());
+        assert!(store.delete("k").is_err());
     }
 
     #[test]
@@ -640,6 +726,29 @@ mod tests {
         store.put("config", &cfg).unwrap();
         let loaded: Option<Config> = store.get("config").unwrap();
         assert_eq!(loaded, Some(cfg));
+    }
+
+    #[test]
+    fn kv_get_raw_returns_json_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        store.put("num", &42u32).unwrap();
+        let raw = store.get_raw("num").unwrap();
+        assert_eq!(raw, Some("42".to_string()));
+    }
+
+    #[test]
+    fn kv_persistence_across_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 写入后关闭
+        {
+            let store = KvStore::open(tmp.path()).unwrap();
+            store.put("persist", &"data".to_string()).unwrap();
+        }
+        // 重新打开,验证数据仍在
+        let store = KvStore::open(tmp.path()).unwrap();
+        let val: Option<String> = store.get("persist").unwrap();
+        assert_eq!(val, Some("data".to_string()));
     }
 
     // ── 并发测试 ──
