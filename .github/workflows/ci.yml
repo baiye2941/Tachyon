@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: 安装 cargo-deny (预编译二进制)
-        run: cargo binstall -y cargo-deny
+        run: cargo binstall -y --force cargo-deny
       - run: cargo deny check
 
   cargo-audit:
@@ -89,7 +89,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: 安装 cargo-audit (预编译二进制)
-        run: cargo binstall -y cargo-audit
+        run: cargo binstall -y --force cargo-audit
       - run: cargo audit
 
   coverage:
