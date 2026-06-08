@@ -8,8 +8,9 @@ pub use commands::TaskInfo;
 
 use commands::{
     AppState, add_sniffer_filter, cancel_task, create_task, delete_task, get_app_info, get_config,
-    get_download_progress, get_sniffer_resources, get_task_detail, get_task_list, pause_task,
-    resume_task, subscribe_progress, supported_protocols, update_config,
+    get_download_progress, get_hf_download_url, get_sniffer_resources, get_task_detail,
+    get_task_list, list_repo_files, pause_task, resume_task, subscribe_progress,
+    supported_protocols, update_config,
 };
 
 /// 构建并运行 Tauri 应用
@@ -66,6 +67,9 @@ pub fn run() {
             // 配置管理
             get_config,
             update_config,
+            // HuggingFace Hub
+            list_repo_files,
+            get_hf_download_url,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

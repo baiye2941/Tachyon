@@ -2,7 +2,7 @@
 //!
 //! 封装与 HF Hub 的 HTTP 交互, 包括文件树列表和文件下载 URL 解析。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tachyon_core::DownloadResult;
 use tachyon_protocol::HttpClient;
 
@@ -10,7 +10,7 @@ use crate::lfs;
 use crate::token;
 
 /// HF Hub 文件信息
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfFile {
     /// 文件类型: "file" | "directory"
     #[serde(rename = "type")]
@@ -24,7 +24,7 @@ pub struct HfFile {
 }
 
 /// LFS 对象信息
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfLfsInfo {
     /// LFS oid (sha256:<hex>)
     pub oid: String,

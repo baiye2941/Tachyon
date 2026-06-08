@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
 tachyon-engine = { path = "../tachyon-engine" }
+tachyon-hub = { path = "../tachyon-hub" }
 tachyon-scheduler = { path = "../tachyon-scheduler" }
 tachyon-sniffer = { path = "../tachyon-sniffer" }
 tachyon-store = { path = "../tachyon-store" }
