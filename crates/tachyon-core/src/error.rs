@@ -262,11 +262,13 @@ mod tests {
         assert!(!DownloadError::Cancelled.is_retryable());
         assert!(!DownloadError::Timeout("30s".into()).is_retryable());
         assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
-        assert!(!DownloadError::ChecksumMismatch {
-            expected: "a".into(),
-            actual: "b".into(),
-        }
-        .is_retryable());
+        assert!(
+            !DownloadError::ChecksumMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+            .is_retryable()
+        );
         assert!(!DownloadError::TaskNotFound("x".into()).is_retryable());
         assert!(!DownloadError::Config("bad".into()).is_retryable());
     }
@@ -275,25 +277,33 @@ mod tests {
     fn test_is_retryable_returns_true_for_retryable() {
         assert!(DownloadError::Network("timeout".into()).is_retryable());
         assert!(DownloadError::Protocol("bad response".into()).is_retryable());
-        assert!(DownloadError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "reset"
-        ))
-        .is_retryable());
+        assert!(
+            DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            ))
+            .is_retryable()
+        );
         assert!(DownloadError::Fragment("short write".into()).is_retryable());
-        assert!(DownloadError::Throttled {
-            retry_after_secs: Some(5)
-        }
-        .is_retryable());
-        assert!(DownloadError::Throttled {
-            retry_after_secs: None
-        }
-        .is_retryable());
-        assert!(DownloadError::Http {
-            status: 500,
-            reason: "Internal Server Error".into(),
-        }
-        .is_retryable());
+        assert!(
+            DownloadError::Throttled {
+                retry_after_secs: Some(5)
+            }
+            .is_retryable()
+        );
+        assert!(
+            DownloadError::Throttled {
+                retry_after_secs: None
+            }
+            .is_retryable()
+        );
+        assert!(
+            DownloadError::Http {
+                status: 500,
+                reason: "Internal Server Error".into(),
+            }
+            .is_retryable()
+        );
         assert!(DownloadError::Other("unknown".into()).is_retryable());
     }
 }
