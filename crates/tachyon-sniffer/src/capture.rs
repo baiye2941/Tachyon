@@ -13,6 +13,8 @@ pub enum ResourceType {
     Archive,
     Executable,
     Image,
+    /// AI/ML 模型文件(safetensors, gguf, pytorch, onnx 等)
+    Model,
     Other,
 }
 
@@ -26,6 +28,7 @@ impl ResourceType {
             ResourceType::Archive => "archive",
             ResourceType::Executable => "executable",
             ResourceType::Image => "image",
+            ResourceType::Model => "model",
             ResourceType::Other => "other",
         }
     }
@@ -49,6 +52,7 @@ impl Default for CaptureConfig {
         enabled_types.insert(ResourceType::Document);
         enabled_types.insert(ResourceType::Archive);
         enabled_types.insert(ResourceType::Executable);
+        enabled_types.insert(ResourceType::Model);
         Self {
             enabled_types,
             min_size: 1024, // 1KB
@@ -73,6 +77,8 @@ pub fn identify_resource(url: &str) -> ResourceType {
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => ResourceType::Archive,
         "exe" | "msi" | "dmg" | "appimage" | "deb" | "rpm" => ResourceType::Executable,
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" => ResourceType::Image,
+        "safetensors" | "gguf" | "bin" | "pt" | "pth" | "onnx" | "tflite" | "h5" | "pkl"
+        | "model" => ResourceType::Model,
         _ => ResourceType::Other,
     }
 }
@@ -199,6 +205,35 @@ mod tests {
         assert_eq!(
             identify_resource("http://example.com/doc.pdf#page=5"),
             ResourceType::Document
+        );
+    }
+
+    #[test]
+    fn test_identify_model_files() {
+        // HuggingFace 模型文件
+        assert_eq!(
+            identify_resource("https://huggingface.co/model.safetensors"),
+            ResourceType::Model
+        );
+        assert_eq!(
+            identify_resource("https://example.com/model.gguf"),
+            ResourceType::Model
+        );
+        assert_eq!(
+            identify_resource("https://example.com/pytorch_model.bin"),
+            ResourceType::Model
+        );
+        assert_eq!(
+            identify_resource("https://example.com/weights.pt"),
+            ResourceType::Model
+        );
+        assert_eq!(
+            identify_resource("https://example.com/model.onnx"),
+            ResourceType::Model
+        );
+        assert_eq!(
+            identify_resource("https://example.com/model.gguf?download=true"),
+            ResourceType::Model
         );
     }
 }
