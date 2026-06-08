@@ -1145,10 +1145,14 @@ impl DownloadTask {
                 };
                 if bytes_per_sec > 0 {
                     self.scheduler.observe_bandwidth(bytes_per_sec);
+                    // 带宽自适应:将观测带宽反馈给限速器动态调整速率
+                    if let Some(ref limiter) = self.rate_limiter {
+                        limiter.update_rate(bytes_per_sec);
+                    }
                     debug!(
                         index = index,
                         bytes_per_sec = bytes_per_sec,
-                        "带宽数据已反馈给调度器"
+                        "带宽数据已反馈给调度器和限速器"
                     );
                 }
             }
