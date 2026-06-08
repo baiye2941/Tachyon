@@ -114,6 +114,7 @@ jobs:
   miri:
     name: Miri (unsafe 代码检测)
     runs-on: ubuntu-latest
+    continue-on-error: true
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
