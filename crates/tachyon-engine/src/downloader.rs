@@ -26,7 +26,9 @@ use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use tachyon_crypto::CpuVerifier;
 use tachyon_io::storage::AsyncStorage;
-use tachyon_io::{TokioFile, WinFile};
+use tachyon_io::TokioFile;
+#[cfg(target_os = "windows")]
+use tachyon_io::WinFile;
 use tachyon_protocol::http::HttpClient;
 use tachyon_scheduler::AdaptiveDownloadScheduler;
 
