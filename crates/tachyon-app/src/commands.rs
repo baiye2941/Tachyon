@@ -279,6 +279,7 @@ fn resource_type_to_string(rt: ResourceType) -> &'static str {
         ResourceType::Archive => "archive",
         ResourceType::Executable => "executable",
         ResourceType::Image => "image",
+        ResourceType::Model => "model",
         ResourceType::Other => "other",
     }
 }
@@ -375,6 +376,7 @@ fn build_download_config(app_config: &AppConfig, download_dir: &str) -> Download
     download
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_fn(
     state: Arc<AppState>,
     task_id: String,
@@ -383,6 +385,7 @@ async fn task_fn(
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
     control_rx: watch::Receiver<DownloadState>,
+    mirror_urls: Option<Vec<String>>,
 ) {
     // HF 镜像: 自动将 huggingface.co 替换为 HF_ENDPOINT 或 hf-mirror.com
     let url = rewrite_hf_url(&url);
@@ -436,15 +439,30 @@ async fn task_fn(
         return;
     }
 
-    let mut download_task =
-        match DownloadTask::with_pool(url.clone(), download_config, Some(connection_pool)).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
-                update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-                return;
+    let mut download_task = match mirror_urls {
+        Some(mirrors) if !mirrors.is_empty() => {
+            tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
+            match DownloadTask::with_mirrors(url.clone(), mirrors, download_config).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(task_id = %task_id, error = %e, "创建镜像 DownloadTask 失败");
+                    update_task_status(&state.tasks, &task_id, DownloadState::Failed);
+                    return;
+                }
             }
-        };
+        }
+        _ => {
+            match DownloadTask::with_pool(url.clone(), download_config, Some(connection_pool)).await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
+                    update_task_status(&state.tasks, &task_id, DownloadState::Failed);
+                    return;
+                }
+            }
+        }
+    };
     download_task.set_control_rx(control_rx.clone());
 
     // 断点续传:若存在已保存快照,注入已完成分片索引,plan() 后将跳过这些分片
@@ -487,7 +505,7 @@ async fn task_fn(
                 // 预计算总分段数(基于最小分片1MB),供进度显示使用
                 let total_frags = meta
                     .file_size
-                    .map(|s| (s.max(1) + 1024 * 1024 - 1) / (1024 * 1024))
+                    .map(|s| s.max(1).div_ceil(1024 * 1024))
                     .unwrap_or(0) as u32;
                 if let Some(mut task) = state.tasks.get_mut(&task_id) {
                     task.file_size = meta.file_size;
@@ -564,7 +582,7 @@ async fn task_fn(
                 .unwrap_or(0);
             total_downloaded =
                 total_downloaded.saturating_add(progress.fragment_downloaded.saturating_sub(old));
-            if event_count == 1 || event_count % 50 == 0 {
+            if event_count == 1 || event_count.is_multiple_of(50) {
                 tracing::info!(
                     event = event_count,
                     idx = progress.fragment_index,
@@ -781,9 +799,9 @@ pub async fn create_task(
     state: tauri::State<'_, AppState>,
     url: String,
     download_dir: Option<String>,
-    _mirror_urls: Option<Vec<String>>,
+    mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
-    create_task_inner(&state, url, download_dir).await
+    create_task_inner(&state, url, download_dir, mirror_urls).await
 }
 
 #[tauri::command]
@@ -962,6 +980,7 @@ async fn create_task_inner(
     state: &AppState,
     url: String,
     download_dir: Option<String>,
+    mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
     validate_download_url(&url)?;
     let task_id = Uuid::new_v4().to_string();
@@ -1062,6 +1081,7 @@ async fn create_task_inner(
     let tid = task_id.clone();
     let url_clone = url.clone();
     let pool_clone = state_arc.connection_pool.clone();
+    let mirrors = mirror_urls.filter(|v| !v.is_empty());
     let handle = tokio::spawn(async move {
         task_fn(
             state_arc,
@@ -1071,6 +1091,7 @@ async fn create_task_inner(
             download_config,
             pool_clone,
             control_rx,
+            mirrors,
         )
         .await;
     });
@@ -1319,9 +1340,14 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_returns_valid_uuid() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(Uuid::parse_str(&id).is_ok());
     }
 
@@ -1331,6 +1357,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://cdn.example.org/releases/app-v2.0.tar.gz".to_string(),
+            None,
             None,
         )
         .await
@@ -1342,9 +1369,14 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_default_status_is_pending() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/data.bin".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/data.bin".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let task = get_task_detail_inner(&state, id).await.unwrap();
         assert_eq!(task.status, DownloadState::Pending);
         assert_eq!(task.downloaded, 0);
@@ -1369,6 +1401,7 @@ mod tests {
             &state,
             "https://example.com/file.zip".to_string(),
             Some(sub_dir.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -1379,11 +1412,21 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_duplicate_url_rejected() {
         let state = test_state();
-        let _ = create_task_inner(&state, "https://dup.example.com/once.zip".to_string(), None)
-            .await
-            .unwrap();
-        let result =
-            create_task_inner(&state, "https://dup.example.com/once.zip".to_string(), None).await;
+        let _ = create_task_inner(
+            &state,
+            "https://dup.example.com/once.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let result = create_task_inner(
+            &state,
+            "https://dup.example.com/once.zip".to_string(),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("已存在"));
     }
@@ -1391,9 +1434,14 @@ mod tests {
     #[tokio::test]
     async fn test_pause_pending_task() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         pause_task_inner(&state, id.clone()).await.unwrap();
         let task = get_task_detail_inner(&state, id).await.unwrap();
         assert_eq!(task.status, DownloadState::Paused);
@@ -1403,9 +1451,14 @@ mod tests {
     #[tokio::test]
     async fn test_resume_paused_task() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         pause_task_inner(&state, id.clone()).await.unwrap();
         resume_task_inner(&state, id.clone()).await.unwrap();
         let task = get_task_detail_inner(&state, id).await.unwrap();
@@ -1415,9 +1468,14 @@ mod tests {
     #[tokio::test]
     async fn test_pause_already_paused_task_fails() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         pause_task_inner(&state, id.clone()).await.unwrap();
         let result = pause_task_inner(&state, id).await;
         assert!(result.is_err());
@@ -1427,9 +1485,14 @@ mod tests {
     #[tokio::test]
     async fn test_resume_non_paused_task_fails() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let result = resume_task_inner(&state, id).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("仅暂停状态可恢复"));
@@ -1438,9 +1501,14 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_pending_task() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         cancel_task_inner(&state, id.clone()).await.unwrap();
         let task = get_task_detail_inner(&state, id).await.unwrap();
         assert_eq!(task.status, DownloadState::Cancelled);
@@ -1449,9 +1517,14 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_already_cancelled_task_fails() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         cancel_task_inner(&state, id.clone()).await.unwrap();
         let result = cancel_task_inner(&state, id).await;
         assert!(result.is_err());
@@ -1461,9 +1534,14 @@ mod tests {
     #[tokio::test]
     async fn test_delete_cancelled_task() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         cancel_task_inner(&state, id.clone()).await.unwrap();
         delete_task_inner(&state, id.clone()).await.unwrap();
         assert!(get_task_detail_inner(&state, id).await.is_err());
@@ -1472,9 +1550,14 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pending_task_fails() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/file.zip".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let result = delete_task_inner(&state, id.clone()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("不允许删除"));
@@ -1483,10 +1566,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_task_list_returns_all_tasks() {
         let state = test_state();
-        let id1 = create_task_inner(&state, "https://example.com/a.zip".to_string(), None)
+        let id1 = create_task_inner(&state, "https://example.com/a.zip".to_string(), None, None)
             .await
             .unwrap();
-        let id2 = create_task_inner(&state, "https://example.com/b.zip".to_string(), None)
+        let id2 = create_task_inner(&state, "https://example.com/b.zip".to_string(), None, None)
             .await
             .unwrap();
         let list = get_task_list_inner(&state).await.unwrap();
@@ -1695,6 +1778,7 @@ mod tests {
             &state,
             "https://example.com/lifecycle.bin".to_string(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1740,9 +1824,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_download_progress() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/progress.bin".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/progress.bin".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let progress = get_download_progress_inner(&state, id.clone())
             .await
             .unwrap();
@@ -1935,9 +2024,14 @@ mod tests {
     #[tokio::test]
     async fn test_any_fragment_failed_detection() {
         let state = test_state();
-        let id = create_task_inner(&state, "https://example.com/fail.bin".to_string(), None)
-            .await
-            .unwrap();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/fail.bin".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
         assert_eq!(task.status, DownloadState::Pending);
         assert_ne!(task.status, DownloadState::Failed);
@@ -1956,13 +2050,14 @@ mod tests {
             cfg.download.download_dir = test_dir_str.clone();
             cfg.download.authorized_dirs = vec![test_dir_str];
         }
-        let _id1 = create_task_inner(&state, "http://example.com/gate1.bin".into(), None)
+        let _id1 = create_task_inner(&state, "http://example.com/gate1.bin".into(), None, None)
             .await
             .unwrap();
-        let _id2 = create_task_inner(&state, "http://example.com/gate2.bin".into(), None)
+        let _id2 = create_task_inner(&state, "http://example.com/gate2.bin".into(), None, None)
             .await
             .unwrap();
-        let result = create_task_inner(&state, "http://example.com/gate3.bin".into(), None).await;
+        let result =
+            create_task_inner(&state, "http://example.com/gate3.bin".into(), None, None).await;
         assert!(result.is_err(), "超过 max_concurrent_tasks 应被拒绝");
         let err = result.unwrap_err();
         assert!(
@@ -1984,13 +2079,14 @@ mod tests {
             cfg.download.download_dir = test_dir_str.clone();
             cfg.download.authorized_dirs = vec![test_dir_str];
         }
-        let _id1 = create_task_inner(&state, "http://example.com/file1.bin".into(), None)
+        let _id1 = create_task_inner(&state, "http://example.com/file1.bin".into(), None, None)
             .await
             .unwrap();
-        let _id2 = create_task_inner(&state, "http://example.com/file2.bin".into(), None)
+        let _id2 = create_task_inner(&state, "http://example.com/file2.bin".into(), None, None)
             .await
             .unwrap();
-        let result = create_task_inner(&state, "http://example.com/file3.bin".into(), None).await;
+        let result =
+            create_task_inner(&state, "http://example.com/file3.bin".into(), None, None).await;
         assert!(result.is_err(), "超过 max_concurrent_tasks 应返回错误");
         assert!(
             result.unwrap_err().to_string().contains("最大并发任务数"),
@@ -2149,7 +2245,7 @@ mod tests {
             cfg.download.max_concurrent_fragments = 0;
         }
         let result =
-            create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None).await;
+            create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None, None).await;
         assert!(
             result.is_err(),
             "max_concurrent_fragments=0 时应拒绝创建任务"
@@ -2168,6 +2264,7 @@ mod tests {
             let id = create_task_inner(
                 &state,
                 format!("http://example.com/deadlock-test-{i}.bin"),
+                None,
                 None,
             )
             .await
@@ -2227,6 +2324,7 @@ mod tests {
                 &state,
                 format!("http://example.com/to-delete-{i}.bin"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2242,6 +2340,7 @@ mod tests {
                 create_task_inner(
                     &state_clone,
                     format!("http://example.com/new-task-{i}.bin"),
+                    None,
                     None,
                 )
                 .await
@@ -2284,6 +2383,7 @@ mod tests {
             &state,
             "http://example.com/pause-resume-test.bin".to_string(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2293,7 +2393,7 @@ mod tests {
         for i in 0..10 {
             let state_clone = state.clone();
             let tid = id.clone();
-            if i % 2 == 0 {
+            if (i as u32).is_multiple_of(2) {
                 handles.push(tokio::spawn(async move {
                     pause_task_inner(&state_clone, tid).await
                 }));
@@ -2321,6 +2421,7 @@ mod tests {
             &state,
             "http://example.com/control-pause.bin".to_string(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2342,6 +2443,7 @@ mod tests {
             &state,
             "https://example.com/status-failed.bin".to_string(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2361,6 +2463,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "http://example.com/control-cancel.bin".to_string(),
+            None,
             None,
         )
         .await
