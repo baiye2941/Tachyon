@@ -1,4 +1,5 @@
-import { createSignal, createEffect, onCleanup, Show, For } from 'solid-js'
+import { createSignal, Show, For, untrack } from 'solid-js'
+import type { JSX } from 'solid-js'
 import type { SidebarFilter } from '../types'
 import {
     FileIcon, VideoIcon, AudioIcon, DocumentIcon, ImageIcon,
@@ -24,10 +25,10 @@ const SIDEBAR_STORAGE_KEY = 'tachyon-sidebar-state'
 const MIN_WIDTH = 60
 const MAX_WIDTH = 300
 const DEFAULT_WIDTH = 200
-const COLLAPSE_THRESHOLD = 120
 const EDGE_ZONE_WIDTH = 20
+type IconComponent = (props: { class?: string }) => JSX.Element
 
-const statusItems: { key: SidebarFilter; label: string; icon: any }[] = [
+const statusItems: { key: SidebarFilter; label: string; icon: IconComponent }[] = [
     { key: 'all', label: '\u5168\u90E8\u6587\u4EF6', icon: FileIcon },
     { key: 'downloading', label: '\u4E0B\u8F7D\u4E2D', icon: FileIcon },
     { key: 'completed', label: '\u5DF2\u5B8C\u6210', icon: FileIcon },
@@ -35,7 +36,7 @@ const statusItems: { key: SidebarFilter; label: string; icon: any }[] = [
     { key: 'failed', label: '\u5931\u8D25', icon: FileIcon },
 ]
 
-const typeItems = [
+const typeItems: { key: string; label: string; icon: IconComponent }[] = [
     { key: 'video', label: '\u89C6\u9891', icon: VideoIcon },
     { key: 'audio', label: '\u97F3\u9891', icon: AudioIcon },
     { key: 'document', label: '\u6587\u6863', icon: DocumentIcon },
@@ -108,8 +109,8 @@ export default function Sidebar(props: SidebarProps) {
         saveSidebarState(width(), next)
     }
 
-    const NavItem = (p: { icon: any; label: string; count: number; active: boolean; onClick: () => void }) => {
-        const Icon = p.icon
+    const NavItem = (p: { icon: IconComponent; label: string; count: number; active: boolean; onClick: () => void }) => {
+        const Icon = untrack(() => p.icon)
         const showText = () => isExpanded()
         return (
             <div
@@ -124,7 +125,7 @@ export default function Sidebar(props: SidebarProps) {
                     transition: 'all 200ms ease',
                     'justify-content': showText() ? 'space-between' : 'center',
                 }}
-                onClick={p.onClick}
+                onClick={() => p.onClick()}
             >
                 <div class="flex items-center min-w-0" style={{ gap: showText() ? '12px' : '0' }}>
                     <div style={{ width: '20px', height: '20px', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'flex-shrink': 0 }}>

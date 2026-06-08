@@ -1,4 +1,4 @@
-import { createMemo, onMount, onCleanup } from 'solid-js'
+import { createMemo, onMount } from 'solid-js'
 import type { TaskInfo } from '../types'
 import { formatSpeed } from '../utils/format'
 
@@ -11,13 +11,6 @@ const MAX_POINTS = 120 // 2 minutes at 1 sample/sec
 export default function SpeedChart(props: SpeedChartProps) {
   let svgRef: SVGSVGElement | undefined
   let dataPoints: number[] = []
-
-  const updateData = () => {
-    dataPoints.push(props.task.speed)
-    if (dataPoints.length > MAX_POINTS) {
-      dataPoints = dataPoints.slice(-MAX_POINTS)
-    }
-  }
 
   // Initialize with some simulated historical data for demo
   onMount(() => {

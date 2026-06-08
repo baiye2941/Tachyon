@@ -1,4 +1,4 @@
-import { createMemo, createSignal, createEffect, Show, onCleanup } from 'solid-js'
+import { createMemo, createSignal, createEffect, Show, onCleanup, untrack } from 'solid-js'
 import type { TaskInfo } from '../types'
 import { formatSize, formatSpeed, getFileType, getStatusLabel, getStatusColor, formatETA, formatDate } from '../utils/format'
 import {
@@ -78,16 +78,18 @@ export default function DetailPanel(props: DetailPanelProps) {
             setShouldRender(false)
             setDisplayTask(null)
             closeTimer = null
-            props.onClose()
+            untrack(() => props.onClose())
         }, 300)
     }
 
     const task = () => displayTask()
-    const fileInfo = createMemo(() => task() ? getFileType(task()!.fileName) : { icon: FileIcon, color: '#6B7280' })
+    const fileInfo = createMemo(() => {
+        const currentTask = task()
+        return currentTask ? getFileType(currentTask.fileName) : { icon: FileIcon, color: '#6B7280' }
+    })
     const isCompleted = () => task()?.status === 'completed'
     const isFailed = () => task()?.status === 'failed'
     const isDownloading = () => task()?.status === 'downloading'
-    const isPaused = () => task()?.status === 'paused'
 
     const eta = createMemo(() => {
         const t = task()
@@ -229,7 +231,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                                 'font-size': '24px',
                                 'font-weight': 700,
                                 color: '#F0F0F5',
-                                'line-height': 1.2,
+                                'line-height': '1.2',
                             }}
                         >
                             {((task()?.progress || 0) * 100).toFixed(1)}%
@@ -343,10 +345,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                         />
                         <InfoRow
                             label={'\u4FDD\u5B58\u8DEF\u5F84'}
-                            value={'C:\\Users\\Downloads'}
-                            copyable
-                            copied={copied() === 'path'}
-                            onCopy={() => copyToClipboard('C:\\Users\\Downloads', 'path')}
+                            value={'默认下载目录'}
                         />
                         <InfoRow
                             label={'\u521B\u5EFA\u65F6\u95F4'}
@@ -400,7 +399,7 @@ function InfoRow(props: { label: string; value: string; copyable?: boolean; copi
                 <button
                     class="icon-btn-sm"
                     style={{ 'flex-shrink': 0, width: '24px', height: '24px' }}
-                    onClick={props.onCopy}
+                    onClick={() => props.onCopy?.()}
                     title={props.copied ? '\u5DF2\u590D\u5236' : '\u590D\u5236'}
                 >
                     <Show when={props.copied} fallback={<CopyIcon />}>

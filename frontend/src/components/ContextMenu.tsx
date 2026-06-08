@@ -116,7 +116,7 @@ export default function ContextMenu(props: ContextMenuProps) {
       <div
         class="fixed inset-0 z-[150]"
         style={{ background: 'transparent' }}
-        onClick={props.onClose}
+        onClick={() => props.onClose()}
       />
       <div
         class="fixed z-[160]"

@@ -2,103 +2,91 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library'
 import HistoryPanel from '../HistoryPanel'
 import StatsDashboard from '../StatsDashboard'
-import type { HistoryRecord, HistoryStats } from '../../stores/history'
+import type { TaskInfo } from '../../types'
+import type { HistoryStats } from '../../stores/history'
 
-const makeRecord = (overrides: Partial<HistoryRecord> = {}): HistoryRecord => ({
+const makeTask = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   id: `id-${Math.random().toString(36).slice(2)}`,
   url: 'https://example.com/file.zip',
   fileName: 'file.zip',
   fileSize: 1024 * 1024,
+  downloaded: 1024 * 1024,
+  progress: 1,
+  speed: 204800,
   status: 'completed',
-  duration: 5000,
-  avgSpeed: 204800,
-  completedAt: '2026-05-30T10:00:00Z',
+  fragmentsTotal: 4,
+  fragmentsDone: 4,
+  createdAt: '2026-05-30T10:00:00Z',
   ...overrides,
 })
 
 describe('HistoryPanel 历史记录面板', () => {
-  const records = [
-    makeRecord({ fileName: 'a.zip', status: 'completed', fileSize: 1024 * 1024 }),
-    makeRecord({ fileName: 'b.zip', status: 'failed', fileSize: 512 * 1024 }),
-    makeRecord({ fileName: 'c.zip', status: 'cancelled', fileSize: 256 * 1024 }),
+  const tasks = [
+    makeTask({ id: 'a', fileName: 'a.zip', status: 'completed', fileSize: 1024 * 1024 }),
+    makeTask({ id: 'b', fileName: 'b.zip', status: 'failed', fileSize: 512 * 1024, progress: 0.2 }),
+    makeTask({ id: 'c', fileName: 'c.zip', status: 'completed', fileSize: 256 * 1024 }),
   ]
 
   beforeEach(() => {
     cleanup()
   })
 
-  it('渲染所有记录', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
+  const renderPanel = (overrides: Partial<Parameters<typeof HistoryPanel>[0]> = {}) => render(() => (
+    <HistoryPanel
+      visible={true}
+      tasks={tasks}
+      onClose={() => {}}
+      onOpenFolder={() => {}}
+      onRedownload={() => {}}
+      onDeleteRecord={() => {}}
+      {...overrides}
+    />
+  ))
+
+  it('只渲染已完成任务记录', () => {
+    renderPanel()
     expect(screen.getByText('a.zip')).toBeDefined()
-    expect(screen.getByText('b.zip')).toBeDefined()
     expect(screen.getByText('c.zip')).toBeDefined()
+    expect(screen.queryByText('b.zip')).toBeNull()
   })
 
-  it('completed 过滤只显示已完成', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
-    const btn = screen.getAllByLabelText('过滤已完成')[0]
-    fireEvent.click(btn)
+  it('搜索历史记录按文件名过滤', () => {
+    renderPanel()
+    fireEvent.input(screen.getByPlaceholderText('搜索历史记录...'), { target: { value: 'a.' } })
     expect(screen.getByText('a.zip')).toBeDefined()
-    expect(screen.queryByText('b.zip')).toBeNull()
     expect(screen.queryByText('c.zip')).toBeNull()
   })
 
-  it('failed 过滤只显示失败', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
-    const btn = screen.getAllByLabelText('过滤失败')[0]
-    fireEvent.click(btn)
-    expect(screen.queryByText('a.zip')).toBeNull()
-    expect(screen.getByText('b.zip')).toBeDefined()
-    expect(screen.queryByText('c.zip')).toBeNull()
+  it('点击删除记录触发 onDeleteRecord', () => {
+    const onDeleteRecord = vi.fn()
+    renderPanel({ onDeleteRecord })
+    fireEvent.click(screen.getByLabelText('删除记录 a.zip'))
+    expect(onDeleteRecord).toHaveBeenCalledWith('a')
   })
 
-  it('cancelled 过滤只显示已取消', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
-    const btn = screen.getAllByLabelText('过滤已取消')[0]
-    fireEvent.click(btn)
-    expect(screen.queryByText('a.zip')).toBeNull()
-    expect(screen.queryByText('b.zip')).toBeNull()
-    expect(screen.getByText('c.zip')).toBeDefined()
+  it('点击重新下载触发 onRedownload 并传回任务', () => {
+    const onRedownload = vi.fn()
+    renderPanel({ onRedownload })
+    fireEvent.click(screen.getByLabelText('重新下载 a.zip'))
+    expect(onRedownload).toHaveBeenCalledWith(expect.objectContaining({ id: 'a', fileName: 'a.zip' }))
   })
 
-  it('点击过滤按钮切换过滤状态', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
-    // 初始显示全部
-    expect(screen.getByText('a.zip')).toBeDefined()
-    expect(screen.getByText('b.zip')).toBeDefined()
-
-    // 点击 completed 过滤
-    const btn = screen.getAllByLabelText('过滤已完成')[0]
-    fireEvent.click(btn)
-    expect(screen.getByText('a.zip')).toBeDefined()
-    expect(screen.queryByText('b.zip')).toBeNull()
-
-    // 再点 all 恢复全部
-    const allBtn = screen.getAllByLabelText('过滤全部')[0]
-    fireEvent.click(allBtn)
-    expect(screen.getByText('a.zip')).toBeDefined()
-    expect(screen.getByText('b.zip')).toBeDefined()
+  it('点击打开目录触发 onOpenFolder', () => {
+    const onOpenFolder = vi.fn()
+    renderPanel({ onOpenFolder })
+    fireEvent.click(screen.getByLabelText('打开目录 a.zip'))
+    expect(onOpenFolder).toHaveBeenCalledWith('a')
   })
 
-  it('点击清除按钮触发 onClear', () => {
-    const onClear = vi.fn()
-    render(() => <HistoryPanel records={records} onClear={onClear} />)
-
-    const clearBtn = screen.getAllByLabelText('清除历史')[0]
-    fireEvent.click(clearBtn)
-    expect(onClear).toHaveBeenCalled()
-  })
-
-  it('空记录显示空状态', () => {
-    render(() => <HistoryPanel records={[]} onClear={() => {}} />)
+  it('没有已完成任务时显示空状态', () => {
+    renderPanel({ tasks: [makeTask({ id: 'failed', status: 'failed', fileName: 'failed.zip' })] })
     expect(screen.getByText('暂无历史记录')).toBeDefined()
   })
 
-  it('显示文件大小和状态', () => {
-    render(() => <HistoryPanel records={records} onClear={() => {}} />)
+  it('显示文件大小和已完成状态', () => {
+    renderPanel()
     expect(screen.getAllByText('1.0 MB').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('已完成').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('失败').length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/已完成/).length).toBeGreaterThan(0)
   })
 })
 

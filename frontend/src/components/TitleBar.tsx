@@ -13,7 +13,7 @@ interface TitleBarProps {
   onOpenSettings: () => void
 }
 
-export default function TitleBar(props: TitleBarProps) {
+export default function TitleBar(_props: TitleBarProps) {
   const [isMaximized, setIsMaximized] = createSignal(false)
   let appWindow: AppWindow | undefined
   let unlistenResize: (() => void) | undefined

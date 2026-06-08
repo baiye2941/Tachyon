@@ -1,5 +1,5 @@
 import { createMemo } from 'solid-js'
-import { StatusDot, ArrowDownIcon, ChevronDownIcon } from './icons'
+import { ArrowDownIcon, ChevronDownIcon } from './icons'
 import Sparkline from './Sparkline'
 import { formatSpeed } from '../utils/format'
 

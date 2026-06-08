@@ -41,8 +41,9 @@ describe('ChannelStore 高频更新', () => {
   let setTasksRaw: ReturnType<typeof createStore<TaskInfo[]>>[1]
 
   beforeEach(() => {
-    createRoot((dispose) => {
+    createRoot((_dispose) => {
       const [store, setter] = createStore<TaskInfo[]>([])
+      // eslint-disable-next-line solid/reactivity -- 测试 harness 需要保留 store 代理供后续断言读取
       tasks = store
       setTasksRaw = setter
     })

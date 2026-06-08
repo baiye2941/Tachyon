@@ -9,7 +9,6 @@ let count = 0
 let sum = 0
 let peak = 0
 
-const [version, setVersion] = createSignal(0)
 const [activeTasks, setActiveTasks] = createSignal(0)
 
 export function pushSpeed(speed: number) {
@@ -33,7 +32,6 @@ export function pushSpeed(speed: number) {
   if (speed > peak) peak = speed
 
   writeIndex = (writeIndex + 1) % HISTORY_SIZE
-  setVersion(v => v + 1)
 }
 
 export function getHistory(): number[] {
@@ -51,7 +49,6 @@ export function clearHistory() {
   count = 0
   sum = 0
   peak = 0
-  setVersion(0)
 }
 
 export function setActiveTasksCount(n: number) {

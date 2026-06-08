@@ -1,4 +1,4 @@
-import { Show, createMemo, onMount, onCleanup } from 'solid-js'
+import { Show, onMount, onCleanup } from 'solid-js'
 import { selectedCount, hasSelection, deselectAll, selectAll } from '../stores/selection'
 import { $tasks } from '../stores/downloads'
 import { Icon } from '../utils/icons'
@@ -13,12 +13,10 @@ interface BatchToolbarProps {
 export default function BatchToolbar(props: BatchToolbarProps) {
   const count = () => selectedCount()
   const visible = () => hasSelection()
-  const taskIds = createMemo(() => $tasks.get().map(t => t.id))
-
-  let handler: ((e: KeyboardEvent) => void) | undefined
+  const taskIds = () => $tasks.get().map(t => t.id)
 
   onMount(() => {
-    handler = (e: KeyboardEvent) => {
+    const handler = (e: KeyboardEvent) => {
       if (e.key === 'Delete' && hasSelection()) {
         e.preventDefault()
         props.onDeleteAll()
@@ -29,10 +27,7 @@ export default function BatchToolbar(props: BatchToolbarProps) {
       }
     }
     document.addEventListener('keydown', handler)
-  })
-
-  onCleanup(() => {
-    if (handler) document.removeEventListener('keydown', handler)
+    onCleanup(() => document.removeEventListener('keydown', handler))
   })
 
   return (

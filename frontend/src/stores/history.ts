@@ -1,4 +1,5 @@
 import { createStore } from 'solid-js/store'
+import { untrack } from 'solid-js'
 
 export type HistoryFilter = 'all' | 'completed' | 'failed' | 'cancelled'
 
@@ -76,13 +77,14 @@ export function addHistoryRecord(
 }
 
 export function getHistoryRecords(filter: HistoryFilter = 'all'): HistoryRecord[] {
-  if (filter === 'all') return [...historyRecords]
-  return historyRecords.filter(r => r.status === filter)
+  const records = untrack(() => historyRecords)
+  if (filter === 'all') return [...records]
+  return records.filter(r => r.status === filter)
 }
 
 // 单次遍历统计，替代原来 3 次 reduce + 3 次 filter
 export function getHistoryStats(): HistoryStats {
-  const records = historyRecords
+  const records = untrack(() => historyRecords)
   let totalBytes = 0
   let totalDuration = 0
   let speedSum = 0
@@ -122,5 +124,6 @@ export function clearHistory(): void {
 }
 
 export function getRecordById(id: string): HistoryRecord | undefined {
-  return historyRecords.find(r => r.id === id)
+  const records = untrack(() => historyRecords)
+  return records.find(r => r.id === id)
 }

@@ -1,10 +1,10 @@
 import { createSignal, createMemo, createEffect, Show, onMount, onCleanup, ErrorBoundary } from 'solid-js'
-import type { SidebarFilter, FileTypeFilter, ListDensity, TaskInfo, SnifferResource } from './types'
+import type { SidebarFilter, FileTypeFilter, ListDensity, TaskInfo, SnifferResource, ViewName } from './types'
 import { api } from './api/invoke'
 import { $tasks, $totalSpeed, $activeCount, refreshTaskList } from './stores/downloads'
 import { useProgressListener } from './hooks/useTauriEvent'
 import * as speedHistory from './stores/speedHistory'
-import { historyRecords, clearHistory } from './stores/history'
+import { $selectedIds, deselectAll, selectAll, toggleSelection } from './stores/selection'
 import TitleBar from './components/TitleBar'
 import Sidebar from './components/Sidebar'
 import Toolbar from './components/Toolbar'
@@ -26,7 +26,6 @@ function AppContent() {
     const [fileTypeFilter] = createSignal<FileTypeFilter>('all')
     const [listDensity, setListDensity] = createSignal<ListDensity>('comfortable')
     const [isMultiSelectMode, setIsMultiSelectMode] = createSignal(false)
-    const [selectedTaskIds, setSelectedTaskIds] = createSignal<Set<string>>(new Set())
     const [showNewTaskModal, setShowNewTaskModal] = createSignal(false)
     const [searchQuery, setSearchQuery] = createSignal('')
     const [searchOpen, setSearchOpen] = createSignal(false)
@@ -208,12 +207,7 @@ function AppContent() {
 
     const handleTaskClick = (taskId: string) => {
         if (isMultiSelectMode()) {
-            setSelectedTaskIds(prev => {
-                const next = new Set(prev)
-                if (next.has(taskId)) next.delete(taskId)
-                else next.add(taskId)
-                return next
-            })
+            toggleSelection(taskId)
         } else {
             setSelectedTaskId(prev => prev === taskId ? null : taskId)
         }
@@ -227,11 +221,35 @@ function AppContent() {
 
     const handleSelectAll = () => {
         const allIds = filteredTasks().map(t => t.id)
-        const current = selectedTaskIds()
+        const current = $selectedIds.get()
         if (current.size === allIds.length) {
-            setSelectedTaskIds(new Set<string>())
+            deselectAll()
         } else {
-            setSelectedTaskIds(new Set(allIds))
+            selectAll(allIds)
+        }
+    }
+
+    const handleBatchAction = (action: (taskId: string) => Promise<unknown>) => {
+        const ids = Array.from($selectedIds.get())
+        Promise.allSettled(ids.map(action)).then(() => {
+            deselectAll()
+            refreshTaskList()
+        }).catch((e) => console.error('batch action', e))
+    }
+
+    const handlePauseSelected = () => handleBatchAction(api.pauseTask)
+    const handleResumeSelected = () => handleBatchAction(api.resumeTask)
+    const handleDeleteSelected = () => handleBatchAction(api.deleteTask)
+
+    const handleViewChange = (view: ViewName) => {
+        setSearchOpen(false)
+        setSnifferVisible(view === 'sniffer')
+        setHistoryVisible(view === 'history')
+        setSettingsVisible(view === 'settings')
+        if (view === 'downloads' || view === 'stats') {
+            setSnifferVisible(false)
+            setHistoryVisible(false)
+            setSettingsVisible(false)
         }
     }
 
@@ -287,16 +305,6 @@ function AppContent() {
     }
 
     const pausedCount = createMemo(() => $tasks.get().filter(t => t.status === 'paused').length)
-
-    // Responsive breakpoints
-    const [windowWidth, setWindowWidth] = createSignal(window.innerWidth)
-    const isMobile = () => windowWidth() < 768
-
-    onMount(() => {
-        const handleResize = () => setWindowWidth(window.innerWidth)
-        window.addEventListener('resize', handleResize)
-        onCleanup(() => window.removeEventListener('resize', handleResize))
-    })
 
     return (
         <div
@@ -365,16 +373,16 @@ function AppContent() {
                         isMultiSelectMode={isMultiSelectMode()}
                         onToggleMultiSelect={() => {
                             setIsMultiSelectMode(v => !v)
-                            setSelectedTaskIds(new Set<string>())
+                            deselectAll()
                         }}
-                        selectedCount={selectedTaskIds().size}
+                        selectedCount={$selectedIds.get().size}
                         onSelectAll={handleSelectAll}
-                        onPauseSelected={() => { }}
-                        onResumeSelected={() => { }}
-                        onDeleteSelected={() => { }}
+                        onPauseSelected={handlePauseSelected}
+                        onResumeSelected={handleResumeSelected}
+                        onDeleteSelected={handleDeleteSelected}
                         onExitMultiSelect={() => {
                             setIsMultiSelectMode(false)
-                            setSelectedTaskIds(new Set<string>())
+                            deselectAll()
                         }}
                         listDensity={listDensity()}
                         onToggleDensity={() => setListDensity(d => d === 'comfortable' ? 'compact' : 'comfortable')}
@@ -389,7 +397,7 @@ function AppContent() {
                             onTaskClick={handleTaskClick}
                             onTaskContextMenu={handleTaskContextMenu}
                             isMultiSelectMode={isMultiSelectMode()}
-                            selectedTaskIds={selectedTaskIds()}
+                            selectedTaskIds={$selectedIds.get()}
                             density={listDensity()}
                             searchQuery={searchQuery()}
                         />
@@ -473,9 +481,17 @@ function AppContent() {
             <CommandPalette
                 open={searchOpen()}
                 onClose={() => setSearchOpen(false)}
+                onViewChange={handleViewChange}
+                onNewDownload={() => setShowNewTaskModal(true)}
+                onPauseAll={handlePauseSelected}
+                onResumeAll={handleResumeSelected}
             />
 
-            <BatchToolbar />
+            <BatchToolbar
+                onPauseAll={handlePauseSelected}
+                onResumeAll={handleResumeSelected}
+                onDeleteAll={handleDeleteSelected}
+            />
         </div>
     )
 }

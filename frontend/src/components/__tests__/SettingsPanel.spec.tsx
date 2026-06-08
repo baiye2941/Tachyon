@@ -17,10 +17,12 @@ vi.mock('../../stores/toast', () => ({
   addToast: vi.fn(),
 }))
 
+const renderSettingsPanel = () => render(() => <SettingsPanel visible={true} onClose={() => undefined} />)
+
 const mockConfig: AppConfig = {
   maxConcurrentTasks: 3,
   download: {
-    downloadDir: 'D:\\Downloads',
+    downloadDir: 'downloads',
     maxConcurrentFragments: 8,
     verifyChecksum: true,
     maxRetries: 3,
@@ -57,28 +59,31 @@ describe('SettingsPanel', () => {
   })
 
   it('渲染 SettingsPanel 时显示加载状态', () => {
-    render(() => <SettingsPanel />)
+    vi.mocked(api.getConfig).mockReturnValue(new Promise(() => {}))
+    renderSettingsPanel()
     expect(screen.getByText('加载配置中...')).toBeDefined()
   })
 
   it('从 api.getConfig 加载配置后正确填充表单字段', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
-    render(() => <SettingsPanel />)
+    renderSettingsPanel()
 
     await waitFor(() => {
       expect(screen.queryByText('加载配置中...')).toBeNull()
     })
 
-    expect(screen.getByDisplayValue('D:\\Downloads')).toBeDefined()
-    expect(screen.getByDisplayValue('3')).toBeDefined()
-    expect(screen.getByDisplayValue('8')).toBeDefined()
-    expect(screen.getByDisplayValue('4')).toBeDefined()
+    expect(screen.getByDisplayValue('downloads')).toBeDefined()
+    fireEvent.click(screen.getByText('下载'))
+    expect((screen.getByLabelText('最大并发任务数') as HTMLInputElement).value).toBe('3')
+    expect((screen.getByLabelText('最大并发分片数') as HTMLInputElement).value).toBe('8')
+    fireEvent.click(screen.getByText('连接'))
+    expect((screen.getByLabelText('每个主机最大连接数') as HTMLInputElement).value).toBe('4')
   })
 
   it('点击保存时调用 api.updateConfig 且参数包含完整的 scheduler 字段', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockResolvedValue(undefined)
-    render(() => <SettingsPanel />)
+    renderSettingsPanel()
 
     await waitFor(() => {
       expect(screen.queryByText('加载配置中...')).toBeNull()
@@ -101,7 +106,7 @@ describe('SettingsPanel', () => {
   it('保存成功时显示 toast 配置已保存', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockResolvedValue(undefined)
-    render(() => <SettingsPanel />)
+    renderSettingsPanel()
 
     await waitFor(() => {
       expect(screen.queryByText('加载配置中...')).toBeNull()
@@ -117,7 +122,7 @@ describe('SettingsPanel', () => {
   it('保存失败时显示 toast 错误信息', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockRejectedValue(new Error('network error'))
-    render(() => <SettingsPanel />)
+    renderSettingsPanel()
 
     await waitFor(() => {
       expect(screen.queryByText('加载配置中...')).toBeNull()

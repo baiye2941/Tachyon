@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For, Show, onMount } from 'solid-js'
+import { createSignal, createEffect, For, Show, onMount, untrack } from 'solid-js'
 import { api } from '../api/invoke'
 import { $config, $configLoading } from '../stores/settings'
 import { addToast } from '../stores/toast'
@@ -14,8 +14,9 @@ interface SettingsPanelProps {
 
 export default function SettingsPanel(props: SettingsPanelProps) {
   const [activeTab, setActiveTab] = createSignal<SettingsTab>('general')
-  const [shouldRender, setShouldRender] = createSignal(false)
-  const [visible, setVisible] = createSignal(false)
+  const initialVisible = untrack(() => props.visible)
+  const [shouldRender, setShouldRender] = createSignal(initialVisible)
+  const [visible, setVisible] = createSignal(initialVisible)
 
   let closeTimer: number | null = null
 
@@ -172,7 +173,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
           opacity: visible() ? 1 : 0,
           transition: 'opacity 250ms ease',
         }}
-        onClick={props.onClose}
+        onClick={() => props.onClose()}
       />
 
       {/* Panel */}
@@ -237,7 +238,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
             </span>
             <button
               class="icon-btn-sm hover-light"
-              onClick={props.onClose}
+              onClick={() => props.onClose()}
             >
               <CloseIcon />
             </button>
@@ -245,146 +246,172 @@ export default function SettingsPanel(props: SettingsPanelProps) {
 
           {/* Scrollable content */}
           <div class="flex-1 overflow-y-auto" style={{ padding: '20px' }}>
-            <Show when={activeTab() === 'general'}>
-              <div class="flex flex-col gap-5">
-                <div>
-                  <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>默认下载路径</div>
-                  <div class="flex items-center gap-2">
-                    <input
-                      type="text"
-                      class="input flex-1"
-                      value={downloadDir()}
-                      onInput={e => setDownloadDir(e.currentTarget.value)}
-                      style={{ 'font-size': '13px' }}
-                    />
-                    <button
-                      class="btn btn-secondary"
-                      style={{ 'font-size': '12px', padding: '6px 12px' }}
-                      onClick={handleChooseDownloadDir}
-                    >
-                      浏览
-                    </button>
+            <Show
+              when={!$configLoading.get()}
+              fallback={<div style={{ color: '#A0A0B0', 'font-size': '14px' }}>加载配置中...</div>}
+            >
+              <Show when={activeTab() === 'general'}>
+                <div class="flex flex-col gap-5">
+                  <div>
+                    <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>默认下载路径</div>
+                    <div class="flex items-center gap-2">
+                      <input
+                        type="text"
+                        class="input flex-1"
+                        value={downloadDir()}
+                        onInput={e => setDownloadDir(e.currentTarget.value)}
+                        style={{ 'font-size': '13px' }}
+                      />
+                      <button
+                        class="btn btn-secondary"
+                        style={{ 'font-size': '12px', padding: '6px 12px' }}
+                        onClick={handleChooseDownloadDir}
+                      >
+                        浏览
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </Show>
+              </Show>
 
-            <Show when={activeTab() === 'download'}>
-              <div class="flex flex-col gap-5">
-                <SliderItem
-                  label="最大并发任务数"
-                  value={maxConcurrentTasks()}
-                  min={1}
-                  max={16}
-                  onChange={setMaxConcurrentTasks}
-                  displayValue={`${maxConcurrentTasks()}`}
-                />
-                <SliderItem
-                  label="最大并发分片数"
-                  value={maxConcurrentFragments()}
-                  min={1}
-                  max={32}
-                  onChange={setMaxConcurrentFragments}
-                  displayValue={`${maxConcurrentFragments()}`}
-                />
-                <SliderItem
-                  label="最大重试次数"
-                  value={maxRetries()}
-                  min={0}
-                  max={10}
-                  onChange={setMaxRetries}
-                  displayValue={`${maxRetries()} 次`}
-                />
-                <ToggleItem label="校验文件完整性" value={verifyChecksum()} onChange={setVerifyChecksum} />
-                <div>
-                  <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>User-Agent</div>
-                  <input
-                    type="text"
-                    class="input"
-                    value={userAgent()}
-                    onInput={e => setUserAgent(e.currentTarget.value)}
-                    placeholder="默认 User-Agent"
-                    style={{ width: '100%', 'font-size': '13px' }}
+              <Show when={activeTab() === 'download'}>
+                <div class="flex flex-col gap-5">
+                  <SliderItem
+                    label="最大并发任务数"
+                    value={maxConcurrentTasks()}
+                    min={1}
+                    max={16}
+                    onChange={setMaxConcurrentTasks}
+                    displayValue={`${maxConcurrentTasks()}`}
+                  />
+                  <SliderItem
+                    label="最大并发分片数"
+                    value={maxConcurrentFragments()}
+                    min={1}
+                    max={32}
+                    onChange={setMaxConcurrentFragments}
+                    displayValue={`${maxConcurrentFragments()}`}
+                  />
+                  <SliderItem
+                    label="最大重试次数"
+                    value={maxRetries()}
+                    min={0}
+                    max={10}
+                    onChange={setMaxRetries}
+                    displayValue={`${maxRetries()} 次`}
+                  />
+                  <ToggleItem label="校验文件完整性" value={verifyChecksum()} onChange={setVerifyChecksum} />
+                  <div>
+                    <div style={{ 'font-size': '13px', color: '#A0A0B0', 'margin-bottom': '8px' }}>User-Agent</div>
+                    <input
+                      type="text"
+                      class="input"
+                      value={userAgent()}
+                      onInput={e => setUserAgent(e.currentTarget.value)}
+                      placeholder="默认 User-Agent"
+                      style={{ width: '100%', 'font-size': '13px' }}
+                    />
+                  </div>
+                </div>
+              </Show>
+
+              <Show when={activeTab() === 'connection'}>
+                <div class="flex flex-col gap-5">
+                  <SliderItem
+                    label="每个主机最大连接数"
+                    value={maxConnectionsPerHost()}
+                    min={1}
+                    max={16}
+                    onChange={setMaxConnectionsPerHost}
+                    displayValue={`${maxConnectionsPerHost()}`}
+                  />
+                  <SliderItem
+                    label="连接超时"
+                    value={connectTimeoutSecs()}
+                    min={5}
+                    max={120}
+                    onChange={setConnectTimeoutSecs}
+                    displayValue={`${connectTimeoutSecs()} 秒`}
+                  />
+                  <ToggleItem label="启用 HTTP/2" value={enableHttp2()} onChange={setEnableHttp2} />
+                  <ToggleItem label="启用 QUIC" value={enableQuic()} onChange={setEnableQuic} />
+                </div>
+              </Show>
+
+              <Show when={activeTab() === 'scheduler'}>
+                <div class="flex flex-col gap-5">
+                  <SliderItem
+                    label="最小分片大小"
+                    value={minFragmentSize()}
+                    min={262144}
+                    max={10485760}
+                    onChange={setMinFragmentSize}
+                    displayValue={`${(minFragmentSize() / 1048576).toFixed(1)} MB`}
+                  />
+                  <SliderItem
+                    label="最大分片大小"
+                    value={maxFragmentSize()}
+                    min={10485760}
+                    max={134217728}
+                    onChange={setMaxFragmentSize}
+                    displayValue={`${(maxFragmentSize() / 1048576).toFixed(0)} MB`}
+                  />
+                  <SliderItem
+                    label="EWMA 平滑系数"
+                    value={ewmaAlpha()}
+                    min={0.1}
+                    max={0.9}
+                    onChange={setEwmaAlpha}
+                    displayValue={ewmaAlpha().toFixed(2)}
                   />
                 </div>
-              </div>
-            </Show>
+              </Show>
 
-            <Show when={activeTab() === 'connection'}>
-              <div class="flex flex-col gap-5">
-                <SliderItem
-                  label="每个主机最大连接数"
-                  value={maxConnectionsPerHost()}
-                  min={1}
-                  max={16}
-                  onChange={setMaxConnectionsPerHost}
-                  displayValue={`${maxConnectionsPerHost()}`}
-                />
-                <SliderItem
-                  label="连接超时"
-                  value={connectTimeoutSecs()}
-                  min={5}
-                  max={120}
-                  onChange={setConnectTimeoutSecs}
-                  displayValue={`${connectTimeoutSecs()} 秒`}
-                />
-                <ToggleItem label="启用 HTTP/2" value={enableHttp2()} onChange={setEnableHttp2} />
-                <ToggleItem label="启用 QUIC" value={enableQuic()} onChange={setEnableQuic} />
-              </div>
-            </Show>
-
-            <Show when={activeTab() === 'scheduler'}>
-              <div class="flex flex-col gap-5">
-                <SliderItem
-                  label="最小分片大小"
-                  value={minFragmentSize()}
-                  min={262144}
-                  max={10485760}
-                  onChange={setMinFragmentSize}
-                  displayValue={`${(minFragmentSize() / 1048576).toFixed(1)} MB`}
-                />
-                <SliderItem
-                  label="最大分片大小"
-                  value={maxFragmentSize()}
-                  min={10485760}
-                  max={134217728}
-                  onChange={setMaxFragmentSize}
-                  displayValue={`${(maxFragmentSize() / 1048576).toFixed(0)} MB`}
-                />
-                <SliderItem
-                  label="EWMA 平滑系数"
-                  value={ewmaAlpha()}
-                  min={0.1}
-                  max={0.9}
-                  onChange={setEwmaAlpha}
-                  displayValue={ewmaAlpha().toFixed(2)}
-                />
-              </div>
-            </Show>
-
-            <Show when={activeTab() === 'about'}>
-              <div class="flex flex-col items-center gap-3" style={{ padding: '40px 20px' }}>
-                <div style={{
-                  width: '48px',
-                  height: '48px',
-                  background: 'linear-gradient(135deg, #00D4AA 0%, #00B4D8 100%)',
-                  'border-radius': '12px',
-                  display: 'flex',
-                  'align-items': 'center',
-                  'justify-content': 'center',
-                  color: '#0A0A0F',
-                  'font-size': '24px',
-                  'font-weight': 700,
-                }}>
-                  T
+              <Show when={activeTab() === 'about'}>
+                <div class="flex flex-col items-center gap-3" style={{ padding: '40px 20px' }}>
+                  <div style={{
+                    width: '48px',
+                    height: '48px',
+                    background: 'linear-gradient(135deg, #00D4AA 0%, #00B4D8 100%)',
+                    'border-radius': '12px',
+                    display: 'flex',
+                    'align-items': 'center',
+                    'justify-content': 'center',
+                    color: '#0A0A0F',
+                    'font-size': '24px',
+                    'font-weight': 700,
+                  }}>
+                    T
+                  </div>
+                  <div style={{ 'font-size': '18px', 'font-weight': 600, color: '#F0F0F5' }}>Tachyon</div>
+                  <div style={{ 'font-size': '13px', color: '#6B7280' }}>版本 0.1.0 · Rust + Tauri</div>
+                  <div style={{ 'font-size': '12px', color: '#4A4A5A', 'margin-top': '8px' }}>
+                    高性能多线程下载加速器
+                  </div>
                 </div>
-                <div style={{ 'font-size': '18px', 'font-weight': 600, color: '#F0F0F5' }}>Tachyon</div>
-                <div style={{ 'font-size': '13px', color: '#6B7280' }}>版本 0.1.0 · Rust + Tauri</div>
-                <div style={{ 'font-size': '12px', color: '#4A4A5A', 'margin-top': '8px' }}>
-                  高性能多线程下载加速器
-                </div>
-              </div>
+              </Show>
             </Show>
+          </div>
+
+          <div
+            class="flex items-center justify-end gap-2"
+            style={{ padding: '12px 20px', 'border-top': '1px solid rgba(255, 255, 255, 0.05)' }}
+          >
+            <button
+              class="btn btn-secondary"
+              style={{ 'font-size': '13px', padding: '7px 14px' }}
+              onClick={() => props.onClose()}
+            >
+              取消
+            </button>
+            <button
+              class="btn-primary"
+              style={{ 'font-size': '13px', padding: '7px 14px' }}
+              disabled={$configLoading.get() || saving()}
+              onClick={handleSave}
+            >
+              {saving() ? '保存中...' : '保存配置'}
+            </button>
           </div>
         </div>
       </div>
@@ -445,6 +472,7 @@ function SliderItem(props: {
       </div>
       <input
         type="range"
+        aria-label={props.label}
         min={props.min}
         max={props.max}
         value={props.value}

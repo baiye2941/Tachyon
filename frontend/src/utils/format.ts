@@ -69,6 +69,21 @@ export function getStatusColor(status: string): string {
     }
 }
 
+export function statusColor(status: string): string {
+    switch (status) {
+        case 'downloading': return 'bg-[#00D4AA]'
+        case 'pending': return 'bg-[#6B7280]'
+        case 'paused': return 'bg-[#F59E0B]'
+        case 'completed': return 'bg-[#00D4AA]'
+        case 'failed': return 'bg-[#EF4444]'
+        case 'connecting':
+        case 'verifying':
+        case 'resuming':
+            return 'bg-[#00B4D8]'
+        default: return 'bg-[#6B7280]'
+    }
+}
+
 export function getStatusLabel(status: string): string {
     switch (status) {
         case 'downloading': return '\u4E0B\u8F7D\u4E2D'

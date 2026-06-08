@@ -1,4 +1,4 @@
-import { For, createSignal, onCleanup } from 'solid-js'
+import { For, createSignal, onCleanup, onMount } from 'solid-js'
 import type { ToastMessage } from '../types'
 import { XIcon } from './icons'
 
@@ -18,6 +18,10 @@ export function addToast(toast: Omit<ToastMessage, 'id'>) {
 
 export function removeToast(id: string) {
   setToasts(prev => prev.filter(t => t.id !== id))
+}
+
+export function getToasts() {
+  return toasts()
 }
 
 export default function ToastContainer() {
@@ -41,21 +45,20 @@ export default function ToastContainer() {
 }
 
 function ToastItem(props: { toast: ToastMessage }) {
-  const [isHovered, setIsHovered] = createSignal(false)
   let timer: number | null = null
 
   const startTimer = () => {
+    const { id, duration } = props.toast
     timer = window.setTimeout(() => {
-      removeToast(props.toast.id)
-    }, props.toast.duration)
+      removeToast(id)
+    }, duration)
   }
 
   const clearTimer = () => {
     if (timer) clearTimeout(timer)
   }
 
-  startTimer()
-
+  onMount(startTimer)
   onCleanup(() => clearTimer())
 
   const indicatorColor = () => {
@@ -83,11 +86,9 @@ function ToastItem(props: { toast: ToastMessage }) {
         animation: 'toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1)',
       }}
       onMouseEnter={() => {
-        setIsHovered(true)
         clearTimer()
       }}
       onMouseLeave={() => {
-        setIsHovered(false)
         startTimer()
       }}
     >

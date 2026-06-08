@@ -26,7 +26,7 @@ export default function NavItem(props: NavItemProps) {
           ? 'text-accent bg-accent-muted'
           : 'text-text-secondary hover:bg-white/[0.04] hover:text-text-primary hover:translate-x-[1px]'
       }`}
-      onClick={props.onClick}
+      onClick={() => props.onClick()}
       onKeyDown={handleKeyDown}
       aria-pressed={props.isActive}
     >

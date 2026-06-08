@@ -1,7 +1,7 @@
-import { createMemo, Show } from 'solid-js'
+import { createMemo, For, Show } from 'solid-js'
 import type { TaskInfo, ListDensity } from '../types'
 import { CheckboxIcon } from './icons'
-import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel, THREAD_COLORS } from '../utils/format'
+import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel } from '../utils/format'
 
 interface TaskItemProps {
   task: TaskInfo
@@ -16,30 +16,37 @@ interface TaskItemProps {
 }
 
 function HighlightedText(props: { text: string; query: string }) {
-  if (!props.query.trim()) return <>{props.text}</>
+  const parts = createMemo(() => {
+    const text = props.text
+    const query = props.query.trim()
 
-  const lowerText = props.text.toLowerCase()
-  const lowerQuery = props.query.toLowerCase()
-  const parts: { text: string; highlight: boolean }[] = []
+    if (!query) return [{ text, highlight: false }]
 
-  let i = 0
-  while (i < props.text.length) {
-    const idx = lowerText.indexOf(lowerQuery, i)
-    if (idx === -1) {
-      parts.push({ text: props.text.slice(i), highlight: false })
-      break
+    const lowerText = text.toLowerCase()
+    const lowerQuery = query.toLowerCase()
+    const result: { text: string; highlight: boolean }[] = []
+
+    let i = 0
+    while (i < text.length) {
+      const idx = lowerText.indexOf(lowerQuery, i)
+      if (idx === -1) {
+        result.push({ text: text.slice(i), highlight: false })
+        break
+      }
+      if (idx > i) {
+        result.push({ text: text.slice(i, idx), highlight: false })
+      }
+      result.push({ text: text.slice(idx, idx + query.length), highlight: true })
+      i = idx + query.length
     }
-    if (idx > i) {
-      parts.push({ text: props.text.slice(i, idx), highlight: false })
-    }
-    parts.push({ text: props.text.slice(idx, idx + props.query.length), highlight: true })
-    i = idx + props.query.length
-  }
+
+    return result
+  })
 
   return (
     <>
-      {parts.map((part, idx) =>
-        part.highlight ? (
+      <For each={parts()}>
+        {(part) => part.highlight ? (
           <span
             style={{
               background: 'rgba(0, 212, 170, 0.2)',
@@ -52,8 +59,8 @@ function HighlightedText(props: { text: string; query: string }) {
           </span>
         ) : (
           <>{part.text}</>
-        )
-      )}
+        )}
+      </For>
     </>
   )
 }
@@ -91,9 +98,9 @@ export default function TaskItem(props: TaskItemProps) {
         'border-left': props.isMultiSelected ? '2px solid #00D4AA' : '2px solid transparent',
         '--stagger-index': props.staggerIndex ?? 0,
       }}
-      onClick={props.onClick}
+      onClick={() => props.onClick()}
       onKeyDown={handleKeyDown}
-      onContextMenu={props.onContextMenu}
+      onContextMenu={(e) => props.onContextMenu?.(e)}
     >
       <div class="flex items-center gap-3">
         <Show when={props.isMultiSelectMode}>

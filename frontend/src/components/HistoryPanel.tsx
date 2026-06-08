@@ -2,7 +2,7 @@ import { createSignal, createMemo, For, Show } from 'solid-js'
 import type { TaskInfo } from '../types'
 import {
   CloseIcon, HistoryIcon, FolderOpenIcon, RefreshIcon, TrashIcon,
-  TrophyIcon, PackageIcon, GlobeIcon, ClockIcon,
+  TrophyIcon, PackageIcon,
 } from './icons'
 import { formatSize, formatSpeed } from '../utils/format'
 
@@ -103,7 +103,8 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           </For>
           <button
             class="icon-btn-sm hover-light"
-            onClick={props.onClose}
+            onClick={() => props.onClose()}
+            aria-label="关闭历史面板"
           >
             <CloseIcon />
           </button>
@@ -207,46 +208,54 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           class="input"
           style={{ width: '100%', 'margin-bottom': '12px', 'font-size': '13px' }}
         />
-        <For each={filteredTasks()}>
-          {(task) => (
-            <div
-              class="flex items-center gap-3 hover-row"
-              style={{
-                padding: '10px 12px',
-                'border-radius': '8px',
-                transition: 'all 150ms ease',
-              }}
-            >
-              <PackageIcon />
-              <div class="flex-1 min-w-0">
-                <div class="truncate" style={{ 'font-size': '14px', color: '#F0F0F5' }}>{task.fileName}</div>
-                <div style={{ 'font-size': '12px', color: '#6B7280' }}>
-                  {formatSize(task.fileSize || 0)} · 已完成 · {timeAgo(task.createdAt)}
+        <Show
+          when={filteredTasks().length > 0}
+          fallback={<div style={{ color: '#6B7280', 'font-size': '13px' }}>暂无历史记录</div>}
+        >
+          <For each={filteredTasks()}>
+            {(task) => (
+              <div
+                class="flex items-center gap-3 hover-row"
+                style={{
+                  padding: '10px 12px',
+                  'border-radius': '8px',
+                  transition: 'all 150ms ease',
+                }}
+              >
+                <PackageIcon />
+                <div class="flex-1 min-w-0">
+                  <div class="truncate" style={{ 'font-size': '14px', color: '#F0F0F5' }}>{task.fileName}</div>
+                  <div style={{ 'font-size': '12px', color: '#6B7280' }}>
+                    {formatSize(task.fileSize || 0)} · 已完成 · {timeAgo(task.createdAt)}
+                  </div>
+                </div>
+                <div class="flex items-center gap-1">
+                  <button
+                    class="icon-btn-sm hover-light"
+                    onClick={() => props.onOpenFolder(task.id)}
+                    aria-label={`打开目录 ${task.fileName}`}
+                  >
+                    <FolderOpenIcon />
+                  </button>
+                  <button
+                    class="icon-btn-sm hover-light"
+                    onClick={() => props.onRedownload(task)}
+                    aria-label={`重新下载 ${task.fileName}`}
+                  >
+                    <RefreshIcon />
+                  </button>
+                  <button
+                    class="icon-btn-sm hover-danger"
+                    onClick={() => props.onDeleteRecord(task.id)}
+                    aria-label={`删除记录 ${task.fileName}`}
+                  >
+                    <TrashIcon />
+                  </button>
                 </div>
               </div>
-              <div class="flex items-center gap-1">
-                <button
-                  class="icon-btn-sm hover-light"
-                  onClick={() => props.onOpenFolder(task.id)}
-                >
-                  <FolderOpenIcon />
-                </button>
-                <button
-                  class="icon-btn-sm hover-light"
-                  onClick={() => props.onRedownload(task)}
-                >
-                  <RefreshIcon />
-                </button>
-                <button
-                  class="icon-btn-sm hover-danger"
-                  onClick={() => props.onDeleteRecord(task.id)}
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            </div>
-          )}
-        </For>
+            )}
+          </For>
+        </Show>
       </div>
     </div>
   )

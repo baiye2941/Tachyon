@@ -89,7 +89,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
         </div>
         <button
           class="icon-btn-sm hover-light"
-          onClick={props.onClose}
+          onClick={() => props.onClose()}
         >
           <CloseIcon />
         </button>

@@ -1,5 +1,5 @@
 import { createSignal } from 'solid-js'
-import { CloseIcon, FolderOpenIcon, PlusIcon, CheckboxIcon } from './icons'
+import { CloseIcon, FolderOpenIcon, PlusIcon } from './icons'
 import { api } from '../api/invoke'
 import { addToast } from '../stores/toast'
 
@@ -9,7 +9,7 @@ interface NewTaskModalProps {
 
 export default function NewTaskModal(props: NewTaskModalProps) {
   const [url, setUrl] = createSignal('')
-  const [savePath, setSavePath] = createSignal('C:\\Users\\Default\\Downloads')
+  const [savePath, setSavePath] = createSignal('')
   const [autoStart, setAutoStart] = createSignal(true)
   const [isDragOver, setIsDragOver] = createSignal(false)
 
@@ -36,7 +36,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       await api.createTask(urlValue)
       addToast('任务已创建', 'success')
       setUrl('')
-      setSavePath('C:\\Users\\Default\\Downloads')
+      setSavePath('')
       setAutoStart(true)
       props.onClose()
     } catch (err) {
@@ -52,7 +52,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
         background: 'rgba(0, 0, 0, 0.6)',
         'backdrop-filter': 'blur(4px)',
       }}
-      onClick={props.onClose}
+      onClick={() => props.onClose()}
     >
       <div
         class="glass-strong"
@@ -86,7 +86,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               border: 'none',
               cursor: 'pointer',
             }}
-            onClick={props.onClose}
+            onClick={() => props.onClose()}
           >
             <CloseIcon />
           </button>
@@ -143,7 +143,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           <div class="flex items-center gap-2">
             <input
               type="text"
-              placeholder="暂由全局配置控制"
+              placeholder="默认下载目录"
               value={savePath()}
               onInput={e => setSavePath(e.currentTarget.value)}
               class="input"
@@ -211,7 +211,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               border: 'none',
               cursor: 'pointer',
             }}
-            onClick={props.onClose}
+            onClick={() => props.onClose()}
           >
             取消
           </button>

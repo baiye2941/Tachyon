@@ -23,13 +23,15 @@ export default function Layout(props: LayoutProps) {
   return (
     <div class="min-h-[100dvh] h-[100dvh] bg-canvas text-text-primary flex flex-col">
       <TitleBar
-        onPauseAll={props.onPauseAll}
-        onOpenSearch={props.onOpenSearch}
+        onOpenSettings={() => props.onViewChange('settings')}
       />
       <div class="flex-1 flex min-h-0">
         <Sidebar
-          currentView={props.currentView}
-          onViewChange={props.onViewChange}
+          filter="all"
+          onFilterChange={() => props.onViewChange('downloads')}
+          taskCounts={{ all: 0, downloading: 0, completed: 0, paused: 0, failed: 0 }}
+          onOpenSniffer={() => props.onViewChange('sniffer')}
+          onOpenHistory={() => props.onViewChange('history')}
         />
 
         <main class="relative min-w-0 flex-1 flex flex-col overflow-hidden">

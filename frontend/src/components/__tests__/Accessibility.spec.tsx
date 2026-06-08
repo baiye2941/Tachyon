@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library'
+import { describe, it, expect, vi } from 'vitest'
+import { render, fireEvent } from '@solidjs/testing-library'
 import TaskItem from '../TaskItem'
 import TitleBar from '../TitleBar'
 import type { TaskInfo } from '../../types'
@@ -36,11 +36,13 @@ describe('Accessibility Tests', () => {
     fileName: 'test-file.zip',
     url: 'https://example.com/test.zip',
     fileSize: 1024000,
+    downloaded: 512000,
     progress: 0.5,
     speed: 1048576,
     status: 'downloading',
-    createdAt: Date.now(),
-    threads: 4,
+    fragmentsTotal: 4,
+    fragmentsDone: 2,
+    createdAt: '2026-05-30T00:00:00Z',
   }
 
   describe('prefers-reduced-motion 支持', () => {
@@ -66,7 +68,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -79,8 +81,7 @@ describe('Accessibility Tests', () => {
 
     it('应该在用户设置 prefers-reduced-motion 时禁用动画', () => {
       // 模拟 prefers-reduced-motion: reduce
-      const mediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
-      const originalMatches = mediaQuery.matches
+      window.matchMedia('(prefers-reduced-motion: reduce)')
 
       // 注入 CSS 规则
       const style = document.createElement('style')
@@ -98,7 +99,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -146,7 +147,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -193,7 +194,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -212,7 +213,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={onClick}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -232,7 +233,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={onClick}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -252,7 +253,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={onClick}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -275,7 +276,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -296,7 +297,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={true}
           isMultiSelectMode={true}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -313,7 +314,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={true}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -333,7 +334,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 
@@ -355,7 +356,7 @@ describe('Accessibility Tests', () => {
           isMultiSelected={false}
           isMultiSelectMode={false}
           onClick={() => {}}
-          density="normal"
+          density="comfortable"
         />
       ))
 

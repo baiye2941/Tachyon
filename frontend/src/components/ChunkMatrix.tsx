@@ -1,4 +1,4 @@
-import { For, createMemo, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
 import { THREAD_COLORS } from '../utils/format'
 
 interface ChunkMatrixProps {
@@ -9,7 +9,6 @@ interface ChunkMatrixProps {
 
 export default function ChunkMatrix(props: ChunkMatrixProps) {
     const chunksPerRow = 25
-    const [hoveredIndex, setHoveredIndex] = createSignal<number | null>(null)
     const [tooltipIndex, setTooltipIndex] = createSignal<number | null>(null)
     const [cursorPos, setCursorPos] = createSignal({ x: 0, y: 0 })
     let tooltipTimer: number | null = null
@@ -17,7 +16,6 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
     const showTooltip = (index: number) => {
         if (tooltipTimer !== null) clearTimeout(tooltipTimer)
-        setHoveredIndex(index)
         tooltipTimer = window.setTimeout(() => {
             setTooltipIndex(index)
             tooltipTimer = null
@@ -29,7 +27,6 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
             clearTimeout(tooltipTimer)
             tooltipTimer = null
         }
-        setHoveredIndex(null)
         setTooltipIndex(null)
     }
 
@@ -46,9 +43,10 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const chunks = createMemo(() => {
         const total = props.fragmentsTotal
         const done = props.fragmentsDone
+        const progress = props.progress
         return Array.from({ length: total }, (_, i) => {
             const isDone = i < done
-            const isDownloading = i === done && props.progress < 1
+            const isDownloading = i === done && progress < 1
             const threadId = i % THREAD_COLORS.length
             return {
                 index: i,
@@ -65,6 +63,22 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
         if (chunk.isDownloading) return '\u4E0B\u8F7D\u4E2D'
         return '\u7B49\u5F85\u4E2D'
     }
+
+    const tooltipInfo = createMemo(() => {
+        const idx = tooltipIndex()
+        if (idx === null) return null
+        const chunkList = chunks()
+        const chunk = chunkList[idx]
+        if (!chunk) return null
+        const pos = cursorPos()
+        return {
+            idx,
+            chunk,
+            total: chunkList.length,
+            left: Math.min(pos.x + 12, (gridRef?.clientWidth || 360) - 160),
+            top: pos.y - 60,
+        }
+    })
 
     return (
         <div>
@@ -118,40 +132,35 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                 </div>
 
                 {/* Tooltip */}
-                {tooltipIndex() !== null && (() => {
-                    const idx = tooltipIndex()!
-                    const chunkList = chunks()
-                    const chunk = chunkList[idx]
-                    if (!chunk) return null
-                    const pos = cursorPos()
-                    return (
+                <Show when={tooltipInfo()} keyed>
+                    {(tooltip) => (
                         <div
                             class="chunk-tooltip"
                             style={{
-                                left: `${Math.min(pos.x + 12, (gridRef?.clientWidth || 360) - 160)}px`,
-                                top: `${pos.y - 60}px`,
+                                left: `${tooltip.left}px`,
+                                top: `${tooltip.top}px`,
                             }}
                         >
                             <div
                                 class="chunk-tooltip-dot"
-                                style={{ background: chunk.isDone || chunk.isDownloading ? chunk.color : '#1A1A25' }}
+                                style={{ background: tooltip.chunk.isDone || tooltip.chunk.isDownloading ? tooltip.chunk.color : '#1A1A25' }}
                             />
                             <div class="chunk-tooltip-body">
                                 <div class="chunk-tooltip-title">
-                                    {'\u5206\u7247'} #{idx + 1}
-                                    <span class="chunk-tooltip-subtitle">/ {chunkList.length}</span>
+                                    {'\u5206\u7247'} #{tooltip.idx + 1}
+                                    <span class="chunk-tooltip-subtitle">/ {tooltip.total}</span>
                                 </div>
                                 <div class="chunk-tooltip-meta">
-                                    <span style={{ color: chunk.isDone ? '#00D4AA' : chunk.isDownloading ? '#00B4D8' : '#6B7280' }}>
-                                        {statusLabel(chunk)}
+                                    <span style={{ color: tooltip.chunk.isDone ? '#00D4AA' : tooltip.chunk.isDownloading ? '#00B4D8' : '#6B7280' }}>
+                                        {statusLabel(tooltip.chunk)}
                                     </span>
                                     <span class="chunk-tooltip-sep">{'\u00B7'}</span>
-                                    <span style={{ color: chunk.color }}>{'T'}{chunk.threadId + 1}</span>
+                                    <span style={{ color: tooltip.chunk.color }}>{'T'}{tooltip.chunk.threadId + 1}</span>
                                 </div>
                             </div>
                         </div>
-                    )
-                })()}
+                    )}
+                </Show>
 
                 {/* Legend */}
                 <div class="flex items-center gap-4" style={{ 'margin-top': '12px' }}>
