@@ -414,6 +414,9 @@ pub struct DownloadTask {
     #[allow(dead_code)]
     verifier: VerifierKind,
     completed_fragments: Vec<u32>,
+    /// 外部共享限速器(跨任务全局限速)。
+    /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl DownloadTask {
@@ -496,7 +499,16 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            rate_limiter: None,
         })
+    }
+
+    /// 设置共享限速器(跨任务全局限速)
+    ///
+    /// 多个 DownloadTask 可共享同一个 `Arc<RateLimiter>` 实例,
+    /// 确保所有并发下载的总带宽不超过配置上限。
+    pub fn set_rate_limiter(&mut self, limiter: Arc<RateLimiter>) {
+        self.rate_limiter = Some(limiter);
     }
 
     /// 使用主 URL + 备用镜像 URL 创建下载任务
@@ -541,6 +553,7 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            rate_limiter: None,
         })
     }
 
@@ -567,6 +580,7 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            rate_limiter: None,
         }
     }
 
@@ -859,12 +873,13 @@ impl DownloadTask {
         };
         let start_instant = std::time::Instant::now();
 
-        // 创建限速器(如配置了速率限制)
-        let rate_limiter: Option<Arc<RateLimiter>> = self
-            .config
-            .rate_limit_bytes_per_sec
-            .filter(|&bps| bps > 0)
-            .map(|bps| Arc::new(RateLimiter::new(bps)));
+        // 优先使用外部共享限速器(跨任务全局限速),否则从配置创建 per-task 限速器
+        let rate_limiter: Option<Arc<RateLimiter>> = self.rate_limiter.clone().or_else(|| {
+            self.config
+                .rate_limit_bytes_per_sec
+                .filter(|&bps| bps > 0)
+                .map(|bps| Arc::new(RateLimiter::new(bps)))
+        });
 
         // 获取流式响应(控制信号可在建立连接阶段中断)
         let stream = if let Some(rx) = self.control_rx.as_mut() {
@@ -973,11 +988,13 @@ impl DownloadTask {
         let control_rx = self.control_rx.clone();
         let progress_tx = self.progress_tx.clone();
         let max_retries = self.config.max_retries;
-        let rate_limiter: Option<Arc<RateLimiter>> = self
-            .config
-            .rate_limit_bytes_per_sec
-            .filter(|&bps| bps > 0)
-            .map(|bps| Arc::new(RateLimiter::new(bps)));
+        // 优先使用外部共享限速器(跨任务全局限速),否则从配置创建 per-task 限速器
+        let rate_limiter: Option<Arc<RateLimiter>> = self.rate_limiter.clone().or_else(|| {
+            self.config
+                .rate_limit_bytes_per_sec
+                .filter(|&bps| bps > 0)
+                .map(|bps| Arc::new(RateLimiter::new(bps)))
+        });
         tracing::info!(
             has_progress_tx = progress_tx.is_some(),
             frag_count = self.fragments.len(),
@@ -3876,6 +3893,29 @@ mod tests {
         task.prepare_storage().await.unwrap();
         task.execute().await.expect("其余分片应成功下载");
         assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// 共享限速器跨任务生效:设置 set_rate_limiter 后下载应使用该限速器
+    #[tokio::test]
+    async fn test_shared_rate_limiter_is_used() {
+        let total_size = 400u64;
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("shared_limiter.bin", total_size),
+            frag_size: 100,
+            fail_start: u64::MAX, // 不注入失败
+            fail_times: 0,
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total_size, 100, 0);
+        // 设置一个极高速限速器(不应阻塞下载)
+        let limiter = Arc::new(RateLimiter::new(u64::MAX));
+        task.set_rate_limiter(limiter);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("共享限速器不应阻止下载完成");
+        assert_eq!(task.state(), DownloadState::Completed);
     }
 
     /// 测试协议:指定分片的前 N 次请求返回固定分类错误,之后成功。
