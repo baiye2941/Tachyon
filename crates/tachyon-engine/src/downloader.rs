@@ -381,8 +381,22 @@ impl Protocol for MirrorProtocol {
         url: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
         let primary = self.primary.clone();
+        let mirrors = self.mirrors.clone();
         let url = url.to_string();
-        Box::pin(async move { primary.download_full(&url).await })
+        Box::pin(async move {
+            match primary.download_full(&url).await {
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    for (mirror_url, mirror_proto) in &mirrors {
+                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像(全量)");
+                        if let Ok(data) = mirror_proto.download_full(mirror_url).await {
+                            return Ok(data);
+                        }
+                    }
+                    Err(e)
+                }
+            }
+        })
     }
 }
 
@@ -4090,5 +4104,144 @@ mod tests {
             DynStorage::open_with_strategy(tmp.path(), tachyon_core::config::IoStrategy::Iocp)
                 .await;
         assert!(storage.is_ok(), "Iocp 策略应成功打开存储");
+    }
+
+    // ── MirrorProtocol 测试 ──
+
+    /// 始终返回网络错误的 mock 协议
+    struct AlwaysFailProtocol {
+        meta: FileMetadata,
+    }
+
+    impl Clone for AlwaysFailProtocol {
+        fn clone(&self) -> Self {
+            Self {
+                meta: self.meta.clone(),
+            }
+        }
+    }
+
+    impl Protocol for AlwaysFailProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+        fn download_range(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async { Err(DownloadError::Network("主源不可用".into())) })
+        }
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
+        {
+            Box::pin(async { Err(DownloadError::Network("主源不可用(流)".into())) })
+        }
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async { Err(DownloadError::Network("主源不可用(全量)".into())) })
+        }
+    }
+
+    /// 镜像回退:主源 download_range 失败时回退到镜像
+    #[tokio::test]
+    async fn test_mirror_fallback_on_range_failure() {
+        use super::MirrorProtocol;
+        let meta = test_metadata("mirror.bin", 100);
+        let primary: Arc<dyn Protocol> = Arc::new(AlwaysFailProtocol { meta: meta.clone() });
+        let mirror: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_range_data(0, 99, Bytes::from(vec![0xAA; 100])));
+        let mirror_proto =
+            MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
+
+        let result = mirror_proto
+            .download_range("http://primary.com", 0, 99)
+            .await;
+        assert!(result.is_ok(), "镜像回退应成功");
+        assert_eq!(result.unwrap().len(), 100);
+    }
+
+    /// 镜像回退:主源 download_range_stream 失败时回退到镜像
+    #[tokio::test]
+    async fn test_mirror_fallback_on_stream_failure() {
+        use super::MirrorProtocol;
+        let meta = test_metadata("mirror_stream.bin", 100);
+        let primary: Arc<dyn Protocol> = Arc::new(AlwaysFailProtocol { meta: meta.clone() });
+        let mirror: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_range_data(0, 99, Bytes::from(vec![0xBB; 100])));
+        let mirror_proto =
+            MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
+
+        let result = mirror_proto
+            .download_range_stream("http://primary.com", 0, 99)
+            .await;
+        assert!(result.is_ok(), "镜像流式回退应成功");
+    }
+
+    /// 镜像回退:主源 download_full 失败时回退到镜像
+    #[tokio::test]
+    async fn test_mirror_fallback_on_full_failure() {
+        use super::MirrorProtocol;
+        let meta = test_metadata("mirror_full.bin", 100);
+        let primary: Arc<dyn Protocol> = Arc::new(AlwaysFailProtocol { meta: meta.clone() });
+        let mirror: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_default_data(Bytes::from(vec![0xCC; 100])));
+        let mirror_proto =
+            MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
+
+        let result = mirror_proto.download_full("http://primary.com").await;
+        assert!(result.is_ok(), "镜像全量回退应成功");
+    }
+
+    /// 主源成功时不回退到镜像
+    #[tokio::test]
+    async fn test_mirror_uses_primary_when_success() {
+        use super::MirrorProtocol;
+        let meta = test_metadata("primary_ok.bin", 50);
+        let primary: Arc<dyn Protocol> = Arc::new(MockProto::new(meta.clone()).with_range_data(
+            0,
+            49,
+            Bytes::from(vec![0xDD; 50]),
+        ));
+        // 镜像不应被调用(用 AlwaysFailProtocol 验证)
+        let mirror: Arc<dyn Protocol> = Arc::new(AlwaysFailProtocol { meta });
+        let mirror_proto =
+            MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
+
+        let result = mirror_proto
+            .download_range("http://primary.com", 0, 49)
+            .await;
+        assert!(result.is_ok(), "主源成功时应直接返回");
+    }
+
+    /// 所有源均失败时返回主源错误
+    #[tokio::test]
+    async fn test_mirror_returns_primary_error_when_all_fail() {
+        use super::MirrorProtocol;
+        let meta = test_metadata("all_fail.bin", 100);
+        let fail_proto: Arc<dyn Protocol> = Arc::new(AlwaysFailProtocol { meta });
+        let mirror_proto = MirrorProtocol::new(
+            fail_proto.clone(),
+            vec![("http://mirror1.com".into(), fail_proto)],
+        );
+
+        let result = mirror_proto
+            .download_range("http://primary.com", 0, 99)
+            .await;
+        assert!(result.is_err(), "所有源失败时应返回错误");
     }
 }
