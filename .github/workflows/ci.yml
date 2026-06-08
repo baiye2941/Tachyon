@@ -104,10 +104,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@main
-      - name: 安装 cargo-llvm-cov (预编译二进制)
-        run: cargo binstall -y cargo-llvm-cov
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: 运行覆盖率检查
         run: cargo llvm-cov --all --fail-under-lines 80
 
