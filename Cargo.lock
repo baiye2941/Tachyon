@@ -4200,6 +4200,7 @@ dependencies = [
  "serde_json",
  "tachyon-core",
  "tachyon-engine",
+ "tachyon-hub",
  "tachyon-scheduler",
  "tachyon-sniffer",
  "tachyon-store",

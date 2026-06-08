@@ -118,7 +118,10 @@ impl AsyncStorage for TokioFile {
     }
 
     async fn close(&self) -> DownloadResult<()> {
-        self.close().await
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
     }
 }
 
@@ -179,7 +182,10 @@ impl AsyncStorage for TokioFile {
     }
 
     async fn close(&self) -> DownloadResult<()> {
-        self.close().await
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
     }
 }
 
@@ -233,7 +239,10 @@ impl AsyncStorage for TokioFile {
     }
 
     async fn close(&self) -> DownloadResult<()> {
-        self.close().await
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
     }
 }
 
