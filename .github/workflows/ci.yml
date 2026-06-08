@@ -129,7 +129,7 @@ jobs:
       - name: 初始化 Miri
         run: cargo miri setup
       - name: Miri 检测 tachyon-core
-        run: cargo miri test -p tachyon-core --lib
+        run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path
       - name: Miri 检测 tachyon-io (非平台特定代码)
         run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring
 

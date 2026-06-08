@@ -741,7 +741,6 @@ mod tests {
         assert!(result.is_absolute(), "返回路径应为绝对路径: {:?}", result);
     }
 
-    #[cfg(not(miri))]
     #[tokio::test]
     async fn test_validate_save_path_concurrent_access() {
         use std::sync::Arc;
