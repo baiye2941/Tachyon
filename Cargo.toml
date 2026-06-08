@@ -126,6 +126,10 @@ harness = false
 name = "write_pipeline"
 harness = false
 
+[[bench]]
+name = "e2e_download"
+harness = false
+
 [profile.dev]
 opt-level = 1
 incremental = true
