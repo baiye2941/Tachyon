@@ -9,14 +9,16 @@
 //! 令牌不足时,计算精确等待时间后 sleep。初始令牌等于速率值,允许首秒满速突发。
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// 令牌桶限速器
 ///
 /// 线程安全,可跨多个异步分片任务共享。
+/// 支持运行时动态更新速率(bytes_per_sec),用于带宽自适应限速。
 pub struct RateLimiter {
     state: Mutex<BucketState>,
-    bytes_per_sec: u64,
+    bytes_per_sec: AtomicU64,
 }
 
 struct BucketState {
@@ -36,7 +38,7 @@ impl RateLimiter {
                 tokens: bytes_per_sec as f64,
                 last_refill: Instant::now(),
             }),
-            bytes_per_sec,
+            bytes_per_sec: AtomicU64::new(bytes_per_sec),
         }
     }
 
@@ -45,7 +47,8 @@ impl RateLimiter {
     /// 调用方在每次存储写入后调用此方法,传入实际写入的字节数。
     /// 令牌充足时立即返回;不足时计算精确等待时间后返回。
     pub async fn acquire(&self, bytes: u64) {
-        if self.bytes_per_sec == 0 || bytes == 0 {
+        let rate = self.bytes_per_sec.load(Ordering::Relaxed);
+        if rate == 0 || bytes == 0 {
             return;
         }
 
@@ -59,8 +62,8 @@ impl RateLimiter {
             state.last_refill = now;
 
             // 补充令牌(不超过桶容量)
-            let capacity = self.bytes_per_sec as f64;
-            state.tokens = (state.tokens + elapsed * self.bytes_per_sec as f64).min(capacity);
+            let capacity = rate as f64;
+            state.tokens = (state.tokens + elapsed * rate as f64).min(capacity);
 
             if state.tokens >= bytes as f64 {
                 state.tokens -= bytes as f64;
@@ -68,7 +71,7 @@ impl RateLimiter {
             } else {
                 let deficit = bytes as f64 - state.tokens;
                 state.tokens = 0.0;
-                deficit / self.bytes_per_sec as f64
+                deficit / rate as f64
             }
         };
 
@@ -77,9 +80,17 @@ impl RateLimiter {
         }
     }
 
-    /// 获取配置的速率(bytes/sec)
+    /// 动态更新限速速率(bytes/sec)
+    ///
+    /// 用于带宽自适应:根据调度器的带宽观测值动态调整限速。
+    /// 更新立即生效,正在进行的 acquire 等待不受影响。
+    pub fn update_rate(&self, bytes_per_sec: u64) {
+        self.bytes_per_sec.store(bytes_per_sec, Ordering::Relaxed);
+    }
+
+    /// 获取当前速率(bytes/sec)
     pub fn bytes_per_sec(&self) -> u64 {
-        self.bytes_per_sec
+        self.bytes_per_sec.load(Ordering::Relaxed)
     }
 }
 
@@ -141,5 +152,28 @@ mod tests {
     async fn bytes_per_sec_returns_configured_value() {
         let limiter = RateLimiter::new(4096);
         assert_eq!(limiter.bytes_per_sec(), 4096);
+    }
+
+    #[tokio::test]
+    async fn update_rate_changes_bytes_per_sec() {
+        let limiter = RateLimiter::new(1024);
+        assert_eq!(limiter.bytes_per_sec(), 1024);
+        limiter.update_rate(2048);
+        assert_eq!(limiter.bytes_per_sec(), 2048);
+    }
+
+    #[tokio::test]
+    async fn update_rate_to_zero_disables_limiting() {
+        let limiter = RateLimiter::new(100);
+        // 消耗初始令牌
+        limiter.acquire(100).await;
+        // 更新为 0 应禁用限速
+        limiter.update_rate(0);
+        let start = Instant::now();
+        limiter.acquire(1000).await;
+        assert!(
+            start.elapsed().as_millis() < 10,
+            "rate=0 时 acquire 应立即返回"
+        );
     }
 }
