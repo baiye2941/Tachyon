@@ -79,6 +79,23 @@ impl DownloadError {
     pub fn protocol_with_source<E: std::fmt::Display>(msg: &str, source: E) -> Self {
         DownloadError::Protocol(format!("{msg}: {source}"))
     }
+
+    /// 判断错误是否值得重试
+    ///
+    /// - 取消、超时、权限错误不重试
+    /// - 校验失败不重试(数据已损坏)
+    /// - 其他错误(网络、协议、I/O、限流等)可重试
+    pub fn is_retryable(&self) -> bool {
+        !matches!(
+            self,
+            DownloadError::Cancelled
+                | DownloadError::Timeout(_)
+                | DownloadError::Forbidden { .. }
+                | DownloadError::ChecksumMismatch { .. }
+                | DownloadError::TaskNotFound(_)
+                | DownloadError::Config(_)
+        )
+    }
 }
 
 pub type DownloadResult<T> = Result<T, DownloadError>;
@@ -238,5 +255,45 @@ mod tests {
         assert!(matches!(err, DownloadError::Protocol(_)));
         assert!(err.to_string().contains("FTP 登录失败"));
         assert!(err.to_string().contains("数据格式错误"));
+    }
+
+    #[test]
+    fn test_is_retryable_returns_false_for_non_retryable() {
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::Timeout("30s".into()).is_retryable());
+        assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
+        assert!(!DownloadError::ChecksumMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        }
+        .is_retryable());
+        assert!(!DownloadError::TaskNotFound("x".into()).is_retryable());
+        assert!(!DownloadError::Config("bad".into()).is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_returns_true_for_retryable() {
+        assert!(DownloadError::Network("timeout".into()).is_retryable());
+        assert!(DownloadError::Protocol("bad response".into()).is_retryable());
+        assert!(DownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))
+        .is_retryable());
+        assert!(DownloadError::Fragment("short write".into()).is_retryable());
+        assert!(DownloadError::Throttled {
+            retry_after_secs: Some(5)
+        }
+        .is_retryable());
+        assert!(DownloadError::Throttled {
+            retry_after_secs: None
+        }
+        .is_retryable());
+        assert!(DownloadError::Http {
+            status: 500,
+            reason: "Internal Server Error".into(),
+        }
+        .is_retryable());
+        assert!(DownloadError::Other("unknown".into()).is_retryable());
     }
 }

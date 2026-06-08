@@ -1046,12 +1046,8 @@ impl DownloadTask {
                             return Ok((frag_index, downloaded, duration));
                         }
                         Err(e) => {
-                            // 取消/暂停超时等控制类错误不重试,直接上报
-                            if matches!(e, DownloadError::Cancelled | DownloadError::Timeout(_)) {
-                                return Err((frag_index, e));
-                            }
-                            // 权限错误(401/403)重试无意义,立即终止该分片
-                            if matches!(e, DownloadError::Forbidden { .. }) {
+                            // 不可重试的错误(取消、超时、权限、校验等)直接上报
+                            if !e.is_retryable() {
                                 return Err((frag_index, e));
                             }
                             if attempt >= max_retries {
