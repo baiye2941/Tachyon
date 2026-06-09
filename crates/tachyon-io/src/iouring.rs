@@ -280,9 +280,12 @@ impl IoUringStorage {
             .collect();
 
         // 注意:注册需要可变引用,在 Mutex 包裹之前完成
-        ring.submitter()
-            .register_buffers(&iovecs)
-            .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
+        // SAFETY: iovecs 引用的 buf 生命周期覆盖整个 ring 的使用期
+        unsafe {
+            ring.submitter()
+                .register_buffers(&iovecs)
+                .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
+        }
 
         // 步骤 4: 以 O_DIRECT 打开文件
         // O_DIRECT 绕过页缓存,配合 fixed buffer 实现真正零拷贝
