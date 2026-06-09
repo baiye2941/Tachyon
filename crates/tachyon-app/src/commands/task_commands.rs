@@ -11,12 +11,12 @@ use tokio::sync::watch;
 use url::Url;
 use uuid::Uuid;
 
+use super::config_commands::authorize_download_dir;
 use super::{
     AppError, AppState, ProgressEvent, TaskInfo, TaskProgress, build_download_config,
     cleanup_runtime, now_iso8601, persist_task_snapshot, rewrite_hf_url, update_task_status,
     validate_download_url,
 };
-use super::config_commands::authorize_download_dir;
 
 // ---------------------------------------------------------------------------
 // Core download task function
@@ -88,7 +88,14 @@ pub(crate) async fn task_fn(
     let mut download_task = match mirror_urls {
         Some(mirrors) if !mirrors.is_empty() => {
             tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
-            match DownloadTask::with_mirrors(url.clone(), mirrors, download_config, Some(connection_pool)).await {
+            match DownloadTask::with_mirrors(
+                url.clone(),
+                mirrors,
+                download_config,
+                Some(connection_pool),
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(task_id = %task_id, error = %e, "创建镜像 DownloadTask 失败");
@@ -632,10 +639,7 @@ pub(crate) async fn create_task_inner(
     Ok(task_id)
 }
 
-pub(crate) async fn pause_task_inner(
-    state: &AppState,
-    task_id: String,
-) -> Result<(), AppError> {
+pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
     {
         let mut task = state
             .tasks
@@ -657,10 +661,7 @@ pub(crate) async fn pause_task_inner(
     Ok(())
 }
 
-pub(crate) async fn resume_task_inner(
-    state: &AppState,
-    task_id: String,
-) -> Result<(), AppError> {
+pub(crate) async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
     {
         let mut task = state
             .tasks
@@ -683,10 +684,7 @@ pub(crate) async fn resume_task_inner(
     Ok(())
 }
 
-pub(crate) async fn cancel_task_inner(
-    state: &AppState,
-    task_id: String,
-) -> Result<(), AppError> {
+pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
     {
         let mut task = state
             .tasks
@@ -710,10 +708,7 @@ pub(crate) async fn cancel_task_inner(
     Ok(())
 }
 
-pub(crate) async fn delete_task_inner(
-    state: &AppState,
-    task_id: String,
-) -> Result<(), AppError> {
+pub(crate) async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
     let task = state
         .tasks
         .get(&task_id)
@@ -755,8 +750,8 @@ pub(crate) async fn get_task_detail_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::test_state;
+    use super::*;
     use tachyon_core::types::DownloadState;
 
     #[tokio::test]

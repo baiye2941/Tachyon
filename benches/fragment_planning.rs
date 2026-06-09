@@ -6,8 +6,8 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use support::bench_config;
 use std::time::Duration;
+use support::bench_config;
 use tachyon_core::types::FragmentInfo;
 use tachyon_engine::fragment::compute_fragment_size;
 use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord};

@@ -100,7 +100,10 @@ pub(crate) fn validate_config(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn authorize_download_dir(config: &AppConfig, requested_dir: &str) -> Result<String, AppError> {
+pub(crate) fn authorize_download_dir(
+    config: &AppConfig,
+    requested_dir: &str,
+) -> Result<String, AppError> {
     let requested = std::path::Path::new(requested_dir);
     // 兼容不存在目录:canonicalize 失败时回退到原始路径(用于测试和目录创建前)
     let requested_canonical = requested
@@ -131,9 +134,9 @@ pub(crate) fn authorize_download_dir(config: &AppConfig, requested_dir: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::test_state;
     use super::super::{build_download_config, persist_task_snapshot};
+    use super::*;
     use tachyon_core::config::{IoStrategy, USER_AGENT};
 
     /// 创建临时测试路径，在所有平台上均有效

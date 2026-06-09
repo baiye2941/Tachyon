@@ -23,16 +23,15 @@ use tachyon_core::error::DownloadResult;
 // BLAKE3 标志位常量(Rust 侧,用于树形归约和测试)
 // 注意: ROOT = bit 3 (值 8), PARENT = bit 2 (值 4), 不要混淆!
 #[allow(dead_code)]
-const FLAG_CHUNK_START: u32 = 1;  // bit 0
+const FLAG_CHUNK_START: u32 = 1; // bit 0
 #[allow(dead_code)]
-const FLAG_CHUNK_END: u32 = 2;    // bit 1
-const FLAG_PARENT: u32 = 4;       // bit 2
-const FLAG_ROOT: u32 = 8;         // bit 3
+const FLAG_CHUNK_END: u32 = 2; // bit 1
+const FLAG_PARENT: u32 = 4; // bit 2
+const FLAG_ROOT: u32 = 8; // bit 3
 
 /// Blake3 初始化向量(SHA-256 前 8 个质数的平方根小数部分)
 const IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
 /// BLAKE3 消息排列索引(每轮对 16 个消息字重新排列)
@@ -161,10 +160,7 @@ impl GpuVerifier {
             return Ok(hash.to_hex().to_string());
         }
 
-        tracing::info!(
-            data_len = data.len(),
-            "使用 GPU blake3 计算哈希"
-        );
+        tracing::info!(data_len = data.len(), "使用 GPU blake3 计算哈希");
 
         // 准备输入数据: 按 64 字节块对齐填充为 u32 数组
         let padded_size = ((data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
@@ -183,9 +179,9 @@ impl GpuVerifier {
 
         // 构建 GPU 输入 buffer: 消息字 + 元数据(4 个 u32)
         let mut gpu_input = input_words;
-        gpu_input.push(data_len);         // metadata[0]: 原始数据长度
+        gpu_input.push(data_len); // metadata[0]: 原始数据长度
         gpu_input.push(input_word_count); // metadata[1]: 输入 u32 字数量
-        gpu_input.push(0);               // metadata[2]: 保留
+        gpu_input.push(0); // metadata[2]: 保留
         gpu_input.push(num_chunks as u32); // metadata[3]: chunk 数量
 
         let input_bytes = bytemuck_cast_slice(&gpu_input);
@@ -195,11 +191,13 @@ impl GpuVerifier {
 
         // 创建 GPU buffers
         use wgpu::util::DeviceExt;
-        let input_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("blake3_input"),
-            contents: input_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blake3_input"),
+                contents: input_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blake3_output"),
@@ -231,9 +229,11 @@ impl GpuVerifier {
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("blake3_encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("blake3_encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("blake3_compute"),
@@ -272,7 +272,8 @@ impl GpuVerifier {
                     "GPU 输出长度不足: 预期 {} 个 u32, 实际 {}",
                     num_chunks * 8,
                     output_words.len()
-                ).into(),
+                )
+                .into(),
             ));
         }
 
@@ -307,16 +308,17 @@ impl GpuVerifier {
 /// 注意: `GpuVerifier::new()` 开销较大,调用方应缓存实例。
 pub async fn auto_select_and_hash(data: &[u8]) -> DownloadResult<String> {
     if data.len() >= GPU_MIN_SIZE && GpuVerifier::is_available().await {
-        tracing::info!(data_len = data.len(), "数据量达到阈值且 GPU 可用,使用 GPU blake3");
+        tracing::info!(
+            data_len = data.len(),
+            "数据量达到阈值且 GPU 可用,使用 GPU blake3"
+        );
         match GpuVerifier::new().await {
-            Ok(verifier) => {
-                match verifier.compute_blake3(data).await {
-                    Ok(hash) => return Ok(hash),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "GPU blake3 失败,回退到 CPU");
-                    }
+            Ok(verifier) => match verifier.compute_blake3(data).await {
+                Ok(hash) => return Ok(hash),
+                Err(e) => {
+                    tracing::warn!(error = %e, "GPU blake3 失败,回退到 CPU");
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "GPU 初始化失败,回退到 CPU blake3");
             }
@@ -343,11 +345,22 @@ fn blake3_compress(
     flags: u32,
 ) -> [u32; 8] {
     let mut state = [
-        chaining[0], chaining[1], chaining[2], chaining[3],
-        chaining[4], chaining[5], chaining[6], chaining[7],
-        IV[0], IV[1], IV[2], IV[3],
-        counter as u32, (counter >> 32) as u32,
-        block_len, flags,
+        chaining[0],
+        chaining[1],
+        chaining[2],
+        chaining[3],
+        chaining[4],
+        chaining[5],
+        chaining[6],
+        chaining[7],
+        IV[0],
+        IV[1],
+        IV[2],
+        IV[3],
+        counter as u32,
+        (counter >> 32) as u32,
+        block_len,
+        flags,
     ];
 
     let mut m = *block_words;
@@ -419,7 +432,13 @@ fn blake3_tree_reduce(chunk_cvs: &[[u32; 8]], _total_len: u32) -> [u32; 8] {
             }
 
             // counter=0 for parent nodes, block_len=64 (full block)
-            next.push(blake3_compress(&IV, &parent_block, 0, BLOCK_SIZE as u32, flags));
+            next.push(blake3_compress(
+                &IV,
+                &parent_block,
+                0,
+                BLOCK_SIZE as u32,
+                flags,
+            ));
             i += 2;
         }
         // 奇数个 CV 时,最后一个直接传递到下一层
@@ -668,12 +687,21 @@ mod tests {
         assert!(BLAKE3_SHADER.contains("input_data"));
         // 验证 BLAKE3 压缩函数关键组件
         assert!(BLAKE3_SHADER.contains("fn g("), "应包含 G 混合函数");
-        assert!(BLAKE3_SHADER.contains("fn compress_inplace("), "应包含压缩函数");
+        assert!(
+            BLAKE3_SHADER.contains("fn compress_inplace("),
+            "应包含压缩函数"
+        );
         assert!(BLAKE3_SHADER.contains("rotr32"), "应包含右旋操作");
         assert!(BLAKE3_SHADER.contains("PERM"), "应包含消息排列索引");
-        assert!(BLAKE3_SHADER.contains("CHUNK_START"), "应包含 CHUNK_START 标志");
+        assert!(
+            BLAKE3_SHADER.contains("CHUNK_START"),
+            "应包含 CHUNK_START 标志"
+        );
         assert!(BLAKE3_SHADER.contains("CHUNK_END"), "应包含 CHUNK_END 标志");
-        assert!(BLAKE3_SHADER.contains("workgroupBarrier"), "应包含工作组同步屏障");
+        assert!(
+            BLAKE3_SHADER.contains("workgroupBarrier"),
+            "应包含工作组同步屏障"
+        );
     }
 
     /// 测试 CPU blake3 与 auto_select_and_hash 对同一数据产生相同哈希
@@ -720,7 +748,10 @@ mod tests {
         for i in 0..16 {
             let off = i * 4;
             block_words[i] = u32::from_le_bytes([
-                padded[off], padded[off + 1], padded[off + 2], padded[off + 3],
+                padded[off],
+                padded[off + 1],
+                padded[off + 2],
+                padded[off + 3],
             ]);
         }
 
@@ -734,8 +765,16 @@ mod tests {
     /// 测试 u32_to_hex 辅助函数
     #[test]
     fn test_u32_to_hex() {
-        let words = [0x01020304u32, 0x05060708, 0x090A0B0C, 0x0D0E0F10,
-                     0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20];
+        let words = [
+            0x01020304u32,
+            0x05060708,
+            0x090A0B0C,
+            0x0D0E0F10,
+            0x11121314,
+            0x15161718,
+            0x191A1B1C,
+            0x1D1E1F20,
+        ];
         let hex = u32_to_hex(&words);
         assert_eq!(hex.len(), 64);
         // 小端序: 0x01020304 -> bytes [04, 03, 02, 01]

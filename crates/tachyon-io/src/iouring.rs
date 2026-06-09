@@ -372,12 +372,7 @@ impl IoUringStorage {
 
             // 将数据复制到 fixed buffer 0 (Mutex 保证排他访问)
             let buf = &ring_handle.buffers[0];
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_ptr() as *mut u8,
-                    len,
-                )
-            };
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, len) };
             dst.copy_from_slice(&data[..len]);
 
             // 构造 IORING_OP_WRITE_FIXED SQE
@@ -410,12 +405,9 @@ impl IoUringStorage {
                 .map_err(DownloadError::Io)?;
 
             // 读取 CQE 获取完成结果
-            let cqe = uring
-                .completion()
-                .next()
-                .ok_or_else(|| {
-                    DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
-                })?;
+            let cqe = uring.completion().next().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+            })?;
             let result = cqe.result();
             if result < 0 {
                 return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
@@ -521,10 +513,7 @@ impl AsyncStorage for IoUringStorage {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             match self.state {
                 IoUringState::Ready => {

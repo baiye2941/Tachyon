@@ -5,14 +5,14 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
 // ============================================================
 // 常量
@@ -624,20 +624,18 @@ impl KademliaDht {
     /// 首先在本地存储中查找,然后返回最近节点列表用于迭代查找。
     pub fn find_value(&self, key: &[u8]) -> (Option<Vec<u8>>, Vec<DhtNode>) {
         let value = self.local_store.get(key).cloned();
-        let nodes = self.routing_table.find_closest(
-            &Self::key_to_node_id(key),
-            K_BUCKET_SIZE,
-        );
+        let nodes = self
+            .routing_table
+            .find_closest(&Self::key_to_node_id(key), K_BUCKET_SIZE);
         (value, nodes)
     }
 
     /// 本地存储查找(不触发网络操作)
     pub fn find_value_local(&self, key: &[u8]) -> (Option<Vec<u8>>, Vec<DhtNode>) {
         let value = self.local_store.get(key).cloned();
-        let nodes = self.routing_table.find_closest(
-            &Self::key_to_node_id(key),
-            K_BUCKET_SIZE,
-        );
+        let nodes = self
+            .routing_table
+            .find_closest(&Self::key_to_node_id(key), K_BUCKET_SIZE);
         (value, nodes)
     }
 
@@ -829,10 +827,7 @@ impl DhtTransport {
     /// 绑定到指定地址的 UDP socket,创建传输层实例
     ///
     /// 使用 `addr = "127.0.0.1:0"` 可由操作系统自动分配可用端口。
-    pub async fn bind(
-        addr: &str,
-        dht: Arc<RwLock<KademliaDht>>,
-    ) -> Result<Self, TransportError> {
+    pub async fn bind(addr: &str, dht: Arc<RwLock<KademliaDht>>) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Self {
             socket: Arc::new(socket),
@@ -979,9 +974,7 @@ impl DhtTransport {
                 })
             }
 
-            KademliaMessage::Store {
-                key, value, ..
-            } => {
+            KademliaMessage::Store { key, value, .. } => {
                 dht_guard.store(key.clone(), value.clone());
                 // 将发送方添加到路由表(Ping 验证通过)
                 let sender_id = match msg {
@@ -1092,9 +1085,7 @@ impl DhtTransport {
         };
         let response = self.send_rpc(addr, &msg).await?;
         match response {
-            KademliaMessage::FindValueResponse {
-                value, nodes, ..
-            } => Ok((value, nodes)),
+            KademliaMessage::FindValueResponse { value, nodes, .. } => Ok((value, nodes)),
             _ => Ok((None, Vec::new())),
         }
     }
@@ -1111,8 +1102,8 @@ impl DhtTransport {
             key: key.to_vec(),
             value: value.to_vec(),
         };
-        let payload = serde_json::to_vec(&msg)
-            .map_err(|e| TransportError::Serialization(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(&msg).map_err(|e| TransportError::Serialization(e.to_string()))?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         let mut packet = Vec::with_capacity(8 + payload.len());
@@ -1190,8 +1181,9 @@ impl DhtTransport {
                         };
                         let (tx, rx) = oneshot::channel();
                         // 使用临时 pending map
-                        let temp_pending: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>> =
-                            pending_ref;
+                        let temp_pending: Arc<
+                            DashMap<RequestId, oneshot::Sender<KademliaMessage>>,
+                        > = pending_ref;
                         temp_pending.insert(req_id, tx);
                         let mut packet = Vec::with_capacity(8 + payload.len());
                         packet.extend_from_slice(&req_id.to_be_bytes());
@@ -1215,8 +1207,7 @@ impl DhtTransport {
             for handle in handles {
                 if let Ok(nodes) = handle.await {
                     for node in nodes {
-                        if !queried_ids.contains(&node.id)
-                            && !known.iter().any(|n| n.id == node.id)
+                        if !queried_ids.contains(&node.id) && !known.iter().any(|n| n.id == node.id)
                         {
                             known.push(node);
                             new_found = true;
@@ -2106,10 +2097,7 @@ mod tests {
         assert_eq!(value, Some(b"test_value".to_vec()));
 
         // Key not stored at B
-        let (value, _nodes) = ta
-            .find_value_rpc(&addr_b, b"nonexistent")
-            .await
-            .unwrap();
+        let (value, _nodes) = ta.find_value_rpc(&addr_b, b"nonexistent").await.unwrap();
         assert_eq!(value, None);
 
         ta.shutdown();
@@ -2122,7 +2110,9 @@ mod tests {
         let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
 
         let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b.clone()).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b.clone())
+            .await
+            .unwrap();
         let addr_b = tb.local_addr().unwrap().to_string();
 
         ta.start_recv_loop();
@@ -2160,10 +2150,14 @@ mod tests {
         };
 
         // Override timeout for faster test: use tokio::time::timeout directly
-        let result = tokio::time::timeout(Duration::from_millis(200), ta.send_rpc(unused_addr, &msg)).await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), ta.send_rpc(unused_addr, &msg)).await;
 
         // Should timeout
-        assert!(result.is_err(), "RPC to non-listening address should timeout");
+        assert!(
+            result.is_err(),
+            "RPC to non-listening address should timeout"
+        );
 
         ta.shutdown();
     }
@@ -2194,7 +2188,10 @@ mod tests {
         // Distributed store: A stores key-value, replicated to B
         let key = b"dist_key".to_vec();
         let value = b"dist_value".to_vec();
-        let stored = ta.distributed_store(key.clone(), value.clone()).await.unwrap();
+        let stored = ta
+            .distributed_store(key.clone(), value.clone())
+            .await
+            .unwrap();
         assert!(stored > 0, "Should store to at least one remote node");
 
         // Wait for Store RPCs to be processed
@@ -2241,15 +2238,16 @@ mod tests {
 
         drop(ta);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!running.load(Ordering::SeqCst), "Drop should set running to false");
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "Drop should set running to false"
+        );
     }
 
     #[tokio::test]
     async fn test_transport_multiple_pings() {
         let dht_server = Arc::new(RwLock::new(KademliaDht::new([0u8; 20], 100)));
-        let server = DhtTransport::bind("127.0.0.1:0", dht_server)
-            .await
-            .unwrap();
+        let server = DhtTransport::bind("127.0.0.1:0", dht_server).await.unwrap();
         let server_addr = server.local_addr().unwrap().to_string();
         server.start_recv_loop();
 
@@ -2258,9 +2256,7 @@ mod tests {
             let mut id = [0u8; 20];
             id[0] = i;
             let dht_client = Arc::new(RwLock::new(KademliaDht::new(id, 100)));
-            let client = DhtTransport::bind("127.0.0.1:0", dht_client)
-                .await
-                .unwrap();
+            let client = DhtTransport::bind("127.0.0.1:0", dht_client).await.unwrap();
             client.start_recv_loop();
 
             let result = client.ping(&server_addr).await.unwrap();

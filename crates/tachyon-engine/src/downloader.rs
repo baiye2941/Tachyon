@@ -248,10 +248,7 @@ impl AsyncStorage for AsyncMemWrapper {
         Box::pin(async move { fut.await })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         use tachyon_core::traits::Storage;
         let fut = self.0.allocate(size);
         Box::pin(async move { fut.await })
@@ -2045,9 +2042,7 @@ mod tests {
         }
 
         fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
 
         fn allocate(
@@ -2062,15 +2057,11 @@ mod tests {
         }
 
         fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(self.data.lock().unwrap().len() as u64)
-            })
+            Box::pin(async move { Ok(self.data.lock().unwrap().len() as u64) })
         }
 
         fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -3053,9 +3044,7 @@ mod tests {
         }
 
         fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
 
         fn allocate(
@@ -3069,15 +3058,11 @@ mod tests {
         }
 
         fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(self.data.lock().unwrap().len() as u64)
-            })
+            Box::pin(async move { Ok(self.data.lock().unwrap().len() as u64) })
         }
 
         fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -3147,9 +3132,7 @@ mod tests {
         }
 
         fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
 
         fn allocate(
@@ -3163,15 +3146,11 @@ mod tests {
         }
 
         fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(self.data.lock().unwrap().len() as u64)
-            })
+            Box::pin(async move { Ok(self.data.lock().unwrap().len() as u64) })
         }
 
         fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
     }
 

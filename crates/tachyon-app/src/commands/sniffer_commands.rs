@@ -67,9 +67,7 @@ pub async fn add_sniffer_resource(state: &AppState, url: String) {
 // Inner implementations
 // ---------------------------------------------------------------------------
 
-async fn get_sniffer_resources_inner(
-    state: &AppState,
-) -> Result<Vec<SnifferResource>, AppError> {
+async fn get_sniffer_resources_inner(state: &AppState) -> Result<Vec<SnifferResource>, AppError> {
     let store = state.sniffer.lock().await;
     Ok(store.iter().rev().cloned().collect())
 }
@@ -93,9 +91,9 @@ async fn add_sniffer_filter_inner(state: &AppState, filter: String) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::tests::test_state;
     use super::super::resource_type_to_string;
+    use super::super::tests::test_state;
+    use super::*;
     use tachyon_sniffer::capture::ResourceType;
 
     #[tokio::test]
