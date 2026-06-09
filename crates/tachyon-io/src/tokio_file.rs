@@ -117,10 +117,7 @@ impl AsyncStorage for TokioFile {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
@@ -199,10 +196,7 @@ impl AsyncStorage for TokioFile {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
@@ -288,10 +282,7 @@ impl AsyncStorage for TokioFile {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))

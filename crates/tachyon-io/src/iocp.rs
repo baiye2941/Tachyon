@@ -19,9 +19,9 @@
 //! - Windows:完整 IOCP 实现
 //! - 其他平台:编译为空桩,构造函数返回 `Unsupported` 错误
 
-use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::future::Future;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::pin::Pin;
 #[cfg(target_os = "windows")]
@@ -625,9 +625,7 @@ impl crate::storage::AsyncStorage for IoCpStorage {
 
             // 4. 检查是否为 ERROR_IO_PENDING(异步进行中)
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error()
-                != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32)
-            {
+            if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
                 // 真正的写入失败
                 {
                     let mut map = lock_completion_registry(&self.registry);
@@ -637,11 +635,8 @@ impl crate::storage::AsyncStorage for IoCpStorage {
             }
 
             // pending I/O 的缓冲区和 OVERLAPPED 继续由 registry 持有到完成通知。
-            let mut cancel_guard = PendingWriteCancelGuard::new(
-                file_handle,
-                overlapped_key,
-                self.registry.clone(),
-            );
+            let mut cancel_guard =
+                PendingWriteCancelGuard::new(file_handle, overlapped_key, self.registry.clone());
             let completion = rx.await.map_err(|_| {
                 DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -685,10 +680,7 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.clone_ready_file()?;
             tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
@@ -709,9 +701,7 @@ impl crate::storage::AsyncStorage for IoCpStorage {
     }
 
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            self.sync().await
-        })
+        Box::pin(async move { self.sync().await })
     }
 }
 

@@ -171,13 +171,12 @@ impl FileStore {
         while let Some(c) = chars.next() {
             if c == '%' {
                 let hex: String = chars.by_ref().take(2).collect();
-                if hex.len() == 2 {
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(decoded_char) = char::from_u32(code) {
-                            result.push(decoded_char);
-                            continue;
-                        }
-                    }
+                if hex.len() == 2
+                    && let Ok(code) = u32::from_str_radix(&hex, 16)
+                    && let Some(decoded_char) = char::from_u32(code)
+                {
+                    result.push(decoded_char);
+                    continue;
                 }
                 // 解码失败，保持原样
                 result.push('%');

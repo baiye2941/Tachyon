@@ -7,8 +7,8 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use support::bench_config;
 use std::path::PathBuf;
+use support::bench_config;
 use tachyon_core::DownloadState;
 use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord, compute_fragment_size};
 use tachyon_store::{KvStore, RecoveryManager, TaskSnapshot};

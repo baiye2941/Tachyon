@@ -189,9 +189,7 @@ pub mod harness {
         }
 
         fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
 
         fn allocate(
@@ -213,9 +211,7 @@ pub mod harness {
         }
 
         fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
     }
 

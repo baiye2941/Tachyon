@@ -164,79 +164,70 @@ impl QuicTransport {
 
         tachyon_core::reject_forbidden_ip(addr.ip())?;
 
-        let connection =
-            if let Some(ref crypto) = self.stored_crypto {
-                if self.session_tokens.contains_key(host) {
-                    // 尝试 0-RTT: 使用缓存的 TLS 会话跳过完整握手
-                    // rustls 的 Resumption 配置会自动提供缓存的 session ticket
-                    let client_config = quinn::ClientConfig::new(Arc::clone(crypto));
+        let connection = if let Some(ref crypto) = self.stored_crypto {
+            if self.session_tokens.contains_key(host) {
+                // 尝试 0-RTT: 使用缓存的 TLS 会话跳过完整握手
+                // rustls 的 Resumption 配置会自动提供缓存的 session ticket
+                let client_config = quinn::ClientConfig::new(Arc::clone(crypto));
 
-                    let connecting = self
-                        .endpoint
-                        .connect_with(client_config, addr, host)
-                        .map_err(|e| {
-                            DownloadError::Network(format!("发起 QUIC 0-RTT 连接失败: {e}"))
-                        })?;
+                let connecting = self
+                    .endpoint
+                    .connect_with(client_config, addr, host)
+                    .map_err(|e| {
+                        DownloadError::Network(format!("发起 QUIC 0-RTT 连接失败: {e}"))
+                    })?;
 
-                    match connecting.into_0rtt() {
-                        Ok((conn, accepted)) => {
-                            if accepted.await {
-                                tracing::info!(host, port, "QUIC 0-RTT 连接成功");
-                            } else {
-                                tracing::debug!(
-                                    host,
-                                    "服务端拒绝 0-RTT,连接已通过 1-RTT 握手完成"
-                                );
-                            }
-                            conn
+                match connecting.into_0rtt() {
+                    Ok((conn, accepted)) => {
+                        if accepted.await {
+                            tracing::info!(host, port, "QUIC 0-RTT 连接成功");
+                        } else {
+                            tracing::debug!(host, "服务端拒绝 0-RTT,连接已通过 1-RTT 握手完成");
                         }
-                        Err(connecting) => {
-                            // 0-RTT 不可用,回退到标准 1-RTT 连接
-                            tracing::debug!(host, "0-RTT 不可用,回退到 1-RTT 连接");
-                            connecting.await.map_err(|e| {
-                                DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
-                            })?
-                        }
+                        conn
                     }
-                } else {
-                    // 首次连接该 host,无缓存会话,执行标准 1-RTT 握手
-                    let connecting = self
-                        .endpoint
-                        .connect(addr, host)
-                        .map_err(|e| {
-                            DownloadError::Network(format!("发起 QUIC 连接失败: {e}"))
-                        })?;
-                    connecting.await.map_err(|e| {
-                        DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
-                    })?
+                    Err(connecting) => {
+                        // 0-RTT 不可用,回退到标准 1-RTT 连接
+                        tracing::debug!(host, "0-RTT 不可用,回退到 1-RTT 连接");
+                        connecting.await.map_err(|e| {
+                            DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
+                        })?
+                    }
                 }
             } else {
-                // 无存储的加密配置(如 with_endpoint 创建),使用默认配置
+                // 首次连接该 host,无缓存会话,执行标准 1-RTT 握手
                 let connecting = self
                     .endpoint
                     .connect(addr, host)
                     .map_err(|e| DownloadError::Network(format!("发起 QUIC 连接失败: {e}")))?;
-                connecting.await.map_err(|e| {
-                    DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
-                })?
-            };
+                connecting
+                    .await
+                    .map_err(|e| DownloadError::Network(format!("QUIC 连接建立失败: {e}")))?
+            }
+        } else {
+            // 无存储的加密配置(如 with_endpoint 创建),使用默认配置
+            let connecting = self
+                .endpoint
+                .connect(addr, host)
+                .map_err(|e| DownloadError::Network(format!("发起 QUIC 连接失败: {e}")))?;
+            connecting
+                .await
+                .map_err(|e| DownloadError::Network(format!("QUIC 连接建立失败: {e}")))?
+        };
 
         self.connection = Some(connection);
         tracing::info!(host, port, "QUIC 连接已建立");
 
         // 缓存该 host 的服务器证书,标记为已知 host 以便后续尝试 0-RTT。
         // 实际的 TLS session ticket 由 rustls 内部会话缓存自动管理。
-        if !self.session_tokens.contains_key(host) {
-            if let Some(conn) = &self.connection {
-                if let Some(identity) = conn.peer_identity() {
-                    if let Some(chain) = identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
-                        if let Some(cert) = chain.first() {
-                            self.session_tokens
-                                .insert(host.to_string(), cert.to_vec());
-                        }
-                    }
-                }
-            }
+        if !self.session_tokens.contains_key(host)
+            && let Some(conn) = &self.connection
+            && let Some(identity) = conn.peer_identity()
+            && let Some(chain) =
+                identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            && let Some(cert) = chain.first()
+        {
+            self.session_tokens.insert(host.to_string(), cert.to_vec());
         }
 
         Ok(())

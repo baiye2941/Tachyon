@@ -94,9 +94,9 @@ async fn get_download_progress_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::tests::test_state;
     use super::super::task_commands::create_task_inner;
+    use super::super::tests::test_state;
+    use super::*;
     use tachyon_core::types::DownloadState;
 
     #[tokio::test]

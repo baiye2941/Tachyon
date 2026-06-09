@@ -192,13 +192,8 @@ impl AsyncStorage for WinFile {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            self.preallocate(size).await
-        })
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move { self.preallocate(size).await })
     }
 
     fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
@@ -271,13 +266,8 @@ impl AsyncStorage for WinFile {
         })
     }
 
-    fn allocate(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            self.preallocate(size).await
-        })
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move { self.preallocate(size).await })
     }
 
     fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {

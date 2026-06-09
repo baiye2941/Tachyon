@@ -10,8 +10,7 @@ pub use self::hub_commands::{get_hf_download_url, list_repo_files};
 pub use self::progress_commands::{get_download_progress, subscribe_progress};
 pub use self::sniffer_commands::{add_sniffer_filter, add_sniffer_resource, get_sniffer_resources};
 pub use self::task_commands::{
-    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
-    resume_task,
+    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task, resume_task,
 };
 
 use std::collections::HashMap;
@@ -492,17 +491,29 @@ pub(crate) mod tests {
             cfg.download.download_dir = test_dir_str.clone();
             cfg.download.authorized_dirs = vec![test_dir_str];
         }
-        let _id1 =
-            task_commands::create_task_inner(&state, "http://example.com/gate1.bin".into(), None, None)
-                .await
-                .unwrap();
-        let _id2 =
-            task_commands::create_task_inner(&state, "http://example.com/gate2.bin".into(), None, None)
-                .await
-                .unwrap();
-        let result =
-            task_commands::create_task_inner(&state, "http://example.com/gate3.bin".into(), None, None)
-                .await;
+        let _id1 = task_commands::create_task_inner(
+            &state,
+            "http://example.com/gate1.bin".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let _id2 = task_commands::create_task_inner(
+            &state,
+            "http://example.com/gate2.bin".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let result = task_commands::create_task_inner(
+            &state,
+            "http://example.com/gate3.bin".into(),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err(), "超过 max_concurrent_tasks 应被拒绝");
         let err = result.unwrap_err();
         assert!(

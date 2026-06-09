@@ -278,13 +278,13 @@ impl FtpClient {
             .map_err(|e| DownloadError::Protocol(format!("设置传输模式失败: {e}")))?;
 
         // 设置 REST 偏移(仅在指定 start > 0 时)
-        if let Some(offset) = start {
-            if offset > 0 {
-                stream
-                    .resume_transfer(offset as usize)
-                    .await
-                    .map_err(|e| DownloadError::Protocol(format!("REST 命令失败: {e}")))?;
-            }
+        if let Some(offset) = start
+            && offset > 0
+        {
+            stream
+                .resume_transfer(offset as usize)
+                .await
+                .map_err(|e| DownloadError::Protocol(format!("REST 命令失败: {e}")))?;
         }
 
         // 打开数据连接并返回(不缓冲数据)
@@ -586,18 +586,13 @@ impl Protocol for FtpClient {
                         }
                         Ok(n) => {
                             buf.truncate(n);
-                            Some((
-                                Ok(Bytes::from(buf)),
-                                (Some(ds), client, path),
-                            ))
+                            Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
                         }
                         Err(e) => {
                             let _ = client.finalize_retr_stream(ds).await;
                             client.disconnect().await;
                             Some((
-                                Err(DownloadError::Network(format!(
-                                    "读取 FTP 数据流失败: {e}"
-                                ))),
+                                Err(DownloadError::Network(format!("读取 FTP 数据流失败: {e}"))),
                                 (None, client, path),
                             ))
                         }
@@ -674,18 +669,13 @@ impl Protocol for FtpClient {
                         }
                         Ok(n) => {
                             buf.truncate(n);
-                            Some((
-                                Ok(Bytes::from(buf)),
-                                (Some(ds), client, path),
-                            ))
+                            Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
                         }
                         Err(e) => {
                             let _ = client.finalize_retr_stream(ds).await;
                             client.disconnect().await;
                             Some((
-                                Err(DownloadError::Network(format!(
-                                    "读取 FTP 数据流失败: {e}"
-                                ))),
+                                Err(DownloadError::Network(format!("读取 FTP 数据流失败: {e}"))),
                                 (None, client, path),
                             ))
                         }
