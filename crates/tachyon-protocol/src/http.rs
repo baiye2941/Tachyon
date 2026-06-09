@@ -58,6 +58,7 @@ impl HttpClient {
             .pool_max_idle_per_host(16)
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .no_proxy()
+            .dns_resolver(PublicDnsResolver::new())
             .redirect(safe_redirect_policy());
 
         if connect_secs > 0 {
@@ -97,7 +98,6 @@ struct PublicDnsResolver {
 }
 
 impl PublicDnsResolver {
-    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             cache: DashMap::new(),

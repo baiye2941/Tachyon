@@ -3,7 +3,10 @@
 //! 测试分片大小计算、EWMA 带宽追踪、Holt-Winters 预测器的 CPU 性能,
 //! 以及调度器优先级队列的吞吐量。
 
+mod support;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::bench_config;
 use std::time::Duration;
 use tachyon_core::types::FragmentInfo;
 use tachyon_engine::fragment::compute_fragment_size;
@@ -274,17 +277,19 @@ fn bench_scheduler_batch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_compute_fragment_size,
-    bench_bandwidth_tracker_record,
-    bench_bandwidth_tracker_cycle,
-    bench_holt_winters_observe,
-    bench_holt_winters_predict,
-    bench_holt_winters_workflow,
-    bench_fragment_state_machine,
-    bench_fragment_backoff,
-    bench_scheduler_push_pop,
-    bench_scheduler_batch,
-);
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_compute_fragment_size,
+        bench_bandwidth_tracker_record,
+        bench_bandwidth_tracker_cycle,
+        bench_holt_winters_observe,
+        bench_holt_winters_predict,
+        bench_holt_winters_workflow,
+        bench_fragment_state_machine,
+        bench_fragment_backoff,
+        bench_scheduler_push_pop,
+        bench_scheduler_batch
+}
 criterion_main!(benches);

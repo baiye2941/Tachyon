@@ -1,6 +1,15 @@
-import { For, Show } from 'solid-js'
+import { For, Show, createSignal, createMemo, createEffect, onMount, onCleanup } from 'solid-js'
 import type { TaskInfo, ListDensity } from '../types'
 import TaskItem from './TaskItem'
+
+/** Fixed row heights per density mode (px) */
+const ITEM_HEIGHTS: Record<ListDensity, number> = {
+  comfortable: 80,
+  compact: 52,
+}
+
+/** Number of off-screen buffer items rendered above/below the viewport */
+const BUFFER_COUNT = 3
 
 interface TaskListProps {
   tasks: TaskInfo[]
@@ -14,6 +23,95 @@ interface TaskListProps {
 }
 
 export default function TaskList(props: TaskListProps) {
+  let scrollContainerRef: HTMLDivElement | undefined
+  let rafId: number | null = null
+
+  // ── Virtual-scroll reactive state ──────────────────────────────
+  const [scrollTop, setScrollTop] = createSignal(0)
+  const [containerHeight, setContainerHeight] = createSignal(500)
+
+  const itemHeight = createMemo(() => ITEM_HEIGHTS[props.density])
+
+  const totalHeight = createMemo(() => props.tasks.length * itemHeight())
+
+  /** How many items fit in the visible viewport */
+  const visibleCount = createMemo(
+    () => Math.ceil(containerHeight() / itemHeight()) + 1,
+  )
+
+  /** First index in the render window (including buffer) */
+  const startIndex = createMemo(() => {
+    const raw = Math.floor(scrollTop() / itemHeight()) - BUFFER_COUNT
+    return Math.max(0, raw)
+  })
+
+  /** Last index (exclusive) in the render window (including buffer) */
+  const endIndex = createMemo(() => {
+    const raw =
+      Math.floor(scrollTop() / itemHeight()) + visibleCount() + BUFFER_COUNT
+    return Math.min(props.tasks.length, raw)
+  })
+
+  /** Y-offset for the inner positioning container */
+  const offsetY = createMemo(() => startIndex() * itemHeight())
+
+  /** The subset of tasks currently rendered (<For> reconciles by identity) */
+  const visibleTasks = createMemo(() => props.tasks.slice(startIndex(), endIndex()))
+
+  // ── Scroll handler (RAF-throttled) ─────────────────────────────
+  const handleScroll = () => {
+    if (rafId !== null) return
+    rafId = requestAnimationFrame(() => {
+      rafId = null
+      if (scrollContainerRef) {
+        setScrollTop(scrollContainerRef.scrollTop)
+      }
+    })
+  }
+
+  // ── Measure viewport height ────────────────────────────────────
+  const measureHeight = () => {
+    if (scrollContainerRef) {
+      setContainerHeight(scrollContainerRef.clientHeight)
+    }
+  }
+
+  let resizeObserver: ResizeObserver | undefined
+
+  onMount(() => {
+    measureHeight()
+    if (scrollContainerRef) {
+      resizeObserver = new ResizeObserver(measureHeight)
+      resizeObserver.observe(scrollContainerRef)
+    }
+  })
+
+  onCleanup(() => {
+    if (rafId !== null) cancelAnimationFrame(rafId)
+    resizeObserver?.disconnect()
+  })
+
+  // ── Scroll selected task into view ─────────────────────────────
+  const scrollToTask = (taskId: string) => {
+    const idx = props.tasks.findIndex(t => t.id === taskId)
+    if (idx < 0 || !scrollContainerRef) return
+    const top = idx * itemHeight()
+    const bottom = top + itemHeight()
+    const viewTop = scrollContainerRef.scrollTop
+    const viewBottom = viewTop + scrollContainerRef.clientHeight
+    if (top < viewTop) {
+      scrollContainerRef.scrollTop = top
+    } else if (bottom > viewBottom) {
+      scrollContainerRef.scrollTop = bottom - scrollContainerRef.clientHeight
+    }
+  }
+
+  // Auto-scroll when the externally-selected task changes
+  createEffect(() => {
+    const id = props.selectedTaskId
+    if (id) scrollToTask(id)
+  })
+
   return (
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* List Header */}
@@ -38,8 +136,12 @@ export default function TaskList(props: TaskListProps) {
         <div style={{ width: '80px', 'text-align': 'right' }}>状态</div>
       </div>
 
-      {/* Task Items */}
-      <div class="flex-1 overflow-y-auto">
+      {/* Virtual-scroll viewport */}
+      <div
+        ref={scrollContainerRef}
+        class="flex-1 overflow-y-auto"
+        onScroll={handleScroll}
+      >
         <Show
           when={props.tasks.length > 0}
           fallback={
@@ -79,21 +181,35 @@ export default function TaskList(props: TaskListProps) {
             </div>
           }
         >
-          <For each={props.tasks}>
-            {(task, index) => (
-              <TaskItem
-                task={task}
-                isSelected={props.selectedTaskId === task.id}
-                isMultiSelected={props.selectedTaskIds.has(task.id)}
-                isMultiSelectMode={props.isMultiSelectMode}
-                onClick={() => props.onTaskClick(task.id)}
-                onContextMenu={e => props.onTaskContextMenu?.(e, task.id)}
-                density={props.density}
-                searchQuery={props.searchQuery}
-                staggerIndex={index()}
-              />
-            )}
-          </For>
+          {/* Outer wrapper: sets total scrollable height via spacer */}
+          <div style={{ position: 'relative', height: `${totalHeight()}px` }}>
+            {/* Inner wrapper: offset to the visible window */}
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                transform: `translateY(${offsetY()}px)`,
+              }}
+            >
+              <For each={visibleTasks()}>
+                {(task, visibleIndex) => (
+                  <TaskItem
+                    task={task}
+                    isSelected={props.selectedTaskId === task.id}
+                    isMultiSelected={props.selectedTaskIds.has(task.id)}
+                    isMultiSelectMode={props.isMultiSelectMode}
+                    onClick={() => props.onTaskClick(task.id)}
+                    onContextMenu={e => props.onTaskContextMenu?.(e, task.id)}
+                    density={props.density}
+                    searchQuery={props.searchQuery}
+                    staggerIndex={visibleIndex()}
+                  />
+                )}
+              </For>
+            </div>
+          </div>
         </Show>
       </div>
     </div>

@@ -8,6 +8,7 @@ pub mod harness {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    use std::future::Future;
     use std::pin::Pin;
 
     use crate::config::{DownloadConfig, IoStrategy};
@@ -152,46 +153,69 @@ pub mod harness {
     }
 
     impl Storage for MemoryStorage {
-        async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-            let mut buf = self.data.lock().unwrap();
-            let start = offset as usize;
-            let end = start + data.len();
-            if end > buf.len() {
-                buf.resize(end, 0);
-            }
-            buf[start..end].copy_from_slice(&data);
-            Ok(data.len())
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            Box::pin(async move {
+                let mut buf = self.data.lock().unwrap();
+                let start = offset as usize;
+                let end = start + data.len();
+                if end > buf.len() {
+                    buf.resize(end, 0);
+                }
+                buf[start..end].copy_from_slice(&data);
+                Ok(data.len())
+            })
         }
 
-        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
-            let data = self.data.lock().unwrap();
-            let start = offset as usize;
-            let available = data.len().saturating_sub(start);
-            let to_read = buf.len().min(available);
-            if to_read == 0 {
-                return Ok(0);
-            }
-            buf[..to_read].copy_from_slice(&data[start..start + to_read]);
-            Ok(to_read)
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                let data = self.data.lock().unwrap();
+                let start = offset as usize;
+                let available = data.len().saturating_sub(start);
+                let to_read = buf.len().min(available);
+                if to_read == 0 {
+                    return Ok(0);
+                }
+                buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+                Ok(to_read)
+            })
         }
 
-        async fn sync(&self) -> DownloadResult<()> {
-            Ok(())
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(())
+            })
         }
 
-        async fn allocate(&self, size: u64) -> DownloadResult<()> {
-            let mut data = self.data.lock().unwrap();
-            data.resize(size as usize, 0);
-            Ok(())
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                let mut data = self.data.lock().unwrap();
+                data.resize(size as usize, 0);
+                Ok(())
+            })
         }
 
-        async fn file_size(&self) -> DownloadResult<u64> {
-            let data = self.data.lock().unwrap();
-            Ok(data.len() as u64)
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async move {
+                let data = self.data.lock().unwrap();
+                Ok(data.len() as u64)
+            })
         }
 
-        async fn close(&self) -> DownloadResult<()> {
-            Ok(())
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(())
+            })
         }
     }
 

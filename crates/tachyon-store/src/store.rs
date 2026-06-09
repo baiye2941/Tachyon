@@ -164,6 +164,31 @@ impl FileStore {
             .collect()
     }
 
+    /// 将安全文件名还原为原始键（safe_key 的逆操作）
+    pub(crate) fn unsafe_key(encoded: &str) -> String {
+        let mut result = String::with_capacity(encoded.len());
+        let mut chars = encoded.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() == 2 {
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(decoded_char) = char::from_u32(code) {
+                            result.push(decoded_char);
+                            continue;
+                        }
+                    }
+                }
+                // 解码失败，保持原样
+                result.push('%');
+                result.push_str(&hex);
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
     /// 键对应的文件路径
     pub(crate) fn path_for(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{}.json", Self::safe_key(key)))
@@ -245,9 +270,9 @@ impl Store for FileStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(key) = name.strip_suffix(".json") {
-                // 从文件名还原键（safe_key 是单射的，这里只是去掉 .json 后缀）
-                let raw_key = key.to_string();
+            if let Some(encoded_key) = name.strip_suffix(".json") {
+                // 从编码后的文件名还原原始键
+                let raw_key = Self::unsafe_key(encoded_key);
                 if raw_key.starts_with(prefix) {
                     keys.push(raw_key);
                 }
@@ -539,6 +564,35 @@ mod tests {
     #[test]
     fn file_safe_key_escapes_path_sensitive_characters() {
         assert_eq!(FileStore::safe_key("task/a:b c"), "task%2Fa%3Ab%20c");
+    }
+
+    #[test]
+    fn file_unsafe_key_roundtrip() {
+        let original_keys = [
+            "task/a:b c",
+            "http://example.com/file.zip",
+            "key_with-special_chars",
+            "simple",
+            "中文键名",
+            "a/b/c/d:e",
+        ];
+        for key in original_keys {
+            let encoded = FileStore::safe_key(key);
+            let decoded = FileStore::unsafe_key(&encoded);
+            assert_eq!(decoded, *key, "roundtrip failed for key: {key}");
+        }
+    }
+
+    #[test]
+    fn file_keys_returns_original_keys_with_special_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        store.set("task/http://a.com/f", "1".to_string()).unwrap();
+        store.set("task/simple", "2".to_string()).unwrap();
+
+        let mut keys = store.keys("task/").unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["task/http://a.com/f", "task/simple"]);
     }
 
     #[test]

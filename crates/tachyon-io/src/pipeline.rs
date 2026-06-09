@@ -114,12 +114,59 @@ impl<S: AsyncStorage> WritePipeline<S> {
             return Ok(0);
         }
 
+        let flush_threshold = self.max_pending * self.buffer_size;
+
+        // 按偏移排序并预计算实际 write_at 调用次数，确保信号量许可与 I/O 操作数一致
+        let sorted_indices: Vec<usize> = if segments.len() > 1 {
+            let mut idx: Vec<usize> = (0..segments.len()).collect();
+            idx.sort_unstable_by_key(|&i| segments[i].0);
+            idx
+        } else {
+            vec![0]
+        };
+
+        let mut write_count: u32 = if segments.len() == 1 {
+            1
+        } else {
+            let mut count: u32 = 0;
+            let mut merged_end =
+                segments[sorted_indices[0]].0 + segments[sorted_indices[0]].1.len() as u64;
+            let mut merged_len: usize = segments[sorted_indices[0]].1.len();
+
+            for &i in &sorted_indices[1..] {
+                let (off, data) = segments[i];
+                let len = data.len() as u64;
+
+                if off == merged_end && len > 0 {
+                    merged_end += len;
+                    merged_len += data.len();
+                    if merged_len >= flush_threshold {
+                        count += 1;
+                        merged_end = off + len;
+                        merged_len = 0;
+                    }
+                } else {
+                    count += 1;
+                    merged_end = off + len;
+                    merged_len = data.len();
+                }
+            }
+            if merged_len > 0 {
+                count += 1;
+            }
+            count
+        };
+
+        // 至少获取 1 个许可，防止所有 segment 均为零长度时跳过信号量
+        if write_count == 0 {
+            write_count = 1;
+        }
+
         let _permit = self
             .semaphore
-            .acquire()
+            .acquire_many(write_count)
             .await
             .expect("WritePipeline 信号量不应被关闭");
-        let flush_threshold = self.max_pending * self.buffer_size;
 
         let total = if segments.len() == 1 {
             let (offset, data) = segments[0];
@@ -127,16 +174,13 @@ impl<S: AsyncStorage> WritePipeline<S> {
                 .write_at(offset, Bytes::copy_from_slice(data))
                 .await?
         } else {
-            let mut indices: Vec<usize> = (0..segments.len()).collect();
-            indices.sort_unstable_by_key(|&i| segments[i].0);
-
             let mut total_written: usize = 0;
-            let mut merged_start = segments[indices[0]].0;
-            let mut merged_end = merged_start + segments[indices[0]].1.len() as u64;
-            let mut merged_data: Vec<u8> = Vec::with_capacity(segments[indices[0]].1.len());
-            merged_data.extend_from_slice(segments[indices[0]].1);
+            let mut merged_start = segments[sorted_indices[0]].0;
+            let mut merged_end = merged_start + segments[sorted_indices[0]].1.len() as u64;
+            let mut merged_data: Vec<u8> = Vec::with_capacity(segments[sorted_indices[0]].1.len());
+            merged_data.extend_from_slice(segments[sorted_indices[0]].1);
 
-            for &idx in &indices[1..] {
+            for &idx in &sorted_indices[1..] {
                 let (off, data) = segments[idx];
                 let len = data.len() as u64;
 

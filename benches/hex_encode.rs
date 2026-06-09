@@ -1,4 +1,7 @@
+mod support;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::bench_config;
 
 fn bench_hex_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("hex_encode");
@@ -13,5 +16,9 @@ fn bench_hex_encode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hex_encode);
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets = bench_hex_encode
+}
 criterion_main!(benches);

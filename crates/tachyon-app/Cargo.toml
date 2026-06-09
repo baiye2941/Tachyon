@@ -13,13 +13,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 name = "tachyon"
 path = "src/main.rs"
 
+[features]
+default = ["tachyon-engine/ftp", "tachyon-engine/quic", "tachyon-hub/ftp", "tachyon-hub/quic"]
+ftp = ["tachyon-engine/ftp", "tachyon-hub/ftp"]
+quic = ["tachyon-engine/quic", "tachyon-hub/quic"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
-tachyon-engine = { path = "../tachyon-engine" }
-tachyon-hub = { path = "../tachyon-hub" }
+tachyon-engine = { path = "../tachyon-engine", default-features = false }
+tachyon-hub = { path = "../tachyon-hub", default-features = false }
 tachyon-scheduler = { path = "../tachyon-scheduler" }
 tachyon-sniffer = { path = "../tachyon-sniffer" }
 tachyon-store = { path = "../tachyon-store" }

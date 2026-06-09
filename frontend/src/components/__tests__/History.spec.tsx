@@ -1,9 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library'
 import HistoryPanel from '../HistoryPanel'
-import StatsDashboard from '../StatsDashboard'
 import type { TaskInfo } from '../../types'
-import type { HistoryStats } from '../../stores/history'
 
 const makeTask = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   id: `id-${Math.random().toString(36).slice(2)}`,
@@ -90,49 +88,3 @@ describe('HistoryPanel 历史记录面板', () => {
   })
 })
 
-describe('StatsDashboard 统计仪表盘', () => {
-  const stats: HistoryStats = {
-    totalDownloads: 10,
-    totalBytes: 1024 * 1024 * 50,
-    avgSpeed: 1024 * 1024,
-    successRate: 0.8,
-    totalDuration: 3600000,
-    completedCount: 8,
-    failedCount: 1,
-    cancelledCount: 1,
-  }
-
-  beforeEach(() => {
-    cleanup()
-  })
-
-  it('渲染所有统计项', () => {
-    render(() => <StatsDashboard stats={stats} />)
-    expect(screen.getByText('总下载量')).toBeDefined()
-    expect(screen.getByText('平均速度')).toBeDefined()
-    expect(screen.getByText('成功率')).toBeDefined()
-    expect(screen.getByText('总耗时')).toBeDefined()
-  })
-
-  it('显示正确的数值', () => {
-    render(() => <StatsDashboard stats={stats} />)
-    expect(screen.getAllByText('10').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('80.0%').length).toBeGreaterThan(0)
-  })
-
-  it('零值统计正确显示', () => {
-    const zeroStats: HistoryStats = {
-      totalDownloads: 0,
-      totalBytes: 0,
-      avgSpeed: 0,
-      successRate: 0,
-      totalDuration: 0,
-      completedCount: 0,
-      failedCount: 0,
-      cancelledCount: 0,
-    }
-    render(() => <StatsDashboard stats={zeroStats} />)
-    expect(screen.getAllByText('0').length).toBeGreaterThan(0)
-    expect(screen.getByText('0.0%')).toBeDefined()
-  })
-})

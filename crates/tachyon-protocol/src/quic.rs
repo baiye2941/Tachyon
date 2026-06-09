@@ -14,8 +14,10 @@
 //! - Range 请求(分片下载)
 //! - 全量下载
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 #[cfg(test)]
@@ -28,11 +30,17 @@ use url::Url;
 /// QUIC 传输客户端
 ///
 /// 封装 quinn::Endpoint 和连接状态,提供统一的 Protocol trait 实现。
+/// 支持 0-RTT 连接建立:首次连接后缓存 TLS 会话状态,后续连接可跳过完整握手。
 pub struct QuicTransport {
     /// 本地 QUIC 端点
     endpoint: quinn::Endpoint,
     /// 当前活跃连接(如有)
     connection: Option<quinn::Connection>,
+    /// 存储的 QUIC 客户端加密配置,用于构造支持 0-RTT 的自定义 ClientConfig
+    stored_crypto: Option<Arc<dyn quinn::crypto::ClientConfig>>,
+    /// TLS 会话缓存:按 host 记录已建立过连接的服务器证书 DER 编码。
+    /// 存在条目表示该 host 的 TLS session 已由 rustls 内部缓存,可尝试 0-RTT。
+    session_tokens: HashMap<String, Vec<u8>>,
 }
 
 impl QuicTransport {
@@ -54,9 +62,10 @@ impl QuicTransport {
             root_store.add(cert.clone()).ok();
         }
 
-        let tls_config = rustls::ClientConfig::builder()
+        let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+        tls_config.resumption = rustls::client::Resumption::in_memory_sessions(256);
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(
             |e: std::net::AddrParseError| DownloadError::Network(format!("解析本地地址失败: {e}")),
@@ -66,19 +75,28 @@ impl QuicTransport {
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|e| DownloadError::Network(format!("构建 QUIC 客户端配置失败: {e}")))?;
 
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        // 保存加密配置的 Arc 引用,用于后续构造支持 0-RTT 的自定义 ClientConfig
+        let stored_crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(crypto);
+        endpoint.set_default_client_config(quinn::ClientConfig::new(stored_crypto.clone()));
 
         Ok(Self {
             endpoint,
             connection: None,
+            stored_crypto: Some(stored_crypto),
+            session_tokens: HashMap::new(),
         })
     }
 
     /// 使用已有 quinn::Endpoint 创建(高级用法)
+    ///
+    /// 注意:通过此方法创建的实例不包含加密配置副本,
+    /// 因此不支持 0-RTT 连接建立。如需 0-RTT,请使用 `new()` 方法。
     pub fn with_endpoint(endpoint: quinn::Endpoint) -> Self {
         Self {
             endpoint,
             connection: None,
+            stored_crypto: None,
+            session_tokens: HashMap::new(),
         }
     }
 
@@ -97,31 +115,37 @@ impl QuicTransport {
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
 
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
             .with_client_auth_cert(vec![cert_der], key.into())
             .map_err(|e| DownloadError::Network(format!("构建 TLS 配置失败: {e}")))?;
+        crypto.resumption = rustls::client::Resumption::in_memory_sessions(64);
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(
             |e: std::net::AddrParseError| DownloadError::Network(format!("解析本地地址失败: {e}")),
         )?)
         .map_err(|e| DownloadError::Network(format!("创建 QUIC 端点失败: {e}")))?;
 
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                .map_err(|e| DownloadError::Network(format!("构建 QUIC 客户端配置失败: {e}")))?,
-        )));
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .map_err(|e| DownloadError::Network(format!("构建 QUIC 客户端配置失败: {e}")))?;
+
+        let stored_crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(quic_crypto);
+        endpoint.set_default_client_config(quinn::ClientConfig::new(stored_crypto.clone()));
 
         Ok(Self {
             endpoint,
             connection: None,
+            stored_crypto: Some(stored_crypto),
+            session_tokens: HashMap::new(),
         })
     }
 
     /// 连接到远程 QUIC 服务器
     ///
     /// 解析 URL 中的 host:port,建立 QUIC 连接并存储。
+    /// 如果目标 host 存在缓存的 TLS 会话,将尝试 0-RTT 连接以跳过完整握手;
+    /// 0-RTT 失败时自动回退到标准 1-RTT 连接。
     pub async fn connect(&mut self, url: &str) -> DownloadResult<()> {
         let parsed =
             Url::parse(url).map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
@@ -140,17 +164,81 @@ impl QuicTransport {
 
         tachyon_core::reject_forbidden_ip(addr.ip())?;
 
-        let connecting = self
-            .endpoint
-            .connect(addr, host)
-            .map_err(|e| DownloadError::Network(format!("发起 QUIC 连接失败: {e}")))?;
+        let connection =
+            if let Some(ref crypto) = self.stored_crypto {
+                if self.session_tokens.contains_key(host) {
+                    // 尝试 0-RTT: 使用缓存的 TLS 会话跳过完整握手
+                    // rustls 的 Resumption 配置会自动提供缓存的 session ticket
+                    let client_config = quinn::ClientConfig::new(Arc::clone(crypto));
 
-        let connection = connecting
-            .await
-            .map_err(|e| DownloadError::Network(format!("QUIC 连接建立失败: {e}")))?;
+                    let connecting = self
+                        .endpoint
+                        .connect_with(client_config, addr, host)
+                        .map_err(|e| {
+                            DownloadError::Network(format!("发起 QUIC 0-RTT 连接失败: {e}"))
+                        })?;
+
+                    match connecting.into_0rtt() {
+                        Ok((conn, accepted)) => {
+                            if accepted.await {
+                                tracing::info!(host, port, "QUIC 0-RTT 连接成功");
+                            } else {
+                                tracing::debug!(
+                                    host,
+                                    "服务端拒绝 0-RTT,连接已通过 1-RTT 握手完成"
+                                );
+                            }
+                            conn
+                        }
+                        Err(connecting) => {
+                            // 0-RTT 不可用,回退到标准 1-RTT 连接
+                            tracing::debug!(host, "0-RTT 不可用,回退到 1-RTT 连接");
+                            connecting.await.map_err(|e| {
+                                DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
+                            })?
+                        }
+                    }
+                } else {
+                    // 首次连接该 host,无缓存会话,执行标准 1-RTT 握手
+                    let connecting = self
+                        .endpoint
+                        .connect(addr, host)
+                        .map_err(|e| {
+                            DownloadError::Network(format!("发起 QUIC 连接失败: {e}"))
+                        })?;
+                    connecting.await.map_err(|e| {
+                        DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
+                    })?
+                }
+            } else {
+                // 无存储的加密配置(如 with_endpoint 创建),使用默认配置
+                let connecting = self
+                    .endpoint
+                    .connect(addr, host)
+                    .map_err(|e| DownloadError::Network(format!("发起 QUIC 连接失败: {e}")))?;
+                connecting.await.map_err(|e| {
+                    DownloadError::Network(format!("QUIC 连接建立失败: {e}"))
+                })?
+            };
 
         self.connection = Some(connection);
         tracing::info!(host, port, "QUIC 连接已建立");
+
+        // 缓存该 host 的服务器证书,标记为已知 host 以便后续尝试 0-RTT。
+        // 实际的 TLS session ticket 由 rustls 内部会话缓存自动管理。
+        if !self.session_tokens.contains_key(host) {
+            if let Some(conn) = &self.connection {
+                if let Some(identity) = conn.peer_identity() {
+                    if let Some(chain) = identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
+                        if let Some(cert) = chain.first() {
+                            self.session_tokens
+                                .insert(host.to_string(), cert.to_vec());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -511,8 +599,6 @@ fn build_full_request(url: &str) -> DownloadResult<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // 不安全的证书验证器 -- 仅用于测试
 // ---------------------------------------------------------------------------
-
-use std::sync::Arc;
 
 /// 不安全的证书验证器 -- 仅用于测试,接受任何证书
 ///

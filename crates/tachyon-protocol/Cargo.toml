@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Tachyon 协议层:HTTP/HTTPS/QUIC/FTP"
 
+[features]
+default = ["ftp", "quic"]
+ftp = ["dep:suppaftp"]
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-native-certs", "dep:rcgen"]
+
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
 reqwest.workspace = true
@@ -14,11 +19,11 @@ url.workspace = true
 tracing.workspace = true
 futures.workspace = true
 dashmap.workspace = true
-quinn.workspace = true
-rustls.workspace = true
-rustls-native-certs.workspace = true
-rcgen.workspace = true
-suppaftp.workspace = true
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+suppaftp = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

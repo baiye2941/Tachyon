@@ -5,10 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "Tachyon 引擎层:分片引擎、连接管理"
 
+[features]
+default = ["tachyon-protocol/ftp", "tachyon-protocol/quic"]
+ftp = ["tachyon-protocol/ftp"]
+quic = ["tachyon-protocol/quic"]
+
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
 tachyon-io = { path = "../tachyon-io" }
-tachyon-protocol = { path = "../tachyon-protocol" }
+tachyon-protocol = { path = "../tachyon-protocol", default-features = false }
 tachyon-crypto = { path = "../tachyon-crypto" }
 tachyon-scheduler = { path = "../tachyon-scheduler" }
 tokio.workspace = true

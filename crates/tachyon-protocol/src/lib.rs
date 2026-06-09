@@ -6,23 +6,30 @@
 //! - FTP 客户端(基于 suppaftp)
 //! - 统一 Protocol trait
 
+#[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod http;
+#[cfg(feature = "quic")]
 pub mod quic;
 
+#[cfg(feature = "ftp")]
 pub use ftp::FtpClient;
 pub use http::HttpClient;
+#[cfg(feature = "quic")]
 pub use quic::QuicTransport;
 
 /// 协议模块统一测试:验证三种协议的 Protocol trait 实现一致性
 #[cfg(test)]
 mod protocol_tests {
+    #[cfg(any(feature = "ftp", feature = "quic"))]
     use super::*;
+    #[cfg(any(feature = "ftp", feature = "quic"))]
     use tachyon_core::traits::Protocol;
 
     /// 辅助泛型函数:验证 Protocol trait 在所有协议上的一致行为
     ///
     /// 对不可达地址调用 probe/download_range/download_full/download_range_stream 均应返回错误。
+    #[cfg(any(feature = "ftp", feature = "quic"))]
     async fn verify_protocol_returns_error<P: Protocol>(proto: &P, url: &str) {
         let result = proto.probe(url).await;
         assert!(result.is_err(), "probe 应返回错误");
@@ -37,6 +44,7 @@ mod protocol_tests {
         assert!(result.is_err(), "download_range_stream 应返回错误");
     }
 
+    #[cfg(feature = "ftp")]
     #[tokio::test]
     async fn test_ftp_protocol_trait_consistency() {
         let ftp = FtpClient::new();
@@ -45,12 +53,14 @@ mod protocol_tests {
         verify_protocol_returns_error(&ftp, "ftp://192.0.2.1:1/file.bin").await;
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn test_quic_protocol_trait_consistency() {
         let quic = QuicTransport::new_insecure().await.unwrap();
         verify_protocol_returns_error(&quic, "https://example.com/file.bin").await;
     }
 
+    #[cfg(all(feature = "ftp", feature = "quic"))]
     #[tokio::test]
     async fn test_all_protocols_consistent_error_messages() {
         let ftp = FtpClient::new();
@@ -72,6 +82,7 @@ mod protocol_tests {
         );
     }
 
+    #[cfg(all(feature = "ftp", feature = "quic"))]
     #[tokio::test]
     async fn test_all_protocols_return_error_variant() {
         use tachyon_core::DownloadError;

@@ -82,21 +82,21 @@ pub trait Storage: Send + Sync {
         &self,
         offset: u64,
         data: Bytes,
-    ) -> impl std::future::Future<Output = DownloadResult<usize>> + Send;
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
 
-    fn read_at(
-        &self,
+    fn read_at<'a>(
+        &'a self,
         offset: u64,
-        buf: &mut [u8],
-    ) -> impl std::future::Future<Output = DownloadResult<usize>> + Send;
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>>;
 
-    fn sync(&self) -> impl std::future::Future<Output = DownloadResult<()>> + Send;
+    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
 
-    fn allocate(&self, size: u64) -> impl std::future::Future<Output = DownloadResult<()>> + Send;
+    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
 
-    fn file_size(&self) -> impl std::future::Future<Output = DownloadResult<u64>> + Send;
+    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>>;
 
-    fn close(&self) -> impl std::future::Future<Output = DownloadResult<()>> + Send;
+    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
 }
 
 /// 校验层 trait:负责数据完整性校验

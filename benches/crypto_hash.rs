@@ -3,7 +3,10 @@
 //! 对比不同数据大小下 blake3 和 sha256 的吞吐量,
 //! 用于验证 blake3 在大数据量下的性能优势。
 
+mod support;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::bench_config;
 use tachyon_core::traits::Verifier;
 use tachyon_crypto::cpu::CpuVerifier;
 
@@ -131,12 +134,14 @@ fn bench_verify(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_blake3,
-    bench_sha256,
-    bench_blake3_direct,
-    bench_sha256_direct,
-    bench_verify,
-);
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_blake3,
+        bench_sha256,
+        bench_blake3_direct,
+        bench_sha256_direct,
+        bench_verify
+}
 criterion_main!(benches);

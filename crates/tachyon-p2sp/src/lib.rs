@@ -12,7 +12,7 @@ pub mod source;
 pub use dht::DhtNode;
 pub use dht::{
     ALPHA, K_BUCKET_SIZE, KBucket, KademliaDht, KademliaMessage, NodeId, RoutingTable,
-    generate_node_id, xor_distance,
+    DhtTransport, TransportError, generate_node_id, xor_distance,
 };
 pub use peer::{PeerInfo, PeerScore};
 pub use source::{DownloadSource, SourceSelector};

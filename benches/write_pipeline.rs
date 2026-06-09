@@ -1,8 +1,11 @@
 //! WritePipeline 顺序写基准测试
 //! 测量 TokioFile 和 WritePipeline 在不同写入大小下的顺序写吞吐量，用于对比。
 
+mod support;
+
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use support::{bench_config, configure_group};
 use tachyon_io::{AsyncStorage, TokioFile, WritePipeline};
 use tempfile::NamedTempFile;
 
@@ -16,7 +19,7 @@ fn rt() -> tokio::runtime::Runtime {
 /// TokioFile 顺序写基准：从偏移 0 开始逐块写入指定大小的数据
 fn bench_tokiofile_sequential_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("tokiofile_sequential_write");
-    group.sample_size(20);
+    configure_group(&mut group, 20);
 
     for size in [256 * 1024, 1024 * 1024, 4 * 1024 * 1024].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
@@ -40,7 +43,7 @@ fn bench_tokiofile_sequential_write(c: &mut Criterion) {
 /// WritePipeline 顺序写基准：通过缓冲管道从偏移 0 开始逐块写入指定大小的数据
 fn bench_pipeline_sequential_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_sequential_write");
-    group.sample_size(20);
+    configure_group(&mut group, 20);
 
     for size in [256 * 1024, 1024 * 1024, 4 * 1024 * 1024].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
@@ -66,7 +69,7 @@ fn bench_pipeline_sequential_write(c: &mut Criterion) {
 /// 对比 pipeline_sequential_write 可量化 Bytes::clone() vs Bytes::copy_from_slice() 的差距
 fn bench_pipeline_write_bytes(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_write_bytes");
-    group.sample_size(20);
+    configure_group(&mut group, 20);
     for size in [256 * 1024, 1024 * 1024, 4 * 1024 * 1024].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -88,7 +91,7 @@ fn bench_pipeline_write_bytes(c: &mut Criterion) {
 /// 分片偏移写基准：模拟下载器分片写入模式——4 个 256KiB 分片写入不同偏移
 fn bench_fragment_offset_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("fragment_offset_writes");
-    group.sample_size(20);
+    configure_group(&mut group, 20);
     group.throughput(Throughput::Bytes(1024 * 1024)); // 4 × 256KiB = 1MiB
 
     let fragment_size = 256 * 1024usize;
@@ -149,7 +152,7 @@ fn bench_fragment_offset_writes(c: &mut Criterion) {
 /// sync 频率基准：对比每次写后 sync vs 最后一次 sync 的性能差异
 fn bench_sync_frequency(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_frequency");
-    group.sample_size(10);
+    configure_group(&mut group, 10);
     group.throughput(Throughput::Bytes(1024 * 1024)); // 4 × 256KiB = 1MiB
 
     let fragment_size = 256 * 1024usize;
@@ -194,12 +197,14 @@ fn bench_sync_frequency(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_tokiofile_sequential_write,
-    bench_pipeline_sequential_write,
-    bench_pipeline_write_bytes,
-    bench_fragment_offset_writes,
-    bench_sync_frequency
-);
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_tokiofile_sequential_write,
+        bench_pipeline_sequential_write,
+        bench_pipeline_write_bytes,
+        bench_fragment_offset_writes,
+        bench_sync_frequency
+}
 criterion_main!(benches);

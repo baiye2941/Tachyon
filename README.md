@@ -22,15 +22,16 @@
 | 能力 | 说明 |
 |:--|:--|
 | **多线程分片下载** | 16 并发动态分片，Holt-Winters 带宽预测自适应调整，支持 HTTP Range 断点续传 |
-| **QUIC + 0-RTT** | 基于 QUIC 协议实现零往返时间建连，降低连接延迟 |
-| **MP-QUIC 多路径传输** | 单连接多路径传输，自动在 WiFi / 5G / 有线间切换与聚合 |
-| **零拷贝存储引擎** | io_uring SQE/CQE 写入路径（Linux），IOCP Overlapped I/O（Windows），网络收包到文件写入全程无用户态拷贝 |
+| **QUIC + 0-RTT** | 基于 QUIC 协议实现零往返时间建连，自动缓存 session ticket，0-RTT 被拒时透明回退 1-RTT |
+| **MP-QUIC 多路径传输** | 单连接多路径传输框架就绪（QuicTransport 已完备，多路径聚合待集成） |
+| **零拷贝存储引擎** | io_uring SQE/CQE 写入路径（Linux），IOCP Overlapped I/O（Windows），WritePipeline 按实际 I/O 数精确消耗信号量 |
 | **磁盘空间预分配** | Linux `fallocate` / Windows `SetFileInformationByHandle` 预分配真实磁盘块，防止 ENOSPC |
 | **流式哈希校验** | 分片数据流式 BLAKE3 增量校验，峰值内存 O(chunk) 而非 O(fragment) |
-| **P2SP 混合下载** | CDN + DHT Peer 双源下载，自动测速选择最优源 |
+| **P2SP 混合下载** | Kademlia DHT + UDP RPC（PING/FIND_NODE/FIND_VALUE/STORE），迭代查找与分布式存储已落地 |
 | **GPU 加速校验** | 通过 Vulkan Compute / WebGPU 对分片做并行哈希校验（框架就绪） |
 | **智能调度与预测** | 基于 Holt-Winters 的带宽预测模型，提前分配连接资源 |
-| **协议级优化** | HTTP/HTTPS（含 HTTP/2）/ QUIC / FTP 多协议，每种协议做专项优化 |
+| **协议级优化** | HTTP/HTTPS（含 HTTP/2）/ QUIC / FTP 多协议，全协议真流式下载（64KB chunk 逐块读写） |
+| **协议裁剪** | Feature Flag 控制 FTP/QUIC 编译，`--no-default-features` 仅构建 HTTP 以减小二进制体积 |
 | **限速控制** | 令牌桶算法全局下载速度限制，不占用额外带宽 |
 
 ## 快速开始
@@ -51,11 +52,19 @@
 git clone https://github.com/baiye2941/Tachyon.git
 cd Tachyon
 
-# 构建（调试模式）
+# 构建（调试模式，默认启用全部协议）
 cargo build
 
 # 构建（发布模式，启用 LTO 和全量优化）
 cargo build --release
+
+# 仅构建 HTTP 协议（裁剪 FTP/QUIC，减小二进制体积）
+cargo build --no-default-features
+
+# 按需启用协议
+cargo build --features ftp      # HTTP + FTP
+cargo build --features quic     # HTTP + QUIC
+cargo build --features "ftp,quic"  # 全部协议（同默认）
 ```
 
 ### 开发模式
@@ -75,8 +84,8 @@ cargo tauri dev
 ```mermaid
 graph TB
     subgraph GUI["GUI 层 — Tauri v2 + SolidJS"]
-        FE["前端<br/><b>SolidJS</b> 细粒度响应式"]
-        APP["<b>tachyon-app</b><br/>Tauri 命令注册<br/>GUI 事件桥接"]
+        FE["前端<br/><b>SolidJS</b> 细粒度响应式<br/>虚拟滚动任务列表"]
+        APP["<b>tachyon-app</b><br/>Tauri 命令注册 (6 模块)<br/>GUI 事件桥接"]
     end
 
     subgraph BIZ["业务编排层"]
@@ -86,19 +95,19 @@ graph TB
     end
 
     subgraph ENGINE["引擎层"]
-        ENG["<b>tachyon-engine</b><br/>分片引擎 / 连接池<br/>断点续传 / 并发控制"]
-        P2SP["<b>tachyon-p2sp</b><br/>Kademlia DHT<br/>Peer 发现与管理"]
+        ENG["<b>tachyon-engine</b><br/>分片引擎 / 全局连接池<br/>断点续传 / 信号量并发控制"]
+        P2SP["<b>tachyon-p2sp</b><br/>Kademlia DHT + UDP RPC<br/>迭代查找 · 分布式存储"]
     end
 
     subgraph INFRA["基础设施层"]
-        PROTO["<b>tachyon-protocol</b><br/>HTTP/2 · QUIC · FTP"]
-        IO["<b>tachyon-io</b><br/>io_uring · IOCP<br/>WritePipeline"]
+        PROTO["<b>tachyon-protocol</b><br/>HTTP/2 · QUIC(0-RTT) · FTP<br/>Feature Flag 裁剪"]
+        IO["<b>tachyon-io</b><br/>io_uring · IOCP<br/>BufferPool · WritePipeline"]
         CRYPT["<b>tachyon-crypto</b><br/>BLAKE3 · SHA-256<br/>GPU 加速（预留）"]
-        STORE["<b>tachyon-store</b><br/>KV 存储 · 原子写入<br/>任务快照恢复"]
+        STORE["<b>tachyon-store</b><br/>KV 存储 · URL-safe 键名<br/>原子写入 · 快照恢复"]
     end
 
     subgraph CORE["核心层"]
-        CORELIB["<b>tachyon-core</b><br/>类型 · Trait · 错误体系<br/>配置 · 事件 · 状态机"]
+        CORELIB["<b>tachyon-core</b><br/>Object-safe Trait · 类型<br/>错误体系 · 配置 · 状态机"]
     end
 
     FE --> APP
@@ -168,7 +177,7 @@ sequenceDiagram
 flowchart LR
     subgraph NET["网络层"]
         HTTP["HTTP/2<br/>多路复用"]
-        QUIC["QUIC<br/>0-RTT"]
+        QUIC["QUIC<br/>0-RTT Session<br/>Resumption"]
         FTP["FTP"]
     end
 
@@ -256,17 +265,17 @@ graph LR
 
 | Crate | 职责 | 关键技术 |
 |:--|:--|:--|
-| `tachyon-core` | 核心类型、trait 定义、错误体系、配置与事件 | `thiserror`, `serde` |
-| `tachyon-engine` | 分片引擎、连接管理、MP-QUIC 多路径传输 | `tokio`, `quinn`, `bytes` |
+| `tachyon-core` | 核心类型、object-safe trait 定义、错误体系、配置与事件 | `thiserror`, `serde`, `Pin<Box<dyn Future>>` |
+| `tachyon-engine` | 分片引擎、全局连接池（单例 + 信号量并发控制）、断点续传 | `tokio`, `quinn`, `bytes`, `Semaphore` |
 | `tachyon-scheduler` | 智能调度器、带宽预测、优先级队列 | Holt-Winters, `BinaryHeap` |
-| `tachyon-io` | 跨平台异步文件 I/O、缓冲区池管理 | `tokio`, `io-uring`, IOCP |
-| `tachyon-protocol` | HTTP/HTTPS/QUIC/FTP 协议适配与实现 | `reqwest`, `quinn`, `suppaftp` |
+| `tachyon-io` | 跨平台异步文件 I/O、BufferPool、WritePipeline（按实际写入数消耗信号量） | `tokio`, `io-uring`, IOCP |
+| `tachyon-protocol` | HTTP/HTTPS/QUIC(0-RTT)/FTP 全流式协议，Feature Flag 裁剪 | `reqwest`, `quinn`, `suppaftp` |
 | `tachyon-sniffer` | 浏览器资源嗅探、流量拦截与解析 | `url`, playwright MCP |
 | `tachyon-crypto` | CPU/GPU 哈希校验、完整性验证 | `blake3`, `sha2`, `wgpu` |
-| `tachyon-p2sp` | P2SP 混合下载、DHT 网络、Peer 发现 | 自研 Kademlia DHT |
-| `tachyon-store` | 断点续传持久化、KV 存储、任务快照管理 | JSON 原子写入 |
+| `tachyon-p2sp` | Kademlia DHT、UDP RPC 网络层、迭代查找、分布式存储 | 自研 Kademlia + `tokio::net::UdpSocket` |
+| `tachyon-store` | 断点续传持久化、KV 存储（URL-safe 键名编码）、任务快照恢复 | JSON 原子写入 |
 | `tachyon-hub` | HuggingFace / GitHub LFS 模型仓库 API | REST API 对接 |
-| `tachyon-app` | Tauri 应用入口、命令注册、GUI 事件桥接 | `tauri` v2 |
+| `tachyon-app` | Tauri 应用入口、模块化命令（6 子模块）、GUI 事件桥接 | `tauri` v2 |
 
 ## 技术栈
 
@@ -285,7 +294,7 @@ graph LR
 | 功能 | Crate / 工具 | 说明 |
 |:--|:--|:--|
 | 异步运行时 | `tokio` | multi-thread, full features |
-| QUIC 协议 | `quinn` | 基于 rustls 的 QUIC 实现 |
+| QUIC 协议 | `quinn` | 基于 rustls 的 QUIC 实现，支持 0-RTT session resumption（`quic` feature） |
 | io_uring | `io-uring` / `tokio-uring` | Linux 异步 IO 接口（按需启用） |
 | HTTP 客户端 | `reqwest` | 基于 hyper，支持 rustls-tls + HTTP/2 |
 | 桌面框架 | `tauri` v2 | 跨平台桌面应用框架 |
@@ -294,7 +303,7 @@ graph LR
 | 序列化 | `serde`, `serde_json` | JSON 与结构化数据序列化 |
 | 错误处理 | `thiserror` | 结构化错误体系 |
 | 日志 | `tracing` | 结构化日志与过滤 |
-| FTP | `suppaftp` | 异步 FTP 客户端 |
+| FTP | `suppaftp` | 异步 FTP 客户端，真流式 64KB chunk 读取（`ftp` feature） |
 | 属性测试 | `proptest` | 基于属性的随机测试 |
 | 基准测试 | `criterion` | 统计学基准测试框架 |
 | Mock 框架 | `mockall` | trait 与函数 mock |
@@ -312,14 +321,22 @@ Tachyon/
 │   ├── tachyon-engine/         # 分片引擎与连接管理
 │   ├── tachyon-scheduler/      # 智能调度器
 │   ├── tachyon-io/             # 跨平台异步文件 I/O
-│   ├── tachyon-protocol/       # 多协议适配
+│   ├── tachyon-protocol/       # 多协议适配（Feature Flag 裁剪）
 │   ├── tachyon-sniffer/        # 浏览器资源嗅探
 │   ├── tachyon-crypto/         # CPU/GPU 哈希校验
-│   ├── tachyon-p2sp/           # P2SP 混合下载
+│   ├── tachyon-p2sp/           # Kademlia DHT + UDP RPC
 │   ├── tachyon-store/          # 持久化存储
 │   ├── tachyon-hub/            # 模型仓库 API
 │   └── tachyon-app/            # Tauri 应用入口
+│       └── src/commands/       # 按功能拆分的命令模块
+│           ├── mod.rs            公共类型与状态管理
+│           ├── task_commands.rs  任务生命周期管理
+│           ├── config_commands.rs 配置读写与校验
+│           ├── sniffer_commands.rs 资源嗅探
+│           ├── hub_commands.rs   HuggingFace Hub
+│           └── progress_commands.rs 进度订阅
 ├── frontend/                   # Tauri 前端 (Bun + SolidJS)
+│   └── src/components/         # 19 个活跃组件（含虚拟滚动任务列表）
 ├── tests/                      # 集成测试
 ├── benches/                    # criterion 基准测试
 └── docs/                       # 架构文档 (本地)
@@ -328,14 +345,20 @@ Tachyon/
 ## 测试
 
 ```bash
-# 运行全部测试
-cargo test --all
+# 运行全部测试（774 个单元测试）
+cargo test --workspace --lib
 
 # 运行指定 crate 的单元测试
 cargo test -p tachyon-core --lib
 
 # 运行指定测试（精确匹配）
 cargo test -p tachyon-core -- test_name --exact
+
+# 验证协议裁剪（仅 HTTP）
+cargo test -p tachyon-protocol --no-default-features --lib
+
+# 验证协议裁剪（HTTP + FTP）
+cargo test -p tachyon-protocol --features ftp --lib
 
 # 代码检查（clippy 零警告）
 cargo clippy --all-targets --all-features -- -D warnings
@@ -349,7 +372,7 @@ cargo llvm-cov --all --fail-under-lines 90
 
 ### 测试策略
 
-项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。
+项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。测试严格跟随各自模块文件，每个子模块维护独立的 `#[cfg(test)]` 测试块。当前共 **774 个单元测试**覆盖 11 个 crate。
 
 ## 基准测试
 
@@ -365,6 +388,7 @@ cargo bench
 | `fragment_planning` | 分片规划算法效率 |
 | `hex_encode` | Hex 编码吞吐量 |
 | `write_pipeline` | WritePipeline 写入管道性能 |
+| `e2e_download` | 端到端下载流程集成性能 |
 
 ### 发布构建优化
 
@@ -403,8 +427,9 @@ overflow-checks = false
 4. 提交信息格式：`<类型>(<范围>): <简要描述>`
 5. 确保 `cargo clippy --all-targets --all-features -- -D warnings` 零警告
 6. 确保 `cargo fmt --all -- --check` 通过
-7. 新功能需附带测试，覆盖率不低于 90%
-8. 提交 Pull Request 前运行 `cargo test --all` 确保全部通过
+7. 新功能需附带测试，测试跟随对应模块文件，覆盖率不低于 90%
+8. 协议层改动需验证 `--no-default-features` 编译通过
+9. 提交 Pull Request 前运行 `cargo test --workspace --lib` 确保全部通过
 
 ## 许可证
 

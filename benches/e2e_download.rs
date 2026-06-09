@@ -4,7 +4,10 @@
 //! 快照序列化/反序列化、恢复加载等。所有测试使用内存或本地文件系统，
 //! 不进行真实 HTTP 请求。
 
+mod support;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use support::bench_config;
 use std::path::PathBuf;
 use tachyon_core::DownloadState;
 use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord, compute_fragment_size};
@@ -182,13 +185,15 @@ fn bench_bandwidth_tracking_cycle(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_snapshot_save_load,
-    bench_snapshot_batch_save,
-    bench_recover_pending,
-    bench_fragment_size_computation,
-    bench_fragment_lifecycle,
-    bench_bandwidth_tracking_cycle,
-);
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_snapshot_save_load,
+        bench_snapshot_batch_save,
+        bench_recover_pending,
+        bench_fragment_size_computation,
+        bench_fragment_lifecycle,
+        bench_bandwidth_tracking_cycle
+}
 criterion_main!(benches);

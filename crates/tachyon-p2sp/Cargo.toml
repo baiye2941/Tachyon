@@ -5,12 +5,19 @@ edition.workspace = true
 license.workspace = true
 description = "Tachyon P2SP 混合下载、DHT、Peer 发现"
 
+[features]
+default = ["tachyon-protocol/ftp", "tachyon-protocol/quic"]
+ftp = ["tachyon-protocol/ftp"]
+quic = ["tachyon-protocol/quic"]
+
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
-tachyon-protocol = { path = "../tachyon-protocol" }
+tachyon-protocol = { path = "../tachyon-protocol", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

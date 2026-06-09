@@ -21,6 +21,10 @@
 
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
+use std::future::Future;
+#[cfg(target_os = "windows")]
+use std::pin::Pin;
+#[cfg(target_os = "windows")]
 use std::sync::{Mutex, MutexGuard};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
@@ -551,135 +555,163 @@ impl crate::storage::AsyncStorage for IoCpStorage {
     /// 1. 使用 KernelOverlapped(内核兼容布局)提交 WriteFile
     /// 2. pending I/O 由 poller 线程从完成端口接收通知
     /// 3. 同步完成时直接返回,不会再投递完成包
-    async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        if self.state != IoCpState::Ready {
-            return Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "IOCP 存储引擎未初始化",
-            )));
-        }
+    fn write_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        Box::pin(async move {
+            if self.state != IoCpState::Ready {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "IOCP 存储引擎未初始化",
+                )));
+            }
 
-        use std::os::windows::io::AsRawHandle;
+            use std::os::windows::io::AsRawHandle;
 
-        // 1. 构造内核兼容的 OVERLAPPED 结构(正确的字段布局)。
-        // Box 随 PendingWrite 进入 registry,确保 future 被取消后内核仍可访问。
-        let mut overlapped = Box::new(KernelOverlapped::new_for_offset(offset));
-        let ov_ptr = overlapped.as_overlapped_ptr();
+            // 1. 构造内核兼容的 OVERLAPPED 结构(正确的字段布局)。
+            // Box 随 PendingWrite 进入 registry,确保 future 被取消后内核仍可访问。
+            let mut overlapped = Box::new(KernelOverlapped::new_for_offset(offset));
+            let ov_ptr = overlapped.as_overlapped_ptr();
 
-        let file = self.file.as_ref().ok_or_else(|| {
-            DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "IOCP 文件句柄未初始化",
-            ))
-        })?;
-        let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-        let overlapped_key = ov_ptr as usize;
-        let data_ptr = data.as_ptr();
-        let data_len = data.len();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut map = lock_completion_registry(&self.registry);
-            map.insert(
-                overlapped_key,
-                PendingWrite {
-                    completion: tx,
-                    data,
-                    overlapped,
-                },
-            );
-        }
+            let file = self.file.as_ref().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "IOCP 文件句柄未初始化",
+                ))
+            })?;
+            let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let overlapped_key = ov_ptr as usize;
+            let data_ptr = data.as_ptr();
+            let data_len = data.len();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut map = lock_completion_registry(&self.registry);
+                map.insert(
+                    overlapped_key,
+                    PendingWrite {
+                        completion: tx,
+                        data,
+                        overlapped,
+                    },
+                );
+            }
 
-        let mut bytes_written: u32 = 0;
-        // Safety:
-        // - file_handle 来自 init() 中 FILE_FLAG_OVERLAPPED 打开的文件
-        // - data_ptr 指向 registry 中 PendingWrite 持有的 Bytes 缓冲区
-        // - ov_ptr 指向 registry 中 PendingWrite 持有的 KernelOverlapped
-        let write_ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::WriteFile(
+            let mut bytes_written: u32 = 0;
+            // Safety:
+            // - file_handle 来自 init() 中 FILE_FLAG_OVERLAPPED 打开的文件
+            // - data_ptr 指向 registry 中 PendingWrite 持有的 Bytes 缓冲区
+            // - ov_ptr 指向 registry 中 PendingWrite 持有的 KernelOverlapped
+            let write_ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
+                    file_handle,
+                    data_ptr,
+                    data_len as u32,
+                    &mut bytes_written,
+                    ov_ptr,
+                )
+            };
+
+            if write_ok != 0 {
+                // 同步完成(fast path):WriteFile 直接写入成功
+                tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
+                {
+                    let mut map = lock_completion_registry(&self.registry);
+                    map.remove(&overlapped_key);
+                }
+                return Ok(bytes_written as usize);
+            }
+
+            // 4. 检查是否为 ERROR_IO_PENDING(异步进行中)
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error()
+                != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32)
+            {
+                // 真正的写入失败
+                {
+                    let mut map = lock_completion_registry(&self.registry);
+                    map.remove(&overlapped_key);
+                }
+                return Err(map_writefile_submission_error(err));
+            }
+
+            // pending I/O 的缓冲区和 OVERLAPPED 继续由 registry 持有到完成通知。
+            let mut cancel_guard = PendingWriteCancelGuard::new(
                 file_handle,
-                data_ptr,
-                data_len as u32,
-                &mut bytes_written,
-                ov_ptr,
-            )
-        };
-
-        if write_ok != 0 {
-            // 同步完成(fast path):WriteFile 直接写入成功
-            tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
-            {
-                let mut map = lock_completion_registry(&self.registry);
-                map.remove(&overlapped_key);
-            }
-            return Ok(bytes_written as usize);
-        }
-
-        // 4. 检查是否为 ERROR_IO_PENDING(异步进行中)
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
-            // 真正的写入失败
-            {
-                let mut map = lock_completion_registry(&self.registry);
-                map.remove(&overlapped_key);
-            }
-            return Err(map_writefile_submission_error(err));
-        }
-
-        // pending I/O 的缓冲区和 OVERLAPPED 继续由 registry 持有到完成通知。
-        let mut cancel_guard =
-            PendingWriteCancelGuard::new(file_handle, overlapped_key, self.registry.clone());
-        let completion = rx.await.map_err(|_| {
-            DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "IOCP 完成通知通道关闭",
-            ))
-        });
-        cancel_guard.disarm();
-        completion?
-    }
-
-    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
-        use std::os::windows::fs::FileExt;
-
-        let file = self.clone_ready_file()?;
-        let buf_len = buf.len();
-        let mut owned_buf = vec![0u8; buf_len];
-        let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-            let n = file.seek_read(&mut owned_buf, offset)?;
-            Ok::<_, std::io::Error>((n, owned_buf))
+                overlapped_key,
+                self.registry.clone(),
+            );
+            let completion = rx.await.map_err(|_| {
+                DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "IOCP 完成通知通道关闭",
+                ))
+            });
+            cancel_guard.disarm();
+            completion?
         })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
-        .map_err(DownloadError::Io)?;
-        buf[..n].copy_from_slice(&owned_buf[..n]);
-        Ok(n)
     }
 
-    async fn sync(&self) -> DownloadResult<()> {
-        let file = self.clone_ready_file()?;
-        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+    fn read_at<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::windows::fs::FileExt;
+
+            let file = self.clone_ready_file()?;
+            let buf_len = buf.len();
+            let mut owned_buf = vec![0u8; buf_len];
+            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
+                let n = file.seek_read(&mut owned_buf, offset)?;
+                Ok::<_, std::io::Error>((n, owned_buf))
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map_err(DownloadError::Io)?;
+            buf[..n].copy_from_slice(&owned_buf[..n]);
+            Ok(n)
+        })
     }
 
-    async fn allocate(&self, size: u64) -> DownloadResult<()> {
-        let file = self.clone_ready_file()?;
-        tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
+    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.clone_ready_file()?;
+            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn allocate(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.clone_ready_file()?;
+            tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.clone_ready_file()?;
+            tokio::task::spawn_blocking(move || {
+                file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-    }
-
-    async fn file_size(&self) -> DownloadResult<u64> {
-        let file = self.clone_ready_file()?;
-        tokio::task::spawn_blocking(move || {
-            file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
         })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
     }
 
-    async fn close(&self) -> DownloadResult<()> {
-        self.sync().await
+    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.sync().await
+        })
     }
 }
 

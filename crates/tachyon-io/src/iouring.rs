@@ -32,7 +32,9 @@
 //! - Linux 5.4+:完整 io_uring 实现
 //! - 其他平台:编译为空桩,`init()` 返回 `Unsupported` 错误
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use bytes::Bytes;
 
@@ -125,7 +127,7 @@ pub struct IoUringStorage {
     // io_uring 实例持有者,在 Linux 上通过 Box 持有
     // 避免在非 Linux 平台上引入 io_uring crate 依赖
     #[cfg(target_os = "linux")]
-    ring: Option<IoUringHandle>,
+    ring: Option<std::sync::Arc<IoUringHandle>>,
 }
 
 /// 地址对齐的缓冲区(Linux only)
@@ -157,7 +159,7 @@ struct IoUringHandle {
     /// io_uring 实例(Mutex 包裹以支持内部可变性)
     ring: std::sync::Mutex<io_uring::IoUring>,
     /// 注册的 fixed buffers (保持内存不被释放)
-    _buffers: Vec<AlignedBuffer>,
+    buffers: Vec<AlignedBuffer>,
 }
 
 /// 分配地址对齐的缓冲区(O_DIRECT/io_uring 要求)
@@ -277,9 +279,10 @@ impl IoUringStorage {
             })
             .collect();
 
-        // 注意:实际注册需要可变引用 ring,此处为框架代码
-        // ring.submitter().register_buffers(&iovecs)?;
-        let _ = &iovecs; // 抑制未使用警告
+        // 注意:注册需要可变引用,在 Mutex 包裹之前完成
+        ring.submitter()
+            .register_buffers(&iovecs)
+            .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
 
         // 步骤 4: 以 O_DIRECT 打开文件
         // O_DIRECT 绕过页缓存,配合 fixed buffer 实现真正零拷贝
@@ -293,10 +296,10 @@ impl IoUringStorage {
             .map_err(DownloadError::Io)?;
 
         self.file_fd = Some(file);
-        self.ring = Some(IoUringHandle {
+        self.ring = Some(std::sync::Arc::new(IoUringHandle {
             ring: std::sync::Mutex::new(ring),
-            _buffers: buffers,
-        });
+            buffers,
+        }));
         self.state = IoUringState::Ready;
 
         tracing::info!(
@@ -330,11 +333,13 @@ impl IoUringStorage {
     /// - `len`: 数据长度
     /// - `buf_index`: 注册的 buffer 索引
     ///
-    /// 提交后阻塞等待 CQE 返回,获取实际写入字节数。
+    /// 使用 `spawn_blocking` 在独立线程中提交并等待 CQE,
+    /// 避免阻塞 tokio 异步运行时。Mutex 保证同一时刻仅有一个
+    /// 写入操作使用 fixed buffer 0,确保数据不被覆盖。
     #[cfg(target_os = "linux")]
     async fn submit_write(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        let ring = match &self.ring {
-            Some(h) => h,
+        let ring_handle = match &self.ring {
+            Some(h) => h.clone(), // Arc clone, Send + 'static
             None => {
                 return Err(DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
@@ -342,8 +347,11 @@ impl IoUringStorage {
                 )));
             }
         };
-        let file = match &self.file_fd {
-            Some(f) => f,
+        let fd = match &self.file_fd {
+            Some(f) => {
+                use std::os::fd::AsRawFd;
+                f.as_raw_fd()
+            }
             None => {
                 return Err(DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
@@ -351,41 +359,73 @@ impl IoUringStorage {
                 )));
             }
         };
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
+
         let len = data.len();
 
-        // 构造 IORING_OP_WRITE SQE
-        let write_op =
-            io_uring::opcode::Write::new(io_uring::types::Fd(fd), data.as_ptr(), len as u32)
-                .offset(offset)
-                .build();
+        // spawn_blocking: 在独立线程中完成 io_uring 提交+等待,
+        // 避免 MutexGuard 跨 await 点以及阻塞 tokio 工作线程
+        tokio::task::spawn_blocking(move || {
+            let mut uring = ring_handle
+                .ring
+                .lock()
+                .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
 
-        // 提交 SQ (Mutex lock 提供内部可变性)
-        let mut uring = ring
-            .ring
-            .lock()
-            .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
-        let mut sq = uring.submission();
-        unsafe {
-            sq.push(&write_op)
-                .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring 提交队列已满")))?;
-        }
-        sq.sync();
-        drop(sq);
+            // 将数据复制到 fixed buffer 0 (Mutex 保证排他访问)
+            let buf = &ring_handle.buffers[0];
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.as_ptr() as *mut u8,
+                    len,
+                )
+            };
+            dst.copy_from_slice(&data[..len]);
 
-        // 等待 CQE
-        let cqe = uring
-            .completion()
-            .next()
-            .ok_or_else(|| DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭")))?;
-        let result = cqe.result();
-        if result < 0 {
-            return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
-                -result,
-            )));
-        }
-        Ok(result as usize)
+            // 构造 IORING_OP_WRITE_FIXED SQE
+            // 使用已注册的 fixed buffer 索引 0,内核直接使用注册页面的物理地址,
+            // 省去每次 I/O 的页表查找开销
+            let write_op = io_uring::opcode::WriteFixed::new(
+                io_uring::types::Fd(fd),
+                buf.as_ptr(),
+                len as u32,
+                0, // buf_index: 使用第 0 个注册的 fixed buffer
+            )
+            .offset(offset)
+            .build();
+
+            // 提交 SQE 到 SQ 并同步到内核
+            let mut sq = uring.submission();
+            unsafe {
+                sq.push(&write_op).map_err(|_| {
+                    DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
+                })?;
+            }
+            sq.sync();
+            drop(sq);
+
+            // submit_and_wait(1): 提交待处理的 SQE 并阻塞等待至少 1 个 CQE,
+            // 由于已在 spawn_blocking 线程中运行,不会阻塞 tokio 运行时
+            uring
+                .submitter()
+                .submit_and_wait(1)
+                .map_err(DownloadError::Io)?;
+
+            // 读取 CQE 获取完成结果
+            let cqe = uring
+                .completion()
+                .next()
+                .ok_or_else(|| {
+                    DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+                })?;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
+                    -result,
+                )));
+            }
+            Ok(result as usize)
+        })
+        .await
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
     }
 }
 
@@ -397,152 +437,175 @@ impl IoUringStorage {
 // =============================================================================
 
 impl AsyncStorage for IoUringStorage {
-    async fn write_at(&self, _offset: u64, _data: Bytes) -> DownloadResult<usize> {
-        match self.state {
-            IoUringState::Ready => {
-                // Linux 上:走 io_uring 零拷贝路径
-                #[cfg(target_os = "linux")]
-                {
-                    self.submit_write(_offset, _data).await
+    fn write_at(
+        &self,
+        _offset: u64,
+        _data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    // Linux 上:走 io_uring 零拷贝路径
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.submit_write(_offset, _data).await
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化,请先调用 init() 或使用 TokioFile",
+                ))),
             }
-            _ => Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "io_uring 存储引擎未初始化,请先调用 init() 或使用 TokioFile",
-            ))),
-        }
+        })
     }
 
-    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> DownloadResult<usize> {
-        match self.state {
-            IoUringState::Ready => {
-                // 暂未实现原因:READ_FIXED 需要配合 fixed buffer 池管理,
-                // 当前优先实现写入路径,读取路径在 Linux CI 中验证后补全。
-                #[cfg(target_os = "linux")]
-                {
-                    // TODO: 实现 io_uring READ_FIXED 零拷贝读取(需 fixed buffer 池管理)
-                    Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "io_uring 读取尚未实现,请使用 TokioFile",
-                    )))
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
-            }
-            _ => Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "io_uring 存储引擎未初始化,请先调用 init() 或使用 TokioFile",
-            ))),
-        }
-    }
-
-    async fn sync(&self) -> DownloadResult<()> {
-        match self.state {
-            IoUringState::Ready => {
-                // 暂未实现原因:io_uring FSYNC 操作需要与 SQE 提交循环集成,
-                // 当前通过 tokio::fs::File::sync_all() 作为后备方案。
-                #[cfg(target_os = "linux")]
-                {
-                    // TODO: 实现 io_uring FSYNC SQE 提交(需集成事件循环)
-                    Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "io_uring 同步尚未实现,请使用 TokioFile",
-                    )))
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
-            }
-            _ => Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "io_uring 存储引擎未初始化",
-            ))),
-        }
-    }
-
-    async fn allocate(&self, size: u64) -> DownloadResult<()> {
-        match self.state {
-            IoUringState::Ready => {
-                // 暂未实现原因:fallocate 预分配需要调用 io_uring FALLOCATE 操作码,
-                // 或者直接使用 libc::fallocate,需要与文件描述符生命周期配合。
-                // 当前使用标准文件写入按需扩展,待性能测试确认瓶颈后实现。
-                #[cfg(target_os = "linux")]
-                {
-                    // TODO: 实现 fallocate 或 io_uring FALLOCATE 操作
-                    let _ = size;
-                    Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "io_uring 空间预分配尚未实现,请使用 TokioFile",
-                    )))
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = size;
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
-            }
-            _ => Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "io_uring 存储引擎未初始化",
-            ))),
-        }
-    }
-
-    async fn file_size(&self) -> DownloadResult<u64> {
-        match self.state {
-            IoUringState::Ready => {
-                // 文件大小查询走标准 stat,无需 io_uring
-                #[cfg(target_os = "linux")]
-                {
-                    #[allow(unused_imports)]
-                    // metadata() 不需要 AsRawFd,保留供后续 io_uring 操作使用
-                    use std::os::unix::io::AsRawFd;
-                    if let Some(ref file) = self.file_fd {
-                        let metadata = file.metadata().map_err(DownloadError::Io)?;
-                        Ok(metadata.len())
-                    } else {
+    fn read_at<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    // 暂未实现原因:READ_FIXED 需要配合 fixed buffer 池管理,
+                    // 当前优先实现写入路径,读取路径在 Linux CI 中验证后补全。
+                    #[cfg(target_os = "linux")]
+                    {
+                        // TODO: 实现 io_uring READ_FIXED 零拷贝读取(需 fixed buffer 池管理)
                         Err(DownloadError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotConnected,
-                            "文件未打开",
+                            std::io::ErrorKind::Unsupported,
+                            "io_uring 读取尚未实现,请使用 TokioFile",
                         )))
                     }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化,请先调用 init() 或使用 TokioFile",
+                ))),
             }
-            _ => Err(DownloadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "io_uring 存储引擎未初始化",
-            ))),
-        }
+        })
     }
 
-    async fn close(&self) -> DownloadResult<()> {
-        match self.state {
-            IoUringState::Ready => {
-                #[cfg(target_os = "linux")]
-                {
-                    if let Some(ref file) = self.file_fd {
-                        file.sync_all().map_err(DownloadError::Io)?;
+    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    // 暂未实现原因:io_uring FSYNC 操作需要与 SQE 提交循环集成,
+                    // 当前通过 tokio::fs::File::sync_all() 作为后备方案。
+                    #[cfg(target_os = "linux")]
+                    {
+                        // TODO: 实现 io_uring FSYNC SQE 提交(需集成事件循环)
+                        Err(DownloadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "io_uring 同步尚未实现,请使用 TokioFile",
+                        )))
                     }
-                    Ok(())
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    unreachable!("非 Linux 平台不可能处于 Ready 状态")
-                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化",
+                ))),
             }
-            _ => Ok(()),
-        }
+        })
+    }
+
+    fn allocate(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    // 暂未实现原因:fallocate 预分配需要调用 io_uring FALLOCATE 操作码,
+                    // 或者直接使用 libc::fallocate,需要与文件描述符生命周期配合。
+                    // 当前使用标准文件写入按需扩展,待性能测试确认瓶颈后实现。
+                    #[cfg(target_os = "linux")]
+                    {
+                        // TODO: 实现 fallocate 或 io_uring FALLOCATE 操作
+                        let _ = size;
+                        Err(DownloadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "io_uring 空间预分配尚未实现,请使用 TokioFile",
+                        )))
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = size;
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
+                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化",
+                ))),
+            }
+        })
+    }
+
+    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    // 文件大小查询走标准 stat,无需 io_uring
+                    #[cfg(target_os = "linux")]
+                    {
+                        #[allow(unused_imports)]
+                        // metadata() 不需要 AsRawFd,保留供后续 io_uring 操作使用
+                        use std::os::unix::io::AsRawFd;
+                        if let Some(ref file) = self.file_fd {
+                            let metadata = file.metadata().map_err(DownloadError::Io)?;
+                            Ok(metadata.len())
+                        } else {
+                            Err(DownloadError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "文件未打开",
+                            )))
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
+                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化",
+                ))),
+            }
+        })
+    }
+
+    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(ref file) = self.file_fd {
+                            file.sync_all().map_err(DownloadError::Io)?;
+                        }
+                        Ok(())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
+                }
+                _ => Ok(()),
+            }
+        })
     }
 }
 

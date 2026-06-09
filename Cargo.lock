@@ -4306,7 +4306,9 @@ dependencies = [
 name = "tachyon-p2sp"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "serde",
+ "serde_json",
  "tachyon-core",
  "tachyon-protocol",
  "tokio",

@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -105,149 +107,197 @@ impl WinFile {
 
 #[cfg(target_os = "windows")]
 impl AsyncStorage for WinFile {
-    async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        use std::os::windows::fs::FileExt;
-        if self.no_buffering {
-            const SECTOR_SIZE: u64 = 512;
-            if !offset.is_multiple_of(SECTOR_SIZE) {
-                return Err(DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
-                )));
+    fn write_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        Box::pin(async move {
+            use std::os::windows::fs::FileExt;
+            if self.no_buffering {
+                const SECTOR_SIZE: u64 = 512;
+                if !offset.is_multiple_of(SECTOR_SIZE) {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
+                    )));
+                }
+                if !(data.len() as u64).is_multiple_of(SECTOR_SIZE) {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "NO_BUFFERING 模式下数据长度 {} 未对齐到 {SECTOR_SIZE} 字节",
+                            data.len()
+                        ),
+                    )));
+                }
             }
-            if !(data.len() as u64).is_multiple_of(SECTOR_SIZE) {
-                return Err(DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "NO_BUFFERING 模式下数据长度 {} 未对齐到 {SECTOR_SIZE} 字节",
-                        data.len()
-                    ),
-                )));
-            }
-        }
 
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
-            file.seek_write(&data, offset).map_err(DownloadError::Io)
-        })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
-    }
-
-    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
-        use std::os::windows::fs::FileExt;
-        if self.no_buffering {
-            const SECTOR_SIZE: u64 = 512;
-            if !offset.is_multiple_of(SECTOR_SIZE) {
-                return Err(DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
-                )));
-            }
-            if !(buf.len() as u64).is_multiple_of(SECTOR_SIZE) {
-                return Err(DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "NO_BUFFERING 模式下缓冲区长度 {} 未对齐到 {SECTOR_SIZE} 字节",
-                        buf.len()
-                    ),
-                )));
-            }
-        }
-
-        let file = self.file.clone();
-        let buf_len = buf.len();
-        let mut owned_buf = vec![0u8; buf_len];
-        let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-            let n = file.seek_read(&mut owned_buf, offset)?;
-            Ok::<_, std::io::Error>((n, owned_buf))
-        })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
-        .map_err(DownloadError::Io)?;
-        buf[..n].copy_from_slice(&owned_buf[..n]);
-        Ok(n)
-    }
-
-    async fn sync(&self) -> DownloadResult<()> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || {
+                file.seek_write(&data, offset).map_err(DownloadError::Io)
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-    }
-
-    async fn allocate(&self, size: u64) -> DownloadResult<()> {
-        self.preallocate(size).await
-    }
-
-    async fn file_size(&self) -> DownloadResult<u64> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
-            file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
         })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
     }
 
-    async fn close(&self) -> DownloadResult<()> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+    fn read_at<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::windows::fs::FileExt;
+            if self.no_buffering {
+                const SECTOR_SIZE: u64 = 512;
+                if !offset.is_multiple_of(SECTOR_SIZE) {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
+                    )));
+                }
+                if !(buf.len() as u64).is_multiple_of(SECTOR_SIZE) {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "NO_BUFFERING 模式下缓冲区长度 {} 未对齐到 {SECTOR_SIZE} 字节",
+                            buf.len()
+                        ),
+                    )));
+                }
+            }
+
+            let file = self.file.clone();
+            let buf_len = buf.len();
+            let mut owned_buf = vec![0u8; buf_len];
+            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
+                let n = file.seek_read(&mut owned_buf, offset)?;
+                Ok::<_, std::io::Error>((n, owned_buf))
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map_err(DownloadError::Io)?;
+            buf[..n].copy_from_slice(&owned_buf[..n]);
+            Ok(n)
+        })
+    }
+
+    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn allocate(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.preallocate(size).await
+        })
+    }
+
+    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || {
+                file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 impl AsyncStorage for WinFile {
-    async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        use std::os::unix::fs::FileExt;
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.write_at(&data, offset).map_err(DownloadError::Io))
+    fn write_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || {
+                file.write_at(&data, offset).map_err(DownloadError::Io)
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-    }
-
-    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
-        use std::os::unix::fs::FileExt;
-        let file = self.file.clone();
-        let buf_len = buf.len();
-        let mut owned_buf = vec![0u8; buf_len];
-        let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-            let n = file.read_at(&mut owned_buf, offset)?;
-            Ok::<_, std::io::Error>((n, owned_buf))
         })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
-        .map_err(DownloadError::Io)?;
-        buf[..n].copy_from_slice(&owned_buf[..n]);
-        Ok(n)
     }
 
-    async fn sync(&self) -> DownloadResult<()> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+    fn read_at<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.clone();
+            let buf_len = buf.len();
+            let mut owned_buf = vec![0u8; buf_len];
+            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
+                let n = file.read_at(&mut owned_buf, offset)?;
+                Ok::<_, std::io::Error>((n, owned_buf))
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-    }
-
-    async fn allocate(&self, size: u64) -> DownloadResult<()> {
-        self.preallocate(size).await
-    }
-
-    async fn file_size(&self) -> DownloadResult<u64> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
-            file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
+            .map_err(DownloadError::Io)?;
+            buf[..n].copy_from_slice(&owned_buf[..n]);
+            Ok(n)
         })
-        .await
-        .map_err(|e| DownloadError::Io(e.into()))?
     }
 
-    async fn close(&self) -> DownloadResult<()> {
-        let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn allocate(
+        &self,
+        size: u64,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.preallocate(size).await
+        })
+    }
+
+    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || {
+                file.metadata().map(|m| m.len()).map_err(DownloadError::Io)
+            })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let file = self.file.clone();
+            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+        })
     }
 }
 

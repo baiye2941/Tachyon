@@ -4,9 +4,6 @@
  * 使用 Heroicons 20 Solid 风格的 SVG path。
  * 所有图标基于 20x20 viewBox，fill="currentColor"。
  * 通过 <Icon name="..." /> 组件统一渲染。
- *
- * 旧版导出 (IconPause/IconResume/IconCancel/IconDelete) 保留兼容，
- * 内部委托给统一的 <Icon /> 组件。
  */
 
 import { type JSX, splitProps } from 'solid-js'
@@ -69,29 +66,6 @@ export function Icon(props: IconProps) {
       ) : null}
     </>
   )
-}
-
-// ---- 旧版兼容导出 ----
-// DownloadCard / BatchToolbar 使用的旧接口
-
-interface LegacyIconProps {
-  class?: string
-}
-
-export function IconPause(props: LegacyIconProps) {
-  return <Icon name="pause" class={`w-4 h-4 ${props.class || ''}`} />
-}
-
-export function IconResume(props: LegacyIconProps) {
-  return <Icon name="play" class={`w-4 h-4 ${props.class || ''}`} />
-}
-
-export function IconCancel(props: LegacyIconProps) {
-  return <Icon name="x-mark" class={`w-4 h-4 ${props.class || ''}`} />
-}
-
-export function IconDelete(props: LegacyIconProps) {
-  return <Icon name="trash" class={`w-4 h-4 ${props.class || ''}`} />
 }
 
 /** 获取图标 path 数据（用于 Sidebar 等直接渲染 SVG path 的场景） */

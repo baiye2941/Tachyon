@@ -3,8 +3,16 @@
 //! 基于 Kademlia 协议的分布式哈希表,用于 Peer 发现。
 //! 包含 XOR 距离度量、k-bucket 路由表、迭代查找算法。
 
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use tokio::net::UdpSocket;
+use tokio::sync::{oneshot, RwLock};
 
 // ============================================================
 // 常量
@@ -102,13 +110,14 @@ pub fn generate_node_id() -> NodeId {
 // ============================================================
 
 /// DHT 节点信息
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhtNode {
     /// 节点 ID
     pub id: NodeId,
     /// 节点地址
     pub addr: String,
-    /// 最后通信时间
+    /// 最后通信时间(序列化为 UNIX 毫秒时间戳)
+    #[serde(with = "serde_system_time")]
     pub last_seen: SystemTime,
 }
 
@@ -144,7 +153,7 @@ impl DhtNode {
 ///
 /// 定义了 Kademlia DHT 的四种核心 RPC 消息以及对应的响应。
 /// 实际的网络发送/接收将在后续版本中通过 tachyon-protocol 实现。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KademliaMessage {
     /// 心跳探测
     Ping { sender_id: NodeId },
@@ -492,6 +501,8 @@ pub struct KademliaDht {
     routing_table: RoutingTable,
     /// 最大节点数限制(0 表示无限制)
     max_nodes: usize,
+    /// 本地键值存储(用于 FindValue/Store RPC)
+    local_store: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl KademliaDht {
@@ -501,6 +512,7 @@ impl KademliaDht {
             local_id,
             routing_table: RoutingTable::new(local_id),
             max_nodes,
+            local_store: HashMap::new(),
         }
     }
 
@@ -607,21 +619,51 @@ impl KademliaDht {
         self.routing_table.find_closest(target, K_BUCKET_SIZE)
     }
 
-    /// 按 key 查找存储的值
+    /// 按 key 查找本地存储的值
     ///
-    /// 当前版本为占位实现,返回 None + 最近节点列表。
-    /// 完整的分布式存储将在后续版本中实现。
-    pub fn find_value(&self, _key: &[u8]) -> (Option<Vec<u8>>, Vec<DhtNode>) {
-        // TODO: 实现 DHT 分布式存储(需要 RPC 通信)
-        (None, Vec::new())
+    /// 首先在本地存储中查找,然后返回最近节点列表用于迭代查找。
+    pub fn find_value(&self, key: &[u8]) -> (Option<Vec<u8>>, Vec<DhtNode>) {
+        let value = self.local_store.get(key).cloned();
+        let nodes = self.routing_table.find_closest(
+            &Self::key_to_node_id(key),
+            K_BUCKET_SIZE,
+        );
+        (value, nodes)
     }
 
-    /// 存储键值对
+    /// 本地存储查找(不触发网络操作)
+    pub fn find_value_local(&self, key: &[u8]) -> (Option<Vec<u8>>, Vec<DhtNode>) {
+        let value = self.local_store.get(key).cloned();
+        let nodes = self.routing_table.find_closest(
+            &Self::key_to_node_id(key),
+            K_BUCKET_SIZE,
+        );
+        (value, nodes)
+    }
+
+    /// 将 key 映射为 NodeId(取 key 哈希填充 20 字节)
+    fn key_to_node_id(key: &[u8]) -> NodeId {
+        let mut id = [0u8; 20];
+        let rb = std::collections::hash_map::RandomState::new();
+        for (i, chunk) in id.chunks_mut(8).enumerate() {
+            let mut hasher = rb.build_hasher();
+            hasher.write(key);
+            hasher.write_u64(i as u64);
+            let val = hasher.finish();
+            let bytes = val.to_le_bytes();
+            for (j, b) in chunk.iter_mut().enumerate() {
+                *b = bytes[j];
+            }
+        }
+        id
+    }
+
+    /// 存储键值对到本地存储
     ///
-    /// 当前版本为占位实现。
-    /// 完整的分布式存储将在后续版本中实现。
-    pub fn store(&mut self, _key: Vec<u8>, _value: Vec<u8>) {
-        // TODO: 实现 DHT 分布式存储(需要 RPC 通信)
+    /// 将键值对保存到本节点的本地存储中,
+    /// 网络层的分布式存储会将数据复制到最近的 k 个节点。
+    pub fn store(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.local_store.insert(key, value);
     }
 
     /// 构造 Ping 消息
@@ -687,12 +729,615 @@ impl KademliaDht {
 }
 
 // ============================================================
+// Serde 辅助: SystemTime <-> UNIX 毫秒时间戳
+// ============================================================
+
+/// `SystemTime` 的 serde 序列化辅助模块(以 UNIX 毫秒时间戳存储)
+mod serde_system_time {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
+        let millis = time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        s.serialize_u64(millis)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+        let millis = u64::deserialize(d)?;
+        Ok(UNIX_EPOCH + Duration::from_millis(millis))
+    }
+}
+
+// ============================================================
+// TransportError
+// ============================================================
+
+/// DHT 网络传输错误
+#[derive(Debug)]
+pub enum TransportError {
+    /// 消息序列化或反序列化失败
+    Serialization(String),
+    /// UDP I/O 错误
+    Io(std::io::Error),
+    /// RPC 请求超时(默认 5 秒)
+    Timeout,
+    /// 传输层已关闭
+    Shutdown,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
+            Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::Timeout => write!(f, "RPC request timed out"),
+            Self::Shutdown => write!(f, "transport is shut down"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+// ============================================================
+// DhtTransport — UDP RPC 网络层
+// ============================================================
+
+/// RPC 请求 ID(单调递增计数器,用于匹配请求与响应)
+type RequestId = u64;
+
+/// 默认 RPC 超时时间(5 秒)
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// DHT UDP 传输层
+///
+/// 在 `KademliaDht` 之上提供基于 UDP 的 RPC 网络能力:
+/// - 消息 JSON 序列化/反序列化
+/// - 请求-响应关联(通过 8 字节 request ID 头)
+/// - 后台接收循环与消息路由
+/// - 迭代式分布式查找(FIND_NODE / FIND_VALUE / STORE)
+///
+/// # 线格式
+///
+/// ```text
+/// [request_id: u64 big-endian (8 bytes)][JSON payload]
+/// ```
+pub struct DhtTransport {
+    socket: Arc<UdpSocket>,
+    dht: Arc<RwLock<KademliaDht>>,
+    pending_requests: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>>,
+    running: Arc<AtomicBool>,
+    next_request_id: AtomicU64,
+}
+
+impl DhtTransport {
+    /// 绑定到指定地址的 UDP socket,创建传输层实例
+    ///
+    /// 使用 `addr = "127.0.0.1:0"` 可由操作系统自动分配可用端口。
+    pub async fn bind(
+        addr: &str,
+        dht: Arc<RwLock<KademliaDht>>,
+    ) -> Result<Self, TransportError> {
+        let socket = UdpSocket::bind(addr).await?;
+        Ok(Self {
+            socket: Arc::new(socket),
+            dht,
+            pending_requests: Arc::new(DashMap::new()),
+            running: Arc::new(AtomicBool::new(false)),
+            next_request_id: AtomicU64::new(1),
+        })
+    }
+
+    /// 获取本地 socket 地址
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
+        Ok(self.socket.local_addr()?)
+    }
+
+    /// 获取本节点 ID
+    pub async fn local_id(&self) -> NodeId {
+        *self.dht.read().await.local_id()
+    }
+
+    /// 获取底层 DHT 的 Arc 引用
+    pub fn dht(&self) -> &Arc<RwLock<KademliaDht>> {
+        &self.dht
+    }
+
+    /// 启动后台接收循环
+    ///
+    /// 在独立的 tokio task 中持续接收 UDP 报文:
+    /// - **响应消息**: 匹配到 pending request,通过 oneshot channel 返回给调用者
+    /// - **请求消息**: 调用 `process_incoming` 生成响应并回送
+    ///
+    /// 调用 [`shutdown()`](Self::shutdown) 可终止循环。
+    pub fn start_recv_loop(&self) {
+        self.running.store(true, Ordering::SeqCst);
+        let socket = self.socket.clone();
+        let dht = self.dht.clone();
+        let pending = self.pending_requests.clone();
+        let running = self.running.clone();
+        tokio::spawn(Self::recv_loop_inner(socket, dht, pending, running));
+    }
+
+    /// 关闭传输层,停止接收循环
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// 检查传输层是否正在运行
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    // ----------------------------------------------------------
+    // 内部: 接收循环
+    // ----------------------------------------------------------
+
+    async fn recv_loop_inner(
+        socket: Arc<UdpSocket>,
+        dht: Arc<RwLock<KademliaDht>>,
+        pending: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>>,
+        running: Arc<AtomicBool>,
+    ) {
+        let mut buf = [0u8; 65535];
+        while running.load(Ordering::SeqCst) {
+            let (len, src_addr) = match socket.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "UDP recv_from failed");
+                    continue;
+                }
+            };
+            if len < 8 {
+                continue; // 报文过短,无法包含 request ID
+            }
+
+            // 解析 request ID(前 8 字节,大端序)
+            let request_id = u64::from_be_bytes(buf[..8].try_into().unwrap());
+
+            // 解析 JSON 消息体
+            let msg: KademliaMessage = match serde_json::from_slice(&buf[8..len]) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to deserialize message");
+                    continue;
+                }
+            };
+
+            // 尝试匹配 pending request(响应消息)
+            if let Some((_, sender)) = pending.remove(&request_id) {
+                let _ = sender.send(msg);
+                continue;
+            }
+
+            // 未匹配:视为入站请求,生成响应并回送
+            if let Some(response) = Self::process_incoming(&dht, &msg, src_addr).await {
+                let payload = match serde_json::to_vec(&response) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to serialize response");
+                        continue;
+                    }
+                };
+                let mut packet = Vec::with_capacity(8 + payload.len());
+                packet.extend_from_slice(&request_id.to_be_bytes());
+                packet.extend_from_slice(&payload);
+                if let Err(e) = socket.send_to(&packet, src_addr).await {
+                    tracing::warn!(error = %e, addr = %src_addr, "failed to send response");
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
+    // 内部: 入站消息处理
+    // ----------------------------------------------------------
+
+    /// 处理入站 RPC 请求,返回需要回送的响应(若需要)
+    ///
+    /// - 请求类消息(Ping / FindNode / FindValue / Store):更新路由表 + 生成响应
+    /// - 响应类消息(Pong / FindNodeResponse / FindValueResponse):仅更新路由表,不生成响应
+    async fn process_incoming(
+        dht: &Arc<RwLock<KademliaDht>>,
+        msg: &KademliaMessage,
+        src_addr: std::net::SocketAddr,
+    ) -> Option<KademliaMessage> {
+        let mut dht_guard = dht.write().await;
+
+        // 更新路由表中已知发送方的 last_seen
+        dht_guard.handle_message(msg);
+
+        match msg {
+            KademliaMessage::Ping { .. } => Some(dht_guard.make_pong()),
+
+            KademliaMessage::FindNode { target, .. } => {
+                let nodes = dht_guard.handle_find_node(target);
+                Some(dht_guard.make_find_node_response(nodes))
+            }
+
+            KademliaMessage::FindValue { key, .. } => {
+                let (value, nodes) = dht_guard.find_value_local(key);
+                Some(KademliaMessage::FindValueResponse {
+                    sender_id: *dht_guard.local_id(),
+                    value,
+                    nodes,
+                })
+            }
+
+            KademliaMessage::Store {
+                key, value, ..
+            } => {
+                dht_guard.store(key.clone(), value.clone());
+                // 将发送方添加到路由表(Ping 验证通过)
+                let sender_id = match msg {
+                    KademliaMessage::Store { sender_id, .. } => *sender_id,
+                    _ => unreachable!(),
+                };
+                dht_guard.add_node(DhtNode::new(sender_id, src_addr.to_string()));
+                None
+            }
+
+            // 响应类消息:已在 handle_message 中刷新路由表,无需生成响应
+            _ => None,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // 核心: 发送 RPC 请求并等待响应
+    // ----------------------------------------------------------
+
+    /// 发送 RPC 请求到目标地址并等待响应
+    ///
+    /// 1. 分配唯一的 request ID
+    /// 2. 注册 oneshot channel 到 pending map
+    /// 3. 序列化消息并通过 UDP 发送(前缀 8 字节 request ID)
+    /// 4. 等待响应(超时 5 秒)
+    ///
+    /// # 错误
+    ///
+    /// - `TransportError::Shutdown`: 传输层已关闭
+    /// - `TransportError::Serialization`: 消息序列化失败
+    /// - `TransportError::Io`: UDP 发送失败
+    /// - `TransportError::Timeout`: 5 秒内未收到响应
+    pub async fn send_rpc(
+        &self,
+        target_addr: &str,
+        message: &KademliaMessage,
+    ) -> Result<KademliaMessage, TransportError> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(TransportError::Shutdown);
+        }
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.insert(request_id, tx);
+
+        let payload = serde_json::to_vec(message)
+            .map_err(|e| TransportError::Serialization(e.to_string()))?;
+
+        let mut packet = Vec::with_capacity(8 + payload.len());
+        packet.extend_from_slice(&request_id.to_be_bytes());
+        packet.extend_from_slice(&payload);
+
+        self.socket.send_to(&packet, target_addr).await?;
+
+        match tokio::time::timeout(RPC_TIMEOUT, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                self.pending_requests.remove(&request_id);
+                Err(TransportError::Shutdown)
+            }
+            Err(_) => {
+                self.pending_requests.remove(&request_id);
+                Err(TransportError::Timeout)
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
+    // 高层 RPC 便捷方法
+    // ----------------------------------------------------------
+
+    /// 发送 Ping RPC,成功收到 Pong 则返回 `true`
+    pub async fn ping(&self, addr: &str) -> Result<bool, TransportError> {
+        let msg = {
+            let dht = self.dht.read().await;
+            dht.make_ping()
+        };
+        let response = self.send_rpc(addr, &msg).await?;
+        Ok(matches!(response, KademliaMessage::Pong { .. }))
+    }
+
+    /// 发送 FindNode RPC,返回目标节点已知的最近节点列表
+    pub async fn find_node_rpc(
+        &self,
+        addr: &str,
+        target: &NodeId,
+    ) -> Result<Vec<DhtNode>, TransportError> {
+        let msg = {
+            let dht = self.dht.read().await;
+            dht.make_find_node(*target)
+        };
+        let response = self.send_rpc(addr, &msg).await?;
+        match response {
+            KademliaMessage::FindNodeResponse { nodes, .. } => Ok(nodes),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// 发送 FindValue RPC,返回 (值, 最近节点列表)
+    pub async fn find_value_rpc(
+        &self,
+        addr: &str,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, Vec<DhtNode>), TransportError> {
+        let msg = KademliaMessage::FindValue {
+            sender_id: self.local_id().await,
+            key: key.to_vec(),
+        };
+        let response = self.send_rpc(addr, &msg).await?;
+        match response {
+            KademliaMessage::FindValueResponse {
+                value, nodes, ..
+            } => Ok((value, nodes)),
+            _ => Ok((None, Vec::new())),
+        }
+    }
+
+    /// 发送 Store RPC(单向,不等待响应)
+    pub async fn store_rpc(
+        &self,
+        addr: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), TransportError> {
+        let msg = KademliaMessage::Store {
+            sender_id: self.local_id().await,
+            key: key.to_vec(),
+            value: value.to_vec(),
+        };
+        let payload = serde_json::to_vec(&msg)
+            .map_err(|e| TransportError::Serialization(e.to_string()))?;
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let mut packet = Vec::with_capacity(8 + payload.len());
+        packet.extend_from_slice(&request_id.to_be_bytes());
+        packet.extend_from_slice(&payload);
+
+        self.socket.send_to(&packet, addr).await?;
+        Ok(())
+    }
+
+    // ----------------------------------------------------------
+    // 迭代式分布式查找
+    // ----------------------------------------------------------
+
+    /// 迭代查找距离 target 最近的 k 个节点
+    ///
+    /// 实现 Kademlia 标准迭代查询:
+    /// 1. 从本地路由表取初始候选集
+    /// 2. 每轮并发向 `ALPHA`(3) 个最近未查询节点发送 FindNode
+    /// 3. 合并新发现的节点,按 XOR 距离排序
+    /// 4. 当候选集不再收敛时终止
+    pub async fn iterative_find_node(
+        &self,
+        target: &NodeId,
+    ) -> Result<Vec<DhtNode>, TransportError> {
+        let mut known: Vec<DhtNode> = {
+            let dht = self.dht.read().await;
+            dht.routing_table().find_closest(target, K_BUCKET_SIZE)
+        };
+
+        if known.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut queried_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+        loop {
+            // 按 XOR 距离排序,选择最多 ALPHA 个未查询节点
+            known.sort_by_cached_key(|n| xor_distance(&n.id, target));
+            let targets: Vec<DhtNode> = known
+                .iter()
+                .filter(|n| !queried_ids.contains(&n.id))
+                .take(ALPHA)
+                .cloned()
+                .collect();
+
+            if targets.is_empty() {
+                break; // 所有已知节点均已查询,查找收敛
+            }
+
+            for t in &targets {
+                queried_ids.insert(t.id);
+            }
+
+            // 并发 RPC 查询
+            let mut handles = Vec::new();
+            for node in targets {
+                let target_copy = *target;
+                handles.push(tokio::spawn({
+                    let transport_socket = self.socket.clone();
+                    let dht_ref = self.dht.clone();
+                    let pending_ref = self.pending_requests.clone();
+                    let next_id = &self.next_request_id;
+                    let addr = node.addr.clone();
+                    let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        // 构造 FindNode 消息
+                        let msg = {
+                            let dht = dht_ref.read().await;
+                            dht.make_find_node(target_copy)
+                        };
+                        let payload = match serde_json::to_vec(&msg) {
+                            Ok(p) => p,
+                            Err(_) => return Vec::new(),
+                        };
+                        let (tx, rx) = oneshot::channel();
+                        // 使用临时 pending map
+                        let temp_pending: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>> =
+                            pending_ref;
+                        temp_pending.insert(req_id, tx);
+                        let mut packet = Vec::with_capacity(8 + payload.len());
+                        packet.extend_from_slice(&req_id.to_be_bytes());
+                        packet.extend_from_slice(&payload);
+                        if transport_socket.send_to(&packet, &addr).await.is_err() {
+                            temp_pending.remove(&req_id);
+                            return Vec::new();
+                        }
+                        match tokio::time::timeout(RPC_TIMEOUT, rx).await {
+                            Ok(Ok(KademliaMessage::FindNodeResponse { nodes, .. })) => nodes,
+                            _ => {
+                                temp_pending.remove(&req_id);
+                                Vec::new()
+                            }
+                        }
+                    }
+                }));
+            }
+
+            let mut new_found = false;
+            for handle in handles {
+                if let Ok(nodes) = handle.await {
+                    for node in nodes {
+                        if !queried_ids.contains(&node.id)
+                            && !known.iter().any(|n| n.id == node.id)
+                        {
+                            known.push(node);
+                            new_found = true;
+                        }
+                    }
+                }
+            }
+
+            if !new_found {
+                break;
+            }
+        }
+
+        // 按距离排序并截取前 k 个
+        known.sort_by_cached_key(|n| xor_distance(&n.id, target));
+        known.truncate(K_BUCKET_SIZE);
+        Ok(known)
+    }
+
+    /// 迭代查找并获取值
+    ///
+    /// 1. 执行迭代查找定位存储了该 key 的节点
+    /// 2. 向候选节点逐个发送 FindValue 直到获取到值
+    pub async fn distributed_find_value(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        let key_node_id = KademliaDht::key_to_node_id(key);
+
+        // Phase 1: 迭代查找近距离节点
+        let closest = self.iterative_find_node(&key_node_id).await?;
+
+        // Phase 2: 向候选节点发送 FindValue 请求
+        for node in &closest {
+            match self.find_value_rpc(&node.addr, key).await {
+                Ok((Some(value), _)) => return Ok(Some(value)),
+                Ok((None, _)) => continue,
+                Err(_) => continue,
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// 分布式存储:将键值对复制到最近的 k 个节点
+    ///
+    /// 1. 通过迭代查找定位最近的 k 个节点
+    /// 2. 并发向这些节点发送 Store RPC
+    /// 3. 同时存储到本地
+    ///
+    /// 返回成功存储的节点数。
+    pub async fn distributed_store(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<usize, TransportError> {
+        let key_node_id = KademliaDht::key_to_node_id(&key);
+
+        // 查找最近的 k 个节点
+        let closest = self.iterative_find_node(&key_node_id).await?;
+
+        // 并发 Store 到远程节点
+        let mut handles = Vec::new();
+        for node in &closest {
+            let key = key.clone();
+            let value = value.clone();
+            let addr = node.addr.clone();
+            handles.push(tokio::spawn({
+                let socket = self.socket.clone();
+                let next_id = &self.next_request_id;
+                let sender_id = self.local_id().await;
+                let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let msg = KademliaMessage::Store {
+                        sender_id,
+                        key,
+                        value,
+                    };
+                    let payload = match serde_json::to_vec(&msg) {
+                        Ok(p) => p,
+                        Err(_) => return false,
+                    };
+                    let mut packet = Vec::with_capacity(8 + payload.len());
+                    packet.extend_from_slice(&req_id.to_be_bytes());
+                    packet.extend_from_slice(&payload);
+                    socket.send_to(&packet, &addr).await.is_ok()
+                }
+            }));
+        }
+
+        // 同时存储到本地
+        {
+            let mut dht = self.dht.write().await;
+            dht.store(key, value);
+        }
+
+        let mut success_count = 0usize;
+        for h in handles {
+            if let Ok(true) = h.await {
+                success_count += 1;
+            }
+        }
+
+        Ok(success_count)
+    }
+}
+
+impl Drop for DhtTransport {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// ============================================================
 // 测试
 // ============================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     fn make_node(id_byte: u8) -> DhtNode {
         let mut id = [0u8; 20];
@@ -1219,5 +1864,434 @@ mod tests {
         fn nodes_mut(&mut self) -> &mut Vec<DhtNode> {
             &mut self.nodes
         }
+    }
+
+    // ----------------------------------------------------------
+    // 消息序列化 / 反序列化测试
+    // ----------------------------------------------------------
+
+    #[test]
+    fn test_serialize_ping_pong() {
+        let ping = KademliaMessage::Ping {
+            sender_id: [0xAA; 20],
+        };
+        let json = serde_json::to_string(&ping).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(ping, deserialized);
+
+        let pong = KademliaMessage::Pong {
+            sender_id: [0xBB; 20],
+        };
+        let json = serde_json::to_string(&pong).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(pong, deserialized);
+    }
+
+    #[test]
+    fn test_serialize_find_node() {
+        let msg = KademliaMessage::FindNode {
+            sender_id: [1u8; 20],
+            target: [2u8; 20],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_serialize_find_node_response_with_nodes() {
+        // 使用毫秒对齐的时间戳避免序列化精度损失
+        let aligned_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        let mut node1 = DhtNode::new([1u8; 20], "10.0.0.1:8080".to_string());
+        node1.last_seen = aligned_time;
+        let mut node2 = DhtNode::new([2u8; 20], "10.0.0.2:9090".to_string());
+        node2.last_seen = aligned_time;
+        let nodes = vec![node1, node2];
+
+        let msg = KademliaMessage::FindNodeResponse {
+            sender_id: [0u8; 20],
+            nodes,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+
+        // 验证反序列化后的节点信息完整
+        if let KademliaMessage::FindNodeResponse {
+            nodes: deser_nodes, ..
+        } = &deserialized
+        {
+            assert_eq!(deser_nodes.len(), 2);
+            assert_eq!(deser_nodes[0].addr, "10.0.0.1:8080");
+            assert_eq!(deser_nodes[1].addr, "10.0.0.2:9090");
+        }
+    }
+
+    #[test]
+    fn test_serialize_find_value_with_data() {
+        let msg = KademliaMessage::FindValue {
+            sender_id: [3u8; 20],
+            key: b"hello".to_vec(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+
+        let msg_resp = KademliaMessage::FindValueResponse {
+            sender_id: [3u8; 20],
+            value: Some(b"world".to_vec()),
+            nodes: vec![],
+        };
+        let json = serde_json::to_string(&msg_resp).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg_resp, deserialized);
+    }
+
+    #[test]
+    fn test_serialize_store() {
+        let msg = KademliaMessage::Store {
+            sender_id: [4u8; 20],
+            key: b"my_key".to_vec(),
+            value: b"my_value".to_vec(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: KademliaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_serialize_dht_node_preserves_last_seen() {
+        let node = DhtNode::new([5u8; 20], "192.168.1.1:6881".to_string());
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: DhtNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(node.id, deserialized.id);
+        assert_eq!(node.addr, deserialized.addr);
+        // SystemTime 精度到毫秒
+        let orig_millis = node
+            .last_seen
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let deser_millis = deserialized
+            .last_seen
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert_eq!(orig_millis, deser_millis);
+    }
+
+    // ----------------------------------------------------------
+    // KademliaDht 本地存储测试
+    // ----------------------------------------------------------
+
+    #[test]
+    fn test_local_store_and_find_value() {
+        let mut dht = KademliaDht::new([0u8; 20], 100);
+        dht.store(b"key1".to_vec(), b"value1".to_vec());
+        dht.store(b"key2".to_vec(), b"value2".to_vec());
+
+        let (val, _nodes) = dht.find_value(b"key1");
+        assert_eq!(val, Some(b"value1".to_vec()));
+
+        let (val, _nodes) = dht.find_value(b"key2");
+        assert_eq!(val, Some(b"value2".to_vec()));
+
+        let (val, _nodes) = dht.find_value(b"nonexistent");
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_store_overwrites() {
+        let mut dht = KademliaDht::new([0u8; 20], 100);
+        dht.store(b"key".to_vec(), b"old".to_vec());
+        dht.store(b"key".to_vec(), b"new".to_vec());
+
+        let (val, _) = dht.find_value(b"key");
+        assert_eq!(val, Some(b"new".to_vec()));
+    }
+
+    // ----------------------------------------------------------
+    // Transport 网络层测试(localhost UDP)
+    // ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_transport_bind_and_shutdown() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let transport = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let addr = transport.local_addr().unwrap();
+        assert!(addr.port() > 0);
+
+        transport.start_recv_loop();
+        assert!(transport.is_running());
+
+        transport.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!transport.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_transport_ping_pong() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        // A -> B: Ping, expect Pong
+        let result = ta.ping(&addr_b).await.unwrap();
+        assert!(result, "Ping should receive Pong");
+
+        ta.shutdown();
+        tb.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_find_node_rpc() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        // Pre-populate B's routing table with some nodes
+        {
+            let mut b = dht_b.write().await;
+            for i in 3..=10u8 {
+                let mut id = [0u8; 20];
+                id[0] = i;
+                b.add_node(DhtNode::new(id, format!("10.0.0.{i}:8080")));
+            }
+        }
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        let target = [5u8; 20];
+        let nodes = ta.find_node_rpc(&addr_b, &target).await.unwrap();
+        assert!(
+            !nodes.is_empty(),
+            "B should return nodes from its routing table"
+        );
+        assert!(nodes.len() <= K_BUCKET_SIZE);
+
+        ta.shutdown();
+        tb.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_find_value_rpc() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        // Store a value at B
+        {
+            let mut b = dht_b.write().await;
+            b.store(b"test_key".to_vec(), b"test_value".to_vec());
+        }
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        let (value, _nodes) = ta.find_value_rpc(&addr_b, b"test_key").await.unwrap();
+        assert_eq!(value, Some(b"test_value".to_vec()));
+
+        // Key not stored at B
+        let (value, _nodes) = ta
+            .find_value_rpc(&addr_b, b"nonexistent")
+            .await
+            .unwrap();
+        assert_eq!(value, None);
+
+        ta.shutdown();
+        tb.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_store_rpc() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b.clone()).await.unwrap();
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        // A sends Store to B
+        ta.store_rpc(&addr_b, b"remote_key", b"remote_value")
+            .await
+            .unwrap();
+
+        // Wait for B to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify B has the value
+        let b = dht_b.read().await;
+        let (value, _) = b.find_value(b"remote_key");
+        assert_eq!(value, Some(b"remote_value".to_vec()));
+
+        ta.shutdown();
+        tb.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_rpc_timeout() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        ta.start_recv_loop();
+
+        // Send RPC to an address where nobody is listening
+        // Use a short timeout by sending to a non-routable address
+        // For faster test, we use a local port that isn't bound
+        let unused_addr = "127.0.0.1:19999";
+        let msg = KademliaMessage::Ping {
+            sender_id: [1u8; 20],
+        };
+
+        // Override timeout for faster test: use tokio::time::timeout directly
+        let result = tokio::time::timeout(Duration::from_millis(200), ta.send_rpc(unused_addr, &msg)).await;
+
+        // Should timeout
+        assert!(result.is_err(), "RPC to non-listening address should timeout");
+
+        ta.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_distributed_store_and_find() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b2 = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b2.clone())
+            .await
+            .unwrap();
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        // Add B to A's routing table
+        {
+            let mut a = dht_a.write().await;
+            a.add_node(DhtNode::new([2u8; 20], addr_b));
+        }
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a.clone())
+            .await
+            .unwrap();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        // Distributed store: A stores key-value, replicated to B
+        let key = b"dist_key".to_vec();
+        let value = b"dist_value".to_vec();
+        let stored = ta.distributed_store(key.clone(), value.clone()).await.unwrap();
+        assert!(stored > 0, "Should store to at least one remote node");
+
+        // Wait for Store RPCs to be processed
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify B has the value
+        {
+            let b = dht_b2.read().await;
+            let (val, _) = b.find_value(&key);
+            assert_eq!(val, Some(value.clone()), "B should have the stored value");
+        }
+
+        // Distributed find_value: A looks up the key
+        let found = ta.distributed_find_value(&key).await.unwrap();
+        assert_eq!(found, Some(value));
+
+        ta.shutdown();
+        tb.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_shutdown_stops_rpc() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        ta.start_recv_loop();
+        ta.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // RPC after shutdown should fail immediately
+        let result = ta.ping("127.0.0.1:19999").await;
+        assert!(
+            matches!(result, Err(TransportError::Shutdown)),
+            "RPC after shutdown should return Shutdown error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_drop_shuts_down() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let running = ta.running.clone();
+        ta.start_recv_loop();
+        assert!(running.load(Ordering::SeqCst));
+
+        drop(ta);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!running.load(Ordering::SeqCst), "Drop should set running to false");
+    }
+
+    #[tokio::test]
+    async fn test_transport_multiple_pings() {
+        let dht_server = Arc::new(RwLock::new(KademliaDht::new([0u8; 20], 100)));
+        let server = DhtTransport::bind("127.0.0.1:0", dht_server)
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap().to_string();
+        server.start_recv_loop();
+
+        // Multiple clients ping the same server
+        for i in 1..=5u8 {
+            let mut id = [0u8; 20];
+            id[0] = i;
+            let dht_client = Arc::new(RwLock::new(KademliaDht::new(id, 100)));
+            let client = DhtTransport::bind("127.0.0.1:0", dht_client)
+                .await
+                .unwrap();
+            client.start_recv_loop();
+
+            let result = client.ping(&server_addr).await.unwrap();
+            assert!(result, "Client {i} ping should succeed");
+
+            client.shutdown();
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_transport_bidirectional_ping() {
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+
+        let addr_a = ta.local_addr().unwrap().to_string();
+        let addr_b = tb.local_addr().unwrap().to_string();
+
+        ta.start_recv_loop();
+        tb.start_recv_loop();
+
+        // A pings B
+        assert!(ta.ping(&addr_b).await.unwrap());
+        // B pings A
+        assert!(tb.ping(&addr_a).await.unwrap());
+
+        ta.shutdown();
+        tb.shutdown();
     }
 }

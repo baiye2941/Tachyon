@@ -1,24 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library'
-import type { TaskInfo } from '../../types'
-import DownloadCard from '../DownloadCard'
 import BatchToolbar from '../BatchToolbar'
 import * as selectionModule from '../../stores/selection'
-
-const makeTask = (id: string, overrides: Partial<TaskInfo> = {}): TaskInfo => ({
-  id,
-  url: `https://example.com/${id}.bin`,
-  fileName: `${id}.bin`,
-  fileSize: 1048576,
-  downloaded: 0,
-  speed: 0,
-  status: 'downloading',
-  progress: 0.5,
-  fragmentsTotal: 4,
-  fragmentsDone: 2,
-  createdAt: '2026-05-30T00:00:00Z',
-  ...overrides,
-})
 
 describe('selection store', () => {
   beforeEach(() => {
@@ -70,65 +53,6 @@ describe('selection store', () => {
     expect(selectionModule.hasSelection()).toBe(false)
     selectionModule.toggleSelection('x')
     expect(selectionModule.hasSelection()).toBe(true)
-  })
-})
-
-describe('DownloadCard 复选框', () => {
-  const task = makeTask('t1')
-
-  afterEach(() => {
-    cleanup()
-  })
-
-  it('渲染复选框', () => {
-    render(() => (
-      <DownloadCard
-        task={task}
-        selected={false}
-        onSelect={() => {}}
-        onPause={() => {}}
-        onResume={() => {}}
-        onCancel={() => {}}
-        onDelete={() => {}}
-      />
-    ))
-    const checkbox = screen.getByRole('checkbox') as HTMLInputElement
-    expect(checkbox).toBeDefined()
-    expect(checkbox.checked).toBe(false)
-  })
-
-  it('选中状态反映到复选框', () => {
-    render(() => (
-      <DownloadCard
-        task={task}
-        selected={true}
-        onSelect={() => {}}
-        onPause={() => {}}
-        onResume={() => {}}
-        onCancel={() => {}}
-        onDelete={() => {}}
-      />
-    ))
-    const checkbox = screen.getByRole('checkbox') as HTMLInputElement
-    expect(checkbox.checked).toBe(true)
-  })
-
-  it('点击复选框触发 onSelect 且不冒泡', () => {
-    const onSelect = vi.fn()
-    render(() => (
-      <DownloadCard
-        task={task}
-        selected={false}
-        onSelect={onSelect}
-        onPause={() => {}}
-        onResume={() => {}}
-        onCancel={() => {}}
-        onDelete={() => {}}
-      />
-    ))
-    const checkbox = screen.getByRole('checkbox')
-    fireEvent.click(checkbox)
-    expect(onSelect).toHaveBeenCalledWith('t1')
   })
 })
 

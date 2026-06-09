@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use suppaftp::tokio::AsyncFtpStream;
+use suppaftp::tokio::{AsyncDataStream, AsyncFtpStream, AsyncNoTlsStream};
 use suppaftp::types::FileType;
 use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
@@ -24,6 +24,9 @@ use tachyon_core::url_safety::reject_forbidden_ip;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
+
+/// `retr_as_stream` 返回的数据流类型(实现 `AsyncRead`,可逐块读取)
+type FtpDataStream = AsyncDataStream<AsyncNoTlsStream>;
 
 /// FTP 连接状态
 ///
@@ -249,6 +252,62 @@ impl FtpClient {
             .map_err(|e| DownloadError::Protocol(format!("完成 FTP 传输失败: {e}")))?;
 
         Ok(Bytes::from(buf))
+    }
+
+    /// 设置 Binary 传输模式,可选 REST 偏移,并打开 RETR 数据流
+    ///
+    /// 返回已打开的数据连接流,调用方需逐块读取后调用
+    /// `finalize_retr_stream` 完成 FTP 传输。
+    /// 必须在 `login()` 成功后调用。
+    async fn open_data_stream(
+        &self,
+        path: &str,
+        start: Option<u64>,
+    ) -> DownloadResult<FtpDataStream> {
+        let mut guard = self.inner.write().await;
+        Self::require_stream(&guard)?;
+        let stream = guard
+            .stream
+            .as_mut()
+            .ok_or_else(|| DownloadError::Protocol("FTP 流不可用".into()))?;
+
+        // Binary 模式,避免文本换行转换损坏数据
+        stream
+            .transfer_type(FileType::Binary)
+            .await
+            .map_err(|e| DownloadError::Protocol(format!("设置传输模式失败: {e}")))?;
+
+        // 设置 REST 偏移(仅在指定 start > 0 时)
+        if let Some(offset) = start {
+            if offset > 0 {
+                stream
+                    .resume_transfer(offset as usize)
+                    .await
+                    .map_err(|e| DownloadError::Protocol(format!("REST 命令失败: {e}")))?;
+            }
+        }
+
+        // 打开数据连接并返回(不缓冲数据)
+        stream
+            .retr_as_stream(path)
+            .await
+            .map_err(|e| DownloadError::Protocol(format!("打开 FTP 数据流失败: {e}")))
+    }
+
+    /// 完成 RETR 传输并读取服务端响应
+    ///
+    /// 内部获取写锁,将数据流传入 suppaftp 的 `finalize_retr_stream`。
+    /// 必须在数据流读取完毕(或提前终止)后调用。
+    async fn finalize_retr_stream(&self, data_stream: FtpDataStream) -> DownloadResult<()> {
+        let mut guard = self.inner.write().await;
+        let stream = guard
+            .stream
+            .as_mut()
+            .ok_or_else(|| DownloadError::Protocol("FTP 流不可用".into()))?;
+        stream
+            .finalize_retr_stream(data_stream)
+            .await
+            .map_err(|e| DownloadError::Protocol(format!("完成 FTP 传输失败: {e}")))
     }
 
     /// 当前是否已连接(包含已认证状态)
@@ -488,10 +547,65 @@ impl Protocol for FtpClient {
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
         let url = url.to_owned();
         let this = self.clone();
-        // TODO: FTP 实现仍为整块缓冲,后续改为按 chunk 流式读取 FTP 数据连接
         Box::pin(async move {
-            let data = this.download_range(&url, start, end).await?;
-            Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            if start == 0 && end == 0 {
+                return this.download_full_stream(&url).await;
+            }
+
+            let info = Self::parse_ftp_url(&url)?;
+
+            this.connect(&info.host, info.port).await?;
+            if let Err(e) = this.login(&info.username, &info.password).await {
+                this.disconnect().await;
+                return Err(e);
+            }
+
+            // 打开 FTP 数据连接(设置 Binary 模式 + REST 偏移)
+            let data_stream = match this.open_data_stream(&info.path, Some(start)).await {
+                Ok(ds) => ds,
+                Err(e) => {
+                    this.disconnect().await;
+                    return Err(e);
+                }
+            };
+
+            // 使用 unfold 逐块读取,64KB/chunk,避免一次性缓冲整个范围
+            // 状态中 Option<FtpDataStream> 允许在 finalize 时 take 出数据流
+            let stream: ByteStream = Box::pin(futures::stream::unfold(
+                (Some(data_stream), this.clone(), info.path.clone()),
+                |(ds, client, path)| async move {
+                    let mut ds = ds?; // None 时返回 None,结束 Stream
+
+                    let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
+                    match ds.read(&mut buf).await {
+                        Ok(0) => {
+                            // 数据流已耗尽,完成 RETR 传输并断开连接
+                            let _ = client.finalize_retr_stream(ds).await;
+                            client.disconnect().await;
+                            None
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Some((
+                                Ok(Bytes::from(buf)),
+                                (Some(ds), client, path),
+                            ))
+                        }
+                        Err(e) => {
+                            let _ = client.finalize_retr_stream(ds).await;
+                            client.disconnect().await;
+                            Some((
+                                Err(DownloadError::Network(format!(
+                                    "读取 FTP 数据流失败: {e}"
+                                ))),
+                                (None, client, path),
+                            ))
+                        }
+                    }
+                },
+            ));
+
+            Ok(stream)
         })
     }
 
@@ -516,6 +630,70 @@ impl Protocol for FtpClient {
             this.disconnect().await;
 
             result
+        })
+    }
+
+    fn download_full_stream(
+        &self,
+        url: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
+        let url = url.to_owned();
+        let this = self.clone();
+        Box::pin(async move {
+            let info = Self::parse_ftp_url(&url)?;
+
+            this.connect(&info.host, info.port).await?;
+            if let Err(e) = this.login(&info.username, &info.password).await {
+                this.disconnect().await;
+                return Err(e);
+            }
+
+            // 打开 FTP 数据连接(Binary 模式,无 REST 偏移,从文件头开始)
+            let data_stream = match this.open_data_stream(&info.path, None).await {
+                Ok(ds) => ds,
+                Err(e) => {
+                    this.disconnect().await;
+                    return Err(e);
+                }
+            };
+
+            // 使用 unfold 逐块读取,64KB/chunk,避免一次性缓冲整个文件
+            // 状态中 Option<FtpDataStream> 允许在 finalize 时 take 出数据流
+            let stream: ByteStream = Box::pin(futures::stream::unfold(
+                (Some(data_stream), this.clone(), info.path.clone()),
+                |(ds, client, path)| async move {
+                    let mut ds = ds?; // None 时返回 None,结束 Stream
+
+                    let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
+                    match ds.read(&mut buf).await {
+                        Ok(0) => {
+                            // 数据流已耗尽,完成 RETR 传输并断开连接
+                            let _ = client.finalize_retr_stream(ds).await;
+                            client.disconnect().await;
+                            None
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Some((
+                                Ok(Bytes::from(buf)),
+                                (Some(ds), client, path),
+                            ))
+                        }
+                        Err(e) => {
+                            let _ = client.finalize_retr_stream(ds).await;
+                            client.disconnect().await;
+                            Some((
+                                Err(DownloadError::Network(format!(
+                                    "读取 FTP 数据流失败: {e}"
+                                ))),
+                                (None, client, path),
+                            ))
+                        }
+                    }
+                },
+            ));
+
+            Ok(stream)
         })
     }
 }
