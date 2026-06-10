@@ -147,7 +147,17 @@ fn bench_fragment_size_computation(c: &mut Criterion) {
             BenchmarkId::new("compute", name),
             &(file_size, bandwidth),
             |b, &(fs, bw)| {
-                b.iter(|| compute_fragment_size(*fs, *bw, 256 * 1024, 64 * 1024 * 1024, 16));
+                b.iter(|| {
+                    compute_fragment_size(
+                        *fs,
+                        *bw,
+                        256 * 1024,
+                        64 * 1024 * 1024,
+                        16,
+                        100 * 1024 * 1024,
+                        10 * 1024 * 1024,
+                    )
+                });
             },
         );
     }

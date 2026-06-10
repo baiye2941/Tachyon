@@ -11,7 +11,7 @@ use support::bench_config;
 use tachyon_core::types::FragmentInfo;
 use tachyon_engine::fragment::compute_fragment_size;
 use tachyon_engine::fragment::{BandwidthTracker, FragmentRecord};
-use tachyon_scheduler::predictor::HoltWintersPredictor;
+use tachyon_scheduler::predictor::HoltLinearPredictor;
 use tachyon_scheduler::scheduler::{Priority, ScheduledTask, Scheduler};
 
 // ---------- 辅助函数 ----------
@@ -84,7 +84,17 @@ fn bench_compute_fragment_size(c: &mut Criterion) {
             BenchmarkId::new("fragment_size", name),
             &(file_size, bw, min_s, max_s, target),
             |b, &(fs, bw, min_s, max_s, target)| {
-                b.iter(|| compute_fragment_size(*fs, *bw, *min_s, *max_s, *target));
+                b.iter(|| {
+                    compute_fragment_size(
+                        *fs,
+                        *bw,
+                        *min_s,
+                        *max_s,
+                        *target,
+                        100 * 1024 * 1024,
+                        10 * 1024 * 1024,
+                    )
+                });
             },
         );
     }
@@ -133,11 +143,11 @@ fn bench_bandwidth_tracker_cycle(c: &mut Criterion) {
 
 // ---------- Holt-Winters 预测器 ----------
 
-/// 基准:HoltWintersPredictor::observe 单次观测
+/// 基准:HoltLinearPredictor::observe 单次观测
 fn bench_holt_winters_observe(c: &mut Criterion) {
     let mut group = c.benchmark_group("holt_winters");
     group.bench_function("observe", |b| {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         // 预热
         for i in 0..50 {
             pred.observe(1_000_000.0 + i as f64 * 1000.0);
@@ -149,7 +159,7 @@ fn bench_holt_winters_observe(c: &mut Criterion) {
     group.finish();
 }
 
-/// 基准:HoltWintersPredictor::predict 预测
+/// 基准:HoltLinearPredictor::predict 预测
 fn bench_holt_winters_predict(c: &mut Criterion) {
     let mut group = c.benchmark_group("holt_winters_predict");
     for steps in [1u64, 5, 10, 100].iter() {
@@ -157,7 +167,7 @@ fn bench_holt_winters_predict(c: &mut Criterion) {
             BenchmarkId::new("predict_steps", steps),
             steps,
             |b, &steps| {
-                let mut pred = HoltWintersPredictor::default();
+                let mut pred = HoltLinearPredictor::default();
                 for i in 0..100 {
                     pred.observe(1_000_000.0 + i as f64 * 5000.0);
                 }
@@ -172,7 +182,7 @@ fn bench_holt_winters_predict(c: &mut Criterion) {
 fn bench_holt_winters_workflow(c: &mut Criterion) {
     let mut group = c.benchmark_group("holt_winters_workflow");
     group.bench_function("observe_predict_cycle", |b| {
-        let mut pred = HoltWintersPredictor::new(0.3, 0.1);
+        let mut pred = HoltLinearPredictor::new(0.3, 0.1);
         let mut sample = 1_000_000.0f64;
         b.iter(|| {
             // 模拟带宽波动
@@ -214,7 +224,7 @@ fn bench_fragment_backoff(c: &mut Criterion) {
                 let info = make_fragment(0, 1024);
                 let mut record = FragmentRecord::new(info, 10);
                 record.retry_count = retry;
-                b.iter(|| record.backoff_duration());
+                b.iter(|| record.backoff_duration(None));
             },
         );
     }

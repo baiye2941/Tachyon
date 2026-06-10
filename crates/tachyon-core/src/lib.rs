@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod filename;
 pub mod rate_limit;
+#[cfg(any(test, feature = "test-harness"))]
 pub mod test_harness;
 pub mod traits;
 pub mod types;
@@ -32,7 +33,10 @@ pub use traits::{ByteStream, Protocol, Storage, Verifier};
 pub use types::{
     DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskId, TaskProgress,
 };
-pub use url_safety::{redact_url_for_log, reject_forbidden_ip, validate_public_http_url};
+pub use url_safety::{
+    redact_url_for_log, reject_forbidden_ip, validate_public_http_url, validate_redirect,
+    validate_resolved_ip,
+};
 
 /// 下载性能指标计数器
 ///
@@ -63,17 +67,26 @@ impl Metrics {
 
     /// 原子累加下载字节数
     pub fn add_bytes(&self, n: u64) {
-        self.bytes_downloaded.fetch_add(n, Ordering::Relaxed);
+        self.bytes_downloaded.fetch_add(n, Ordering::AcqRel);
     }
 
     /// 原子递增完成分片数
     pub fn inc_fragment(&self) {
-        self.fragments_completed.fetch_add(1, Ordering::Relaxed);
+        self.fragments_completed.fetch_add(1, Ordering::AcqRel);
     }
 
     /// 原子递增错误计数
     pub fn inc_error(&self) {
-        self.errors.fetch_add(1, Ordering::Relaxed);
+        self.errors.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 读取当前指标快照(Acquire 语义,保证看到最新的写入)
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.bytes_downloaded.load(Ordering::Acquire),
+            self.fragments_completed.load(Ordering::Acquire),
+            self.errors.load(Ordering::Acquire),
+        )
     }
 }
 

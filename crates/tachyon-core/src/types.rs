@@ -3,12 +3,31 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::DownloadError;
+
 /// 任务唯一标识
 pub type TaskId = Uuid;
 
 /// 下载任务状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+///
+/// A-02: 使用 `strum::Display` 和 `strum::EnumString` 自动派生，
+/// Display / FromStr / serde 三者通过 `#[strum(serialize_all = "lowercase")]`
+/// 和 `#[serde(rename_all = "lowercase")]` 保持一致，新增变体只需添加枚举项。
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Default,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum DownloadState {
     #[default]
     Pending,
@@ -22,24 +41,8 @@ pub enum DownloadState {
     Cancelled,
 }
 
-impl std::fmt::Display for DownloadState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DownloadState::Pending => write!(f, "pending"),
-            DownloadState::Connecting => write!(f, "connecting"),
-            DownloadState::Downloading => write!(f, "downloading"),
-            DownloadState::Paused => write!(f, "paused"),
-            DownloadState::Resuming => write!(f, "resuming"),
-            DownloadState::Verifying => write!(f, "verifying"),
-            DownloadState::Completed => write!(f, "completed"),
-            DownloadState::Failed => write!(f, "failed"),
-            DownloadState::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-
 impl DownloadState {
-    pub fn try_transition(&self, next: DownloadState) -> Result<DownloadState, String> {
+    pub fn try_transition(&self, next: DownloadState) -> Result<DownloadState, DownloadError> {
         use DownloadState::*;
         let valid = matches!(
             (self, &next),
@@ -65,7 +68,9 @@ impl DownloadState {
         if valid {
             Ok(next)
         } else {
-            Err(format!("非法状态转换: {self:?} -> {next:?}"))
+            Err(DownloadError::Config(format!(
+                "非法状态转换: {self:?} -> {next:?}"
+            )))
         }
     }
 
@@ -164,9 +169,13 @@ pub struct FragmentInfo {
 
 impl FragmentInfo {
     pub fn new(index: u32, start: u64, end: u64, size: u64) -> Self {
-        debug_assert_eq!(
-            end + 1,
-            start + size,
+        // 使用 checked_add 防止 u64 溢出, assert_eq! 在 release 模式下也执行
+        let end_plus_1 = end.checked_add(1).expect("FragmentInfo: end + 1 溢出");
+        let start_plus_size = start
+            .checked_add(size)
+            .expect("FragmentInfo: start + size 溢出");
+        assert_eq!(
+            end_plus_1, start_plus_size,
             "FragmentInfo invariant: end + 1 == start + size, got end={end}, start={start}, size={size}"
         );
         Self {

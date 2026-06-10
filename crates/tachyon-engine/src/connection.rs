@@ -57,16 +57,21 @@ pub struct ConnectionPool {
     pub(crate) global_semaphore: Arc<Semaphore>,
     active_count: Arc<AtomicU32>,
     host_semaphores: DashMap<String, Arc<Semaphore>>,
+    /// host_semaphores 自动清理阈值:超过此数量时在 acquire 中触发清理
+    cleanup_threshold: usize,
 }
 
 impl ConnectionPool {
     /// 创建新的连接池
     pub fn new(config: PoolConfig) -> Self {
+        // 清理阈值 = max_global * 2,避免 host_semaphores 无限增长
+        let cleanup_threshold = (config.max_global as usize).saturating_mul(2).max(64);
         Self {
             global_semaphore: Arc::new(Semaphore::new(config.max_global as usize)),
             config,
             active_count: Arc::new(AtomicU32::new(0)),
             host_semaphores: DashMap::new(),
+            cleanup_threshold,
         }
     }
 
@@ -96,6 +101,12 @@ impl ConnectionPool {
             .await
             .map_err(|_| DownloadError::Network("主机连接信号量已关闭".into()))?;
         self.active_count.fetch_add(1, Ordering::Relaxed);
+
+        // W-09: 当主机信号量条目超过阈值时自动清理空闲条目,防止内存泄漏
+        if self.host_semaphores.len() > self.cleanup_threshold {
+            self.cleanup_idle_hosts();
+        }
+
         Ok(ConnectionPermit {
             _global_permit: global_permit,
             _host_permit: host_permit,
@@ -125,6 +136,20 @@ impl ConnectionPool {
     /// 当前跟踪的主机数量
     pub fn host_count(&self) -> usize {
         self.host_semaphores.len()
+    }
+
+    /// A-05: 获取指定主机的活跃连接数(已消耗的许可数)
+    ///
+    /// 返回 `max_per_host - available_permits`,即当前正在使用的连接数。
+    /// 用于监控和诊断连接池状态。
+    pub fn host_active_connections(&self, host: &str) -> u32 {
+        self.host_semaphores
+            .get(host)
+            .map(|sem| {
+                let used = self.config.max_per_host as usize - sem.available_permits();
+                used as u32
+            })
+            .unwrap_or(0)
     }
 }
 

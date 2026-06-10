@@ -520,43 +520,27 @@ pub(crate) async fn create_task_inner(
     mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
     validate_download_url(&url)?;
-    let task_id = Uuid::new_v4().to_string();
-    let file_name = extract_filename_from_url(&url);
-    let created_at = now_iso8601();
 
-    {
-        if state.tasks.iter().any(|r| {
-            let t = r.value();
-            t.url == url
-                && t.status != DownloadState::Cancelled
-                && t.status != DownloadState::Completed
-                && t.status != DownloadState::Failed
-        }) {
-            return Err(AppError::TaskAlreadyExists(
-                "相同 URL 的下载任务已存在".to_string(),
-            ));
-        }
-        let max_tasks = state.config.lock().await.max_concurrent_tasks as usize;
-        let active_count = state
-            .tasks
-            .iter()
-            .filter(|r| {
-                let t = r.value();
-                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
-            })
-            .count();
-        if active_count >= max_tasks {
-            return Err(AppError::Config(format!(
-                "已达最大并发任务数({max_tasks}),请等待现有任务完成"
-            )));
+    // A-14: 对每个镜像 URL 执行与主 URL 相同的 SSRF 防护验证
+    if let Some(ref mirrors) = mirror_urls {
+        for mirror in mirrors {
+            validate_download_url(mirror)
+                .map_err(|e| AppError::Config(format!("镜像 URL 验证失败: {e}")))?;
         }
     }
 
-    let download_dir_str = {
+    // 提前获取配置和下载目录,避免在检查-插入间隙中 await(消除 TOCTOU 竞态)
+    let (max_tasks, download_dir_str) = {
         let cfg = state.config.lock().await;
+        let max_tasks = cfg.max_concurrent_tasks as usize;
         let requested = download_dir.unwrap_or_else(|| cfg.download.download_dir.clone());
-        authorize_download_dir(&cfg, &requested)?
+        let authorized = authorize_download_dir(&cfg, &requested)?;
+        (max_tasks, authorized)
     };
+
+    let task_id = Uuid::new_v4().to_string();
+    let file_name = extract_filename_from_url(&url);
+    let created_at = now_iso8601();
 
     let task = TaskInfo {
         id: task_id.clone(),
@@ -572,7 +556,36 @@ pub(crate) async fn create_task_inner(
         created_at,
     };
 
+    // 使用互斥锁保证 check-and-insert 的原子性
+    // 防止并发 create_task 请求导致去重检查和并发计数被绕过
     {
+        let _create_guard = state.create_task_lock.lock().await;
+
+        if state.tasks.iter().any(|r| {
+            let t = r.value();
+            t.url == url
+                && t.status != DownloadState::Cancelled
+                && t.status != DownloadState::Completed
+                && t.status != DownloadState::Failed
+        }) {
+            return Err(AppError::TaskAlreadyExists(
+                "相同 URL 的下载任务已存在".to_string(),
+            ));
+        }
+        let active_count = state
+            .tasks
+            .iter()
+            .filter(|r| {
+                let t = r.value();
+                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
+            })
+            .count();
+        if active_count >= max_tasks {
+            return Err(AppError::Config(format!(
+                "已达最大并发任务数({max_tasks}),请等待现有任务完成"
+            )));
+        }
+        // 在锁保护下立即插入,消除竞态窗口
         state.tasks.insert(task_id.clone(), task);
     }
 
@@ -610,6 +623,7 @@ pub(crate) async fn create_task_inner(
         connection_pool: state.connection_pool.clone(),
         controls: state.controls.clone(),
         task_store: state.task_store.clone(),
+        create_task_lock: state.create_task_lock.clone(),
     });
 
     let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
@@ -846,6 +860,47 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("已存在"));
+    }
+
+    /// Q-001 修复验证:并发创建相同 URL 的任务,应只有一个成功
+    /// 修复前存在 TOCTOU 竞态:检查与插入非原子,两个并发请求可能都通过检查
+    #[tokio::test]
+    async fn test_concurrent_create_same_url_only_one_succeeds() {
+        let state = test_state();
+        let url = "https://race.example.com/unique-file.bin";
+
+        // 并发创建 10 个相同 URL 的任务
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                create_task_inner(&state, url.to_string(), None, None).await
+            }));
+        }
+
+        let mut successes = 0usize;
+        let mut failures = 0usize;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => successes += 1,
+                Err(_) => failures += 1,
+            }
+        }
+
+        // 必须恰好只有 1 个成功
+        assert_eq!(
+            successes, 1,
+            "并发创建相同 URL 应只有 1 个成功,实际成功 {successes} 个"
+        );
+        // 其余 9 个应返回 TaskAlreadyExists 错误
+        assert_eq!(
+            failures, 9,
+            "并发创建相同 URL 应有 9 个失败,实际失败 {failures} 个"
+        );
+
+        // 验证 DashMap 中只有 1 条任务记录
+        let task_count = state.tasks.iter().filter(|r| r.value().url == url).count();
+        assert_eq!(task_count, 1, "DashMap 中应只有 1 条相同 URL 的任务");
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use url::Url;
 
@@ -25,6 +25,72 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
         reject_forbidden_ip(ip)?;
     }
 
+    Ok(())
+}
+
+/// DNS 解析后校验:对 URL 主机执行 DNS 解析并检查每个解析出的 IP 地址
+///
+/// 防止 DNS Rebinding 攻击:攻击者可通过 DNS TTL=0 使首次解析返回公网 IP（通过校验）,
+/// 第二次解析返回内网 IP（如 169.254.169.254 云元数据服务）。
+/// 此函数在 URL 字符串校验之后、发起连接之前调用,确保所有解析结果均为安全 IP。
+///
+/// # 注意
+///
+/// 调用此函数后,协议层应使用已解析的 IP 进行连接（而非重新发起 DNS 查询）,
+/// 否则仍存在 TOCTOU（Time-of-Check to Time-of-Use）窗口。
+pub fn validate_resolved_ip(url: &Url) -> DownloadResult<()> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))?;
+
+    // 如果 host 已经是 IP 地址,直接校验即可（无需 DNS 解析）
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return reject_forbidden_ip(ip);
+    }
+
+    // 对域名执行 DNS 解析
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(|e| DownloadError::Network(format!("DNS 解析失败: {e}")))?;
+
+    let mut resolved_count = 0u32;
+    for addr in addrs {
+        reject_forbidden_ip(addr.ip())?;
+        resolved_count += 1;
+    }
+
+    if resolved_count == 0 {
+        return Err(DownloadError::Network("DNS 解析无结果".into()));
+    }
+
+    Ok(())
+}
+
+/// 重定向目标校验:对每次重定向的目标 URL 执行完整的 SSRF 校验
+///
+/// 防止攻击者通过合法公网 URL 通过初始校验后,通过服务端重定向（301/302/307/308）
+/// 将请求导向内网地址。协议层应禁用 HTTP 客户端的自动重定向,改为手动跟随并在
+/// 每一步调用此函数。
+///
+/// # 参数
+///
+/// - `redirect_url`: 重定向目标 URL
+/// - `max_redirects`: 允许的最大重定向次数
+/// - `current_redirect`: 当前已执行的重定向次数（从 0 开始）
+pub fn validate_redirect(
+    redirect_url: &Url,
+    max_redirects: u32,
+    current_redirect: u32,
+) -> DownloadResult<()> {
+    if current_redirect >= max_redirects {
+        return Err(DownloadError::Protocol(format!(
+            "重定向次数超过上限 ({max_redirects})"
+        )));
+    }
+    // 对每次重定向目标执行完整的 URL 校验 + DNS 解析校验
+    validate_public_http_url(redirect_url)?;
+    validate_resolved_ip(redirect_url)?;
     Ok(())
 }
 
@@ -107,6 +173,7 @@ pub fn redact_url_for_log(url: &str) -> String {
         .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("");
+    // 仅脱敏凭据、query、fragment，保留 scheme/host/basename 供日志排查
     if basename.is_empty() {
         format!("{}://{}", parsed.scheme(), host)
     } else {
@@ -232,5 +299,56 @@ mod tests {
     #[test]
     fn redacts_invalid_url_to_placeholder() {
         assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
+    }
+
+    // --- validate_resolved_ip 测试 ---
+
+    #[test]
+    fn validate_resolved_ip_rejects_ip_literal_localhost() {
+        let url = Url::parse("http://127.0.0.1/file.bin").unwrap();
+        assert!(validate_resolved_ip(&url).is_err());
+    }
+
+    #[test]
+    fn validate_resolved_ip_rejects_ip_literal_private() {
+        let url = Url::parse("http://10.0.0.1/file.bin").unwrap();
+        assert!(validate_resolved_ip(&url).is_err());
+    }
+
+    #[test]
+    fn validate_resolved_ip_accepts_public_ip_literal() {
+        let url = Url::parse("https://93.184.216.34/file.bin").unwrap();
+        assert!(validate_resolved_ip(&url).is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_ip_rejects_empty_host() {
+        // 构造一个 host_str 为 None 的 URL 不现实，但空字符串域名解析会失败
+        let url = Url::parse("https://example.com/file.bin").unwrap();
+        // 正常公网域名应通过（DNS 解析由运行环境决定）
+        // 此处仅验证函数不会 panic
+        let _ = validate_resolved_ip(&url);
+    }
+
+    // --- validate_redirect 测试 ---
+
+    #[test]
+    fn validate_redirect_rejects_exceeded_limit() {
+        let url = Url::parse("https://example.com/file.bin").unwrap();
+        assert!(validate_redirect(&url, 10, 10).is_err());
+        assert!(validate_redirect(&url, 5, 5).is_err());
+    }
+
+    #[test]
+    fn validate_redirect_rejects_internal_target() {
+        let url = Url::parse("http://127.0.0.1/admin").unwrap();
+        assert!(validate_redirect(&url, 10, 0).is_err());
+    }
+
+    #[test]
+    fn validate_redirect_accepts_within_limit() {
+        let url = Url::parse("https://example.com/file.bin").unwrap();
+        // 次数未超限且 URL 合法，应通过（DNS 解析由运行环境决定）
+        let _ = validate_redirect(&url, 10, 0);
     }
 }

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 #[cfg(test)]
@@ -38,10 +39,17 @@ pub struct QuicTransport {
     connection: Option<quinn::Connection>,
     /// 存储的 QUIC 客户端加密配置,用于构造支持 0-RTT 的自定义 ClientConfig
     stored_crypto: Option<Arc<dyn quinn::crypto::ClientConfig>>,
-    /// TLS 会话缓存:按 host 记录已建立过连接的服务器证书 DER 编码。
+    /// TLS 会话缓存:按 host 记录已建立过连接的服务器证书 DER 编码及缓存时间。
     /// 存在条目表示该 host 的 TLS session 已由 rustls 内部缓存,可尝试 0-RTT。
-    session_tokens: HashMap<String, Vec<u8>>,
+    /// 条目附带 `Instant` 时间戳用于 TTL 过期清理。
+    session_tokens: HashMap<String, (Vec<u8>, Instant)>,
 }
+
+/// TLS 会话缓存 TTL:超过此时间的缓存条目将被视为过期,不再尝试 0-RTT
+const SESSION_TOKEN_TTL: Duration = Duration::from_secs(3600);
+
+/// 会话缓存容量上限:防止长期运行时内存无限增长
+const MAX_SESSION_TOKENS: usize = 256;
 
 impl QuicTransport {
     /// 创建新的 QUIC 传输实例
@@ -165,7 +173,13 @@ impl QuicTransport {
         tachyon_core::reject_forbidden_ip(addr.ip())?;
 
         let connection = if let Some(ref crypto) = self.stored_crypto {
-            if self.session_tokens.contains_key(host) {
+            // 检查 session token 是否存在且未过期
+            let has_valid_session = self
+                .session_tokens
+                .get(host)
+                .is_some_and(|(_, cached_at)| cached_at.elapsed() < SESSION_TOKEN_TTL);
+
+            if has_valid_session {
                 // 尝试 0-RTT: 使用缓存的 TLS 会话跳过完整握手
                 // rustls 的 Resumption 配置会自动提供缓存的 session ticket
                 let client_config = quinn::ClientConfig::new(Arc::clone(crypto));
@@ -181,10 +195,22 @@ impl QuicTransport {
                     Ok((conn, accepted)) => {
                         if accepted.await {
                             tracing::info!(host, port, "QUIC 0-RTT 连接成功");
+                            conn
                         } else {
-                            tracing::debug!(host, "服务端拒绝 0-RTT,连接已通过 1-RTT 握手完成");
+                            // 0-RTT 被服务端拒绝: 安全起见关闭此连接并重新建立 1-RTT 连接。
+                            // 0-RTT 被拒绝意味着服务端不认可缓存的 session ticket
+                            // (可能已过期或被撤销),此时 conn 可能处于不确定状态。
+                            tracing::info!(host, "服务端拒绝 0-RTT, 清除缓存并重新建立 1-RTT 连接");
+                            conn.close(0u32.into(), b"0-rtt rejected, reconnecting");
+                            self.session_tokens.remove(host);
+
+                            let connecting = self.endpoint.connect(addr, host).map_err(|e| {
+                                DownloadError::Network(format!("QUIC 1-RTT 重连失败: {e}"))
+                            })?;
+                            connecting.await.map_err(|e| {
+                                DownloadError::Network(format!("QUIC 1-RTT 连接建立失败: {e}"))
+                            })?
                         }
-                        conn
                     }
                     Err(connecting) => {
                         // 0-RTT 不可用,回退到标准 1-RTT 连接
@@ -195,7 +221,10 @@ impl QuicTransport {
                     }
                 }
             } else {
-                // 首次连接该 host,无缓存会话,执行标准 1-RTT 握手
+                // 过期条目延迟清理(避免在热路径上遍历 HashMap)
+                self.session_tokens.remove(host);
+
+                // 首次连接该 host 或缓存已过期,执行标准 1-RTT 握手
                 let connecting = self
                     .endpoint
                     .connect(addr, host)
@@ -227,7 +256,22 @@ impl QuicTransport {
                 identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
             && let Some(cert) = chain.first()
         {
-            self.session_tokens.insert(host.to_string(), cert.to_vec());
+            // 容量上限保护: 淘汰最旧条目以防止长期运行时内存泄漏
+            if self.session_tokens.len() >= MAX_SESSION_TOKENS {
+                self.cleanup_expired_sessions();
+                // 清理后仍满则淘汰最旧条目
+                if self.session_tokens.len() >= MAX_SESSION_TOKENS
+                    && let Some(oldest_key) = self
+                        .session_tokens
+                        .iter()
+                        .min_by_key(|(_, (_, t))| *t)
+                        .map(|(k, _)| k.clone())
+                {
+                    self.session_tokens.remove(&oldest_key);
+                }
+            }
+            self.session_tokens
+                .insert(host.to_string(), (cert.to_vec(), Instant::now()));
         }
 
         Ok(())
@@ -250,6 +294,15 @@ impl QuicTransport {
         if let Some(conn) = self.connection.take() {
             conn.close(0u32.into(), b"client disconnect");
         }
+    }
+
+    /// 清理过期的 TLS 会话缓存条目
+    ///
+    /// 移除所有超过 `SESSION_TOKEN_TTL`（1 小时）的缓存条目,
+    /// 防止长期运行时内存无限增长和使用过期的 session ticket 尝试 0-RTT。
+    pub fn cleanup_expired_sessions(&mut self) {
+        self.session_tokens
+            .retain(|_, (_, cached_at)| cached_at.elapsed() < SESSION_TOKEN_TTL);
     }
 
     /// 获取活跃连接引用,未连接时返回 Protocol 错误
@@ -352,6 +405,7 @@ fn parse_head_response(response: &str, url: &str) -> DownloadResult<FileMetadata
 ///
 /// HTTP 响应以 `\r\n\r\n` 分隔头部与正文。返回正文部分的 Bytes。
 /// 如果未找到分隔符,返回错误。
+#[cfg(test)]
 fn parse_body_response(response: &[u8]) -> DownloadResult<Bytes> {
     // 查找 \r\n\r\n 分隔符
     let separator = b"\r\n\r\n";
@@ -378,6 +432,26 @@ fn parse_body_response(response: &[u8]) -> DownloadResult<Bytes> {
             return Err(DownloadError::Protocol(format!("HTTP {status_code}")));
         }
     }
+
+    Ok(Bytes::copy_from_slice(&response[body_start..]))
+}
+
+/// 分离 Range 请求的 HTTP 响应头和响应体,并严格验证 206 状态码
+///
+/// Range 请求必须返回 206 Partial Content。如果服务器忽略 Range 头返回 200 OK,
+/// 将导致引擎层将完整文件写入分片偏移处,造成数据越界写入。
+#[cfg(test)]
+fn parse_range_body_response(response: &[u8]) -> DownloadResult<Bytes> {
+    let separator = b"\r\n\r\n";
+    let header_end = response
+        .windows(separator.len())
+        .position(|window| window == separator)
+        .ok_or_else(|| DownloadError::Protocol("响应中未找到头部/体部分隔符".into()))?;
+
+    let body_start = header_end + separator.len();
+
+    // 严格验证 Range 请求必须返回 206
+    validate_range_status(&response[..header_end])?;
 
     Ok(Bytes::copy_from_slice(&response[body_start..]))
 }
@@ -411,7 +485,12 @@ async fn send_request(conn: &quinn::Connection, request: &[u8]) -> DownloadResul
 /// 先解析 HTTP 响应头并验证状态码,再逐块产出正文数据。
 ///
 /// 消除 `read_to_end` 的 256MB 硬性上限和峰值内存问题。
-fn recv_streaming(recv: quinn::RecvStream) -> ByteStream {
+///
+/// # 参数
+///
+/// - `recv`: QUIC 接收流
+/// - `is_range_request`: 如果为 true,则验证状态码必须为 206 (Range 请求)
+fn recv_streaming(recv: quinn::RecvStream, is_range_request: bool) -> ByteStream {
     const CHUNK_SIZE: usize = 64 * 1024; // 64KB per read_chunk
     const MAX_HEADER_BUF: usize = 256 * 1024; // 头部缓冲区上限 256KB
 
@@ -431,7 +510,7 @@ fn recv_streaming(recv: quinn::RecvStream) -> ByteStream {
     // recv 的所有权移入闭包,确保 Stream 结束时正确清理 QUIC 流
     Box::pin(futures::stream::unfold(
         (initial_state, recv, Bytes::new()),
-        |(mut state, mut recv, pending): (State, quinn::RecvStream, Bytes)| async move {
+        move |(mut state, mut recv, pending): (State, quinn::RecvStream, Bytes)| async move {
             loop {
                 // 读取下一个 QUIC 数据块(零拷贝)
                 let chunk = match recv.read_chunk(CHUNK_SIZE, true).await {
@@ -453,9 +532,30 @@ fn recv_streaming(recv: quinn::RecvStream) -> ByteStream {
                         if let Some(pos) = find_subsequence(header_buf, b"\r\n\r\n") {
                             let body_start = pos + 4;
 
-                            // 验证 HTTP 状态码
-                            if let Err(e) = validate_http_status(&header_buf[..pos]) {
+                            // 验证 HTTP 状态码（Range 请求要求 206，普通请求要求 2xx）
+                            let status_result = if is_range_request {
+                                validate_range_status(&header_buf[..pos])
+                            } else {
+                                validate_http_status(&header_buf[..pos])
+                            };
+                            if let Err(e) = status_result {
                                 return Some((Err(e), (State::Body, recv, pending)));
+                            }
+
+                            // W-11: 检测 Transfer-Encoding: chunked (HTTP/3 不应使用)
+                            // QUIC 上的 HTTP/3 使用自有帧机制,Transfer-Encoding 被规范禁止。
+                            // 若服务器违反规范发送 chunked 编码,返回明确错误而非静默返回损坏数据。
+                            let header_str = std::str::from_utf8(&header_buf[..pos]).unwrap_or("");
+                            if header_str.lines().any(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+                            }) {
+                                return Some((
+                                    Err(DownloadError::Protocol(
+                                        "QUIC/HTTP3 响应包含 Transfer-Encoding: chunked,这违反 HTTP/3 规范".into(),
+                                    )),
+                                    (State::Body, recv, pending),
+                                ));
                             }
 
                             // 提取尾部残余数据(分隔符之后的字节)
@@ -517,6 +617,35 @@ fn validate_http_status(header_bytes: &[u8]) -> DownloadResult<()> {
     Ok(())
 }
 
+/// 验证 Range 请求的 HTTP 响应状态码必须为 206 Partial Content
+///
+/// 如果服务器忽略 Range 头返回 200 OK（完整文件）,会导致:
+/// 1. 引擎层将完整文件数据写入分片偏移处,造成数据越界写入
+/// 2. 虽然 downloader 有越界检查,但已读取整个响应到内存,峰值内存不可控
+///
+/// 此函数与 HTTP 客户端(`http.rs` 行 277-286)的校验逻辑保持一致。
+fn validate_range_status(header_bytes: &[u8]) -> DownloadResult<()> {
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|e| DownloadError::Protocol(format!("响应头部非有效 UTF-8: {e}")))?;
+
+    if let Some(status_line) = header_str.lines().next() {
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        if status_code != 206 {
+            return Err(DownloadError::Protocol(format!(
+                "服务器忽略 Range 头, 返回 HTTP {status_code} (期望 206 Partial Content)"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// 从 URL 中提取路径(含查询字符串)
 ///
 /// 返回格式: `/path?key=value`
@@ -541,12 +670,13 @@ fn build_head_request(url: &str) -> DownloadResult<Vec<u8>> {
         .host_str()
         .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
     let full_path = extract_path(&parsed);
+    let user_agent = tachyon_core::config::USER_AGENT;
 
     // 使用 write! 避免 format! 创建中间 String,直接写入预分配缓冲区
-    let mut buf = Vec::with_capacity(128 + full_path.len() + host.len());
+    let mut buf = Vec::with_capacity(200 + full_path.len() + host.len());
     write!(
         buf,
-        "HEAD {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        "HEAD {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     )
     .expect("写入 Vec 不会失败");
     Ok(buf)
@@ -561,9 +691,10 @@ fn build_range_request(url: &str, start: u64, end: u64) -> DownloadResult<Vec<u8
         .host_str()
         .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
     let full_path = extract_path(&parsed);
+    let user_agent = tachyon_core::config::USER_AGENT;
 
-    let mut buf = Vec::with_capacity(160 + full_path.len() + host.len());
-    write!(buf, "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n")
+    let mut buf = Vec::with_capacity(240 + full_path.len() + host.len());
+    write!(buf, "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n")
         .expect("写入 Vec 不会失败");
     Ok(buf)
 }
@@ -577,11 +708,12 @@ fn build_full_request(url: &str) -> DownloadResult<Vec<u8>> {
         .host_str()
         .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
     let full_path = extract_path(&parsed);
+    let user_agent = tachyon_core::config::USER_AGENT;
 
-    let mut buf = Vec::with_capacity(128 + full_path.len() + host.len());
+    let mut buf = Vec::with_capacity(200 + full_path.len() + host.len());
     write!(
         buf,
-        "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     )
     .expect("写入 Vec 不会失败");
     Ok(buf)
@@ -674,8 +806,33 @@ impl Protocol for QuicTransport {
         let url = url.to_owned();
         Box::pin(async move {
             let request = build_range_request(&url, start, end)?;
-            let response_bytes = send_request(&conn, &request).await?;
-            parse_body_response(&response_bytes)
+
+            // 使用流式读取代替 send_request 的 256MB 硬编码缓冲
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+
+            send.write_all(&request)
+                .await
+                .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
+
+            send.finish()
+                .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
+
+            // 流式读取: recv_streaming 验证 206 状态码并逐块返回正文
+            use futures::StreamExt;
+            let mut stream = recv_streaming(recv, true);
+            let mut chunks = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                chunks.push(chunk?);
+            }
+            let total_len = chunks.iter().map(|b| b.len()).sum();
+            let mut result = Vec::with_capacity(total_len);
+            for chunk in chunks {
+                result.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(result))
         })
     }
 
@@ -707,7 +864,8 @@ impl Protocol for QuicTransport {
                 .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
 
             // 返回流式读取器:逐块读取响应,避免一次性缓冲整个响应
-            Ok(recv_streaming(recv))
+            // Range 请求必须验证 206 状态码
+            Ok(recv_streaming(recv, true))
         })
     }
 
@@ -722,8 +880,42 @@ impl Protocol for QuicTransport {
         let url = url.to_owned();
         Box::pin(async move {
             let request = build_full_request(&url)?;
-            let response_bytes = send_request(&conn, &request).await?;
-            parse_body_response(&response_bytes)
+
+            // 使用流式读取代替 send_request 的 256MB 硬编码缓冲
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+
+            send.write_all(&request)
+                .await
+                .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
+
+            send.finish()
+                .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
+
+            // 流式读取: 非 Range 请求,验证 2xx 状态码
+            use futures::StreamExt;
+            let mut stream = recv_streaming(recv, false);
+            let mut chunks = Vec::new();
+            let mut total_size: usize = 0;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                total_size = total_size.saturating_add(chunk.len());
+                // W-12: 统一使用共享大小限制,防止 OOM
+                if total_size > tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE {
+                    return Err(DownloadError::Protocol(format!(
+                        "QUIC 文件过大: 超过单次全量下载上限 {} MB, 请使用分片下载",
+                        tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE / (1024 * 1024)
+                    )));
+                }
+                chunks.push(chunk);
+            }
+            let mut result = Vec::with_capacity(total_size);
+            for chunk in chunks {
+                result.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(result))
         })
     }
 }
@@ -1155,6 +1347,50 @@ mod tests {
     #[test]
     fn test_validate_http_status_206_partial() {
         assert!(validate_http_status(b"HTTP/1.1 206 Partial Content").is_ok());
+    }
+
+    // --- Range 请求 206 状态码验证测试 ---
+
+    #[test]
+    fn test_validate_range_status_206_ok() {
+        assert!(validate_range_status(b"HTTP/1.1 206 Partial Content").is_ok());
+    }
+
+    #[test]
+    fn test_validate_range_status_200_rejected() {
+        let result = validate_range_status(b"HTTP/1.1 200 OK");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("206"), "错误应提及期望 206, 实际: {err}");
+        assert!(err.contains("200"), "错误应包含实际状态码 200, 实际: {err}");
+    }
+
+    #[test]
+    fn test_validate_range_status_404_rejected() {
+        assert!(validate_range_status(b"HTTP/1.1 404 Not Found").is_err());
+    }
+
+    #[test]
+    fn test_parse_range_body_response_206_ok() {
+        let body = b"partial data";
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 12\r\n\r\n");
+        response.extend_from_slice(body);
+        let parsed = parse_range_body_response(&response).unwrap();
+        assert_eq!(parsed.as_ref(), body);
+    }
+
+    #[test]
+    fn test_parse_range_body_response_200_rejected() {
+        let body = b"full file data";
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n");
+        response.extend_from_slice(body);
+        let result = parse_range_body_response(&response);
+        assert!(
+            result.is_err(),
+            "Range 请求返回 200 应被拒绝(服务器忽略 Range 头)"
+        );
     }
 
     #[test]

@@ -91,6 +91,8 @@ impl HttpClient {
 // Default 实现已移除 — TLS 初始化可能失败,请使用 HttpClient::new()
 
 const DNS_CACHE_TTL_SECS: u64 = 60;
+/// DNS 缓存最大条目数,防止 DashMap 无限增长导致内存泄漏
+const DNS_CACHE_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 struct PublicDnsResolver {
@@ -102,6 +104,13 @@ impl PublicDnsResolver {
         Self {
             cache: DashMap::new(),
         }
+    }
+
+    /// 清理过期的 DNS 缓存条目
+    #[allow(dead_code)]
+    fn evict_expired(&self) {
+        let ttl = Duration::from_secs(DNS_CACHE_TTL_SECS);
+        self.cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
     }
 }
 
@@ -123,7 +132,16 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
                 tachyon_core::reject_forbidden_ip(addr.ip())
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
-            cache.insert(host, (addrs.clone(), Instant::now()));
+
+            // 容量检查: 达到上限时先清理过期条目,仍满则拒绝缓存(仍返回解析结果)
+            if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+                // 借用 self 不可用(已 move 进闭包),通过 cache 引用操作
+                let ttl = Duration::from_secs(DNS_CACHE_TTL_SECS);
+                cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
+            }
+            if cache.len() < DNS_CACHE_MAX_ENTRIES {
+                cache.insert(host, (addrs.clone(), Instant::now()));
+            }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -147,7 +165,7 @@ fn safe_redirect_policy() -> reqwest::redirect::Policy {
 
 /// 根据 HTTP 状态码和响应头对错误进行精确分类
 ///
-/// - 429/503: 返回 Throttled,尝试解析 Retry-After 头中的秒数
+/// - 429/503: 返回 Throttled,尝试解析 Retry-After 头中的秒数(整数或 HTTP-date)
 /// - 401/403: 返回 Forbidden
 /// - 其他: 返回通用 Protocol 错误
 fn classify_http_error(
@@ -160,12 +178,105 @@ fn classify_http_error(
             let retry_after_secs = headers
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
+                .and_then(parse_retry_after);
             DownloadError::Throttled { retry_after_secs }
         }
         401 | 403 => DownloadError::Forbidden { status: code },
         _ => DownloadError::Protocol(format!("HTTP {status}")),
     }
+}
+
+/// 解析 Retry-After 头部值
+///
+/// 支持两种格式(RFC 7231):
+/// 1. delay-seconds: 纯整数秒数(如 "120")
+/// 2. HTTP-date: IMF-fixdate 格式(如 "Wed, 21 Oct 2026 07:28:00 GMT")
+fn parse_retry_after(value: &str) -> Option<u64> {
+    // 优先尝试整数秒格式
+    if let Ok(secs) = value.trim().parse::<u64>() {
+        return Some(secs);
+    }
+
+    // W-10: 解析 HTTP-date (IMF-fixdate) 格式
+    // 格式: "Day, DD Mon YYYY HH:MM:SS GMT"
+    parse_http_date_to_secs(value.trim())
+}
+
+/// 月份名称映射
+fn month_num(name: &str) -> Option<u32> {
+    match name {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// 将 IMF-fixdate 格式的 HTTP-date 转换为距当前时刻的秒数
+///
+/// 输入: "Wed, 21 Oct 2026 07:28:00 GMT"
+/// 输出: 距离当前 UTC 时间的秒数(若已过期则返回 Some(0))
+fn parse_http_date_to_secs(date_str: &str) -> Option<u64> {
+    // 解析 "Day, DD Mon YYYY HH:MM:SS GMT"
+    let parts: Vec<&str> = date_str.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+
+    // parts[0] = "Wed," (忽略星期)
+    let day: u32 = parts.get(1)?.parse().ok()?;
+    let month = month_num(parts.get(2)?)?;
+    let year: u32 = parts.get(3)?.parse().ok()?;
+    let time_str = parts.get(4)?;
+    // parts[5] = "GMT" (忽略时区,假定为 UTC)
+
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts[2].parse().ok()?;
+
+    // 计算从 epoch 到目标时间的秒数(简化算法,精确到天级别即可)
+    let target_epoch = days_from_epoch(year, month, day) as u64 * 86400
+        + hour as u64 * 3600
+        + minute as u64 * 60
+        + second as u64;
+
+    // 获取当前 UNIX 时间戳
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+
+    Some(target_epoch.saturating_sub(now_epoch))
+}
+
+/// 计算从 1970-01-01 到指定日期的天数(简化算法)
+fn days_from_epoch(year: u32, month: u32, day: u32) -> i64 {
+    // 使用 civil_from_days 的反向算法
+    // 参考: http://howardhinnant.github.io/date_algorithms.html
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
+    let m = if month <= 2 { month + 9 } else { month - 3 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // year of era [0, 399]
+    let doy = (153 * m as i64 + 2) / 5 + day as i64 - 1; // day of year [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
+    era * 146097 + doe - 719468
 }
 
 impl Protocol for HttpClient {
@@ -582,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_classify_429_with_invalid_retry_after() {
-        // Retry-After 为 HTTP 日期格式(当前只解析纯秒数),应返回 None
+        // W-10 后 HTTP-date 格式已被支持，应返回距当前时刻的正整数秒数
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "retry-after",
@@ -591,7 +702,10 @@ mod tests {
         let err = super::classify_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
         match err {
             DownloadError::Throttled { retry_after_secs } => {
-                assert_eq!(retry_after_secs, None);
+                assert!(
+                    retry_after_secs.is_some_and(|s| s > 0),
+                    "HTTP-date 在未来时应返回正秒数, 实际: {retry_after_secs:?}"
+                );
             }
             other => panic!("预期 Throttled,实际: {other:?}"),
         }

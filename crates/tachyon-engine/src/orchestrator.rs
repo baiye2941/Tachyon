@@ -87,6 +87,8 @@ impl DownloadOrchestrator {
                     self.scheduler_config.min_fragment_size,
                     self.scheduler_config.max_fragment_size,
                     self.scheduler_config.default_target_fragments,
+                    self.scheduler_config.high_bandwidth_threshold,
+                    self.scheduler_config.medium_bandwidth_threshold,
                 )
             }
         };
@@ -96,19 +98,28 @@ impl DownloadOrchestrator {
             return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
         }
 
+        // 防止超大文件导致分片数溢出: 硬上限 1,000,000 个分片
+        // 超过此阈值时强制增大 frag_size
+        const MAX_FRAGMENT_COUNT: u64 = 1_000_000;
+        let mut effective_frag_size = frag_size;
+        let estimated_count = file_size / effective_frag_size;
+        if estimated_count > MAX_FRAGMENT_COUNT {
+            effective_frag_size = file_size.div_ceil(MAX_FRAGMENT_COUNT);
+        }
+
         let mut fragments = Vec::new();
         let mut offset: u64 = 0;
         let mut index: u32 = 0;
 
         while offset < file_size {
             let remaining = file_size - offset;
-            let size = remaining.min(frag_size);
+            let size = remaining.min(effective_frag_size);
             let end = offset + size - 1;
 
             fragments.push(FragmentInfo::new(index, offset, end, size));
 
             offset += size;
-            index += 1;
+            index = index.checked_add(1).expect("分片数超过 u32::MAX,文件过大");
         }
 
         fragments

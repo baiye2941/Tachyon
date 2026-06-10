@@ -8,16 +8,21 @@
 //! 令牌桶以恒定速率 `bytes_per_sec` 补充令牌。每次写入消耗对应字节数的令牌。
 //! 令牌不足时,计算精确等待时间后 sleep。初始令牌等于速率值,允许首秒满速突发。
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// 单次 acquire 最大等待时间(秒)
+///
+/// 超过此阈值的等待会被截断并记录警告,防止在高并发场景下
+/// 个别请求因令牌长期不足而被无限期饿死。
+const MAX_ACQUIRE_WAIT_SECS: f64 = 5.0;
 
 /// 令牌桶限速器
 ///
 /// 线程安全,可跨多个异步分片任务共享。
 /// 支持运行时动态更新速率(bytes_per_sec),用于带宽自适应限速。
 pub struct RateLimiter {
-    state: Mutex<BucketState>,
+    state: std::sync::Mutex<BucketState>,
     bytes_per_sec: AtomicU64,
 }
 
@@ -34,7 +39,7 @@ impl RateLimiter {
     /// `bytes_per_sec` = 0 时等同于不限速(调用方应提前过滤)。
     pub fn new(bytes_per_sec: u64) -> Self {
         Self {
-            state: Mutex::new(BucketState {
+            state: std::sync::Mutex::new(BucketState {
                 tokens: bytes_per_sec as f64,
                 last_refill: Instant::now(),
             }),
@@ -47,7 +52,7 @@ impl RateLimiter {
     /// 调用方在每次存储写入后调用此方法,传入实际写入的字节数。
     /// 令牌充足时立即返回;不足时计算精确等待时间后返回。
     pub async fn acquire(&self, bytes: u64) {
-        let rate = self.bytes_per_sec.load(Ordering::Relaxed);
+        let rate = self.bytes_per_sec.load(Ordering::Acquire);
         if rate == 0 || bytes == 0 {
             return;
         }
@@ -76,7 +81,18 @@ impl RateLimiter {
         };
 
         if wait_secs > 0.0 {
-            tokio::time::sleep(std::time::Duration::from_secs_f64(wait_secs)).await;
+            // W-03: 截断过长等待时间,防止高并发下个别请求被饿死
+            let clamped = if wait_secs > MAX_ACQUIRE_WAIT_SECS {
+                tracing::warn!(
+                    requested_wait_secs = wait_secs,
+                    max_wait_secs = MAX_ACQUIRE_WAIT_SECS,
+                    "令牌桶等待时间超限,已截断"
+                );
+                MAX_ACQUIRE_WAIT_SECS
+            } else {
+                wait_secs
+            };
+            tokio::time::sleep(std::time::Duration::from_secs_f64(clamped)).await;
         }
     }
 
@@ -85,12 +101,12 @@ impl RateLimiter {
     /// 用于带宽自适应:根据调度器的带宽观测值动态调整限速。
     /// 更新立即生效,正在进行的 acquire 等待不受影响。
     pub fn update_rate(&self, bytes_per_sec: u64) {
-        self.bytes_per_sec.store(bytes_per_sec, Ordering::Relaxed);
+        self.bytes_per_sec.store(bytes_per_sec, Ordering::Release);
     }
 
     /// 获取当前速率(bytes/sec)
     pub fn bytes_per_sec(&self) -> u64 {
-        self.bytes_per_sec.load(Ordering::Relaxed)
+        self.bytes_per_sec.load(Ordering::Acquire)
     }
 }
 

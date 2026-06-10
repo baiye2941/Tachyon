@@ -11,7 +11,7 @@ pub mod filter;
 pub mod resources;
 
 pub use capture::{CaptureConfig, ResourceType, identify_resource, should_capture};
-pub use resources::{ResourceManager, SnifferResource};
+pub use resources::{ResourceManager, SnifferResource, redact_sensitive_params};
 
 #[cfg(test)]
 #[test]

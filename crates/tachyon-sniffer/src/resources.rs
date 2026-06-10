@@ -11,6 +11,30 @@ use tachyon_core::filename::extract_filename_from_url;
 
 use crate::capture::{CaptureConfig, identify_resource, should_capture};
 
+/// 敏感查询参数名称列表
+///
+/// 匹配这些名称的查询参数值将在存储和 IPC 传输前被脱敏,
+/// 防止 API 密钥、令牌等凭据通过嗅探资源列表泄露到前端。
+const SENSITIVE_PARAM_NAMES: &[&str] = &[
+    "token",
+    "key",
+    "secret",
+    "auth",
+    "session",
+    "password",
+    "passwd",
+    "credential",
+    "access_token",
+    "api_key",
+    "apikey",
+    "jwt",
+    "bearer",
+    "sig",
+    "signature",
+    "client_secret",
+    "refresh_token",
+];
+
 /// 嗅探到的资源
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,7 +120,7 @@ impl ResourceManager {
             id.clone(),
             SnifferResource {
                 id,
-                url: url.to_string(),
+                url: redact_sensitive_params(url),
                 file_name,
                 resource_type: resource_type.as_str().to_string(),
                 file_size,
@@ -167,6 +191,45 @@ fn generate_id(url: &str) -> String {
     let mut hasher = DefaultHasher::new();
     url.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// A-13: 脱敏 URL 中的敏感查询参数
+///
+/// 将匹配的查询参数值替换为 `[REDACTED]`,防止 API 密钥、
+/// 令牌等凭据通过嗅探资源列表泄露到前端 IPC。
+pub fn redact_sensitive_params(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+
+    let has_sensitive = parsed.query_pairs().any(|(key, _)| {
+        let lower = key.to_ascii_lowercase();
+        SENSITIVE_PARAM_NAMES.iter().any(|&s| lower.contains(s))
+    });
+
+    if !has_sensitive {
+        return url.to_string();
+    }
+
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| {
+            let lower = key.to_ascii_lowercase();
+            if SENSITIVE_PARAM_NAMES.iter().any(|&s| lower.contains(s)) {
+                (key.into_owned(), "[REDACTED]".to_string())
+            } else {
+                (key.into_owned(), value.into_owned())
+            }
+        })
+        .collect();
+
+    // 重建查询字符串
+    parsed.set_query(None);
+    for (key, value) in &pairs {
+        parsed.query_pairs_mut().append_pair(key, value);
+    }
+
+    parsed.to_string()
 }
 
 #[cfg(test)]

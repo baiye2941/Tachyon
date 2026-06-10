@@ -8,6 +8,19 @@
 //! 5. `verify`  -- 校验完整性
 //!
 //! `run()` 方法一键执行上述全部步骤。
+//!
+//! # TODO(W-14): 模块拆分
+//!
+//! 本文件当前约 4300 行,职责过于集中。建议拆分为以下子模块:
+//!
+//! - `probe.rs`  -- 文件元数据探测与协议选择
+//! - `planner.rs` -- 分片规划与大小计算
+//! - `execute.rs` -- 并发分片下载编排(核心循环)
+//! - `verify.rs` -- 下载完整性校验(hash/CRC)
+//! - `retry.rs`  -- 重试策略与指数退避
+//!
+//! 拆分后本文件仅保留 `Downloader` 结构体和 `run()` 方法,
+//! 将具体阶段逻辑委托到子模块。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -141,6 +154,7 @@ impl DynStorage {
     /// - `Standard`: TokioFile（跨平台稳定路径）
     /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
     /// - `Iocp`: IOCP 异步后端（仅 Windows；其他平台回退到 Standard）
+    /// - `IoUring`: io_uring 零拷贝后端（仅 Linux 5.4+；其他平台回退到 Standard）
     async fn open_with_strategy(
         path: &std::path::Path,
         strategy: tachyon_core::config::IoStrategy,
@@ -187,6 +201,22 @@ impl DynStorage {
                         "Iocp 策略在非 Windows 平台不可用,回退到 Standard"
                     );
                     Self::open(path).await
+                }
+            }
+            tachyon_core::config::IoStrategy::IoUring => {
+                tracing::info!(path = %path.display(), "使用 io_uring 零拷贝后端");
+                let mut storage =
+                    tachyon_io::IoUringStorage::new(path, tachyon_io::IoUringConfig::default());
+                match storage.init() {
+                    Ok(()) => Ok(Self::new(storage)),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "io_uring 后端初始化失败,回退到 Standard"
+                        );
+                        Self::open(path).await
+                    }
                 }
             }
         }
@@ -298,19 +328,25 @@ pub struct FragmentProgress {
 }
 
 // ---------------------------------------------------------------------------
-// MirrorProtocol: 多源下载适配器
+// MirrorProtocol: 多源下载适配器 (A-07: Happy Eyeballs v2)
 // ---------------------------------------------------------------------------
 
 /// 多镜像源 Protocol 适配器
 ///
-/// 包装主源和备用源列表,在分片下载失败时自动 fallback 到下一个可用源。
-/// 每个源独立重试,所有源均不可用时上报原始错误。
+/// 包装主源和备用源列表,采用 Happy Eyeballs v2 (RFC 8305) 并行竞速策略:
+/// - **probe**: 同时向所有源发起 HEAD 探测,选择最先响应的源
+/// - **download**: 优先尝试主源(500ms 超时),失败后并行竞速所有镜像源
+///
+/// 显著减少镜像切换时的等待时间,避免顺序 fallback 的串行延迟累积。
 struct MirrorProtocol {
     /// 主下载源
     primary: Arc<dyn Protocol>,
     /// 备用镜像源列表 (url, protocol)
     mirrors: Vec<(String, Arc<dyn Protocol>)>,
 }
+
+/// 主源快速尝试超时 (Happy Eyeballs 核心参数)
+const PRIMARY_FAST_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl MirrorProtocol {
     fn new(primary: Arc<dyn Protocol>, mirrors: Vec<(String, Arc<dyn Protocol>)>) -> Self {
@@ -325,8 +361,41 @@ impl Protocol for MirrorProtocol {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
     {
         let primary = self.primary.clone();
+        let mirrors = self.mirrors.clone();
         let url = url.to_string();
-        Box::pin(async move { primary.probe(&url).await })
+        Box::pin(async move {
+            if mirrors.is_empty() {
+                return primary.probe(&url).await;
+            }
+
+            // Happy Eyeballs: 并行竞速所有源的 probe
+            let mut set = JoinSet::new();
+            set.spawn({
+                let p = primary.clone();
+                let u = url.clone();
+                async move { p.probe(&u).await }
+            });
+            for (mirror_url, proto) in &mirrors {
+                let p = proto.clone();
+                let u = mirror_url.clone();
+                set.spawn(async move { p.probe(&u).await });
+            }
+
+            let mut last_err = None;
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok(Ok(meta)) => {
+                        set.abort_all();
+                        return Ok(meta);
+                    }
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(e) => {
+                        last_err = Some(DownloadError::Io(std::io::Error::other(e.to_string())));
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| DownloadError::Protocol("所有源探测均失败".into())))
+        })
     }
 
     fn download_range(
@@ -339,19 +408,46 @@ impl Protocol for MirrorProtocol {
         let mirrors = self.mirrors.clone();
         let url = url.to_string();
         Box::pin(async move {
-            match primary.download_range(&url, start, end).await {
-                Ok(data) => Ok(data),
-                Err(e) => {
-                    for (mirror_url, mirror_proto) in &mirrors {
-                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像");
-                        if let Ok(data) = mirror_proto.download_range(mirror_url, start, end).await
-                        {
-                            return Ok(data);
-                        }
-                    }
-                    Err(e)
+            // 快速尝试主源(500ms 超时)
+            match tokio::time::timeout(
+                PRIMARY_FAST_TIMEOUT,
+                primary.download_range(&url, start, end),
+            )
+            .await
+            {
+                Ok(Ok(data)) => return Ok(data),
+                Ok(Err(_)) | Err(_) => {
+                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像", mirrors.len());
                 }
             }
+            // 并行竞速所有镜像源
+            let mut set = JoinSet::new();
+            for (mirror_url, proto) in &mirrors {
+                let p = proto.clone();
+                let u = mirror_url.clone();
+                set.spawn(async move { p.download_range(&u, start, end).await });
+            }
+            let mut primary_err = None;
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok(Ok(data)) => {
+                        set.abort_all();
+                        return Ok(data);
+                    }
+                    Ok(Err(e)) => {
+                        if primary_err.is_none() {
+                            primary_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if primary_err.is_none() {
+                            primary_err =
+                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
+                        }
+                    }
+                }
+            }
+            Err(primary_err.unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败".into())))
         })
     }
 
@@ -366,21 +462,45 @@ impl Protocol for MirrorProtocol {
         let mirrors = self.mirrors.clone();
         let url = url.to_string();
         Box::pin(async move {
-            match primary.download_range_stream(&url, start, end).await {
-                Ok(stream) => Ok(stream),
-                Err(e) => {
-                    for (mirror_url, mirror_proto) in &mirrors {
-                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像(流式)");
-                        if let Ok(stream) = mirror_proto
-                            .download_range_stream(mirror_url, start, end)
-                            .await
-                        {
-                            return Ok(stream);
-                        }
-                    }
-                    Err(e)
+            match tokio::time::timeout(
+                PRIMARY_FAST_TIMEOUT,
+                primary.download_range_stream(&url, start, end),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(_)) | Err(_) => {
+                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像(流式)", mirrors.len());
                 }
             }
+            let mut set = JoinSet::new();
+            for (mirror_url, proto) in &mirrors {
+                let p = proto.clone();
+                let u = mirror_url.clone();
+                set.spawn(async move { p.download_range_stream(&u, start, end).await });
+            }
+            let mut primary_err = None;
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok(Ok(stream)) => {
+                        set.abort_all();
+                        return Ok(stream);
+                    }
+                    Ok(Err(e)) => {
+                        if primary_err.is_none() {
+                            primary_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if primary_err.is_none() {
+                            primary_err =
+                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
+                        }
+                    }
+                }
+            }
+            Err(primary_err
+                .unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败(流式)".into())))
         })
     }
 
@@ -392,18 +512,40 @@ impl Protocol for MirrorProtocol {
         let mirrors = self.mirrors.clone();
         let url = url.to_string();
         Box::pin(async move {
-            match primary.download_full(&url).await {
-                Ok(data) => Ok(data),
-                Err(e) => {
-                    for (mirror_url, mirror_proto) in &mirrors {
-                        tracing::info!(url = %mirror_url, "主源失败,尝试备用镜像(全量)");
-                        if let Ok(data) = mirror_proto.download_full(mirror_url).await {
-                            return Ok(data);
-                        }
-                    }
-                    Err(e)
+            match tokio::time::timeout(PRIMARY_FAST_TIMEOUT, primary.download_full(&url)).await {
+                Ok(Ok(data)) => return Ok(data),
+                Ok(Err(_)) | Err(_) => {
+                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像(全量)", mirrors.len());
                 }
             }
+            let mut set = JoinSet::new();
+            for (mirror_url, proto) in &mirrors {
+                let p = proto.clone();
+                let u = mirror_url.clone();
+                set.spawn(async move { p.download_full(&u).await });
+            }
+            let mut primary_err = None;
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok(Ok(data)) => {
+                        set.abort_all();
+                        return Ok(data);
+                    }
+                    Ok(Err(e)) => {
+                        if primary_err.is_none() {
+                            primary_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if primary_err.is_none() {
+                            primary_err =
+                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
+                        }
+                    }
+                }
+            }
+            Err(primary_err
+                .unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败(全量)".into())))
         })
     }
 }
@@ -1098,12 +1240,27 @@ impl DownloadTask {
                                 return Err((frag_index, e));
                             }
                             // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
-                            // 否则回退到指数退避 1s, 2s, 4s, ...(上限 1024s)
+                            // 否则回退到 Full Jitter 指数退避,避免多分片同源失败时惊群
                             let backoff = match &e {
                                 DownloadError::Throttled {
                                     retry_after_secs: Some(secs),
                                 } => Duration::from_secs((*secs).min(1024)),
-                                _ => Duration::from_secs(1u64 << attempt.min(10)),
+                                _ => {
+                                    let base_secs = 1u64 << attempt.min(10);
+                                    if base_secs <= 1 {
+                                        // base_secs=1 时无法抖动,直接使用 1s
+                                        Duration::from_secs(1)
+                                    } else {
+                                        // 使用分片索引+尝试次数作为抖动种子,确定性且各分片不同
+                                        let seed = (frag_index as u64)
+                                            .wrapping_mul(0x9E3779B97F4A7C15)
+                                            .wrapping_add(attempt as u64);
+                                        let log2 = base_secs.trailing_zeros();
+                                        let hash = seed.wrapping_mul(0x517cc1b727220a95);
+                                        let jitter = hash >> (64 - log2);
+                                        Duration::from_secs(base_secs.saturating_sub(jitter).max(1))
+                                    }
+                                }
                             };
                             warn!(
                                 index = frag_index,

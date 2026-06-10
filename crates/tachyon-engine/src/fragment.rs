@@ -47,7 +47,7 @@ impl FragmentRecord {
 
     /// 转换到下载中状态(仅允许从 Pending 进入)
     pub fn start_download(&mut self) {
-        debug_assert!(
+        assert!(
             self.state == FragmentState::Pending,
             "非法状态转换: {:?} -> Downloading",
             self.state
@@ -57,7 +57,7 @@ impl FragmentRecord {
 
     /// 下载完成,转换到校验状态(仅允许从 Downloading 进入)
     pub fn complete_download(&mut self, downloaded: u64, duration: Duration) {
-        debug_assert!(
+        assert!(
             self.state == FragmentState::Downloading,
             "非法状态转换: {:?} -> Verifying",
             self.state
@@ -72,7 +72,7 @@ impl FragmentRecord {
     /// 用于 spawn 内已完成下载和写入的场景,跳过 Verifying/Writing 中间状态,
     /// 但仍正确设置 `last_duration` 以激活调度器反馈回路。
     pub fn complete_download_fast(&mut self, downloaded: u64, duration: Duration) {
-        debug_assert!(
+        assert!(
             self.state == FragmentState::Downloading,
             "非法状态转换: {:?} -> Done(fast)",
             self.state
@@ -84,7 +84,7 @@ impl FragmentRecord {
 
     /// 校验通过,转换到写入状态(仅允许从 Verifying 进入)
     pub fn verify_ok(&mut self) {
-        debug_assert!(
+        assert!(
             self.state == FragmentState::Verifying,
             "非法状态转换: {:?} -> Writing",
             self.state
@@ -94,7 +94,7 @@ impl FragmentRecord {
 
     /// 写入完成,转换到完成状态(仅允许从 Writing 进入)
     pub fn write_done(&mut self) {
-        debug_assert!(
+        assert!(
             self.state == FragmentState::Writing,
             "非法状态转换: {:?} -> Done",
             self.state
@@ -104,7 +104,7 @@ impl FragmentRecord {
 
     /// 标记失败,如果可重试则回到 Pending(仅允许从 Downloading/Verifying/Writing 进入)
     pub fn mark_failed(&mut self) -> bool {
-        debug_assert!(
+        assert!(
             matches!(
                 self.state,
                 FragmentState::Downloading | FragmentState::Verifying | FragmentState::Writing
@@ -140,9 +140,29 @@ impl FragmentRecord {
         self.state == FragmentState::Failed
     }
 
-    /// 计算重试退避时间(指数退避:1s, 2s, 4s, 8s, ...)
-    pub fn backoff_duration(&self) -> Duration {
-        Duration::from_secs(1u64 << self.retry_count.min(10))
+    /// 计算重试退避时间(Full Jitter 指数退避)
+    ///
+    /// 基础退避为 2^attempt 秒,再施加 [0, base) 均匀随机抖动,
+    /// 避免多分片/多任务同源失败时产生惊群效应(thundering herd)。
+    /// 上限 1024 秒(约 17 分钟)。
+    ///
+    /// # 参数
+    /// - `jitter_seed`: 调用方提供的种子,用于确定性抖动;
+    ///   传入 `None` 时退避时间退化为纯指数(无抖动),保持向后兼容。
+    pub fn backoff_duration(&self, jitter_seed: Option<u64>) -> Duration {
+        let base_secs = 1u64 << self.retry_count.min(10);
+        let jittered = match jitter_seed {
+            Some(seed) if base_secs > 1 => {
+                // 使用乘法哈希将种子映射到 [0, base_secs)
+                // FxHash 风格: seed * 0x517cc1b727220a95 >> (64 - log2(base_secs))
+                let log2 = base_secs.trailing_zeros();
+                let hash = seed.wrapping_mul(0x517cc1b727220a95);
+                let jitter = hash >> (64 - log2);
+                base_secs.saturating_sub(jitter)
+            }
+            _ => base_secs,
+        };
+        Duration::from_secs(jittered.max(1))
     }
 }
 
@@ -196,12 +216,16 @@ impl Default for BandwidthTracker {
 }
 
 /// 根据带宽和文件大小计算最优分片大小
+///
+/// A-04: 高/中带宽阈值已外移到 `SchedulerConfig`,通过参数传入。
 pub fn compute_fragment_size(
     file_size: u64,
     bandwidth_bps: u64,
     min_size: u64,
     max_size: u64,
     target_fragments: u32,
+    high_bandwidth_threshold: u64,
+    medium_bandwidth_threshold: u64,
 ) -> u64 {
     if file_size == 0 {
         return 0;
@@ -211,10 +235,10 @@ pub fn compute_fragment_size(
     let base = file_size / target_fragments.max(1) as u64;
 
     // 根据带宽调整:高带宽时增大分片以减少开销
-    let bandwidth_factor = if bandwidth_bps > 100 * 1024 * 1024 {
-        2.0 // > 100Mbps,分片翻倍
-    } else if bandwidth_bps > 10 * 1024 * 1024 {
-        1.5 // > 10Mbps
+    let bandwidth_factor = if bandwidth_bps > high_bandwidth_threshold {
+        2.0 // > 高带宽阈值,分片翻倍
+    } else if bandwidth_bps > medium_bandwidth_threshold {
+        1.5 // > 中等带宽阈值
     } else {
         1.0
     };
@@ -281,17 +305,49 @@ mod tests {
         let info = make_frag(0, 1024);
         let mut record = FragmentRecord::new(info, 5);
 
+        // 无抖动时退化为纯指数
         record.retry_count = 0;
-        assert_eq!(record.backoff_duration(), Duration::from_secs(1));
+        assert_eq!(record.backoff_duration(None), Duration::from_secs(1));
 
         record.retry_count = 1;
-        assert_eq!(record.backoff_duration(), Duration::from_secs(2));
+        assert_eq!(record.backoff_duration(None), Duration::from_secs(2));
 
         record.retry_count = 2;
-        assert_eq!(record.backoff_duration(), Duration::from_secs(4));
+        assert_eq!(record.backoff_duration(None), Duration::from_secs(4));
 
         record.retry_count = 3;
-        assert_eq!(record.backoff_duration(), Duration::from_secs(8));
+        assert_eq!(record.backoff_duration(None), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn test_backoff_duration_with_jitter() {
+        let info = make_frag(0, 1024);
+        let mut record = FragmentRecord::new(info, 5);
+
+        // 有抖动时退避时间应在 [1, base_secs] 范围内
+        record.retry_count = 3; // base = 8s
+        for seed in 0..100 {
+            let backoff = record.backoff_duration(Some(seed));
+            assert!(backoff.as_secs() >= 1, "退避时间应 >= 1s");
+            assert!(backoff.as_secs() <= 8, "退避时间应 <= base(8s)");
+        }
+    }
+
+    #[test]
+    fn test_backoff_jitter_produces_different_values() {
+        let info = make_frag(0, 1024);
+        let mut record = FragmentRecord::new(info, 5);
+        record.retry_count = 5; // base = 32s,足够大的范围产生差异
+
+        let vals: std::collections::HashSet<u64> = (0..20)
+            .map(|seed| record.backoff_duration(Some(seed)).as_secs())
+            .collect();
+        // 20 个不同种子应产生多个不同的退避值(至少 5 个)
+        assert!(
+            vals.len() >= 5,
+            "Full Jitter 应产生多样化的退避值,实际只有 {} 种",
+            vals.len()
+        );
     }
 
     #[test]
@@ -324,6 +380,8 @@ mod tests {
             1024 * 1024,
             64 * 1024 * 1024,
             16,
+            100 * 1024 * 1024,
+            10 * 1024 * 1024,
         );
         assert!(size >= 1024 * 1024);
         assert!(size <= 64 * 1024 * 1024);
@@ -337,19 +395,37 @@ mod tests {
             1024 * 1024,
             64 * 1024 * 1024,
             16,
+            100 * 1024 * 1024,
+            10 * 1024 * 1024,
         );
         assert!(size >= 1024 * 1024);
     }
 
     #[test]
     fn test_compute_fragment_size_zero() {
-        let size = compute_fragment_size(0, 0, 1024, 64 * 1024 * 1024, 16);
+        let size = compute_fragment_size(
+            0,
+            0,
+            1024,
+            64 * 1024 * 1024,
+            16,
+            100 * 1024 * 1024,
+            10 * 1024 * 1024,
+        );
         assert_eq!(size, 0);
     }
 
     #[test]
     fn test_compute_fragment_size_small_file() {
-        let size = compute_fragment_size(500, 1024, 1024, 64 * 1024 * 1024, 4);
+        let size = compute_fragment_size(
+            500,
+            1024,
+            1024,
+            64 * 1024 * 1024,
+            4,
+            100 * 1024 * 1024,
+            10 * 1024 * 1024,
+        );
         assert_eq!(size, 1024); // clamp to min
     }
 }
@@ -376,6 +452,8 @@ mod proptests {
                 min_size,
                 max_size,
                 target_fragments,
+                100 * 1024 * 1024,
+                10 * 1024 * 1024,
             );
 
             if file_size == 0 {
@@ -481,11 +559,34 @@ mod proptests {
             let mut record = FragmentRecord::new(info, 20);
             record.retry_count = retry_count;
 
-            let backoff = record.backoff_duration();
+            let backoff = record.backoff_duration(None);
             // 退避时间应为正数
             prop_assert!(backoff.as_secs() >= 1);
             // 最大不应超过 2^10 = 1024 秒（被 min(10) 限制）
             prop_assert!(backoff.as_secs() <= 1024);
+        }
+
+        /// 有抖动时退避时间应在 [1, base] 范围内
+        #[test]
+        fn test_backoff_duration_jitter_bounded(
+            retry_count in 0u32..10,
+            seed in 0u64..1000,
+        ) {
+            let info = FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 99,
+                size: 100,
+                downloaded: 0,
+                hash: None,
+            };
+            let mut record = FragmentRecord::new(info, 20);
+            record.retry_count = retry_count;
+
+            let base_secs = 1u64 << retry_count.min(10);
+            let backoff = record.backoff_duration(Some(seed));
+            prop_assert!(backoff.as_secs() >= 1);
+            prop_assert!(backoff.as_secs() <= base_secs);
         }
     }
 }

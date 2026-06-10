@@ -8,6 +8,9 @@
 
 /// 清洗文件名,防止路径遍历攻击
 ///
+/// A-01: 合并为两次遍历(路径分隔符替换 + .. 移除 → 一次;trim + 危险字符过滤 → 一次),
+/// 消除了中间的 `Vec<char>` 分配和多余的 `String` 创建。
+///
 /// 安全措施:
 /// - 移除所有路径分隔符 (`/`, `\`)
 /// - 移除所有 `..` 序列
@@ -16,61 +19,68 @@
 ///
 /// 如果清洗后结果为空,返回 `"unknown"`。
 pub fn sanitize_filename(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-
-    // 移除路径分隔符和点号序列
-    for ch in name.chars() {
-        match ch {
-            '/' | '\\' => {
-                // 路径分隔符替换为空格(后续会 trim)
-                result.push(' ');
-            }
-            _ => result.push(ch),
-        }
+    // 危险字符集合(位掩码风格内联判断)
+    fn is_dangerous(c: char) -> bool {
+        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
     }
 
-    // 单次遍历移除所有 ".." 序列,避免 O(n^2) 的 while-replace 循环
-    let chars: Vec<char> = result.chars().collect();
-    result = String::with_capacity(result.len());
+    // 第一次遍历:替换路径分隔符为空格 + 移除独立 ".." 路径组件
+    let mut buf = String::with_capacity(name.len());
+    let chars: Vec<char> = name.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '.' && chars[i + 1] == '.' {
-            i += 2;
-        } else {
-            result.push(chars[i]);
-            i += 1;
+        let ch = chars[i];
+        match ch {
+            '/' | '\\' => {
+                buf.push(' ');
+                i += 1;
+            }
+            '.' if i + 1 < chars.len() && chars[i + 1] == '.' => {
+                // 检查 ".." 是否为独立路径组件(两侧为空格或字符串边界)
+                let before = buf.chars().last().is_none_or(|c| c == ' ');
+                let after_is_boundary = i + 2 >= chars.len()
+                    || chars[i + 2] == ' '
+                    || chars[i + 2] == '/'
+                    || chars[i + 2] == '\\';
+                if before && after_is_boundary {
+                    i += 2;
+                    continue;
+                }
+                buf.push(ch);
+                i += 1;
+            }
+            _ => {
+                buf.push(ch);
+                i += 1;
+            }
         }
     }
 
-    // 移除前导和尾随的空格与点号
-    let trimmed = result.trim().trim_matches('.');
-
-    // 如果结果为空或只包含空白字符,返回 "unknown"
+    // 第二次遍历:trim + 过滤危险字符
+    let trimmed = buf.trim();
     if trimmed.is_empty() {
         return "unknown".to_string();
     }
 
-    // 额外安全检查:确保不包含任何路径分隔符(双重保险)
-    let safe_name: String = trimmed
-        .chars()
-        .filter(|c| {
-            *c != '/'
-                && *c != '\\'
-                && *c != ':'
-                && *c != '*'
-                && *c != '?'
-                && *c != '"'
-                && *c != '<'
-                && *c != '>'
-                && *c != '|'
-        })
-        .collect();
+    let mut filtered = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        if !is_dangerous(c) {
+            filtered.push(c);
+        }
+    }
 
-    if safe_name.is_empty() {
+    // 后处理: 移除纯点序列 token (如 "..", "....")，防止变体路径遍历
+    let result: String = filtered
+        .split_whitespace()
+        .filter(|token| !token.chars().all(|c| c == '.'))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if result.is_empty() {
         return "unknown".to_string();
     }
 
-    safe_name
+    result
 }
 
 /// 从 URL 路径段提取文件名
@@ -132,23 +142,9 @@ pub fn validate_save_path(
         .canonicalize()
         .map_err(|e| crate::DownloadError::Config(format!("下载目录不存在或无法访问: {e}")))?;
 
-    // 2. 如果 final_path 已存在,直接 canonicalize 并校验
-    if final_path.exists() {
-        let canonical_final = final_path
-            .canonicalize()
-            .map_err(|e| crate::DownloadError::Config(format!("无法解析文件路径: {e}")))?;
-
-        if !canonical_final.starts_with(&canonical_base) {
-            return Err(crate::DownloadError::Config(format!(
-                "路径逃逸检测: {:?} 不在预期目录 {:?} 内",
-                canonical_final, canonical_base
-            )));
-        }
-
-        return Ok(canonical_final);
-    }
-
-    // 3. 文件尚不存在,校验父目录
+    // 2. 统一通过父目录 canonicalize + 文件名拼接
+    //    避免 TOCTOU 竞态: 不检查 final_path.exists(),防止检查与 canonicalize 之间
+    //    被另一进程插入符号链接
     let parent = final_path
         .parent()
         .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无父目录".into()))?;
@@ -172,7 +168,23 @@ pub fn validate_save_path(
     let file_name = final_path
         .file_name()
         .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无文件名".into()))?;
-    Ok(canonical_parent.join(file_name))
+    let result = canonical_parent.join(file_name);
+
+    // 如果路径已存在（例如符号链接），解析实际目标并验证不逃逸出基目录
+    if result.exists() {
+        let canonical_final = result
+            .canonicalize()
+            .map_err(|e| crate::DownloadError::Config(format!("无法解析文件路径: {e}")))?;
+        if !canonical_final.starts_with(&canonical_base) {
+            return Err(crate::DownloadError::Config(format!(
+                "符号链接逃逸检测: {:?} 实际指向 {:?}，不在预期目录 {:?} 内",
+                result, canonical_final, canonical_base
+            )));
+        }
+        return Ok(canonical_final);
+    }
+
+    Ok(result)
 }
 
 /// 解析 Content-Disposition 头中的文件名

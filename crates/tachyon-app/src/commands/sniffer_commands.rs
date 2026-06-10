@@ -1,6 +1,6 @@
 use tachyon_core::filename::extract_filename_from_url;
-use tachyon_sniffer::SnifferResource;
 use tachyon_sniffer::capture::identify_resource;
+use tachyon_sniffer::{SnifferResource, redact_sensitive_params};
 use uuid::Uuid;
 
 use super::{AppError, AppState, resource_type_to_string};
@@ -39,7 +39,7 @@ pub async fn add_sniffer_resource(state: &AppState, url: String) {
         .as_secs();
     let resource = SnifferResource {
         id: Uuid::new_v4().to_string(),
-        url: url.clone(),
+        url: redact_sensitive_params(&url),
         file_name,
         resource_type: resource_type_to_string(resource_type).to_string(),
         file_size: None,

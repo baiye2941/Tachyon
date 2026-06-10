@@ -146,6 +146,8 @@ pub struct AppState {
     pub connection_pool: Arc<ConnectionPool>,
     pub controls: Arc<DashMap<String, watch::Sender<DownloadState>>>,
     pub task_store: Arc<TaskStore>,
+    /// 任务创建锁: 保证去重检查 + 并发计数 + 插入的原子性
+    pub create_task_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for AppState {
@@ -179,6 +181,7 @@ impl AppState {
             connection_pool: Arc::new(connection_pool),
             controls: Arc::new(DashMap::new()),
             task_store,
+            create_task_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -372,6 +375,7 @@ pub(crate) mod tests {
             })),
             controls: Arc::new(DashMap::new()),
             task_store: Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap()),
+            create_task_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

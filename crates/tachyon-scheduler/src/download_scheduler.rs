@@ -1,6 +1,6 @@
 //! 自适应下载调度器
 //!
-//! 基于 Holt-Winters 带宽预测实现 `DownloadScheduler` trait,
+//! 基于 Holt 双指数平滑带宽预测实现 `DownloadScheduler` trait,
 //! 为下载引擎提供动态的并发度和分片大小建议。
 //! 使用 parking_lot::RwLock 实现读多写少的高效并发访问。
 
@@ -9,14 +9,14 @@ use parking_lot::RwLock;
 use tachyon_core::config::SchedulerConfig;
 use tachyon_core::traits::{DownloadScheduler, ScheduleRecommendation};
 
-use crate::predictor::HoltWintersPredictor;
+use crate::predictor::HoltLinearPredictor;
 
 /// 自适应下载调度器
 ///
-/// 使用 Holt-Winters 指数平滑模型预测带宽,
+/// 使用 Holt 双指数平滑模型预测带宽,
 /// 并根据预测结果动态调整并发度和分片大小。
 pub struct AdaptiveDownloadScheduler {
-    predictor: RwLock<HoltWintersPredictor>,
+    predictor: RwLock<HoltLinearPredictor>,
     config: SchedulerConfig,
 }
 
@@ -24,7 +24,7 @@ impl AdaptiveDownloadScheduler {
     /// 创建新的自适应调度器
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
-            predictor: RwLock::new(HoltWintersPredictor::new(
+            predictor: RwLock::new(HoltLinearPredictor::new(
                 config.ewma_alpha,
                 config.ewma_alpha * 0.3, // beta 通常小于 alpha
             )),

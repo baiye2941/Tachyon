@@ -28,6 +28,63 @@ use tokio::sync::RwLock;
 /// `retr_as_stream` 返回的数据流类型(实现 `AsyncRead`,可逐块读取)
 type FtpDataStream = AsyncDataStream<AsyncNoTlsStream>;
 
+/// FTP 数据流 Drop Guard
+///
+/// 确保当 ByteStream 被提前 Drop（如下载取消、消费者不再轮询）时，
+/// 后台会尝试 finalize FTP 数据传输并断开连接，防止 FTP 控制连接泄漏。
+///
+/// # 工作原理
+/// - unfold 闭包正常消费完数据流后,将 `finalized` 标记为 `true`
+/// - 如果 Stream 被提前 Drop (消费端停止轮询),`finalized` 仍为 `false`
+/// - Drop 时检查 `finalized`:未 finalize 则 spawn 异步清理任务
+///
+/// 注意: Drop 中使用 `tokio::spawn` 进行异步清理,仅在 Tokio 运行时中有效。
+struct FtpDataGuard {
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+    client: FtpClient,
+}
+
+impl Drop for FtpDataGuard {
+    fn drop(&mut self) {
+        let was_finalized = self.finalized.load(std::sync::atomic::Ordering::SeqCst);
+        if !was_finalized {
+            let client = self.client.clone();
+            let spawned = tokio::runtime::Handle::try_current()
+                .map(|handle| {
+                    handle.spawn(async move {
+                        // 数据流已随 unfold 状态 Drop,TCP 连接被 RST 关闭
+                        // 这里主要清理 FTP 控制通道:读取服务端对 RST 的响应码
+                        client.disconnect().await;
+                    })
+                })
+                .is_ok();
+
+            if !spawned {
+                tracing::warn!("FtpDataGuard: 非 Tokio 运行时上下文,无法异步清理 FTP 连接");
+            }
+        }
+    }
+}
+
+/// Stream wrapper: 将 FtpDataGuard 的 Drop 绑定到 ByteStream 生命周期
+struct FtpGuardStream {
+    inner: ByteStream,
+    _guard: FtpDataGuard,
+}
+
+impl futures::Stream for FtpGuardStream {
+    type Item = DownloadResult<Bytes>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl std::marker::Unpin for FtpGuardStream {}
+
 /// FTP 连接状态
 ///
 /// 跟踪控制连接的生命周期阶段:
@@ -99,6 +156,22 @@ impl FtpClient {
             .trim_end_matches(']');
         if let Ok(ip) = stripped.parse::<IpAddr>() {
             reject_forbidden_ip(ip).map_err(|e| DownloadError::Protocol(e.to_string()))?;
+        } else {
+            // W-13: DNS Rebinding 防护 — 域名需要先解析再检查 IP
+            // 在 TCP 连接前执行 DNS 解析,对每个解析出的 IP 调用 reject_forbidden_ip
+            use std::net::ToSocketAddrs;
+            let addrs = format!("{stripped}:{port}")
+                .to_socket_addrs()
+                .map_err(|e| DownloadError::Network(format!("FTP DNS 解析失败: {e}")))?;
+            let mut resolved_count = 0u32;
+            for addr in addrs {
+                reject_forbidden_ip(addr.ip())
+                    .map_err(|e| DownloadError::Protocol(format!("FTP DNS Rebinding 拦截: {e}")))?;
+                resolved_count += 1;
+            }
+            if resolved_count == 0 {
+                return Err(DownloadError::Network("FTP DNS 解析无结果".into()));
+            }
         }
 
         let addr = format!("{host}:{port}");
@@ -163,6 +236,10 @@ impl FtpClient {
     /// 使用 RETR 命令通过数据连接接收文件内容。
     /// FTP 不原生支持 Range 请求,此方法始终下载完整文件。
     /// 必须在 `login()` 成功后调用。
+    ///
+    /// # 安全限制
+    /// 为防止 OOM,单次下载最大缓冲 [`FTP_MAX_FULL_DOWNLOAD_SIZE`] 字节。
+    /// 超过此阈值的文件请使用分片下载 (`download_range_stream`)。
     pub async fn retrieve(&self, path: &str) -> DownloadResult<Bytes> {
         let mut guard = self.inner.write().await;
         Self::require_stream(&guard)?;
@@ -174,17 +251,33 @@ impl FtpClient {
             .await
             .map_err(|e| DownloadError::Protocol(format!("设置传输模式失败: {e}")))?;
 
-        // 获取数据流并读取全部内容
+        // 获取数据流
         let mut data_stream = stream
             .retr_as_stream(path)
             .await
             .map_err(|e| DownloadError::Protocol(format!("下载文件失败: {e}")))?;
 
+        // 流式读取,使用共享上限防止 OOM (W-12: 统一使用 tachyon_core 常量)
         let mut buf = Vec::new();
-        data_stream
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| DownloadError::Network(format!("读取 FTP 数据流失败: {e}")))?;
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = data_stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| DownloadError::Network(format!("读取 FTP 数据流失败: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() + n > tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE {
+                // 提前终止并 finalize,避免 FTP 连接挂起
+                let _ = stream.finalize_retr_stream(data_stream).await;
+                return Err(DownloadError::Protocol(format!(
+                    "FTP 文件过大: 超过单次全量下载上限 {} MB, 请使用分片下载",
+                    tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE / (1024 * 1024)
+                )));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
 
         // 完成 RETR 传输并读取服务端响应
         stream
@@ -571,36 +664,54 @@ impl Protocol for FtpClient {
 
             // 使用 unfold 逐块读取,64KB/chunk,避免一次性缓冲整个范围
             // 状态中 Option<FtpDataStream> 允许在 finalize 时 take 出数据流
+            // finalized flag: 标记数据流是否已被正常 finalize,用于 Drop guard
+            let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finalized_clone = finalized.clone();
             let stream: ByteStream = Box::pin(futures::stream::unfold(
                 (Some(data_stream), this.clone(), info.path.clone()),
-                |(ds, client, path)| async move {
-                    let mut ds = ds?; // None 时返回 None,结束 Stream
+                move |(ds, client, path)| {
+                    let finalized = finalized_clone.clone();
+                    async move {
+                        let mut ds = ds?; // None 时返回 None,结束 Stream
 
-                    let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
-                    match ds.read(&mut buf).await {
-                        Ok(0) => {
-                            // 数据流已耗尽,完成 RETR 传输并断开连接
-                            let _ = client.finalize_retr_stream(ds).await;
-                            client.disconnect().await;
-                            None
-                        }
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
-                        }
-                        Err(e) => {
-                            let _ = client.finalize_retr_stream(ds).await;
-                            client.disconnect().await;
-                            Some((
-                                Err(DownloadError::Network(format!("读取 FTP 数据流失败: {e}"))),
-                                (None, client, path),
-                            ))
+                        let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
+                        match ds.read(&mut buf).await {
+                            Ok(0) => {
+                                // 数据流已耗尽,完成 RETR 传输并断开连接
+                                let _ = client.finalize_retr_stream(ds).await;
+                                client.disconnect().await;
+                                finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+                                None
+                            }
+                            Ok(n) => {
+                                buf.truncate(n);
+                                Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
+                            }
+                            Err(e) => {
+                                let _ = client.finalize_retr_stream(ds).await;
+                                client.disconnect().await;
+                                finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Some((
+                                    Err(DownloadError::Network(format!(
+                                        "读取 FTP 数据流失败: {e}"
+                                    ))),
+                                    (None, client, path),
+                                ))
+                            }
                         }
                     }
                 },
             ));
 
-            Ok(stream)
+            // 包装 Drop guard: 如果 Stream 被提前 Drop 而未 finalize,自动清理
+            let guard = FtpDataGuard {
+                finalized: finalized.clone(),
+                client: this.clone(),
+            };
+            Ok(Box::pin(FtpGuardStream {
+                inner: stream,
+                _guard: guard,
+            }) as ByteStream)
         })
     }
 
@@ -654,36 +765,54 @@ impl Protocol for FtpClient {
 
             // 使用 unfold 逐块读取,64KB/chunk,避免一次性缓冲整个文件
             // 状态中 Option<FtpDataStream> 允许在 finalize 时 take 出数据流
+            // finalized flag: 标记数据流是否已被正常 finalize,用于 Drop guard
+            let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finalized_clone = finalized.clone();
             let stream: ByteStream = Box::pin(futures::stream::unfold(
                 (Some(data_stream), this.clone(), info.path.clone()),
-                |(ds, client, path)| async move {
-                    let mut ds = ds?; // None 时返回 None,结束 Stream
+                move |(ds, client, path)| {
+                    let finalized = finalized_clone.clone();
+                    async move {
+                        let mut ds = ds?; // None 时返回 None,结束 Stream
 
-                    let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
-                    match ds.read(&mut buf).await {
-                        Ok(0) => {
-                            // 数据流已耗尽,完成 RETR 传输并断开连接
-                            let _ = client.finalize_retr_stream(ds).await;
-                            client.disconnect().await;
-                            None
-                        }
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
-                        }
-                        Err(e) => {
-                            let _ = client.finalize_retr_stream(ds).await;
-                            client.disconnect().await;
-                            Some((
-                                Err(DownloadError::Network(format!("读取 FTP 数据流失败: {e}"))),
-                                (None, client, path),
-                            ))
+                        let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
+                        match ds.read(&mut buf).await {
+                            Ok(0) => {
+                                // 数据流已耗尽,完成 RETR 传输并断开连接
+                                let _ = client.finalize_retr_stream(ds).await;
+                                client.disconnect().await;
+                                finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+                                None
+                            }
+                            Ok(n) => {
+                                buf.truncate(n);
+                                Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
+                            }
+                            Err(e) => {
+                                let _ = client.finalize_retr_stream(ds).await;
+                                client.disconnect().await;
+                                finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Some((
+                                    Err(DownloadError::Network(format!(
+                                        "读取 FTP 数据流失败: {e}"
+                                    ))),
+                                    (None, client, path),
+                                ))
+                            }
                         }
                     }
                 },
             ));
 
-            Ok(stream)
+            // 包装 Drop guard: 如果 Stream 被提前 Drop 而未 finalize,自动清理
+            let guard = FtpDataGuard {
+                finalized: finalized.clone(),
+                client: this.clone(),
+            };
+            Ok(Box::pin(FtpGuardStream {
+                inner: stream,
+                _guard: guard,
+            }) as ByteStream)
         })
     }
 }

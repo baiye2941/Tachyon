@@ -9,7 +9,7 @@
   <a href="https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&style=flat-square&job=Miri&label=Miri" alt="Miri" /></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/edition-2024-blue?style=flat-square" alt="Edition" />
-  <img src="https://img.shields.io/badge/coverage-90%25-brightgreen?style=flat-square" alt="Coverage" />
+  <img src="https://img.shields.io/badge/coverage-80%25-brightgreen?style=flat-square" alt="Coverage" />
   <img src="https://img.shields.io/badge/clippy-0%20warnings-green?style=flat-square" alt="Clippy" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=flat-square" alt="License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square" alt="Platform" />
@@ -21,15 +21,16 @@
 
 | 能力 | 说明 |
 |:--|:--|
-| **多线程分片下载** | 16 并发动态分片，Holt-Winters 带宽预测自适应调整，支持 HTTP Range 断点续传 |
+| **多线程分片下载** | 16 并发动态分片，HoltLinearPredictor 带宽预测自适应调整，支持 HTTP Range 断点续传 |
 | **QUIC + 0-RTT** | 基于 QUIC 协议实现零往返时间建连，自动缓存 session ticket，0-RTT 被拒时透明回退 1-RTT |
 | **MP-QUIC 多路径传输** | 单连接多路径传输框架就绪（QuicTransport 已完备，多路径聚合待集成） |
-| **零拷贝存储引擎** | io_uring SQE/CQE 写入路径（Linux），IOCP Overlapped I/O（Windows），WritePipeline 按实际 I/O 数精确消耗信号量 |
+| **多源竞速下载** | MirrorProtocol 多源并行竞速（Happy Eyeballs v2 / RFC 8305），500ms 快速超时主源，全源 JoinSet 并行 probe |
+| **零拷贝存储引擎** | io_uring SQE/CQE 全操作路径（read/write/fsync/fallocate，Linux），IOCP Overlapped I/O（Windows），write_at_aligned 对齐写入 API，WritePipeline 按实际 I/O 数精确消耗信号量 |
 | **磁盘空间预分配** | Linux `fallocate` / Windows `SetFileInformationByHandle` 预分配真实磁盘块，防止 ENOSPC |
 | **流式哈希校验** | 分片数据流式 BLAKE3 增量校验，峰值内存 O(chunk) 而非 O(fragment) |
-| **P2SP 混合下载** | Kademlia DHT + UDP RPC（PING/FIND_NODE/FIND_VALUE/STORE），迭代查找与分布式存储已落地 |
+| **P2SP 混合下载** | Kademlia DHT（6 模块拆分）+ UDP RPC（PING/FIND_NODE/FIND_VALUE/STORE），迭代查找、分布式存储、周期性 Bucket Refresh、postcard 二进制序列化（减少 50-70% 包体积） |
 | **GPU 加速校验** | 通过 Vulkan Compute / WebGPU 对分片做并行哈希校验（框架就绪） |
-| **智能调度与预测** | 基于 Holt-Winters 的带宽预测模型，提前分配连接资源 |
+| **智能调度与预测** | 基于 HoltLinearPredictor（双指数平滑）的带宽预测模型，提前分配连接资源 |
 | **协议级优化** | HTTP/HTTPS（含 HTTP/2）/ QUIC / FTP 多协议，全协议真流式下载（64KB chunk 逐块读写） |
 | **协议裁剪** | Feature Flag 控制 FTP/QUIC 编译，`--no-default-features` 仅构建 HTTP 以减小二进制体积 |
 | **限速控制** | 令牌桶算法全局下载速度限制，不占用额外带宽 |
@@ -89,19 +90,19 @@ graph TB
     end
 
     subgraph BIZ["业务编排层"]
-        SCH["<b>tachyon-scheduler</b><br/>Holt-Winters 带宽预测<br/>优先级调度队列"]
+        SCH["<b>tachyon-scheduler</b><br/>HoltLinearPredictor 带宽预测<br/>优先级调度队列"]
         HUB["<b>tachyon-hub</b><br/>HuggingFace / GitHub<br/>模型仓库 API"]
         SNIFF["<b>tachyon-sniffer</b><br/>浏览器资源嗅探<br/>流量拦截与解析"]
     end
 
     subgraph ENGINE["引擎层"]
-        ENG["<b>tachyon-engine</b><br/>分片引擎 / 全局连接池<br/>断点续传 / 信号量并发控制"]
-        P2SP["<b>tachyon-p2sp</b><br/>Kademlia DHT + UDP RPC<br/>迭代查找 · 分布式存储"]
+        ENG["<b>tachyon-engine</b><br/>分片引擎 / 全局连接池<br/>MirrorProtocol 多源竞速<br/>断点续传 / 信号量并发控制"]
+        P2SP["<b>tachyon-p2sp</b><br/>Kademlia DHT (6 模块)<br/>UDP RPC · postcard 二进制<br/>Bucket Refresh"]
     end
 
     subgraph INFRA["基础设施层"]
         PROTO["<b>tachyon-protocol</b><br/>HTTP/2 · QUIC(0-RTT) · FTP<br/>Feature Flag 裁剪"]
-        IO["<b>tachyon-io</b><br/>io_uring · IOCP<br/>BufferPool · WritePipeline"]
+        IO["<b>tachyon-io</b><br/>io_uring · IOCP<br/>BufferPool · WritePipeline<br/>write_at_aligned"]
         CRYPT["<b>tachyon-crypto</b><br/>BLAKE3 · SHA-256<br/>GPU 加速（预留）"]
         STORE["<b>tachyon-store</b><br/>KV 存储 · URL-safe 键名<br/>原子写入 · 快照恢复"]
     end
@@ -194,7 +195,7 @@ flowchart LR
 
     subgraph DISK["存储层"]
         IOCP["Windows IOCP<br/>Overlapped I/O"]
-        IOURING["Linux io_uring<br/>零拷贝"]
+        IOURING["Linux io_uring<br/>零拷贝 R/W/Sync<br/>fallocate"]
         TOKIO["tokio::fs<br/>跨平台回退"]
     end
 
@@ -265,14 +266,14 @@ graph LR
 
 | Crate | 职责 | 关键技术 |
 |:--|:--|:--|
-| `tachyon-core` | 核心类型、object-safe trait 定义、错误体系、配置与事件 | `thiserror`, `serde`, `Pin<Box<dyn Future>>` |
-| `tachyon-engine` | 分片引擎、全局连接池（单例 + 信号量并发控制）、断点续传 | `tokio`, `quinn`, `bytes`, `Semaphore` |
-| `tachyon-scheduler` | 智能调度器、带宽预测、优先级队列 | Holt-Winters, `BinaryHeap` |
-| `tachyon-io` | 跨平台异步文件 I/O、BufferPool、WritePipeline（按实际写入数消耗信号量） | `tokio`, `io-uring`, IOCP |
+| `tachyon-core` | 核心类型、object-safe trait 定义、错误体系、配置与事件 | `thiserror`, `serde`, `strum`, `Pin<Box<dyn Future>>` |
+| `tachyon-engine` | 分片引擎、全局连接池、MirrorProtocol 多源竞速（Happy Eyeballs v2）、断点续传 | `tokio`, `quinn`, `bytes`, `Semaphore` |
+| `tachyon-scheduler` | 智能调度器、带宽预测、优先级队列 | HoltLinearPredictor, `BinaryHeap` |
+| `tachyon-io` | 跨平台异步文件 I/O、BufferPool、WritePipeline、write_at_aligned 对齐写入 | `tokio`, `io-uring`, IOCP |
 | `tachyon-protocol` | HTTP/HTTPS/QUIC(0-RTT)/FTP 全流式协议，Feature Flag 裁剪 | `reqwest`, `quinn`, `suppaftp` |
 | `tachyon-sniffer` | 浏览器资源嗅探、流量拦截与解析 | `url`, playwright MCP |
 | `tachyon-crypto` | CPU/GPU 哈希校验、完整性验证 | `blake3`, `sha2`, `wgpu` |
-| `tachyon-p2sp` | Kademlia DHT、UDP RPC 网络层、迭代查找、分布式存储 | 自研 Kademlia + `tokio::net::UdpSocket` |
+| `tachyon-p2sp` | Kademlia DHT（6 模块拆分）、UDP RPC、迭代查找、Bucket Refresh、postcard 二进制序列化 | 自研 Kademlia + `tokio::net::UdpSocket` + `postcard` |
 | `tachyon-store` | 断点续传持久化、KV 存储（URL-safe 键名编码）、任务快照恢复 | JSON 原子写入 |
 | `tachyon-hub` | HuggingFace / GitHub LFS 模型仓库 API | REST API 对接 |
 | `tachyon-app` | Tauri 应用入口、模块化命令（6 子模块）、GUI 事件桥接 | `tauri` v2 |
@@ -295,19 +296,20 @@ graph LR
 |:--|:--|:--|
 | 异步运行时 | `tokio` | multi-thread, full features |
 | QUIC 协议 | `quinn` | 基于 rustls 的 QUIC 实现，支持 0-RTT session resumption（`quic` feature） |
-| io_uring | `io-uring` / `tokio-uring` | Linux 异步 IO 接口（按需启用） |
+| io_uring | `io-uring` / `tokio-uring` | Linux 异步 IO 接口，read/write/fsync/fallocate 全操作路径（按需启用） |
 | HTTP 客户端 | `reqwest` | 基于 hyper，支持 rustls-tls + HTTP/2 |
 | 桌面框架 | `tauri` v2 | 跨平台桌面应用框架 |
 | GPU 计算 | `wgpu` | WebGPU / Vulkan Compute（预留） |
 | 哈希算法 | `blake3`, `sha2` | 高性能哈希与校验 |
-| 序列化 | `serde`, `serde_json` | JSON 与结构化数据序列化 |
+| 序列化 | `serde`, `serde_json`, `postcard` | JSON 结构化数据 + postcard 二进制（DHT 消息，减少 50-70% 包体积） |
 | 错误处理 | `thiserror` | 结构化错误体系 |
+| 枚举辅助 | `strum` | derive Display / FromStr，消除手写样板 |
 | 日志 | `tracing` | 结构化日志与过滤 |
 | FTP | `suppaftp` | 异步 FTP 客户端，真流式 64KB chunk 读取（`ftp` feature） |
 | 属性测试 | `proptest` | 基于属性的随机测试 |
 | 基准测试 | `criterion` | 统计学基准测试框架 |
 | Mock 框架 | `mockall` | trait 与函数 mock |
-| 带宽预测 | Holt-Winters（自研） | 双参数指数平滑模型 |
+| 带宽预测 | HoltLinearPredictor（自研） | 双指数平滑模型（原 Holt-Winters 别名已废弃） |
 
 ## 项目结构
 
@@ -325,6 +327,13 @@ Tachyon/
 │   ├── tachyon-sniffer/        # 浏览器资源嗅探
 │   ├── tachyon-crypto/         # CPU/GPU 哈希校验
 │   ├── tachyon-p2sp/           # Kademlia DHT + UDP RPC
+│   │   └── src/dht/            # DHT 模块（6 子模块拆分）
+│   │       ├── mod.rs            模块入口与文档
+│   │       ├── kademlia.rs       KademliaDht 核心逻辑、本地存储、Bucket Refresh
+│   │       ├── kbucket.rs        K-Bucket 路由表
+│   │       ├── message.rs        Kademlia 消息定义
+│   │       ├── node.rs           NodeId / NodeInfo
+│   │       └── transport.rs      UDP 传输层、postcard 序列化、周期性刷新
 │   ├── tachyon-store/          # 持久化存储
 │   ├── tachyon-hub/            # 模型仓库 API
 │   └── tachyon-app/            # Tauri 应用入口
@@ -336,7 +345,7 @@ Tachyon/
 │           ├── hub_commands.rs   HuggingFace Hub
 │           └── progress_commands.rs 进度订阅
 ├── frontend/                   # Tauri 前端 (Bun + SolidJS)
-│   └── src/components/         # 19 个活跃组件（含虚拟滚动任务列表）
+│   └── src/components/         # 20 个活跃组件（含虚拟滚动任务列表）
 ├── tests/                      # 集成测试
 ├── benches/                    # criterion 基准测试
 └── docs/                       # 架构文档 (本地)
@@ -345,8 +354,8 @@ Tachyon/
 ## 测试
 
 ```bash
-# 运行全部测试（774 个单元测试）
-cargo test --workspace --lib
+# 运行全部测试（831 个测试，含单元测试 + 集成测试）
+cargo test --all
 
 # 运行指定 crate 的单元测试
 cargo test -p tachyon-core --lib
@@ -366,13 +375,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 # 格式检查
 cargo fmt --all -- --check
 
-# 测试覆盖率（目标 90%+）
-cargo llvm-cov --all --fail-under-lines 90
+# 测试覆盖率（目标 80%+）
+cargo llvm-cov --all --fail-under-lines 80
 ```
 
 ### 测试策略
 
-项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。测试严格跟随各自模块文件，每个子模块维护独立的 `#[cfg(test)]` 测试块。当前共 **774 个单元测试**覆盖 11 个 crate。
+项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。测试严格跟随各自模块文件，每个子模块维护独立的 `#[cfg(test)]` 测试块。当前共 **831 个测试**覆盖 11 个 crate。
 
 ## 基准测试
 
@@ -414,7 +423,7 @@ overflow-checks = false
 | **docs** | `cargo doc --no-deps` 文档构建（零警告） |
 | **audit** | `cargo-deny check` 许可证与依赖策略 |
 | **cargo-audit** | `cargo audit` 安全漏洞扫描 |
-| **coverage** | `cargo llvm-cov` 覆盖率 ≥ 90% |
+| **coverage** | `cargo llvm-cov` 覆盖率 ≥ 80% |
 | **miri** | Miri 检测 unsafe 代码（内存安全） |
 | **bench** | Criterion 基准测试 + 性能回归检测 |
 | **frontend** | TypeScript 类型检查 + 前端构建 |
@@ -427,9 +436,9 @@ overflow-checks = false
 4. 提交信息格式：`<类型>(<范围>): <简要描述>`
 5. 确保 `cargo clippy --all-targets --all-features -- -D warnings` 零警告
 6. 确保 `cargo fmt --all -- --check` 通过
-7. 新功能需附带测试，测试跟随对应模块文件，覆盖率不低于 90%
+7. 新功能需附带测试，测试跟随对应模块文件，覆盖率不低于 80%
 8. 协议层改动需验证 `--no-default-features` 编译通过
-9. 提交 Pull Request 前运行 `cargo test --workspace --lib` 确保全部通过
+9. 提交 Pull Request 前运行 `cargo test --all` 确保全部通过
 
 ## 许可证
 

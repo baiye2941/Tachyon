@@ -1,10 +1,16 @@
 //! 带宽预测模型
 //!
-//! 基于 Holt-Winters 指数平滑的短期带宽预测。
+//! 基于 Holt 双指数平滑(Holt's linear method)的短期带宽预测。
+//! 注意:此实现仅包含水平(level)和趋势(trend)分量,
+//! 不含季节性(seasonal)分量,因此严格来说是 Holt 线性方法
+//! 而非完整的 Holt-Winters 三指数平滑。
 //! 提供置信度评估,帮助调度器判断预测可靠性。
 
-/// Holt-Winters 带宽预测器
-pub struct HoltWintersPredictor {
+/// Holt 双指数平滑带宽预测器
+///
+/// 仅包含水平(alpha)和趋势(beta)两个平滑参数,
+/// 等价于 Holt's linear method / Double Exponential Smoothing。
+pub struct HoltLinearPredictor {
     /// 水平分量
     level: f64,
     /// 趋势分量
@@ -19,7 +25,7 @@ pub struct HoltWintersPredictor {
     sample_count: u64,
 }
 
-impl HoltWintersPredictor {
+impl HoltLinearPredictor {
     pub fn new(alpha: f64, beta: f64) -> Self {
         Self {
             level: 0.0,
@@ -86,11 +92,16 @@ impl HoltWintersPredictor {
     }
 }
 
-impl Default for HoltWintersPredictor {
+impl Default for HoltLinearPredictor {
     fn default() -> Self {
         Self::new(0.3, 0.1)
     }
 }
+
+/// 向后兼容的类型别名:完整 Holt-Winters 应包含季节性分量,
+/// 本实现仅有双指数平滑,使用 `HoltLinearPredictor` 更准确。
+#[deprecated(note = "使用 HoltLinearPredictor (双指数平滑,非完整 Holt-Winters)")]
+pub type HoltWintersPredictor = HoltLinearPredictor;
 
 #[cfg(test)]
 mod tests {
@@ -98,13 +109,13 @@ mod tests {
 
     #[test]
     fn test_predictor_initialization() {
-        let pred = HoltWintersPredictor::default();
+        let pred = HoltLinearPredictor::default();
         assert_eq!(pred.predict(1), 0.0);
     }
 
     #[test]
     fn test_predictor_single_observation() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         pred.observe(100.0);
         assert_eq!(pred.current_level(), 100.0);
         assert_eq!(pred.predict(1), 100.0); // trend = 0
@@ -112,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_predictor_ignores_nan() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         pred.observe(100.0);
         pred.observe(f64::NAN);
         pred.observe(f64::INFINITY);
@@ -124,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_predictor_ignores_negative() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         pred.observe(100.0);
         pred.observe(-50.0);
         // 负值应被跳过
@@ -134,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_predictor_trend() {
-        let mut pred = HoltWintersPredictor::new(0.5, 0.5);
+        let mut pred = HoltLinearPredictor::new(0.5, 0.5);
         pred.observe(100.0);
         pred.observe(200.0);
         // 水平和趋势应该上升
@@ -143,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_predictor_stable() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         for _ in 0..10 {
             pred.observe(1000.0);
         }
@@ -153,20 +164,20 @@ mod tests {
 
     #[test]
     fn test_predictor_no_observations() {
-        let pred = HoltWintersPredictor::default();
+        let pred = HoltLinearPredictor::default();
         assert_eq!(pred.predict(0), 0.0);
     }
 
     #[test]
     fn test_confidence_no_observations() {
-        let pred = HoltWintersPredictor::default();
+        let pred = HoltLinearPredictor::default();
         assert_eq!(pred.confidence(), 0.0);
         assert_eq!(pred.sample_count(), 0);
     }
 
     #[test]
     fn test_confidence_after_one_observation() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         pred.observe(100.0);
         assert_eq!(pred.sample_count(), 1);
         // n=1: 1/(1+exp(-0.1*(1-10))) = 1/(1+exp(0.9)) ≈ 0.289
@@ -176,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_confidence_at_ten_observations() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         for i in 0..10 {
             pred.observe(100.0 + i as f64);
         }
@@ -188,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_confidence_high_sample_count() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         for _ in 0..50 {
             pred.observe(1000.0);
         }
@@ -200,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_sample_count_increments() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         assert_eq!(pred.sample_count(), 0);
         pred.observe(100.0);
         assert_eq!(pred.sample_count(), 1);
@@ -212,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_confidence_monotonic_increase() {
-        let mut pred = HoltWintersPredictor::default();
+        let mut pred = HoltLinearPredictor::default();
         let mut prev_conf = 0.0;
         for i in 1..=20 {
             pred.observe(i as f64 * 100.0);

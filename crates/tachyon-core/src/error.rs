@@ -82,14 +82,13 @@ impl DownloadError {
 
     /// 判断错误是否值得重试
     ///
-    /// - 取消、超时、权限错误不重试
+    /// - 取消、权限错误不重试
     /// - 校验失败不重试(数据已损坏)
-    /// - 其他错误(网络、协议、I/O、限流等)可重试
+    /// - 超时、网络、协议、I/O、限流等可重试
     pub fn is_retryable(&self) -> bool {
         !matches!(
             self,
             DownloadError::Cancelled
-                | DownloadError::Timeout(_)
                 | DownloadError::Forbidden { .. }
                 | DownloadError::ChecksumMismatch { .. }
                 | DownloadError::TaskNotFound(_)
@@ -260,7 +259,6 @@ mod tests {
     #[test]
     fn test_is_retryable_returns_false_for_non_retryable() {
         assert!(!DownloadError::Cancelled.is_retryable());
-        assert!(!DownloadError::Timeout("30s".into()).is_retryable());
         assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
         assert!(
             !DownloadError::ChecksumMismatch {
@@ -275,6 +273,7 @@ mod tests {
 
     #[test]
     fn test_is_retryable_returns_true_for_retryable() {
+        assert!(DownloadError::Timeout("30s".into()).is_retryable());
         assert!(DownloadError::Network("timeout".into()).is_retryable());
         assert!(DownloadError::Protocol("bad response".into()).is_retryable());
         assert!(

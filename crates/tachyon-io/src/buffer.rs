@@ -66,7 +66,9 @@ impl BufferPool {
             capacity,
             pool,
             semaphore: Arc::new(semaphore),
-            outstanding: Arc::new(AtomicUsize::new(0)),
+            // W-16: 预填充的 buffer 视为"已分配",outstanding 应等于 capacity
+            // 维持不变量: available_permits(0) + outstanding(capacity) == capacity
+            outstanding: Arc::new(AtomicUsize::new(capacity)),
         }
     }
 

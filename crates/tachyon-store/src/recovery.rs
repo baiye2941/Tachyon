@@ -97,27 +97,26 @@ impl From<TaskRecord> for TaskSnapshot {
 }
 
 fn parse_legacy_status(status: &str) -> tachyon_core::DownloadState {
-    match status {
-        "pending" => tachyon_core::DownloadState::Pending,
-        "downloading" => tachyon_core::DownloadState::Downloading,
-        "paused" => tachyon_core::DownloadState::Paused,
-        "completed" => tachyon_core::DownloadState::Completed,
-        "failed" => tachyon_core::DownloadState::Failed,
-        "cancelled" => tachyon_core::DownloadState::Cancelled,
-        "verifying" => tachyon_core::DownloadState::Verifying,
-        _ => tachyon_core::DownloadState::Failed,
-    }
+    // A-02: 利用 strum::EnumString 自动派生的 FromStr，
+    // 未知状态字符串回退到 Failed（兼容旧数据）。
+    use std::str::FromStr;
+    tachyon_core::DownloadState::from_str(status).unwrap_or(tachyon_core::DownloadState::Failed)
 }
 
 /// 恢复管理器
 pub struct RecoveryManager {
     store: KvStore,
+    /// 序列化 read-modify-write 操作,防止并发分片进度更新丢失
+    progress_lock: std::sync::Mutex<()>,
 }
 
 impl RecoveryManager {
     /// 创建恢复管理器
     pub fn new(store: KvStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            progress_lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// 保存任务快照
@@ -200,12 +199,15 @@ impl RecoveryManager {
     }
 
     /// 更新分片进度
+    ///
+    /// 使用内部锁序列化 read-modify-write,防止并发分片完成时丢失更新。
     pub fn update_fragment_progress(
         &self,
         task_id: &str,
         fragment_index: u32,
         downloaded_bytes: u64,
     ) -> std::io::Result<()> {
+        let _guard = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut record) = self.load_task(task_id)? {
             if !record.completed_fragments.contains(&fragment_index) {
                 record.completed_fragments.push(fragment_index);

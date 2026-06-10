@@ -154,13 +154,17 @@ pub trait DownloadTask: Send + Sync {
 }
 
 /// 分片下载 trait:单个分片的下载操作
+///
+/// 使用 `Pin<Box<dyn Future>>` 返回类型以满足 object-safe 条件,
+/// 与 `Protocol` / `Storage` 等 trait 的设计风格保持一致,
+/// 支持 `Arc<dyn FragmentDownloader>` 动态分发。
 pub trait FragmentDownloader: Send + Sync {
     /// 下载单个分片
     fn download(
         &self,
         task_id: TaskId,
-        fragment: &FragmentInfo,
-    ) -> impl std::future::Future<Output = DownloadResult<Bytes>> + Send;
+        fragment: FragmentInfo,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send + '_>>;
 
     /// 取消分片下载
     fn cancel(&self, task_id: TaskId, fragment_index: u32) -> DownloadResult<()>;

@@ -119,8 +119,10 @@ pub struct IoUringStorage {
     /// 目标文件路径
     file_path: PathBuf,
     /// 文件描述符(Linux 上通过 RawFd 传入 io_uring)
+    /// W-17: 使用 Arc 包装,确保 spawn_blocking 闭包中 raw fd 的生命周期
+    /// 不短于 IoUringStorage 本身
     #[allow(dead_code)] // Linux cfg 代码中使用
-    file_fd: Option<std::fs::File>,
+    file_fd: Option<std::sync::Arc<std::fs::File>>,
     /// 引擎状态
     state: IoUringState,
     // === Linux-only 字段(条件编译) ===
@@ -298,7 +300,7 @@ impl IoUringStorage {
             .open(&self.file_path)
             .map_err(DownloadError::Io)?;
 
-        self.file_fd = Some(file);
+        self.file_fd = Some(std::sync::Arc::new(file));
         self.ring = Some(std::sync::Arc::new(IoUringHandle {
             ring: std::sync::Mutex::new(ring),
             buffers,
@@ -325,6 +327,200 @@ impl IoUringStorage {
             std::io::ErrorKind::Unsupported,
             "io_uring 仅在 Linux 5.4+ 上可用,当前平台不支持",
         )))
+    }
+
+    /// 提交读取操作到 io_uring SQ (Linux)
+    ///
+    /// 构造 `IORING_OP_READ_FIXED` SQE:
+    /// - `fd`: 目标文件描述符
+    /// - `off`: 文件偏移量
+    /// - `addr`: fixed buffer 地址
+    /// - `len`: 读取长度
+    /// - `buf_index`: 注册的 buffer 索引
+    ///
+    /// 读取完成后将 fixed buffer 中的数据复制到用户提供的 buf 中。
+    #[cfg(target_os = "linux")]
+    async fn submit_read(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
+        let ring_handle = match &self.ring {
+            Some(h) => h.clone(),
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 未初始化",
+                )));
+            }
+        };
+        let fd = match &self.file_fd {
+            Some(f) => {
+                use std::os::fd::AsRawFd;
+                f.as_raw_fd()
+            }
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "文件未打开",
+                )));
+            }
+        };
+
+        let file_guard = self.file_fd.as_ref().unwrap().clone();
+        let read_len = buf.len();
+
+        // spawn_blocking 要求 'static，因此把读取结果放入自有 Vec 中返回
+        let read_result: Vec<u8> = tokio::task::spawn_blocking(move || {
+            let _file_guard = file_guard;
+
+            let mut uring = ring_handle
+                .ring
+                .lock()
+                .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
+
+            let fixed_buf = &ring_handle.buffers[0];
+            let actual_len = read_len.min(fixed_buf.len());
+
+            // 构造 IORING_OP_READ_FIXED SQE
+            let read_op = io_uring::opcode::ReadFixed::new(
+                io_uring::types::Fd(fd),
+                fixed_buf.as_ptr() as *mut u8,
+                actual_len as u32,
+                0, // buf_index: 使用第 0 个注册的 fixed buffer
+            )
+            .offset(offset)
+            .build();
+
+            let mut sq = uring.submission();
+            unsafe {
+                sq.push(&read_op).map_err(|_| {
+                    DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
+                })?;
+            }
+            sq.sync();
+            drop(sq);
+
+            uring
+                .submitter()
+                .submit_and_wait(1)
+                .map_err(DownloadError::Io)?;
+
+            let cqe = uring.completion().next().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+            })?;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
+                    -result,
+                )));
+            }
+            let bytes_read = result as usize;
+
+            // 从 fixed buffer 复制到 Vec 中返回
+            let src = unsafe { std::slice::from_raw_parts(fixed_buf.as_ptr(), bytes_read) };
+            Ok(src.to_vec())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))??;
+
+        // 从返回的 Vec 复制到用户缓冲区
+        let bytes_read = read_result.len();
+        buf[..bytes_read].copy_from_slice(&read_result);
+        Ok(bytes_read)
+    }
+
+    /// 同步文件数据到磁盘 (Linux)
+    ///
+    /// 使用 io_uring FSYNC SQE 提交同步操作。
+    #[cfg(target_os = "linux")]
+    async fn submit_sync(&self) -> DownloadResult<()> {
+        let ring_handle = match &self.ring {
+            Some(h) => h.clone(),
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 未初始化",
+                )));
+            }
+        };
+        let fd = match &self.file_fd {
+            Some(f) => {
+                use std::os::fd::AsRawFd;
+                f.as_raw_fd()
+            }
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "文件未打开",
+                )));
+            }
+        };
+
+        let file_guard = self.file_fd.as_ref().unwrap().clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _file_guard = file_guard;
+
+            let mut uring = ring_handle
+                .ring
+                .lock()
+                .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
+
+            // 构造 IORING_OP_FSYNC SQE
+            let fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd)).build();
+
+            let mut sq = uring.submission();
+            unsafe {
+                sq.push(&fsync_op).map_err(|_| {
+                    DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
+                })?;
+            }
+            sq.sync();
+            drop(sq);
+
+            uring
+                .submitter()
+                .submit_and_wait(1)
+                .map_err(DownloadError::Io)?;
+
+            let cqe = uring.completion().next().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+            })?;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
+                    -result,
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// 预分配文件空间 (Linux)
+    ///
+    /// 使用 `fallocate` 系统调用预分配磁盘空间，避免写入时的动态扩展开销。
+    #[cfg(target_os = "linux")]
+    async fn submit_allocate(&self, size: u64) -> DownloadResult<()> {
+        let file_guard = match &self.file_fd {
+            Some(f) => f.clone(),
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "文件未打开",
+                )));
+            }
+        };
+
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            let fd = file_guard.as_raw_fd();
+            let ret = unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) };
+            if ret != 0 {
+                return Err(DownloadError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// 提交写入操作到 io_uring SQ (Linux)
@@ -363,11 +559,17 @@ impl IoUringStorage {
             }
         };
 
+        // W-17: 克隆 Arc<File> 移入 spawn_blocking,确保 raw fd 在闭包执行期间有效
+        let file_guard = self.file_fd.as_ref().unwrap().clone();
+
         let len = data.len();
 
         // spawn_blocking: 在独立线程中完成 io_uring 提交+等待,
         // 避免 MutexGuard 跨 await 点以及阻塞 tokio 工作线程
         tokio::task::spawn_blocking(move || {
+            // W-17: 持有 Arc<File> 确保 raw fd 在 spawn_blocking 线程执行期间有效
+            let _file_guard = file_guard;
+
             let mut uring = ring_handle
                 .ring
                 .lock()
@@ -466,15 +668,9 @@ impl AsyncStorage for IoUringStorage {
         Box::pin(async move {
             match self.state {
                 IoUringState::Ready => {
-                    // 暂未实现原因:READ_FIXED 需要配合 fixed buffer 池管理,
-                    // 当前优先实现写入路径,读取路径在 Linux CI 中验证后补全。
                     #[cfg(target_os = "linux")]
                     {
-                        // TODO: 实现 io_uring READ_FIXED 零拷贝读取(需 fixed buffer 池管理)
-                        Err(DownloadError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "io_uring 读取尚未实现,请使用 TokioFile",
-                        )))
+                        self.submit_read(_offset, _buf).await
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -493,15 +689,9 @@ impl AsyncStorage for IoUringStorage {
         Box::pin(async move {
             match self.state {
                 IoUringState::Ready => {
-                    // 暂未实现原因:io_uring FSYNC 操作需要与 SQE 提交循环集成,
-                    // 当前通过 tokio::fs::File::sync_all() 作为后备方案。
                     #[cfg(target_os = "linux")]
                     {
-                        // TODO: 实现 io_uring FSYNC SQE 提交(需集成事件循环)
-                        Err(DownloadError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "io_uring 同步尚未实现,请使用 TokioFile",
-                        )))
+                        self.submit_sync().await
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -520,17 +710,9 @@ impl AsyncStorage for IoUringStorage {
         Box::pin(async move {
             match self.state {
                 IoUringState::Ready => {
-                    // 暂未实现原因:fallocate 预分配需要调用 io_uring FALLOCATE 操作码,
-                    // 或者直接使用 libc::fallocate,需要与文件描述符生命周期配合。
-                    // 当前使用标准文件写入按需扩展,待性能测试确认瓶颈后实现。
                     #[cfg(target_os = "linux")]
                     {
-                        // TODO: 实现 fallocate 或 io_uring FALLOCATE 操作
-                        let _ = size;
-                        Err(DownloadError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "io_uring 空间预分配尚未实现,请使用 TokioFile",
-                        )))
+                        self.submit_allocate(size).await
                     }
                     #[cfg(not(target_os = "linux"))]
                     {

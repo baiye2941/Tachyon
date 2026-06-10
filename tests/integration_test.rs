@@ -370,13 +370,28 @@ fn integration_bandwidth_affects_fragment_size() {
     // 低带宽场景
     let mut low_bw = BandwidthTracker::new(0.3);
     low_bw.record(1024 * 1024); // 1MB/s
-    let low_frag_size = compute_fragment_size(file_size, low_bw.estimate(), min_size, max_size, 16);
+    let low_frag_size = compute_fragment_size(
+        file_size,
+        low_bw.estimate(),
+        min_size,
+        max_size,
+        16,
+        100 * 1024 * 1024,
+        10 * 1024 * 1024,
+    );
 
     // 高带宽场景
     let mut high_bw = BandwidthTracker::new(0.3);
     high_bw.record(200 * 1024 * 1024); // 200MB/s
-    let high_frag_size =
-        compute_fragment_size(file_size, high_bw.estimate(), min_size, max_size, 16);
+    let high_frag_size = compute_fragment_size(
+        file_size,
+        high_bw.estimate(),
+        min_size,
+        max_size,
+        16,
+        100 * 1024 * 1024,
+        10 * 1024 * 1024,
+    );
 
     // 两者都在有效范围内
     assert!(low_frag_size >= min_size && low_frag_size <= max_size);
@@ -615,15 +630,30 @@ async fn integration_bandwidth_affects_fragment_planning() {
 
     // 计算分片大小
     let file_size = 100 * 1024 * 1024u64; // 100MB
-    let frag_size_low = compute_fragment_size(file_size, low_bw, 1024 * 1024, 64 * 1024 * 1024, 16);
+    let frag_size_low = compute_fragment_size(
+        file_size,
+        low_bw,
+        1024 * 1024,
+        64 * 1024 * 1024,
+        16,
+        100 * 1024 * 1024,
+        10 * 1024 * 1024,
+    );
 
     // 模拟高带宽
     for _ in 0..10 {
         tracker.record(100 * 1024 * 1024); // 100MB/s
     }
     let high_bw = tracker.estimate();
-    let frag_size_high =
-        compute_fragment_size(file_size, high_bw, 1024 * 1024, 64 * 1024 * 1024, 16);
+    let frag_size_high = compute_fragment_size(
+        file_size,
+        high_bw,
+        1024 * 1024,
+        64 * 1024 * 1024,
+        16,
+        100 * 1024 * 1024,
+        10 * 1024 * 1024,
+    );
 
     // 高带宽应产生更大的分片
     assert!(
