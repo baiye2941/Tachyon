@@ -20,6 +20,9 @@ pub enum DownloadError {
     #[error("校验失败: 预期 {expected}, 实际 {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
+    #[error("校验失败: 已启用校验但没有期望校验摘要")]
+    NoExpectedChecksum,
+
     #[error("配置错误: {0}")]
     Config(String),
 
@@ -84,16 +87,33 @@ impl DownloadError {
     ///
     /// - 取消、权限错误不重试
     /// - 校验失败不重试(数据已损坏)
-    /// - 超时、网络、协议、I/O、限流等可重试
+    /// - HTTP 4xx 客户端错误不重试(除 408/429 外,重试无法解决)
+    /// - 超时、网络、协议、I/O、限流、5xx 服务端错误可重试
     pub fn is_retryable(&self) -> bool {
-        !matches!(
-            self,
+        match self {
+            // 绝对不可重试
             DownloadError::Cancelled
-                | DownloadError::Forbidden { .. }
-                | DownloadError::ChecksumMismatch { .. }
-                | DownloadError::TaskNotFound(_)
-                | DownloadError::Config(_)
-        )
+            | DownloadError::Forbidden { .. }
+            | DownloadError::ChecksumMismatch { .. }
+            | DownloadError::NoExpectedChecksum
+            | DownloadError::TaskNotFound(_)
+            | DownloadError::Config(_) => false,
+
+            // HTTP 4xx 客户端错误不可重试 (429/408 除外)
+            DownloadError::Http { status, .. } => {
+                let s = *status;
+                s == 429 // Too Many Requests (限流, 等同 Throttled)
+                    || s == 408 // Request Timeout (超时, 可能瞬时)
+                    || s >= 500 // 5xx 服务端错误可重试
+            }
+
+            // Other 错误来源不可控(可能是配置错误等不可重试情况),默认不重试
+            // 需要重试的具体错误应使用 Network/Protocol 等明确变体
+            DownloadError::Other(_) => false,
+
+            // 其余错误默认可重试
+            _ => true,
+        }
     }
 }
 
@@ -267,6 +287,7 @@ mod tests {
             }
             .is_retryable()
         );
+        assert!(!DownloadError::NoExpectedChecksum.is_retryable());
         assert!(!DownloadError::TaskNotFound("x".into()).is_retryable());
         assert!(!DownloadError::Config("bad".into()).is_retryable());
     }
@@ -303,6 +324,37 @@ mod tests {
             }
             .is_retryable()
         );
-        assert!(DownloadError::Other("unknown".into()).is_retryable());
+        // S-5: 429/408 虽为 4xx 但仍可重试
+        assert!(
+            DownloadError::Http {
+                status: 429,
+                reason: "Too Many Requests".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            DownloadError::Http {
+                status: 408,
+                reason: "Request Timeout".into(),
+            }
+            .is_retryable()
+        );
+        // M-7 修复: Other 变体不再默认可重试(来源不可控,可能是配置错误)
+        assert!(!DownloadError::Other("unknown".into()).is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_returns_false_for_4xx_client_errors() {
+        // S-5: HTTP 4xx 客户端错误不应重试
+        for status in [400, 401, 403, 404, 405, 406, 410] {
+            assert!(
+                !DownloadError::Http {
+                    status,
+                    reason: format!("Client Error {status}"),
+                }
+                .is_retryable(),
+                "HTTP {status} 不应被重试"
+            );
+        }
     }
 }

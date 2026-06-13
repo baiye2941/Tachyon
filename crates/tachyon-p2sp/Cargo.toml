@@ -20,6 +20,9 @@ serde_json.workspace = true
 postcard.workspace = true
 dashmap.workspace = true
 blake3.workspace = true
+getrandom.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

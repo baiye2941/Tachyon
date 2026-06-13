@@ -93,7 +93,7 @@ export function getHistoryStats(): HistoryStats {
   let cancelledCount = 0
 
   for (let i = 0; i < records.length; i++) {
-    const r = records[i]
+    const r = records[i]!
     totalBytes += r.fileSize || 0
     totalDuration += r.duration || 0
     speedSum += r.avgSpeed || 0

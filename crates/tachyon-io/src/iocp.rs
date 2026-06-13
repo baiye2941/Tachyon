@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::pin::Pin;
 #[cfg(target_os = "windows")]
-use std::sync::{Mutex, MutexGuard};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
@@ -53,19 +52,16 @@ type CompletionRegistry = std::collections::HashMap<usize, PendingWrite>;
 
 #[cfg(target_os = "windows")]
 fn lock_completion_registry(
-    registry: &Mutex<CompletionRegistry>,
-) -> MutexGuard<'_, CompletionRegistry> {
-    registry.lock().unwrap_or_else(|poisoned| {
-        tracing::error!("IOCP 完成注册表锁已 poison,继续回收内部状态");
-        poisoned.into_inner()
-    })
+    registry: &parking_lot::Mutex<CompletionRegistry>,
+) -> parking_lot::MutexGuard<'_, CompletionRegistry> {
+    registry.lock()
 }
 
 #[cfg(target_os = "windows")]
 struct PendingWriteCancelGuard {
     file_handle: usize,
     overlapped_key: usize,
-    registry: std::sync::Arc<Mutex<CompletionRegistry>>,
+    registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
     armed: bool,
 }
 
@@ -74,7 +70,7 @@ impl PendingWriteCancelGuard {
     fn new(
         file_handle: windows_sys::Win32::Foundation::HANDLE,
         overlapped_key: usize,
-        registry: std::sync::Arc<Mutex<CompletionRegistry>>,
+        registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
     ) -> Self {
         Self {
             file_handle: file_handle as usize,
@@ -164,9 +160,53 @@ impl KernelOverlapped {
         }
     }
 
+    /// 重置为可复用状态,设置新的文件偏移
+    fn reset(&mut self, offset: u64) {
+        self.internal = 0;
+        self.internal_high = 0;
+        self.offset_low = offset as u32;
+        self.offset_high = (offset >> 32) as u32;
+        // h_event 保持 null_mut(),IOCP 不需要事件句柄
+    }
+
     /// 获取内核兼容的 OVERLAPPED 指针
     fn as_overlapped_ptr(&mut self) -> *mut windows_sys::Win32::System::IO::OVERLAPPED {
         self as *mut Self as *mut windows_sys::Win32::System::IO::OVERLAPPED
+    }
+}
+
+/// OVERLAPPED 对象池
+///
+/// IOCP 每次写入都需要一个 OVERLAPPED 结构;频繁 `Box::new` 分配与释放
+/// 会成为高并发写入路径上的 GC/分配热点。对象池允许在完成通知到达后
+/// 回收并复用 OVERLAPPED,显著降低 Windows 下载路径上的堆分配压力。
+#[cfg(target_os = "windows")]
+struct OverlappedPool {
+    available: crossbeam_queue::SegQueue<Box<KernelOverlapped>>,
+}
+
+#[cfg(target_os = "windows")]
+impl OverlappedPool {
+    fn new() -> Self {
+        Self {
+            available: crossbeam_queue::SegQueue::new(),
+        }
+    }
+
+    /// 获取一个 OVERLAPPED,优先从池中复用
+    fn acquire(&self, offset: u64) -> Box<KernelOverlapped> {
+        if let Some(mut ov) = self.available.pop() {
+            ov.reset(offset);
+            ov
+        } else {
+            Box::new(KernelOverlapped::new_for_offset(offset))
+        }
+    }
+
+    /// 归还 OVERLAPPED 到池中复用
+    fn release(&self, mut ov: Box<KernelOverlapped>) {
+        ov.reset(0);
+        self.available.push(ov);
     }
 }
 
@@ -196,8 +236,13 @@ pub struct IoCpStorage {
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 完成回调注册表:OVERLAPPED 堆地址 -> oneshot Sender
     ///
-    /// 由 Mutex 保护,写入操作注册 Sender,轮询线程完成时取出。
-    registry: std::sync::Arc<Mutex<CompletionRegistry>>,
+    /// 由 parking_lot::Mutex 保护,写入操作注册 Sender,轮询线程完成时取出。
+    /// 使用 parking_lot 降低 Windows 高并发写入时的锁竞争开销。
+    registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
+    /// OVERLAPPED 对象池
+    ///
+    /// 复用已完成 I/O 的 OVERLAPPED 结构,减少高并发写入时的堆分配。
+    overlapped_pool: std::sync::Arc<OverlappedPool>,
 }
 
 // Safety: IoCpStorage 的所有字段均可安全跨线程共享:
@@ -222,7 +267,10 @@ impl IoCpStorage {
             port: None,
             poller: None,
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            registry: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            overlapped_pool: std::sync::Arc::new(OverlappedPool::new()),
         }
     }
 
@@ -330,6 +378,7 @@ impl IoCpStorage {
 
         let shutdown_flag = self.shutdown.clone();
         let registry = self.registry.clone();
+        let overlapped_pool = self.overlapped_pool.clone();
         // 通过 usize 传递句柄到线程(*mut c_void 不实现 Send)
         let port_raw = port_handle as usize;
 
@@ -339,7 +388,7 @@ impl IoCpStorage {
             .spawn(move || {
                 // Safety: port_raw 来自成功的 CreateIoCompletionPort,转换回 HANDLE 安全
                 let port = port_raw as windows_sys::Win32::Foundation::HANDLE;
-                Self::poller_loop(port, &shutdown_flag, &registry);
+                Self::poller_loop(port, &shutdown_flag, &registry, &overlapped_pool);
             }) {
             Ok(poller) => poller,
             Err(error) => {
@@ -372,7 +421,8 @@ impl IoCpStorage {
     fn poller_loop(
         port: windows_sys::Win32::Foundation::HANDLE,
         shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-        registry: &std::sync::Arc<Mutex<CompletionRegistry>>,
+        registry: &std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
+        overlapped_pool: &std::sync::Arc<OverlappedPool>,
     ) {
         use windows_sys::Win32::System::IO::OVERLAPPED_ENTRY;
 
@@ -414,7 +464,13 @@ impl IoCpStorage {
                     // Internal 字段是 NTSTATUS; 0 = STATUS_SUCCESS
                     let status = entry.Internal as i32;
 
-                    Self::complete_pending_write(registry.as_ref(), overlapped_ptr, bytes, status);
+                    Self::complete_pending_write(
+                        registry.as_ref(),
+                        overlapped_pool.as_ref(),
+                        overlapped_ptr,
+                        bytes,
+                        status,
+                    );
                 }
             }
             // ok == 0 且 GetLastError == WAIT_TIMEOUT:正常超时,继续循环
@@ -424,7 +480,8 @@ impl IoCpStorage {
     }
 
     fn complete_pending_write(
-        registry: &Mutex<CompletionRegistry>,
+        registry: &parking_lot::Mutex<CompletionRegistry>,
+        overlapped_pool: &OverlappedPool,
         overlapped_ptr: usize,
         bytes: usize,
         status: i32,
@@ -454,7 +511,8 @@ impl IoCpStorage {
         } = pending;
         let _ = completion.send(result);
         drop(data);
-        drop(overlapped);
+        // 将 OVERLAPPED 归还对象池复用,避免下次写入重新堆分配
+        overlapped_pool.release(overlapped);
         true
     }
 
@@ -570,9 +628,9 @@ impl crate::storage::AsyncStorage for IoCpStorage {
 
             use std::os::windows::io::AsRawHandle;
 
-            // 1. 构造内核兼容的 OVERLAPPED 结构(正确的字段布局)。
-            // Box 随 PendingWrite 进入 registry,确保 future 被取消后内核仍可访问。
-            let mut overlapped = Box::new(KernelOverlapped::new_for_offset(offset));
+            // 1. 从对象池获取 OVERLAPPED,减少高并发写入时的堆分配。
+            // 复用的 OVERLAPPED 会由 registry 持有直到完成通知抵达,再归还池中。
+            let mut overlapped = self.overlapped_pool.acquire(offset);
             let ov_ptr = overlapped.as_overlapped_ptr();
 
             let file = self.file.as_ref().ok_or_else(|| {
@@ -618,7 +676,9 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
                 {
                     let mut map = lock_completion_registry(&self.registry);
-                    map.remove(&overlapped_key);
+                    if let Some(pending) = map.remove(&overlapped_key) {
+                        self.overlapped_pool.release(pending.overlapped);
+                    }
                 }
                 return Ok(bytes_written as usize);
             }
@@ -629,7 +689,9 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 // 真正的写入失败
                 {
                     let mut map = lock_completion_registry(&self.registry);
-                    map.remove(&overlapped_key);
+                    if let Some(pending) = map.remove(&overlapped_key) {
+                        self.overlapped_pool.release(pending.overlapped);
+                    }
                 }
                 return Err(map_writefile_submission_error(err));
             }
@@ -879,10 +941,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_iocp_unknown_completion_is_not_owned() {
-        let registry = Mutex::new(std::collections::HashMap::new());
+        let registry = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let pool = OverlappedPool::new();
 
         assert!(
-            !IoCpStorage::complete_pending_write(&registry, 0xDEAD_BEEF, 0, 0),
+            !IoCpStorage::complete_pending_write(&registry, &pool, 0xDEAD_BEEF, 0, 0),
             "未知 completion 应被忽略,不能释放外部 OVERLAPPED"
         );
         assert_eq!(lock_completion_registry(&registry).len(), 0);
@@ -892,7 +955,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_iocp_registered_completion_resolves_pending_write() {
-        let registry = Mutex::new(std::collections::HashMap::new());
+        let registry = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let pool = OverlappedPool::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut overlapped = Box::new(KernelOverlapped::new_for_offset(0));
         let key = overlapped.as_overlapped_ptr() as usize;
@@ -910,7 +974,7 @@ mod tests {
         }
 
         assert!(
-            IoCpStorage::complete_pending_write(&registry, key, 3, 0),
+            IoCpStorage::complete_pending_write(&registry, &pool, key, 3, 0),
             "注册表命中的 completion 应完成 pending write"
         );
         assert_eq!(lock_completion_registry(&registry).len(), 0);
@@ -927,7 +991,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_iocp_cancel_guard_preserves_pending_registry_entry() {
-        let registry = std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let registry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let mut overlapped = Box::new(KernelOverlapped::new_for_offset(0));
         let key = overlapped.as_overlapped_ptr() as usize;

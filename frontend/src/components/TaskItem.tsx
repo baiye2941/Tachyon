@@ -156,7 +156,7 @@ export default function TaskItem(props: TaskItemProps) {
                 >
                   {props.task.fileSize ? formatSize(props.task.fileSize) : '未知大小'}
                   {' · '}
-                  {props.task.url.split(':')[0].toUpperCase()}
+                  {props.task.url.split(':')[0]?.toUpperCase() ?? ''}
                   {props.task.speed > 0 && ` · ${formatSpeed(props.task.speed)}`}
                 </div>
               </Show>

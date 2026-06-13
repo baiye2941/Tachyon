@@ -45,6 +45,9 @@ pub use url_safety::{
 /// - `bytes_downloaded`: 累计已下载字节数
 /// - `fragments_completed`: 已完成的分片数
 /// - `errors`: 错误计数
+///
+/// 注意: 当前为预留的生产可观测性接口,待下游模块集成后启用。
+/// 测试代码可直接使用,生产代码调用前需确认集成状态。
 #[derive(Debug)]
 pub struct Metrics {
     /// 累计已下载字节数
@@ -203,6 +206,7 @@ fn app_config() {
         headers: std::collections::HashMap::new(),
         pause_timeout_secs: 300,
         rate_limit_bytes_per_sec: None,
+        max_full_stream_bytes: config::default_max_full_stream_bytes(),
         authorized_dirs: vec!["/tmp/test".to_string()],
         io_strategy: config::IoStrategy::default(),
     };

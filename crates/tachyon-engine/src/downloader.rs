@@ -9,21 +9,11 @@
 //!
 //! `run()` 方法一键执行上述全部步骤。
 //!
-//! # TODO(W-14): 模块拆分
+//! # 模块拆分
 //!
-//! 本文件当前约 4300 行,职责过于集中。建议拆分为以下子模块:
-//!
-//! - `probe.rs`  -- 文件元数据探测与协议选择
-//! - `planner.rs` -- 分片规划与大小计算
-//! - `execute.rs` -- 并发分片下载编排(核心循环)
-//! - `verify.rs` -- 下载完整性校验(hash/CRC)
-//! - `retry.rs`  -- 重试策略与指数退避
-//!
-//! 拆分后本文件仅保留 `Downloader` 结构体和 `run()` 方法,
-//! 将具体阶段逻辑委托到子模块。
+//! - `storage_adapter` -- 类型擦除存储包装器 (DynStorage) + 分片进度消息
+//! - `mirror`          -- 多镜像源 Happy Eyeballs 适配器
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,14 +26,15 @@ use tachyon_core::config::DownloadConfig;
 use tachyon_core::rate_limit::RateLimiter;
 use tachyon_core::traits::{DownloadScheduler, Protocol, Verifier};
 use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
-use tachyon_core::{ByteStream, DownloadError, DownloadResult};
+use tachyon_core::{DownloadError, DownloadResult, Metrics};
 use tachyon_crypto::CpuVerifier;
-use tachyon_io::TokioFile;
-#[cfg(target_os = "windows")]
-use tachyon_io::WinFile;
-use tachyon_io::storage::AsyncStorage;
 use tachyon_protocol::http::HttpClient;
 use tachyon_scheduler::AdaptiveDownloadScheduler;
+
+use crate::circuit_breaker::SourceCircuitBreakers;
+use crate::mirror::MirrorProtocol;
+use crate::storage_adapter::DynStorage;
+pub use crate::storage_adapter::FragmentProgress;
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
 /// 添加新校验后端只需实现 Verifier trait,无需修改引擎层枚举。
@@ -56,6 +47,15 @@ pub fn default_blake3_verifier() -> VerifierKind {
 
 pub type StorageKind = DynStorage;
 
+/// L-9: verify() 分块读取文件的 chunk 大小 (1 MiB)。
+/// 过小则系统调用频繁,过大则占用内存;1 MiB 在 HDD/SSD 上均为合理折中。
+const VERIFY_HASH_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// L-12: 分片下载进度上报频率 — 每 N 个 chunk 上报一次。
+/// 值过小则通道压力大,值过大则前端更新不及时;5 在默认 256 KiB batch 下
+/// 约每 1.25 MiB 上报一次,平衡延迟与开销。
+const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
+
 type FragmentTaskOk = (u32, u64, Duration);
 type FragmentTaskErr = (u32, DownloadError);
 type FragmentTaskResult = Result<FragmentTaskOk, FragmentTaskErr>;
@@ -65,490 +65,7 @@ use crate::fragment::FragmentRecord;
 use crate::orchestrator::DownloadOrchestrator;
 
 #[cfg(test)]
-use tachyon_core::test_harness::harness::MemoryStorage as MemStorage;
-#[cfg(test)]
 use tachyon_core::test_harness::harness::MockProtocol as MockProto;
-
-// ---------------------------------------------------------------------------
-// DynStorage: 类型擦除存储包装器
-// ---------------------------------------------------------------------------
-
-trait ErasedStorage: Send + Sync {
-    fn write_at_erased(
-        &self,
-        offset: u64,
-        data: Bytes,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
-    fn read_at_erased<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>>;
-    fn allocate_erased(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
-    fn sync_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
-    fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>>;
-}
-
-impl<S: AsyncStorage + 'static> ErasedStorage for S {
-    fn write_at_erased(
-        &self,
-        offset: u64,
-        data: Bytes,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
-        self.write_at(offset, data)
-    }
-
-    fn read_at_erased<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
-        self.read_at(offset, buf)
-    }
-
-    fn allocate_erased(
-        &self,
-        size: u64,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        self.allocate(size)
-    }
-
-    fn sync_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        self.sync()
-    }
-
-    fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-        self.file_size()
-    }
-}
-
-/// 类型擦除存储包装器
-///
-/// 通过 `Arc<dyn ErasedStorage>` 实现动态分发,添加新存储后端只需
-/// 实现 `AsyncStorage` trait,无需修改引擎层枚举定义和 match 分支。
-#[derive(Clone)]
-pub struct DynStorage(Arc<dyn ErasedStorage>);
-
-impl DynStorage {
-    /// 从任意 AsyncStorage 实现创建
-    pub fn new<S: AsyncStorage + 'static>(storage: S) -> Self {
-        Self(Arc::new(storage))
-    }
-
-    /// 从 Arc 包装的 AsyncStorage 创建
-    pub fn from_arc<S: AsyncStorage + 'static>(storage: Arc<S>) -> Self {
-        Self(storage)
-    }
-
-    /// 打开或创建 TokioFile 存储
-    async fn open(path: &std::path::Path) -> DownloadResult<Self> {
-        let storage = TokioFile::open(path).await?;
-        Ok(Self::new(storage))
-    }
-
-    /// 根据 I/O 策略打开存储后端
-    ///
-    /// - `Standard`: TokioFile（跨平台稳定路径）
-    /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
-    /// - `Iocp`: IOCP 异步后端（仅 Windows；其他平台回退到 Standard）
-    /// - `IoUring`: io_uring 零拷贝后端（仅 Linux 5.4+；其他平台回退到 Standard）
-    async fn open_with_strategy(
-        path: &std::path::Path,
-        strategy: tachyon_core::config::IoStrategy,
-    ) -> DownloadResult<Self> {
-        match strategy {
-            tachyon_core::config::IoStrategy::Standard => Self::open(path).await,
-            tachyon_core::config::IoStrategy::WinAligned => {
-                #[cfg(target_os = "windows")]
-                {
-                    tracing::info!(path = %path.display(), "使用 WinFile NO_BUFFERING 后端");
-                    let storage = WinFile::open_optimized(path).await?;
-                    Ok(Self::new(storage))
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "WinAligned 策略在非 Windows 平台不可用,回退到 Standard"
-                    );
-                    Self::open(path).await
-                }
-            }
-            tachyon_core::config::IoStrategy::Iocp => {
-                #[cfg(target_os = "windows")]
-                {
-                    tracing::info!(path = %path.display(), "使用 IOCP 后端");
-                    let mut storage = tachyon_io::IoCpStorage::new(path);
-                    match storage.init() {
-                        Ok(()) => Ok(Self::new(storage)),
-                        Err(error) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %error,
-                                "IOCP 后端初始化失败,回退到 Standard"
-                            );
-                            Self::open(path).await
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "Iocp 策略在非 Windows 平台不可用,回退到 Standard"
-                    );
-                    Self::open(path).await
-                }
-            }
-            tachyon_core::config::IoStrategy::IoUring => {
-                tracing::info!(path = %path.display(), "使用 io_uring 零拷贝后端");
-                let mut storage =
-                    tachyon_io::IoUringStorage::new(path, tachyon_io::IoUringConfig::default());
-                match storage.init() {
-                    Ok(()) => Ok(Self::new(storage)),
-                    Err(error) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %error,
-                            "io_uring 后端初始化失败,回退到 Standard"
-                        );
-                        Self::open(path).await
-                    }
-                }
-            }
-        }
-    }
-
-    /// 写入数据到指定偏移
-    pub async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        self.0.write_at_erased(offset, data).await
-    }
-
-    /// 从指定偏移读取数据
-    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
-        self.0.read_at_erased(offset, buf).await
-    }
-
-    /// 预分配文件空间
-    pub async fn allocate(&self, size: u64) -> DownloadResult<()> {
-        self.0.allocate_erased(size).await
-    }
-
-    /// 同步数据到磁盘
-    pub async fn sync(&self) -> DownloadResult<()> {
-        self.0.sync_erased().await
-    }
-
-    pub async fn file_size(&self) -> DownloadResult<u64> {
-        self.0.file_size_erased().await
-    }
-}
-
-#[cfg(test)]
-struct AsyncMemWrapper(MemStorage);
-
-#[cfg(test)]
-impl AsyncStorage for AsyncMemWrapper {
-    fn write_at(
-        &self,
-        offset: u64,
-        data: Bytes,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.write_at(offset, data);
-        Box::pin(async move { fut.await })
-    }
-
-    fn read_at<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.read_at(offset, buf);
-        Box::pin(async move { fut.await })
-    }
-
-    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.sync();
-        Box::pin(async move { fut.await })
-    }
-
-    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.allocate(size);
-        Box::pin(async move { fut.await })
-    }
-
-    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.file_size();
-        Box::pin(async move { fut.await })
-    }
-
-    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        let fut = self.0.close();
-        Box::pin(async move { fut.await })
-    }
-}
-
-#[cfg(test)]
-impl DynStorage {
-    fn memory() -> Self {
-        Self::new(AsyncMemWrapper(MemStorage::new()))
-    }
-
-    fn memory_with_capacity(cap: usize) -> Self {
-        Self::new(AsyncMemWrapper(MemStorage::with_capacity(cap)))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FragmentProgress: 分片进度回调消息
-// ---------------------------------------------------------------------------
-
-/// 分片进度回调消息
-///
-/// 通过 `progress_tx` 通道发送给上层(tachyon-app),用于:
-/// - `completed == false`:增量进度更新(每写一个 chunk 发一次)
-/// - `completed == true`:分片整体下载完成,触发上层 checkpoint 落盘(断点续传)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FragmentProgress {
-    /// 分片索引
-    pub fragment_index: u32,
-    /// 该分片是否已整体完成
-    pub completed: bool,
-    /// 该分片当前已下载字节数
-    pub fragment_downloaded: u64,
-}
-
-// ---------------------------------------------------------------------------
-// MirrorProtocol: 多源下载适配器 (A-07: Happy Eyeballs v2)
-// ---------------------------------------------------------------------------
-
-/// 多镜像源 Protocol 适配器
-///
-/// 包装主源和备用源列表,采用 Happy Eyeballs v2 (RFC 8305) 并行竞速策略:
-/// - **probe**: 同时向所有源发起 HEAD 探测,选择最先响应的源
-/// - **download**: 优先尝试主源(500ms 超时),失败后并行竞速所有镜像源
-///
-/// 显著减少镜像切换时的等待时间,避免顺序 fallback 的串行延迟累积。
-struct MirrorProtocol {
-    /// 主下载源
-    primary: Arc<dyn Protocol>,
-    /// 备用镜像源列表 (url, protocol)
-    mirrors: Vec<(String, Arc<dyn Protocol>)>,
-}
-
-/// 主源快速尝试超时 (Happy Eyeballs 核心参数)
-const PRIMARY_FAST_TIMEOUT: Duration = Duration::from_millis(500);
-
-impl MirrorProtocol {
-    fn new(primary: Arc<dyn Protocol>, mirrors: Vec<(String, Arc<dyn Protocol>)>) -> Self {
-        Self { primary, mirrors }
-    }
-}
-
-impl Protocol for MirrorProtocol {
-    fn probe(
-        &self,
-        url: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
-    {
-        let primary = self.primary.clone();
-        let mirrors = self.mirrors.clone();
-        let url = url.to_string();
-        Box::pin(async move {
-            if mirrors.is_empty() {
-                return primary.probe(&url).await;
-            }
-
-            // Happy Eyeballs: 并行竞速所有源的 probe
-            let mut set = JoinSet::new();
-            set.spawn({
-                let p = primary.clone();
-                let u = url.clone();
-                async move { p.probe(&u).await }
-            });
-            for (mirror_url, proto) in &mirrors {
-                let p = proto.clone();
-                let u = mirror_url.clone();
-                set.spawn(async move { p.probe(&u).await });
-            }
-
-            let mut last_err = None;
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok(Ok(meta)) => {
-                        set.abort_all();
-                        return Ok(meta);
-                    }
-                    Ok(Err(e)) => last_err = Some(e),
-                    Err(e) => {
-                        last_err = Some(DownloadError::Io(std::io::Error::other(e.to_string())));
-                    }
-                }
-            }
-            Err(last_err.unwrap_or_else(|| DownloadError::Protocol("所有源探测均失败".into())))
-        })
-    }
-
-    fn download_range(
-        &self,
-        url: &str,
-        start: u64,
-        end: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let primary = self.primary.clone();
-        let mirrors = self.mirrors.clone();
-        let url = url.to_string();
-        Box::pin(async move {
-            // 快速尝试主源(500ms 超时)
-            match tokio::time::timeout(
-                PRIMARY_FAST_TIMEOUT,
-                primary.download_range(&url, start, end),
-            )
-            .await
-            {
-                Ok(Ok(data)) => return Ok(data),
-                Ok(Err(_)) | Err(_) => {
-                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像", mirrors.len());
-                }
-            }
-            // 并行竞速所有镜像源
-            let mut set = JoinSet::new();
-            for (mirror_url, proto) in &mirrors {
-                let p = proto.clone();
-                let u = mirror_url.clone();
-                set.spawn(async move { p.download_range(&u, start, end).await });
-            }
-            let mut primary_err = None;
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok(Ok(data)) => {
-                        set.abort_all();
-                        return Ok(data);
-                    }
-                    Ok(Err(e)) => {
-                        if primary_err.is_none() {
-                            primary_err = Some(e);
-                        }
-                    }
-                    Err(e) => {
-                        if primary_err.is_none() {
-                            primary_err =
-                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
-                        }
-                    }
-                }
-            }
-            Err(primary_err.unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败".into())))
-        })
-    }
-
-    fn download_range_stream(
-        &self,
-        url: &str,
-        start: u64,
-        end: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
-    {
-        let primary = self.primary.clone();
-        let mirrors = self.mirrors.clone();
-        let url = url.to_string();
-        Box::pin(async move {
-            match tokio::time::timeout(
-                PRIMARY_FAST_TIMEOUT,
-                primary.download_range_stream(&url, start, end),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => return Ok(stream),
-                Ok(Err(_)) | Err(_) => {
-                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像(流式)", mirrors.len());
-                }
-            }
-            let mut set = JoinSet::new();
-            for (mirror_url, proto) in &mirrors {
-                let p = proto.clone();
-                let u = mirror_url.clone();
-                set.spawn(async move { p.download_range_stream(&u, start, end).await });
-            }
-            let mut primary_err = None;
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok(Ok(stream)) => {
-                        set.abort_all();
-                        return Ok(stream);
-                    }
-                    Ok(Err(e)) => {
-                        if primary_err.is_none() {
-                            primary_err = Some(e);
-                        }
-                    }
-                    Err(e) => {
-                        if primary_err.is_none() {
-                            primary_err =
-                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
-                        }
-                    }
-                }
-            }
-            Err(primary_err
-                .unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败(流式)".into())))
-        })
-    }
-
-    fn download_full(
-        &self,
-        url: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let primary = self.primary.clone();
-        let mirrors = self.mirrors.clone();
-        let url = url.to_string();
-        Box::pin(async move {
-            match tokio::time::timeout(PRIMARY_FAST_TIMEOUT, primary.download_full(&url)).await {
-                Ok(Ok(data)) => return Ok(data),
-                Ok(Err(_)) | Err(_) => {
-                    tracing::info!("主源超时或失败,并行竞速 {} 个镜像(全量)", mirrors.len());
-                }
-            }
-            let mut set = JoinSet::new();
-            for (mirror_url, proto) in &mirrors {
-                let p = proto.clone();
-                let u = mirror_url.clone();
-                set.spawn(async move { p.download_full(&u).await });
-            }
-            let mut primary_err = None;
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok(Ok(data)) => {
-                        set.abort_all();
-                        return Ok(data);
-                    }
-                    Ok(Err(e)) => {
-                        if primary_err.is_none() {
-                            primary_err = Some(e);
-                        }
-                    }
-                    Err(e) => {
-                        if primary_err.is_none() {
-                            primary_err =
-                                Some(DownloadError::Io(std::io::Error::other(e.to_string())));
-                        }
-                    }
-                }
-            }
-            Err(primary_err
-                .unwrap_or_else(|| DownloadError::Protocol("所有镜像源均失败(全量)".into())))
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // DownloadTask: 下载任务执行器
@@ -561,9 +78,9 @@ impl Protocol for MirrorProtocol {
 /// 存储延迟初始化:在 `probe()` 获取真实文件名后,通过 `init_storage()`
 /// 配合 `validate_save_path()` 纵深防御创建存储。
 pub struct DownloadTask {
-    pub id: TaskId,
-    pub url: String,
-    pub config: DownloadConfig,
+    id: TaskId,
+    url: String,
+    config: DownloadConfig,
     protocol: Arc<dyn Protocol>,
     /// 延迟初始化:probe() 后通过 init_storage() 创建
     storage: Option<Arc<DynStorage>>,
@@ -581,9 +98,28 @@ pub struct DownloadTask {
     /// 外部共享限速器(跨任务全局限速)。
     /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// 可选的下载指标统计器,用于记录下载字节数、分片完成数和错误数。
+    metrics: Option<Arc<Metrics>>,
+    /// 每源熔断器,防止持续失败的源浪费连接资源
+    circuit_breakers: SourceCircuitBreakers,
 }
 
 impl DownloadTask {
+    /// 获取任务 ID
+    pub fn id(&self) -> &TaskId {
+        &self.id
+    }
+
+    /// 获取下载 URL
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// 获取下载配置
+    pub fn config(&self) -> &DownloadConfig {
+        &self.config
+    }
+
     /// 创建新的下载任务
     ///
     /// 根据 URL scheme 自动选择协议后端,使用默认 blake3 校验器和自适应调度器。
@@ -664,6 +200,8 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
         })
     }
 
@@ -723,6 +261,8 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
         })
     }
 
@@ -750,6 +290,8 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
         }
     }
 
@@ -759,6 +301,13 @@ impl DownloadTask {
 
     pub fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
         self.progress_tx = Some(tx);
+    }
+
+    /// 设置指标统计器
+    ///
+    /// 用于记录下载字节数、分片完成数和错误数。
+    pub fn set_metrics(&mut self, metrics: Arc<Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// 设置已完成分片索引列表(断点续传)
@@ -959,8 +508,8 @@ impl DownloadTask {
                     // 仅对仍处于 Pending 的分片执行恢复,避免重复迁移状态
                     if frag.state == crate::fragment::FragmentState::Pending {
                         frag.info.downloaded = frag.info.size;
-                        frag.start_download();
-                        frag.complete_download_fast(frag.info.size, Duration::ZERO);
+                        frag.start_download()?;
+                        frag.complete_download_fast(frag.info.size, Duration::ZERO)?;
                         resumed += 1;
                     }
                 }
@@ -1011,10 +560,10 @@ impl DownloadTask {
             .ok_or_else(|| DownloadError::Config("必须先调用 probe()".into()))?;
 
         let supports_range = metadata.supports_range;
-        let file_size = metadata.file_size.unwrap_or(0);
+        let file_size = metadata.file_size;
 
         // 空文件无需下载
-        if file_size == 0 {
+        if file_size == Some(0) {
             self.state = DownloadState::Completed;
             info!("文件大小为 0,跳过下载");
             return Ok(());
@@ -1067,6 +616,7 @@ impl DownloadTask {
             .storage
             .as_ref()
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
+        let expected_size = self.metadata.as_ref().and_then(|md| md.file_size);
 
         // 逐块消费并写入,顺序追加偏移
         let mut pos: u64 = 0;
@@ -1076,6 +626,21 @@ impl DownloadTask {
                 Self::wait_control_rx(rx, pause_timeout).await?;
             }
             let chunk = chunk_result?;
+            let chunk_len = u64::try_from(chunk.len())
+                .map_err(|_| DownloadError::Config("整块下载 chunk 长度溢出".into()))?;
+            if expected_size.is_none() {
+                let attempted = pos.checked_add(chunk_len).ok_or_else(|| {
+                    DownloadError::Config(format!(
+                        "未知大小整块下载长度溢出: written={pos}, chunk={chunk_len}"
+                    ))
+                })?;
+                if attempted > self.config.max_full_stream_bytes {
+                    return Err(DownloadError::Config(format!(
+                        "未知大小整块下载超过上限: 上限 {} 字节, 本次将写入 {} 字节",
+                        self.config.max_full_stream_bytes, attempted
+                    )));
+                }
+            }
             let written = storage.write_at(pos, chunk).await?;
             pos += written as u64;
             // 实时令牌桶限速
@@ -1085,8 +650,7 @@ impl DownloadTask {
         }
         debug!(written = pos, "整块流式下载写入完成");
 
-        if let Some(md) = &self.metadata
-            && let Some(expected_size) = md.file_size
+        if let Some(expected_size) = expected_size
             && pos != expected_size
         {
             return Err(DownloadError::Io(std::io::Error::new(
@@ -1097,9 +661,13 @@ impl DownloadTask {
 
         if let Some(frag) = self.fragments.first_mut() {
             if frag.state == crate::fragment::FragmentState::Pending {
-                frag.start_download();
+                frag.start_download()?;
             }
-            frag.complete_download_fast(pos, start_instant.elapsed());
+            frag.complete_download_fast(pos, start_instant.elapsed())?;
+        }
+        if let Some(ref metrics) = self.metrics {
+            metrics.add_bytes(pos);
+            metrics.inc_fragment();
         }
         self.state = DownloadState::Completed;
         Ok(())
@@ -1164,6 +732,8 @@ impl DownloadTask {
                 .filter(|&bps| bps > 0)
                 .map(|bps| Arc::new(RateLimiter::new(bps)))
         });
+        let circuit_breakers = self.circuit_breakers.clone();
+        let metrics = self.metrics.clone();
         tracing::info!(
             has_progress_tx = progress_tx.is_some(),
             frag_count = self.fragments.len(),
@@ -1190,17 +760,42 @@ impl DownloadTask {
             let frag_limiter = rate_limiter.clone();
             let frag_control_rx = control_rx.clone();
             let frag_progress_tx = progress_tx.clone();
+            let frag_metrics = metrics.clone();
+
+            let frag_circuit_breakers = circuit_breakers.clone();
 
             if frag_index as usize >= self.fragments.len() {
                 return Err(DownloadError::Config("分片索引越界".into()));
             }
-            self.fragments[frag_index as usize].start_download();
+            self.fragments[frag_index as usize].start_download()?;
+            if let Some(ref m) = metrics {
+                m.inc_fragment();
+            }
 
             handles.spawn(async move {
                 // spawn 内部重试循环:单次尝试失败后指数退避重试,
                 // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
                 let mut attempt: u32 = 0;
                 loop {
+                    // 熔断器检查:若源已被熔断,直接跳过本次尝试
+                    if !frag_circuit_breakers.allow(&frag_url) {
+                        if attempt >= max_retries {
+                            return Err((
+                                frag_index,
+                                DownloadError::Network(format!("源 {frag_url} 已被熔断,跳过重试")),
+                            ));
+                        }
+                        warn!(
+                            index = frag_index,
+                            attempt = attempt + 1,
+                            source = %frag_url,
+                            "源处于熔断状态,跳过本次尝试"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        attempt += 1;
+                        continue;
+                    }
+
                     let permit = match frag_semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(e) => {
@@ -1229,14 +824,23 @@ impl DownloadTask {
 
                     match result {
                         Ok((downloaded, duration)) => {
+                            frag_circuit_breakers.record_success(&frag_url);
                             return Ok((frag_index, downloaded, duration));
                         }
                         Err(e) => {
                             // 不可重试的错误(取消、超时、权限、校验等)直接上报
                             if !e.is_retryable() {
+                                if let Some(ref m) = frag_metrics {
+                                    m.inc_error();
+                                }
+                                frag_circuit_breakers.record_failure(&frag_url);
                                 return Err((frag_index, e));
                             }
                             if attempt >= max_retries {
+                                if let Some(ref m) = frag_metrics {
+                                    m.inc_error();
+                                }
+                                frag_circuit_breakers.record_failure(&frag_url);
                                 return Err((frag_index, e));
                             }
                             // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
@@ -1270,6 +874,7 @@ impl DownloadTask {
                                 error = %e,
                                 "分片下载失败,退避后重试"
                             );
+                            frag_circuit_breakers.record_failure(&frag_url);
                             tokio::time::sleep(backoff).await;
                             attempt += 1;
                         }
@@ -1304,7 +909,11 @@ impl DownloadTask {
             };
 
             let frag = &mut self.fragments[index as usize];
-            frag.complete_download_fast(downloaded, duration);
+            frag.complete_download_fast(downloaded, duration)?;
+
+            if let Some(ref m) = self.metrics {
+                m.add_bytes(downloaded);
+            }
 
             // 将带宽数据反馈给调度器
             if let Some(duration) = frag.last_duration {
@@ -1492,12 +1101,14 @@ impl DownloadTask {
                     limiter.acquire(w).await;
                 }
                 if let Some(tx) = progress_tx
-                    && chunk_count.is_multiple_of(5)
+                    && chunk_count.is_multiple_of(PROGRESS_REPORT_CHUNK_INTERVAL)
                 {
                     let _ = tx.try_send(FragmentProgress {
                         fragment_index: frag_index,
                         completed: false,
                         fragment_downloaded: total_written,
+                    }).map_err(|e| {
+                        tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
                     });
                     tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
                 }
@@ -1535,12 +1146,16 @@ impl DownloadTask {
         let elapsed = start_instant.elapsed();
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
-        if let Some(tx) = progress_tx {
-            let _ = tx.try_send(FragmentProgress {
-                fragment_index: frag_index,
-                completed: true,
-                fragment_downloaded: total_written,
-            });
+        if let Some(tx) = progress_tx
+            && let Err(e) = tx
+                .send(FragmentProgress {
+                    fragment_index: frag_index,
+                    completed: true,
+                    fragment_downloaded: total_written,
+                })
+                .await
+        {
+            warn!(index = frag_index, error = %e, "分片完成进度事件发送失败");
         }
 
         info!(
@@ -1572,9 +1187,11 @@ impl DownloadTask {
             .as_ref()
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
 
+        let mut has_expected_hash = false;
         for frag in &self.fragments {
             if let Some(ref expected_hash) = frag.info.hash {
-                let chunk_size = 1024 * 1024;
+                has_expected_hash = true;
+                let chunk_size = VERIFY_HASH_CHUNK_SIZE;
                 let mut offset = frag.info.start;
                 let end = frag.info.start + frag.info.size;
                 let mut buf = vec![0u8; chunk_size];
@@ -1606,6 +1223,11 @@ impl DownloadTask {
             }
         }
 
+        if !has_expected_hash {
+            self.state = DownloadState::Failed;
+            return Err(DownloadError::NoExpectedChecksum);
+        }
+
         info!("文件完整性校验通过");
         Ok(())
     }
@@ -1631,10 +1253,20 @@ impl DownloadTask {
     }
 
     fn apply_terminal_error(&mut self, error: &DownloadError) {
-        if matches!(error, DownloadError::Cancelled) || self.state == DownloadState::Cancelled {
-            self.state = DownloadState::Cancelled;
+        let target = if matches!(error, DownloadError::Cancelled)
+            || self.state == DownloadState::Cancelled
+        {
+            DownloadState::Cancelled
         } else {
-            self.state = DownloadState::Failed;
+            DownloadState::Failed
+        };
+        match self.state.try_transition(target) {
+            Ok(new_state) => self.state = new_state,
+            Err(_) => {
+                // 终态强制转换:非标准路径(如 Pending->Failed)时直接赋值
+                warn!(from = ?self.state, to = ?target, "非标准状态转换(终态强制)");
+                self.state = target;
+            }
         }
     }
 
@@ -1786,11 +1418,17 @@ impl DownloadTask {
 mod tests {
     use super::*;
     use crate::fragment::FragmentState;
+    use crate::storage_adapter::AsyncMemWrapper;
     use bytes::Bytes;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::time::Duration;
-    use tachyon_core::test_harness::harness::{test_config, test_metadata};
+    use tachyon_core::test_harness::harness::{
+        MemoryStorage as MemStorage, test_config, test_metadata,
+    };
     use tachyon_core::traits::{ByteStream, Verifier as VerifierTrait};
+    use tachyon_io::storage::AsyncStorage;
 
     /// 辅助函数:创建带 mock 协议和存储的测试任务
     fn make_task(
@@ -2533,6 +2171,46 @@ mod tests {
             result.unwrap_err(),
             DownloadError::ChecksumMismatch { .. }
         ));
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_verify_enabled_without_expected_hash_fails() {
+        let data = Bytes::from_static(b"missing expected checksum");
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: None,
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata(
+            "no-hash.bin",
+            data.len() as u64,
+        )));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                ..test_config()
+            },
+        );
+
+        task.storage
+            .as_ref()
+            .unwrap()
+            .write_at(0, data.clone())
+            .await
+            .unwrap();
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("no-hash.bin", data.len() as u64));
+
+        let result = task.verify().await;
+
+        assert!(matches!(result, Err(DownloadError::NoExpectedChecksum)));
         assert_eq!(task.state(), DownloadState::Failed);
     }
 
@@ -3634,6 +3312,38 @@ mod tests {
 
     // ------ 补充: DownloadTask::progress() 正确性(更多场景) ------
 
+    #[tokio::test]
+    async fn test_unknown_size_full_download_respects_max_full_stream_bytes() {
+        let data = Bytes::from_static(b"too large");
+        let meta = FileMetadata {
+            file_name: "unknown.bin".into(),
+            file_size: None,
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
+        let storage = StorageKind::memory();
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: false,
+                max_full_stream_bytes: 4,
+                ..test_config()
+            },
+        );
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        let result = task.execute().await;
+
+        let err = result.expect_err("未知大小 full-stream 超过上限应失败");
+        assert!(err.to_string().contains("超过上限"));
+    }
+
     /// 验证 progress() 在多种分片状态下的准确性
     #[test]
     fn test_progress_various_fragment_states() {
@@ -3734,20 +3444,22 @@ mod tests {
         let mut record = FragmentRecord::new(info, 3);
         assert_eq!(record.state, FragmentState::Pending);
 
-        record.start_download();
+        record.start_download().unwrap();
         assert_eq!(record.state, FragmentState::Downloading);
         assert!(!record.is_done());
         assert!(!record.is_failed());
 
-        record.complete_download(1000, Duration::from_millis(50));
+        record
+            .complete_download(1000, Duration::from_millis(50))
+            .unwrap();
         assert_eq!(record.state, FragmentState::Verifying);
         assert_eq!(record.info.downloaded, 1000);
         assert!(record.last_duration.is_some());
 
-        record.verify_ok();
+        record.verify_ok().unwrap();
         assert_eq!(record.state, FragmentState::Writing);
 
-        record.write_done();
+        record.write_done().unwrap();
         assert_eq!(record.state, FragmentState::Done);
         assert!(record.is_done());
     }
@@ -3765,19 +3477,19 @@ mod tests {
         };
         let mut record = FragmentRecord::new(info, 1); // 最多重试 1 次
 
-        record.start_download();
+        record.start_download().unwrap();
         assert_eq!(record.state, FragmentState::Downloading);
 
         // 第一次失败:可以重试
-        let can_retry = record.mark_failed();
+        let can_retry = record.mark_failed().unwrap();
         assert!(can_retry, "首次失败应可重试");
         assert_eq!(record.state, FragmentState::Pending);
         assert_eq!(record.retry_count, 1);
 
-        record.start_download();
+        record.start_download().unwrap();
 
         // 第二次失败:超过重试次数
-        let can_retry = record.mark_failed();
+        let can_retry = record.mark_failed().unwrap();
         assert!(!can_retry, "超过重试次数应不可重试");
         assert_eq!(record.state, FragmentState::Failed);
         assert!(record.is_failed());
@@ -3798,20 +3510,24 @@ mod tests {
 
         // 从 Verifying 阶段失败
         let mut record = FragmentRecord::new(info.clone(), 3);
-        record.start_download();
-        record.complete_download(4, Duration::from_millis(5));
+        record.start_download().unwrap();
+        record
+            .complete_download(4, Duration::from_millis(5))
+            .unwrap();
         assert_eq!(record.state, FragmentState::Verifying);
-        let can_retry = record.mark_failed();
+        let can_retry = record.mark_failed().unwrap();
         assert!(can_retry);
         assert_eq!(record.state, FragmentState::Pending);
 
         // 从 Writing 阶段失败
         let mut record = FragmentRecord::new(info, 3);
-        record.start_download();
-        record.complete_download(4, Duration::from_millis(5));
-        record.verify_ok();
+        record.start_download().unwrap();
+        record
+            .complete_download(4, Duration::from_millis(5))
+            .unwrap();
+        record.verify_ok().unwrap();
         assert_eq!(record.state, FragmentState::Writing);
-        let can_retry = record.mark_failed();
+        let can_retry = record.mark_failed().unwrap();
         assert!(can_retry);
         assert_eq!(record.state, FragmentState::Pending);
     }
@@ -4332,6 +4048,113 @@ mod tests {
     }
 
     // ── MirrorProtocol 测试 ──
+
+    /// probe 可人为延迟且下载返回固定数据的 mock 协议
+    #[derive(Clone)]
+    struct ProbeSelectedSourceProtocol {
+        meta: FileMetadata,
+        probe_delay: Duration,
+        range_data: Bytes,
+        full_data: Bytes,
+    }
+
+    impl Protocol for ProbeSelectedSourceProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            let delay = self.probe_delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(meta)
+            })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            let data = self.range_data.clone();
+            Box::pin(async move { Ok(data) })
+        }
+
+        fn download_range_stream(
+            &self,
+            url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
+        {
+            let this = self.clone();
+            let url = url.to_owned();
+            Box::pin(async move {
+                let data = this.download_range(&url, start, end).await?;
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            let data = self.full_data.clone();
+            Box::pin(async move { Ok(data) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mirror_downloads_use_probe_selected_source() {
+        use super::MirrorProtocol;
+
+        let primary: Arc<dyn Protocol> = Arc::new(ProbeSelectedSourceProtocol {
+            meta: test_metadata("primary.bin", 12),
+            probe_delay: Duration::from_millis(50),
+            range_data: Bytes::from_static(b"primary-range"),
+            full_data: Bytes::from_static(b"primary-full"),
+        });
+        let mirror: Arc<dyn Protocol> = Arc::new(ProbeSelectedSourceProtocol {
+            meta: test_metadata("mirror.bin", 11),
+            probe_delay: Duration::from_millis(0),
+            range_data: Bytes::from_static(b"mirror-range"),
+            full_data: Bytes::from_static(b"mirror-full"),
+        });
+        let protocol: Arc<dyn Protocol> = Arc::new(MirrorProtocol::new(
+            primary,
+            vec![("http://mirror1.com/file.bin".into(), mirror)],
+        ));
+
+        let metadata = protocol.probe("http://primary.com/file.bin").await.unwrap();
+        assert_eq!(metadata.file_name, "mirror.bin");
+
+        let full = protocol
+            .download_full("http://primary.com/file.bin")
+            .await
+            .unwrap();
+        assert_eq!(full, Bytes::from_static(b"mirror-full"));
+
+        let range = protocol
+            .download_range("http://primary.com/file.bin", 0, 11)
+            .await
+            .unwrap();
+        assert_eq!(range, Bytes::from_static(b"mirror-range"));
+
+        let mut stream = protocol
+            .download_range_stream("http://primary.com/file.bin", 0, 11)
+            .await
+            .unwrap();
+        let chunk = tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, Bytes::from_static(b"mirror-range"));
+        assert!(tokio_stream::StreamExt::next(&mut stream).await.is_none());
+    }
 
     /// 始终返回网络错误的 mock 协议
     struct AlwaysFailProtocol {

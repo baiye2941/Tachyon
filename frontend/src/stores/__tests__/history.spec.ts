@@ -44,8 +44,8 @@ describe('HistoryStore 历史记录存储', () => {
     })
 
     expect(historyStore.records).toHaveLength(1)
-    expect(historyStore.records[0].fileName).toBe('file.zip')
-    expect(historyStore.records[0].status).toBe('completed')
+    expect(historyStore.records[0]?.fileName).toBe('file.zip')
+    expect(historyStore.records[0]?.status).toBe('completed')
   })
 
   it('自动分配唯一 ID 和时间戳', () => {
@@ -59,10 +59,10 @@ describe('HistoryStore 历史记录存储', () => {
     })
 
     const record = historyStore.records[0]
-    expect(record.id).toBeDefined()
-    expect(record.id.length).toBeGreaterThan(0)
-    expect(record.completedAt).toBeDefined()
-    expect(typeof record.completedAt).toBe('string')
+    expect(record?.id).toBeDefined()
+    expect(record!.id.length).toBeGreaterThan(0)
+    expect(record?.completedAt).toBeDefined()
+    expect(typeof record!.completedAt).toBe('string')
   })
 
   it('记录保存到 localStorage', () => {
@@ -100,7 +100,7 @@ describe('HistoryStore 历史记录存储', () => {
     vi.resetModules()
     const mod = await import('../history')
     expect(mod.historyRecords).toHaveLength(1)
-    expect(mod.historyRecords[0].id).toBe('test-1')
+    expect(mod.historyRecords[0]?.id).toBe('test-1')
   })
 
   it('环形缓冲区限制 100 条记录', () => {
@@ -116,8 +116,8 @@ describe('HistoryStore 历史记录存储', () => {
     }
 
     expect(historyStore.records).toHaveLength(100)
-    expect(historyStore.records[0].fileName).toBe('file104.zip')
-    expect(historyStore.records[99].fileName).toBe('file5.zip')
+    expect(historyStore.records[0]?.fileName).toBe('file104.zip')
+    expect(historyStore.records[99]?.fileName).toBe('file5.zip')
   })
 
   it('新记录插入到队列头部', () => {
@@ -138,8 +138,8 @@ describe('HistoryStore 历史记录存储', () => {
       avgSpeed: 50,
     })
 
-    expect(historyStore.records[0].fileName).toBe('second.zip')
-    expect(historyStore.records[1].fileName).toBe('first.zip')
+    expect(historyStore.records[0]?.fileName).toBe('second.zip')
+    expect(historyStore.records[1]?.fileName).toBe('first.zip')
   })
 
   it('清除历史记录', () => {
@@ -167,7 +167,7 @@ describe('HistoryStore 历史记录存储', () => {
       avgSpeed: 100,
     })
 
-    const id = historyStore.records[0].id
+    const id = historyStore.records[0]!.id
     const found = historyStore.getRecordById(id)
     expect(found).toBeDefined()
     expect(found!.fileName).toBe('target.zip')
@@ -212,7 +212,7 @@ describe('HistoryStore 过滤功能', () => {
   it('cancelled 过滤只返回已取消', () => {
     const result = historyStore.getRecords('cancelled')
     expect(result).toHaveLength(1)
-    expect(result[0].status).toBe('cancelled')
+    expect(result[0]?.status).toBe('cancelled')
   })
 })
 

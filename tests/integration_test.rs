@@ -250,14 +250,16 @@ async fn integration_fragment_lifecycle_with_verification() {
     let mut record = FragmentRecord::new(info, 3);
 
     // Pending -> Downloading
-    record.start_download();
+    record.start_download().expect("start_download 应成功");
     assert_eq!(record.state, FragmentState::Downloading);
 
     // 下载数据
     let data = Bytes::from(vec![42u8; 1000]);
 
     // Downloading -> Verifying
-    record.complete_download(data.len() as u64, std::time::Duration::from_millis(50));
+    record
+        .complete_download(data.len() as u64, std::time::Duration::from_millis(50))
+        .expect("complete_download 应成功");
     assert_eq!(record.state, FragmentState::Verifying);
     assert_eq!(record.info.downloaded, 1000);
 
@@ -269,7 +271,7 @@ async fn integration_fragment_lifecycle_with_verification() {
     record.info.hash = Some(hash.clone());
 
     // Verifying -> Writing
-    record.verify_ok();
+    record.verify_ok().expect("verify_ok 应成功");
     assert_eq!(record.state, FragmentState::Writing);
 
     // 写入存储
@@ -278,7 +280,7 @@ async fn integration_fragment_lifecycle_with_verification() {
     storage.write_at(0, data.clone()).await.unwrap();
 
     // Writing -> Done
-    record.write_done();
+    record.write_done().expect("write_done 应成功");
     assert!(record.is_done());
 
     // 最终验证: 存储数据与分片哈希一致
@@ -288,6 +290,9 @@ async fn integration_fragment_lifecycle_with_verification() {
 }
 
 /// 测试多分片并发写入 + 校验
+///
+/// L-17: 使用 tokio::spawn 实现真正的并发写入,而非顺序循环。
+/// 各分片在不同 tokio task 中并行执行 write_at,验证 MemoryStorage 的 Mutex 互斥正确性。
 #[tokio::test]
 async fn integration_multi_fragment_concurrent() {
     let verifier = CpuVerifier::blake3();
@@ -298,19 +303,25 @@ async fn integration_multi_fragment_concurrent() {
     let storage = MemoryStorage::with_capacity(total_size as usize);
     storage.allocate(total_size).await.unwrap();
 
-    // 模拟并发写入(顺序化执行,但模拟并发逻辑)
-    let mut handles = Vec::new();
+    // L-17: 真正的并发写入 — 每个分片在独立的 tokio task 中执行
+    let mut write_handles = Vec::new();
     for frag in &fragments {
         let frag = frag.clone();
+        let storage = storage.clone();
         let data = vec![frag.index as u8; frag.size as usize];
-        handles.push((frag, data));
+        write_handles.push(tokio::spawn(async move {
+            storage
+                .write_at(frag.start, Bytes::copy_from_slice(&data))
+                .await
+                .unwrap();
+            (frag, data)
+        }));
     }
 
-    for (frag, data) in &handles {
-        storage
-            .write_at(frag.start, Bytes::copy_from_slice(data))
-            .await
-            .unwrap();
+    // 等待所有写入完成并收集结果
+    let mut handles = Vec::new();
+    for handle in write_handles {
+        handles.push(handle.await.unwrap());
     }
 
     // 校验每个分片
@@ -341,22 +352,24 @@ async fn integration_fragment_retry_and_verify() {
     let mut record = FragmentRecord::new(info, 3);
 
     // 第一次尝试: 失败
-    record.start_download();
-    assert!(record.mark_failed());
+    record.start_download().expect("start_download 应成功");
+    assert!(record.mark_failed().expect("mark_failed 应返回 true"));
     assert_eq!(record.state, FragmentState::Pending);
     assert_eq!(record.retry_count, 1);
 
     // 第二次尝试: 成功
-    record.start_download();
+    record.start_download().expect("start_download 应成功");
     let data = Bytes::from(vec![7u8; 100]);
-    record.complete_download(data.len() as u64, std::time::Duration::from_millis(10));
+    record
+        .complete_download(data.len() as u64, std::time::Duration::from_millis(10))
+        .expect("complete_download 应成功");
     assert_eq!(record.state, FragmentState::Verifying);
 
     // 校验
     let hash = verifier.compute_hash(&data).unwrap();
     assert!(verifier.verify(&data, &hash).is_ok());
-    record.verify_ok();
-    record.write_done();
+    record.verify_ok().expect("verify_ok 应成功");
+    record.write_done().expect("write_done 应成功");
     assert!(record.is_done());
 }
 

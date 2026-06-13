@@ -63,7 +63,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
     const items = filtered()
     const idx = activeIndex()
     if (idx >= 0 && idx < items.length) {
-      items[idx].action()
+      items[idx]?.action()
     }
   }
 

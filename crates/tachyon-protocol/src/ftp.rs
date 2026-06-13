@@ -154,27 +154,37 @@ impl FtpClient {
         let stripped = normalized_host
             .trim_start_matches('[')
             .trim_end_matches(']');
-        if let Ok(ip) = stripped.parse::<IpAddr>() {
+        // W-13: DNS Rebinding 防护 — 必须先解析并验证 IP,再用已验证 IP 连接
+        // 关键: 不能将原始域名传给 suppaftp,否则其内部会再次 DNS 解析,
+        // 攻击者可在两次解析之间修改 DNS 记录 (DNS rebinding) 绕过 SSRF 防护
+        let addr = if let Ok(ip) = stripped.parse::<IpAddr>() {
             reject_forbidden_ip(ip).map_err(|e| DownloadError::Protocol(e.to_string()))?;
+            format!("{ip}:{port}")
         } else {
-            // W-13: DNS Rebinding 防护 — 域名需要先解析再检查 IP
-            // 在 TCP 连接前执行 DNS 解析,对每个解析出的 IP 调用 reject_forbidden_ip
             use std::net::ToSocketAddrs;
             let addrs = format!("{stripped}:{port}")
                 .to_socket_addrs()
                 .map_err(|e| DownloadError::Network(format!("FTP DNS 解析失败: {e}")))?;
+            let mut validated: Option<IpAddr> = None;
             let mut resolved_count = 0u32;
             for addr in addrs {
                 reject_forbidden_ip(addr.ip())
                     .map_err(|e| DownloadError::Protocol(format!("FTP DNS Rebinding 拦截: {e}")))?;
+                // 保留第一个已验证的 IP 用于连接,消除 TOCTOU 窗口
+                if validated.is_none() {
+                    validated = Some(addr.ip());
+                }
                 resolved_count += 1;
             }
             if resolved_count == 0 {
                 return Err(DownloadError::Network("FTP DNS 解析无结果".into()));
             }
-        }
+            match validated {
+                Some(ip) => format!("{ip}:{port}"),
+                None => format!("{host}:{port}"),
+            }
+        };
 
-        let addr = format!("{host}:{port}");
         let stream = AsyncFtpStream::connect(&addr)
             .await
             .map_err(|e| DownloadError::Network(format!("FTP 连接失败: {e}")))?;
@@ -1132,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_ftp_protocol_probe_returns_error_for_unreachable() {
         let client = FtpClient::new();
-        let result = client.probe("ftp://192.0.2.1:1/file.zip").await;
+        let result = client.probe("ftp://8.8.4.4:1/file.zip").await;
         assert!(result.is_err(), "不可达服务器 probe 应返回错误");
     }
 
@@ -1140,7 +1150,7 @@ mod tests {
     async fn test_ftp_protocol_download_range_returns_error_for_unreachable() {
         let client = FtpClient::new();
         let result = client
-            .download_range("ftp://192.0.2.1:1/file.zip", 0, 1023)
+            .download_range("ftp://8.8.4.4:1/file.zip", 0, 1023)
             .await;
         assert!(result.is_err(), "不可达服务器 download_range 应返回错误");
     }
@@ -1148,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn test_ftp_protocol_download_full_returns_error_for_unreachable() {
         let client = FtpClient::new();
-        let result = client.download_full("ftp://192.0.2.1:1/file.zip").await;
+        let result = client.download_full("ftp://8.8.4.4:1/file.zip").await;
         assert!(result.is_err(), "不可达服务器 download_full 应返回错误");
     }
 
@@ -1191,7 +1201,7 @@ mod tests {
     async fn test_file_size_formatting_in_error_message() {
         // 验证 Protocol 方法在不可达地址上生成包含有意义上下文的错误消息
         let client = FtpClient::new();
-        let result = client.probe("ftp://192.0.2.1:1/large-file.bin").await;
+        let result = client.probe("ftp://8.8.4.4:1/large-file.bin").await;
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
@@ -1267,7 +1277,7 @@ mod tests {
     #[tokio::test]
     async fn test_error_message_connect_unreachable() {
         let client = FtpClient::new();
-        let result = client.connect("192.0.2.1", 1).await;
+        let result = client.connect("8.8.4.4", 1).await;
         assert!(result.is_err());
 
         let msg = result.unwrap_err().to_string();

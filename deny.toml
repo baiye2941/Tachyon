@@ -8,8 +8,12 @@ all-features = true
 [advisories]
 # 使用 RustSec 漏洞数据库
 version = 2
-# 忽略的已知漏洞(如需添加,格式如下)
-# ignore = ["RUSTSEC-2024-XXXX"]
+# 忽略的已知漏洞
+# M-22: glib unsound (RUSTSEC-2024-0429) — gtk-rs GTK3 绑定不再维护,
+# glib 存在已确认的 unsound 缺陷。Tauri v2 在 Linux 上依赖 GTK3/WebKitGTK,
+# 无法主动解决。等待 Tauri v3 迁移到 GTK4 后移除此条目。
+# 注意: 此条目仅在 Linux 目标构建时生效(Windows/MacOS 依赖树中不含 glib)。
+ignore = ["RUSTSEC-2024-0429"]
 
 [licenses]
 version = 2

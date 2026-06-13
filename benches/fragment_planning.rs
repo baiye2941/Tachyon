@@ -30,12 +30,7 @@ fn make_fragment(index: u32, size: u64) -> FragmentInfo {
 
 /// 构造 ScheduledTask
 fn make_task(priority: Priority, size: u64, progress: f64) -> ScheduledTask {
-    ScheduledTask {
-        task_id: tachyon_core::TaskId::new_v4(),
-        priority,
-        file_size: size,
-        progress,
-    }
+    ScheduledTask::new(tachyon_core::TaskId::new_v4(), priority, size, progress)
 }
 
 // ---------- 分片大小计算 ----------
@@ -203,10 +198,10 @@ fn bench_fragment_state_machine(c: &mut Criterion) {
         b.iter(|| {
             let info = make_fragment(0, 64 * 1024);
             let mut record = FragmentRecord::new(info, 3);
-            record.start_download();
-            record.complete_download(14, Duration::from_millis(50));
-            record.verify_ok();
-            record.write_done();
+            let _ = record.start_download();
+            let _ = record.complete_download(14, Duration::from_millis(50));
+            let _ = record.verify_ok();
+            let _ = record.write_done();
             assert!(record.is_done());
         });
     });

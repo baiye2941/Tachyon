@@ -1,8 +1,8 @@
-//! DHT 节点类型、XOR 距离度量和常量定义
+//! DHT 节点类型、XOR 距离度量和密钥身份定义
 
-use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, SystemTime};
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -76,24 +76,178 @@ pub fn leading_zeros(distance: &NodeId) -> u32 {
 
 /// 随机生成 160-bit 节点 ID
 ///
-/// 使用系统随机种子生成伪随机 ID。不依赖外部 `rand` crate。
+/// M-25 修复: 使用 OS CSPRNG (getrandom) 生成节点 ID,
+/// 替代之前基于 SipHash/RandomState 的伪随机方案。
+/// DHT 安全性依赖 NodeId 不可预测性,必须使用密码学安全的随机源。
+///
+/// # Deprecated
+/// 推荐使用 [`NodeIdentity::generate()`] 生成密钥对,
+/// NodeId 从 Ed25519 公钥派生,支持非对称签名验证。
 #[must_use]
 pub fn generate_node_id() -> NodeId {
-    use std::collections::hash_map::RandomState;
-    let rb = RandomState::new();
     let mut id = [0u8; 20];
-    // 利用 SipHash 的随机种子填充 160-bit ID
-    // RandomState 每次实例化使用不同的 OS 随机种子
-    for chunk in id.chunks_mut(8) {
-        let mut hasher = rb.build_hasher();
-        hasher.write_u64(chunk.len() as u64);
-        let val = hasher.finish();
-        let bytes = val.to_le_bytes();
-        for (j, b) in chunk.iter_mut().enumerate() {
-            *b = bytes[j];
+    getrandom::fill(&mut id).expect("OS CSPRNG 不可用,无法生成安全的 NodeId");
+    id
+}
+
+// ============================================================
+// H-3: Ed25519 非对称签名身份
+// ============================================================
+
+/// 从 Ed25519 公钥派生 NodeId
+///
+/// NodeId = BLAKE3(public_key_bytes)[..20]
+/// 这保证了 NodeId 与公钥的绑定关系——验证方可以从公钥重新计算 NodeId
+/// 并与消息中的 sender_id 比对,防止伪造。
+#[must_use]
+pub fn public_key_to_node_id(public_key: &[u8; 32]) -> NodeId {
+    let hash = blake3::hash(public_key);
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&hash.as_bytes()[..20]);
+    id
+}
+
+/// DHT 节点身份：Ed25519 密钥对 + 派生的 NodeId
+///
+/// H-3 修复: 使用 Ed25519 非对称签名替代 BLAKE3 对称 MAC。
+/// 每个 DHT 节点持有唯一的 Ed25519 密钥对:
+/// - **签名**: 使用私钥对消息签名,任何持有公钥的节点可验证
+/// - **NodeId**: 从公钥派生 (`blake3(public_key)[..20]`),保证不可伪造
+///
+/// 与旧方案(BLAKE3 keyed hash, key = 公开的 NodeId)不同,
+/// Ed25519 签名的私钥仅由节点自身持有,攻击者无法伪造来自其他节点的消息。
+pub struct NodeIdentity {
+    /// Ed25519 签名私钥
+    signing_key: SigningKey,
+    /// 派生的 NodeId = blake3(verifying_key)[..20]
+    node_id: NodeId,
+}
+
+impl NodeIdentity {
+    /// 生成随机 Ed25519 密钥对并派生 NodeId
+    ///
+    /// 使用 OS CSPRNG 生成密钥,保证不可预测性。
+    /// NodeId 自动从公钥派生,无需手动指定。
+    #[must_use]
+    pub fn generate() -> Self {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let node_id = public_key_to_node_id(verifying_key.as_bytes());
+        Self {
+            signing_key,
+            node_id,
         }
     }
-    id
+
+    /// 从 32 字节种子恢复密钥对
+    ///
+    /// 用于从持久化存储中恢复节点身份。
+    /// 相同的种子总是产生相同的密钥对和 NodeId。
+    #[must_use]
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(seed);
+        let verifying_key = signing_key.verifying_key();
+        let node_id = public_key_to_node_id(verifying_key.as_bytes());
+        Self {
+            signing_key,
+            node_id,
+        }
+    }
+
+    /// 获取节点 ID (160-bit, 从公钥派生)
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// 获取签名私钥引用
+    #[must_use]
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    /// 获取验证公钥
+    #[must_use]
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// 对消息签名,返回 Ed25519 签名
+    ///
+    /// 签名包含 64 字节 Ed25519 签名和 32 字节公钥,
+    /// 验证方可以用公钥验证签名并确认 NodeId 绑定。
+    #[must_use]
+    pub fn sign(&self, message: &[u8]) -> DhtSignature {
+        let sig = self.signing_key.sign(message);
+        let public_key = *self.signing_key.verifying_key().as_bytes();
+        DhtSignature {
+            sig: sig.to_bytes(),
+            public_key,
+        }
+    }
+}
+
+/// H-3: DHT 消息的 Ed25519 非对称签名
+///
+/// 包含 Ed25519 签名(64 字节)和签名者的公钥(32 字节)。
+/// 公钥随签名传输,验证方可以:
+/// 1. 从公钥派生 NodeId,与消息的 sender_id 比对
+/// 2. 使用公钥验证签名
+///
+/// 这保证了消息确实由持有私钥的节点发出,防止身份伪造。
+///
+/// 序列化使用 postcard 二进制格式,`sig` 和 `public_key` 以字节向量传输。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtSignature {
+    /// Ed25519 签名 (64 字节)
+    pub sig: [u8; 64],
+    /// 签名者的 Ed25519 公钥 (32 字节)
+    pub public_key: [u8; 32],
+}
+
+impl Serialize for DhtSignature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // 使用两字段的元组序列化,避免 [u8; 64] 的 serde 限制
+        (&self.sig[..], &self.public_key[..]).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DhtSignature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (sig_vec, pk_vec): (Vec<u8>, Vec<u8>) = Deserialize::deserialize(deserializer)?;
+        let sig: [u8; 64] = sig_vec
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("DhtSignature.sig 长度必须为 64 字节"))?;
+        let public_key: [u8; 32] = pk_vec
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("DhtSignature.public_key 长度必须为 32 字节"))?;
+        Ok(Self { sig, public_key })
+    }
+}
+
+impl DhtSignature {
+    /// 使用公钥验证签名,并校验 NodeId 绑定
+    ///
+    /// 验证步骤:
+    /// 1. 从 `public_key` 派生 NodeId,与 `expected_sender_id` 比对
+    /// 2. 使用 `public_key` 验证 `sig` 对 `message` 的有效性
+    ///
+    /// 两步都必须通过,防止攻击者用自己的密钥签名并声称是其他节点。
+    pub fn verify(&self, message: &[u8], expected_sender_id: &NodeId) -> bool {
+        // 步骤 1: 公钥与 NodeId 绑定校验
+        let derived_id = public_key_to_node_id(&self.public_key);
+        if derived_id != *expected_sender_id {
+            return false;
+        }
+
+        // 步骤 2: Ed25519 签名验证
+        let verifying_key = match VerifyingKey::from_bytes(&self.public_key) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&self.sig);
+        verifying_key.verify(message, &signature).is_ok()
+    }
 }
 
 // ============================================================

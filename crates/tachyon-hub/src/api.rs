@@ -119,3 +119,95 @@ impl HubApi {
         lfs::build_resolve_url(&self.endpoint, repo_id, revision, file_path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M-17: with_endpoint 构造测试
+    #[test]
+    fn test_with_endpoint() {
+        let api = HubApi::with_endpoint("https://hf-mirror.com".to_string());
+        assert_eq!(api.endpoint(), "https://hf-mirror.com");
+    }
+
+    /// M-17: endpoint 访问器测试
+    #[test]
+    fn test_endpoint_accessor() {
+        let api = HubApi::with_endpoint("https://custom-hub.example.com".to_string());
+        assert_eq!(api.endpoint(), "https://custom-hub.example.com");
+    }
+
+    /// M-17: 无 token 时 is_authenticated 返回 false
+    #[test]
+    fn test_is_authenticated_without_token() {
+        // 清除环境变量以避免干扰
+        let _guard = test_env_guard();
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string());
+        // 无 HF_TOKEN 时应为 false
+        assert!(!api.is_authenticated());
+    }
+
+    /// M-17: download_url 正确拼接 LFS resolve URL
+    #[test]
+    fn test_download_url() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string());
+        let url = api.download_url("bert-base-uncased", "main", "config.json");
+        assert_eq!(
+            url,
+            "https://huggingface.co/bert-base-uncased/resolve/main/config.json"
+        );
+    }
+
+    /// M-17: download_url 使用自定义 endpoint
+    #[test]
+    fn test_download_url_custom_endpoint() {
+        let api = HubApi::with_endpoint("https://hf-mirror.com".to_string());
+        let url = api.download_url("gpt2", "v1.0", "model.safetensors");
+        assert_eq!(
+            url,
+            "https://hf-mirror.com/gpt2/resolve/v1.0/model.safetensors"
+        );
+    }
+
+    /// M-17: download_url 带子路径的文件
+    #[test]
+    fn test_download_url_nested_path() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string());
+        let url = api.download_url("org/model", "main", "subdir/file.bin");
+        assert_eq!(
+            url,
+            "https://huggingface.co/org/model/resolve/main/subdir/file.bin"
+        );
+    }
+
+    /// 环境变量隔离守卫
+    ///
+    /// 测试期间移除 HF_TOKEN,测试结束后恢复原值。
+    /// 使用 RAII 模式确保恢复。
+    fn test_env_guard() -> EnvGuard {
+        let original = std::env::var("HF_TOKEN").ok();
+        // Safety: 测试代码中临时修改环境变量,仅用于隔离测试环境
+        unsafe {
+            std::env::remove_var("HF_TOKEN");
+        }
+        EnvGuard { original }
+    }
+
+    struct EnvGuard {
+        original: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: 测试代码中恢复环境变量,仅用于隔离测试环境
+            unsafe {
+                if let Some(ref val) = self.original {
+                    std::env::set_var("HF_TOKEN", val);
+                } else {
+                    std::env::remove_var("HF_TOKEN");
+                }
+            }
+        }
+    }
+}

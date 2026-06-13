@@ -7,7 +7,7 @@ description = "Tachyon Tauri 应用入口"
 
 [lib]
 name = "tachyon_app_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib", "cdylib"]
 
 [[bin]]
 name = "tachyon"
@@ -25,7 +25,6 @@ tauri-build = { version = "2", features = [] }
 tachyon-core = { path = "../tachyon-core" }
 tachyon-engine = { path = "../tachyon-engine", default-features = false }
 tachyon-hub = { path = "../tachyon-hub", default-features = false }
-tachyon-scheduler = { path = "../tachyon-scheduler" }
 tachyon-sniffer = { path = "../tachyon-sniffer" }
 tachyon-store = { path = "../tachyon-store" }
 tauri.workspace = true
@@ -42,4 +41,3 @@ dashmap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-

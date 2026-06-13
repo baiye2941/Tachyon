@@ -9,7 +9,7 @@
   <a href="https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&style=flat-square&job=Miri&label=Miri" alt="Miri" /></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/edition-2024-blue?style=flat-square" alt="Edition" />
-  <img src="https://img.shields.io/badge/coverage-80%25-brightgreen?style=flat-square" alt="Coverage" />
+  <img src="https://img.shields.io/badge/coverage-90%25-brightgreen?style=flat-square" alt="Coverage" />
   <img src="https://img.shields.io/badge/clippy-0%20warnings-green?style=flat-square" alt="Clippy" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=flat-square" alt="License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square" alt="Platform" />
@@ -25,7 +25,7 @@
 | **QUIC + 0-RTT** | 基于 QUIC 协议实现零往返时间建连，自动缓存 session ticket，0-RTT 被拒时透明回退 1-RTT |
 | **MP-QUIC 多路径传输** | 单连接多路径传输框架就绪（QuicTransport 已完备，多路径聚合待集成） |
 | **多源竞速下载** | MirrorProtocol 多源并行竞速（Happy Eyeballs v2 / RFC 8305），500ms 快速超时主源，全源 JoinSet 并行 probe |
-| **零拷贝存储引擎** | io_uring SQE/CQE 全操作路径（read/write/fsync/fallocate，Linux），IOCP Overlapped I/O（Windows），write_at_aligned 对齐写入 API，WritePipeline 按实际 I/O 数精确消耗信号量 |
+| **零拷贝存储引擎** | io_uring SQE/CQE 全操作路径（read/write/fsync/fallocate，Linux），IOCP Overlapped I/O（Windows）+ OVERLAPPED 对象池复用，write_at_aligned 对齐写入 API，WritePipeline 按实际 I/O 数精确消耗信号量 |
 | **磁盘空间预分配** | Linux `fallocate` / Windows `SetFileInformationByHandle` 预分配真实磁盘块，防止 ENOSPC |
 | **流式哈希校验** | 分片数据流式 BLAKE3 增量校验，峰值内存 O(chunk) 而非 O(fragment) |
 | **P2SP 混合下载** | Kademlia DHT（6 模块拆分）+ UDP RPC（PING/FIND_NODE/FIND_VALUE/STORE），迭代查找、分布式存储、周期性 Bucket Refresh、postcard 二进制序列化（减少 50-70% 包体积） |
@@ -33,7 +33,7 @@
 | **智能调度与预测** | 基于 HoltLinearPredictor（双指数平滑）的带宽预测模型，提前分配连接资源 |
 | **协议级优化** | HTTP/HTTPS（含 HTTP/2）/ QUIC / FTP 多协议，全协议真流式下载（64KB chunk 逐块读写） |
 | **协议裁剪** | Feature Flag 控制 FTP/QUIC 编译，`--no-default-features` 仅构建 HTTP 以减小二进制体积 |
-| **限速控制** | 令牌桶算法全局下载速度限制，不占用额外带宽 |
+| **限速控制** | 无锁令牌桶全局下载速度限制，消除高并发下的锁竞争 |
 
 ## 快速开始
 
@@ -354,7 +354,7 @@ Tachyon/
 ## 测试
 
 ```bash
-# 运行全部测试（831 个测试，含单元测试 + 集成测试）
+# 运行全部测试（870+ 个测试，含单元测试 + 集成测试）
 cargo test --all
 
 # 运行指定 crate 的单元测试
@@ -375,13 +375,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 # 格式检查
 cargo fmt --all -- --check
 
-# 测试覆盖率（目标 80%+）
-cargo llvm-cov --all --fail-under-lines 80
+# 测试覆盖率（目标 90%+，排除外部服务/硬件模块）
+cargo llvm-cov --workspace --all-features --fail-under-lines 90 --summary-only \
+  --exclude tachyon-app --exclude tachyon-protocol --exclude tachyon-hub --exclude tachyon-crypto
 ```
 
 ### 测试策略
 
-项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。测试严格跟随各自模块文件，每个子模块维护独立的 `#[cfg(test)]` 测试块。当前共 **831 个测试**覆盖 11 个 crate。
+项目采用六类测试覆盖：正常路径、空值处理、边界值、并发安全、外部故障、恶意输入。使用 `proptest` 进行属性测试，`tokio::test` 进行异步测试，`mockall` 隔离外部依赖。测试严格跟随各自模块文件，每个子模块维护独立的 `#[cfg(test)]` 测试块。当前共 **870+ 个测试**覆盖 11 个 crate。
 
 ## 基准测试
 
@@ -423,10 +424,10 @@ overflow-checks = false
 | **docs** | `cargo doc --no-deps` 文档构建（零警告） |
 | **audit** | `cargo-deny check` 许可证与依赖策略 |
 | **cargo-audit** | `cargo audit` 安全漏洞扫描 |
-| **coverage** | `cargo llvm-cov` 覆盖率 ≥ 80% |
+| **coverage** | `cargo llvm-cov` 覆盖率 ≥ 90% |
 | **miri** | Miri 检测 unsafe 代码（内存安全） |
 | **bench** | Criterion 基准测试 + 性能回归检测 |
-| **frontend** | TypeScript 类型检查 + 前端构建 |
+| **frontend** | TypeScript 类型检查 + lint + test + 前端构建 |
 
 ## 贡献指南
 
@@ -436,7 +437,7 @@ overflow-checks = false
 4. 提交信息格式：`<类型>(<范围>): <简要描述>`
 5. 确保 `cargo clippy --all-targets --all-features -- -D warnings` 零警告
 6. 确保 `cargo fmt --all -- --check` 通过
-7. 新功能需附带测试，测试跟随对应模块文件，覆盖率不低于 80%
+7. 新功能需附带测试，测试跟随对应模块文件，覆盖率不低于 90%
 8. 协议层改动需验证 `--no-default-features` 编译通过
 9. 提交 Pull Request 前运行 `cargo test --all` 确保全部通过
 

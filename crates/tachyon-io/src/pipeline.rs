@@ -22,6 +22,8 @@ use tachyon_core::DownloadResult;
 pub struct WritePipeline<S: AsyncStorage> {
     storage: S,
     semaphore: Arc<Semaphore>,
+    /// 信号量初始容量,用于 clamp acquire_many 防止死锁
+    semaphore_capacity: usize,
     max_pending: usize,
     buffer_size: usize,
 }
@@ -35,6 +37,7 @@ impl<S: AsyncStorage> WritePipeline<S> {
         Self {
             storage,
             semaphore: Arc::new(Semaphore::new(capacity)),
+            semaphore_capacity: capacity,
             max_pending: 64,
             buffer_size,
         }
@@ -104,19 +107,19 @@ impl<S: AsyncStorage> WritePipeline<S> {
     /// 优化策略:
     /// 1. 按偏移排序
     /// 2. 相邻连续 segment(前一个 end_offset == 后一个 offset)合并为一次 `write_at`
-    /// 3. 最后统一 sync 一次
     ///
     /// 例如 `[(0, a), (4, b), (8, c)]` 合并为 `write_at(0, [a+b+c])`,
     /// 将 N 次 write_at 减少到 1 次。
+    ///
+    /// 注意:本方法不再自动 `sync`,需要落盘保证时由上层调用 `flush()`。
     pub async fn write_batch(&self, segments: &[(u64, &[u8])]) -> DownloadResult<usize> {
         if segments.is_empty() {
-            self.storage.sync().await?;
             return Ok(0);
         }
 
         let flush_threshold = self.max_pending * self.buffer_size;
 
-        // 按偏移排序并预计算实际 write_at 调用次数，确保信号量许可与 I/O 操作数一致
+        // 按偏移排序
         let sorted_indices: Vec<usize> = if segments.len() > 1 {
             let mut idx: Vec<usize> = (0..segments.len()).collect();
             idx.sort_unstable_by_key(|&i| segments[i].0);
@@ -125,42 +128,12 @@ impl<S: AsyncStorage> WritePipeline<S> {
             vec![0]
         };
 
-        let mut write_count: u32 = if segments.len() == 1 {
-            1
-        } else {
-            let mut count: u32 = 0;
-            let mut merged_end =
-                segments[sorted_indices[0]].0 + segments[sorted_indices[0]].1.len() as u64;
-            let mut merged_len: usize = segments[sorted_indices[0]].1.len();
-
-            for &i in &sorted_indices[1..] {
-                let (off, data) = segments[i];
-                let len = data.len() as u64;
-
-                if off == merged_end && len > 0 {
-                    merged_end += len;
-                    merged_len += data.len();
-                    if merged_len >= flush_threshold {
-                        count += 1;
-                        merged_end = off + len;
-                        merged_len = 0;
-                    }
-                } else {
-                    count += 1;
-                    merged_end = off + len;
-                    merged_len = data.len();
-                }
-            }
-            if merged_len > 0 {
-                count += 1;
-            }
-            count
-        };
-
-        // 至少获取 1 个许可，防止所有 segment 均为零长度时跳过信号量
-        if write_count == 0 {
-            write_count = 1;
-        }
+        // S-14: 统一合并规划 -- 先计算合并后的写入批次,再获取精确数量的信号量许可
+        // 旧实现中 dry-run 计数与实际执行使用独立的合并逻辑,存在 permit 计数不匹配风险
+        let batches = Self::plan_batches(segments, &sorted_indices, flush_threshold);
+        // M-6 修复: clamp write_count 不超过信号量容量,防止 acquire_many 永久阻塞
+        let raw_count = batches.len().max(1) as u32;
+        let write_count = raw_count.min(self.semaphore_capacity as u32).max(1);
 
         let _permit = self
             .semaphore
@@ -168,56 +141,70 @@ impl<S: AsyncStorage> WritePipeline<S> {
             .await
             .expect("WritePipeline 信号量不应被关闭");
 
-        let total = if segments.len() == 1 {
-            let (offset, data) = segments[0];
-            self.storage
-                .write_at(offset, Bytes::copy_from_slice(data))
-                .await?
-        } else {
-            let mut total_written: usize = 0;
-            let mut merged_start = segments[sorted_indices[0]].0;
-            let mut merged_end = merged_start + segments[sorted_indices[0]].1.len() as u64;
-            let mut merged_data: Vec<u8> = Vec::with_capacity(segments[sorted_indices[0]].1.len());
-            merged_data.extend_from_slice(segments[sorted_indices[0]].1);
+        // 按合并计划执行写入
+        let mut total_written: usize = 0;
+        for (start_offset, data) in batches {
+            total_written += self
+                .storage
+                .write_at(start_offset, Bytes::from(data))
+                .await?;
+        }
 
-            for &idx in &sorted_indices[1..] {
-                let (off, data) = segments[idx];
-                let len = data.len() as u64;
+        Ok(total_written)
+    }
 
-                if off == merged_end && len > 0 {
-                    merged_end += len;
-                    merged_data.extend_from_slice(data);
-                    if merged_data.len() >= flush_threshold {
-                        let data = std::mem::take(&mut merged_data);
-                        total_written += self
-                            .storage
-                            .write_at(merged_start, Bytes::from(data))
-                            .await?;
-                        merged_start = off + len;
-                        merged_end = merged_start;
-                    }
-                } else {
-                    let old = std::mem::take(&mut merged_data);
-                    total_written += self
-                        .storage
-                        .write_at(merged_start, Bytes::from(old))
-                        .await?;
-                    merged_start = off;
-                    merged_end = off + len;
-                    merged_data.extend_from_slice(data);
+    /// 主动将已写入数据同步到磁盘
+    pub async fn flush(&self) -> DownloadResult<()> {
+        self.storage.sync().await
+    }
+
+    /// 计算合并写入计划
+    ///
+    /// 将排序后的 segments 按连续性和 flush_threshold 合并为 (offset, data) 批次。
+    /// 此函数同时用于 permit 计数和实际执行,确保两者严格一致。
+    fn plan_batches(
+        segments: &[(u64, &[u8])],
+        sorted_indices: &[usize],
+        flush_threshold: usize,
+    ) -> Vec<(u64, Vec<u8>)> {
+        if segments.is_empty() {
+            return Vec::new();
+        }
+
+        let first_idx = sorted_indices[0];
+        let mut merged_start = segments[first_idx].0;
+        let mut merged_end = merged_start + segments[first_idx].1.len() as u64;
+        let mut merged_data: Vec<u8> = Vec::with_capacity(segments[first_idx].1.len());
+        merged_data.extend_from_slice(segments[first_idx].1);
+
+        let mut batches = Vec::new();
+
+        for &idx in &sorted_indices[1..] {
+            let (off, data) = segments[idx];
+            let len = data.len() as u64;
+
+            if off == merged_end && len > 0 {
+                merged_end += len;
+                merged_data.extend_from_slice(data);
+                if merged_data.len() >= flush_threshold {
+                    let data = std::mem::take(&mut merged_data);
+                    batches.push((merged_start, data));
+                    merged_start = off + len;
+                    merged_end = merged_start;
                 }
+            } else {
+                let old = std::mem::take(&mut merged_data);
+                batches.push((merged_start, old));
+                merged_start = off;
+                merged_end = off + len;
+                merged_data.extend_from_slice(data);
             }
-            if !merged_data.is_empty() {
-                total_written += self
-                    .storage
-                    .write_at(merged_start, Bytes::from(merged_data))
-                    .await?;
-            }
-            total_written
-        };
+        }
+        if !merged_data.is_empty() {
+            batches.push((merged_start, merged_data));
+        }
 
-        self.storage.sync().await?;
-        Ok(total)
+        batches
     }
 }
 

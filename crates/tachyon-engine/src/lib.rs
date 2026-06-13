@@ -6,10 +6,13 @@
 //! - 分片状态机
 //! - 并发控制
 
+pub mod circuit_breaker;
 pub mod connection;
 pub mod downloader;
 pub mod fragment;
+mod mirror;
 pub mod orchestrator;
+mod storage_adapter;
 
 pub use connection::{ConnectionPool, PoolConfig};
 pub use downloader::{

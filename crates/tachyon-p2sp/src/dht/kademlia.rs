@@ -1,7 +1,6 @@
 //! KademliaDht 核心逻辑: 节点管理、本地存储、消息构造
 
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 
 use super::kbucket::{RoutingTable, extract_subnet_key};
 use super::message::KademliaMessage;
@@ -11,24 +10,20 @@ use super::node::{DhtNode, K_BUCKET_SIZE, NUM_BUCKETS, NodeId};
 // Key → NodeId 映射
 // ============================================================
 
-/// 将 key 映射为 NodeId(确定性哈希, 固定盐值填充 20 字节)
+/// 将 key 映射为 NodeId(确定性哈希, BLAKE3)
 ///
-/// 使用固定盐值 + DefaultHasher 保证同一 key 始终映射到同一 NodeId,
+/// 使用 BLAKE3 对 key 进行哈希, 保证同一 key 在所有节点上始终映射到相同 NodeId。
 /// 这是 Kademlia DHT 正确性的前提: 不同节点必须对同一 key 得到相同的 NodeId。
+///
+/// 相比之前的 DefaultHasher 实现, BLAKE3 提供:
+/// 1. 跨平台/版本的确定性输出(无 SipHash 随机种子问题)
+/// 2. 抗碰撞性(防止恶意构造 key 碰撞路由桶)
 pub(crate) fn key_to_node_id(key: &[u8]) -> NodeId {
-    use std::hash::Hasher;
+    let hash = blake3::hash(key);
+    let hash_bytes = hash.as_bytes(); // 32 bytes
     let mut id = [0u8; 20];
-    for (i, chunk) in id.chunks_mut(8).enumerate() {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        // 固定盐值: 0xDEAD_BEEF_CAFE_BABE + chunk 索引, 保证确定性
-        hasher.write_u64(0xDEAD_BEEF_CAFE_BABE_u64.wrapping_add(i as u64));
-        hasher.write(key);
-        let val = hasher.finish();
-        let bytes = val.to_le_bytes();
-        for (j, b) in chunk.iter_mut().enumerate() {
-            *b = bytes[j];
-        }
-    }
+    // 取 BLAKE3 输出的前 20 字节作为 NodeId
+    id.copy_from_slice(&hash_bytes[..20]);
     id
 }
 
@@ -37,11 +32,8 @@ pub(crate) fn key_to_node_id(key: &[u8]) -> NodeId {
 /// 生成一个与 local_id 的 XOR 距离前导零位数为 (159 - bucket_index) 的随机 ID,
 /// 使得该 ID 恰好落入目标 bucket 的键空间范围。
 ///
-/// 例如 bucket_index=159 生成距离为 0b1xxxx... 的 ID(最高位不同),
-/// bucket_index=0 生成距离为 0b000...01x...x 的 ID(仅最后一位不同)。
+/// 使用 SplitMix64 PRNG（种子来自系统时间），确保跨平台无外部依赖。
 pub(crate) fn generate_random_id_in_bucket_range(local_id: &NodeId, bucket_index: usize) -> NodeId {
-    use std::collections::hash_map::RandomState;
-
     let target_lz = 159 - bucket_index; // 目标前导零位数 (0..159)
     let mut distance = [0u8; 20];
 
@@ -50,23 +42,22 @@ pub(crate) fn generate_random_id_in_bucket_range(local_id: &NodeId, bucket_index
     let bit_idx = target_lz % 8;
     distance[byte_idx] |= 1 << (7 - bit_idx);
 
-    // 用随机数据填充后续字节
-    let rb = RandomState::new();
+    // 使用 SplitMix64 PRNG（确定性算法，种子来自系统时间）
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x1234_5678_9ABC_DEF0);
+    let mut rng = SplitMix64::new(seed);
+
+    // 用随机数据填充 1-bit 之后的字节
     for i in (byte_idx + 1)..20 {
-        let mut hasher = rb.build_hasher();
-        hasher.write_u64(i as u64);
-        hasher.write_u64(bucket_index as u64);
-        distance[i] = hasher.finish() as u8;
+        distance[i] = rng.next_u8();
     }
 
     // 随机化目标字节中 1-bit 之后的低位
     if bit_idx < 7 {
-        let mut hasher = rb.build_hasher();
-        hasher.write_u64(byte_idx as u64);
-        hasher.write_u64(bucket_index as u64);
-        let rand_byte = hasher.finish() as u8;
         let mask = (1u8 << (7 - bit_idx)) - 1;
-        distance[byte_idx] |= rand_byte & mask;
+        distance[byte_idx] |= rng.next_u8() & mask;
     }
 
     // XOR distance 还原为 NodeId
@@ -75,6 +66,32 @@ pub(crate) fn generate_random_id_in_bucket_range(local_id: &NodeId, bucket_index
         id[i] = local_id[i] ^ distance[i];
     }
     id
+}
+
+/// SplitMix64 PRNG — 轻量级伪随机数生成器
+///
+/// 无需外部依赖，适合生成 DHT bucket refresh 所需的随机字节。
+/// 不用于密码学场景。
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_u8(&mut self) -> u8 {
+        self.next_u64() as u8
+    }
 }
 
 // ============================================================
@@ -260,6 +277,7 @@ impl KademliaDht {
     pub fn make_ping(&self) -> KademliaMessage {
         KademliaMessage::Ping {
             sender_id: self.local_id,
+            signature: None,
         }
     }
 
@@ -267,6 +285,7 @@ impl KademliaDht {
     pub fn make_pong(&self) -> KademliaMessage {
         KademliaMessage::Pong {
             sender_id: self.local_id,
+            signature: None,
         }
     }
 
@@ -275,6 +294,7 @@ impl KademliaDht {
         KademliaMessage::FindNode {
             sender_id: self.local_id,
             target,
+            signature: None,
         }
     }
 
@@ -283,6 +303,7 @@ impl KademliaDht {
         KademliaMessage::FindNodeResponse {
             sender_id: self.local_id,
             nodes,
+            signature: None,
         }
     }
 
@@ -291,8 +312,8 @@ impl KademliaDht {
     /// 根据消息类型更新发送方节点信息到路由表。
     pub fn handle_message(&mut self, msg: &KademliaMessage) {
         let sender_id = match msg {
-            KademliaMessage::Ping { sender_id }
-            | KademliaMessage::Pong { sender_id }
+            KademliaMessage::Ping { sender_id, .. }
+            | KademliaMessage::Pong { sender_id, .. }
             | KademliaMessage::FindNode { sender_id, .. }
             | KademliaMessage::FindNodeResponse { sender_id, .. }
             | KademliaMessage::FindValue { sender_id, .. }
@@ -305,13 +326,11 @@ impl KademliaDht {
         let bucket_idx = self.routing_table.bucket_index(&sender_id);
         if let Some(idx) = bucket_idx {
             if let Some(bucket) = self.routing_table.bucket_mut(idx) {
-                if bucket.contains(&sender_id) {
-                    // 刷新已有节点的时间
-                    if let Some(pos) = bucket.nodes().iter().position(|n| n.id == sender_id) {
-                        let mut node = bucket.nodes()[pos].clone();
-                        node.touch();
-                        bucket.update(node);
-                    }
+                // H-9 修复: 单次 position() 扫描替代 contains() + position() + update() 三重扫描
+                if let Some(pos) = bucket.nodes().iter().position(|n| n.id == sender_id) {
+                    let mut node = bucket.nodes()[pos].clone();
+                    node.touch();
+                    bucket.update(node);
                 }
             }
         }
@@ -482,7 +501,10 @@ mod tests {
         }
 
         // 收到该节点的消息应刷新时间
-        let msg = KademliaMessage::Ping { sender_id: node.id };
+        let msg = KademliaMessage::Ping {
+            sender_id: node.id,
+            signature: None,
+        };
         dht.handle_message(&msg);
 
         // 节点应被刷新,不再是过期状态

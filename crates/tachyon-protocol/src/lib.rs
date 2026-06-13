@@ -50,7 +50,7 @@ mod protocol_tests {
         let ftp = FtpClient::new();
         // 使用不可达的公网地址(端口 1),FTP 客户端将返回连接错误
         // 注意:不能用 127.0.0.1,SSRF 防护会在连接前拒绝
-        verify_protocol_returns_error(&ftp, "ftp://192.0.2.1:1/file.bin").await;
+        verify_protocol_returns_error(&ftp, "ftp://8.8.4.4:1/file.bin").await;
     }
 
     #[cfg(feature = "quic")]
@@ -68,7 +68,7 @@ mod protocol_tests {
 
         // FTP 客户端对不可达的公网地址返回连接错误
         // 注意:不能用 127.0.0.1,SSRF 防护会在连接前拒绝
-        let ftp_err = ftp.probe("ftp://192.0.2.1:1/test").await.unwrap_err();
+        let ftp_err = ftp.probe("ftp://8.8.4.4:1/test").await.unwrap_err();
         assert!(
             ftp_err.to_string().contains("FTP 连接失败"),
             "FTP 错误应包含连接失败信息: {ftp_err}"
@@ -92,7 +92,7 @@ mod protocol_tests {
 
         // FTP 对不可达的公网地址返回 Network 变体
         // 注意:不能用 127.0.0.1,SSRF 防护会在连接前返回 Protocol 变体
-        let ftp_err = ftp.probe("ftp://192.0.2.1:1/test").await.unwrap_err();
+        let ftp_err = ftp.probe("ftp://8.8.4.4:1/test").await.unwrap_err();
         assert!(
             matches!(ftp_err, DownloadError::Network(_)),
             "FTP 连接失败应返回 Network 变体,实际: {ftp_err:?}"

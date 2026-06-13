@@ -135,7 +135,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
         <For each={filteredResources()}>
           {(resource, index) => {
             const isSelected = () => selectedIds().has(resource.id)
-            const Icon = typeIcons[resource.type] || typeIcons.other
+            const Icon = (typeIcons[resource.type] ?? typeIcons['other'])!
             return (
               <div
                 class="flex items-start gap-3 cursor-pointer hover-row"

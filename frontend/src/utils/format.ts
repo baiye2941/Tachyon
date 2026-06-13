@@ -48,7 +48,8 @@ const EXT_TYPE_MAP: Record<string, string> = {
 export function getFileType(fileName: string): { icon: typeof FileIcon; color: string } {
     const ext = fileName.split('.').pop()?.toLowerCase() || ''
     const type = EXT_TYPE_MAP[ext]
-    return type ? FILE_TYPE_MAP[type] : { icon: AttachmentIcon, color: '#6B7280' }
+    const entry = type ? FILE_TYPE_MAP[type] : undefined
+    return entry ? { icon: entry.icon, color: entry.color } : { icon: AttachmentIcon, color: '#6B7280' }
 }
 
 export function getFileTypeColor(type: string): string {

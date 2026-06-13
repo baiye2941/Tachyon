@@ -22,8 +22,14 @@ export interface DownloadConfig {
   maxConcurrentFragments: number
   maxRetries: number
   requestTimeoutSecs: number
+  connectTimeoutSecs: number
   verifyChecksum: boolean
+  pauseTimeoutSecs: number
+  rateLimitBytesPerSec?: number | null
+  maxFullStreamBytes: number
+  authorizedDirs: string[]
   userAgent: string
+  headers: Record<string, string>
 }
 
 export interface ConnectionConfig {

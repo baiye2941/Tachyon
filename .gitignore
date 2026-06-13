@@ -21,6 +21,11 @@ AGENTS.md
 # 文档（不跟踪）
 docx/
 docs/
+RTK.md
+
+# 编译泄漏文件（Windows NUL 设备 bug）
+nul.*
+nul.*/
 
 # 系统文件
 .DS_Store
@@ -36,6 +41,9 @@ Thumbs.db
 
 # Reasonix 工具运行时数据
 .reasonix/
+
+# CodeGraph 运行时数据
+.codegraph/
 
 # 环境变量
 .env

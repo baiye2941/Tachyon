@@ -169,10 +169,10 @@ fn bench_fragment_lifecycle(c: &mut Criterion) {
     group.bench_function("full_lifecycle", |b| {
         b.iter(|| {
             let mut record = make_fragment_record(0, 64 * 1024);
-            record.start_download();
-            record.complete_download(16, std::time::Duration::from_millis(50));
-            record.verify_ok();
-            record.write_done();
+            let _ = record.start_download();
+            let _ = record.complete_download(16, std::time::Duration::from_millis(50));
+            let _ = record.verify_ok();
+            let _ = record.write_done();
             assert!(record.is_done());
         });
     });

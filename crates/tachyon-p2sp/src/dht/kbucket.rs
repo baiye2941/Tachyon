@@ -1,5 +1,6 @@
 //! Kademlia k-bucket 路由表和 Sybil 防护
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use super::node::{DhtNode, K_BUCKET_SIZE, NUM_BUCKETS, NodeId, leading_zeros, xor_distance};
@@ -330,9 +331,22 @@ impl RoutingTable {
             }
         }
 
-        // 按与 target 的 XOR 距离排序,取前 count 个
-        candidates.sort_by_cached_key(|n| xor_distance(&n.id, target));
-        candidates.dedup_by(|a, b| a.id == b.id);
+        // 先按 NodeId 去重,避免同一节点出现在多个 bucket 中
+        let mut seen = HashSet::with_capacity(candidates.len());
+        candidates.retain(|n| seen.insert(n.id));
+
+        // 使用 select_nth_unstable_by_key 进行 O(n) 部分排序,
+        // 只将前 count 个最小元素放到正确位置
+        let need = count.min(candidates.len());
+        if need > 0 && need < candidates.len() {
+            candidates.select_nth_unstable_by_key(need - 1, |n| xor_distance(&n.id, target));
+            // 对前 count 个元素稳定排序,保证结果确定性
+            candidates[..need].sort_by_key(|n| xor_distance(&n.id, target));
+        } else if need > 0 {
+            // candidates.len() <= count,直接全排序即可
+            candidates.sort_by_key(|n| xor_distance(&n.id, target));
+        }
+
         candidates.into_iter().take(count).cloned().collect()
     }
 

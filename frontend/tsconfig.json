@@ -11,7 +11,9 @@
     "noEmit": true,
     "strict": true,
     "isolatedModules": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true
   },
   "include": ["src"]
 }

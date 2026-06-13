@@ -152,40 +152,58 @@ impl FileStore {
     }
 
     /// 将键转换为安全的文件名
+    ///
+    /// 使用逐字节 percent-encoding: 保留 ASCII 字母数字、下划线和连字符,
+    /// 其余字符先 UTF-8 编码再逐字节 `%XX` 转义。
+    ///
+    /// 这种编码方式确保:
+    /// 1. 输出仅包含文件系统安全字符(ASCII 字母数字 + `_` + `-` + `%XX`)
+    /// 2. 编码可逆(`unsafe_key` 可精确还原)
+    /// 3. 多字节字符(如 CJK、emoji)按 UTF-8 字节逐字节编码,避免截断碰撞
     pub(crate) fn safe_key(key: &str) -> String {
-        key.chars()
-            .flat_map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    vec![c]
-                } else {
-                    format!("%{:02X}", c as u32).chars().collect()
-                }
-            })
-            .collect()
+        let mut result = String::with_capacity(key.len() * 2);
+        for byte in key.bytes() {
+            let ch = byte as char;
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                result.push(ch);
+            } else {
+                // 按字节 percent-encode,确保每字节恰好 2 位十六进制
+                use std::fmt::Write;
+                let _ = write!(result, "%{byte:02X}");
+            }
+        }
+        result
     }
 
     /// 将安全文件名还原为原始键（safe_key 的逆操作）
+    ///
+    /// 将 `%XX` 序列解码为字节,其余字符按 UTF-8 字节处理,
+    /// 最后将完整字节序列按 UTF-8 解码为字符串。
     pub(crate) fn unsafe_key(encoded: &str) -> String {
-        let mut result = String::with_capacity(encoded.len());
+        let mut bytes: Vec<u8> = Vec::with_capacity(encoded.len());
         let mut chars = encoded.chars();
         while let Some(c) = chars.next() {
             if c == '%' {
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() == 2
-                    && let Ok(code) = u32::from_str_radix(&hex, 16)
-                    && let Some(decoded_char) = char::from_u32(code)
+                    && let Ok(byte) = u8::from_str_radix(&hex, 16)
                 {
-                    result.push(decoded_char);
+                    bytes.push(byte);
                     continue;
                 }
-                // 解码失败，保持原样
-                result.push('%');
-                result.push_str(&hex);
+                // 解码失败,保持原样
+                bytes.push(b'%');
+                for b in hex.bytes() {
+                    bytes.push(b);
+                }
             } else {
-                result.push(c);
+                // 安全字符均为 ASCII,直接推入字节
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                bytes.extend_from_slice(s.as_bytes());
             }
         }
-        result
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// 键对应的文件路径

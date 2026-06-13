@@ -26,7 +26,7 @@ let taskIndexMap = new Map<string, number>()
 function rebuildIndexMap() {
   taskIndexMap = new Map<string, number>()
   for (let i = 0; i < tasks.length; i++) {
-    taskIndexMap.set(tasks[i].id, i)
+    taskIndexMap.set(tasks[i]!.id, i)
   }
 }
 
@@ -78,7 +78,7 @@ const filterCounts = createMemo(() => {
   let completed = 0
   let incomplete = 0
   for (let i = 0; i < tasks.length; i++) {
-    const s = tasks[i].status
+    const s = tasks[i]!.status
     if (DOWNLOADING_SET.has(s)) downloading++
     if (COMPLETED_SET.has(s)) completed++
     if (INCOMPLETE_SET.has(s)) incomplete++
@@ -105,8 +105,8 @@ const speedStats = createMemo(() => {
   let speed = 0
   let count = 0
   for (let i = 0; i < tasks.length; i++) {
-    if (DOWNLOADING_SET.has(tasks[i].status)) {
-      speed += tasks[i].speed || 0
+    if (DOWNLOADING_SET.has(tasks[i]!.status)) {
+      speed += tasks[i]!.speed || 0
       count++
     }
   }
@@ -131,20 +131,20 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
     for (const [id, p] of Object.entries(payload)) {
       const idx = taskIndexMap.get(id)    // O(1) 查找
       if (idx !== undefined) {
-        const oldStatus = tasks[idx].status
+        const oldStatus = tasks[idx]!.status
         const newStatus = VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : oldStatus
 
         setTasksRaw(idx, {
-          downloaded: p.downloaded ?? tasks[idx].downloaded,
-          speed: p.speed ?? tasks[idx].speed,
+          downloaded: p.downloaded ?? tasks[idx]!.downloaded,
+          speed: p.speed ?? tasks[idx]!.speed,
           status: newStatus,
-          progress: p.progress ?? tasks[idx].progress,
-          fragmentsDone: p.fragmentsDone ?? tasks[idx].fragmentsDone,
+          progress: p.progress ?? tasks[idx]!.progress,
+          fragmentsDone: p.fragmentsDone ?? tasks[idx]!.fragmentsDone,
         })
 
         // 检测状态转 terminal：写入历史
         if (!TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(newStatus)) {
-          const task = tasks[idx]
+          const task = tasks[idx]!
           const duration = task.createdAt ? Date.now() - new Date(task.createdAt).getTime() : 0
           const avgSpeed = duration > 0 ? (task.downloaded || 0) / (duration / 1000) : 0
 

@@ -37,10 +37,11 @@ export default function SpeedChart(props: SpeedChartProps) {
     if (points.length < 2) return { line: '', area: '' }
 
     // Build smooth line with simple bezier curves
-    let line = `M ${points[0][0]} ${points[0][1]}`
+    const first = points[0]!
+    let line = `M ${first[0]} ${first[1]}`
     for (let i = 1; i < points.length; i++) {
-      const prev = points[i - 1]
-      const curr = points[i]
+      const prev = points[i - 1]!
+      const curr = points[i]!
       const cpx1 = prev[0] + (curr[0] - prev[0]) * 0.5
       const cpx2 = prev[0] + (curr[0] - prev[0]) * 0.5
       line += ` C ${cpx1} ${prev[1]}, ${cpx2} ${curr[1]}, ${curr[0]} ${curr[1]}`

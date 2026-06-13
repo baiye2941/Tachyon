@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use tachyon_core::types::FragmentInfo;
+use tachyon_core::{DownloadError, DownloadResult};
 
 /// 分片状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -46,79 +47,94 @@ impl FragmentRecord {
     }
 
     /// 转换到下载中状态(仅允许从 Pending 进入)
-    pub fn start_download(&mut self) {
-        assert!(
-            self.state == FragmentState::Pending,
-            "非法状态转换: {:?} -> Downloading",
-            self.state
-        );
+    pub fn start_download(&mut self) -> DownloadResult<()> {
+        if self.state != FragmentState::Pending {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Downloading",
+                self.state
+            )));
+        }
         self.state = FragmentState::Downloading;
+        Ok(())
     }
 
     /// 下载完成,转换到校验状态(仅允许从 Downloading 进入)
-    pub fn complete_download(&mut self, downloaded: u64, duration: Duration) {
-        assert!(
-            self.state == FragmentState::Downloading,
-            "非法状态转换: {:?} -> Verifying",
-            self.state
-        );
+    pub fn complete_download(&mut self, downloaded: u64, duration: Duration) -> DownloadResult<()> {
+        if self.state != FragmentState::Downloading {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Verifying",
+                self.state
+            )));
+        }
         self.info.downloaded = downloaded;
         self.last_duration = Some(duration);
         self.state = FragmentState::Verifying;
+        Ok(())
     }
 
     /// 下载完成并直接流转到 Done 状态
     ///
     /// 用于 spawn 内已完成下载和写入的场景,跳过 Verifying/Writing 中间状态,
     /// 但仍正确设置 `last_duration` 以激活调度器反馈回路。
-    pub fn complete_download_fast(&mut self, downloaded: u64, duration: Duration) {
-        assert!(
-            self.state == FragmentState::Downloading,
-            "非法状态转换: {:?} -> Done(fast)",
-            self.state
-        );
+    pub fn complete_download_fast(
+        &mut self,
+        downloaded: u64,
+        duration: Duration,
+    ) -> DownloadResult<()> {
+        if self.state != FragmentState::Downloading {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Done(fast)",
+                self.state
+            )));
+        }
         self.info.downloaded = downloaded;
         self.last_duration = Some(duration);
         self.state = FragmentState::Done;
+        Ok(())
     }
 
     /// 校验通过,转换到写入状态(仅允许从 Verifying 进入)
-    pub fn verify_ok(&mut self) {
-        assert!(
-            self.state == FragmentState::Verifying,
-            "非法状态转换: {:?} -> Writing",
-            self.state
-        );
+    pub fn verify_ok(&mut self) -> DownloadResult<()> {
+        if self.state != FragmentState::Verifying {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Writing",
+                self.state
+            )));
+        }
         self.state = FragmentState::Writing;
+        Ok(())
     }
 
     /// 写入完成,转换到完成状态(仅允许从 Writing 进入)
-    pub fn write_done(&mut self) {
-        assert!(
-            self.state == FragmentState::Writing,
-            "非法状态转换: {:?} -> Done",
-            self.state
-        );
+    pub fn write_done(&mut self) -> DownloadResult<()> {
+        if self.state != FragmentState::Writing {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Done",
+                self.state
+            )));
+        }
         self.state = FragmentState::Done;
+        Ok(())
     }
 
     /// 标记失败,如果可重试则回到 Pending(仅允许从 Downloading/Verifying/Writing 进入)
-    pub fn mark_failed(&mut self) -> bool {
-        assert!(
-            matches!(
-                self.state,
-                FragmentState::Downloading | FragmentState::Verifying | FragmentState::Writing
-            ),
-            "非法状态转换: {:?} -> Failed/Pending",
-            self.state
-        );
+    pub fn mark_failed(&mut self) -> DownloadResult<bool> {
+        if !matches!(
+            self.state,
+            FragmentState::Downloading | FragmentState::Verifying | FragmentState::Writing
+        ) {
+            return Err(DownloadError::Fragment(format!(
+                "非法状态转换: {:?} -> Failed/Pending",
+                self.state
+            )));
+        }
         self.retry_count += 1;
         if self.retry_count <= self.max_retries {
             self.state = FragmentState::Pending;
-            true
+            Ok(true)
         } else {
             self.state = FragmentState::Failed;
-            false
+            Ok(false)
         }
     }
 
@@ -267,16 +283,18 @@ mod tests {
         let mut record = FragmentRecord::new(info, 3);
         assert_eq!(record.state, FragmentState::Pending);
 
-        record.start_download();
+        record.start_download().unwrap();
         assert_eq!(record.state, FragmentState::Downloading);
 
-        record.complete_download(4, Duration::from_millis(100));
+        record
+            .complete_download(4, Duration::from_millis(100))
+            .unwrap();
         assert_eq!(record.state, FragmentState::Verifying);
 
-        record.verify_ok();
+        record.verify_ok().unwrap();
         assert_eq!(record.state, FragmentState::Writing);
 
-        record.write_done();
+        record.write_done().unwrap();
         assert_eq!(record.state, FragmentState::Done);
         assert!(record.is_done());
     }
@@ -286,16 +304,16 @@ mod tests {
         let info = make_frag(0, 1024);
         let mut record = FragmentRecord::new(info, 2);
 
-        record.start_download();
-        assert!(record.mark_failed()); // retry 1
+        record.start_download().unwrap();
+        assert!(record.mark_failed().unwrap()); // retry 1
         assert_eq!(record.state, FragmentState::Pending);
 
-        record.start_download();
-        assert!(record.mark_failed()); // retry 2
+        record.start_download().unwrap();
+        assert!(record.mark_failed().unwrap()); // retry 2
         assert_eq!(record.state, FragmentState::Pending);
 
-        record.start_download();
-        assert!(!record.mark_failed()); // retry 3, exceeds max
+        record.start_download().unwrap();
+        assert!(!record.mark_failed().unwrap()); // retry 3, exceeds max
         assert_eq!(record.state, FragmentState::Failed);
         assert!(record.is_failed());
     }
@@ -521,22 +539,22 @@ mod proptests {
 
             // 尝试下载 -> 失败重试
             for _ in 0..=max_retries {
-                record.start_download();
+                record.start_download().unwrap();
                 prop_assert_eq!(record.state, FragmentState::Downloading);
 
                 if record.retry_count < max_retries {
                     // 还可以重试
-                    let can_retry = record.mark_failed();
+                    let can_retry = record.mark_failed().unwrap();
                     prop_assert!(can_retry);
                     prop_assert_eq!(record.state, FragmentState::Pending);
                 } else {
                     // 超过最大重试次数
                     let data_len = 22u64;
-                    record.complete_download(data_len, Duration::from_millis(10));
+                    record.complete_download(data_len, Duration::from_millis(10)).unwrap();
                     prop_assert_eq!(record.state, FragmentState::Verifying);
-                    record.verify_ok();
+                    record.verify_ok().unwrap();
                     prop_assert_eq!(record.state, FragmentState::Writing);
-                    record.write_done();
+                    record.write_done().unwrap();
                     prop_assert!(record.is_done());
                     break;
                 }

@@ -15,18 +15,27 @@
 //! - 全量下载
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 #[cfg(test)]
 use tachyon_core::filename::{extract_filename_from_url, parse_content_disposition};
 use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use url::Url;
+
+/// HTTP/3 客户端请求句柄类型(h3 + h3-quinn)
+///
+/// 使用 `Arc<tokio::sync::Mutex<>>` 包装,因为 `SendRequest::send_request()` 需要
+/// `&mut self`(内部维护 stream ID 计数器)。Mutex 仅在发送请求瞬间持有,
+/// 响应读取通过独立的 `RequestStream` 进行,不影响并发。
+type H3SendRequest = Arc<tokio::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>>;
+
+/// HTTP/3 连接管理句柄(保持控制流活跃)
+type H3Connection = h3::client::Connection<h3_quinn::Connection, Bytes>;
 
 /// QUIC 传输客户端
 ///
@@ -43,6 +52,10 @@ pub struct QuicTransport {
     /// 存在条目表示该 host 的 TLS session 已由 rustls 内部缓存,可尝试 0-RTT。
     /// 条目附带 `Instant` 时间戳用于 TTL 过期清理。
     session_tokens: HashMap<String, (Vec<u8>, Instant)>,
+    /// HTTP/3 客户端请求句柄(连接建立后创建, Mutex 保护并发请求发送)
+    h3_send: Option<H3SendRequest>,
+    /// HTTP/3 连接管理句柄(保持控制流活跃,防止服务端 GOAWAY)
+    h3_conn: Option<H3Connection>,
 }
 
 /// TLS 会话缓存 TTL:超过此时间的缓存条目将被视为过期,不再尝试 0-RTT
@@ -92,6 +105,8 @@ impl QuicTransport {
             connection: None,
             stored_crypto: Some(stored_crypto),
             session_tokens: HashMap::new(),
+            h3_send: None,
+            h3_conn: None,
         })
     }
 
@@ -105,6 +120,8 @@ impl QuicTransport {
             connection: None,
             stored_crypto: None,
             session_tokens: HashMap::new(),
+            h3_send: None,
+            h3_conn: None,
         }
     }
 
@@ -146,6 +163,8 @@ impl QuicTransport {
             connection: None,
             stored_crypto: Some(stored_crypto),
             session_tokens: HashMap::new(),
+            h3_send: None,
+            h3_conn: None,
         })
     }
 
@@ -244,8 +263,22 @@ impl QuicTransport {
                 .map_err(|e| DownloadError::Network(format!("QUIC 连接建立失败: {e}")))?
         };
 
-        self.connection = Some(connection);
+        self.connection = Some(connection.clone());
         tracing::info!(host, port, "QUIC 连接已建立");
+
+        // S-10: 初始化 HTTP/3 客户端
+        let h3_conn = h3_quinn::Connection::new(connection);
+        match h3::client::new(h3_conn).await {
+            Ok((h3_client_conn, send_request)) => {
+                self.h3_send = Some(Arc::new(tokio::sync::Mutex::new(send_request)));
+                self.h3_conn = Some(h3_client_conn);
+                tracing::info!("HTTP/3 客户端已就绪");
+            }
+            Err(e) => {
+                tracing::warn!("HTTP/3 客户端创建失败: {e}");
+                self.h3_send = None;
+            }
+        }
 
         // 缓存该 host 的服务器证书,标记为已知 host 以便后续尝试 0-RTT。
         // 实际的 TLS session ticket 由 rustls 内部会话缓存自动管理。
@@ -291,6 +324,9 @@ impl QuicTransport {
 
     /// 关闭当前连接
     pub fn disconnect(&mut self) {
+        // S-10: 先丢弃 h3 客户端句柄(Arc drop)
+        self.h3_send.take();
+        self.h3_conn.take();
         if let Some(conn) = self.connection.take() {
             conn.close(0u32.into(), b"client disconnect");
         }
@@ -312,6 +348,13 @@ impl QuicTransport {
             .filter(|c| c.close_reason().is_none())
             .ok_or_else(|| DownloadError::Protocol("QUIC 未连接,请先调用 connect()".into()))
     }
+
+    /// 获取 h3 客户端句柄的 Arc 克隆,未初始化时返回 Protocol 错误
+    fn require_h3_send(&self) -> DownloadResult<H3SendRequest> {
+        self.h3_send
+            .clone()
+            .ok_or_else(|| DownloadError::Protocol("HTTP/3 客户端未初始化".into()))
+    }
 }
 
 impl Drop for QuicTransport {
@@ -321,72 +364,90 @@ impl Drop for QuicTransport {
 }
 
 // ---------------------------------------------------------------------------
-// 辅助函数:HTTP 响应解析
+// HTTP/3 辅助函数
 // ---------------------------------------------------------------------------
 
-/// 解析 HTTP HEAD 响应,提取文件元数据
+/// 构造 HTTP/3 请求
 ///
-/// 响应格式:
-/// ```text
-/// HTTP/1.1 200 OK\r\n
-/// Content-Length: 12345\r\n
-/// Content-Type: application/octet-stream\r\n
-/// \r\n
-/// ```
-fn parse_head_response(response: &str, url: &str) -> DownloadResult<FileMetadata> {
-    let header_end = response
-        .find("\r\n\r\n")
-        .or_else(|| response.find("\n\n"))
-        .unwrap_or(response.len());
-    let header_section = &response[..header_end];
+/// 使用 `http::Request::builder()` 构建标准 HTTP/3 请求。
+/// h3 自动通过 QPACK 二进制编码头部,从根本上消除 HTTP 头注入风险 (S-3)。
+fn build_h3_request(
+    method: http::Method,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+) -> DownloadResult<http::Request<()>> {
+    let parsed =
+        Url::parse(url).map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let full_path = match parsed.query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    };
+    let user_agent = tachyon_core::config::USER_AGENT;
 
-    let mut lines = header_section.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| DownloadError::Protocol("响应为空".into()))?;
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(&full_path)
+        .header("host", host)
+        .header("user-agent", user_agent)
+        .header("accept-encoding", "identity");
 
-    // 解析状态码: "HTTP/1.1 200 OK" -> 200
-    let status_code: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| DownloadError::Protocol(format!("无效的状态行: {status_line}")))?
-        .parse()
-        .map_err(|_| DownloadError::Protocol(format!("无法解析状态码: {status_line}")))?;
-
-    if !(200..300).contains(&status_code) {
-        return Err(DownloadError::Protocol(format!("HTTP {status_code}")));
+    for (key, value) in extra_headers {
+        builder = builder.header(*key, *value);
     }
 
-    // 解析各响应头
-    let mut file_size: Option<u64> = None;
-    let mut content_type: Option<String> = None;
-    let mut supports_range = false;
-    let mut etag: Option<String> = None;
-    let mut last_modified: Option<String> = None;
-    let mut content_disposition_name: Option<String> = None;
+    builder
+        .body(())
+        .map_err(|e| DownloadError::Protocol(format!("构造 HTTP/3 请求失败: {e}")))
+}
 
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let value_trimmed = value.trim();
-
-            // 使用 eq_ignore_ascii_case 避免每行分配一个新 String
-            if key.eq_ignore_ascii_case("content-length") {
-                file_size = value_trimmed.parse().ok();
-            } else if key.eq_ignore_ascii_case("content-type") {
-                content_type = Some(value_trimmed.to_string());
-            } else if key.eq_ignore_ascii_case("accept-ranges") {
-                supports_range = value_trimmed.contains("bytes");
-            } else if key.eq_ignore_ascii_case("etag") {
-                etag = Some(value_trimmed.to_string());
-            } else if key.eq_ignore_ascii_case("last-modified") {
-                last_modified = Some(value_trimmed.to_string());
-            } else if key.eq_ignore_ascii_case("content-disposition") {
-                content_disposition_name =
-                    tachyon_core::filename::parse_content_disposition(value_trimmed);
-            }
-        }
+/// 从 HTTP/3 响应头中提取文件元数据
+///
+/// 使用 `http::HeaderMap` 直接访问解码后的头部,无需文本解析。
+fn parse_h3_metadata(response: &http::Response<()>, url: &str) -> DownloadResult<FileMetadata> {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(DownloadError::Protocol(format!("HTTP {status}")));
     }
+
+    let headers = response.headers();
+
+    let file_size = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let supports_range = headers
+        .get(http::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.contains("bytes"));
+
+    let etag = headers
+        .get(http::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let last_modified = headers
+        .get(http::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let content_disposition_name = headers
+        .get(http::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(tachyon_core::filename::parse_content_disposition);
 
     let file_name = content_disposition_name
         .unwrap_or_else(|| tachyon_core::filename::extract_filename_from_url(url));
@@ -401,322 +462,37 @@ fn parse_head_response(response: &str, url: &str) -> DownloadResult<FileMetadata
     })
 }
 
-/// 分离 HTTP 响应头和响应体
+/// 将 h3 RequestStream 包装为 ByteStream
 ///
-/// HTTP 响应以 `\r\n\r\n` 分隔头部与正文。返回正文部分的 Bytes。
-/// 如果未找到分隔符,返回错误。
-#[cfg(test)]
-fn parse_body_response(response: &[u8]) -> DownloadResult<Bytes> {
-    // 查找 \r\n\r\n 分隔符
-    let separator = b"\r\n\r\n";
-    let header_end = response
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .ok_or_else(|| DownloadError::Protocol("响应中未找到头部/体部分隔符".into()))?;
-
-    let body_start = header_end + separator.len();
-
-    // 解析状态码以验证响应有效
-    let header_str = std::str::from_utf8(&response[..header_end])
-        .map_err(|e| DownloadError::Protocol(format!("响应头部非有效 UTF-8: {e}")))?;
-
-    if let Some(status_line) = header_str.lines().next() {
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
-
-        if !(200..300).contains(&status_code) {
-            return Err(DownloadError::Protocol(format!("HTTP {status_code}")));
-        }
-    }
-
-    Ok(Bytes::copy_from_slice(&response[body_start..]))
-}
-
-/// 分离 Range 请求的 HTTP 响应头和响应体,并严格验证 206 状态码
-///
-/// Range 请求必须返回 206 Partial Content。如果服务器忽略 Range 头返回 200 OK,
-/// 将导致引擎层将完整文件写入分片偏移处,造成数据越界写入。
-#[cfg(test)]
-fn parse_range_body_response(response: &[u8]) -> DownloadResult<Bytes> {
-    let separator = b"\r\n\r\n";
-    let header_end = response
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .ok_or_else(|| DownloadError::Protocol("响应中未找到头部/体部分隔符".into()))?;
-
-    let body_start = header_end + separator.len();
-
-    // 严格验证 Range 请求必须返回 206
-    validate_range_status(&response[..header_end])?;
-
-    Ok(Bytes::copy_from_slice(&response[body_start..]))
-}
-
-/// 在已建立的 QUIC 连接上发送 HTTP 请求并读取完整响应
-///
-/// 打开一个新的双向流,发送请求,读取响应。
-async fn send_request(conn: &quinn::Connection, request: &[u8]) -> DownloadResult<Vec<u8>> {
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
-
-    send.write_all(request)
-        .await
-        .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
-
-    send.finish()
-        .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
-
-    // 分片下载可能返回大量数据,设置 256MB 上限
-    // TODO: 改为流式读取(循环 recv.read() 直到 EOF),消除硬性上限
-    recv.read_to_end(256 * 1024 * 1024)
-        .await
-        .map_err(|e| DownloadError::Network(format!("读取响应数据失败: {e}")))
-}
-
-/// 流式读取 QUIC 响应,分块返回数据
-///
-/// 使用 quinn `read_chunk` 进行零拷贝分块读取(默认 64KB/块),
-/// 先解析 HTTP 响应头并验证状态码,再逐块产出正文数据。
-///
-/// 消除 `read_to_end` 的 256MB 硬性上限和峰值内存问题。
-///
-/// # 参数
-///
-/// - `recv`: QUIC 接收流
-/// - `is_range_request`: 如果为 true,则验证状态码必须为 206 (Range 请求)
-fn recv_streaming(recv: quinn::RecvStream, is_range_request: bool) -> ByteStream {
-    const CHUNK_SIZE: usize = 64 * 1024; // 64KB per read_chunk
-    const MAX_HEADER_BUF: usize = 256 * 1024; // 头部缓冲区上限 256KB
-
-    /// 解析器状态:跟踪 HTTP 响应头解析进度
-    enum State {
-        /// 正在寻找 `\r\n\r\n` 头部终止符
-        FindHeader { header_buf: Vec<u8> },
-        /// 正在流式读取正文
-        Body,
-    }
-
-    let initial_state = State::FindHeader {
-        header_buf: Vec::with_capacity(4096),
-    };
-
-    // 使用 futures::stream::unfold 实现状态机驱动的 Stream
-    // recv 的所有权移入闭包,确保 Stream 结束时正确清理 QUIC 流
-    Box::pin(futures::stream::unfold(
-        (initial_state, recv, Bytes::new()),
-        move |(mut state, mut recv, pending): (State, quinn::RecvStream, Bytes)| async move {
-            loop {
-                // 读取下一个 QUIC 数据块(零拷贝)
-                let chunk = match recv.read_chunk(CHUNK_SIZE, true).await {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => return None,
-                    Err(e) => {
-                        return Some((
-                            Err(DownloadError::Network(format!("QUIC 流读取失败: {e}"))),
-                            (state, recv, pending),
-                        ));
-                    }
-                };
-
-                match state {
-                    State::FindHeader { ref mut header_buf } => {
-                        header_buf.extend_from_slice(&chunk.bytes);
-
-                        // 在累积缓冲区中搜索分隔符
-                        if let Some(pos) = find_subsequence(header_buf, b"\r\n\r\n") {
-                            let body_start = pos + 4;
-
-                            // 验证 HTTP 状态码（Range 请求要求 206，普通请求要求 2xx）
-                            let status_result = if is_range_request {
-                                validate_range_status(&header_buf[..pos])
-                            } else {
-                                validate_http_status(&header_buf[..pos])
-                            };
-                            if let Err(e) = status_result {
-                                return Some((Err(e), (State::Body, recv, pending)));
-                            }
-
-                            // W-11: 检测 Transfer-Encoding: chunked (HTTP/3 不应使用)
-                            // QUIC 上的 HTTP/3 使用自有帧机制,Transfer-Encoding 被规范禁止。
-                            // 若服务器违反规范发送 chunked 编码,返回明确错误而非静默返回损坏数据。
-                            let header_str = std::str::from_utf8(&header_buf[..pos]).unwrap_or("");
-                            if header_str.lines().any(|line| {
-                                let lower = line.to_ascii_lowercase();
-                                lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-                            }) {
-                                return Some((
-                                    Err(DownloadError::Protocol(
-                                        "QUIC/HTTP3 响应包含 Transfer-Encoding: chunked,这违反 HTTP/3 规范".into(),
-                                    )),
-                                    (State::Body, recv, pending),
-                                ));
-                            }
-
-                            // 提取尾部残余数据(分隔符之后的字节)
-                            let tail = Bytes::copy_from_slice(&header_buf[body_start..]);
-                            if !tail.is_empty() {
-                                return Some((Ok(tail), (State::Body, recv, pending)));
-                            }
-                            // 没有残余数据,继续读取 body
-                            continue;
-                        }
-
-                        if header_buf.len() > MAX_HEADER_BUF {
-                            return Some((
-                                Err(DownloadError::Protocol("HTTP 头部超过 256KB 上限".into())),
-                                (State::Body, recv, pending),
-                            ));
-                        }
-                        // 继续读取下一个 chunk
-                        continue;
-                    }
-                    State::Body => {
-                        let data = chunk.bytes;
-                        if !data.is_empty() {
-                            return Some((Ok(data), (State::Body, recv, pending)));
-                        }
-                        // 空 chunk,继续读取
-                    }
+/// 逐块读取 HTTP/3 DATA 帧,产出 Bytes。无需手动解析 HTTP 响应头:
+/// h3 已通过 QPACK 解码头部,响应状态码和头部通过 `http::Response` 直接访问。
+fn h3_recv_streaming(
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> ByteStream {
+    Box::pin(futures::stream::unfold(stream, move |mut s| async move {
+        match s.recv_data().await {
+            Ok(Some(mut buf)) => {
+                let len = buf.chunk().len();
+                let data = Bytes::copy_from_slice(buf.chunk());
+                buf.advance(len);
+                if data.is_empty() {
+                    None
+                } else {
+                    Some((Ok(data), s))
                 }
             }
-        },
-    ))
-}
-
-/// 在字节切片中查找子序列位置
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// 从头部字节中解析并验证 HTTP 状态码(200-299)
-fn validate_http_status(header_bytes: &[u8]) -> DownloadResult<()> {
-    let header_str = std::str::from_utf8(header_bytes)
-        .map_err(|e| DownloadError::Protocol(format!("响应头部非有效 UTF-8: {e}")))?;
-
-    if let Some(status_line) = header_str.lines().next() {
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
-
-        if !(200..300).contains(&status_code) {
-            return Err(DownloadError::Protocol(format!("HTTP {status_code}")));
+            Ok(None) => None,
+            Err(e) => Some((
+                Err(DownloadError::Network(format!("HTTP/3 流读取失败: {e}"))),
+                s,
+            )),
         }
-    }
-
-    Ok(())
+    }))
 }
 
-/// 验证 Range 请求的 HTTP 响应状态码必须为 206 Partial Content
-///
-/// 如果服务器忽略 Range 头返回 200 OK（完整文件）,会导致:
-/// 1. 引擎层将完整文件数据写入分片偏移处,造成数据越界写入
-/// 2. 虽然 downloader 有越界检查,但已读取整个响应到内存,峰值内存不可控
-///
-/// 此函数与 HTTP 客户端(`http.rs` 行 277-286)的校验逻辑保持一致。
-fn validate_range_status(header_bytes: &[u8]) -> DownloadResult<()> {
-    let header_str = std::str::from_utf8(header_bytes)
-        .map_err(|e| DownloadError::Protocol(format!("响应头部非有效 UTF-8: {e}")))?;
-
-    if let Some(status_line) = header_str.lines().next() {
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
-
-        if status_code != 206 {
-            return Err(DownloadError::Protocol(format!(
-                "服务器忽略 Range 头, 返回 HTTP {status_code} (期望 206 Partial Content)"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// 从 URL 中提取路径(含查询字符串)
-///
-/// 返回格式: `/path?key=value`
-fn extract_path(url: &Url) -> String {
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-    match url.query() {
-        Some(query) => format!("{path}?{query}"),
-        None => path.to_string(),
-    }
-}
-
-/// 构造 HTTP/1.1 格式的 HEAD 请求
-fn build_head_request(url: &str) -> DownloadResult<Vec<u8>> {
-    let parsed =
-        Url::parse(url).map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
-    let full_path = extract_path(&parsed);
-    let user_agent = tachyon_core::config::USER_AGENT;
-
-    // 使用 write! 避免 format! 创建中间 String,直接写入预分配缓冲区
-    let mut buf = Vec::with_capacity(200 + full_path.len() + host.len());
-    write!(
-        buf,
-        "HEAD {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
-    )
-    .expect("写入 Vec 不会失败");
-    Ok(buf)
-}
-
-/// 构造 HTTP/1.1 格式的 GET 请求(带 Range 头)
-fn build_range_request(url: &str, start: u64, end: u64) -> DownloadResult<Vec<u8>> {
-    let parsed =
-        Url::parse(url).map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
-    let full_path = extract_path(&parsed);
-    let user_agent = tachyon_core::config::USER_AGENT;
-
-    let mut buf = Vec::with_capacity(240 + full_path.len() + host.len());
-    write!(buf, "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n")
-        .expect("写入 Vec 不会失败");
-    Ok(buf)
-}
-
-/// 构造 HTTP/1.1 格式的 GET 请求(全量下载)
-fn build_full_request(url: &str) -> DownloadResult<Vec<u8>> {
-    let parsed =
-        Url::parse(url).map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
-    let full_path = extract_path(&parsed);
-    let user_agent = tachyon_core::config::USER_AGENT;
-
-    let mut buf = Vec::with_capacity(200 + full_path.len() + host.len());
-    write!(
-        buf,
-        "GET {full_path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
-    )
-    .expect("写入 Vec 不会失败");
-    Ok(buf)
+/// 将 h3 错误转换为 DownloadError
+fn h3_error(e: impl std::fmt::Display) -> DownloadError {
+    DownloadError::Network(format!("HTTP/3 协议错误: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,16 +556,27 @@ impl Protocol for QuicTransport {
         &self,
         url: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>> {
-        let conn = match self.require_connection() {
-            Ok(c) => c.clone(),
+        if let Err(e) = self.require_connection() {
+            return Box::pin(async move { Err(e) });
+        }
+        let h3_send = match self.require_h3_send() {
+            Ok(s) => s,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = url.to_owned();
         Box::pin(async move {
-            let request = build_head_request(&url)?;
-            let response_bytes = send_request(&conn, &request).await?;
-            let response = String::from_utf8_lossy(&response_bytes);
-            parse_head_response(&response, &url)
+            // S-2: 校验 URL 防 SSRF
+            let parsed = Url::parse(&url)
+                .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
+            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
+
+            let request = build_h3_request(http::Method::HEAD, &url, &[])?;
+
+            let mut send = h3_send.lock().await;
+            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            let response = stream.recv_response().await.map_err(h3_error)?;
+
+            parse_h3_metadata(&response, &url)
         })
     }
 
@@ -799,32 +586,41 @@ impl Protocol for QuicTransport {
         start: u64,
         end: u64,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let conn = match self.require_connection() {
-            Ok(c) => c.clone(),
+        if let Err(e) = self.require_connection() {
+            return Box::pin(async move { Err(e) });
+        }
+        let h3_send = match self.require_h3_send() {
+            Ok(s) => s,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = url.to_owned();
         Box::pin(async move {
-            let request = build_range_request(&url, start, end)?;
+            // S-2: 校验 URL 防 SSRF
+            let parsed = Url::parse(&url)
+                .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
+            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
 
-            // 使用流式读取代替 send_request 的 256MB 硬编码缓冲
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+            let range_value = format!("bytes={start}-{end}");
+            let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
 
-            send.write_all(&request)
-                .await
-                .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
+            let mut send = h3_send.lock().await;
+            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            let response = stream.recv_response().await.map_err(h3_error)?;
 
-            send.finish()
-                .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
+            // 严格验证 Range 请求必须返回 206
+            let status = response.status().as_u16();
+            if status != 206 {
+                return Err(DownloadError::Protocol(format!(
+                    "服务器忽略 Range 头, 返回 HTTP {status} (期望 206 Partial Content)"
+                )));
+            }
+            drop(send); // 释放 Mutex 以便并发请求
 
-            // 流式读取: recv_streaming 验证 206 状态码并逐块返回正文
+            // 读取响应体 DATA 帧
             use futures::StreamExt;
-            let mut stream = recv_streaming(recv, true);
+            let mut byte_stream = h3_recv_streaming(stream);
             let mut chunks = Vec::new();
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = byte_stream.next().await {
                 chunks.push(chunk?);
             }
             let total_len = chunks.iter().map(|b| b.len()).sum();
@@ -842,30 +638,37 @@ impl Protocol for QuicTransport {
         start: u64,
         end: u64,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
-        let conn = match self.require_connection() {
-            Ok(c) => c.clone(),
+        if let Err(e) = self.require_connection() {
+            return Box::pin(async move { Err(e) });
+        }
+        let h3_send = match self.require_h3_send() {
+            Ok(s) => s,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = url.to_owned();
         Box::pin(async move {
-            let request = build_range_request(&url, start, end)?;
+            // S-2: 校验 URL 防 SSRF
+            let parsed = Url::parse(&url)
+                .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
+            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
 
-            // 打开双向流并发送请求
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+            let range_value = format!("bytes={start}-{end}");
+            let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
 
-            send.write_all(&request)
-                .await
-                .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
+            let mut send = h3_send.lock().await;
+            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            let response = stream.recv_response().await.map_err(h3_error)?;
 
-            send.finish()
-                .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
+            // 严格验证 Range 请求必须返回 206
+            let status = response.status().as_u16();
+            if status != 206 {
+                return Err(DownloadError::Protocol(format!(
+                    "服务器忽略 Range 头, 返回 HTTP {status} (期望 206 Partial Content)"
+                )));
+            }
+            drop(send); // 释放 Mutex
 
-            // 返回流式读取器:逐块读取响应,避免一次性缓冲整个响应
-            // Range 请求必须验证 206 状态码
-            Ok(recv_streaming(recv, true))
+            Ok(h3_recv_streaming(stream))
         })
     }
 
@@ -873,33 +676,33 @@ impl Protocol for QuicTransport {
         &self,
         url: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let conn = match self.require_connection() {
-            Ok(c) => c.clone(),
+        if let Err(e) = self.require_connection() {
+            return Box::pin(async move { Err(e) });
+        }
+        let h3_send = match self.require_h3_send() {
+            Ok(s) => s,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = url.to_owned();
         Box::pin(async move {
-            let request = build_full_request(&url)?;
+            // S-2: 校验 URL 防 SSRF
+            let parsed = Url::parse(&url)
+                .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
+            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
 
-            // 使用流式读取代替 send_request 的 256MB 硬编码缓冲
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| DownloadError::Network(format!("打开 QUIC 双向流失败: {e}")))?;
+            let request = build_h3_request(http::Method::GET, &url, &[])?;
 
-            send.write_all(&request)
-                .await
-                .map_err(|e| DownloadError::Network(format!("发送请求数据失败: {e}")))?;
+            let mut send = h3_send.lock().await;
+            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            let _response = stream.recv_response().await.map_err(h3_error)?;
+            drop(send); // 释放 Mutex
 
-            send.finish()
-                .map_err(|e| DownloadError::Network(format!("关闭发送流失败: {e}")))?;
-
-            // 流式读取: 非 Range 请求,验证 2xx 状态码
+            // 读取全部响应体 DATA 帧
             use futures::StreamExt;
-            let mut stream = recv_streaming(recv, false);
+            let mut byte_stream = h3_recv_streaming(stream);
             let mut chunks = Vec::new();
             let mut total_size: usize = 0;
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk?;
                 total_size = total_size.saturating_add(chunk.len());
                 // W-12: 统一使用共享大小限制,防止 OOM
@@ -1002,229 +805,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("未连接"));
     }
 
-    // --- HEAD 请求构造测试 ---
-
-    #[test]
-    fn test_build_head_request_basic() {
-        let request = build_head_request("https://example.com/file.bin").unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.starts_with("HEAD /file.bin HTTP/1.1\r\n"));
-        assert!(text.contains("Host: example.com\r\n"));
-        assert!(text.contains("Connection: close\r\n"));
-        assert!(text.ends_with("\r\n\r\n"));
-    }
-
-    #[test]
-    fn test_build_head_request_root_path() {
-        let request = build_head_request("https://example.com/").unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.starts_with("HEAD / HTTP/1.1\r\n"));
-    }
-
-    #[test]
-    fn test_build_head_request_with_query() {
-        let request = build_head_request("https://example.com/path?key=value").unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.starts_with("HEAD /path?key=value HTTP/1.1\r\n"));
-    }
-
-    #[test]
-    fn test_build_head_request_custom_port() {
-        let request = build_head_request("https://example.com:8443/file").unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.contains("Host: example.com\r\n"));
-    }
-
-    #[test]
-    fn test_build_head_request_invalid_url() {
-        let result = build_head_request("not a url");
-        assert!(result.is_err());
-    }
-
-    // --- GET Range 请求构造测试 ---
-
-    #[test]
-    fn test_build_range_request() {
-        let request = build_range_request("https://example.com/big.bin", 0, 999).unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.starts_with("GET /big.bin HTTP/1.1\r\n"));
-        assert!(text.contains("Range: bytes=0-999\r\n"));
-        assert!(text.contains("Host: example.com\r\n"));
-    }
-
-    #[test]
-    fn test_build_range_request_large_offsets() {
-        let request =
-            build_range_request("https://example.com/big.bin", 1_000_000, 9_999_999).unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.contains("Range: bytes=1000000-9999999\r\n"));
-    }
-
-    // --- GET 全量请求构造测试 ---
-
-    #[test]
-    fn test_build_full_request() {
-        let request = build_full_request("https://example.com/file.bin").unwrap();
-        let text = String::from_utf8(request).unwrap();
-        assert!(text.starts_with("GET /file.bin HTTP/1.1\r\n"));
-        assert!(text.contains("Host: example.com\r\n"));
-        // 不应包含 Range 头
-        assert!(!text.contains("Range:"));
-    }
-
-    // --- 响应头解析测试 ---
-
-    #[test]
-    fn test_parse_head_response_success() {
-        let response = "HTTP/1.1 200 OK\r\n\
-                         Content-Length: 1048576\r\n\
-                         Content-Type: application/octet-stream\r\n\
-                         Accept-Ranges: bytes\r\n\
-                         ETag: \"abc123\"\r\n\
-                         Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
-                         \r\n";
-
-        let meta = parse_head_response(response, "https://example.com/data.bin").unwrap();
-        assert_eq!(meta.file_name, "data.bin");
-        assert_eq!(meta.file_size, Some(1_048_576));
-        assert_eq!(
-            meta.content_type,
-            Some("application/octet-stream".to_string())
-        );
-        assert!(meta.supports_range);
-        assert_eq!(meta.etag, Some("\"abc123\"".to_string()));
-        assert_eq!(
-            meta.last_modified,
-            Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_head_response_no_content_length() {
-        let response = "HTTP/1.1 200 OK\r\n\
-                         Content-Type: text/html\r\n\
-                         \r\n";
-
-        let meta = parse_head_response(response, "https://example.com/page").unwrap();
-        assert_eq!(meta.file_name, "page");
-        assert_eq!(meta.file_size, None);
-        assert!(!meta.supports_range);
-    }
-
-    #[test]
-    fn test_parse_head_response_404() {
-        let response = "HTTP/1.1 404 Not Found\r\n\
-                         Content-Length: 0\r\n\
-                         \r\n";
-
-        let result = parse_head_response(response, "https://example.com/missing");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("404"),
-            "应报告 HTTP 404 错误,实际: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_head_response_500() {
-        let response = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-        let result = parse_head_response(response, "https://example.com/");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("500"));
-    }
-
-    #[test]
-    fn test_parse_head_response_302_redirect() {
-        let response = "HTTP/1.1 302 Found\r\n\
-                         Location: https://example.com/new-location\r\n\
-                         \r\n";
-        let result = parse_head_response(response, "https://example.com/old");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("302"));
-    }
-
-    #[test]
-    fn test_parse_head_response_content_disposition() {
-        let response = "HTTP/1.1 200 OK\r\n\
-                         Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
-                         Content-Length: 2048\r\n\
-                         \r\n";
-
-        let meta = parse_head_response(response, "https://example.com/download?id=42").unwrap();
-        assert_eq!(meta.file_name, "report.pdf");
-        assert_eq!(meta.file_size, Some(2048));
-    }
-
-    #[test]
-    fn test_parse_head_response_content_disposition_no_quotes() {
-        let response = "HTTP/1.1 200 OK\r\n\
-                         Content-Disposition: attachment; filename=report.pdf\r\n\
-                         \r\n";
-
-        let meta = parse_head_response(response, "https://example.com/download").unwrap();
-        assert_eq!(meta.file_name, "report.pdf");
-    }
-
-    #[test]
-    fn test_parse_head_response_no_range_support() {
-        let response = "HTTP/1.1 200 OK\r\n\
-                         Content-Length: 100\r\n\
-                         \r\n";
-
-        let meta = parse_head_response(response, "https://example.com/file").unwrap();
-        assert!(!meta.supports_range, "无 Accept-Ranges 头应为 false");
-    }
-
-    #[test]
-    fn test_parse_head_response_empty() {
-        let result = parse_head_response("", "https://example.com/");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_head_response_invalid_status_line() {
-        let response = "GARBAGE\r\n\r\n";
-        let result = parse_head_response(response, "https://example.com/");
-        assert!(result.is_err());
-    }
-
-    // --- 响应体分离测试 ---
-
-    #[test]
-    fn test_parse_body_response_success() {
-        let body = b"Hello, World!";
-        let mut response = Vec::new();
-        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n");
-        response.extend_from_slice(body);
-
-        let parsed = parse_body_response(&response).unwrap();
-        assert_eq!(parsed.as_ref(), body);
-    }
-
-    #[test]
-    fn test_parse_body_response_empty_body() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-        let parsed = parse_body_response(response).unwrap();
-        assert!(parsed.is_empty());
-    }
-
-    #[test]
-    fn test_parse_body_response_error_status() {
-        let response = b"HTTP/1.1 404 Not Found\r\n\r\nNot Found";
-        let result = parse_body_response(response);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("404"));
-    }
-
-    #[test]
-    fn test_parse_body_response_no_separator() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5";
-        let result = parse_body_response(response);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("分隔符"));
-    }
-
     // --- URL 解析辅助测试 ---
 
     #[test]
@@ -1314,123 +894,6 @@ mod tests {
         assert!(matches!(err, DownloadError::Protocol(_)));
     }
 
-    // --- 辅助函数测试 ---
-
-    #[test]
-    fn test_find_subsequence_found() {
-        assert_eq!(
-            find_subsequence(b"hello\r\n\r\nworld", b"\r\n\r\n"),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn test_find_subsequence_not_found() {
-        assert_eq!(find_subsequence(b"hello world", b"\r\n\r\n"), None);
-    }
-
-    #[test]
-    fn test_find_subsequence_at_start() {
-        assert_eq!(find_subsequence(b"\r\n\r\ndata", b"\r\n\r\n"), Some(0));
-    }
-
-    #[test]
-    fn test_find_subsequence_at_end() {
-        assert_eq!(find_subsequence(b"data\r\n\r\n", b"\r\n\r\n"), Some(4));
-    }
-
-    #[test]
-    fn test_validate_http_status_200() {
-        assert!(validate_http_status(b"HTTP/1.1 200 OK\r\nContent-Length: 10").is_ok());
-    }
-
-    #[test]
-    fn test_validate_http_status_206_partial() {
-        assert!(validate_http_status(b"HTTP/1.1 206 Partial Content").is_ok());
-    }
-
-    // --- Range 请求 206 状态码验证测试 ---
-
-    #[test]
-    fn test_validate_range_status_206_ok() {
-        assert!(validate_range_status(b"HTTP/1.1 206 Partial Content").is_ok());
-    }
-
-    #[test]
-    fn test_validate_range_status_200_rejected() {
-        let result = validate_range_status(b"HTTP/1.1 200 OK");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("206"), "错误应提及期望 206, 实际: {err}");
-        assert!(err.contains("200"), "错误应包含实际状态码 200, 实际: {err}");
-    }
-
-    #[test]
-    fn test_validate_range_status_404_rejected() {
-        assert!(validate_range_status(b"HTTP/1.1 404 Not Found").is_err());
-    }
-
-    #[test]
-    fn test_parse_range_body_response_206_ok() {
-        let body = b"partial data";
-        let mut response = Vec::new();
-        response.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 12\r\n\r\n");
-        response.extend_from_slice(body);
-        let parsed = parse_range_body_response(&response).unwrap();
-        assert_eq!(parsed.as_ref(), body);
-    }
-
-    #[test]
-    fn test_parse_range_body_response_200_rejected() {
-        let body = b"full file data";
-        let mut response = Vec::new();
-        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n");
-        response.extend_from_slice(body);
-        let result = parse_range_body_response(&response);
-        assert!(
-            result.is_err(),
-            "Range 请求返回 200 应被拒绝(服务器忽略 Range 头)"
-        );
-    }
-
-    #[test]
-    fn test_validate_http_status_404() {
-        let result = validate_http_status(b"HTTP/1.1 404 Not Found");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("404"));
-    }
-
-    #[test]
-    fn test_validate_http_status_500() {
-        let result = validate_http_status(b"HTTP/1.1 500 Internal Server Error");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("500"));
-    }
-
-    #[test]
-    fn test_extract_path_basic() {
-        let url = Url::parse("https://example.com/file.bin").unwrap();
-        assert_eq!(extract_path(&url), "/file.bin");
-    }
-
-    #[test]
-    fn test_extract_path_root() {
-        let url = Url::parse("https://example.com/").unwrap();
-        assert_eq!(extract_path(&url), "/");
-    }
-
-    #[test]
-    fn test_extract_path_with_query() {
-        let url = Url::parse("https://example.com/path?key=value").unwrap();
-        assert_eq!(extract_path(&url), "/path?key=value");
-    }
-
-    #[test]
-    fn test_extract_path_no_path() {
-        let url = Url::parse("https://example.com").unwrap();
-        assert_eq!(extract_path(&url), "/");
-    }
-
     // --- download_range_stream 未连接错误测试 ---
 
     #[tokio::test]
@@ -1442,5 +905,147 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("未连接"), "应提示未连接,实际: {err_msg}");
+    }
+
+    // --- h3 请求构造测试 ---
+
+    #[test]
+    fn test_build_h3_request_head_basic() {
+        let req =
+            build_h3_request(http::Method::HEAD, "https://example.com/file.bin", &[]).unwrap();
+        assert_eq!(req.method(), http::Method::HEAD);
+        assert_eq!(req.uri().path(), "/file.bin");
+        assert_eq!(req.headers().get("host").unwrap(), "example.com");
+        assert!(req.headers().contains_key("user-agent"));
+    }
+
+    #[test]
+    fn test_build_h3_request_root_path() {
+        let req = build_h3_request(http::Method::HEAD, "https://example.com/", &[]).unwrap();
+        assert_eq!(req.uri().path(), "/");
+    }
+
+    #[test]
+    fn test_build_h3_request_with_query() {
+        let req =
+            build_h3_request(http::Method::GET, "https://example.com/path?key=value", &[]).unwrap();
+        assert_eq!(req.uri().path(), "/path");
+        assert_eq!(req.uri().query(), Some("key=value"));
+    }
+
+    #[test]
+    fn test_build_h3_request_with_range_header() {
+        let req = build_h3_request(
+            http::Method::GET,
+            "https://example.com/big.bin",
+            &[("range", "bytes=0-999")],
+        )
+        .unwrap();
+        assert_eq!(req.method(), http::Method::GET);
+        assert_eq!(req.headers().get("range").unwrap(), "bytes=0-999");
+    }
+
+    #[test]
+    fn test_build_h3_request_custom_port() {
+        let req =
+            build_h3_request(http::Method::HEAD, "https://example.com:8443/file", &[]).unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn test_build_h3_request_invalid_url() {
+        let result = build_h3_request(http::Method::GET, "not a url", &[]);
+        assert!(result.is_err());
+    }
+
+    // --- h3 响应元数据解析测试 ---
+
+    fn make_h3_response(status: u16, headers: Vec<(&str, &str)>) -> http::Response<()> {
+        let mut builder = http::Response::builder().status(status);
+        for (k, v) in headers {
+            builder = builder.header(k, v);
+        }
+        builder.body(()).unwrap()
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_success() {
+        let resp = make_h3_response(
+            200,
+            vec![
+                ("content-length", "1048576"),
+                ("content-type", "application/octet-stream"),
+                ("accept-ranges", "bytes"),
+                ("etag", "\"abc123\""),
+                ("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+            ],
+        );
+        let meta = parse_h3_metadata(&resp, "https://example.com/data.bin").unwrap();
+        assert_eq!(meta.file_name, "data.bin");
+        assert_eq!(meta.file_size, Some(1_048_576));
+        assert_eq!(
+            meta.content_type,
+            Some("application/octet-stream".to_string())
+        );
+        assert!(meta.supports_range);
+        assert_eq!(meta.etag, Some("\"abc123\"".to_string()));
+        assert_eq!(
+            meta.last_modified,
+            Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_no_content_length() {
+        let resp = make_h3_response(200, vec![("content-type", "text/html")]);
+        let meta = parse_h3_metadata(&resp, "https://example.com/page").unwrap();
+        assert_eq!(meta.file_name, "page");
+        assert_eq!(meta.file_size, None);
+        assert!(!meta.supports_range);
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_404() {
+        let resp = make_h3_response(404, vec![]);
+        let result = parse_h3_metadata(&resp, "https://example.com/missing");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("404"));
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_500() {
+        let resp = make_h3_response(500, vec![]);
+        let result = parse_h3_metadata(&resp, "https://example.com/");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("500"));
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_302_redirect() {
+        let resp = make_h3_response(302, vec![("location", "https://example.com/new")]);
+        let result = parse_h3_metadata(&resp, "https://example.com/old");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("302"));
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_content_disposition() {
+        let resp = make_h3_response(
+            200,
+            vec![
+                ("content-disposition", "attachment; filename=\"report.pdf\""),
+                ("content-length", "2048"),
+            ],
+        );
+        let meta = parse_h3_metadata(&resp, "https://example.com/download?id=42").unwrap();
+        assert_eq!(meta.file_name, "report.pdf");
+        assert_eq!(meta.file_size, Some(2048));
+    }
+
+    #[test]
+    fn test_parse_h3_metadata_no_range_support() {
+        let resp = make_h3_response(200, vec![("content-length", "100")]);
+        let meta = parse_h3_metadata(&resp, "https://example.com/file").unwrap();
+        assert!(!meta.supports_range, "无 Accept-Ranges 头应为 false");
     }
 }

@@ -201,6 +201,10 @@ impl AsyncStorage for TokioFile {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
                 use std::os::fd::AsRawFd;
+                // Safety:
+                // - file 是合法打开的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
+                // - as_raw_fd() 返回的文件描述符在该期间有效
+                // - mode=0、offset=0、len=size 均为合法的 fallocate 参数
                 let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
                 if ret != 0 {
                     return Err(DownloadError::Io(std::io::Error::last_os_error()));

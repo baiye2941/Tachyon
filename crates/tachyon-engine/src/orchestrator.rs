@@ -21,6 +21,8 @@ pub struct DownloadOrchestrator {
     pool: Arc<ConnectionPool>,
     bandwidth: BandwidthTracker,
     scheduler_config: SchedulerConfig,
+    /// 预留接口:活跃分片记录,待未来 Orchestrator 接管分片状态时启用
+    #[allow(dead_code)]
     active_fragments: Vec<FragmentRecord>,
 }
 
@@ -139,19 +141,28 @@ impl DownloadOrchestrator {
     }
 
     /// 注册分片到活跃列表(供上层追踪分片状态)
+    ///
+    /// 预留接口:待未来 Orchestrator 接管分片状态时启用。
+    #[allow(dead_code)]
     pub fn register_fragment(&mut self, info: FragmentInfo) {
         self.active_fragments.push(FragmentRecord::new(info, 3));
     }
 
     /// 标记分片完成并更新带宽追踪(供上层在分片下载完成后调用)
+    ///
+    /// 预留接口:待未来 Orchestrator 接管分片状态时启用。
+    #[allow(dead_code)]
     pub fn on_fragment_complete(&mut self, info: &FragmentInfo, duration: Duration) {
         self.on_fragment_done(info.size, duration);
         if let Some(record) = self.active_fragments.get_mut(info.index as usize) {
-            record.write_done();
+            let _ = record.write_done();
         }
     }
 
     /// 获取活跃分片记录的不可变引用(供上层查询分片状态)
+    ///
+    /// 预留接口:待未来 Orchestrator 接管分片状态时启用。
+    #[allow(dead_code)]
     pub fn active_fragments(&self) -> &[FragmentRecord] {
         &self.active_fragments
     }

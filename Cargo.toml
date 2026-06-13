@@ -45,10 +45,20 @@ quinn = "0.11"
 rustls = "0.23"
 rustls-native-certs = "0.8"
 rcgen = "0.13"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 
 # 哈希
 blake3 = "1"
 sha2 = "0.10"
+
+# 随机数
+getrandom = "0.3"
+
+# 密码学
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+rand = "0.8"
 
 # GPU
 wgpu = "24"

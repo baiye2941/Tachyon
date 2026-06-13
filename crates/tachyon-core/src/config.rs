@@ -35,6 +35,50 @@ pub enum IoStrategy {
     IoUring,
 }
 
+/// 分片并发数上限
+///
+/// 过高的并发可能导致源服务器拒绝服务或本地资源耗尽。
+/// 256 个并发分片在千兆网络下可占满带宽。
+pub const MAX_CONCURRENT_FRAGMENTS_LIMIT: u32 = 256;
+
+/// 最大重试次数上限
+///
+/// 100 次重试足以覆盖指数退避策略下数小时的恢复窗口。
+pub const MAX_RETRIES_LIMIT: u32 = 100;
+
+/// 请求超时上限(秒)
+///
+/// 1 小时足以覆盖慢速源的大文件单分片传输。
+pub const REQUEST_TIMEOUT_SECS_LIMIT: u64 = 3600;
+
+/// 连接超时上限(秒)
+///
+/// 5 分钟涵盖高延迟网络(如卫星链路)的 TCP 握手时间。
+pub const CONNECT_TIMEOUT_SECS_LIMIT: u64 = 300;
+
+/// 暂停超时上限(秒)
+///
+/// 24 小时防止任务永久暂停占用资源。
+pub const PAUSE_TIMEOUT_SECS_LIMIT: u64 = 86400;
+
+/// 单主机最大连接数上限
+///
+/// 128 路连接在常规多线程 HTTP 客户端中已属较高水平,
+/// 继续增大收益递减且增加端口耗尽风险。
+pub const MAX_CONNECTIONS_PER_HOST_LIMIT: u32 = 128;
+
+/// 全局最大连接数上限
+///
+/// 4096 足以支撑高并发下载场景,
+/// 同时避免文件描述符耗尽。
+pub const MAX_GLOBAL_CONNECTIONS_LIMIT: u32 = 4096;
+
+/// 最大并发任务数上限
+///
+/// 100 个并发任务在高带宽场景下已足够,
+/// 继续增大易导致调度开销激增。
+pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 100;
+
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "DownloadConfigSerde")]
@@ -62,6 +106,9 @@ pub struct DownloadConfig {
     /// 全局下载限速(字节/秒)，None 表示不限速
     #[serde(default)]
     pub rate_limit_bytes_per_sec: Option<u64>,
+    /// 未知大小整块流式下载的最大允许字节数
+    #[serde(default = "default_max_full_stream_bytes")]
+    pub max_full_stream_bytes: u64,
     /// I/O 存储后端策略
     #[serde(default)]
     pub io_strategy: IoStrategy,
@@ -84,6 +131,8 @@ struct DownloadConfigSerde {
     authorized_dirs: Option<Vec<String>>,
     #[serde(default)]
     rate_limit_bytes_per_sec: Option<u64>,
+    #[serde(default = "default_max_full_stream_bytes")]
+    max_full_stream_bytes: u64,
     #[serde(default)]
     io_strategy: IoStrategy,
 }
@@ -94,6 +143,10 @@ fn default_pause_timeout_secs() -> u64 {
 
 fn default_connect_timeout_secs() -> u64 {
     10
+}
+
+pub const fn default_max_full_stream_bytes() -> u64 {
+    64 * 1024 * 1024 * 1024
 }
 
 impl From<DownloadConfigSerde> for DownloadConfig {
@@ -114,6 +167,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             headers: value.headers,
             pause_timeout_secs: value.pause_timeout_secs,
             rate_limit_bytes_per_sec: value.rate_limit_bytes_per_sec,
+            max_full_stream_bytes: value.max_full_stream_bytes,
             authorized_dirs,
             io_strategy: value.io_strategy,
         }
@@ -142,6 +196,7 @@ impl Default for DownloadConfig {
             headers: std::collections::HashMap::new(),
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
+            max_full_stream_bytes: default_max_full_stream_bytes(),
             authorized_dirs: vec![download_dir],
             io_strategy: IoStrategy::default(),
         }
@@ -238,20 +293,54 @@ impl DownloadConfig {
         if self.max_concurrent_fragments == 0 {
             return Err(e("max_concurrent_fragments 必须 >= 1"));
         }
-        if self.max_concurrent_fragments > 256 {
-            return Err(e("max_concurrent_fragments 不能超过 256"));
+        if self.max_concurrent_fragments > MAX_CONCURRENT_FRAGMENTS_LIMIT {
+            return Err(e(&format!(
+                "max_concurrent_fragments 不能超过 {MAX_CONCURRENT_FRAGMENTS_LIMIT}"
+            )));
         }
-        if self.max_retries > 100 {
-            return Err(e("max_retries 不能超过 100"));
+        if self.max_retries > MAX_RETRIES_LIMIT {
+            return Err(e(&format!("max_retries 不能超过 {MAX_RETRIES_LIMIT}")));
         }
         if self.request_timeout_secs == 0 {
             return Err(e("request_timeout_secs 必须 >= 1"));
         }
+        if self.request_timeout_secs > REQUEST_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "request_timeout_secs 不能超过 {REQUEST_TIMEOUT_SECS_LIMIT}"
+            )));
+        }
         if self.connect_timeout_secs == 0 {
             return Err(e("connect_timeout_secs 必须 >= 1"));
         }
+        if self.connect_timeout_secs > CONNECT_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "connect_timeout_secs 不能超过 {CONNECT_TIMEOUT_SECS_LIMIT}"
+            )));
+        }
         if self.download_dir.is_empty() {
             return Err(e("download_dir 不能为空"));
+        }
+        if self.pause_timeout_secs == 0 {
+            return Err(e("pause_timeout_secs 必须 >= 1"));
+        }
+        if self.pause_timeout_secs > PAUSE_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "pause_timeout_secs 不能超过 {PAUSE_TIMEOUT_SECS_LIMIT} (24h)"
+            )));
+        }
+        if let Some(rate) = self.rate_limit_bytes_per_sec
+            && rate == 0
+        {
+            return Err(e("rate_limit_bytes_per_sec 不能为 0,使用 None 表示不限速"));
+        }
+        if self.max_full_stream_bytes == 0 {
+            return Err(e("max_full_stream_bytes 必须 >= 1"));
+        }
+        if self.user_agent.is_empty() {
+            return Err(e("user_agent 不能为空"));
+        }
+        if self.authorized_dirs.is_empty() {
+            return Err(e("authorized_dirs 不能为空"));
         }
         Ok(())
     }
@@ -265,14 +354,18 @@ impl ConnectionConfig {
         if self.max_connections_per_host == 0 {
             return Err(e("max_connections_per_host 必须 >= 1"));
         }
-        if self.max_connections_per_host > 128 {
-            return Err(e("max_connections_per_host 不能超过 128"));
+        if self.max_connections_per_host > MAX_CONNECTIONS_PER_HOST_LIMIT {
+            return Err(e(&format!(
+                "max_connections_per_host 不能超过 {MAX_CONNECTIONS_PER_HOST_LIMIT}"
+            )));
         }
         if self.max_global_connections == 0 {
             return Err(e("max_global_connections 必须 >= 1"));
         }
-        if self.max_global_connections > 4096 {
-            return Err(e("max_global_connections 不能超过 4096"));
+        if self.max_global_connections > MAX_GLOBAL_CONNECTIONS_LIMIT {
+            return Err(e(&format!(
+                "max_global_connections 不能超过 {MAX_GLOBAL_CONNECTIONS_LIMIT}"
+            )));
         }
         Ok(())
     }
@@ -313,8 +406,10 @@ impl AppConfig {
         if self.max_concurrent_tasks == 0 {
             return Err(e("max_concurrent_tasks 必须 >= 1"));
         }
-        if self.max_concurrent_tasks > 100 {
-            return Err(e("max_concurrent_tasks 不能超过 100"));
+        if self.max_concurrent_tasks > MAX_CONCURRENT_TASKS_LIMIT {
+            return Err(e(&format!(
+                "max_concurrent_tasks 不能超过 {MAX_CONCURRENT_TASKS_LIMIT}"
+            )));
         }
         self.download.validate()?;
         self.connection.validate()?;

@@ -136,18 +136,18 @@ pub type ProgressEvent = HashMap<String, TaskProgress>;
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
-    pub tasks: DashMap<String, TaskInfo>,
-    pub config: Arc<tokio::sync::Mutex<AppConfig>>,
-    pub handles: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
-    pub active_permits: Arc<AtomicU32>,
-    pub sniffer: Arc<tokio::sync::Mutex<Vec<SnifferResource>>>,
-    pub sniffer_filters: Arc<tokio::sync::Mutex<Vec<String>>>,
-    pub progress_tx: watch::Sender<ProgressEvent>,
-    pub connection_pool: Arc<ConnectionPool>,
-    pub controls: Arc<DashMap<String, watch::Sender<DownloadState>>>,
-    pub task_store: Arc<TaskStore>,
+    pub(crate) tasks: DashMap<String, TaskInfo>,
+    pub(crate) config: Arc<tokio::sync::Mutex<AppConfig>>,
+    pub(crate) handles: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    pub(crate) active_permits: Arc<AtomicU32>,
+    pub(crate) sniffer: Arc<tokio::sync::Mutex<Vec<SnifferResource>>>,
+    pub(crate) sniffer_filters: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub(crate) progress_tx: watch::Sender<ProgressEvent>,
+    pub(crate) connection_pool: Arc<ConnectionPool>,
+    pub(crate) controls: Arc<DashMap<String, watch::Sender<DownloadState>>>,
+    pub(crate) task_store: Arc<TaskStore>,
     /// 任务创建锁: 保证去重检查 + 并发计数 + 插入的原子性
-    pub create_task_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) create_task_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for AppState {

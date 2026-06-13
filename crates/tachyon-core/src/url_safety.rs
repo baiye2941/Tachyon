@@ -34,18 +34,29 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
 /// 第二次解析返回内网 IP（如 169.254.169.254 云元数据服务）。
 /// 此函数在 URL 字符串校验之后、发起连接之前调用,确保所有解析结果均为安全 IP。
 ///
-/// # 注意
+/// # 返回值
 ///
-/// 调用此函数后,协议层应使用已解析的 IP 进行连接（而非重新发起 DNS 查询）,
-/// 否则仍存在 TOCTOU（Time-of-Check to Time-of-Use）窗口。
-pub fn validate_resolved_ip(url: &Url) -> DownloadResult<()> {
+/// 返回所有已验证的安全 IP 地址列表。**协议层必须使用这些 IP 进行连接**
+/// （而非重新发起 DNS 查询）,以消除 TOCTOU（Time-of-Check to Time-of-Use）窗口。
+///
+/// # 用法
+///
+/// ```ignore
+/// let safe_ips = validate_resolved_ip(&url)?;
+/// // 使用 safe_ips 中的 IP 直接建立连接,不再重新 DNS 解析
+/// for ip in &safe_ips {
+///     match connect_to(ip, port).await { ... }
+/// }
+/// ```
+pub fn validate_resolved_ip(url: &Url) -> DownloadResult<Vec<IpAddr>> {
     let host = url
         .host_str()
         .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))?;
 
     // 如果 host 已经是 IP 地址,直接校验即可（无需 DNS 解析）
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return reject_forbidden_ip(ip);
+        reject_forbidden_ip(ip)?;
+        return Ok(vec![ip]);
     }
 
     // 对域名执行 DNS 解析
@@ -54,17 +65,17 @@ pub fn validate_resolved_ip(url: &Url) -> DownloadResult<()> {
         .to_socket_addrs()
         .map_err(|e| DownloadError::Network(format!("DNS 解析失败: {e}")))?;
 
-    let mut resolved_count = 0u32;
+    let mut resolved_ips = Vec::new();
     for addr in addrs {
         reject_forbidden_ip(addr.ip())?;
-        resolved_count += 1;
+        resolved_ips.push(addr.ip());
     }
 
-    if resolved_count == 0 {
+    if resolved_ips.is_empty() {
         return Err(DownloadError::Network("DNS 解析无结果".into()));
     }
 
-    Ok(())
+    Ok(resolved_ips)
 }
 
 /// 重定向目标校验:对每次重定向的目标 URL 执行完整的 SSRF 校验
@@ -82,7 +93,7 @@ pub fn validate_redirect(
     redirect_url: &Url,
     max_redirects: u32,
     current_redirect: u32,
-) -> DownloadResult<()> {
+) -> DownloadResult<Vec<IpAddr>> {
     if current_redirect >= max_redirects {
         return Err(DownloadError::Protocol(format!(
             "重定向次数超过上限 ({max_redirects})"
@@ -90,8 +101,8 @@ pub fn validate_redirect(
     }
     // 对每次重定向目标执行完整的 URL 校验 + DNS 解析校验
     validate_public_http_url(redirect_url)?;
-    validate_resolved_ip(redirect_url)?;
-    Ok(())
+    let safe_ips = validate_resolved_ip(redirect_url)?;
+    Ok(safe_ips)
 }
 
 pub fn reject_forbidden_ip(ip: IpAddr) -> DownloadResult<()> {
@@ -126,13 +137,27 @@ fn reject_forbidden_ipv4(ip: Ipv4Addr) -> DownloadResult<()> {
             "不允许访问受限 IPv4 地址: {ip}"
         )));
     }
-    // RFC 5737 文档地址
-    if ip == Ipv4Addr::new(192, 0, 2, 0)
-        || ip == Ipv4Addr::new(198, 51, 100, 0)
-        || ip == Ipv4Addr::new(203, 0, 113, 0)
+    // RFC 5737 文档地址: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+    // S-16: 匹配整个 /24 网段(前 3 个字节),而非仅 .0 网络地址
+    let doc_ranges: [(u8, u8, u8); 3] = [(192, 0, 2), (198, 51, 100), (203, 0, 113)];
+    if doc_ranges
+        .iter()
+        .any(|&(a, b, c)| octets[0] == a && octets[1] == b && octets[2] == c)
     {
         return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip}"
+            "不允许访问受限 IPv4 地址: {ip} (RFC 5737 文档地址)"
+        )));
+    }
+    // RFC 2544 基准测试地址 (198.18.0.0/15)
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return Err(DownloadError::Config(format!(
+            "不允许访问受限 IPv4 地址: {ip} (RFC 2544 基准测试地址)"
+        )));
+    }
+    // IETF Protocol Assignments (192.0.0.0/24)
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return Err(DownloadError::Config(format!(
+            "不允许访问受限 IPv4 地址: {ip} (IETF Protocol Assignments)"
         )));
     }
     Ok(())
@@ -244,17 +269,56 @@ mod tests {
 
     #[test]
     fn rejects_documentation_range() {
-        // RFC 5737 文档地址
+        // RFC 5737 文档地址: 整个 /24 网段均应被拒绝
         for ip in [
             Ipv4Addr::new(192, 0, 2, 0),
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(192, 0, 2, 255),
             Ipv4Addr::new(198, 51, 100, 0),
+            Ipv4Addr::new(198, 51, 100, 42),
             Ipv4Addr::new(203, 0, 113, 0),
+            Ipv4Addr::new(203, 0, 113, 200),
         ] {
             assert!(
                 reject_forbidden_ipv4(ip).is_err(),
                 "{ip} should be rejected as documentation range"
             );
         }
+        // 相邻网段不应被误拦截
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(192, 0, 3, 1)).is_ok());
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 51, 101, 1)).is_ok());
+    }
+
+    #[test]
+    fn rejects_rfc2544_benchmark_and_ietf_protocol_assignment_ranges() {
+        // RFC 2544 基准测试地址 (198.18.0.0/15)
+        for ip in [
+            Ipv4Addr::new(198, 18, 0, 0),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(198, 18, 255, 255),
+            Ipv4Addr::new(198, 19, 0, 0),
+            Ipv4Addr::new(198, 19, 255, 255),
+        ] {
+            assert!(
+                reject_forbidden_ipv4(ip).is_err(),
+                "{ip} should be rejected as RFC 2544 benchmark range"
+            );
+        }
+        // IETF Protocol Assignments (192.0.0.0/24)
+        for ip in [
+            Ipv4Addr::new(192, 0, 0, 0),
+            Ipv4Addr::new(192, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 0, 255),
+        ] {
+            assert!(
+                reject_forbidden_ipv4(ip).is_err(),
+                "{ip} should be rejected as IETF Protocol Assignments range"
+            );
+        }
+        // 相邻网段不应被误拦截
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 17, 255, 255)).is_ok());
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 20, 0, 0)).is_ok());
+        assert!(reject_forbidden_ipv4(Ipv4Addr::new(192, 0, 1, 0)).is_ok());
     }
 
     #[test]

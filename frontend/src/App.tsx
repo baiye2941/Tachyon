@@ -86,8 +86,9 @@ function AppContent() {
         const filterRegex = /(\w+):([^\s]+)/g
         let match
         while ((match = filterRegex.exec(query)) !== null) {
-            const [, type, value] = match
-            if (['status', 'type', 'size', 'speed', 'name'].includes(type)) {
+            const type = match[1]
+            const value = match[2]
+            if (type && value && ['status', 'type', 'size', 'speed', 'name'].includes(type)) {
                 filters.push({ type, value, raw: match[0] })
                 textQuery = textQuery.replace(match[0], '').trim()
             }
@@ -159,7 +160,9 @@ function AppContent() {
                         return t.fileSize < num
                     }
                     if (val.includes('..')) {
-                        const [min, max] = val.split('..').map(parseSize)
+                        const parts = val.split('..').map(parseSize)
+                        const min = parts[0] ?? 0
+                        const max = parts[1] ?? 0
                         return t.fileSize >= min && t.fileSize <= max
                     }
                     return t.fileSize === parseSize(val)

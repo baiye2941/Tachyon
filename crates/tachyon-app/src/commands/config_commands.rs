@@ -41,27 +41,23 @@ async fn update_config_inner(state: &AppState, config: AppConfig) -> Result<(), 
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_config(config: &AppConfig) -> Result<(), AppError> {
-    if config.max_concurrent_tasks == 0 || config.max_concurrent_tasks > 64 {
-        return Err(AppError::Config(format!(
-            "max_concurrent_tasks 必须在 1..=64 范围内,当前值: {}",
-            config.max_concurrent_tasks
-        )));
-    }
-    if config.download.max_concurrent_fragments == 0
-        || config.download.max_concurrent_fragments > 32
-    {
-        return Err(AppError::Config(format!(
-            "max_concurrent_fragments 必须在 1..=32 范围内,当前值: {}",
-            config.download.max_concurrent_fragments
-        )));
-    }
-    if config.download.download_dir.is_empty() {
-        return Err(AppError::Config("download_dir 不能为空".to_string()));
-    }
+    // 委托 core 层校验数值范围与其他基础字段,保持上下限一致
+    config.validate().map_err(|e| match e {
+        tachyon_core::DownloadError::Config(msg) => AppError::Config(msg),
+        other => AppError::Core(other),
+    })?;
 
-    // 校验 authorized_dirs:每个目录必须存在且不能是系统根目录
+    // 校验 authorized_dirs:每个授权根必须存在、是目录且不能是系统根目录
     for dir in &config.download.authorized_dirs {
         let path = std::path::Path::new(dir);
+        if path.as_os_str().is_empty() {
+            return Err(AppError::Config("authorized_dirs 不能为空路径".to_string()));
+        }
+        if !path.is_absolute() {
+            return Err(AppError::Config(format!(
+                "authorized_dirs 必须是绝对路径: {dir}"
+            )));
+        }
         if !path.exists() {
             return Err(AppError::Config(format!(
                 "authorized_dirs 路径不存在: {dir}"
@@ -70,30 +66,34 @@ pub(crate) fn validate_config(config: &AppConfig) -> Result<(), AppError> {
         let canonical = path
             .canonicalize()
             .map_err(|_| AppError::Config(format!("authorized_dirs 路径无法解析: {dir}")))?;
+        if !canonical.is_dir() {
+            return Err(AppError::Config(format!(
+                "authorized_dirs 必须是目录: {dir}"
+            )));
+        }
         // 禁止系统根目录和 Unix 系统顶层目录
-        let is_root = canonical.parent().is_none();
-        let first_normal_component = canonical.components().find_map(|component| {
-            if let std::path::Component::Normal(name) = component {
-                name.to_str()
-            } else {
-                None
-            }
-        });
-        let is_unix_system_top_dir =
-            matches!(first_normal_component, Some("usr" | "etc" | "System"));
-        let forbidden = is_root || is_unix_system_top_dir;
-        if forbidden {
+        if is_forbidden_authorized_root(&canonical) {
             return Err(AppError::Config(format!(
                 "authorized_dirs 不允许包含系统根目录: {dir}"
             )));
         }
     }
 
-    // 校验 headers:禁止设置敏感请求头
-    for key in config.download.headers.keys() {
+    // 校验 headers:禁止设置敏感请求头,禁止键/值中包含 CRLF 注入字符
+    for (key, value) in &config.download.headers {
         let lower = key.to_lowercase();
         if ["authorization", "cookie", "proxy-authorization"].contains(&lower.as_str()) {
             return Err(AppError::Config(format!("headers 不允许设置敏感头: {key}")));
+        }
+        if key.contains('\r') || key.contains('\n') {
+            return Err(AppError::Config(format!(
+                "headers 键不能包含换行符(CR/LF): {key}"
+            )));
+        }
+        if value.contains('\r') || value.contains('\n') {
+            return Err(AppError::Config(format!(
+                "headers 值不能包含换行符(CR/LF): {key}"
+            )));
         }
     }
 
@@ -105,27 +105,205 @@ pub(crate) fn authorize_download_dir(
     requested_dir: &str,
 ) -> Result<String, AppError> {
     let requested = std::path::Path::new(requested_dir);
-    // 兼容不存在目录:canonicalize 失败时回退到原始路径(用于测试和目录创建前)
-    let requested_canonical = requested
-        .canonicalize()
-        .unwrap_or_else(|_| requested.to_path_buf());
-
-    let authorized = config.download.authorized_dirs.iter().any(|dir| {
-        let path = std::path::Path::new(dir);
-        path.canonicalize()
-            .ok()
-            .map(|canonical| requested_canonical.starts_with(&canonical))
-            .unwrap_or(false)
-    });
-
-    if !authorized {
+    if requested.as_os_str().is_empty() {
+        return Err(AppError::Config("下载目录未授权: 空路径".to_string()));
+    }
+    if !requested.is_absolute() {
         return Err(AppError::Config(format!(
             "下载目录未授权: {}",
             requested.display()
         )));
     }
-    // 返回原始请求路径而非 canonical 路径，避免 Windows 上 \\?\ 前缀不一致
-    Ok(requested_dir.to_string())
+    if requested
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    }
+
+    let authorized_roots = canonical_authorized_roots(config)?;
+    let Some(existing_ancestor) = deepest_existing_ancestor(requested) else {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    };
+    ensure_not_symlink_or_reparse(existing_ancestor, requested)?;
+    if !existing_ancestor.is_dir() {
+        return Err(AppError::Config(format!(
+            "下载目录已存在但不是目录: {}",
+            existing_ancestor.display()
+        )));
+    }
+
+    let canonical_ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    let authorized_root = authorized_roots
+        .iter()
+        .find(|root| canonical_ancestor.starts_with(root.as_path()))
+        .ok_or_else(|| AppError::Config(format!("下载目录未授权: {}", requested.display())))?;
+
+    let candidate = create_authorized_dir_chain(
+        canonical_ancestor,
+        missing_components_after(requested, existing_ancestor)?,
+        authorized_root,
+        requested,
+    )?;
+
+    let canonical_requested = candidate
+        .canonicalize()
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    if !canonical_requested.is_dir() || !canonical_requested.starts_with(authorized_root) {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    }
+
+    Ok(canonical_requested.to_string_lossy().to_string())
+}
+
+fn create_authorized_dir_chain(
+    mut candidate: std::path::PathBuf,
+    missing_components: Vec<std::ffi::OsString>,
+    authorized_root: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<std::path::PathBuf, AppError> {
+    ensure_authorized_directory(&candidate, authorized_root, requested)?;
+
+    for component in missing_components {
+        candidate.push(component);
+        if candidate.exists() {
+            ensure_authorized_directory(&candidate, authorized_root, requested)?;
+            continue;
+        }
+
+        std::fs::create_dir(&candidate).map_err(|e| {
+            AppError::Config(format!("创建下载目录失败: {}: {e}", requested.display()))
+        })?;
+        ensure_authorized_directory(&candidate, authorized_root, requested)?;
+    }
+
+    Ok(candidate)
+}
+
+fn ensure_authorized_directory(
+    path: &std::path::Path,
+    authorized_root: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    if is_symlink_or_reparse(&metadata) {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    }
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    if !canonical.is_dir() || !canonical.starts_with(authorized_root) {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn ensure_not_symlink_or_reparse(
+    path: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    if is_symlink_or_reparse(&metadata) {
+        return Err(AppError::Config(format!(
+            "下载目录未授权: {}",
+            requested.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::{FileTypeExt, MetadataExt};
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file_type = metadata.file_type();
+    file_type.is_symlink_dir()
+        || file_type.is_symlink_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn canonical_authorized_roots(config: &AppConfig) -> Result<Vec<std::path::PathBuf>, AppError> {
+    if config.download.authorized_dirs.is_empty() {
+        return Err(AppError::Config("authorized_dirs 不能为空".to_string()));
+    }
+
+    config
+        .download
+        .authorized_dirs
+        .iter()
+        .map(|dir| {
+            let path = std::path::Path::new(dir);
+            if path.as_os_str().is_empty() || !path.is_absolute() || !path.exists() {
+                return Err(AppError::Config(format!("authorized_dirs 路径无效: {dir}")));
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| AppError::Config(format!("authorized_dirs 路径无法解析: {dir}")))?;
+            if !canonical.is_dir() || is_forbidden_authorized_root(&canonical) {
+                return Err(AppError::Config(format!("authorized_dirs 路径无效: {dir}")));
+            }
+            Ok(canonical)
+        })
+        .collect()
+}
+
+fn is_forbidden_authorized_root(canonical: &std::path::Path) -> bool {
+    let is_root = canonical.parent().is_none();
+    let first_normal_component = canonical.components().find_map(|component| {
+        if let std::path::Component::Normal(name) = component {
+            name.to_str()
+        } else {
+            None
+        }
+    });
+    let is_unix_system_top_dir = matches!(first_normal_component, Some("usr" | "etc" | "System"));
+    is_root || is_unix_system_top_dir
+}
+
+fn deepest_existing_ancestor(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.ancestors().find(|ancestor| ancestor.exists())
+}
+
+fn missing_components_after(
+    requested: &std::path::Path,
+    existing_ancestor: &std::path::Path,
+) -> Result<Vec<std::ffi::OsString>, AppError> {
+    let relative = requested
+        .strip_prefix(existing_ancestor)
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+    Ok(relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +345,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
+                max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
                 authorized_dirs: vec![download_dir.to_string()],
                 io_strategy: IoStrategy::default(),
             },
@@ -214,6 +393,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
+                max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
                 authorized_dirs: vec![dl_dir_str.clone()],
                 io_strategy: IoStrategy::default(),
             },
@@ -242,7 +422,7 @@ mod tests {
         let state = test_state();
         let before = get_config_inner(&state).await.unwrap();
         let mut invalid = before.clone();
-        invalid.download.max_concurrent_fragments = 128;
+        invalid.download.max_concurrent_fragments = 257;
 
         let result = update_config_inner(&state, invalid).await;
 
@@ -336,6 +516,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
+                max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
                 authorized_dirs: vec!["/tmp".to_string()],
                 io_strategy: IoStrategy::default(),
             },
@@ -396,7 +577,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(65, &test_tmp_path("b"), 16, 16, false, true),
+            make_test_app_config(101, &test_tmp_path("b"), 16, 16, false, true),
         )
         .await;
         assert!(result.is_err());
@@ -413,7 +594,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(5, &test_tmp_path("c"), 33, 16, false, true),
+            make_test_app_config(5, &test_tmp_path("c"), 257, 16, false, true),
         )
         .await;
         assert!(result.is_err());
@@ -464,6 +645,46 @@ mod tests {
         let result = validate_config(&config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("敏感头"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_crlf_in_header_value() {
+        let download_dir = test_tmp_path("crlf-headers");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        config.download.headers.insert(
+            "X-Custom".to_string(),
+            "value\r\nInjected: true".to_string(),
+        );
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("换行符"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_crlf_in_header_key() {
+        let download_dir = test_tmp_path("crlf-key-headers");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        config.download.headers.insert(
+            "X-Custom\r\nInjected: true".to_string(),
+            "value".to_string(),
+        );
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("换行符"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_empty_authorized_dirs() {
+        let download_dir = test_tmp_path("empty-authorized-dirs");
+        let mut config = make_test_app_config(5, &download_dir, 16, 16, false, true);
+        config.download.authorized_dirs.clear();
+
+        let result = validate_config(&config);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("authorized_dirs"));
     }
 
     #[test]
@@ -523,9 +744,10 @@ mod tests {
         config.download.download_dir = safe_path.clone();
         config.download.authorized_dirs = vec![safe_path.clone()];
 
+        let authorized = authorize_download_dir(&config, &safe_path).unwrap();
         assert_eq!(
-            authorize_download_dir(&config, &safe_path).unwrap(),
-            safe_path
+            std::path::Path::new(&authorized),
+            safe_dir.path().canonicalize().unwrap()
         );
     }
 
@@ -540,10 +762,85 @@ mod tests {
         config.download.download_dir = safe_path.clone();
         config.download.authorized_dirs = vec![safe_path.clone()];
 
+        let authorized = authorize_download_dir(&config, &sub_path).unwrap();
         assert_eq!(
-            authorize_download_dir(&config, &sub_path).unwrap(),
-            sub_path
+            std::path::Path::new(&authorized),
+            std::path::Path::new(&sub_path).canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn test_authorize_download_dir_creates_missing_authorized_subdir_and_returns_canonical_path() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+        let requested = safe_dir.path().join("downloads").join("models");
+        let requested_path = requested.to_string_lossy().to_string();
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path];
+
+        let authorized = authorize_download_dir(&config, &requested_path).unwrap();
+
+        assert!(requested.is_dir());
+        assert_eq!(
+            std::path::Path::new(&authorized),
+            requested.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_authorize_download_dir_rejects_existing_symlink_component_without_creating_target() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let target_dir = safe_dir.path().join("real");
+        std::fs::create_dir(&target_dir).unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+        let link_path = safe_dir.path().join("link");
+        let target_created = target_dir.join("created-by-authorize");
+        let requested = link_path.join("created-by-authorize");
+        let requested_path = requested.to_string_lossy().to_string();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+
+        #[cfg(windows)]
+        {
+            if let Err(e) = std::os::windows::fs::symlink_dir(&target_dir, &link_path) {
+                eprintln!("跳过 symlink 逃逸测试: 当前 Windows 权限不允许创建目录符号链接: {e}");
+                return;
+            }
+        }
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path];
+
+        let err = authorize_download_dir(&config, &requested_path).unwrap_err();
+
+        assert!(err.to_string().contains("未授权"));
+        assert!(
+            !target_created.exists(),
+            "拒绝 symlink/reparse 组件时不得在链接目标下创建子目录"
+        );
+    }
+
+    #[test]
+    fn test_authorize_download_dir_rejects_missing_subdir_that_escapes_authorized_root() {
+        let safe_dir = tempfile::tempdir().unwrap();
+        let safe_path = safe_dir.path().to_string_lossy().to_string();
+        let escaped_name = format!("escaped-downloads-{}", uuid::Uuid::new_v4());
+        let escaped = safe_dir.path().parent().unwrap().join(&escaped_name);
+        let requested = safe_dir.path().join("..").join(&escaped_name);
+        let requested_path = requested.to_string_lossy().to_string();
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = safe_path.clone();
+        config.download.authorized_dirs = vec![safe_path];
+
+        let err = authorize_download_dir(&config, &requested_path).unwrap_err();
+
+        assert!(err.to_string().contains("未授权"));
+        assert!(!escaped.exists());
     }
 
     #[test]

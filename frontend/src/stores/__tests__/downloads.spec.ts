@@ -43,8 +43,8 @@ describe('downloads store', () => {
     const tasks = [makeTask('t1'), makeTask('t2')]
     downloadsModule.setTasks(tasks)
     expect(downloadsModule.$tasks.get()).toHaveLength(2)
-    expect(downloadsModule.$tasks.get()[0].id).toBe('t1')
-    expect(downloadsModule.$tasks.get()[1].id).toBe('t2')
+    expect(downloadsModule.$tasks.get()[0]?.id).toBe('t1')
+    expect(downloadsModule.$tasks.get()[1]?.id).toBe('t2')
   })
 
   it('$filteredTasks 根据 currentFilter 正确过滤', () => {
@@ -56,11 +56,11 @@ describe('downloads store', () => {
 
     downloadsModule.setCurrentFilter('downloading')
     expect(downloadsModule.$filteredTasks.get()).toHaveLength(1)
-    expect(downloadsModule.$filteredTasks.get()[0].id).toBe('t1')
+    expect(downloadsModule.$filteredTasks.get()[0]?.id).toBe('t1')
 
     downloadsModule.setCurrentFilter('completed')
     expect(downloadsModule.$filteredTasks.get()).toHaveLength(1)
-    expect(downloadsModule.$filteredTasks.get()[0].id).toBe('t2')
+    expect(downloadsModule.$filteredTasks.get()[0]?.id).toBe('t2')
 
     downloadsModule.setCurrentFilter('incomplete')
     expect(downloadsModule.$filteredTasks.get()).toHaveLength(2)
@@ -128,15 +128,15 @@ describe('downloads store', () => {
       },
     })
 
-    expect(downloadsModule.$tasks.get()[0].progress).toBe(0.5)
-    expect(downloadsModule.$tasks.get()[0].speed).toBe(150)
-    expect(downloadsModule.$tasks.get()[0].downloaded).toBe(500)
-    expect(downloadsModule.$tasks.get()[0].fragmentsDone).toBe(3)
+    expect(downloadsModule.$tasks.get()[0]?.progress).toBe(0.5)
+    expect(downloadsModule.$tasks.get()[0]?.speed).toBe(150)
+    expect(downloadsModule.$tasks.get()[0]?.downloaded).toBe(500)
+    expect(downloadsModule.$tasks.get()[0]?.fragmentsDone).toBe(3)
 
-    expect(downloadsModule.$tasks.get()[1].progress).toBe(0.2)
-    expect(downloadsModule.$tasks.get()[1].speed).toBe(200)
-    expect(downloadsModule.$tasks.get()[1].downloaded).toBe(200)
-    expect(downloadsModule.$tasks.get()[1].fragmentsDone).toBe(2)
+    expect(downloadsModule.$tasks.get()[1]?.progress).toBe(0.2)
+    expect(downloadsModule.$tasks.get()[1]?.speed).toBe(200)
+    expect(downloadsModule.$tasks.get()[1]?.downloaded).toBe(200)
+    expect(downloadsModule.$tasks.get()[1]?.fragmentsDone).toBe(2)
   })
 
   it('refreshTaskList 成功时更新任务列表', async () => {
@@ -146,7 +146,7 @@ describe('downloads store', () => {
     await downloadsModule.refreshTaskList()
 
     expect(downloadsModule.$tasks.get()).toHaveLength(2)
-    expect(downloadsModule.$tasks.get()[0].id).toBe('t1')
+    expect(downloadsModule.$tasks.get()[0]?.id).toBe('t1')
     expect(mockGetTaskList).toHaveBeenCalledTimes(1)
   })
 

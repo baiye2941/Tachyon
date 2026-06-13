@@ -105,9 +105,13 @@ pub trait Verifier: Send + Sync {
     fn compute_hash(&self, data: &[u8]) -> DownloadResult<String>;
 
     /// 校验数据是否匹配预期哈希
+    ///
+    /// 使用常量时间比较防止时序侧信道攻击:
+    /// 无论匹配与否,比较时间恒定(不因首个不匹配字节位置提前返回),
+    /// 防止攻击者通过响应时间差异逐字符猜测哈希值。
     fn verify(&self, data: &[u8], expected_hash: &str) -> DownloadResult<()> {
         let actual = self.compute_hash(data)?;
-        if actual == expected_hash {
+        if constant_time_eq_str(actual.as_bytes(), expected_hash.as_bytes()) {
             Ok(())
         } else {
             Err(crate::error::DownloadError::ChecksumMismatch {
@@ -116,6 +120,22 @@ pub trait Verifier: Send + Sync {
             })
         }
     }
+}
+
+/// 常量时间字符串比较,防止时序侧信道攻击
+///
+/// 对所有字节进行 XOR 运算并累积差异,不提前返回,
+/// 比较时间仅取决于较长字符串的长度,与内容无关。
+fn constant_time_eq_str(a: &[u8], b: &[u8]) -> bool {
+    // 长度不同也应保持恒定时间(不直接返回 false)
+    let len = a.len().max(b.len());
+    let mut diff: u8 = (a.len() != b.len()) as u8;
+    for i in 0..len {
+        let byte_a = a.get(i).copied().unwrap_or(0);
+        let byte_b = b.get(i).copied().unwrap_or(0);
+        diff |= byte_a ^ byte_b;
+    }
+    diff == 0
 }
 
 /// 下载任务 trait:表示一个完整的下载任务

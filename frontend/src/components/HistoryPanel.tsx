@@ -40,7 +40,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
       ? tasks.reduce((sum, t) => sum + t.speed, 0) / tasks.length
       : 0
     const maxFile = tasks.length > 0
-      ? tasks.reduce((max, t) => (t.fileSize || 0) > (max.fileSize || 0) ? t : max, tasks[0])
+      ? tasks.reduce((max, t) => (t.fileSize || 0) > (max.fileSize || 0) ? t : max, tasks[0]!)
       : null
     const maxSpeed = tasks.length > 0
       ? Math.max(...tasks.map(t => t.speed))

@@ -24,9 +24,11 @@ export default function Sparkline(props: SparklineProps) {
 
     if (points.length < 2) return { line: '', area: '' }
 
-    let line = `M ${points[0][0]} ${points[0][1]}`
+    const first = points[0]!
+    let line = `M ${first[0]} ${first[1]}`
     for (let i = 1; i < points.length; i++) {
-      line += ` L ${points[i][0]} ${points[i][1]}`
+      const pt = points[i]!
+      line += ` L ${pt[0]} ${pt[1]}`
     }
 
     const area = `${line} L ${w} ${h} L 0 ${h} Z`

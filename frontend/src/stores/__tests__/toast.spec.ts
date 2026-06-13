@@ -21,8 +21,8 @@ describe('toast store', () => {
   it('addToast 添加的 toast 包含正确的 message 和 type', () => {
     toastModule.addToast('操作成功', 'success')
     const toasts = toastModule.toasts()
-    expect(toasts[0].message).toBe('操作成功')
-    expect(toasts[0].type).toBe('success')
+    expect(toasts[0]?.message).toBe('操作成功')
+    expect(toasts[0]?.type).toBe('success')
   })
 
   it('3000ms 后 toast 自动消失', () => {
@@ -38,9 +38,9 @@ describe('toast store', () => {
     toastModule.addToast('第二条')
     expect(toastModule.toasts()).toHaveLength(2)
 
-    const id = toastModule.toasts()[0].id
+    const id = toastModule.toasts()[0]!.id
     toastModule.removeToast(id)
     expect(toastModule.toasts()).toHaveLength(1)
-    expect(toastModule.toasts()[0].message).toBe('第二条')
+    expect(toastModule.toasts()[0]?.message).toBe('第二条')
   })
 })

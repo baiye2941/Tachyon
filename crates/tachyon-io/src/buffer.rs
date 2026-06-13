@@ -48,27 +48,24 @@ impl BufferPool {
 
     /// 创建并预填充 buffer 池
     ///
-    /// 预填充消耗信号量许可,后续 `alloc()` 从池中取出 buffer 时
-    /// 不需要额外分配堆内存。
+    /// 预分配所有 buffer 到池中,避免运行时堆分配。
+    /// 信号量许可保持完整(available == capacity),后续 `alloc()` 可正常获取。
+    ///
+    /// 不变量: `available_permits(capacity) + outstanding(0) == capacity`
     pub fn with_prefill(buffer_size: usize, capacity: usize) -> Self {
         let pool = Arc::new(ArrayQueue::new(capacity.max(1)));
         let semaphore = Semaphore::new(capacity);
-        // 预填充消耗信号量许可
+        // 预填充: 将所有 buffer 推入池中,但不消耗信号量许可。
+        // alloc() 取出 buffer 时消耗许可,release() 归还时恢复许可。
         for _ in 0..capacity {
-            // 队列刚创建,容量充足,不会失败
             let _ = pool.push(BytesMut::with_capacity(buffer_size));
-            // acquire 成功后 forget permit,净效果:许可 -1
-            let permit = semaphore.try_acquire().expect("信号量初始许可应始终足够");
-            permit.forget();
         }
         Self {
             buffer_size,
             capacity,
             pool,
             semaphore: Arc::new(semaphore),
-            // W-16: 预填充的 buffer 视为"已分配",outstanding 应等于 capacity
-            // 维持不变量: available_permits(0) + outstanding(capacity) == capacity
-            outstanding: Arc::new(AtomicUsize::new(capacity)),
+            outstanding: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -114,13 +111,9 @@ impl BufferPool {
     pub fn release(&self, mut buf: BytesMut) {
         self.outstanding.fetch_sub(1, Ordering::AcqRel);
         buf.clear();
-        let pushed = self.pool.push(buf).is_ok();
-        if !pushed {
-            // 队列已满,buffer 被丢弃。不额外加许可,因为 outstanding 已减。
-            // 不变量恢复: permits = capacity - (old_outstanding - 1) = capacity - new_outstanding
-            return;
-        }
-        // buffer 放回队列,加一个许可恢复不变量
+        // 归还 buffer:成功则复用,队列已满则丢弃。无论哪种情况,
+        // outstanding 已减,许可必须归还以维持不变量。
+        let _ = self.pool.push(buf);
         self.semaphore.add_permits(1);
     }
 
@@ -136,8 +129,8 @@ impl BufferPool {
     /// 在下载任务开始前调用,确保后续 `alloc()` 不会触发堆分配。
     /// 如果池中已有 buffer,只会补充不足的部分。
     ///
-    /// 仅补充 `capacity - pool.len() - outstanding` 个 buffer,
-    /// 确保不会超出总容量预算。
+    /// 信号量许可不被消耗(available 保持不变),因为池中的 buffer
+    /// 只有在被 `alloc()` 取出时才消耗许可。
     pub async fn prewarm(&self) {
         let outstanding = self.outstanding.load(Ordering::Acquire);
         // 可填充数量 = capacity - 已分配 - 队列中已有
@@ -150,13 +143,6 @@ impl BufferPool {
             if self.pool.is_full() {
                 break;
             }
-            // 获取许可(应立即成功,因为 permits = capacity - outstanding >= to_fill)
-            let permit = self
-                .semaphore
-                .acquire()
-                .await
-                .expect("BufferPool 信号量不应被关闭");
-            permit.forget();
             let _ = self.pool.push(BytesMut::with_capacity(self.buffer_size));
         }
     }
@@ -262,20 +248,24 @@ mod tests {
     #[test]
     fn test_prefill_pool() {
         let pool = BufferPool::with_prefill(1024, 5);
-        // 预填充消耗许可,available 为 0(许可已分配给预填充 buffer)
-        assert_eq!(pool.available(), 0);
+        // S-7: 预填充后许可保持完整,可直接 alloc
+        assert_eq!(pool.available(), 5);
     }
 
     #[tokio::test]
     async fn test_alloc_from_prefill() {
         let pool = BufferPool::with_prefill(1024, 3);
-        // 预填充后许可为 0,需要先释放一个 buffer 才能 alloc
-        // 模拟:从队列取出 -> release -> alloc
-        let buf = pool.pool.pop().expect("预填充后队列应有 buffer");
-        pool.release(buf);
-        assert_eq!(pool.available(), 1);
-        let _buf = pool.alloc().await;
+        // S-7: 预填充后可直接 alloc,buffer 从池中复用
+        let buf = pool.alloc().await;
+        assert!(buf.capacity() >= 1024);
+        assert_eq!(pool.available(), 2);
+        // 继续 alloc 直到耗尽
+        let _buf2 = pool.alloc().await;
+        let _buf3 = pool.alloc().await;
         assert_eq!(pool.available(), 0);
+        // 第四次 alloc 应阻塞
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), pool.alloc()).await;
+        assert!(result.is_err(), "预填充池耗尽后 alloc 应阻塞");
     }
 
     #[tokio::test]
@@ -368,8 +358,11 @@ mod tests {
         let pool = BufferPool::new(4096, 8);
         assert_eq!(pool.available(), 8);
         pool.prewarm().await;
-        // prewarm 消耗许可(预分配 buffer 视为"已占用")
-        assert_eq!(pool.available(), 0);
+        // S-7: prewarm 后许可保持完整,池中已有预分配 buffer
+        assert_eq!(pool.available(), 8);
+        // 验证池中有预分配的 buffer
+        let buf = pool.alloc().await;
+        assert!(buf.capacity() >= 4096, "alloc 应复用预分配的 buffer");
     }
 
     #[tokio::test]
@@ -378,29 +371,27 @@ mod tests {
         let _b1 = pool.alloc().await;
         let _b2 = pool.alloc().await;
         assert_eq!(pool.available(), 3);
-        // prewarm 补充池中 buffer(to_fill = 5 - 2 outstanding - 0 in queue = 3)
+        // prewarm 补充池中 buffer (to_fill = 5 - 2 outstanding - 0 in queue = 3)
         pool.prewarm().await;
-        // outstanding=2,池中有 3 个预分配 buffer -> 许可全被占用
-        assert_eq!(pool.available(), 0);
+        // S-7: prewarm 不消耗许可,available 保持 3
+        assert_eq!(pool.available(), 3);
     }
 
     #[tokio::test]
     async fn test_prewarm_idempotent() {
         let pool = BufferPool::new(2048, 4);
         pool.prewarm().await;
-        assert_eq!(pool.available(), 0);
-        // 再次 prewarm:队列已满,outstanding=0,to_fill=0,无额外操作
+        assert_eq!(pool.available(), 4);
+        // 再次 prewarm:队列已满,to_fill=0,无额外操作
         pool.prewarm().await;
-        assert_eq!(pool.available(), 0);
+        assert_eq!(pool.available(), 4);
     }
 
     #[tokio::test]
     async fn test_prewarm_buffers_have_correct_capacity() {
         let pool = BufferPool::new(4096, 3);
         pool.prewarm().await;
-        // prewarm 后许可为 0,先释放一个才能 alloc
-        let buf = pool.pool.pop().expect("prewarm 后队列应有 buffer");
-        pool.release(buf);
+        // S-7: prewarm 后可直接 alloc
         let buf = pool.alloc().await;
         assert!(buf.capacity() >= 4096);
     }
@@ -412,7 +403,7 @@ mod tests {
         assert_eq!(
             stats,
             BufferPoolStats {
-                available: 0,
+                available: 5, // S-7: 预填充后许可完整
                 capacity: 5,
                 buffer_size: 1024,
             }
@@ -423,18 +414,14 @@ mod tests {
     async fn test_stats_after_alloc_and_release() {
         let pool = BufferPool::new(512, 3);
         pool.prewarm().await;
-        // prewarm 后许可为 0
-        assert_eq!(pool.available(), 0);
-        // 释放一个才能 alloc
-        let buf = pool.pool.pop().expect("prewarm 后队列应有 buffer");
-        pool.release(buf);
-        assert_eq!(pool.available(), 1);
+        // S-7: prewarm 后许可保持完整
+        assert_eq!(pool.available(), 3);
         let buf = pool.alloc().await;
         let stats = pool.stats();
-        assert_eq!(stats.available, 0);
+        assert_eq!(stats.available, 2);
         pool.release(buf);
         let stats = pool.stats();
-        assert_eq!(stats.available, 1);
+        assert_eq!(stats.available, 3);
     }
 
     // ------ 并发测试 ------

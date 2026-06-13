@@ -66,7 +66,11 @@ mod tests {
     impl Drop for EnvSnapshot {
         fn drop(&mut self) {
             match &self.value {
+                // Safety: 测试代码中恢复环境变量,仅用于隔离测试环境。
+                // ENV_LOCK 保证同一时刻仅一个测试线程操作环境变量,
+                // 且 Drop 在 EnvSnapshot 离开作用域时调用,与捕获配对。
                 Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // Safety: 同上,移除测试中捕获时已不存在的环境变量。
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
@@ -85,10 +89,13 @@ mod tests {
             EnvSnapshot::capture("HOME"),
             EnvSnapshot::capture("USERPROFILE"),
         ];
+        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,EnvSnapshot::drop 在作用域结束时恢复。
         unsafe { std::env::remove_var("HUGGINGFACE_HUB_TOKEN") };
         let isolated_home =
             std::env::temp_dir().join(format!("tachyon-hub-token-test-{}", std::process::id()));
-        unsafe { std::env::set_var("HOME", isolated_home) };
+        // Safety: 同上,设置 HOME 供测试用,Drop 时恢复原值。
+        unsafe { std::env::set_var("HOME", &isolated_home) };
+        // Safety: 同上,移除 USERPROFILE 避免跨平台干扰。
         unsafe { std::env::remove_var("USERPROFILE") };
         snapshots
     }
@@ -97,8 +104,10 @@ mod tests {
     fn test_load_token_from_env() {
         let _guard = env_lock();
         let _env = isolate_token_fallbacks();
+        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,函数结束时 remove_var 恢复。
         unsafe { std::env::set_var("HF_TOKEN", "hf_test_token_123") };
         let result = load_token();
+        // Safety: 同上,清理测试设置的环境变量。
         unsafe { std::env::remove_var("HF_TOKEN") };
         assert_eq!(result, Some("hf_test_token_123".to_string()));
     }
@@ -107,8 +116,10 @@ mod tests {
     fn test_load_token_empty_env_returns_none() {
         let _guard = env_lock();
         let _env = isolate_token_fallbacks();
+        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,函数结束时 remove_var 恢复。
         unsafe { std::env::set_var("HF_TOKEN", "") };
         let result = load_token();
+        // Safety: 同上,清理测试设置的环境变量。
         unsafe { std::env::remove_var("HF_TOKEN") };
         assert_eq!(result, None);
     }
@@ -117,6 +128,7 @@ mod tests {
     fn test_hf_endpoint_default() {
         let _guard = env_lock();
         let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
+        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,EnvSnapshot::drop 恢复原值。
         unsafe { std::env::remove_var("HF_ENDPOINT") };
         assert_eq!(hf_endpoint(), "https://huggingface.co");
     }
@@ -125,8 +137,10 @@ mod tests {
     fn test_hf_endpoint_custom() {
         let _guard = env_lock();
         let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
+        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,EnvSnapshot::drop 恢复原值。
         unsafe { std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com") };
         assert_eq!(hf_endpoint(), "https://hf-mirror.com");
+        // Safety: 同上,清理测试设置的环境变量。
         unsafe { std::env::remove_var("HF_ENDPOINT") };
     }
 }

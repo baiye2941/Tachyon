@@ -39,7 +39,11 @@ use std::pin::Pin;
 use bytes::Bytes;
 
 #[cfg(target_os = "linux")]
+use std::cell::UnsafeCell;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tachyon_core::{DownloadError, DownloadResult};
 
@@ -133,17 +137,44 @@ pub struct IoUringStorage {
 }
 
 /// 地址对齐的缓冲区(Linux only)
+///
+/// `storage` 使用 `UnsafeCell` 包装，因为 io_uring 内核操作需要从共享引用
+/// (`&AlignedBuffer`) 获取可变内存访问（`*mut u8`），这违反了 Rust 的
+/// Stacked Borrows / Tree Borrows 内存模型。`UnsafeCell` 显式声明内部可变性，
+/// 使跨共享边界的 `*mut` 访问合法化。外部 `Mutex<IoUringHandle>` 保证同一
+/// 时刻只有一个操作访问给定 buffer，确保运行时排他性。
 #[cfg(target_os = "linux")]
 struct AlignedBuffer {
-    storage: Vec<u8>,
+    /// UnsafeCell 包装: io_uring 固定缓冲区需要从 &self 创建 *mut u8，
+    /// UnsafeCell 是 Rust 中唯一合法化此类跨共享边界可变访问的原语。
+    storage: UnsafeCell<Vec<u8>>,
     offset: usize,
     len: usize,
 }
 
+// Safety: AlignedBuffer 始终在 Mutex<IoUringHandle> 内使用，
+// 保证同一 buffer 的并发访问被 Mutex 串行化。
+#[cfg(target_os = "linux")]
+unsafe impl Send for AlignedBuffer {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for AlignedBuffer {}
+
 #[cfg(target_os = "linux")]
 impl AlignedBuffer {
+    /// 获取对齐后的数据起始裸指针(只读用途，如 iovec 注册)
     fn as_ptr(&self) -> *const u8 {
-        self.storage.as_ptr().wrapping_add(self.offset)
+        // Safety: 使用 ptr::addr() 仅获取地址值，不创建 &Vec<u8> 引用，
+        // 避免与后续通过 ptr() 创建的可变引用产生 aliasing 冲突。
+        let base_addr = self.storage.get().addr();
+        (base_addr + self.offset) as *const u8
+    }
+
+    /// 获取对齐后的数据起始裸指针(可变用途，如 io_uring write/read)
+    ///
+    /// Safety: 调用者必须保证同一时刻没有其他引用访问此 buffer 的数据区域。
+    /// IoUringHandle.ring 的 Mutex 保证所有 io_uring 操作互斥。
+    fn ptr(&self) -> *mut u8 {
+        unsafe { (*self.storage.get()).as_mut_ptr().add(self.offset) }
     }
 
     fn len(&self) -> usize {
@@ -151,17 +182,109 @@ impl AlignedBuffer {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
+fn invalid_input(message: impl Into<String>) -> DownloadError {
+    DownloadError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_fixed_buffer_config(config: &IoUringConfig) -> DownloadResult<()> {
+    if config.buffer_size == 0 {
+        return Err(invalid_input("io_uring fixed buffer size must be non-zero"));
+    }
+    if config.buffer_count == 0 {
+        return Err(invalid_input(
+            "io_uring fixed buffer count must be non-zero",
+        ));
+    }
+    if config.buffer_size > u32::MAX as usize {
+        return Err(invalid_input(format!(
+            "io_uring fixed buffer size {} exceeds single-op u32 length limit {}",
+            config.buffer_size,
+            u32::MAX
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_fixed_buffer_write_len(len: usize, buffer_len: usize) -> DownloadResult<()> {
+    if len > buffer_len {
+        return Err(invalid_input(format!(
+            "io_uring write length {len} exceeds fixed buffer size {buffer_len}"
+        )));
+    }
+    if len > u32::MAX as usize {
+        return Err(invalid_input(format!(
+            "io_uring write length {len} exceeds single-op u32 length limit {}",
+            u32::MAX
+        )));
+    }
+    Ok(())
+}
+
 /// io_uring 实例持有者(Linux only)
 ///
 /// 封装 `io_uring::IoUring` 实例及其注册的 fixed buffers。
 /// 使用 `Mutex` 包裹以实现内部可变性——`submission()` 和 `completion()`
 /// 需要 `&mut self`，而 `AsyncStorage` trait 方法签名使用 `&self`。
+///
+/// # Buffer 分配策略
+///
+/// 通过 `AtomicU64` 位图实现无锁 fixed buffer 分配。
+/// 每个 bit 对应一个 buffer: 1=已占用, 0=空闲。
+/// 最多支持 64 个 buffer(远超默认配置 16 个)。
+/// Mutex 仅保护 io_uring ring 的 submission/completion 操作,
+/// buffer 索引的分配/释放通过原子操作完成,不阻塞其他并发 I/O。
 #[cfg(target_os = "linux")]
 struct IoUringHandle {
     /// io_uring 实例(Mutex 包裹以支持内部可变性)
     ring: std::sync::Mutex<io_uring::IoUring>,
     /// 注册的 fixed buffers (保持内存不被释放)
     buffers: Vec<AlignedBuffer>,
+    /// fixed buffer 分配位图(1=已占用, 0=空闲)
+    ///
+    /// 使用 AtomicU64 实现无锁分配,最多支持 64 个 buffer。
+    /// 初始化时超出 `buffer_count` 的位被设为 1,防止越界分配。
+    buffer_bitmap: AtomicU64,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringHandle {
+    /// 原子分配一个空闲 fixed buffer 索引。
+    ///
+    /// 使用 AtomicU64 位图进行无锁分配,返回的索引范围 [0, buffers.len()-1],
+    /// 对应 `buffers` 中的位置。当所有 buffer 都被占用时返回 None。
+    fn alloc_buffer_index(&self) -> Option<usize> {
+        let mut current = self.buffer_bitmap.load(Ordering::Relaxed);
+        loop {
+            let idx = current.trailing_zeros();
+            if idx >= 64 {
+                return None; // 所有 buffer 都被占用
+            }
+            let next = current | (1 << idx);
+            match self.buffer_bitmap.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(idx as usize),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 释放 fixed buffer 索引,使其可被后续操作重新分配。
+    fn free_buffer_index(&self, idx: usize) {
+        if idx >= 64 {
+            return;
+        }
+        self.buffer_bitmap.fetch_and(!(1 << idx), Ordering::Relaxed);
+    }
 }
 
 /// 分配地址对齐的缓冲区(O_DIRECT/io_uring 要求)
@@ -179,7 +302,9 @@ fn aligned_alloc(size: usize, align: usize) -> AlignedBuffer {
     let padding = align - 1;
     let storage_len = size.checked_add(padding).expect("对齐缓冲区大小溢出");
     let storage = vec![0u8; storage_len];
-    let base = storage.as_ptr() as usize;
+    // 使用 ptr::addr() 仅读取地址数值，不创建 &Vec 引用，
+    // 避免与后续 UnsafeCell 内部可变性产生 aliasing 冲突
+    let base = storage.as_ptr().addr();
     let misalignment = base & padding;
     let offset = if misalignment == 0 {
         0
@@ -188,10 +313,10 @@ fn aligned_alloc(size: usize, align: usize) -> AlignedBuffer {
     };
 
     debug_assert!(offset < align);
-    debug_assert!(offset + size <= storage.len());
+    debug_assert!(offset + size <= storage_len);
 
     AlignedBuffer {
-        storage,
+        storage: UnsafeCell::new(storage),
         offset,
         len: size,
     }
@@ -237,6 +362,8 @@ impl IoUringStorage {
     #[cfg(target_os = "linux")]
     pub fn init(&mut self) -> DownloadResult<()> {
         use io_uring::IoUring;
+
+        validate_fixed_buffer_config(&self.config)?;
 
         // 步骤 1: 构建 io_uring 实例
         let mut builder = IoUring::builder();
@@ -301,9 +428,19 @@ impl IoUringStorage {
             .map_err(DownloadError::Io)?;
 
         self.file_fd = Some(std::sync::Arc::new(file));
+
+        // 超出 buffer_count 的位标记为已占用,防止分配越界
+        let buffer_count = buffers.len();
+        let used_mask = if buffer_count >= 64 {
+            0u64
+        } else {
+            (!0u64) << buffer_count
+        };
+
         self.ring = Some(std::sync::Arc::new(IoUringHandle {
             ring: std::sync::Mutex::new(ring),
             buffers,
+            buffer_bitmap: AtomicU64::new(used_mask),
         }));
         self.state = IoUringState::Ready;
 
@@ -336,9 +473,10 @@ impl IoUringStorage {
     /// - `off`: 文件偏移量
     /// - `addr`: fixed buffer 地址
     /// - `len`: 读取长度
-    /// - `buf_index`: 注册的 buffer 索引
+    /// - `buf_index`: 动态分配的注册 buffer 索引
     ///
     /// 读取完成后将 fixed buffer 中的数据复制到用户提供的 buf 中。
+    /// 使用 `AtomicU64` 位图分配 buffer 索引,避免硬编码 `buffers[0]` 的串行化瓶颈。
     #[cfg(target_os = "linux")]
     async fn submit_read(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
         let ring_handle = match &self.ring {
@@ -375,47 +513,70 @@ impl IoUringStorage {
                 .lock()
                 .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
 
-            let fixed_buf = &ring_handle.buffers[0];
-            let actual_len = read_len.min(fixed_buf.len());
-
-            // 构造 IORING_OP_READ_FIXED SQE
-            let read_op = io_uring::opcode::ReadFixed::new(
-                io_uring::types::Fd(fd),
-                fixed_buf.as_ptr() as *mut u8,
-                actual_len as u32,
-                0, // buf_index: 使用第 0 个注册的 fixed buffer
-            )
-            .offset(offset)
-            .build();
-
-            let mut sq = uring.submission();
-            unsafe {
-                sq.push(&read_op).map_err(|_| {
-                    DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
-                })?;
-            }
-            sq.sync();
-            drop(sq);
-
-            uring
-                .submitter()
-                .submit_and_wait(1)
-                .map_err(DownloadError::Io)?;
-
-            let cqe = uring.completion().next().ok_or_else(|| {
-                DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+            // 动态分配 fixed buffer 索引
+            let buf_idx = ring_handle.alloc_buffer_index().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::other(
+                    "io_uring fixed buffer 已耗尽,并发读取操作过多",
+                ))
             })?;
-            let result = cqe.result();
-            if result < 0 {
-                return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
-                    -result,
-                )));
-            }
-            let bytes_read = result as usize;
 
-            // 从 fixed buffer 复制到 Vec 中返回
-            let src = unsafe { std::slice::from_raw_parts(fixed_buf.as_ptr(), bytes_read) };
-            Ok(src.to_vec())
+            // 使用闭包封装 I/O 操作,确保无论成功失败都释放 buffer 索引
+            let io_result = (|| -> DownloadResult<Vec<u8>> {
+                let fixed_buf = &ring_handle.buffers[buf_idx];
+                let actual_len = read_len.min(fixed_buf.len());
+
+                // 构造 IORING_OP_READ_FIXED SQE
+                // 使用 ptr() 获取 *mut u8，通过 UnsafeCell 合法化内核写入
+                let read_op = io_uring::opcode::ReadFixed::new(
+                    io_uring::types::Fd(fd),
+                    fixed_buf.ptr(),
+                    actual_len as u32,
+                    buf_idx as u16, // buf_index: 使用动态分配的 fixed buffer 索引
+                )
+                .offset(offset)
+                .build();
+
+                let mut sq = uring.submission();
+                // Safety:
+                // - read_op 由 io_uring::opcode::ReadFixed::build() 构造,是有效的 SQE
+                // - 调用期间 read_op 在栈上保持存活,指针指向自身内存
+                // - 提交队列未满已通过 push 返回的 Result 处理
+                unsafe {
+                    sq.push(&read_op).map_err(|_| {
+                        DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
+                    })?;
+                }
+                sq.sync();
+                drop(sq);
+
+                uring
+                    .submitter()
+                    .submit_and_wait(1)
+                    .map_err(DownloadError::Io)?;
+
+                let cqe = uring.completion().next().ok_or_else(|| {
+                    DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+                })?;
+                let result = cqe.result();
+                if result < 0 {
+                    return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
+                        -result,
+                    )));
+                }
+                let bytes_read = result as usize;
+
+                // 从 fixed buffer 复制到 Vec 中返回
+                // Safety:
+                // - fixed_buf 是已注册到 io_uring 的合法 fixed buffer,生命周期由 ring_handle 持有
+                // - bytes_read 来自 CQE 结果,且已验证 result >= 0,范围在 fixed_buf 长度内
+                // - fixed_buf.ptr() 返回的指针在 bytes_read 范围内有效且可读
+                let src = unsafe { std::slice::from_raw_parts(fixed_buf.as_ptr(), bytes_read) };
+                Ok(src.to_vec())
+            })();
+
+            // 释放 buffer 索引(无论 I/O 成功或失败)
+            ring_handle.free_buffer_index(buf_idx);
+            io_result
         })
         .await
         .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))??;
@@ -467,6 +628,10 @@ impl IoUringStorage {
             let fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd)).build();
 
             let mut sq = uring.submission();
+            // Safety:
+            // - fsync_op 由 io_uring::opcode::Fsync::build() 构造,是有效的 SQE
+            // - 调用期间 fsync_op 在栈上保持存活,指针指向自身内存
+            // - 提交队列未满已通过 push 返回的 Result 处理
             unsafe {
                 sq.push(&fsync_op).map_err(|_| {
                     DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
@@ -513,6 +678,10 @@ impl IoUringStorage {
         tokio::task::spawn_blocking(move || {
             use std::os::fd::AsRawFd;
             let fd = file_guard.as_raw_fd();
+            // Safety:
+            // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活,确保 fd 有效
+            // - mode=0、offset=0、len=size 均为合法的 fallocate 参数
+            // - 内核负责实际的磁盘空间预分配,不破坏 Rust 内存安全
             let ret = unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) };
             if ret != 0 {
                 return Err(DownloadError::Io(std::io::Error::last_os_error()));
@@ -530,11 +699,12 @@ impl IoUringStorage {
     /// - `off`: 文件偏移量
     /// - `addr`: fixed buffer 地址
     /// - `len`: 数据长度
-    /// - `buf_index`: 注册的 buffer 索引
+    /// - `buf_index`: 动态分配的注册 buffer 索引
     ///
     /// 使用 `spawn_blocking` 在独立线程中提交并等待 CQE,
     /// 避免阻塞 tokio 异步运行时。Mutex 保证同一时刻仅有一个
-    /// 写入操作使用 fixed buffer 0,确保数据不被覆盖。
+    /// 写入操作使用 io_uring ring,但 buffer 索引通过 AtomicU64 位图
+    /// 动态分配,多个并发写入可使用不同 buffer 并行执行。
     #[cfg(target_os = "linux")]
     async fn submit_write(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
         let ring_handle = match &self.ring {
@@ -563,6 +733,12 @@ impl IoUringStorage {
         let file_guard = self.file_fd.as_ref().unwrap().clone();
 
         let len = data.len();
+        let buffer_len = ring_handle
+            .buffers
+            .first()
+            .map(AlignedBuffer::len)
+            .ok_or_else(|| invalid_input("io_uring has no registered fixed buffers for write"))?;
+        validate_fixed_buffer_write_len(len, buffer_len)?;
 
         // spawn_blocking: 在独立线程中完成 io_uring 提交+等待,
         // 避免 MutexGuard 跨 await 点以及阻塞 tokio 工作线程
@@ -575,51 +751,74 @@ impl IoUringStorage {
                 .lock()
                 .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?;
 
-            // 将数据复制到 fixed buffer 0 (Mutex 保证排他访问)
-            let buf = &ring_handle.buffers[0];
-            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, len) };
-            dst.copy_from_slice(&data[..len]);
-
-            // 构造 IORING_OP_WRITE_FIXED SQE
-            // 使用已注册的 fixed buffer 索引 0,内核直接使用注册页面的物理地址,
-            // 省去每次 I/O 的页表查找开销
-            let write_op = io_uring::opcode::WriteFixed::new(
-                io_uring::types::Fd(fd),
-                buf.as_ptr(),
-                len as u32,
-                0, // buf_index: 使用第 0 个注册的 fixed buffer
-            )
-            .offset(offset)
-            .build();
-
-            // 提交 SQE 到 SQ 并同步到内核
-            let mut sq = uring.submission();
-            unsafe {
-                sq.push(&write_op).map_err(|_| {
-                    DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
-                })?;
-            }
-            sq.sync();
-            drop(sq);
-
-            // submit_and_wait(1): 提交待处理的 SQE 并阻塞等待至少 1 个 CQE,
-            // 由于已在 spawn_blocking 线程中运行,不会阻塞 tokio 运行时
-            uring
-                .submitter()
-                .submit_and_wait(1)
-                .map_err(DownloadError::Io)?;
-
-            // 读取 CQE 获取完成结果
-            let cqe = uring.completion().next().ok_or_else(|| {
-                DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+            // 动态分配 fixed buffer 索引
+            let buf_idx = ring_handle.alloc_buffer_index().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::other(
+                    "io_uring fixed buffer 已耗尽,并发写入操作过多",
+                ))
             })?;
-            let result = cqe.result();
-            if result < 0 {
-                return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
-                    -result,
-                )));
-            }
-            Ok(result as usize)
+
+            // 使用闭包封装 I/O 操作,确保无论成功失败都释放 buffer 索引
+            let io_result = (|| -> DownloadResult<usize> {
+                let buf = &ring_handle.buffers[buf_idx];
+                // Safety:
+                // - buf 是已注册到 io_uring 的合法 fixed buffer,生命周期由 ring_handle 持有
+                // - len 已通过 validate_fixed_buffer_write_len 验证,不超过 buf 容量
+                // - buf.ptr() 返回的指针在 len 范围内有效且可写
+                // - alloc_buffer_index 保证同一时刻只有一个操作使用该 buffer 索引
+                let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr(), len) };
+                dst.copy_from_slice(&data[..len]);
+
+                // 构造 IORING_OP_WRITE_FIXED SQE
+                // 使用已注册的 fixed buffer 索引,内核直接使用注册页面的物理地址,
+                // 省去每次 I/O 的页表查找开销
+                let write_op = io_uring::opcode::WriteFixed::new(
+                    io_uring::types::Fd(fd),
+                    buf.ptr() as *const u8,
+                    len as u32,
+                    buf_idx as u16, // buf_index: 使用动态分配的 fixed buffer 索引
+                )
+                .offset(offset)
+                .build();
+
+                // 提交 SQE 到 SQ 并同步到内核
+                let mut sq = uring.submission();
+                // Safety:
+                // - write_op 由 io_uring::opcode::WriteFixed::build() 构造,是有效的 SQE
+                // - 调用期间 write_op 在栈上保持存活,指针指向自身内存
+                // - fixed buffer 的数据已在上方复制完成,生命周期覆盖提交期间
+                // - 提交队列未满已通过 push 返回的 Result 处理
+                unsafe {
+                    sq.push(&write_op).map_err(|_| {
+                        DownloadError::Io(std::io::Error::other("io_uring 提交队列已满"))
+                    })?;
+                }
+                sq.sync();
+                drop(sq);
+
+                // submit_and_wait(1): 提交待处理的 SQE 并阻塞等待至少 1 个 CQE,
+                // 由于已在 spawn_blocking 线程中运行,不会阻塞 tokio 运行时
+                uring
+                    .submitter()
+                    .submit_and_wait(1)
+                    .map_err(DownloadError::Io)?;
+
+                // 读取 CQE 获取完成结果
+                let cqe = uring.completion().next().ok_or_else(|| {
+                    DownloadError::Io(std::io::Error::other("io_uring 完成队列已关闭"))
+                })?;
+                let result = cqe.result();
+                if result < 0 {
+                    return Err(DownloadError::Io(std::io::Error::from_raw_os_error(
+                        -result,
+                    )));
+                }
+                Ok(result as usize)
+            })();
+
+            // 释放 buffer 索引(无论 I/O 成功或失败)
+            ring_handle.free_buffer_index(buf_idx);
+            io_result
         })
         .await
         .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
@@ -645,6 +844,7 @@ impl AsyncStorage for IoUringStorage {
                     // Linux 上:走 io_uring 零拷贝路径
                     #[cfg(target_os = "linux")]
                     {
+                        validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
                         self.submit_write(_offset, _data).await
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -767,8 +967,17 @@ impl AsyncStorage for IoUringStorage {
                 IoUringState::Ready => {
                     #[cfg(target_os = "linux")]
                     {
-                        if let Some(ref file) = self.file_fd {
-                            file.sync_all().map_err(DownloadError::Io)?;
+                        // S-15: sync_all() 是阻塞操作(fsync 系统调用),
+                        // 直接在 async 上下文中调用会阻塞 tokio 工作线程。
+                        // 移至 spawn_blocking 在独立线程中执行。
+                        if let Some(file) = self.file_fd.clone() {
+                            tokio::task::spawn_blocking(move || {
+                                file.sync_all().map_err(DownloadError::Io)
+                            })
+                            .await
+                            .map_err(|e| {
+                                DownloadError::Io(std::io::Error::other(e.to_string()))
+                            })??;
                         }
                         Ok(())
                     }
@@ -786,6 +995,19 @@ impl AsyncStorage for IoUringStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_invalid_input_error(err: DownloadError, expected_message: &str) {
+        match err {
+            DownloadError::Io(io_error) => {
+                assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    io_error.to_string().contains(expected_message),
+                    "错误信息应包含 {expected_message}, 实际: {io_error}"
+                );
+            }
+            other => panic!("应返回 I/O InvalidInput 错误,实际: {other}"),
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -958,6 +1180,64 @@ mod tests {
         assert!(storage.config().sqpoll);
         assert_eq!(storage.config().sqpoll_idle_ms, 500);
         assert_eq!(storage.path(), Path::new("/data/download.bin"));
+    }
+
+    #[test]
+    fn test_fixed_buffer_write_len_allows_exact_buffer_size() {
+        validate_fixed_buffer_write_len(4096, 4096).expect("等于 fixed buffer 大小时应允许写入");
+    }
+
+    #[test]
+    fn test_fixed_buffer_write_len_rejects_oversized_payload() {
+        let err = validate_fixed_buffer_write_len(4097, 4096)
+            .expect_err("超过 fixed buffer 大小时必须返回错误");
+
+        assert_invalid_input_error(err, "exceeds fixed buffer size");
+    }
+
+    #[test]
+    fn test_fixed_buffer_config_rejects_empty_buffers() {
+        let zero_size = IoUringConfig {
+            buffer_size: 0,
+            ..IoUringConfig::default()
+        };
+        let err =
+            validate_fixed_buffer_config(&zero_size).expect_err("buffer_size 为 0 时必须返回错误");
+        assert_invalid_input_error(err, "buffer size must be non-zero");
+
+        let zero_count = IoUringConfig {
+            buffer_count: 0,
+            ..IoUringConfig::default()
+        };
+        let err = validate_fixed_buffer_config(&zero_count)
+            .expect_err("buffer_count 为 0 时必须返回错误");
+        assert_invalid_input_error(err, "buffer count must be non-zero");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_write_at_rejects_payload_larger_than_fixed_buffer_before_backend_io() {
+        let storage = IoUringStorage {
+            config: IoUringConfig {
+                sq_depth: 8,
+                cq_depth: 16,
+                buffer_size: 4096,
+                buffer_count: 1,
+                sqpoll: false,
+                sqpoll_idle_ms: 1000,
+            },
+            file_path: PathBuf::from("/tmp/iouring_oversized_write.bin"),
+            file_fd: None,
+            state: IoUringState::Ready,
+            ring: None,
+        };
+
+        let err = storage
+            .write_at(0, Bytes::from(vec![0u8; 4097]))
+            .await
+            .expect_err("超过 fixed buffer 大小时 write_at 必须先返回错误");
+
+        assert_invalid_input_error(err, "exceeds fixed buffer size");
     }
 
     #[cfg(target_os = "linux")]

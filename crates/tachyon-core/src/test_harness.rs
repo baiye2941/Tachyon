@@ -20,17 +20,127 @@ pub mod harness {
     #[derive(Clone)]
     pub struct MockProtocol {
         metadata: Option<FileMetadata>,
-        error_msg: Option<String>,
+        /// L-16: 保留原始 DownloadError 的关键信息。
+        /// 对可 Clone 的变体(Network/Protocol/Fragment/Config/Cancelled 等)直接保留;
+        /// 对不可 Clone 的变体(Io/Other)转为 Network(error.to_string()),
+        /// 保留错误描述但不保留原始类型(因 DownloadError 未 derive Clone)。
+        preserved_error: Option<PreservedError>,
         pub range_data: Arc<Mutex<HashMap<(u64, u64), Bytes>>>,
         /// 全量下载数据(download_full 的返回值)
         default_data: Option<Bytes>,
+    }
+
+    /// L-16: 保留 MockProtocol 中原始 DownloadError 的可 Clone 部分。
+    /// 可 Clone 变体完整保留(包括 ChecksumMismatch 的 expected/actual 字段);
+    /// 不可 Clone 变体(Io/Other)降级为 Network(string)。
+    ///
+    /// TODO: 考虑给 DownloadError 自定义 Clone 实现(对 Io/Other/UrlParse/Serialization
+    /// 做降级 clone),替代此镜像枚举。当前方案的优势是穷尽 match 保证:当 DownloadError
+    /// 新增变体时,`from_download_error` 编译报错,强制同步更新。
+    #[derive(Clone, Debug)]
+    enum PreservedError {
+        Network(String),
+        Protocol(String),
+        Fragment(String),
+        ChecksumMismatch {
+            expected: String,
+            actual: String,
+        },
+        NoExpectedChecksum,
+        Config(String),
+        Cancelled,
+        TaskNotFound(String),
+        ConnectionPoolExhausted,
+        Timeout(String),
+        Throttled {
+            retry_after_secs: Option<u64>,
+        },
+        Forbidden {
+            status: u16,
+        },
+        Http {
+            status: u16,
+            reason: String,
+        },
+        /// Io/Other 等不可 Clone 变体的降级表示
+        DowngradedNetwork(String),
+    }
+
+    impl PreservedError {
+        fn from_download_error(err: &DownloadError) -> Self {
+            match err {
+                DownloadError::Network(s) => PreservedError::Network(s.clone()),
+                DownloadError::Protocol(s) => PreservedError::Protocol(s.clone()),
+                DownloadError::Fragment(s) => PreservedError::Fragment(s.clone()),
+                DownloadError::ChecksumMismatch { expected, actual } => {
+                    PreservedError::ChecksumMismatch {
+                        expected: expected.clone(),
+                        actual: actual.clone(),
+                    }
+                }
+                DownloadError::NoExpectedChecksum => PreservedError::NoExpectedChecksum,
+                DownloadError::Config(s) => PreservedError::Config(s.clone()),
+                DownloadError::Cancelled => PreservedError::Cancelled,
+                DownloadError::TaskNotFound(s) => PreservedError::TaskNotFound(s.clone()),
+                DownloadError::ConnectionPoolExhausted => PreservedError::ConnectionPoolExhausted,
+                DownloadError::Timeout(s) => PreservedError::Timeout(s.clone()),
+                DownloadError::Throttled { retry_after_secs } => PreservedError::Throttled {
+                    retry_after_secs: *retry_after_secs,
+                },
+                DownloadError::Forbidden { status } => {
+                    PreservedError::Forbidden { status: *status }
+                }
+                DownloadError::Http { status, reason } => PreservedError::Http {
+                    status: *status,
+                    reason: reason.clone(),
+                },
+                // 不可 Clone 的变体降级为 Network
+                DownloadError::Io(_)
+                | DownloadError::Other(_)
+                | DownloadError::UrlParse(_)
+                | DownloadError::Serialization(_) => {
+                    PreservedError::DowngradedNetwork(err.to_string())
+                }
+            }
+        }
+
+        fn to_download_error(&self) -> DownloadError {
+            match self {
+                PreservedError::Network(s) => DownloadError::Network(s.clone()),
+                PreservedError::Protocol(s) => DownloadError::Protocol(s.clone()),
+                PreservedError::Fragment(s) => DownloadError::Fragment(s.clone()),
+                PreservedError::ChecksumMismatch { expected, actual } => {
+                    DownloadError::ChecksumMismatch {
+                        expected: expected.clone(),
+                        actual: actual.clone(),
+                    }
+                }
+                PreservedError::NoExpectedChecksum => DownloadError::NoExpectedChecksum,
+                PreservedError::Config(s) => DownloadError::Config(s.clone()),
+                PreservedError::Cancelled => DownloadError::Cancelled,
+                PreservedError::TaskNotFound(s) => DownloadError::TaskNotFound(s.clone()),
+                PreservedError::ConnectionPoolExhausted => DownloadError::ConnectionPoolExhausted,
+                PreservedError::Timeout(s) => DownloadError::Timeout(s.clone()),
+                PreservedError::Throttled { retry_after_secs } => DownloadError::Throttled {
+                    retry_after_secs: *retry_after_secs,
+                },
+                PreservedError::Forbidden { status } => {
+                    DownloadError::Forbidden { status: *status }
+                }
+                PreservedError::Http { status, reason } => DownloadError::Http {
+                    status: *status,
+                    reason: reason.clone(),
+                },
+                PreservedError::DowngradedNetwork(s) => DownloadError::Network(s.clone()),
+            }
+        }
     }
 
     impl MockProtocol {
         pub fn new(metadata: FileMetadata) -> Self {
             Self {
                 metadata: Some(metadata),
-                error_msg: None,
+                preserved_error: None,
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
             }
@@ -49,10 +159,15 @@ pub mod harness {
             }
         }
 
+        /// 创建一个总是失败的 MockProtocol。
+        ///
+        /// L-16: 保留原始 DownloadError 的关键信息(变体类型 + 附加字段)。
+        /// 对可 Clone 的变体(如 ChecksumMismatch)完整保留 expected/actual 字段;
+        /// 对不可 Clone 的变体(Io/Other)降级为 Network(string)但保留描述。
         pub fn failing(error: DownloadError) -> Self {
             Self {
                 metadata: None,
-                error_msg: Some(error.to_string()),
+                preserved_error: Some(PreservedError::from_download_error(&error)),
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
             }
@@ -69,10 +184,11 @@ pub mod harness {
             Box::pin(async move {
                 if let Some(ref meta) = this.metadata {
                     Ok(meta.clone())
+                } else if let Some(ref preserved) = this.preserved_error {
+                    // L-16: 从保留的错误信息重建 DownloadError,保留原始变体类型
+                    Err(preserved.to_download_error())
                 } else {
-                    Err(DownloadError::Network(
-                        this.error_msg.clone().unwrap_or_default(),
-                    ))
+                    Err(DownloadError::Network("mock 协议未配置".into()))
                 }
             })
         }
@@ -268,6 +384,7 @@ pub mod harness {
             headers: HashMap::new(),
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
+            max_full_stream_bytes: crate::config::default_max_full_stream_bytes(),
             authorized_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
             io_strategy: IoStrategy::default(),
         }

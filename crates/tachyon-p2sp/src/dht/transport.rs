@@ -9,8 +9,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, oneshot};
 
 use super::kademlia::{KademliaDht, key_to_node_id};
-use super::message::KademliaMessage;
-use super::node::{ALPHA, DhtNode, K_BUCKET_SIZE, NUM_BUCKETS, NodeId, xor_distance};
+use super::message::{KademliaMessage, sign_message, verify_message_signature};
+use super::node::{ALPHA, DhtNode, K_BUCKET_SIZE, NUM_BUCKETS, NodeId, NodeIdentity, xor_distance};
 
 /// Bucket Refresh 检查间隔 (Kademlia 推荐 15 分钟)
 const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -105,6 +105,8 @@ fn wire_decode(bytes: &[u8]) -> Result<KademliaMessage, TransportError> {
 pub struct DhtTransport {
     socket: Arc<UdpSocket>,
     dht: Arc<RwLock<KademliaDht>>,
+    /// H-3: 节点 Ed25519 密钥对,用于签名消息
+    identity: Arc<NodeIdentity>,
     pending_requests: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>>,
     running: Arc<AtomicBool>,
     next_request_id: AtomicU64,
@@ -114,11 +116,16 @@ impl DhtTransport {
     /// 绑定到指定地址的 UDP socket,创建传输层实例
     ///
     /// 使用 `addr = "127.0.0.1:0"` 可由操作系统自动分配可用端口。
-    pub async fn bind(addr: &str, dht: Arc<RwLock<KademliaDht>>) -> Result<Self, TransportError> {
+    pub async fn bind(
+        addr: &str,
+        dht: Arc<RwLock<KademliaDht>>,
+        identity: NodeIdentity,
+    ) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Self {
             socket: Arc::new(socket),
             dht,
+            identity: Arc::new(identity),
             pending_requests: Arc::new(DashMap::new()),
             running: Arc::new(AtomicBool::new(false)),
             next_request_id: AtomicU64::new(1),
@@ -153,7 +160,10 @@ impl DhtTransport {
         let dht = self.dht.clone();
         let pending = self.pending_requests.clone();
         let running = self.running.clone();
-        tokio::spawn(Self::recv_loop_inner(socket, dht, pending, running));
+        let identity = self.identity.clone();
+        tokio::spawn(Self::recv_loop_inner(
+            socket, dht, identity, pending, running,
+        ));
     }
 
     /// 关闭传输层,停止接收循环
@@ -250,6 +260,7 @@ impl DhtTransport {
     async fn recv_loop_inner(
         socket: Arc<UdpSocket>,
         dht: Arc<RwLock<KademliaDht>>,
+        identity: Arc<NodeIdentity>,
         pending: Arc<DashMap<RequestId, oneshot::Sender<KademliaMessage>>>,
         running: Arc<AtomicBool>,
     ) {
@@ -295,6 +306,23 @@ impl DhtTransport {
                 }
             };
 
+            // H-3: 验证 Ed25519 消息签名 — 防止路由表投毒和消息篡改
+            // 签名存在时必须验证通过;无签名时记录警告但仍处理(兼容未签名节点)
+            if let Some(signature) = msg.signature().and_then(|s| s.as_ref()) {
+                if !verify_message_signature(&msg, signature) {
+                    tracing::warn!(
+                        addr = %src_addr,
+                        "DHT Ed25519 签名验证失败,丢弃消息(可能的路由表投毒攻击)"
+                    );
+                    continue;
+                }
+            } else {
+                tracing::debug!(
+                    addr = %src_addr,
+                    "DHT 消息无签名,建议升级至签名节点"
+                );
+            }
+
             // 尝试匹配 pending request(响应消息 — 不计入速率限制)
             if let Some((_, sender)) = pending.remove(&request_id) {
                 let _ = sender.send(msg);
@@ -318,7 +346,11 @@ impl DhtTransport {
             }
 
             // 未匹配:视为入站请求,生成响应并回送
-            if let Some(response) = Self::process_incoming(&dht, &msg, src_addr).await {
+            if let Some(mut response) = Self::process_incoming(&dht, &msg, src_addr).await {
+                // H-3: 响应消息 Ed25519 签名
+                if let Some(sig) = sign_message(&identity, &response) {
+                    response.set_signature(sig);
+                }
                 let payload = match wire_encode(&response) {
                     Ok(p) => p,
                     Err(e) => {
@@ -368,17 +400,36 @@ impl DhtTransport {
                     sender_id: *dht_guard.local_id(),
                     value,
                     nodes,
+                    signature: None,
                 })
             }
 
-            KademliaMessage::Store { key, value, .. } => {
+            KademliaMessage::Store {
+                key,
+                value,
+                sender_id,
+                ..
+            } => {
+                // S-4: Store RPC 认证 — 仅接受路由表中已知节点的 Store 请求,
+                // 防止任意节点向本节点注入数据(路由表投毒 / 存储滥用)。
+                let is_known = dht_guard
+                    .routing_table()
+                    .find_closest(sender_id, K_BUCKET_SIZE)
+                    .iter()
+                    .any(|n| n.id == *sender_id);
+
+                if !is_known {
+                    // 未知节点: 拒绝存储,但记录日志用于调试
+                    tracing::debug!(
+                        sender_prefix = sender_id[0],
+                        addr = %src_addr,
+                        "DHT Store RPC 被拒绝: 发送方不在路由表中"
+                    );
+                    return None;
+                }
+
                 dht_guard.store(key.clone(), value.clone());
-                // 将发送方添加到路由表(Ping 验证通过)
-                let sender_id = match msg {
-                    KademliaMessage::Store { sender_id, .. } => *sender_id,
-                    _ => unreachable!(),
-                };
-                dht_guard.add_node(DhtNode::new(sender_id, src_addr.to_string()));
+                // 仅刷新已知节点的路由表时间,不自动添加未知节点
                 None
             }
 
@@ -417,7 +468,12 @@ impl DhtTransport {
         let (tx, rx) = oneshot::channel();
         self.pending_requests.insert(request_id, tx);
 
-        let payload = wire_encode(message)?;
+        // H-3: 发送前 Ed25519 签名消息
+        let mut signed_message = message.clone();
+        if let Some(sig) = sign_message(&self.identity, message) {
+            signed_message.set_signature(sig);
+        }
+        let payload = wire_encode(&signed_message)?;
 
         let mut packet = Vec::with_capacity(8 + payload.len());
         packet.extend_from_slice(&request_id.to_be_bytes());
@@ -478,6 +534,7 @@ impl DhtTransport {
         let msg = KademliaMessage::FindValue {
             sender_id: self.local_id().await,
             key: key.to_vec(),
+            signature: None,
         };
         let response = self.send_rpc(addr, &msg).await?;
         match response {
@@ -493,11 +550,16 @@ impl DhtTransport {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), TransportError> {
-        let msg = KademliaMessage::Store {
+        let mut msg = KademliaMessage::Store {
             sender_id: self.local_id().await,
             key: key.to_vec(),
             value: value.to_vec(),
+            signature: None,
         };
+        // H-3: 发送前 Ed25519 签名消息
+        if let Some(sig) = sign_message(&self.identity, &msg) {
+            msg.set_signature(sig);
+        }
         let payload = wire_encode(&msg)?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
@@ -534,6 +596,7 @@ impl DhtTransport {
         }
 
         let mut queried_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let mut known_ids: std::collections::HashSet<NodeId> = known.iter().map(|n| n.id).collect();
 
         loop {
             // 按 XOR 距离排序,选择最多 ALPHA 个未查询节点
@@ -557,6 +620,7 @@ impl DhtTransport {
             let mut handles = Vec::new();
             for node in targets {
                 let target_copy = *target;
+                let identity_clone = self.identity.clone();
                 handles.push(tokio::spawn({
                     let transport_socket = self.socket.clone();
                     let dht_ref = self.dht.clone();
@@ -566,10 +630,14 @@ impl DhtTransport {
                     let req_id = next_id.fetch_add(1, Ordering::SeqCst);
                     async move {
                         // 构造 FindNode 消息
-                        let msg = {
+                        let mut msg = {
                             let dht = dht_ref.read().await;
                             dht.make_find_node(target_copy)
                         };
+                        // H-3: 发送前 Ed25519 签名消息
+                        if let Some(sig) = sign_message(&identity_clone, &msg) {
+                            msg.set_signature(sig);
+                        }
                         let payload = match wire_encode(&msg) {
                             Ok(p) => p,
                             Err(_) => return Vec::new(),
@@ -602,8 +670,8 @@ impl DhtTransport {
             for handle in handles {
                 if let Ok(nodes) = handle.await {
                     for node in nodes {
-                        if !queried_ids.contains(&node.id) && !known.iter().any(|n| n.id == node.id)
-                        {
+                        if !queried_ids.contains(&node.id) && !known_ids.contains(&node.id) {
+                            known_ids.insert(node.id);
                             known.push(node);
                             new_found = true;
                         }
@@ -670,17 +738,23 @@ impl DhtTransport {
             let key = key.clone();
             let value = value.clone();
             let addr = node.addr.clone();
+            let identity_clone = self.identity.clone();
             handles.push(tokio::spawn({
                 let socket = self.socket.clone();
                 let next_id = &self.next_request_id;
                 let sender_id = self.local_id().await;
                 let req_id = next_id.fetch_add(1, Ordering::SeqCst);
                 async move {
-                    let msg = KademliaMessage::Store {
+                    let mut msg = KademliaMessage::Store {
                         sender_id,
                         key,
                         value,
+                        signature: None,
                     };
+                    // H-3: 发送前 Ed25519 签名消息
+                    if let Some(sig) = sign_message(&identity_clone, &msg) {
+                        msg.set_signature(sig);
+                    }
                     let payload = match wire_encode(&msg) {
                         Ok(p) => p,
                         Err(_) => return false,
@@ -726,8 +800,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_bind_and_shutdown() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let transport = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let identity_a = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let transport = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
         let addr = transport.local_addr().unwrap();
         assert!(addr.port() > 0);
 
@@ -741,11 +818,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_ping_pong() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new(identity_b.node_id(), 100)));
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b, identity_b)
+            .await
+            .unwrap();
 
         let addr_b = tb.local_addr().unwrap().to_string();
 
@@ -762,8 +845,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_find_node_rpc() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new(identity_b.node_id(), 100)));
 
         // Pre-populate B's routing table with some nodes
         {
@@ -775,8 +860,12 @@ mod tests {
             }
         }
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b, identity_b)
+            .await
+            .unwrap();
         let addr_b = tb.local_addr().unwrap().to_string();
 
         ta.start_recv_loop();
@@ -796,8 +885,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_find_value_rpc() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new(identity_b.node_id(), 100)));
 
         // Store a value at B
         {
@@ -805,8 +896,12 @@ mod tests {
             b.store(b"test_key".to_vec(), b"test_value".to_vec());
         }
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b, identity_b)
+            .await
+            .unwrap();
         let addr_b = tb.local_addr().unwrap().to_string();
 
         ta.start_recv_loop();
@@ -825,17 +920,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_store_rpc() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let node_id_a = identity_a.node_id();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(node_id_a, 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new(identity_b.node_id(), 100)));
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b.clone())
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a.clone(), identity_a)
+            .await
+            .unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b.clone(), identity_b)
             .await
             .unwrap();
         let addr_b = tb.local_addr().unwrap().to_string();
+        let addr_a = ta.local_addr().unwrap().to_string();
 
         ta.start_recv_loop();
         tb.start_recv_loop();
+
+        // S-4: 预填充路由表 — B 必须先知道 A,才接受 A 的 Store RPC
+        {
+            let mut b = dht_b.write().await;
+            b.add_node(DhtNode::new(node_id_a, addr_a.clone()));
+        }
 
         // A sends Store to B
         ta.store_rpc(&addr_b, b"remote_key", b"remote_value")
@@ -856,8 +963,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_rpc_timeout() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let identity_a = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
         ta.start_recv_loop();
 
         // Send RPC to an address where nobody is listening
@@ -865,7 +975,8 @@ mod tests {
         // For faster test, we use a local port that isn't bound
         let unused_addr = "127.0.0.1:19999";
         let msg = KademliaMessage::Ping {
-            sender_id: [1u8; 20],
+            sender_id: ta.local_id().await,
+            signature: None,
         };
 
         // Override timeout for faster test: use tokio::time::timeout directly
@@ -883,23 +994,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_distributed_store_and_find() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b2 = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let node_id_a = identity_a.node_id();
+        let node_id_b = identity_b.node_id();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(node_id_a, 100)));
+        let dht_b2 = Arc::new(RwLock::new(KademliaDht::new(node_id_b, 100)));
 
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b2.clone())
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b2.clone(), identity_b)
             .await
             .unwrap();
         let addr_b = tb.local_addr().unwrap().to_string();
 
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a.clone(), identity_a)
+            .await
+            .unwrap();
+        let addr_a = ta.local_addr().unwrap().to_string();
+
         // Add B to A's routing table
         {
             let mut a = dht_a.write().await;
-            a.add_node(DhtNode::new([2u8; 20], addr_b));
+            a.add_node(DhtNode::new(node_id_b, addr_b));
         }
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a.clone())
-            .await
-            .unwrap();
+        // S-4: Add A to B's routing table (Store RPC 认证要求)
+        {
+            let mut b = dht_b2.write().await;
+            b.add_node(DhtNode::new(node_id_a, addr_a));
+        }
 
         ta.start_recv_loop();
         tb.start_recv_loop();
@@ -933,8 +1055,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_shutdown_stops_rpc() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let identity_a = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
         ta.start_recv_loop();
         ta.shutdown();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -949,8 +1074,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_drop_shuts_down() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
+        let identity_a = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
         let running = ta.running.clone();
         ta.start_recv_loop();
         assert!(running.load(Ordering::SeqCst));
@@ -965,21 +1093,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_multiple_pings() {
-        let dht_server = Arc::new(RwLock::new(KademliaDht::new([0u8; 20], 100)));
-        let server = DhtTransport::bind("127.0.0.1:0", dht_server).await.unwrap();
+        let identity_server = NodeIdentity::generate();
+        let dht_server = Arc::new(RwLock::new(KademliaDht::new(
+            identity_server.node_id(),
+            100,
+        )));
+        let server = DhtTransport::bind("127.0.0.1:0", dht_server, identity_server)
+            .await
+            .unwrap();
         let server_addr = server.local_addr().unwrap().to_string();
         server.start_recv_loop();
 
         // Multiple clients ping the same server
-        for i in 1..=5u8 {
-            let mut id = [0u8; 20];
-            id[0] = i;
-            let dht_client = Arc::new(RwLock::new(KademliaDht::new(id, 100)));
-            let client = DhtTransport::bind("127.0.0.1:0", dht_client).await.unwrap();
+        for _ in 1..=5u8 {
+            let identity_client = NodeIdentity::generate();
+            let dht_client = Arc::new(RwLock::new(KademliaDht::new(
+                identity_client.node_id(),
+                100,
+            )));
+            let client = DhtTransport::bind("127.0.0.1:0", dht_client, identity_client)
+                .await
+                .unwrap();
             client.start_recv_loop();
 
             let result = client.ping(&server_addr).await.unwrap();
-            assert!(result, "Client {i} ping should succeed");
+            assert!(result, "Client ping should succeed");
 
             client.shutdown();
         }
@@ -989,11 +1127,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_bidirectional_ping() {
-        let dht_a = Arc::new(RwLock::new(KademliaDht::new([1u8; 20], 100)));
-        let dht_b = Arc::new(RwLock::new(KademliaDht::new([2u8; 20], 100)));
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let dht_a = Arc::new(RwLock::new(KademliaDht::new(identity_a.node_id(), 100)));
+        let dht_b = Arc::new(RwLock::new(KademliaDht::new(identity_b.node_id(), 100)));
 
-        let ta = DhtTransport::bind("127.0.0.1:0", dht_a).await.unwrap();
-        let tb = DhtTransport::bind("127.0.0.1:0", dht_b).await.unwrap();
+        let ta = DhtTransport::bind("127.0.0.1:0", dht_a, identity_a)
+            .await
+            .unwrap();
+        let tb = DhtTransport::bind("127.0.0.1:0", dht_b, identity_b)
+            .await
+            .unwrap();
 
         let addr_a = ta.local_addr().unwrap().to_string();
         let addr_b = tb.local_addr().unwrap().to_string();

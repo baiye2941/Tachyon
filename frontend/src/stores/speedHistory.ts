@@ -13,13 +13,13 @@ const [activeTasks, setActiveTasks] = createSignal(0)
 
 export function pushSpeed(speed: number) {
   if (count === HISTORY_SIZE) {
-    const oldVal = buffer[writeIndex]
+    const oldVal = buffer[writeIndex]!
     sum -= oldVal
     if (oldVal >= peak) {
       peak = speed
       for (let i = 0; i < HISTORY_SIZE; i++) {
-        if (i !== writeIndex && buffer[i] > peak) {
-          peak = buffer[i]
+        if (i !== writeIndex && buffer[i]! > peak) {
+          peak = buffer[i]!
         }
       }
     }
@@ -38,7 +38,7 @@ export function getHistory(): number[] {
   const result = new Array<number>(count)
   const start = count === HISTORY_SIZE ? writeIndex : 0
   for (let i = 0; i < count; i++) {
-    result[i] = buffer[(start + i) % HISTORY_SIZE]
+    result[i] = buffer[(start + i) % HISTORY_SIZE]!
   }
   return result
 }
@@ -69,5 +69,5 @@ export function getPeakSpeed(): number {
 
 export function getCurrentSpeed(): number {
   if (count === 0) return 0
-  return buffer[(writeIndex - 1 + HISTORY_SIZE) % HISTORY_SIZE]
+  return buffer[(writeIndex - 1 + HISTORY_SIZE) % HISTORY_SIZE]!
 }

@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@main
+      - uses: cargo-bins/cargo-binstall@v1.12.3
       - name: 安装 cargo-deny (预编译二进制)
         run: cargo binstall -y --force cargo-deny
       - run: cargo deny check
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@main
+      - uses: cargo-bins/cargo-binstall@v1.12.3
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
       - run: cargo audit
@@ -109,12 +109,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: 运行覆盖率检查
-        run: cargo llvm-cov --all --fail-under-lines 80
+        run: cargo llvm-cov --all --fail-under-lines 90
 
   miri:
     name: Miri (unsafe 代码检测)
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
@@ -160,9 +159,36 @@ jobs:
       - name: 安装前端依赖
         working-directory: frontend
         run: bun install
+      - name: 前端依赖安全审计
+        working-directory: frontend
+        run: npx npm audit --audit-level=moderate
+        continue-on-error: true  # 信息性,Bun lockfile 与 npm 不完全兼容,不阻塞 CI
       - name: TypeScript 类型检查
         working-directory: frontend
         run: bun run typecheck
+      - name: ESLint 检查
+        working-directory: frontend
+        run: bun run lint
+      - name: 前端单元测试
+        working-directory: frontend
+        run: bun run test
       - name: 前端构建
         working-directory: frontend
         run: bun run build
+
+  ci-pass:
+    name: CI 通过
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [fmt, clippy, test, docs, audit, cargo-audit, coverage, miri, frontend]
+    steps:
+      - name: 检查所有 CI 作业是否成功
+        run: |
+          jobs="${{ needs.*.result }}"
+          for result in $jobs; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "::error::CI 作业失败或被取消: $result"
+              exit 1
+            fi
+          done
+          echo "所有 CI 作业通过"

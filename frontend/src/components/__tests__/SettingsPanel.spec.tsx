@@ -27,7 +27,15 @@ const mockConfig: AppConfig = {
     verifyChecksum: true,
     maxRetries: 3,
     requestTimeoutSecs: 30,
+    connectTimeoutSecs: 10,
+    pauseTimeoutSecs: 300,
+    rateLimitBytesPerSec: null,
+    maxFullStreamBytes: 1024 * 1024 * 1024,
+    authorizedDirs: ['downloads'],
     userAgent: 'Tachyon/1.0',
+    headers: {
+      Authorization: 'Bearer test-token',
+    },
   },
   connection: {
     maxConnectionsPerHost: 4,
@@ -95,12 +103,15 @@ describe('SettingsPanel', () => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
     })
 
-    const calledWith = vi.mocked(api.updateConfig).mock.calls[0][0] as AppConfig
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as AppConfig
     expect(calledWith.scheduler).toBeDefined()
     expect(calledWith.scheduler.minFragmentSize).toBe(mockConfig.scheduler.minFragmentSize)
     expect(calledWith.scheduler.maxFragmentSize).toBe(mockConfig.scheduler.maxFragmentSize)
     expect(calledWith.scheduler.samplingIntervalSecs).toBe(mockConfig.scheduler.samplingIntervalSecs)
     expect(calledWith.scheduler.ewmaAlpha).toBe(mockConfig.scheduler.ewmaAlpha)
+    expect(calledWith.download.maxFullStreamBytes).toBe(mockConfig.download.maxFullStreamBytes)
+    expect(calledWith.download.authorizedDirs).toEqual(mockConfig.download.authorizedDirs)
+    expect(calledWith.download.headers).toEqual(mockConfig.download.headers)
   })
 
   it('保存成功时显示 toast 配置已保存', async () => {

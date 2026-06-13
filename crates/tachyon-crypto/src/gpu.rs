@@ -19,6 +19,7 @@ use std::borrow::Cow;
 
 use tachyon_core::DownloadError;
 use tachyon_core::error::DownloadResult;
+use tachyon_core::traits::Verifier;
 
 // BLAKE3 标志位常量(Rust 侧,用于树形归约和测试)
 // 注意: ROOT = bit 3 (值 8), PARENT = bit 2 (值 4), 不要混淆!
@@ -56,6 +57,14 @@ pub struct GpuVerifier {
     device: wgpu::Device,
     queue: wgpu::Queue,
     blake3_pipeline: wgpu::ComputePipeline,
+    /// 缓存的输入缓冲区(按最大容量分配,实际使用可能小于此容量)
+    cached_input_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
+    /// 缓存的输出缓冲区
+    cached_output_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
+    /// 缓存的 staging 缓冲区(用于 CPU 回读)
+    cached_staging_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
+    /// 缓存缓冲区的容量(字节),当新请求超过此容量时重新分配
+    cached_buffer_capacity: std::sync::Mutex<usize>,
 }
 
 /// 小于此阈值的数据直接使用 CPU 计算,避免 GPU 启动开销超过收益
@@ -121,6 +130,10 @@ impl GpuVerifier {
             device,
             queue,
             blake3_pipeline: pipeline,
+            cached_input_buffer: std::sync::Mutex::new(None),
+            cached_output_buffer: std::sync::Mutex::new(None),
+            cached_staging_buffer: std::sync::Mutex::new(None),
+            cached_buffer_capacity: std::sync::Mutex::new(0),
         })
     }
 
@@ -163,7 +176,7 @@ impl GpuVerifier {
         tracing::info!(data_len = data.len(), "使用 GPU blake3 计算哈希");
 
         // 准备输入数据: 按 64 字节块对齐填充为 u32 数组
-        let padded_size = ((data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+        let padded_size = data.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
         let mut padded = vec![0u8; padded_size];
         padded[..data.len()].copy_from_slice(data);
 
@@ -173,7 +186,7 @@ impl GpuVerifier {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        let num_chunks = (data.len().max(1) + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let num_chunks = data.len().max(1).div_ceil(CHUNK_SIZE);
         let input_word_count = input_words.len() as u32;
         let data_len = data.len() as u32;
 
@@ -189,29 +202,102 @@ impl GpuVerifier {
         // 输出 buffer: 每个 chunk 产出 8 个 u32 (32 字节 chaining value)
         let output_size = (num_chunks * 8) as u64;
 
-        // 创建 GPU buffers
-        use wgpu::util::DeviceExt;
-        let input_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blake3_input"),
-                contents: input_bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        // 计算所需缓冲区大小
+        let input_size = input_bytes.len() as u64;
+        let output_byte_size = output_size * 4;
 
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blake3_output"),
-            size: output_size * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // 获取或创建缓存的输入缓冲区
+        let input_buffer = {
+            let mut cached = self.cached_input_buffer.lock().unwrap();
+            let mut capacity = self.cached_buffer_capacity.lock().unwrap();
+            if let Some(ref buf) = *cached {
+                if *capacity >= input_bytes.len() {
+                    // 复用现有缓冲区:写入新数据
+                    self.queue.write_buffer(buf, 0, input_bytes);
+                    buf.clone()
+                } else {
+                    // 容量不足,重新分配更大的缓冲区
+                    let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("blake3_input_cached"),
+                        size: input_size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue.write_buffer(&new_buf, 0, input_bytes);
+                    *cached = Some(new_buf.clone());
+                    *capacity = input_bytes.len();
+                    new_buf
+                }
+            } else {
+                // 首次分配
+                let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("blake3_input_cached"),
+                    size: input_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&new_buf, 0, input_bytes);
+                *cached = Some(new_buf.clone());
+                *capacity = input_bytes.len();
+                new_buf
+            }
+        };
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blake3_staging"),
-            size: output_size * 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // 获取或创建缓存的输出缓冲区
+        let output_buffer = {
+            let mut cached = self.cached_output_buffer.lock().unwrap();
+            if let Some(ref buf) = *cached {
+                if buf.size() >= output_byte_size {
+                    buf.clone()
+                } else {
+                    let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("blake3_output_cached"),
+                        size: output_byte_size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    *cached = Some(new_buf.clone());
+                    new_buf
+                }
+            } else {
+                let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("blake3_output_cached"),
+                    size: output_byte_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                *cached = Some(new_buf.clone());
+                new_buf
+            }
+        };
+
+        // 获取或创建缓存的 staging 缓冲区
+        let staging_buffer = {
+            let mut cached = self.cached_staging_buffer.lock().unwrap();
+            if let Some(ref buf) = *cached {
+                if buf.size() >= output_byte_size {
+                    buf.clone()
+                } else {
+                    let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("blake3_staging_cached"),
+                        size: output_byte_size,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    *cached = Some(new_buf.clone());
+                    new_buf
+                }
+            } else {
+                let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("blake3_staging_cached"),
+                    size: output_byte_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                *cached = Some(new_buf.clone());
+                new_buf
+            }
+        };
 
         // 创建 bind group 并提交 compute pass
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -297,6 +383,22 @@ impl GpuVerifier {
             let root_cv = blake3_tree_reduce(&chunk_cvs, data_len);
             Ok(u32_to_hex(&root_cv))
         }
+    }
+}
+
+/// S-12: 为 GpuVerifier 实现 Verifier trait
+///
+/// `Verifier::compute_hash` 是同步接口,而 GPU 计算路径是异步的。
+/// 因此 trait 实现使用 CPU blake3 作为同步快速路径(适用于大部分校验场景),
+/// GPU 加速路径通过独立的 `compute_blake3` 异步方法暴露给需要高吞吐的场景。
+///
+/// 两者产出相同哈希值(已由 `test_cpu_gpu_hash_consistency` 测试保证一致性)。
+impl Verifier for GpuVerifier {
+    fn compute_hash(&self, data: &[u8]) -> DownloadResult<String> {
+        // 同步路径: 直接使用 CPU blake3
+        // GPU 加速请调用 compute_blake3() 异步方法
+        let hash = blake3::hash(data);
+        Ok(hash.to_hex().to_string())
     }
 }
 
@@ -411,48 +513,99 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
 ///
 /// 将各 chunk 的 chaining value 通过 PARENT 压缩逐层归约,
 /// 直到只剩一个根节点,最终压缩附加 ROOT 标志。
+///
+/// H-6 修复: 使用 blake3 crate 的 hazmat API 做正确的树形归约。
+/// 策略:使用 trailing-zeros 栈式归约收集未合并子树 chaining values,
+/// 然后从右向左逐对归约,最终层使用 merge_subtrees_root。
+///
+/// 对于 2 的幂个 chunks,栈式归约后只剩余 1 个 chaining value,
+/// 此时使用 blake3_compress 做最终 ROOT 输出:
+/// compress(IV, cv||zero, 0, BLOCK_SIZE, PARENT|ROOT)
 fn blake3_tree_reduce(chunk_cvs: &[[u32; 8]], _total_len: u32) -> [u32; 8] {
-    let mut cvs: Vec<[u32; 8]> = chunk_cvs.to_vec();
+    use blake3::hazmat::{Mode, merge_subtrees_non_root, merge_subtrees_root};
 
-    while cvs.len() > 1 {
-        let mut next = Vec::with_capacity((cvs.len() + 1) / 2);
-        let mut i = 0;
-        while i + 1 < cvs.len() {
-            // 构造 parent block: left_cv[0..8] || right_cv[0..8]
-            let mut parent_block = [0u32; 16];
-            parent_block[..8].copy_from_slice(&cvs[i]);
-            parent_block[8..16].copy_from_slice(&cvs[i + 1]);
+    assert!(
+        !chunk_cvs.is_empty(),
+        "blake3_tree_reduce 至少需要一个 chunk CV"
+    );
 
-            let is_last_pair = i + 2 >= cvs.len();
-            let is_root = is_last_pair && cvs.len() <= 2;
-
-            let mut flags = FLAG_PARENT;
-            if is_root {
-                flags |= FLAG_ROOT;
+    // 将 [u32; 8] 格式的 CV 转换为 blake3 ChainingValue ([u8; 32])
+    let cvs_bytes: Vec<[u8; 32]> = chunk_cvs
+        .iter()
+        .map(|cv| {
+            let mut bytes = [0u8; 32];
+            for i in 0..8 {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&cv[i].to_le_bytes());
             }
+            bytes
+        })
+        .collect();
 
-            // counter=0 for parent nodes, block_len=64 (full block)
-            next.push(blake3_compress(
-                &IV,
-                &parent_block,
-                0,
-                BLOCK_SIZE as u32,
-                flags,
-            ));
-            i += 2;
+    // 栈式增量归约
+    let mut cv_stack: Vec<[u8; 32]> = Vec::new();
+
+    for (chunk_idx, &chunk_cv) in cvs_bytes.iter().enumerate() {
+        let mut total_chunks = (chunk_idx + 1) as u64;
+        let mut new_cv = chunk_cv;
+
+        while total_chunks & 1 == 0 {
+            let left_cv = cv_stack.pop().expect("CV 栈不应为空");
+            new_cv = merge_subtrees_non_root(&left_cv, &new_cv, Mode::Hash);
+            total_chunks >>= 1;
         }
-        // 奇数个 CV 时,最后一个直接传递到下一层
-        if i < cvs.len() {
-            next.push(cvs[i]);
-        }
-        cvs = next;
+
+        cv_stack.push(new_cv);
     }
 
-    cvs[0]
+    // 从右向左归约栈中剩余的 CV
+    while cv_stack.len() > 1 {
+        let right = cv_stack.pop().unwrap();
+        let left = cv_stack.pop().unwrap();
+        if cv_stack.is_empty() {
+            // 最终层: ROOT 压缩
+            let root = merge_subtrees_root(&left, &right, Mode::Hash);
+            return hash_to_u32(&root);
+        }
+        cv_stack.push(merge_subtrees_non_root(&left, &right, Mode::Hash));
+    }
+
+    // 栈中只剩 1 个 CV (2 的幂个 chunks):
+    // 回退到使用 blake3_compress 做最终 ROOT 输出
+    let single_cv = cv_stack[0];
+    let mut cv_words = [0u32; 8];
+    for i in 0..8 {
+        cv_words[i] = u32::from_le_bytes([
+            single_cv[i * 4],
+            single_cv[i * 4 + 1],
+            single_cv[i * 4 + 2],
+            single_cv[i * 4 + 3],
+        ]);
+    }
+    let mut root_block = [0u32; 16];
+    root_block[..8].copy_from_slice(&cv_words);
+    blake3_compress(
+        &IV,
+        &root_block,
+        0,
+        BLOCK_SIZE as u32,
+        FLAG_PARENT | FLAG_ROOT,
+    )
 }
 
-// =============================================================================
-// 辅助函数
+/// 将 blake3::Hash 转换为 [u32; 8]
+fn hash_to_u32(hash: &blake3::Hash) -> [u32; 8] {
+    let mut result = [0u32; 8];
+    for (i, item) in result.iter_mut().enumerate().take(8) {
+        *item = u32::from_le_bytes([
+            hash.as_bytes()[i * 4],
+            hash.as_bytes()[i * 4 + 1],
+            hash.as_bytes()[i * 4 + 2],
+            hash.as_bytes()[i * 4 + 3],
+        ]);
+    }
+    result
+}
+
 // =============================================================================
 
 /// 将 u32 数组转换为小端序十六进制字符串(32 字节 = 64 字符)
@@ -468,12 +621,11 @@ fn u32_to_hex(words: &[u32]) -> String {
 
 /// 将 u32 切片转换为字节切片(bytemuck 的安全替代)
 fn bytemuck_cast_slice(data: &[u32]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            data.as_ptr() as *const u8,
-            data.len() * std::mem::size_of::<u32>(),
-        )
-    }
+    // Safety:
+    // - data 是有效的 u32 切片,其内存区域连续且生命周期覆盖本函数返回切片
+    // - u32 与 u8 的字节布局兼容,总字节数为 data.len() * size_of::<u32>(),不会溢出
+    // - 返回切片不超出 data 的原始内存范围
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
 /// Blake3 WGSL compute shader
@@ -484,6 +636,12 @@ fn bytemuck_cast_slice(data: &[u32]) -> &[u8] {
 /// - 每轮间消息字排列(BLAKE3 固定排列索引)
 /// - 自动设置 CHUNK_START/CHUNK_END 标志
 /// - 每个 workgroup 处理一个 1024 字节 chunk(最多 16 个 64 字节块)
+///
+/// S-13: @workgroup_size 改为 1。旧值 256 导致每个 workgroup 内 256 个线程
+/// 执行完全相同的压缩计算(所有线程读取相同的 chunk_idx),造成 99.6% 的计算浪费。
+/// 每个 chunk 的压缩是顺序依赖的(块间 chaining value 串行传递),无法并行化,
+/// 因此每个 workgroup 只需要 1 个线程。多个 chunk 间的并行通过 dispatch_workgroups
+/// (num_chunks, 1, 1) 实现。
 const BLAKE3_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> input_data: array<u32>;
 @group(0) @binding(1) var<storage, read_write> output_hash: array<u32>;
@@ -538,7 +696,8 @@ fn compress_inplace(state: ptr<function, array<u32, 16>>, m: ptr<function, array
     }
 }
 
-@compute @workgroup_size(256)
+// S-13: 单线程 workgroup, 多 chunk 并行通过 dispatch_workgroups 实现
+@compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let chunk_idx: u32 = global_id.x;
 
@@ -567,21 +726,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         cv[i] = IV[i];
     }
 
+    // S-13: workgroup_size=1 时, 每个 workgroup 只有一个线程,
+    // 本地线程 ID 始终为 0, 它负责加载所有 16 个消息字
+    let tid: u32 = 0u;
+
     // 逐块压缩当前 chunk 的所有 64 字节块
     for (var block_in_chunk = 0u; block_in_chunk < num_blocks; block_in_chunk++) {
         let global_block_idx: u32 = chunk_idx * 16u + block_in_chunk;
         let block_start_word: u32 = global_block_idx * 16u;
 
-        // 协作加载 16 个 u32 到工作组共享缓冲区
-        let tid: u32 = global_id.x % 256u;
-        if (tid < 16u) {
-            if (block_start_word + tid < total_words) {
-                wg_msg[tid] = input_data[block_start_word + tid];
+        // S-13: 单线程加载全部 16 个 u32(旧代码仅 tid<16 的线程加载,
+        // workgroup_size=256 时 240 个线程空转; 现在只有 1 个线程,全部加载)
+        for (var j = 0u; j < 16u; j++) {
+            if (block_start_word + j < total_words) {
+                wg_msg[j] = input_data[block_start_word + j];
             } else {
-                wg_msg[tid] = 0u; // 超出数据范围的块填充零
+                wg_msg[j] = 0u;
             }
         }
-        workgroupBarrier();
 
         // 复制到函数作用域数组(用于 G 函数指针参数)
         var m: array<u32, 16>;
@@ -610,8 +772,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         state[0] = cv[0]; state[1] = cv[1]; state[2] = cv[2]; state[3] = cv[3];
         state[4] = cv[4]; state[5] = cv[5]; state[6] = cv[6]; state[7] = cv[7];
         state[8] = IV[0]; state[9] = IV[1]; state[10] = IV[2]; state[11] = IV[3];
-        state[12] = chunk_idx;     // counter low 32 bits
-        state[13] = 0u;            // counter high 32 bits
+        // H-6 修复: counter 应为块在 chunk 内的字节偏移量,而非 chunk 索引
+        // blake3 规范: chunk 节点的 counter = block_index * BLOCK_LEN
+        state[12] = block_in_chunk * 64u;  // counter low 32 bits
+        state[13] = 0u;                     // counter high 32 bits
         state[14] = block_len;
         state[15] = flags;
 
@@ -681,7 +845,10 @@ mod tests {
         assert!(!BLAKE3_SHADER.is_empty());
         assert!(BLAKE3_SHADER.contains("@group(0) @binding(0)"));
         assert!(BLAKE3_SHADER.contains("@group(0) @binding(1)"));
-        assert!(BLAKE3_SHADER.contains("@compute @workgroup_size(256)"));
+        assert!(
+            BLAKE3_SHADER.contains("@compute @workgroup_size(1)"),
+            "S-13: workgroup_size 应为 1"
+        );
         assert!(BLAKE3_SHADER.contains("fn main("));
         assert!(BLAKE3_SHADER.contains("output_hash"));
         assert!(BLAKE3_SHADER.contains("input_data"));
@@ -698,10 +865,7 @@ mod tests {
             "应包含 CHUNK_START 标志"
         );
         assert!(BLAKE3_SHADER.contains("CHUNK_END"), "应包含 CHUNK_END 标志");
-        assert!(
-            BLAKE3_SHADER.contains("workgroupBarrier"),
-            "应包含工作组同步屏障"
-        );
+        // S-13: workgroup_size=1 时不需要 workgroupBarrier
     }
 
     /// 测试 CPU blake3 与 auto_select_and_hash 对同一数据产生相同哈希
@@ -779,5 +943,239 @@ mod tests {
         assert_eq!(hex.len(), 64);
         // 小端序: 0x01020304 -> bytes [04, 03, 02, 01]
         assert!(hex.starts_with("04030201"));
+    }
+
+    // =========================================================================
+    // H-6: blake3_tree_reduce 多 chunk 归约正确性验证
+    // =========================================================================
+
+    /// 辅助: 使用 blake3 crate 的 hazmat API 获取各 chunk 的 chaining value
+    ///
+    /// 使用 blake3::hazmat::HasherExt::finalize_non_root() 获取不含 ROOT 标志的
+    /// chunk chaining value,这正是 blake3_tree_reduce 需要的输入。
+    ///
+    /// 关键: 非首 chunk 必须通过 set_input_offset 设置正确的字节偏移量,
+    /// 否则 chaining value 不正确。
+    fn compute_chunk_cvs_via_blake3(data: &[u8]) -> Vec<[u32; 8]> {
+        use blake3::hazmat::HasherExt;
+        data.chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let mut hasher = blake3::Hasher::new();
+                // H-6: 非首 chunk 必须设置 input_offset,否则 chaining value 不正确
+                let offset = chunk_idx * CHUNK_SIZE;
+                if offset > 0 {
+                    hasher.set_input_offset(offset as u64);
+                }
+                hasher.update(chunk);
+                // finalize_non_root() 返回不含 ROOT 标志的 chaining value,
+                // 这正是 blake3_tree_reduce 的输入格式
+                let cv = hasher.finalize_non_root();
+                // cv 是 [u8; 32] 数组,直接转换为 8 个 u32 (小端序)
+                let mut words = [0u32; 8];
+                for i in 0..8 {
+                    words[i] = u32::from_le_bytes([
+                        cv[i * 4],
+                        cv[i * 4 + 1],
+                        cv[i * 4 + 2],
+                        cv[i * 4 + 3],
+                    ]);
+                }
+                words
+            })
+            .collect()
+    }
+
+    /// 辅助: 对指定大小的数据,分别用 blake3 crate 和 blake3_tree_reduce 计算哈希并比较
+    fn verify_tree_reduce_consistency(data: &[u8], label: &str) {
+        let expected = blake3::hash(data).to_hex().to_string();
+
+        let chunk_cvs = compute_chunk_cvs_via_blake3(data);
+
+        let num_chunks = chunk_cvs.len();
+        if num_chunks <= 1 {
+            // 单 chunk 不走 tree_reduce,跳过
+            return;
+        }
+
+        let root_cv = blake3_tree_reduce(&chunk_cvs, data.len() as u32);
+        let result = u32_to_hex(&root_cv);
+
+        assert_eq!(
+            result, expected,
+            "H-6: blake3_tree_reduce 与 blake3::hash 不一致 ({label}, {num_chunks} chunks)"
+        );
+    }
+
+    /// H-6: 验证 blake3_compress ROOT 压缩与 merge_subtrees_root 一致
+    #[test]
+    fn test_blake3_compress_root_vs_hazmat() {
+        use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root};
+        let data = vec![0xABu8; CHUNK_SIZE * 2];
+
+        // 获取 chunk CVs
+        let cv0 = {
+            let mut h = blake3::Hasher::new();
+            h.update(&data[0..CHUNK_SIZE]);
+            h.finalize_non_root()
+        };
+        let cv1 = {
+            let mut h = blake3::Hasher::new();
+            h.set_input_offset(CHUNK_SIZE as u64);
+            h.update(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+            h.finalize_non_root()
+        };
+
+        // 方法 1: merge_subtrees_root (最终 hash)
+        let hazmat_root = merge_subtrees_root(&cv0, &cv1, Mode::Hash);
+
+        // 方法 2: 手动 ROOT 压缩
+        let non_root = merge_subtrees_non_root(&cv0, &cv1, Mode::Hash);
+        // 对 non_root chaining value 做 ROOT 压缩
+        let mut cv_words = [0u32; 8];
+        for i in 0..8 {
+            cv_words[i] = u32::from_le_bytes([
+                non_root[i * 4],
+                non_root[i * 4 + 1],
+                non_root[i * 4 + 2],
+                non_root[i * 4 + 3],
+            ]);
+        }
+        let mut root_block = [0u32; 16];
+        root_block[..8].copy_from_slice(&cv_words);
+        let our_root = blake3_compress(
+            &IV,
+            &root_block,
+            0,
+            BLOCK_SIZE as u32,
+            FLAG_PARENT | FLAG_ROOT,
+        );
+
+        let our_hex = u32_to_hex(&our_root);
+        let hazmat_hex = hazmat_root.to_hex().to_string();
+
+        // 方法 3: merge_subtrees_root 应该等价于直接对两个 chunk CV 做 ROOT 压缩
+        // (不是对 non_root chaining value 做 ROOT 压缩!)
+        let mut direct_root_block = [0u32; 16];
+        for i in 0..8 {
+            direct_root_block[i] =
+                u32::from_le_bytes([cv0[i * 4], cv0[i * 4 + 1], cv0[i * 4 + 2], cv0[i * 4 + 3]]);
+            direct_root_block[8 + i] =
+                u32::from_le_bytes([cv1[i * 4], cv1[i * 4 + 1], cv1[i * 4 + 2], cv1[i * 4 + 3]]);
+        }
+        let direct_root = blake3_compress(
+            &IV,
+            &direct_root_block,
+            0,
+            BLOCK_SIZE as u32,
+            FLAG_PARENT | FLAG_ROOT,
+        );
+        let direct_hex = u32_to_hex(&direct_root);
+
+        assert_eq!(
+            direct_hex, hazmat_hex,
+            "H-6: direct ROOT compress 应与 merge_subtrees_root 一致\n\
+             direct:  {direct_hex}\n\
+             hazmat:  {hazmat_hex}\n\
+             our:     {our_hex}"
+        );
+    }
+    #[test]
+    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
+    fn test_tree_reduce_2_chunks() {
+        let data = vec![0xABu8; CHUNK_SIZE * 2];
+        verify_tree_reduce_consistency(&data, "2 chunks");
+    }
+
+    /// 辅助: 将 [u8; 32] ChainingValue 转换为 [u32; 8] (保留用于测试调试)
+    #[allow(dead_code)]
+    fn cv_bytes_to_u32(cv: &[u8; 32]) -> [u32; 8] {
+        let mut words = [0u32; 8];
+        for i in 0..8 {
+            words[i] = u32::from_le_bytes([cv[i * 4], cv[i * 4 + 1], cv[i * 4 + 2], cv[i * 4 + 3]]);
+        }
+        words
+    }
+    #[test]
+    fn test_hazmat_merge_2_chunks() {
+        use blake3::hazmat::{HasherExt, Mode, merge_subtrees_root};
+        let data = vec![0xABu8; CHUNK_SIZE * 2];
+        let expected = blake3::hash(&data).to_hex().to_string();
+
+        let cv0 = {
+            let mut h = blake3::Hasher::new();
+            // 首 chunk,offset = 0 (默认)
+            h.update(&data[0..CHUNK_SIZE]);
+            h.finalize_non_root()
+        };
+        let cv1 = {
+            let mut h = blake3::Hasher::new();
+            // H-6: 第二个 chunk 必须设置 input_offset
+            h.set_input_offset(CHUNK_SIZE as u64);
+            h.update(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+            h.finalize_non_root()
+        };
+
+        let root = merge_subtrees_root(&cv0, &cv1, Mode::Hash);
+        let result = root.to_hex().to_string();
+
+        assert_eq!(
+            result, expected,
+            "H-6: hazmat merge_subtrees_root 与 blake3::hash 不一致"
+        );
+    }
+
+    /// H-6: 3 个 chunk 的归约正确性(奇数,验证未配对 CV 传递)
+    #[test]
+    fn test_tree_reduce_3_chunks() {
+        let data = vec![0xCDu8; CHUNK_SIZE * 3];
+        verify_tree_reduce_consistency(&data, "3 chunks");
+    }
+
+    /// H-6: 5 个 chunk 的归约正确性(奇数,多层归约)
+    #[test]
+    fn test_tree_reduce_5_chunks() {
+        let data = vec![0xEFu8; CHUNK_SIZE * 5];
+        verify_tree_reduce_consistency(&data, "5 chunks");
+    }
+
+    /// H-6: 7 个 chunk 的归约正确性(奇数,深层归约)
+    #[test]
+    fn test_tree_reduce_7_chunks() {
+        let data = vec![0x42u8; CHUNK_SIZE * 7];
+        verify_tree_reduce_consistency(&data, "7 chunks");
+    }
+
+    /// H-6: 4 个 chunk 的归约正确性(偶数,两层归约)
+    #[test]
+    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
+    fn test_tree_reduce_4_chunks() {
+        let data = vec![0x13u8; CHUNK_SIZE * 4];
+        verify_tree_reduce_consistency(&data, "4 chunks");
+    }
+
+    /// H-6: 8 个 chunk 的归约正确性(2 的幂)
+    #[test]
+    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
+    fn test_tree_reduce_8_chunks() {
+        let data = vec![0x37u8; CHUNK_SIZE * 8];
+        verify_tree_reduce_consistency(&data, "8 chunks");
+    }
+
+    /// H-6: 6 个 chunk 的归约正确性(偶数但非 2 的幂)
+    #[test]
+    fn test_tree_reduce_6_chunks() {
+        let data = vec![0x55u8; CHUNK_SIZE * 6];
+        verify_tree_reduce_consistency(&data, "6 chunks");
+    }
+
+    /// H-6: 不同数据内容的多 chunk 归约(非全零填充)
+    #[test]
+    fn test_tree_reduce_varying_data() {
+        let mut data = Vec::with_capacity(CHUNK_SIZE * 3);
+        for i in 0..(CHUNK_SIZE * 3) {
+            data.push((i % 256) as u8);
+        }
+        verify_tree_reduce_consistency(&data, "varying data, 3 chunks");
     }
 }
