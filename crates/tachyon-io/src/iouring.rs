@@ -163,10 +163,9 @@ unsafe impl Sync for AlignedBuffer {}
 impl AlignedBuffer {
     /// 获取对齐后的数据起始裸指针(只读用途，如 iovec 注册)
     fn as_ptr(&self) -> *const u8 {
-        // Safety: 使用 ptr::addr() 仅获取地址值，不创建 &Vec<u8> 引用，
-        // 避免与后续通过 ptr() 创建的可变引用产生 aliasing 冲突。
-        let base_addr = self.storage.get().addr();
-        (base_addr + self.offset) as *const u8
+        // 复用 ptr() 保证与可变指针指向同一地址；as_mut_ptr() 通过 UnsafeCell
+        // 内部的原始 Vec 获取堆数据指针，加上创建时记录的 offset 即为对齐地址。
+        self.ptr() as *const u8
     }
 
     /// 获取对齐后的数据起始裸指针(可变用途，如 io_uring write/read)
