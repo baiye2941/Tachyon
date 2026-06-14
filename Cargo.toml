@@ -87,7 +87,7 @@ parking_lot = "0.12"
 url = "2"
 
 # 枚举辅助
-strum = { version = "0.26", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 # 开发依赖
 proptest = "1"
