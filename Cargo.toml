@@ -54,7 +54,7 @@ blake3 = "1"
 sha2 = "0.10"
 
 # 随机数
-getrandom = "0.3"
+getrandom = "0.4"
 
 # 密码学
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
