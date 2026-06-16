@@ -380,6 +380,7 @@ pub mod harness {
             request_timeout_secs: 10,
             connect_timeout_secs: 10,
             verify_checksum: false,
+            verify_strategy: crate::config::VerifyStrategy::BestEffort,
             user_agent: "Tachyon-Test/0.1.0".into(),
             headers: HashMap::new(),
             pause_timeout_secs: 300,

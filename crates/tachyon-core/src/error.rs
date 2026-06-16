@@ -59,7 +59,7 @@ pub enum DownloadError {
     Serialization(#[from] serde_json::Error),
 
     #[error("其他错误: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync>),
+    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<String> for DownloadError {
@@ -97,7 +97,9 @@ impl DownloadError {
             | DownloadError::ChecksumMismatch { .. }
             | DownloadError::NoExpectedChecksum
             | DownloadError::TaskNotFound(_)
-            | DownloadError::Config(_) => false,
+            | DownloadError::Config(_)
+            | DownloadError::UrlParse(_)
+            | DownloadError::Serialization(_) => false,
 
             // HTTP 4xx 客户端错误不可重试 (429/408 除外)
             DownloadError::Http { status, .. } => {
@@ -121,6 +123,8 @@ pub type DownloadResult<T> = Result<T, DownloadError>;
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
     #[test]
@@ -234,6 +238,12 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "管道断裂");
         let err = DownloadError::Other(Box::new(io_err));
         assert!(err.to_string().contains("管道断裂"));
+        assert!(err.source().is_some(), "Other 变体应保留 source 链");
+        assert_eq!(
+            err.source().unwrap().to_string(),
+            "管道断裂",
+            "source 应指向原始错误"
+        );
     }
 
     #[test]
@@ -290,6 +300,13 @@ mod tests {
         assert!(!DownloadError::NoExpectedChecksum.is_retryable());
         assert!(!DownloadError::TaskNotFound("x".into()).is_retryable());
         assert!(!DownloadError::Config("bad".into()).is_retryable());
+        assert!(!DownloadError::UrlParse(url::ParseError::EmptyHost).is_retryable());
+        assert!(
+            !DownloadError::Serialization(
+                serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
+            )
+            .is_retryable()
+        );
     }
 
     #[test]

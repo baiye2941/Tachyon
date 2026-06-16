@@ -1,192 +1,522 @@
-import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
-import { THREAD_COLORS } from '../utils/format'
+import {
+  For,
+  Show,
+  createMemo,
+  createSignal,
+  onCleanup,
+  createEffect,
+  onMount,
+} from "solid-js";
+import { THREAD_COLORS } from "../utils/format";
+import { resolveToken } from "../utils/resolveToken";
+import { useReducedMotion } from "../hooks/useReducedMotion";
 
 interface ChunkMatrixProps {
-    fragmentsTotal: number
-    fragmentsDone: number
-    progress: number
+  fragmentsTotal: number;
+  fragmentsDone: number;
+  progress: number;
+}
+
+const AGGREGATE_THRESHOLD = 200;
+const AGGREGATE_BLOCKS = 100;
+const BLOCKS_PER_ROW = 25;
+const BLOCK_SIZE = 14;
+const BLOCK_GAP = 3;
+
+interface ChunkData {
+  index: number;
+  isDone: boolean;
+  isDownloading: boolean;
+  threadId: number;
+  color: string;
+}
+
+export interface ChunkBlock {
+  index: number;
+  start: number;
+  end: number;
+  done: number;
+  total: number;
+  status: "done" | "downloading" | "pending";
+  color: string;
+  threadId: number;
+}
+
+export function buildBlocks(
+  total: number,
+  done: number,
+  progress: number,
+): ChunkBlock[] {
+  if (total <= 0) return [];
+  const blockCount = Math.min(total, AGGREGATE_BLOCKS);
+  const blocks: ChunkBlock[] = [];
+  for (let i = 0; i < blockCount; i++) {
+    const start = Math.floor((i * total) / blockCount);
+    const end = Math.max(start + 1, Math.floor(((i + 1) * total) / blockCount));
+    const blockTotal = end - start;
+    let blockDone = 0;
+    let blockDownloading = 0;
+    for (let f = start; f < end; f++) {
+      if (f < done) {
+        blockDone++;
+      } else if (f === done && progress < 1) {
+        blockDownloading++;
+      }
+    }
+    const blockPending = blockTotal - blockDone - blockDownloading;
+    let status: ChunkBlock["status"];
+    if (blockDone >= blockDownloading && blockDone >= blockPending) {
+      status = "done";
+    } else if (blockDownloading >= blockPending) {
+      status = "downloading";
+    } else {
+      status = "pending";
+    }
+    const threadId = i % THREAD_COLORS.length;
+    const color = THREAD_COLORS[threadId];
+    blocks.push({
+      index: i,
+      start,
+      end,
+      done: blockDone,
+      total: blockTotal,
+      status,
+      color: color ?? resolveToken("--color-accent-primary"),
+      threadId,
+    });
+  }
+  return blocks;
+}
+
+function statusLabelForChunk(chunk: ChunkData) {
+  if (chunk.isDone) return "已完成";
+  if (chunk.isDownloading) return "下载中";
+  return "等待中";
+}
+
+function statusLabelForBlock(status: ChunkBlock["status"]) {
+  switch (status) {
+    case "done":
+      return "已完成";
+    case "downloading":
+      return "下载中";
+    case "pending":
+      return "等待中";
+  }
 }
 
 export default function ChunkMatrix(props: ChunkMatrixProps) {
-    const chunksPerRow = 25
-    const [tooltipIndex, setTooltipIndex] = createSignal<number | null>(null)
-    const [cursorPos, setCursorPos] = createSignal({ x: 0, y: 0 })
-    let tooltipTimer: number | null = null
-    let gridRef: HTMLDivElement | undefined
+  const chunksPerRow = 25;
+  const [tooltipIndex, setTooltipIndex] = createSignal<number | null>(null);
+  const [cursorPos, setCursorPos] = createSignal({ x: 0, y: 0 });
+  let currentPulsePhase = 0;
+  let tooltipTimer: number | null = null;
+  let rafId: number | null = null;
+  let gridRef: HTMLDivElement | undefined;
+  let canvasRef: HTMLCanvasElement | undefined;
+  let wrapperRef: HTMLDivElement | undefined;
 
-    const showTooltip = (index: number) => {
-        if (tooltipTimer !== null) clearTimeout(tooltipTimer)
-        tooltipTimer = window.setTimeout(() => {
-            setTooltipIndex(index)
-            tooltipTimer = null
-        }, 150)
+  // 检测用户是否偏好减少动画
+  const prefersReducedMotion = useReducedMotion();
+
+  const showTooltip = (index: number) => {
+    if (tooltipTimer !== null) clearTimeout(tooltipTimer);
+    tooltipTimer = window.setTimeout(() => {
+      setTooltipIndex(index);
+      tooltipTimer = null;
+    }, 150);
+  };
+
+  const hideTooltip = () => {
+    if (tooltipTimer !== null) {
+      clearTimeout(tooltipTimer);
+      tooltipTimer = null;
     }
+    setTooltipIndex(null);
+  };
 
-    const hideTooltip = () => {
-        if (tooltipTimer !== null) {
-            clearTimeout(tooltipTimer)
-            tooltipTimer = null
+  const handleMouseMove = (e: MouseEvent) => {
+    if (!gridRef) return;
+    const rect = gridRef.getBoundingClientRect();
+    setCursorPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+  };
+
+  const handleCanvasMouseMove = (e: MouseEvent) => {
+    if (!canvasRef) return;
+    const rect = canvasRef.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setCursorPos({ x, y });
+    const col = Math.floor(x / (BLOCK_SIZE + BLOCK_GAP));
+    const row = Math.floor(y / (BLOCK_SIZE + BLOCK_GAP));
+    const idx = row * BLOCKS_PER_ROW + col;
+    const blockList = blocks();
+    if (
+      col >= 0 &&
+      col < BLOCKS_PER_ROW &&
+      idx >= 0 &&
+      idx < blockList.length
+    ) {
+      setTooltipIndex(idx);
+    } else {
+      setTooltipIndex(null);
+    }
+  };
+
+  const handleCanvasMouseLeave = () => {
+    hideTooltip();
+  };
+
+  onCleanup(() => {
+    if (tooltipTimer !== null) clearTimeout(tooltipTimer);
+    if (rafId !== null) cancelAnimationFrame(rafId);
+  });
+
+  const shouldAggregate = createMemo(
+    () => props.fragmentsTotal > AGGREGATE_THRESHOLD,
+  );
+
+  const chunks = createMemo(() => {
+    if (props.fragmentsTotal > AGGREGATE_THRESHOLD) return [];
+    const total = props.fragmentsTotal;
+    const done = props.fragmentsDone;
+    const progress = props.progress;
+    return Array.from({ length: total }, (_, i) => {
+      const isDone = i < done;
+      const isDownloading = i === done && progress < 1;
+      const threadId = i % THREAD_COLORS.length;
+      const color = THREAD_COLORS[threadId];
+      return {
+        index: i,
+        isDone,
+        isDownloading,
+        threadId,
+        color: color ?? resolveToken("--color-accent-primary"),
+      };
+    });
+  });
+
+  const blocks = createMemo(() =>
+    buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress),
+  );
+
+  const canvasLayout = createMemo(() => {
+    const blockList = blocks();
+    const rows = Math.ceil(blockList.length / BLOCKS_PER_ROW);
+    const width = BLOCKS_PER_ROW * (BLOCK_SIZE + BLOCK_GAP) - BLOCK_GAP;
+    const height = rows * (BLOCK_SIZE + BLOCK_GAP) - BLOCK_GAP;
+    return { rows, width, height };
+  });
+
+  const pendingColor = () => resolveToken("--color-bg-tertiary");
+
+  const drawCanvas = (blockList: ChunkBlock[], phase: number) => {
+    if (!canvasRef) return;
+    const ctx = canvasRef.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const { width, height } = canvasLayout();
+    canvasRef.width = Math.floor(width * dpr);
+    canvasRef.height = Math.floor(height * dpr);
+    canvasRef.style.width = `${width}px`;
+    canvasRef.style.height = `${height}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    const pulse = Math.sin(phase * Math.PI * 2);
+    const pending = pendingColor();
+    const radius = 3;
+
+    blockList.forEach((block, i) => {
+      const row = Math.floor(i / BLOCKS_PER_ROW);
+      const col = i % BLOCKS_PER_ROW;
+      const x = col * (BLOCK_SIZE + BLOCK_GAP);
+      const y = row * (BLOCK_SIZE + BLOCK_GAP);
+
+      ctx.beginPath();
+      ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
+
+      if (block.status === "pending") {
+        ctx.fillStyle = pending;
+      } else {
+        if (block.status === "downloading" && !prefersReducedMotion()) {
+          ctx.globalAlpha = 0.55 + 0.45 * pulse;
         }
-        setTooltipIndex(null)
+        ctx.fillStyle = block.color;
+      }
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      if (block.status === "done") {
+        ctx.shadowColor = `${block.color}66`;
+        ctx.shadowBlur = 4;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+    });
+  };
+
+  const startPulse = () => {
+    if (rafId !== null) return;
+    // 用户偏好减少动画时，仅绘制一次静态帧，不启动动画循环
+    if (prefersReducedMotion()) {
+      drawCanvas(blocks(), 0);
+      return;
     }
+    const loop = (now: number) => {
+      currentPulsePhase = (now % 1500) / 1500;
+      const blockList = blocks();
+      const stillDownloading = blockList.some(
+        (b) => b.status === "downloading",
+      );
+      if (shouldAggregate()) {
+        drawCanvas(blockList, currentPulsePhase);
+      }
+      if (stillDownloading) {
+        rafId = requestAnimationFrame(loop);
+      } else {
+        rafId = null;
+      }
+    };
+    rafId = requestAnimationFrame(loop);
+  };
 
-    const handleMouseMove = (e: MouseEvent) => {
-        if (!gridRef) return
-        const rect = gridRef.getBoundingClientRect()
-        setCursorPos({ x: e.clientX - rect.left, y: e.clientY - rect.top })
+  onMount(() => {
+    if (shouldAggregate()) {
+      drawCanvas(blocks(), currentPulsePhase);
     }
+  });
 
-    onCleanup(() => {
-        if (tooltipTimer !== null) clearTimeout(tooltipTimer)
-    })
-
-    const chunks = createMemo(() => {
-        const total = props.fragmentsTotal
-        const done = props.fragmentsDone
-        const progress = props.progress
-        return Array.from({ length: total }, (_, i) => {
-            const isDone = i < done
-            const isDownloading = i === done && progress < 1
-            const threadId = i % THREAD_COLORS.length
-            return {
-                index: i,
-                isDone,
-                isDownloading,
-                threadId,
-                color: THREAD_COLORS[threadId],
-            }
-        })
-    })
-
-    const statusLabel = (chunk: { isDone: boolean; isDownloading: boolean }) => {
-        if (chunk.isDone) return '\u5DF2\u5B8C\u6210'
-        if (chunk.isDownloading) return '\u4E0B\u8F7D\u4E2D'
-        return '\u7B49\u5F85\u4E2D'
+  createEffect(() => {
+    const blockList = blocks();
+    if (shouldAggregate()) {
+      drawCanvas(blockList, currentPulsePhase);
     }
+  });
 
-    const tooltipInfo = createMemo(() => {
-        const idx = tooltipIndex()
-        if (idx === null) return null
-        const chunkList = chunks()
-        const chunk = chunkList[idx]
-        if (!chunk) return null
-        const pos = cursorPos()
-        return {
-            idx,
-            chunk,
-            total: chunkList.length,
-            left: Math.min(pos.x + 12, (gridRef?.clientWidth || 360) - 160),
-            top: pos.y - 60,
-        }
-    })
+  createEffect(() => {
+    if (shouldAggregate() && blocks().some((b) => b.status === "downloading")) {
+      startPulse();
+    }
+  });
 
-    return (
-        <div>
-            <div class="section-label" style={{ 'margin-bottom': '12px' }}>
-                {'\u4E0B\u8F7D\u5206\u5E03'}
+  const tooltipChunk = createMemo(() => {
+    const idx = tooltipIndex();
+    if (idx === null || shouldAggregate()) return null;
+    const chunkList = chunks();
+    const chunk = chunkList[idx];
+    if (!chunk) return null;
+    return { idx, chunk, total: chunkList.length };
+  });
+
+  const tooltipBlock = createMemo(() => {
+    const idx = tooltipIndex();
+    if (idx === null || !shouldAggregate()) return null;
+    const blockList = blocks();
+    const block = blockList[idx];
+    if (!block) return null;
+    return { block };
+  });
+
+  const tooltipPos = createMemo(() => {
+    const pos = cursorPos();
+    return {
+      left: Math.min(pos.x + 12, (wrapperRef?.clientWidth || 360) - 160),
+      top: pos.y - 60,
+    };
+  });
+
+  return (
+    <div>
+      <div class="section-label" style={{ "margin-bottom": "12px" }}>
+        分片分布
+        <span
+          class="chunk-info-hint"
+          title="分片按批次聚合显示,颜色代表下载状态(已完成/下载中/等待),非线程分配"
+        >
+          ?
+        </span>
+      </div>
+
+      <div
+        class="glass"
+        style={{
+          padding: "16px",
+          "border-radius": "12px",
+          position: "relative",
+        }}
+        ref={wrapperRef}
+        onMouseMove={handleMouseMove}
+      >
+        <Show
+          when={shouldAggregate()}
+          fallback={
+            <div class="flex flex-wrap" style={{ gap: "3px" }} ref={gridRef}>
+              <For each={chunks()}>
+                {(chunk) => (
+                  <div
+                    class="chunk-cell"
+                    style={{
+                      width: "14px",
+                      height: "14px",
+                      "border-radius": "3px",
+                      background: chunk.isDone
+                        ? chunk.color
+                        : chunk.isDownloading
+                          ? chunk.color
+                          : "var(--color-bg-tertiary)",
+                      "box-shadow": chunk.isDone
+                        ? `0 0 4px ${chunk.color}66`
+                        : "none",
+                      animation: chunk.isDownloading
+                        ? `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards, chunk-pulse 1.5s ease-in-out infinite`
+                        : `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards`,
+                      "animation-delay": chunk.isDownloading
+                        ? `${chunk.index * 5}ms, ${(chunk.index % chunksPerRow) * 0.05 + Math.floor(chunk.index / chunksPerRow) * 0.1}s`
+                        : `${chunk.index * 5}ms`,
+                      opacity: 0,
+                    }}
+                    onMouseEnter={() => showTooltip(chunk.index)}
+                    onMouseLeave={() => hideTooltip()}
+                  />
+                )}
+              </For>
             </div>
+          }
+        >
+          <canvas
+            ref={canvasRef}
+            style={{ display: "block" }}
+            onMouseMove={handleCanvasMouseMove}
+            onMouseLeave={handleCanvasMouseLeave}
+          />
+        </Show>
 
+        {/* Chunk tooltip */}
+        <Show when={tooltipChunk()} keyed>
+          {(tooltip) => (
             <div
-                class="glass"
-                style={{
-                    padding: '16px',
-                    'border-radius': '12px',
-                    position: 'relative',
-                }}
-                ref={gridRef}
-                onMouseMove={handleMouseMove}
+              class="chunk-tooltip"
+              style={{
+                left: `${tooltipPos().left}px`,
+                top: `${tooltipPos().top}px`,
+              }}
             >
-                <div
-                    class="flex flex-wrap"
-                    style={{ gap: '3px' }}
-                >
-                    <For each={chunks()}>
-                        {(chunk) => (
-                            <div
-                                class="chunk-cell"
-                                style={{
-                                    width: '14px',
-                                    height: '14px',
-                                    'border-radius': '3px',
-                                    background: chunk.isDone
-                                        ? chunk.color
-                                        : chunk.isDownloading
-                                            ? chunk.color
-                                            : '#1A1A25',
-                                    'box-shadow': chunk.isDone
-                                        ? `0 0 4px ${chunk.color}66`
-                                        : 'none',
-                                    animation: chunk.isDownloading
-                                        ? `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards, chunk-pulse 1.5s ease-in-out infinite`
-                                        : `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards`,
-                                    'animation-delay': chunk.isDownloading
-                                        ? `${chunk.index * 5}ms, ${(chunk.index % chunksPerRow) * 0.05 + Math.floor(chunk.index / chunksPerRow) * 0.1}s`
-                                        : `${chunk.index * 5}ms`,
-                                    opacity: 0,
-                                }}
-                                onMouseEnter={() => showTooltip(chunk.index)}
-                                onMouseLeave={() => hideTooltip()}
-                            />
-                        )}
-                    </For>
+              <div
+                class="chunk-tooltip-dot"
+                style={{
+                  background:
+                    tooltip.chunk.isDone || tooltip.chunk.isDownloading
+                      ? tooltip.chunk.color
+                      : "var(--color-bg-tertiary)",
+                }}
+              />
+              <div class="chunk-tooltip-body">
+                <div class="chunk-tooltip-title">
+                  {"分片"} #{tooltip.idx + 1}
+                  <span class="chunk-tooltip-subtitle">/ {tooltip.total}</span>
                 </div>
-
-                {/* Tooltip */}
-                <Show when={tooltipInfo()} keyed>
-                    {(tooltip) => (
-                        <div
-                            class="chunk-tooltip"
-                            style={{
-                                left: `${tooltip.left}px`,
-                                top: `${tooltip.top}px`,
-                            }}
-                        >
-                            <div
-                                class="chunk-tooltip-dot"
-                                style={{ background: tooltip.chunk.isDone || tooltip.chunk.isDownloading ? tooltip.chunk.color : '#1A1A25' }}
-                            />
-                            <div class="chunk-tooltip-body">
-                                <div class="chunk-tooltip-title">
-                                    {'\u5206\u7247'} #{tooltip.idx + 1}
-                                    <span class="chunk-tooltip-subtitle">/ {tooltip.total}</span>
-                                </div>
-                                <div class="chunk-tooltip-meta">
-                                    <span style={{ color: tooltip.chunk.isDone ? '#00D4AA' : tooltip.chunk.isDownloading ? '#00B4D8' : '#6B7280' }}>
-                                        {statusLabel(tooltip.chunk)}
-                                    </span>
-                                    <span class="chunk-tooltip-sep">{'\u00B7'}</span>
-                                    <span style={{ color: tooltip.chunk.color }}>{'T'}{tooltip.chunk.threadId + 1}</span>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                </Show>
-
-                {/* Legend */}
-                <div class="flex items-center gap-4" style={{ 'margin-top': '12px' }}>
-                    <LegendItem color="#00D4AA" label={'\u5DF2\u5B8C\u6210'} />
-                    <LegendItem color="#1A1A25" label={'\u672A\u5F00\u59CB'} />
-                    <LegendItem color="#00D4AA" label={'\u4E0B\u8F7D\u4E2D'} pulse />
-                    <LegendItem color="#EF4444" label={'\u9519\u8BEF'} />
+                <div class="chunk-tooltip-meta">
+                  <span
+                    style={{
+                      color: tooltip.chunk.isDone
+                        ? "var(--color-status-completed)"
+                        : tooltip.chunk.isDownloading
+                          ? "var(--color-status-downloading)"
+                          : "var(--color-text-tertiary)",
+                    }}
+                  >
+                    {statusLabelForChunk(tooltip.chunk)}
+                  </span>
                 </div>
+              </div>
             </div>
+          )}
+        </Show>
+
+        {/* Block tooltip */}
+        <Show when={tooltipBlock()} keyed>
+          {(tooltip) => (
+            <div
+              class="chunk-tooltip"
+              style={{
+                left: `${tooltipPos().left}px`,
+                top: `${tooltipPos().top}px`,
+              }}
+            >
+              <div
+                class="chunk-tooltip-dot"
+                style={{
+                  background:
+                    tooltip.block.status === "pending"
+                      ? "var(--color-bg-tertiary)"
+                      : tooltip.block.color,
+                }}
+              />
+              <div class="chunk-tooltip-body">
+                <div class="chunk-tooltip-title">
+                  {"分片"} #{tooltip.block.start + 1}-#{tooltip.block.end}
+                </div>
+                <div class="chunk-tooltip-meta">
+                  <span
+                    style={{
+                      color:
+                        tooltip.block.status === "done"
+                          ? "var(--color-status-completed)"
+                          : tooltip.block.status === "downloading"
+                            ? "var(--color-status-downloading)"
+                            : "var(--color-text-tertiary)",
+                    }}
+                  >
+                    {statusLabelForBlock(tooltip.block.status)}
+                  </span>
+                </div>
+                <div class="chunk-tooltip-row" style={{ "margin-top": "4px" }}>
+                  <div class="chunk-tooltip-label">{"已完成"}</div>
+                  <div class="chunk-tooltip-value">
+                    {tooltip.block.done} / {tooltip.block.total}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </Show>
+
+        {/* Legend */}
+        <div class="flex items-center gap-4" style={{ "margin-top": "12px" }}>
+          <LegendItem color="var(--color-status-completed)" label={"已完成"} />
+          <LegendItem color="var(--color-bg-tertiary)" label={"未开始"} />
+          <LegendItem
+            color="var(--color-status-downloading)"
+            label={"下载中"}
+            pulse
+          />
+          <LegendItem color="var(--color-status-error)" label={"错误"} />
         </div>
-    )
+      </div>
+    </div>
+  );
 }
 
 function LegendItem(props: { color: string; label: string; pulse?: boolean }) {
-    return (
-        <div class="flex items-center gap-1.5">
-            <div
-                style={{
-                    width: '8px',
-                    height: '8px',
-                    'border-radius': '2px',
-                    background: props.color,
-                    animation: props.pulse ? 'chunk-pulse 1.5s ease-in-out infinite' : 'none',
-                }}
-            />
-            <span style={{ 'font-size': '11px', color: '#6B7280' }}>{props.label}</span>
-        </div>
-    )
+  return (
+    <div class="flex items-center gap-1.5">
+      <div
+        style={{
+          width: "8px",
+          height: "8px",
+          "border-radius": "2px",
+          background: props.color,
+          animation: props.pulse
+            ? "chunk-pulse 1.5s ease-in-out infinite"
+            : "none",
+        }}
+      />
+      <span
+        style={{ "font-size": "11px", color: "var(--color-text-tertiary)" }}
+      >
+        {props.label}
+      </span>
+    </div>
+  );
 }

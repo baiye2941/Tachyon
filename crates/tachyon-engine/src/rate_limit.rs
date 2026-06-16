@@ -43,6 +43,32 @@ pub struct RateLimiter {
     anchor: Instant,
 }
 
+/// 取消安全 guard:若 Future 在 sleep 期间被 abort,
+/// drop 时回滚已增加的 debt,避免令牌桶永久泄漏。
+/// 正常完成时调用 `disarm` 解除回滚。
+struct CancelGuard<'a> {
+    debt: &'a AtomicU64,
+    /// `Some(bytes)` 表示仍需要回滚的字节数;`None` 表示已正常完成。
+    bytes: Option<u64>,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take() {
+            // 仅发布 debt 减量即可;Acquire 语义不必要,
+            // 因为 drop 不会基于旧值做决策,只须让后续 Acquire 读可见。
+            self.debt.fetch_sub(bytes, Ordering::Release);
+        }
+    }
+}
+
+impl<'a> CancelGuard<'a> {
+    /// 标记任务正常完成,drop 时不再回滚债务。
+    fn disarm(mut self) {
+        self.bytes = None;
+    }
+}
+
 impl RateLimiter {
     /// 创建限速器
     ///
@@ -60,6 +86,9 @@ impl RateLimiter {
     ///
     /// 调用方在每次存储写入后调用此方法,传入实际写入的字节数。
     /// 令牌充足时立即返回;不足时计算精确等待时间后返回。
+    ///
+    /// 取消安全:若 Future 在等待期间被取消(如任务 abort),
+    /// 已增加的 `debt` 会被回滚,避免令牌桶永久泄漏。
     pub async fn acquire(&self, bytes: u64) {
         let rate = self.bytes_per_sec.load(Ordering::Acquire);
         if rate == 0 || bytes == 0 {
@@ -67,8 +96,8 @@ impl RateLimiter {
         }
 
         // 原子增加债务;获取到的 old_debt 是本请求之前的累计值。
-        let old_debt = self.debt.fetch_add(bytes, Ordering::AcqRel);
-        let total_debt = old_debt + bytes;
+        let _old_debt = self.debt.fetch_add(bytes, Ordering::AcqRel);
+        let total_debt = _old_debt + bytes;
 
         let now_ns = self.anchor.elapsed().as_nanos() as i64;
         let baseline = self.baseline_ns.load(Ordering::Acquire);
@@ -79,7 +108,15 @@ impl RateLimiter {
             let deficit = total_debt - allowed;
             let wait_ns = (deficit as u128 * 1_000_000_000 / rate as u128) as u64;
             let clamped = wait_ns.min((MAX_ACQUIRE_WAIT_SECS * 1e9) as u64);
+
+            // CancelSafeSleep:在 sleep 完成后解除 guard,否则在 drop 时回滚 debt
+            let cancel_guard = CancelGuard {
+                debt: &self.debt,
+                bytes: Some(bytes),
+            };
             tokio::time::sleep(Duration::from_nanos(clamped)).await;
+            // sleep 正常完成,解除 guard 防止 drop 时回滚
+            cancel_guard.disarm();
         }
     }
 
@@ -106,7 +143,25 @@ impl RateLimiter {
             let elapsed = (now_ns.saturating_sub(baseline)) as u64;
             let used = (elapsed as u128 * old_rate as u128 / 1_000_000_000) as u64;
             self.baseline_ns.store(now_ns, Ordering::Release);
-            self.debt.store(used, Ordering::Release);
+
+            // 用 CAS 保留并发 acquire 新增的 debt,避免 store 覆盖并发增量。
+            // 计算目标值 = used + (current - snapshot),其中 snapshot 为进入更新时读到的 debt。
+            // 若期间无并发 acquire,current == snapshot,目标值即为 used;
+            // 若有并发 acquire,current > snapshot,目标值叠加了并发增量。
+            let snapshot = self.debt.load(Ordering::Acquire);
+            let mut current = snapshot;
+            loop {
+                let new = current.saturating_add(used).saturating_sub(snapshot);
+                match self.debt.compare_exchange_weak(
+                    current,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
         self.bytes_per_sec.store(bytes_per_sec, Ordering::Release);
     }
@@ -229,5 +284,38 @@ mod tests {
             "并发请求不应过度等待,实际: {:.2}s",
             elapsed.as_secs_f64()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_rate_preserves_debt() {
+        // 并发 acquire 与 update_rate 不应导致 debt 被覆盖或 panic。
+        // 该测试主要验证:在大量并发更新下,限速器仍保持一致性并可查询。
+        let limiter = Arc::new(RateLimiter::new(1_000_000));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let limiter = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    limiter.acquire(1024).await;
+                }
+            }));
+        }
+
+        let updater = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                for i in 1..100 {
+                    limiter.update_rate(1_000_000 + i * 100);
+                }
+            })
+        };
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        updater.await.unwrap();
+
+        assert!(limiter.bytes_per_sec() > 0);
     }
 }

@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 #[cfg(test)]
-use tachyon_core::filename::{extract_filename_from_url, parse_content_disposition};
+use tachyon_core::safety::{extract_filename_from_url, parse_content_disposition};
 use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use url::Url;
+
+use crate::http::parse_retry_after;
 
 /// HTTP/3 客户端请求句柄类型(h3 + h3-quinn)
 ///
@@ -408,13 +410,34 @@ fn build_h3_request(
         .map_err(|e| DownloadError::Protocol(format!("构造 HTTP/3 请求失败: {e}")))
 }
 
+/// 根据 HTTP/3 响应状态码和头部对错误进行分类
+///
+/// 与 HTTP 实现的 `classify_http_error` 对齐:
+/// - 429/503: 返回 Throttled,尝试解析 Retry-After
+/// - 401/403: 返回 Forbidden
+/// - 其他: 返回通用 Protocol 错误
+fn classify_h3_error(status: http::StatusCode, headers: &http::HeaderMap) -> DownloadError {
+    let code = status.as_u16();
+    match code {
+        429 | 503 => {
+            let retry_after_secs = headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after);
+            DownloadError::Throttled { retry_after_secs }
+        }
+        401 | 403 => DownloadError::Forbidden { status: code },
+        _ => DownloadError::Protocol(format!("HTTP {status}")),
+    }
+}
+
 /// 从 HTTP/3 响应头中提取文件元数据
 ///
 /// 使用 `http::HeaderMap` 直接访问解码后的头部,无需文本解析。
 fn parse_h3_metadata(response: &http::Response<()>, url: &str) -> DownloadResult<FileMetadata> {
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(DownloadError::Protocol(format!("HTTP {status}")));
+    let status = response.status();
+    if !status.is_success() {
+        return Err(classify_h3_error(status, response.headers()));
     }
 
     let headers = response.headers();
@@ -447,10 +470,10 @@ fn parse_h3_metadata(response: &http::Response<()>, url: &str) -> DownloadResult
     let content_disposition_name = headers
         .get(http::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
-        .and_then(tachyon_core::filename::parse_content_disposition);
+        .and_then(tachyon_core::safety::parse_content_disposition);
 
     let file_name = content_disposition_name
-        .unwrap_or_else(|| tachyon_core::filename::extract_filename_from_url(url));
+        .unwrap_or_else(|| tachyon_core::safety::extract_filename_from_url(url));
 
     Ok(FileMetadata {
         file_name,
@@ -472,9 +495,8 @@ fn h3_recv_streaming(
     Box::pin(futures::stream::unfold(stream, move |mut s| async move {
         match s.recv_data().await {
             Ok(Some(mut buf)) => {
-                let len = buf.chunk().len();
-                let data = Bytes::copy_from_slice(buf.chunk());
-                buf.advance(len);
+                let len = buf.remaining();
+                let data = buf.copy_to_bytes(len);
                 if data.is_empty() {
                     None
                 } else {
@@ -568,7 +590,7 @@ impl Protocol for QuicTransport {
             // S-2: 校验 URL 防 SSRF
             let parsed = Url::parse(&url)
                 .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
+            tachyon_core::safety::validate_public_http_url(&parsed)?;
 
             let request = build_h3_request(http::Method::HEAD, &url, &[])?;
 
@@ -598,7 +620,7 @@ impl Protocol for QuicTransport {
             // S-2: 校验 URL 防 SSRF
             let parsed = Url::parse(&url)
                 .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
+            tachyon_core::safety::validate_public_http_url(&parsed)?;
 
             let range_value = format!("bytes={start}-{end}");
             let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
@@ -608,11 +630,9 @@ impl Protocol for QuicTransport {
             let response = stream.recv_response().await.map_err(h3_error)?;
 
             // 严格验证 Range 请求必须返回 206
-            let status = response.status().as_u16();
-            if status != 206 {
-                return Err(DownloadError::Protocol(format!(
-                    "服务器忽略 Range 头, 返回 HTTP {status} (期望 206 Partial Content)"
-                )));
+            let status = response.status();
+            if status.as_u16() != 206 {
+                return Err(classify_h3_error(status, response.headers()));
             }
             drop(send); // 释放 Mutex 以便并发请求
 
@@ -650,7 +670,7 @@ impl Protocol for QuicTransport {
             // S-2: 校验 URL 防 SSRF
             let parsed = Url::parse(&url)
                 .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
+            tachyon_core::safety::validate_public_http_url(&parsed)?;
 
             let range_value = format!("bytes={start}-{end}");
             let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
@@ -660,11 +680,9 @@ impl Protocol for QuicTransport {
             let response = stream.recv_response().await.map_err(h3_error)?;
 
             // 严格验证 Range 请求必须返回 206
-            let status = response.status().as_u16();
-            if status != 206 {
-                return Err(DownloadError::Protocol(format!(
-                    "服务器忽略 Range 头, 返回 HTTP {status} (期望 206 Partial Content)"
-                )));
+            let status = response.status();
+            if status.as_u16() != 206 {
+                return Err(classify_h3_error(status, response.headers()));
             }
             drop(send); // 释放 Mutex
 
@@ -688,14 +706,20 @@ impl Protocol for QuicTransport {
             // S-2: 校验 URL 防 SSRF
             let parsed = Url::parse(&url)
                 .map_err(|e| DownloadError::Network(format!("URL 解析失败: {e}")))?;
-            tachyon_core::url_safety::validate_public_http_url(&parsed)?;
+            tachyon_core::safety::validate_public_http_url(&parsed)?;
 
             let request = build_h3_request(http::Method::GET, &url, &[])?;
 
             let mut send = h3_send.lock().await;
             let mut stream = send.send_request(request).await.map_err(h3_error)?;
-            let _response = stream.recv_response().await.map_err(h3_error)?;
+            let response = stream.recv_response().await.map_err(h3_error)?;
             drop(send); // 释放 Mutex
+
+            // 校验全量下载响应状态码,避免将 4xx/5xx 错误体当作目标文件
+            let status = response.status();
+            if !status.is_success() {
+                return Err(classify_h3_error(status, response.headers()));
+            }
 
             // 读取全部响应体 DATA 帧
             use futures::StreamExt;

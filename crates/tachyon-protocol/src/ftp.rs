@@ -18,9 +18,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use suppaftp::tokio::{AsyncDataStream, AsyncFtpStream, AsyncNoTlsStream};
 use suppaftp::types::FileType;
+use tachyon_core::safety::reject_forbidden_ip;
 use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
-use tachyon_core::url_safety::reject_forbidden_ip;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
@@ -166,22 +166,24 @@ impl FtpClient {
                 .to_socket_addrs()
                 .map_err(|e| DownloadError::Network(format!("FTP DNS 解析失败: {e}")))?;
             let mut validated: Option<IpAddr> = None;
-            let mut resolved_count = 0u32;
+            let mut rejected_count = 0u32;
             for addr in addrs {
-                reject_forbidden_ip(addr.ip())
-                    .map_err(|e| DownloadError::Protocol(format!("FTP DNS Rebinding 拦截: {e}")))?;
-                // 保留第一个已验证的 IP 用于连接,消除 TOCTOU 窗口
+                if reject_forbidden_ip(addr.ip()).is_err() {
+                    rejected_count += 1;
+                    continue; // 跳过被 SSRF 防护拦截的 IP,继续检查后续 IP
+                }
+                // 保留第一个已验证的公网 IP 用于连接,消除 TOCTOU 窗口
                 if validated.is_none() {
                     validated = Some(addr.ip());
                 }
-                resolved_count += 1;
-            }
-            if resolved_count == 0 {
-                return Err(DownloadError::Network("FTP DNS 解析无结果".into()));
             }
             match validated {
                 Some(ip) => format!("{ip}:{port}"),
-                None => format!("{host}:{port}"),
+                None => {
+                    return Err(DownloadError::Protocol(format!(
+                        "FTP DNS 解析结果全部被 SSRF 防护拦截({rejected_count} 个 IP)"
+                    )));
+                }
             }
         };
 
@@ -672,19 +674,39 @@ impl Protocol for FtpClient {
                 }
             };
 
+            // 严格限制读取范围不超过 end - start + 1 字节。
+            // FTP REST 只能设置起始偏移,无法限制结束偏移,因此由流层在读取到
+            // 足够字节后主动截断,防止服务器返回超出请求范围的数据。
+            let remaining = end.saturating_sub(start).saturating_add(1);
+
             // 使用 unfold 逐块读取,64KB/chunk,避免一次性缓冲整个范围
             // 状态中 Option<FtpDataStream> 允许在 finalize 时 take 出数据流
             // finalized flag: 标记数据流是否已被正常 finalize,用于 Drop guard
             let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let finalized_clone = finalized.clone();
             let stream: ByteStream = Box::pin(futures::stream::unfold(
-                (Some(data_stream), this.clone(), info.path.clone()),
-                move |(ds, client, path)| {
+                (
+                    Some(data_stream),
+                    this.clone(),
+                    info.path.clone(),
+                    remaining,
+                ),
+                move |(ds, client, path, remaining)| {
                     let finalized = finalized_clone.clone();
                     async move {
+                        if remaining == 0 {
+                            // 已达到请求字节数,主动结束并清理
+                            if let Some(ds) = ds {
+                                let _ = client.finalize_retr_stream(ds).await;
+                            }
+                            client.disconnect().await;
+                            finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return None;
+                        }
                         let mut ds = ds?; // None 时返回 None,结束 Stream
 
-                        let mut buf = vec![0u8; 64 * 1024]; // 64KB per chunk
+                        let chunk_size = (64 * 1024).min(remaining as usize);
+                        let mut buf = vec![0u8; chunk_size];
                         match ds.read(&mut buf).await {
                             Ok(0) => {
                                 // 数据流已耗尽,完成 RETR 传输并断开连接
@@ -694,8 +716,10 @@ impl Protocol for FtpClient {
                                 None
                             }
                             Ok(n) => {
+                                let n = n.min(remaining as usize);
                                 buf.truncate(n);
-                                Some((Ok(Bytes::from(buf)), (Some(ds), client, path)))
+                                let remaining = remaining.saturating_sub(n as u64);
+                                Some((Ok(Bytes::from(buf)), (Some(ds), client, path, remaining)))
                             }
                             Err(e) => {
                                 let _ = client.finalize_retr_stream(ds).await;
@@ -705,7 +729,7 @@ impl Protocol for FtpClient {
                                     Err(DownloadError::Network(format!(
                                         "读取 FTP 数据流失败: {e}"
                                     ))),
-                                    (None, client, path),
+                                    (None, client, path, remaining),
                                 ))
                             }
                         }

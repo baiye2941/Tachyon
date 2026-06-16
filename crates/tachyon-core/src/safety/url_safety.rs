@@ -1,8 +1,21 @@
+//! URL 安全校验与 SSRF 防护
+//!
+//! 提供多层 URL/IP 安全校验:
+//! - `validate_public_http_url` — 公网 HTTP/HTTPS URL 校验
+//! - `validate_resolved_ip` — DNS 解析后 IP 校验(防 DNS Rebinding)
+//! - `validate_redirect` — 重定向目标逐跳校验
+//! - `reject_forbidden_ip` — IP 地址黑名单校验
+//! - `redact_url_for_log` — URL 日志脱敏
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use url::Url;
 
 use crate::{DownloadError, DownloadResult};
+
+// ---------------------------------------------------------------------------
+// URL 安全校验
+// ---------------------------------------------------------------------------
 
 pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
     match url.scheme() {
@@ -30,14 +43,14 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
 
 /// DNS 解析后校验:对 URL 主机执行 DNS 解析并检查每个解析出的 IP 地址
 ///
-/// 防止 DNS Rebinding 攻击:攻击者可通过 DNS TTL=0 使首次解析返回公网 IP（通过校验）,
-/// 第二次解析返回内网 IP（如 169.254.169.254 云元数据服务）。
+/// 防止 DNS Rebinding 攻击:攻击者可通过 DNS TTL=0 使首次解析返回公网 IP(通过校验),
+/// 第二次解析返回内网 IP(如 169.254.169.254 云元数据服务)。
 /// 此函数在 URL 字符串校验之后、发起连接之前调用,确保所有解析结果均为安全 IP。
 ///
 /// # 返回值
 ///
 /// 返回所有已验证的安全 IP 地址列表。**协议层必须使用这些 IP 进行连接**
-/// （而非重新发起 DNS 查询）,以消除 TOCTOU（Time-of-Check to Time-of-Use）窗口。
+/// (而非重新发起 DNS 查询),以消除 TOCTOU(Time-of-Check to Time-of-Use)窗口。
 ///
 /// # 用法
 ///
@@ -53,7 +66,7 @@ pub fn validate_resolved_ip(url: &Url) -> DownloadResult<Vec<IpAddr>> {
         .host_str()
         .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))?;
 
-    // 如果 host 已经是 IP 地址,直接校验即可（无需 DNS 解析）
+    // 如果 host 已经是 IP 地址,直接校验即可(无需 DNS 解析)
     if let Ok(ip) = host.parse::<IpAddr>() {
         reject_forbidden_ip(ip)?;
         return Ok(vec![ip]);
@@ -80,7 +93,7 @@ pub fn validate_resolved_ip(url: &Url) -> DownloadResult<Vec<IpAddr>> {
 
 /// 重定向目标校验:对每次重定向的目标 URL 执行完整的 SSRF 校验
 ///
-/// 防止攻击者通过合法公网 URL 通过初始校验后,通过服务端重定向（301/302/307/308）
+/// 防止攻击者通过合法公网 URL 通过初始校验后,通过服务端重定向(301/302/307/308)
 /// 将请求导向内网地址。协议层应禁用 HTTP 客户端的自动重定向,改为手动跟随并在
 /// 每一步调用此函数。
 ///
@@ -88,7 +101,7 @@ pub fn validate_resolved_ip(url: &Url) -> DownloadResult<Vec<IpAddr>> {
 ///
 /// - `redirect_url`: 重定向目标 URL
 /// - `max_redirects`: 允许的最大重定向次数
-/// - `current_redirect`: 当前已执行的重定向次数（从 0 开始）
+/// - `current_redirect`: 当前已执行的重定向次数(从 0 开始)
 pub fn validate_redirect(
     redirect_url: &Url,
     max_redirects: u32,
@@ -198,7 +211,7 @@ pub fn redact_url_for_log(url: &str) -> String {
         .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("");
-    // 仅脱敏凭据、query、fragment，保留 scheme/host/basename 供日志排查
+    // 仅脱敏凭据、query、fragment,保留 scheme/host/basename 供日志排查
     if basename.is_empty() {
         format!("{}://{}", parsed.scheme(), host)
     } else {
@@ -236,12 +249,11 @@ mod tests {
 
     #[test]
     fn rejects_multicast_and_broadcast_ipv4() {
-        // 组播地址 (224.0.0.0/4)
         for ip in [
             Ipv4Addr::new(224, 0, 0, 1),
-            Ipv4Addr::new(239, 255, 255, 250), // SSDP
+            Ipv4Addr::new(239, 255, 255, 250),
             Ipv4Addr::new(240, 0, 0, 1),
-            Ipv4Addr::new(255, 255, 255, 255), // 广播
+            Ipv4Addr::new(255, 255, 255, 255),
         ] {
             assert!(
                 reject_forbidden_ipv4(ip).is_err(),
@@ -252,7 +264,6 @@ mod tests {
 
     #[test]
     fn rejects_cgnat_range() {
-        // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
         for ip in [
             Ipv4Addr::new(100, 64, 0, 1),
             Ipv4Addr::new(100, 127, 255, 255),
@@ -263,13 +274,11 @@ mod tests {
                 "{ip} should be rejected as CGNAT"
             );
         }
-        // 100.63.255.255 不应被拦截(CGNAT 范围前)
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(100, 63, 255, 255)).is_ok());
     }
 
     #[test]
     fn rejects_documentation_range() {
-        // RFC 5737 文档地址: 整个 /24 网段均应被拒绝
         for ip in [
             Ipv4Addr::new(192, 0, 2, 0),
             Ipv4Addr::new(192, 0, 2, 1),
@@ -284,14 +293,12 @@ mod tests {
                 "{ip} should be rejected as documentation range"
             );
         }
-        // 相邻网段不应被误拦截
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(192, 0, 3, 1)).is_ok());
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 51, 101, 1)).is_ok());
     }
 
     #[test]
     fn rejects_rfc2544_benchmark_and_ietf_protocol_assignment_ranges() {
-        // RFC 2544 基准测试地址 (198.18.0.0/15)
         for ip in [
             Ipv4Addr::new(198, 18, 0, 0),
             Ipv4Addr::new(198, 18, 0, 1),
@@ -304,7 +311,6 @@ mod tests {
                 "{ip} should be rejected as RFC 2544 benchmark range"
             );
         }
-        // IETF Protocol Assignments (192.0.0.0/24)
         for ip in [
             Ipv4Addr::new(192, 0, 0, 0),
             Ipv4Addr::new(192, 0, 0, 1),
@@ -315,7 +321,6 @@ mod tests {
                 "{ip} should be rejected as IETF Protocol Assignments range"
             );
         }
-        // 相邻网段不应被误拦截
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 17, 255, 255)).is_ok());
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(198, 20, 0, 0)).is_ok());
         assert!(reject_forbidden_ipv4(Ipv4Addr::new(192, 0, 1, 0)).is_ok());
@@ -323,7 +328,6 @@ mod tests {
 
     #[test]
     fn rejects_ipv6_site_local() {
-        // fec0::/10 (已弃用的站点本地地址)
         for ip in [
             Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1),
             Ipv6Addr::new(0xfeb0, 0, 0, 0, 0, 0, 0, 1),
@@ -365,8 +369,6 @@ mod tests {
         assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
     }
 
-    // --- validate_resolved_ip 测试 ---
-
     #[test]
     fn validate_resolved_ip_rejects_ip_literal_localhost() {
         let url = Url::parse("http://127.0.0.1/file.bin").unwrap();
@@ -387,14 +389,9 @@ mod tests {
 
     #[test]
     fn validate_resolved_ip_rejects_empty_host() {
-        // 构造一个 host_str 为 None 的 URL 不现实，但空字符串域名解析会失败
         let url = Url::parse("https://example.com/file.bin").unwrap();
-        // 正常公网域名应通过（DNS 解析由运行环境决定）
-        // 此处仅验证函数不会 panic
         let _ = validate_resolved_ip(&url);
     }
-
-    // --- validate_redirect 测试 ---
 
     #[test]
     fn validate_redirect_rejects_exceeded_limit() {
@@ -412,7 +409,6 @@ mod tests {
     #[test]
     fn validate_redirect_accepts_within_limit() {
         let url = Url::parse("https://example.com/file.bin").unwrap();
-        // 次数未超限且 URL 合法，应通过（DNS 解析由运行环境决定）
         let _ = validate_redirect(&url, 10, 0);
     }
 }

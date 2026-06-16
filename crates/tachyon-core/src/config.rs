@@ -13,11 +13,10 @@ pub const MAX_FULL_DOWNLOAD_SIZE: usize = 64 * 1024 * 1024; // 64MB
 /// I/O 存储后端策略
 ///
 /// 控制下载写入时使用的文件 I/O 后端。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IoStrategy {
     /// 标准 TokioFile 后端（跨平台稳定路径）
-    #[default]
     Standard,
     /// Windows 优化后端（NO_BUFFERING + SEQUENTIAL_SCAN）
     ///
@@ -27,12 +26,29 @@ pub enum IoStrategy {
     /// Windows IOCP 异步 I/O 后端
     ///
     /// 仅在 Windows 上生效；非 Windows 平台自动回退到 Standard。
+    /// 使用无锁完成端口和 NO_BUFFERING 写入，提供高吞吐零页缓存路径。
     Iocp,
     /// Linux io_uring 零拷贝后端（O_DIRECT + fixed buffer）
     ///
     /// 仅在 Linux 5.4+ 上生效；其他平台自动回退到 Standard。
     /// 提供零拷贝写入管道，绕过页缓存直接使用 fixed buffer。
     IoUring,
+}
+
+/// Windows 平台默认使用 IOCP 后端（无锁完成端口 + NO_BUFFERING），
+/// 其他平台默认使用 Standard（TokioFile）。
+#[cfg(target_os = "windows")]
+impl Default for IoStrategy {
+    fn default() -> Self {
+        IoStrategy::Iocp
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Default for IoStrategy {
+    fn default() -> Self {
+        IoStrategy::Standard
+    }
 }
 
 /// 分片并发数上限
@@ -79,6 +95,21 @@ pub const MAX_GLOBAL_CONNECTIONS_LIMIT: u32 = 4096;
 /// 继续增大易导致调度开销激增。
 pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 100;
 
+/// 校验策略
+///
+/// 控制下载完成后是否以及如何校验文件完整性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerifyStrategy {
+    /// 必须有 expected hash 且校验通过,否则返回错误
+    Require,
+    /// 有 expected hash 时校验,无 hash 时跳过并记录日志(默认)
+    #[default]
+    BestEffort,
+    /// 完全跳过校验
+    Skip,
+}
+
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "DownloadConfigSerde")]
@@ -95,6 +126,9 @@ pub struct DownloadConfig {
     pub connect_timeout_secs: u64,
     /// 是否启用校验
     pub verify_checksum: bool,
+    /// 校验策略
+    #[serde(default)]
+    pub verify_strategy: VerifyStrategy,
     /// 自定义 User-Agent
     pub user_agent: String,
     /// 自定义请求头
@@ -124,6 +158,8 @@ struct DownloadConfigSerde {
     #[serde(default = "default_connect_timeout_secs")]
     connect_timeout_secs: u64,
     verify_checksum: bool,
+    #[serde(default)]
+    verify_strategy: VerifyStrategy,
     user_agent: String,
     headers: std::collections::HashMap<String, String>,
     #[serde(default = "default_pause_timeout_secs")]
@@ -163,6 +199,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             request_timeout_secs: value.request_timeout_secs,
             connect_timeout_secs: value.connect_timeout_secs,
             verify_checksum: value.verify_checksum,
+            verify_strategy: value.verify_strategy,
             user_agent: value.user_agent,
             headers: value.headers,
             pause_timeout_secs: value.pause_timeout_secs,
@@ -192,6 +229,7 @@ impl Default for DownloadConfig {
             request_timeout_secs: 30,
             connect_timeout_secs: 10,
             verify_checksum: true,
+            verify_strategy: VerifyStrategy::BestEffort,
             user_agent: USER_AGENT.to_string(),
             headers: std::collections::HashMap::new(),
             pause_timeout_secs: 300,
@@ -242,10 +280,18 @@ pub struct SchedulerConfig {
     pub min_fragment_size: u64,
     /// 最大分片大小(字节)
     pub max_fragment_size: u64,
-    /// 带宽预测采样间隔(秒)
+    /// 带宽采样间隔(秒)—— **当前未生效**(保留字段,向后兼容)
+    ///
+    /// 带宽采样实际由"每分片完成"驱动(见 `downloader.rs` execute_fragmented_download
+    /// 的 join 循环),而非定时器。此字段保留是为了不破坏已序列化的配置文件,
+    /// 未来若改为定时采样则会启用。修改采样行为不应调整此值。
+    #[serde(default = "default_sampling_interval_secs")]
     pub sampling_interval_secs: u64,
     /// EWMA 平滑因子(0.0 ~ 1.0)
     pub ewma_alpha: f64,
+    /// Holt 趋势平滑因子(0.0 ~ 1.0)
+    #[serde(default = "default_ewma_beta")]
+    pub ewma_beta: f64,
     /// 默认目标分片数(无调度器建议时使用)
     #[serde(default = "default_target_fragments")]
     pub default_target_fragments: u32,
@@ -269,6 +315,18 @@ fn default_target_fragments() -> u32 {
     16
 }
 
+/// SchedulerConfig.ewma_beta 的默认值
+///
+/// 保持与旧代码 `ewma_alpha * 0.3` 在 alpha=0.3 时的行为一致。
+fn default_ewma_beta() -> f64 {
+    0.09
+}
+
+/// SchedulerConfig.sampling_interval_secs 的默认值(当前未生效,保留兼容)
+fn default_sampling_interval_secs() -> u64 {
+    60
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -276,6 +334,7 @@ impl Default for SchedulerConfig {
             max_fragment_size: 64 * 1024 * 1024, // 64MB
             sampling_interval_secs: 60,
             ewma_alpha: 0.3,
+            ewma_beta: default_ewma_beta(),
             default_target_fragments: 16,
             high_bandwidth_threshold: default_high_bw_threshold(),
             medium_bandwidth_threshold: default_medium_bw_threshold(),
@@ -388,6 +447,9 @@ impl SchedulerConfig {
         if !(0.0..=1.0).contains(&self.ewma_alpha) {
             return Err(e("ewma_alpha 必须在 0.0 ~ 1.0 之间"));
         }
+        if !(0.0..=1.0).contains(&self.ewma_beta) {
+            return Err(e("ewma_beta 必须在 0.0 ~ 1.0 之间"));
+        }
         if self.default_target_fragments == 0 {
             return Err(e("default_target_fragments 必须 >= 1"));
         }
@@ -395,6 +457,125 @@ impl SchedulerConfig {
             return Err(e("sampling_interval_secs 必须 >= 1"));
         }
         Ok(())
+    }
+}
+
+/// 配置白名单补丁 DTO
+///
+/// 仅包含允许前端修改的字段(Option 包裹,Some 表示更新,None 表示保留原值)。
+/// 排除的安全字段:
+/// - `headers`: 有 CRLF 注入风险,需独立授权流程
+/// - `authorized_dirs`: 路径安全敏感,需独立授权流程
+/// - `user_agent`: 不应被前端覆盖
+/// - `max_full_stream_bytes`: OOM 防护上限,不应暴露给前端
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigPatch {
+    pub max_concurrent_tasks: Option<u32>,
+    pub download: Option<DownloadPatch>,
+    pub connection: Option<ConnectionPatch>,
+}
+
+/// 下载配置白名单补丁
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadPatch {
+    pub download_dir: Option<String>,
+    pub max_concurrent_fragments: Option<u32>,
+    pub max_retries: Option<u32>,
+    pub request_timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    pub verify_checksum: Option<bool>,
+    pub pause_timeout_secs: Option<u64>,
+    pub rate_limit_bytes_per_sec: Option<Option<u64>>,
+    pub io_strategy: Option<IoStrategy>,
+}
+
+/// 连接配置白名单补丁
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionPatch {
+    pub max_connections_per_host: Option<u32>,
+    pub max_global_connections: Option<u32>,
+    pub keep_alive_timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    pub enable_http2: Option<bool>,
+    pub enable_quic: Option<bool>,
+}
+
+impl ConfigPatch {
+    /// 将补丁应用到现有 AppConfig,仅更新 Some 字段,保留其余不变
+    ///
+    /// 返回应用后的新 AppConfig(不修改原配置)。
+    pub fn apply_to(&self, base: &AppConfig) -> AppConfig {
+        let mut result = base.clone();
+        if let Some(v) = self.max_concurrent_tasks {
+            result.max_concurrent_tasks = v;
+        }
+        if let Some(patch) = &self.download {
+            patch.apply_to(&mut result.download);
+        }
+        if let Some(patch) = &self.connection {
+            patch.apply_to(&mut result.connection);
+        }
+        result
+    }
+}
+
+impl DownloadPatch {
+    /// 将下载补丁应用到现有 DownloadConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut DownloadConfig) {
+        if let Some(v) = &self.download_dir {
+            base.download_dir = v.clone();
+        }
+        if let Some(v) = self.max_concurrent_fragments {
+            base.max_concurrent_fragments = v;
+        }
+        if let Some(v) = self.max_retries {
+            base.max_retries = v;
+        }
+        if let Some(v) = self.request_timeout_secs {
+            base.request_timeout_secs = v;
+        }
+        if let Some(v) = self.connect_timeout_secs {
+            base.connect_timeout_secs = v;
+        }
+        if let Some(v) = self.verify_checksum {
+            base.verify_checksum = v;
+        }
+        if let Some(v) = self.pause_timeout_secs {
+            base.pause_timeout_secs = v;
+        }
+        if let Some(v) = &self.rate_limit_bytes_per_sec {
+            base.rate_limit_bytes_per_sec = *v;
+        }
+        if let Some(v) = self.io_strategy {
+            base.io_strategy = v;
+        }
+    }
+}
+
+impl ConnectionPatch {
+    /// 将连接补丁应用到现有 ConnectionConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut ConnectionConfig) {
+        if let Some(v) = self.max_connections_per_host {
+            base.max_connections_per_host = v;
+        }
+        if let Some(v) = self.max_global_connections {
+            base.max_global_connections = v;
+        }
+        if let Some(v) = self.keep_alive_timeout_secs {
+            base.keep_alive_timeout_secs = v;
+        }
+        if let Some(v) = self.connect_timeout_secs {
+            base.connect_timeout_secs = v;
+        }
+        if let Some(v) = self.enable_http2 {
+            base.enable_http2 = v;
+        }
+        if let Some(v) = self.enable_quic {
+            base.enable_quic = v;
+        }
     }
 }
 
@@ -466,6 +647,7 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.request_timeout_secs, 30);
         assert!(config.verify_checksum);
+        assert_eq!(config.verify_strategy, VerifyStrategy::BestEffort);
         assert!(config.user_agent.starts_with("Tachyon/"));
         assert!(config.headers.is_empty());
     }
@@ -600,6 +782,75 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_strategy_default_is_best_effort() {
+        assert_eq!(VerifyStrategy::default(), VerifyStrategy::BestEffort);
+    }
+
+    #[test]
+    fn test_verify_strategy_serialization_roundtrip() {
+        for strategy in [
+            VerifyStrategy::Require,
+            VerifyStrategy::BestEffort,
+            VerifyStrategy::Skip,
+        ] {
+            let json = serde_json::to_string(&strategy).unwrap();
+            let deserialized: VerifyStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, strategy);
+        }
+    }
+
+    #[test]
+    fn test_verify_strategy_deserializes_from_json() {
+        assert_eq!(
+            serde_json::from_str::<VerifyStrategy>("\"require\"").unwrap(),
+            VerifyStrategy::Require
+        );
+        assert_eq!(
+            serde_json::from_str::<VerifyStrategy>("\"bestEffort\"").unwrap(),
+            VerifyStrategy::BestEffort
+        );
+        assert_eq!(
+            serde_json::from_str::<VerifyStrategy>("\"skip\"").unwrap(),
+            VerifyStrategy::Skip
+        );
+    }
+
+    #[test]
+    fn test_download_config_deserializes_legacy_without_verify_strategy() {
+        let json = r#"{
+            "downloadDir":"/tmp/downloads",
+            "maxConcurrentFragments":8,
+            "maxRetries":5,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":false,
+            "userAgent":"Tachyon/Legacy",
+            "headers":{}
+        }"#;
+
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.pause_timeout_secs, 300);
+        assert_eq!(config.authorized_dirs, vec!["/tmp/downloads".to_string()]);
+        // 旧配置无 verifyStrategy 时,默认应为 BestEffort
+        assert_eq!(config.verify_strategy, VerifyStrategy::BestEffort);
+    }
+
+    #[test]
+    fn test_download_config_deserializes_with_verify_strategy() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "verifyStrategy":"require",
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.verify_strategy, VerifyStrategy::Require);
+    }
+
+    #[test]
     fn test_connection_config_serialization() {
         let config = ConnectionConfig::default();
         let json = serde_json::to_string(&config).unwrap();
@@ -624,6 +875,10 @@ mod tests {
 
     #[test]
     fn test_io_strategy_default_is_standard() {
+        // Windows 默认为 IOCP,非 Windows 默认为 Standard
+        #[cfg(target_os = "windows")]
+        assert_eq!(IoStrategy::default(), IoStrategy::Iocp);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(IoStrategy::default(), IoStrategy::Standard);
     }
 
@@ -666,8 +921,8 @@ mod tests {
         // 反序列化
         let deserialized: IoStrategy = serde_json::from_str("\"iocp\"").unwrap();
         assert_eq!(deserialized, IoStrategy::Iocp);
-        // 默认值不受影响
-        assert_ne!(IoStrategy::Iocp, IoStrategy::default());
+        // 非默认值的验证: Standard 不是 Iocp
+        assert_ne!(IoStrategy::Standard, IoStrategy::Iocp);
     }
 
     #[test]
@@ -682,6 +937,10 @@ mod tests {
             "headers":{}
         }"#;
         let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        // 缺少 ioStrategy 字段时使用平台默认值
+        #[cfg(target_os = "windows")]
+        assert_eq!(config.io_strategy, IoStrategy::Iocp);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(config.io_strategy, IoStrategy::Standard);
     }
 
@@ -699,5 +958,18 @@ mod tests {
         }"#;
         let config: DownloadConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.io_strategy, IoStrategy::WinAligned);
+    }
+
+    #[test]
+    fn test_io_strategy_default_platform_specific() {
+        let default = IoStrategy::default();
+        #[cfg(target_os = "windows")]
+        assert_eq!(default, IoStrategy::Iocp, "Windows 默认应为 IOCP");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            default,
+            IoStrategy::Standard,
+            "非 Windows 默认应为 Standard"
+        );
     }
 }

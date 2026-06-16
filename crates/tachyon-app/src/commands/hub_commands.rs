@@ -61,7 +61,8 @@ pub async fn list_repo_files(
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
-    let api = tachyon_hub::api::HubApi::from_env();
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.list_files(&repo_id, &rev).await.map_err(AppError::Core)
 }
 
@@ -76,6 +77,7 @@ pub async fn get_hf_download_url(
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
     validate_file_path(&file_path)?;
-    let api = tachyon_hub::api::HubApi::from_env();
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     Ok(api.download_url(&repo_id, &rev, &file_path))
 }

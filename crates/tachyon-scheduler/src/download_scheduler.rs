@@ -26,7 +26,7 @@ impl AdaptiveDownloadScheduler {
         Self {
             predictor: RwLock::new(HoltLinearPredictor::new(
                 config.ewma_alpha,
-                config.ewma_alpha * 0.3, // beta 通常小于 alpha
+                config.ewma_beta,
             )),
             config,
         }

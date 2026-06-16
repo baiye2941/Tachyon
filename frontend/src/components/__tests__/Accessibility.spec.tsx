@@ -43,6 +43,7 @@ describe('Accessibility Tests', () => {
     fragmentsTotal: 4,
     fragmentsDone: 2,
     createdAt: '2026-05-30T00:00:00Z',
+    savePath: '/downloads',
   }
 
   describe('prefers-reduced-motion 支持', () => {
@@ -112,7 +113,7 @@ describe('Accessibility Tests', () => {
 
   describe('触摸目标尺寸（≥44px）', () => {
     it('TitleBar 窗口控制按钮应该有足够的触摸目标尺寸', () => {
-      const { container } = render(() => <TitleBar onOpenSettings={() => {}} />)
+      const { container } = render(() => <TitleBar />)
 
       const buttons = container.querySelectorAll('.win-btn')
       expect(buttons.length).toBeGreaterThan(0)
@@ -162,14 +163,14 @@ describe('Accessibility Tests', () => {
 
   describe('TitleBar ARIA 标签', () => {
     it('最小化按钮应该有 aria-label', () => {
-      const { container } = render(() => <TitleBar onOpenSettings={() => {}} />)
+      const { container } = render(() => <TitleBar />)
       const minimizeBtn = container.querySelector('[aria-label="最小化窗口"]')
       expect(minimizeBtn).toBeDefined()
       expect(minimizeBtn!.getAttribute('aria-label')).toBe('最小化窗口')
     })
 
     it('最大化/恢复按钮应该有动态 aria-label 和 title', () => {
-      const { container } = render(() => <TitleBar onOpenSettings={() => {}} />)
+      const { container } = render(() => <TitleBar />)
       const maximizeBtn = container.querySelector('[aria-label="最大化窗口"]')
       expect(maximizeBtn).toBeDefined()
       expect(maximizeBtn!.getAttribute('aria-label')).toBe('最大化窗口')
@@ -177,7 +178,7 @@ describe('Accessibility Tests', () => {
     })
 
     it('关闭按钮应该有 aria-label 和 title', () => {
-      const { container } = render(() => <TitleBar onOpenSettings={() => {}} />)
+      const { container } = render(() => <TitleBar />)
       const closeBtn = container.querySelector('[aria-label="关闭窗口"]')
       expect(closeBtn).toBeDefined()
       expect(closeBtn!.getAttribute('aria-label')).toBe('关闭窗口')
@@ -341,11 +342,10 @@ describe('Accessibility Tests', () => {
       const taskElement = container.querySelector('[role="button"]')
       expect(taskElement).toBeDefined()
 
-      // 验证使用 focus:outline-none 配合 focus-visible:ring
+      // 验证使用 focus:outline-none 配合 focus-ring(品牌紫 var(--color-accent-primary))
       const classList = taskElement!.className
       expect(classList).toContain('focus:outline-none')
-      expect(classList).toContain('focus-visible:ring-2')
-      expect(classList).toContain('focus-visible:ring-[#00D4AA]')
+      expect(classList).toContain('focus-visible:focus-ring')
     })
 
     it('应该在键盘焦点时显示可见的焦点环', () => {
@@ -366,11 +366,9 @@ describe('Accessibility Tests', () => {
       // 模拟键盘焦点（通过 Tab 键）
       taskElement.focus()
 
-      // 验证焦点样式类存在
+      // 验证焦点样式类存在(focus-ring 使用品牌紫 token)
       const classList = taskElement.className
-      expect(classList).toContain('focus-visible:ring-2')
-      expect(classList).toContain('focus-visible:ring-[#00D4AA]')
-      expect(classList).toContain('focus-visible:ring-offset-2')
+      expect(classList).toContain('focus-visible:focus-ring')
     })
   })
 

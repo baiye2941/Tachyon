@@ -1,8 +1,9 @@
 mod common;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tachyon_core::DownloadState;
-use tachyon_store::{KvStore, RecoveryManager, TaskSnapshot};
+use tachyon_store::{KvStore, RecoveryManager, SNAPSHOT_SCHEMA_VERSION, TaskSnapshot};
 use tempfile::TempDir;
 
 fn temp_store_dir() -> PathBuf {
@@ -12,6 +13,7 @@ fn temp_store_dir() -> PathBuf {
 
 fn make_snapshot(id: &str, url: &str, status: DownloadState) -> TaskSnapshot {
     TaskSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         id: id.to_string(),
         url: url.to_string(),
         save_path: "/tmp/test.bin".to_string(),
@@ -19,6 +21,7 @@ fn make_snapshot(id: &str, url: &str, status: DownloadState) -> TaskSnapshot {
         file_size: None,
         downloaded: 0,
         completed_fragments: vec![],
+        partial_fragments: HashMap::new(),
         total_fragments: 0,
         fragment_size: 0,
         status,
@@ -52,12 +55,12 @@ fn recovery_roundtrip_downloading_recoverable() {
     );
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].id, "task-1");
-    assert_eq!(loaded[0].status, DownloadState::Downloading);
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(result.tasks[0].id, "task-1");
+    assert_eq!(result.tasks[0].status, DownloadState::Downloading);
 
-    let normalized = normalize_recovered_status(loaded[0].status);
+    let normalized = normalize_recovered_status(result.tasks[0].status);
     assert_eq!(normalized, DownloadState::Pending);
 }
 
@@ -74,9 +77,9 @@ fn recovery_roundtrip_paused_recoverable() {
     );
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].status, DownloadState::Paused);
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(result.tasks[0].status, DownloadState::Paused);
 }
 
 #[test]
@@ -93,8 +96,8 @@ fn recovery_roundtrip_failed_not_recoverable() {
     snapshot.fail_reason = Some("网络超时".to_string());
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 0, "失败任务不应被自动恢复");
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 0, "失败任务不应被自动恢复");
 }
 
 #[test]
@@ -110,8 +113,8 @@ fn recovery_roundtrip_completed_not_recoverable() {
     );
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 0, "已完成任务不应被恢复");
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 0, "已完成任务不应被恢复");
 }
 
 #[test]
@@ -127,8 +130,8 @@ fn recovery_roundtrip_cancelled_not_recoverable() {
     );
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 0, "已取消任务不应被恢复");
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 0, "已取消任务不应被恢复");
 }
 
 #[test]
@@ -146,8 +149,8 @@ fn recovery_multiple_snapshots() {
         manager.save_task_snapshot(&snapshot).unwrap();
     }
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 5);
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 5);
 }
 
 #[test]
@@ -167,15 +170,16 @@ fn recovery_overwrite_same_task_id() {
     snapshot.status = DownloadState::Paused;
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].downloaded, 1024);
-    assert_eq!(loaded[0].status, DownloadState::Paused);
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(result.tasks[0].downloaded, 1024);
+    assert_eq!(result.tasks[0].status, DownloadState::Paused);
 }
 
 #[test]
 fn snapshot_preserves_metadata() {
     let snapshot = TaskSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         id: "task-1".to_string(),
         url: "https://example.com/file.bin".to_string(),
         save_path: "/tmp/test.bin".to_string(),
@@ -183,6 +187,7 @@ fn snapshot_preserves_metadata() {
         file_size: Some(1024),
         downloaded: 512,
         completed_fragments: vec![0, 1],
+        partial_fragments: HashMap::new(),
         total_fragments: 4,
         fragment_size: 256,
         status: DownloadState::Paused,
@@ -200,14 +205,14 @@ fn snapshot_preserves_metadata() {
     let manager = RecoveryManager::new(kv);
     manager.save_task_snapshot(&snapshot).unwrap();
 
-    let loaded = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].id, "task-1");
-    assert_eq!(loaded[0].file_size, Some(1024));
-    assert_eq!(loaded[0].downloaded, 512);
-    assert_eq!(loaded[0].total_fragments, 4);
-    assert_eq!(loaded[0].completed_fragments.len(), 2);
-    assert_eq!(loaded[0].etag.as_deref(), Some("abc123"));
+    let result = manager.recover_pending_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(result.tasks[0].id, "task-1");
+    assert_eq!(result.tasks[0].file_size, Some(1024));
+    assert_eq!(result.tasks[0].downloaded, 512);
+    assert_eq!(result.tasks[0].total_fragments, 4);
+    assert_eq!(result.tasks[0].completed_fragments.len(), 2);
+    assert_eq!(result.tasks[0].etag.as_deref(), Some("abc123"));
 }
 
 #[test]
@@ -266,11 +271,15 @@ fn all_snapshots_loadable_via_all() {
         manager.save_task_snapshot(&snapshot).unwrap();
     }
 
-    let all = manager.load_all_task_snapshots().unwrap();
-    assert_eq!(all.len(), 5, "所有快照都应可通过 load_all 加载");
+    let result = manager.load_all_task_snapshots().unwrap();
+    assert_eq!(result.tasks.len(), 5, "所有快照都应可通过 load_all 加载");
 
     let recoverable = manager.recover_pending_snapshots().unwrap();
-    assert_eq!(recoverable.len(), 2, "只有 Downloading 和 Paused 可恢复");
+    assert_eq!(
+        recoverable.tasks.len(),
+        2,
+        "只有 Downloading 和 Paused 可恢复"
+    );
 }
 
 #[test]

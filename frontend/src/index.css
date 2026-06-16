@@ -1,405 +1,580 @@
 /* Tachyon Design System - Global Styles */
 /* Tailwind CSS v4 - Vite Plugin Mode */
+/* Brand: Agnes Tachyon - 实验室仪表盘,深黑操作台 / 紫色试剂反应 / 青色电子读数 */
 
 @import "tailwindcss";
 
 /* ============================================
-    CSS Custom Properties (Design Tokens)
+    第一层:Primitive Tokens(原始色板,不直接使用)
    ============================================ */
 @theme {
-    /* Colors */
-    --color-bg-primary: #0A0A0F;
-    --color-bg-secondary: #12121A;
-    --color-bg-tertiary: #1A1A25;
-    --color-bg-elevated: #22222F;
+  /* ===== Near Black 基底(实验室暗室,纯灰阶无色偏)===== */
+  --black-0: #050505;
+  --black-1: #080808;
+  --black-2: #0a0a0a;
+  --black-3: #0d0d0d;
+  --black-4: #111111;
+  --black-5: #161618;
 
-    --color-accent-primary: #00D4AA;
-    --color-accent-secondary: #00B4D8;
-    --color-accent-glow: rgba(0, 212, 170, 0.3);
-    --color-accent-glow-strong: rgba(0, 212, 170, 0.5);
+  /* ===== Graphite / Gunmetal / Charcoal 中性阶 ===== */
+  --graphite-1: #1c1c1f;
+  --graphite-2: #232327;
+  --graphite-3: #2c2c31;
+  --gunmetal: #3a3a40;
+  --charcoal: #4a4a50;
+  --ash: #6b6b72;
+  --silver: #9a9aa2;
+  --platinum: #c9c9d0;
+  --porcelain: #ededf0;
+  --white-pure: #f7f7fa;
 
-    --color-success: #00D4AA;
-    --color-warning: #F59E0B;
-    --color-error: #EF4444;
-    --color-info: #00B4D8;
+  /* ===== Tachyon Violet(主强调,Agnes Tachyon 标志色)===== */
+  --violet-300: #c4b5fd;
+  --violet-400: #a78bfa;
+  --violet-500: #8b5cf6;
+  --violet-600: #7c3aed;
+  --violet-700: #6d28d9;
 
-    --color-text-primary: #F0F0F5;
-    --color-text-secondary: #A0A0B0;
-    --color-text-tertiary: #7B8290;
-    --color-text-disabled: #4B5563;
+  /* ===== Electric Purple(次强调,关键操作高亮)===== */
+  --purple-400: #c084fc;
+  --purple-500: #a855f7;
 
-    /* Thread Colors for ChunkMatrix */
-    --color-thread-0: #00D4AA;
-    --color-thread-1: #00B4D8;
-    --color-thread-2: #8B5CF6;
-    --color-thread-3: #F59E0B;
-    --color-thread-4: #EC4899;
-    --color-thread-5: #10B981;
-    --color-thread-6: #F97316;
-    --color-thread-7: #06B6D4;
-    --color-thread-8: #A855F7;
-    --color-thread-9: #84CC16;
-    --color-thread-10: #14B8A6;
-    --color-thread-11: #D946EF;
+  /* ===== Neon Cyan(点缀,仅实时下载速度指示)===== */
+  --cyan-400: #22d3ee;
+  --cyan-500: #00e5ff;
 
-    /* File Type Colors */
-    --color-file-video: #F59E0B;
-    --color-file-audio: #8B5CF6;
-    --color-file-document: #3B82F6;
-    --color-file-image: #10B981;
-    --color-file-archive: #F97316;
-    --color-file-executable: #6B7280;
-    --color-file-other: #6B7280;
+  /* ===== 状态色(克制饱和度,保持冷静)===== */
+  --emerald-500: #10b981;
+  --amber-500: #f59e0b;
+  --red-500: #ef4444;
 
-    /* Spacing */
-    --spacing-1: 4px;
-    --spacing-2: 8px;
-    --spacing-3: 12px;
-    --spacing-4: 16px;
-    --spacing-5: 20px;
-    --spacing-6: 24px;
-    --spacing-8: 32px;
-    --spacing-10: 40px;
-    --spacing-12: 48px;
+  /* ===== 字号阶梯(下载器高密度,1.250 major third)===== */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
 
-    /* Border Radius */
-    --radius-sm: 6px;
-    --radius-md: 8px;
-    --radius-lg: 12px;
-    --radius-xl: 16px;
-    --radius-full: 9999px;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
 
-    /* Shadows */
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
-    --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
-    --shadow-glow: 0 0 20px rgba(0, 212, 170, 0.15);
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+}
 
-    /* Typography */
-    --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --font-mono: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+/* ============================================
+    第二层:Semantic Tokens(语义层,组件使用这层)
+   ============================================ */
+@theme {
+  /* 背景层级(elevation) */
+  --color-bg-void: var(--black-0);
+  --color-bg-primary: var(--black-2);
+  --color-bg-secondary: var(--black-3);
+  --color-bg-tertiary: var(--graphite-1);
+  --color-bg-elevated: var(--black-5);
+  --color-bg-raised: var(--graphite-2);
+  --color-bg-overlay: var(--graphite-1);
+  --color-bg-hover: rgba(255, 255, 255, 0.04);
+  /* Modal/弹窗遮罩 scrim(Iteration 06:统一原散落的 rgba(0,0,0,0.4~0.6)) */
+  --color-overlay-scrim: rgba(0, 0, 0, 0.55);
+  /* 比 accent-soft 更淡的强调底色(细微 hover 高亮) */
+  --color-accent-faint: rgba(139, 92, 246, 0.04);
 
-    /* Transitions */
-    --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
-    --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* 兼容旧引用:bg-secondary 在 DetailPanel 中仍被引用 */
+  --color-bg-card: var(--graphite-1);
+
+  /* 边框 / 分隔 */
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-border-default: rgba(255, 255, 255, 0.1);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+
+  /* 文本层级 */
+  --color-text-primary: var(--platinum);
+  --color-text-secondary: var(--silver);
+  --color-text-tertiary: var(--ash);
+  --color-text-disabled: var(--charcoal);
+  --color-text-inverse: var(--black-2);
+  /* 兼容旧引用 */
+  --color-text-title: var(--porcelain);
+
+  /* 强调色(严格控制使用频率) */
+  --color-accent-primary: var(--violet-500);
+  --color-accent-secondary: var(--violet-400);
+  --color-accent-tertiary: var(--violet-600);
+  --color-accent-glow: rgba(139, 92, 246, 0.25);
+  --color-accent-glow-strong: rgba(139, 92, 246, 0.5);
+  --color-accent-soft: rgba(139, 92, 246, 0.12);
+
+  /* 速度指示(Neon Cyan,仅实时下载速度数字与 sparkline) */
+  --color-speed-active: var(--cyan-500);
+  --color-speed-soft: rgba(0, 229, 255, 0.12);
+  /* 信息/警告的柔和底色(筛选激活态,Iteration 06) */
+  --color-info-soft: rgba(34, 211, 238, 0.3);
+  --color-warning-soft: rgba(245, 158, 11, 0.3);
+
+  /* 状态语义:紫(下载中)/ 灰(暂停)/ 翠绿(完成)/ 琥珀(警告)/ 红(错误) */
+  --color-success: var(--emerald-500);
+  --color-warning: var(--amber-500);
+  --color-error: var(--red-500);
+  --color-info: var(--cyan-400);
+
+  --color-status-downloading: var(--violet-500);
+  --color-status-paused: var(--ash);
+  --color-status-completed: var(--emerald-500);
+  --color-status-warning: var(--amber-500);
+  --color-status-error: var(--red-500);
+  --color-status-pending: var(--charcoal);
+  --color-status-connecting: var(--cyan-400);
+  --color-status-verifying: var(--cyan-400);
+  --color-status-resuming: var(--violet-400);
+
+  /* Thread 颜色精简:12 色彩虹 → 5 阶单色 */
+  --color-thread-0: var(--violet-500);
+  --color-thread-1: var(--violet-400);
+  --color-thread-2: var(--violet-600);
+  --color-thread-3: var(--purple-500);
+  --color-thread-4: var(--cyan-500);
+  --color-thread-5: var(--violet-500);
+  --color-thread-6: var(--violet-400);
+  --color-thread-7: var(--purple-500);
+  --color-thread-8: var(--violet-600);
+  --color-thread-9: var(--cyan-500);
+  --color-thread-10: var(--violet-500);
+  --color-thread-11: var(--violet-400);
+
+  /* File Type Colors(保留功能性分类色,降低饱和度) */
+  --color-file-video: var(--amber-500);
+  --color-file-audio: var(--violet-500);
+  --color-file-document: #3b82f6;
+  --color-file-image: var(--emerald-500);
+  --color-file-archive: #f97316;
+  --color-file-executable: var(--ash);
+  --color-file-model: var(--purple-500);
+  --color-file-other: var(--ash);
+
+  /* Spacing */
+  --spacing-1: 4px;
+  --spacing-2: 8px;
+  --spacing-3: 12px;
+  --spacing-4: 16px;
+  --spacing-5: 20px;
+  --spacing-6: 24px;
+  --spacing-8: 32px;
+  --spacing-10: 40px;
+  --spacing-12: 48px;
+
+  /* Border Radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 20px rgba(139, 92, 246, 0.15);
+  --shadow-accent: 0 0 0 1px var(--color-accent-glow);
+
+  /* Typography */
+  --font-sans:
+    "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "SF Mono", "Fira Code", monospace;
+
+  /* Transitions */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Motion Token: micro/meso/macro */
+  --duration-instant: 80ms;
+  --duration-fast: 150ms;
+  --duration-normal: 200ms;
+  --duration-slow: 300ms;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-decelerated: cubic-bezier(0, 0, 0.2, 1);
 }
 
 /* ============================================
    Base Styles
    ============================================ */
 * {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
 html,
 body,
 #root {
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
-    font-family: var(--font-sans);
-    background: var(--color-bg-primary);
-    color: var(--color-text-primary);
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    user-select: none;
+  font-family: var(--font-sans);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
 }
 
 /* Scrollbar */
 ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-    background: transparent;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.2);
 }
 
 /* ============================================
    Utility Classes
    ============================================ */
 
-/* Global focus-visible utility for keyboard navigation */
+/* 屏幕阅读器专用: visually hidden but accessible */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Global focus-visible utility for keyboard navigation - 双层增强(紫 + 白光晕) */
 .focus-visible:focus-visible {
-    outline: 2px solid var(--color-accent-primary);
-    outline-offset: 2px;
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
+}
+
+/* 焦点环工具类:供 Tailwind focus-visible: 覆盖不到的自定义元素使用(如 TaskItem) */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
+}
+
+/* 搜索高亮:供 TaskItem HighlightedText 的 <mark> 使用 */
+.search-highlight {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-secondary);
+  border-radius: 2px;
+  padding: 0 2px;
 }
 
 .glass {
-    background: rgba(18, 18, 26, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(16, 16, 20, 0.85);
+  border: 1px solid var(--color-border-subtle);
 }
 
 .glass-blur {
-    background: rgba(18, 18, 26, 0.85);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(16, 16, 20, 0.85);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--color-border-subtle);
 }
 
-.glass-strong {
-    background: rgba(18, 18, 26, 0.92);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+/* 面板表面(Iteration 07:原 .glass-strong,实际无 backdrop-filter,语义化为 panel-surface) */
+.panel-surface {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+}
+
+/* 可排序列头(Iteration 07 DI-3):hover 反馈,提示可点击排序 */
+.task-col-header:hover {
+  color: var(--color-text-primary);
 }
 
 .accent-gradient {
-    background: linear-gradient(135deg, var(--color-accent-primary) 0%, var(--color-accent-secondary) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--color-accent-primary) 0%,
+    var(--color-accent-secondary) 100%
+  );
 }
 
 /* ============================================
    Animations
    ============================================ */
 
+/* ============================================
+   响应式面板宽度 CSS 变量
+   ============================================ */
+
+:root {
+  --panel-detail-width: 400px;
+  --panel-modal-width: 480px;
+  --panel-sniffer-width: 380px;
+}
+
+@media (max-width: 768px) {
+  :root {
+    --panel-detail-width: min(400px, calc(100vw - 32px));
+    --panel-modal-width: min(480px, calc(100vw - 32px));
+    --panel-sniffer-width: min(380px, calc(100vw - 32px));
+  }
+}
+
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
-    }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 @keyframes logo-shimmer {
+  0%,
+  100% {
+    opacity: 0.6;
+    filter: brightness(1);
+  }
 
-    0%,
-    100% {
-        opacity: 0.6;
-        filter: brightness(1);
-    }
-
-    50% {
-        opacity: 1;
-        filter: brightness(1.3);
-    }
+  50% {
+    opacity: 1;
+    filter: brightness(1.3);
+  }
 }
 
 @keyframes chunk-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 4px var(--color-accent-glow);
+  }
 
-    0%,
-    100% {
-        opacity: 1;
-        box-shadow: 0 0 4px var(--color-accent-glow);
-    }
-
-    50% {
-        opacity: 0.5;
-        box-shadow: 0 0 8px var(--color-accent-glow-strong);
-    }
+  50% {
+    opacity: 0.5;
+    box-shadow: 0 0 8px var(--color-accent-glow-strong);
+  }
 }
 
 @keyframes chunk-appear {
-    0% {
-        transform: scale(0);
-        opacity: 0;
-    }
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
 
-    70% {
-        transform: scale(1.1);
-    }
+  70% {
+    transform: scale(1.1);
+  }
 
-    100% {
-        transform: scale(1);
-        opacity: 1;
-    }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 /* Chunk cell hover interaction */
 .chunk-cell {
-    cursor: pointer;
-    transition: transform 150ms cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 150ms ease;
+  cursor: pointer;
+  transition:
+    transform 150ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 150ms ease;
 }
 
 .chunk-cell:hover {
-    transform: scale(2.5);
-    z-index: 10;
-    box-shadow: 0 0 16px rgba(255, 255, 255, 0.4), 0 0 6px rgba(255, 255, 255, 0.2);
-    outline: 2px solid rgba(255, 255, 255, 0.5);
-    outline-offset: 1px;
-    filter: brightness(1.3);
+  transform: scale(2.5);
+  z-index: 10;
+  box-shadow:
+    0 0 16px rgba(255, 255, 255, 0.4),
+    0 0 6px rgba(255, 255, 255, 0.2);
+  outline: 2px solid rgba(255, 255, 255, 0.5);
+  outline-offset: 1px;
+  filter: brightness(1.3);
 }
 
 /* Chunk tooltip - floating */
 .chunk-tooltip {
-    position: absolute;
-    z-index: 20;
-    padding: 8px 12px;
-    background: rgba(18, 18, 26, 0.92);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    pointer-events: none;
-    backdrop-filter: blur(12px);
-    animation: tooltip-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
-    white-space: nowrap;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 1px rgba(255, 255, 255, 0.1);
+  position: absolute;
+  z-index: 20;
+  padding: 8px 12px;
+  background: rgba(16, 16, 20, 0.92);
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+  animation: tooltip-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  white-space: nowrap;
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 1px rgba(255, 255, 255, 0.1);
 }
 
 @keyframes tooltip-pop {
-    from {
-        opacity: 0;
-        transform: scale(0.9) translateY(4px);
-    }
-    to {
-        opacity: 1;
-        transform: scale(1) translateY(0);
-    }
+  from {
+    opacity: 0;
+    transform: scale(0.9) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 .chunk-tooltip-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 3px;
-    flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
 }
 
 .chunk-tooltip-body {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .chunk-tooltip-title {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    font-weight: 600;
-    color: #F0F0F5;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-title);
 }
 
 .chunk-tooltip-subtitle {
-    font-weight: 400;
-    color: #6B7280;
-    font-size: 11px;
+  font-weight: 400;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
 }
 
 .chunk-tooltip-meta {
-    font-size: 11px;
-    display: flex;
-    align-items: center;
-    gap: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .chunk-tooltip-sep {
-    color: #3A3A4A;
+  color: var(--gunmetal);
 }
 
 .chunk-tooltip-row {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .chunk-tooltip-label {
-    font-size: 10px;
-    color: #6B7280;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 
 .chunk-tooltip-value {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: #F0F0F5;
-    font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-primary);
+  font-weight: 600;
 }
 
 @keyframes toast-in {
-    0% {
-        transform: translateX(100%) scale(0.95);
-        opacity: 0;
-    }
+  0% {
+    transform: translateX(100%) scale(0.95);
+    opacity: 0;
+  }
 
-    100% {
-        transform: translateX(0) scale(1);
-        opacity: 1;
-    }
+  100% {
+    transform: translateX(0) scale(1);
+    opacity: 1;
+  }
 }
 
 @keyframes toast-out {
-    0% {
-        transform: translateX(0) scale(1);
-        opacity: 1;
-    }
+  0% {
+    transform: translateX(0) scale(1);
+    opacity: 1;
+  }
 
-    100% {
-        transform: translateX(100%) scale(0.95);
-        opacity: 0;
-    }
+  100% {
+    transform: translateX(100%) scale(0.95);
+    opacity: 0;
+  }
 }
 
 @keyframes drag-glow {
+  0%,
+  100% {
+    box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.4);
+  }
 
-    0%,
-    100% {
-        box-shadow: inset 0 0 0 2px rgba(0, 212, 170, 0.4);
-    }
-
-    50% {
-        box-shadow: inset 0 0 0 2px rgba(0, 212, 170, 0.8);
-    }
+  50% {
+    box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.8);
+  }
 }
 
 @keyframes shimmer {
-    0% {
-        background-position: -200% 0;
-    }
+  0% {
+    background-position: -200% 0;
+  }
 
-    100% {
-        background-position: 200% 0;
-    }
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 @keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
 
-    0%,
-    100% {
-        opacity: 1;
-    }
-
-    50% {
-        opacity: 0.5;
-    }
+  50% {
+    opacity: 0.5;
+  }
 }
 
 @keyframes fadeIn {
-    0% {
-        opacity: 0;
-    }
+  0% {
+    opacity: 0;
+  }
 
-    100% {
-        opacity: 1;
-    }
+  100% {
+    opacity: 1;
+  }
 }
 
 @keyframes card-fade-in {
-    0% {
-        opacity: 0;
-        transform: translateY(4px);
-    }
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
 
-    100% {
-        opacity: 1;
-        transform: translateY(0);
-    }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* ============================================
@@ -408,207 +583,315 @@ body {
 
 /* Button Base */
 .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-family: var(--font-sans);
-    font-weight: 500;
-    border: none;
-    cursor: pointer;
-    transition: all 200ms var(--ease-spring);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: all 200ms var(--ease-spring);
 }
 
 .btn:hover {
-    transform: translateY(-2px);
+  transform: translateY(-2px);
 }
 
 .btn:active {
-    transform: translateY(0);
+  transform: translateY(0);
 }
 
+/* 主按钮:纯紫色 + glow shadow,移除渐变(性能:减少合成层) */
 .btn-primary {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-family: var(--font-sans);
-    font-weight: 600;
-    border: none;
-    cursor: pointer;
-    transition: all 200ms var(--ease-spring);
-    background: linear-gradient(135deg, var(--color-accent-primary) 0%, var(--color-accent-secondary) 100%);
-    color: var(--color-bg-primary);
-    padding: 8px 16px;
-    border-radius: var(--radius-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 200ms var(--ease-spring),
+    box-shadow 200ms var(--ease-spring),
+    transform 100ms ease;
+  background: var(--color-accent-primary);
+  color: var(--white-pure);
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
 }
 
 .btn-primary:hover {
-    box-shadow: 0 4px 16px rgba(0, 212, 170, 0.3);
+  background: var(--color-accent-secondary);
+  box-shadow:
+    0 0 0 1px var(--color-accent-glow),
+    0 4px 16px rgba(139, 92, 246, 0.25);
+}
+
+.btn-primary:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
+}
+
+.btn-primary:disabled {
+  background: var(--charcoal);
+  color: var(--ash);
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
 }
 
 .btn-secondary {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-family: var(--font-sans);
-    font-weight: 500;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    cursor: pointer;
-    transition: all 200ms var(--ease-spring);
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--color-text-primary);
-    padding: 8px 16px;
-    border-radius: var(--radius-md);
-    backdrop-filter: blur(10px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  border: 1px solid var(--color-border-default);
+  cursor: pointer;
+  transition: all 200ms var(--ease-spring);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
 }
 
 .btn-secondary:hover {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.2);
-    transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--color-border-strong);
+  transform: translateY(-1px);
+}
+
+.btn-secondary:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+.btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Ghost button: 无背景文字按钮(工具栏/批量操作) */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  transition:
+    color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+.btn-ghost:hover {
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+.btn-ghost:active {
+  transform: scale(0.97);
+  background: rgba(255, 255, 255, 0.1);
+}
+.btn-ghost:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+.btn-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Button size modifiers */
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+}
+.btn-md {
+  padding: 8px 16px;
+  font-size: 13px;
+  border-radius: var(--radius-md);
+}
+.btn-lg {
+  padding: 10px 20px;
+  font-size: 14px;
+  border-radius: var(--radius-md);
+}
+
+/* Icon button shape(正方形,由 icon-btn / icon-btn-sm 控制尺寸) */
+.btn-icon,
+.btn-icon-sm {
+  aspect-ratio: 1;
 }
 
 .btn-danger {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-family: var(--font-sans);
-    font-weight: 500;
-    border: none;
-    cursor: pointer;
-    transition: all 200ms var(--ease-spring);
-    background: var(--color-error);
-    color: white;
-    padding: 8px 16px;
-    border-radius: var(--radius-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: all 200ms var(--ease-spring);
+  background: var(--color-error);
+  color: white;
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
 }
 
 .btn-danger:hover {
-    background: #F87171;
-    box-shadow: 0 4px 16px rgba(239, 68, 68, 0.3);
+  background: #f87171;
+  box-shadow: 0 4px 16px rgba(239, 68, 68, 0.3);
+}
+
+.btn-danger:focus-visible {
+  outline: 2px solid var(--color-error);
+  outline-offset: 2px;
 }
 
 /* Input Base */
 .input {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
-    color: var(--color-text-primary);
-    font-size: 14px;
-    font-family: var(--font-sans);
-    width: 100%;
-    transition: all 200ms ease;
-    outline: none;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-family: var(--font-sans);
+  width: 100%;
+  transition: all 200ms ease;
+  outline: none;
 }
 
 .input:focus {
-    border-color: rgba(0, 212, 170, 0.6);
-    box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.2);
-    background: rgba(255, 255, 255, 0.06);
-    outline: 2px solid transparent;
+  border-color: var(--color-accent-secondary);
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
+  background: rgba(255, 255, 255, 0.06);
+  outline: 2px solid transparent;
 }
 
 .input::placeholder {
-    color: var(--color-text-tertiary);
+  color: var(--color-text-tertiary);
 }
 
 /* Toggle */
 .toggle {
-    width: 40px;
-    height: 22px;
-    border-radius: 11px;
-    background: #2A2A3A;
-    transition: all 200ms ease;
-    position: relative;
-    cursor: pointer;
+  width: 40px;
+  height: 22px;
+  border-radius: 11px;
+  background: var(--graphite-2);
+  transition: all 200ms ease;
+  position: relative;
+  cursor: pointer;
 }
 
 .toggle.on {
-    background: var(--color-accent-primary);
+  background: var(--color-accent-primary);
 }
 
 .toggle-thumb {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    background: white;
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    transition: transform 200ms var(--ease-spring);
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: white;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: transform 200ms var(--ease-spring);
 }
 
 .toggle.on .toggle-thumb {
-    transform: translateX(18px);
+  transform: translateX(18px);
 }
 
 /* ============================================
    Hover Utility Classes (replace JS hover)
    ============================================ */
 .hover-light {
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
+
 .hover-light:hover {
-    color: var(--color-text-primary);
-    background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .hover-accent {
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
+
 .hover-accent:hover {
-    color: var(--color-accent-primary);
-    background: rgba(0, 212, 170, 0.08);
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
 }
 
 .hover-danger {
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
+
 .hover-danger:hover {
-    color: var(--color-error);
-    background: rgba(239, 68, 68, 0.1);
+  color: var(--color-error);
+  background: rgba(239, 68, 68, 0.1);
 }
 
 .hover-close:hover {
-    color: white;
-    background: var(--color-error);
+  color: white;
+  background: var(--color-error);
 }
 
 .hover-lift {
-    transition: transform 200ms var(--ease-spring), box-shadow 200ms var(--ease-spring);
+  transition:
+    transform 200ms var(--ease-spring),
+    box-shadow 200ms var(--ease-spring);
 }
+
 .hover-lift:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 16px rgba(0, 212, 170, 0.3);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(139, 92, 246, 0.2);
 }
 
 .hover-lift-sm {
-    transition: transform 150ms ease, box-shadow 150ms ease;
+  transition:
+    transform 150ms ease,
+    box-shadow 150ms ease;
 }
+
 .hover-lift-sm:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .hover-row {
-    transition: background 150ms ease;
+  transition: background 150ms ease;
 }
+
 .hover-row:hover {
-    background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .hover-underline:hover {
-    text-decoration: underline;
+  text-decoration: underline;
 }
 
 /* ============================================
@@ -617,498 +900,680 @@ body {
 
 /* Icon button (32x32) */
 .icon-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    border: none;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
+
 .icon-btn:hover {
-    color: var(--color-text-primary);
-    background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.icon-btn:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
 }
 
 /* Small icon button (28x28 visual, 44x44 touch target) */
 .icon-btn-sm {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
-    position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+  position: relative;
 }
+
 .icon-btn-sm::before {
-    content: '';
-    position: absolute;
-    inset: -8px;
-    border-radius: var(--radius-sm);
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: var(--radius-sm);
 }
+
 .icon-btn-sm:hover {
-    color: var(--color-text-primary);
-    background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.icon-btn-sm:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
 }
 
 /* Window control button (36x36) */
 .win-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    border: none;
-    cursor: pointer;
-    color: var(--color-text-tertiary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
+
 .win-btn:hover {
-    color: var(--color-text-primary);
-    background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
 }
+
 .win-btn-close:hover {
-    color: white;
-    background: var(--color-error);
+  color: white;
+  background: var(--color-error);
 }
 
 /* Pill button (small, inline) */
 .pill-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 12px;
-    border: none;
-    cursor: pointer;
-    transition: background 150ms ease, color 150ms ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
 }
+
 .pill-btn-default {
-    color: var(--color-text-tertiary);
-    background: rgba(255, 255, 255, 0.04);
+  color: var(--color-text-tertiary);
+  background: rgba(255, 255, 255, 0.04);
 }
+
 .pill-btn-default:hover {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-text-primary);
 }
+
 .pill-btn-active {
-    color: var(--color-accent-primary);
-    background: rgba(0, 212, 170, 0.12);
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
 }
 
 /* Stat item */
 .stat-item {
-    display: flex;
-    flex-direction: column;
-    padding: 12px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border-subtle);
 }
+
 .stat-label {
-    font-size: 12px;
-    color: var(--color-text-tertiary);
+  font-size: 12px;
+  color: var(--color-text-tertiary);
 }
+
 .stat-value {
-    font-size: 14px;
-    color: var(--color-text-primary);
-    font-family: var(--font-mono);
-    margin-top: 4px;
+  font-size: 14px;
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  margin-top: 4px;
 }
+
 .stat-value-highlight {
-    color: var(--color-accent-primary);
+  color: var(--color-accent-primary);
 }
 
 /* Section label */
 .section-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--color-text-tertiary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* 分片分布旁的诚实说明问号(交代颜色语义) */
+.chunk-info-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border-default);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  cursor: help;
+  text-transform: none;
+  vertical-align: middle;
 }
 
 /* Panel overlay */
 .panel-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 200;
-    background: rgba(0, 0, 0, 0.5);
-    animation: fadeIn 200ms ease forwards;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.5);
+  animation: fadeIn 200ms ease forwards;
 }
 
 /* Slide panel (right side, fixed) */
 .slide-panel {
-    position: fixed;
-    top: 0;
-    right: 0;
-    height: 100%;
-    z-index: 90;
-    display: flex;
-    flex-direction: column;
-    background: rgba(18, 18, 26, 0.95);
-    border-left: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: -8px 0 32px rgba(0, 0, 0, 0.3);
-    transition: transform 300ms cubic-bezier(0.32, 0.72, 0, 1);
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100%;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  background: rgba(16, 16, 20, 0.95);
+  border-left: 1px solid var(--color-border-subtle);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.3);
+  transition: transform 300ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 /* Mono text */
 .mono {
-    font-family: var(--font-mono);
+  font-family: var(--font-mono);
 }
 
 /* Panel header */
 .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 20px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
 /* Panel title */
 .panel-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--color-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
 }
 
 /* Sidebar resize handle */
 .resize-handle:hover {
-    background: rgba(255, 255, 255, 0.1) !important;
+  background: rgba(255, 255, 255, 0.1) !important;
 }
 
 /* ============================================
    Active / Tactile Feedback
    ============================================ */
 .btn-primary:active {
-    transform: scale(0.97);
+  transform: scale(0.97);
+  background: var(--color-accent-tertiary);
 }
 
 .btn-secondary:active {
-    transform: scale(0.97);
+  transform: scale(0.97);
 }
 
 .btn-danger:active {
-    transform: scale(0.97);
+  transform: scale(0.97);
 }
 
 .icon-btn:active {
-    transform: scale(0.92);
+  transform: scale(0.92);
 }
 
 .icon-btn-sm:active {
-    transform: scale(0.92);
+  transform: scale(0.92);
 }
 
 .win-btn:active {
-    transform: scale(0.92);
+  transform: scale(0.92);
 }
 
 .pill-btn:active {
-    transform: scale(0.97);
+  transform: scale(0.97);
 }
 
 .hover-light:active {
-    background: rgba(255, 255, 255, 0.1) !important;
-    transform: scale(0.98);
+  background: rgba(255, 255, 255, 0.1) !important;
+  transform: scale(0.98);
 }
 
 .hover-accent:active {
-    background: rgba(0, 212, 170, 0.15) !important;
-    transform: scale(0.98);
+  background: rgba(139, 92, 246, 0.15) !important;
+  transform: scale(0.98);
 }
 
 .hover-danger:active {
-    background: rgba(239, 68, 68, 0.2) !important;
-    transform: scale(0.98);
+  background: rgba(239, 68, 68, 0.2) !important;
+  transform: scale(0.98);
 }
 
 .hover-lift:active {
-    transform: translateY(0) scale(0.98) !important;
-    box-shadow: none !important;
+  transform: translateY(0) scale(0.98) !important;
+  box-shadow: none !important;
 }
 
 .hover-lift-sm:active {
-    transform: translateY(0) scale(0.98) !important;
-    box-shadow: none !important;
+  transform: translateY(0) scale(0.98) !important;
+  box-shadow: none !important;
 }
 
 .hover-row:active {
-    background: rgba(255, 255, 255, 0.06) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
 }
 
 /* ============================================
    Progress Bar Shimmer
+   紫→深紫微动,仅在真正写入数据时启用
    ============================================ */
 @keyframes progress-shimmer {
-    0% {
-        background-position: -200% 0;
-    }
-    100% {
-        background-position: 200% 0;
-    }
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 .progress-bar-active {
-    background: linear-gradient(
-        90deg,
-        #00D4AA 0%,
-        #00B4D8 30%,
-        #00E8C0 50%,
-        #00B4D8 70%,
-        #00D4AA 100%
-    ) !important;
-    background-size: 200% 100% !important;
-    animation: progress-shimmer 2s linear infinite;
+  background: linear-gradient(
+    90deg,
+    var(--violet-500) 0%,
+    var(--violet-600) 50%,
+    var(--violet-500) 100%
+  ) !important;
+  background-size: 200% 100% !important;
+  animation: progress-shimmer 2.5s linear infinite;
 }
 
 /* ============================================
    Task Item Stagger Entry
    ============================================ */
 @keyframes task-enter {
-    0% {
-        opacity: 0;
-        transform: translateY(8px);
-    }
-    100% {
-        opacity: 1;
-        transform: translateY(0);
-    }
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .task-item-enter {
-    animation: task-enter 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
-    animation-delay: calc(var(--stagger-index, 0) * 40ms);
+  animation: task-enter 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--stagger-index, 0) * 40ms);
 }
 
 /* ============================================
    Status Indicator (Refined Breathing)
    ============================================ */
 @keyframes status-breathe {
-    0%, 100% {
-        box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.4);
-        opacity: 1;
-    }
-    50% {
-        box-shadow: 0 0 6px 2px rgba(0, 212, 170, 0.2);
-        opacity: 0.8;
-    }
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4);
+    opacity: 1;
+  }
+  50% {
+    box-shadow: 0 0 6px 2px rgba(139, 92, 246, 0.2);
+    opacity: 0.8;
+  }
 }
 
 .status-indicator-active {
-    animation: status-breathe 2.5s ease-in-out infinite;
+  animation: status-breathe 2.5s ease-in-out infinite;
 }
 
 /* ============================================
    Drag-over Glow for Input
    ============================================ */
 @keyframes input-drag-glow {
-    0%, 100% {
-        border-color: rgba(0, 212, 170, 0.4);
-        box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.08);
-    }
-    50% {
-        border-color: rgba(0, 212, 170, 0.7);
-        box-shadow: 0 0 0 4px rgba(0, 212, 170, 0.15);
-    }
+  0%,
+  100% {
+    border-color: rgba(139, 92, 246, 0.4);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
+  }
+  50% {
+    border-color: rgba(139, 92, 246, 0.7);
+    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15);
+  }
 }
 
 .input-drag-over {
-    border-color: rgba(0, 212, 170, 0.5) !important;
-    animation: input-drag-glow 1.2s ease-in-out infinite;
+  border-color: rgba(139, 92, 246, 0.5) !important;
+  animation: input-drag-glow 1.2s ease-in-out infinite;
 }
 
 /* ============================================
    Detail Panel
    ============================================ */
 .detail-stat-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
 }
 
 .detail-stat-cell {
-    padding: 8px 6px 8px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    min-width: 0;
+  padding: 8px 6px 8px 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+  min-width: 0;
 }
 
 .detail-stat-label {
-    font-size: 10px;
-    color: var(--color-text-tertiary);
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    white-space: nowrap;
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
 }
 
 .detail-stat-value {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--color-text-primary);
-    margin-top: 2px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-text-primary);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .detail-stat-value--highlight {
-    color: var(--color-accent-primary);
-    font-weight: 600;
+  color: var(--color-accent-primary);
+  font-weight: 600;
 }
 
 .detail-info-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    gap: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+  gap: 8px;
 }
 
 .detail-info-label {
-    font-size: 10px;
-    color: var(--color-text-tertiary);
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 
 .detail-info-value {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-text-secondary);
-    margin-top: 2px;
-    overflow-wrap: break-word;
-    word-break: break-all;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
 
 .detail-menu {
-    position: absolute;
-    right: 0;
-    top: 100%;
-    margin-top: 4px;
-    min-width: 160px;
-    background: rgba(26, 26, 37, 0.98);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    box-shadow: var(--shadow-lg);
-    z-index: 50;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+  min-width: 160px;
+  background: rgba(28, 28, 31, 0.98);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  padding: 4px;
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
 }
 
 .detail-menu-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    text-align: left;
-    padding: 7px 10px;
-    border-radius: var(--radius-sm);
-    font-size: 13px;
-    border: none;
-    cursor: pointer;
-    color: var(--color-text-secondary);
-    background: transparent;
-    transition: color 150ms ease, background 150ms ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
 }
 
 .detail-menu-item:hover {
-    color: var(--color-text-primary);
-    background: rgba(255, 255, 255, 0.06);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .detail-error-box {
-    padding: 12px 14px;
-    border-radius: var(--radius-md);
-    background: rgba(239, 68, 68, 0.08);
-    border: 1px solid rgba(239, 68, 68, 0.15);
-    display: flex;
-    align-items: center;
-    gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.15);
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .detail-error-icon {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: rgba(239, 68, 68, 0.15);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .detail-progress-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 8px;
 }
 
 .detail-action-btn {
-    width: 100%;
-    padding: 10px 16px;
-    border-radius: var(--radius-md);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 200ms ease;
-    border: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
+  width: 100%;
+  padding: 10px 16px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 200ms ease;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .detail-action-delete {
-    color: var(--color-error);
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid rgba(239, 68, 68, 0.2);
+  color: var(--color-error);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
 .detail-action-delete:hover {
-    background: rgba(239, 68, 68, 0.18);
+  background: rgba(239, 68, 68, 0.18);
 }
 
 .detail-action-delete:active {
-    transform: scale(0.98);
+  transform: scale(0.98);
 }
 
 /* Custom scrollbar for detail panel */
 .overflow-y-auto {
-    scrollbar-width: thin;
-    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
 }
 
 .overflow-y-auto:hover {
-    scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
 }
 
 .overflow-y-auto::-webkit-scrollbar {
-    width: 5px;
+  width: 5px;
 }
 
 .overflow-y-auto::-webkit-scrollbar-track {
-    background: transparent;
+  background: transparent;
 }
 
 .overflow-y-auto::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.12);
-    border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
 }
 
 .overflow-y-auto:hover::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * HuggingFace 浏览器(Iteration 06)
+ * 全部使用语义 token,零硬编码。移除原玻璃拟态(backdrop-filter)。
+ * ───────────────────────────────────────────────────────────── */
+
+/* Panel 容器:实色 + elevation,无 backdrop-filter */
+.hf-panel {
+  width: min(680px, calc(100vw - 32px));
+  height: min(560px, calc(100dvh - 64px));
+  background: var(--color-bg-elevated);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-xl);
+  overflow: hidden;
+  animation: fadeIn 150ms ease forwards;
+}
+
+/* 量化标签(按 tier 差异化,VL-2) */
+.quant-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.quant-tag-balanced {
+  /* 推荐平衡点:accent 主色 */
+  color: var(--color-accent-secondary);
+  background: var(--color-accent-soft);
+}
+.quant-tag-tiny {
+  /* 低质量小体积:中性灰 */
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-tertiary);
+}
+.quant-tag-large {
+  /* 高精度大体积:accent secondary */
+  color: var(--color-accent-secondary);
+  background: var(--color-accent-soft);
+}
+
+/* LFS 标签 */
+.lfs-tag {
+  font-size: 10px;
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* 树行:焦点环 + 筛选降透明度 */
+.hf-tree-row:focus-visible {
+  background: var(--color-bg-tertiary);
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: -2px;
+}
+.hf-tree-row-dimmed {
+  opacity: 0.3;
+}
+
+/* 展开箭头:旋转动效(用 class 替代内联 style) */
+.hf-chevron {
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+  color: var(--color-text-tertiary);
+}
+.hf-chevron-expanded {
+  transform: rotate(0deg);
+}
+
+/* 文件图标:弱化(原版 opacity 0.5) */
+.hf-file-icon {
+  opacity: 0.5;
+  color: var(--color-text-tertiary);
+}
+
+/* skeleton 占位 */
+.hf-skeleton {
+  height: 32px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  animation: shimmer 1.5s infinite linear;
+}
+
+/* 筛选条 tabs(radiogroup) */
+.hf-filter-tab {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition:
+    background 100ms ease,
+    color 100ms ease;
+  white-space: nowrap;
+}
+.hf-filter-tab:hover:not(:disabled) {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+.hf-filter-tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.hf-filter-tab-active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-secondary);
+}
+.hf-filter-count {
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.hf-filter-tab-active .hf-filter-count {
+  color: var(--color-accent-secondary);
+}
+
+/* 筛选搜索框 */
+.hf-filter-search {
+  flex: 1;
+  font-size: 12px;
+  background: transparent;
+  color: var(--color-text-primary);
+  border: none;
+  outline: none;
+  min-width: 0;
+}
+.hf-filter-search::placeholder {
+  color: var(--color-text-tertiary);
 }

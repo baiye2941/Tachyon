@@ -9,109 +9,33 @@
 pub mod config;
 pub mod error;
 pub mod event;
-pub mod filename;
-pub mod rate_limit;
+pub mod safety;
 #[cfg(any(test, feature = "test-harness"))]
 pub mod test_harness;
 pub mod traits;
 pub mod types;
-pub mod url_safety;
-
-use std::sync::atomic::{AtomicU64, Ordering};
+pub mod utils;
 
 // 重新导出核心类型
 pub use config::AppConfig;
+pub use config::ConfigPatch;
+pub use config::ConnectionPatch;
+pub use config::DownloadPatch;
 pub use config::IoStrategy;
 pub use config::SchedulerConfig;
 pub use config::USER_AGENT;
 pub use error::{DownloadError, DownloadResult};
-pub use filename::{
-    extract_filename, extract_filename_from_url, parse_content_disposition, sanitize_filename,
-    validate_save_path,
+pub use safety::{
+    extract_filename, extract_filename_from_url, parse_content_disposition, redact_url_for_log,
+    reject_forbidden_ip, sanitize_filename, validate_public_http_url, validate_redirect,
+    validate_resolved_ip, validate_save_path,
 };
-pub use traits::{ByteStream, Protocol, Storage, Verifier};
+pub use traits::{ByteStream, Protocol, Storage, TaskRunner, Verifier};
 pub use types::{
-    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskId, TaskProgress,
+    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, FragmentProgress, TaskCommand,
+    TaskId, TaskProgress,
 };
-pub use url_safety::{
-    redact_url_for_log, reject_forbidden_ip, validate_public_http_url, validate_redirect,
-    validate_resolved_ip,
-};
-
-/// 下载性能指标计数器
-///
-/// 使用 AtomicU64 实现无锁统计,适用于高并发下载场景。
-/// 各字段含义:
-/// - `bytes_downloaded`: 累计已下载字节数
-/// - `fragments_completed`: 已完成的分片数
-/// - `errors`: 错误计数
-///
-/// 注意: 当前为预留的生产可观测性接口,待下游模块集成后启用。
-/// 测试代码可直接使用,生产代码调用前需确认集成状态。
-#[derive(Debug)]
-pub struct Metrics {
-    /// 累计已下载字节数
-    pub bytes_downloaded: AtomicU64,
-    /// 已完成的分片数
-    pub fragments_completed: AtomicU64,
-    /// 错误计数
-    pub errors: AtomicU64,
-}
-
-impl Metrics {
-    /// 创建全零初始化的指标实例
-    pub fn new() -> Self {
-        Self {
-            bytes_downloaded: AtomicU64::new(0),
-            fragments_completed: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-        }
-    }
-
-    /// 原子累加下载字节数
-    pub fn add_bytes(&self, n: u64) {
-        self.bytes_downloaded.fetch_add(n, Ordering::AcqRel);
-    }
-
-    /// 原子递增完成分片数
-    pub fn inc_fragment(&self) {
-        self.fragments_completed.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// 原子递增错误计数
-    pub fn inc_error(&self) {
-        self.errors.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// 读取当前指标快照(Acquire 语义,保证看到最新的写入)
-    pub fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.bytes_downloaded.load(Ordering::Acquire),
-            self.fragments_completed.load(Ordering::Acquire),
-            self.errors.load(Ordering::Acquire),
-        )
-    }
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 高性能 hex 编码(预分配数组,无逐字节 format! 分配)
-///
-/// 将字节数组编码为十六进制字符串,使用查表法避免逐字节分配。
-/// 性能比 `format!("{:02x}", byte)` 循环快约 5 倍。
-pub fn hex_encode(bytes: &[u8]) -> String {
-    const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = vec![0u8; bytes.len() * 2];
-    for (i, &b) in bytes.iter().enumerate() {
-        buf[i * 2] = HEX_TABLE[(b >> 4) as usize];
-        buf[i * 2 + 1] = HEX_TABLE[(b & 0x0f) as usize];
-    }
-    String::from_utf8(buf).expect("hex 编码只产生有效 ASCII 字符")
-}
+pub use utils::{Metrics, hex_encode};
 
 /// 事件广播可观测性验证测试
 ///
@@ -160,37 +84,6 @@ async fn event_broadcast() {
     assert_eq!(received_progress, progress_event);
 }
 
-/// 验证 Metrics 计数器的基本功能
-#[cfg(test)]
-#[test]
-fn metrics() {
-    let m = Metrics::new();
-
-    // 初始状态全部为零
-    assert_eq!(m.bytes_downloaded.load(Ordering::Relaxed), 0);
-    assert_eq!(m.fragments_completed.load(Ordering::Relaxed), 0);
-    assert_eq!(m.errors.load(Ordering::Relaxed), 0);
-
-    // 累加字节数
-    m.add_bytes(1024);
-    m.add_bytes(2048);
-    assert_eq!(m.bytes_downloaded.load(Ordering::Relaxed), 3072);
-
-    // 递增分片计数
-    m.inc_fragment();
-    m.inc_fragment();
-    m.inc_fragment();
-    assert_eq!(m.fragments_completed.load(Ordering::Relaxed), 3);
-
-    // 递增错误计数
-    m.inc_error();
-    assert_eq!(m.errors.load(Ordering::Relaxed), 1);
-
-    // Default trait 实现与 new() 等价
-    let m2 = Metrics::default();
-    assert_eq!(m2.bytes_downloaded.load(Ordering::Relaxed), 0);
-}
-
 /// 验证统一配置类型存在且序列化往返正确
 #[cfg(test)]
 #[test]
@@ -202,6 +95,7 @@ fn app_config() {
         request_timeout_secs: 60,
         connect_timeout_secs: 10,
         verify_checksum: false,
+        verify_strategy: config::VerifyStrategy::BestEffort,
         user_agent: "Tachyon/Test".to_string(),
         headers: std::collections::HashMap::new(),
         pause_timeout_secs: 300,

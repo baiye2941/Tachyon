@@ -15,6 +15,7 @@ const makeTask = (id: string, overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   fragmentsTotal: 4,
   fragmentsDone: 0,
   createdAt: '2026-05-30T00:00:00Z',
+  savePath: '/downloads',
   ...overrides,
 })
 

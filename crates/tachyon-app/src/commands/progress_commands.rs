@@ -1,4 +1,7 @@
 use super::{AppError, AppState, DownloadProgress, ProgressEvent, TaskProgress};
+use std::collections::HashMap;
+
+use crate::service::try_claim_subscription;
 
 // ---------------------------------------------------------------------------
 // Tauri command wrappers
@@ -19,45 +22,38 @@ pub async fn subscribe_progress(
 ) -> Result<(), AppError> {
     use tauri::Emitter;
 
-    let mut rx = state.progress_tx.subscribe();
-    let tasks = state.tasks.clone();
+    // 幂等去重:仅首次调用 spawn broker 任务,防止反复调用累积后台任务
+    if !try_claim_subscription(&state.runtime.progress_subscribed) {
+        tracing::debug!("进度订阅已存在,跳过重复订阅(幂等)");
+        return Ok(());
+    }
+
+    let mut rx = state.runtime.progress_broker.subscribe();
+    let task_repository = state.domain.task_repository.clone();
 
     tokio::spawn(async move {
-        {
-            let event: ProgressEvent = tasks
-                .iter()
-                .map(|r| {
-                    let id = r.key();
-                    let t = r.value();
-                    (
-                        id.clone(),
-                        TaskProgress {
-                            id: id.clone(),
-                            progress: t.progress,
-                            speed: t.speed,
-                            downloaded: t.downloaded,
-                            status: t.status,
-                            fragments_done: t.fragments_done,
-                        },
-                    )
-                })
-                .collect();
-            let _ = app_handle.emit("progress-update", &event);
-        }
+        // 首次广播全量快照，保证前端初始状态正确
+        let mut last_snapshot: ProgressEvent = build_initial_progress_event(&task_repository);
+        let _ = app_handle.emit("progress-update", &last_snapshot);
 
         while rx.changed().await.is_ok() {
             let snapshot = (*rx.borrow_and_update()).clone();
-            for (tid, tp) in &snapshot {
-                if tp.downloaded > 0 || tp.speed > 0 {
-                    tracing::info!(
-                        tid,
-                        downloaded = tp.downloaded,
-                        speed = tp.speed,
-                        "emit progress-update"
-                    );
+            let delta = compute_progress_delta(&snapshot, &last_snapshot);
+
+            if !delta.is_empty() {
+                for tp in delta.values() {
+                    if tp.downloaded > 0 || tp.speed > 0 {
+                        tracing::info!(
+                            tid = tp.id,
+                            downloaded = tp.downloaded,
+                            speed = tp.speed,
+                            "emit progress-update"
+                        );
+                    }
                 }
+                let _ = app_handle.emit("progress-update", &delta);
+                last_snapshot = snapshot;
             }
-            let _ = app_handle.emit("progress-update", &snapshot);
         }
     });
 
@@ -73,7 +69,8 @@ async fn get_download_progress_inner(
     task_id: String,
 ) -> Result<DownloadProgress, AppError> {
     let task = state
-        .tasks
+        .domain
+        .task_repository
         .get(&task_id)
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
     Ok(DownloadProgress {
@@ -88,6 +85,46 @@ async fn get_download_progress_inner(
     })
 }
 
+/// 根据当前任务列表构建首次订阅时的全量进度快照。
+fn build_initial_progress_event(
+    task_repository: &crate::repository::TaskRepository,
+) -> ProgressEvent {
+    task_repository
+        .iter()
+        .map(|r| {
+            let id = r.key();
+            let t = r.value();
+            (
+                id.clone(),
+                TaskProgress {
+                    id: id.clone(),
+                    progress: t.progress,
+                    speed: t.speed,
+                    downloaded: t.downloaded,
+                    status: t.status,
+                    fragments_done: t.fragments_done,
+                },
+            )
+        })
+        .collect()
+}
+
+/// 将新快照与上次广播值比较，只返回真正发生变化的任务。
+fn compute_progress_delta(
+    new: &ProgressEvent,
+    last: &HashMap<String, TaskProgress>,
+) -> ProgressEvent {
+    new.iter()
+        .filter_map(|(id, tp)| {
+            if last.get(id) != Some(tp) {
+                Some((id.clone(), tp.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -97,7 +134,42 @@ mod tests {
     use super::super::task_commands::create_task_inner;
     use super::super::tests::test_state;
     use super::*;
+    use crate::service::try_claim_subscription;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tachyon_core::types::DownloadState;
+
+    #[test]
+    fn test_try_claim_subscription_first_call_returns_true() {
+        // 首次声明:flag 从 false 切换到 true,返回 true(调用方应执行订阅)
+        let flag = AtomicBool::new(false);
+        assert!(try_claim_subscription(&flag));
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_try_claim_subscription_second_call_returns_false() {
+        // 第二次声明:flag 已是 true,返回 false(调用方应跳过,幂等)
+        let flag = AtomicBool::new(true);
+        assert!(!try_claim_subscription(&flag));
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_try_claim_subscription_idempotent_under_concurrency() {
+        // 模拟并发:多个线程同时声明,只有恰好一个返回 true
+        let flag = Arc::new(AtomicBool::new(false));
+        let claimed: Vec<_> = (0..16)
+            .map(|_| {
+                let flag = flag.clone();
+                std::thread::spawn(move || try_claim_subscription(&flag))
+            })
+            .collect();
+        let results: Vec<bool> = claimed.into_iter().map(|h| h.join().unwrap()).collect();
+        let success_count = results.iter().filter(|&&r| r).count();
+        assert_eq!(success_count, 1, "并发声明应恰好只有一个成功");
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn test_get_download_progress() {
@@ -146,5 +218,101 @@ mod tests {
         assert!(json.contains("taskId"));
         assert!(json.contains("fileSize"));
         assert!(json.contains("fragmentsTotal"));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_progress_initial_full_snapshot() {
+        let state = test_state();
+        let id1 = create_task_inner(&state, "https://example.com/1.bin".to_string(), None, None)
+            .await
+            .unwrap();
+        let id2 = create_task_inner(&state, "https://example.com/2.bin".to_string(), None, None)
+            .await
+            .unwrap();
+
+        let event = build_initial_progress_event(&state.domain.task_repository);
+        assert_eq!(event.len(), 2);
+        assert!(event.contains_key(&id1));
+        assert!(event.contains_key(&id2));
+    }
+
+    #[test]
+    fn test_compute_progress_delta_no_changes() {
+        let tp = TaskProgress {
+            id: "t1".to_string(),
+            progress: 0.5,
+            speed: 100,
+            downloaded: 512,
+            status: DownloadState::Downloading,
+            fragments_done: 2,
+        };
+        let mut last = HashMap::new();
+        last.insert("t1".to_string(), tp.clone());
+
+        let new = last.clone();
+        let delta = compute_progress_delta(&new, &last);
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn test_compute_progress_delta_only_changed_tasks() {
+        let mut last = HashMap::new();
+        last.insert(
+            "t1".to_string(),
+            TaskProgress {
+                id: "t1".to_string(),
+                progress: 0.1,
+                speed: 100,
+                downloaded: 100,
+                status: DownloadState::Downloading,
+                fragments_done: 1,
+            },
+        );
+        last.insert(
+            "t2".to_string(),
+            TaskProgress {
+                id: "t2".to_string(),
+                progress: 0.2,
+                speed: 200,
+                downloaded: 200,
+                status: DownloadState::Downloading,
+                fragments_done: 2,
+            },
+        );
+
+        let mut new = last.clone();
+        new.get_mut("t1").unwrap().progress = 0.5;
+        new.get_mut("t1").unwrap().speed = 150;
+
+        let delta = compute_progress_delta(&new, &last);
+        assert_eq!(delta.len(), 1);
+        assert!(delta.contains_key("t1"));
+        assert!(!delta.contains_key("t2"));
+
+        let changed = delta.get("t1").unwrap();
+        assert!((changed.progress - 0.5).abs() < f64::EPSILON);
+        assert_eq!(changed.speed, 150);
+        assert_eq!(changed.downloaded, 100);
+    }
+
+    #[test]
+    fn test_compute_progress_delta_new_task_appears() {
+        let last: HashMap<String, TaskProgress> = HashMap::new();
+        let mut new = ProgressEvent::new();
+        new.insert(
+            "t1".to_string(),
+            TaskProgress {
+                id: "t1".to_string(),
+                progress: 0.0,
+                speed: 0,
+                downloaded: 0,
+                status: DownloadState::Pending,
+                fragments_done: 0,
+            },
+        );
+
+        let delta = compute_progress_delta(&new, &last);
+        assert_eq!(delta.len(), 1);
+        assert!(delta.contains_key("t1"));
     }
 }

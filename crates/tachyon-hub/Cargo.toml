@@ -15,9 +15,8 @@ tachyon-core = { path = "../tachyon-core" }
 tachyon-protocol = { path = "../tachyon-protocol", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

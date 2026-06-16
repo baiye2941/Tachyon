@@ -45,13 +45,13 @@ export default function Sparkline(props: SparklineProps) {
     >
       <path
         d={pathD().area}
-        fill="rgba(0, 212, 170, 0.1)"
+        fill="var(--color-speed-soft)"
         stroke="none"
       />
       <path
         d={pathD().line}
         fill="none"
-        stroke="#00D4AA"
+        stroke="var(--color-speed-active)"
         stroke-width="2"
         stroke-linecap="round"
         stroke-linejoin="round"

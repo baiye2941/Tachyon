@@ -1,11 +1,14 @@
 import { For, createSignal, onCleanup, onMount } from 'solid-js'
 import type { ToastMessage } from '../types'
 import { XIcon } from './icons'
+import Button from '../shared/ui/Button'
 
 const [toasts, setToasts] = createSignal<ToastMessage[]>([])
 
+let _toastCounter = 0
+
 export function addToast(toast: Omit<ToastMessage, 'id'>) {
-  const id = Math.random().toString(36).slice(2)
+  const id = `toast-${_toastCounter++}`
   const newToast: ToastMessage = { ...toast, id, duration: toast.duration ?? 5000 }
   setToasts(prev => [...prev.slice(-2), newToast])
 
@@ -28,6 +31,8 @@ export default function ToastContainer() {
   return (
     <div
       class="fixed flex flex-col gap-2 pointer-events-none"
+      role="status"
+      aria-live="polite"
       style={{
         top: '48px',
         right: '16px',
@@ -63,11 +68,11 @@ function ToastItem(props: { toast: ToastMessage }) {
 
   const indicatorColor = () => {
     switch (props.toast.type) {
-      case 'success': return '#00D4AA'
-      case 'error': return '#EF4444'
-      case 'warning': return '#F59E0B'
-      case 'info': return '#00B4D8'
-      default: return '#00D4AA'
+      case 'success': return 'var(--color-success)'
+      case 'error': return 'var(--color-error)'
+      case 'warning': return 'var(--color-warning)'
+      case 'info': return 'var(--color-info)'
+      default: return 'var(--color-success)'
     }
   }
 
@@ -75,11 +80,11 @@ function ToastItem(props: { toast: ToastMessage }) {
     <div
       class="pointer-events-auto"
       style={{
-        background: 'rgba(18, 18, 26, 0.95)',
-        border: '1px solid rgba(255, 255, 255, 0.08)',
+        background: 'var(--color-bg-elevated)',
+        border: '1px solid var(--color-border-default)',
         'border-radius': '12px',
         padding: '12px 16px',
-        'box-shadow': '0 8px 24px rgba(0, 0, 0, 0.5)',
+        'box-shadow': 'var(--shadow-lg)',
         display: 'flex',
         gap: '12px',
         overflow: 'hidden',
@@ -108,7 +113,7 @@ function ToastItem(props: { toast: ToastMessage }) {
           class="truncate"
           style={{
             'font-size': '14px',
-            color: '#F0F0F5',
+            color: 'var(--color-text-title)',
             'font-weight': 500,
           }}
         >
@@ -118,7 +123,7 @@ function ToastItem(props: { toast: ToastMessage }) {
           <div
             style={{
               'font-size': '12px',
-              color: '#A0A0B0',
+              color: 'var(--color-text-secondary)',
               'margin-top': '2px',
             }}
           >
@@ -129,23 +134,18 @@ function ToastItem(props: { toast: ToastMessage }) {
           <div class="flex items-center gap-3" style={{ 'margin-top': '8px' }}>
             <For each={props.toast.actions}>
               {(action) => (
-                <button
-                  class="hover-accent hover-underline"
-                  style={{
-                    'font-size': '12px',
-                    color: '#00D4AA',
-                    background: 'none',
-                    border: 'none',
-                    cursor: 'pointer',
-                    padding: 0,
-                  }}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="关闭提示"
+                  style={{ 'font-size': '12px', padding: '0 4px' }}
                   onClick={() => {
                     action.onClick()
                     removeToast(props.toast.id)
                   }}
                 >
                   {action.label}
-                </button>
+                </Button>
               )}
             </For>
           </div>
@@ -153,20 +153,14 @@ function ToastItem(props: { toast: ToastMessage }) {
       </div>
 
       {/* Close */}
-      <button
-        class="icon-btn-sm"
-        style={{
-          width: '20px',
-          height: '20px',
-          color: '#6B7280',
-          background: 'none',
-          border: 'none',
-          cursor: 'pointer',
-        }}
+      <Button
+        variant="ghost"
+        shape="icon-sm"
+        aria-label="关闭通知"
         onClick={() => removeToast(props.toast.id)}
       >
         <XIcon />
-      </button>
+      </Button>
     </div>
   )
 }

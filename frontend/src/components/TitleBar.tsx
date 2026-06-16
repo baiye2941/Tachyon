@@ -9,11 +9,7 @@ type AppWindow = {
   onResized: (handler: () => void | Promise<void>) => Promise<() => void>
 }
 
-interface TitleBarProps {
-  onOpenSettings: () => void
-}
-
-export default function TitleBar(_props: TitleBarProps) {
+export default function TitleBar() {
   const [isMaximized, setIsMaximized] = createSignal(false)
   let appWindow: AppWindow | undefined
   let unlistenResize: (() => void) | undefined
@@ -74,8 +70,8 @@ export default function TitleBar(_props: TitleBarProps) {
       class="flex items-center justify-between select-none relative z-50"
       style={{
         height: '36px',
-        background: '#0A0A0F',
-        'border-bottom': '1px solid rgba(255,255,255,0.05)',
+        background: 'var(--color-bg-primary)',
+        'border-bottom': '1px solid var(--color-border-subtle)',
       }}
       data-tauri-drag-region
     >
@@ -89,7 +85,7 @@ export default function TitleBar(_props: TitleBarProps) {
           style={{
             width: '18px',
             height: '18px',
-            color: '#00D4AA',
+            color: 'var(--color-accent-primary)',
             animation: 'logo-shimmer 3s ease-in-out infinite',
           }}
         >
@@ -100,7 +96,7 @@ export default function TitleBar(_props: TitleBarProps) {
             'font-family': "'Geist', sans-serif",
             'font-size': '13px',
             'font-weight': 500,
-            color: '#F0F0F5',
+            color: 'var(--color-text-title)',
             'letter-spacing': '0.5px',
           }}
         >
@@ -144,8 +140,8 @@ export default function TitleBar(_props: TitleBarProps) {
         class="absolute bottom-0 left-0 right-0 pointer-events-none"
         style={{
           height: '1px',
-          background: 'linear-gradient(90deg, transparent 0%, rgba(0,212,170,0.1) 20%, rgba(0,180,216,0.1) 80%, transparent 100%)',
-          opacity: 0.5,
+          background: 'linear-gradient(90deg, transparent 0%, var(--color-accent-soft) 20%, var(--color-speed-soft) 80%, transparent 100%)',
+          opacity: 0.6,
         }}
       />
     </div>

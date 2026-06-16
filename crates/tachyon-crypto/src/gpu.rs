@@ -57,14 +57,27 @@ pub struct GpuVerifier {
     device: wgpu::Device,
     queue: wgpu::Queue,
     blake3_pipeline: wgpu::ComputePipeline,
-    /// 缓存的输入缓冲区(按最大容量分配,实际使用可能小于此容量)
-    cached_input_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
-    /// 缓存的输出缓冲区
-    cached_output_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
-    /// 缓存的 staging 缓冲区(用于 CPU 回读)
-    cached_staging_buffer: std::sync::Mutex<Option<wgpu::Buffer>>,
-    /// 缓存缓冲区的容量(字节),当新请求超过此容量时重新分配
-    cached_buffer_capacity: std::sync::Mutex<usize>,
+    /// 缓存的 GPU 缓冲区及容量,合并为单一 Mutex 防止部分字段不一致
+    cached: std::sync::Mutex<GpuCache>,
+}
+
+/// GPU 缓冲区缓存,合并为单一结构体保证容量和缓冲区原子更新
+struct GpuCache {
+    input_buffer: Option<wgpu::Buffer>,
+    output_buffer: Option<wgpu::Buffer>,
+    staging_buffer: Option<wgpu::Buffer>,
+    capacity: usize,
+}
+
+impl Default for GpuCache {
+    fn default() -> Self {
+        Self {
+            input_buffer: None,
+            output_buffer: None,
+            staging_buffer: None,
+            capacity: 0,
+        }
+    }
 }
 
 /// 小于此阈值的数据直接使用 CPU 计算,避免 GPU 启动开销超过收益
@@ -130,10 +143,7 @@ impl GpuVerifier {
             device,
             queue,
             blake3_pipeline: pipeline,
-            cached_input_buffer: std::sync::Mutex::new(None),
-            cached_output_buffer: std::sync::Mutex::new(None),
-            cached_staging_buffer: std::sync::Mutex::new(None),
-            cached_buffer_capacity: std::sync::Mutex::new(0),
+            cached: std::sync::Mutex::new(GpuCache::default()),
         })
     }
 
@@ -206,17 +216,16 @@ impl GpuVerifier {
         let input_size = input_bytes.len() as u64;
         let output_byte_size = output_size * 4;
 
-        // 获取或创建缓存的输入缓冲区
-        let input_buffer = {
-            let mut cached = self.cached_input_buffer.lock().unwrap();
-            let mut capacity = self.cached_buffer_capacity.lock().unwrap();
-            if let Some(ref buf) = *cached {
-                if *capacity >= input_bytes.len() {
-                    // 复用现有缓冲区:写入新数据
+        // 获取或创建缓存的缓冲区(单一锁保护,防止部分字段不一致)
+        let (input_buffer, output_buffer, staging_buffer) = {
+            let mut cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+
+            // 输入缓冲区
+            let input_buffer = if let Some(ref buf) = cache.input_buffer {
+                if cache.capacity >= input_bytes.len() {
                     self.queue.write_buffer(buf, 0, input_bytes);
                     buf.clone()
                 } else {
-                    // 容量不足,重新分配更大的缓冲区
                     let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("blake3_input_cached"),
                         size: input_size,
@@ -224,12 +233,11 @@ impl GpuVerifier {
                         mapped_at_creation: false,
                     });
                     self.queue.write_buffer(&new_buf, 0, input_bytes);
-                    *cached = Some(new_buf.clone());
-                    *capacity = input_bytes.len();
+                    cache.input_buffer = Some(new_buf.clone());
+                    cache.capacity = input_bytes.len();
                     new_buf
                 }
             } else {
-                // 首次分配
                 let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("blake3_input_cached"),
                     size: input_size,
@@ -237,16 +245,13 @@ impl GpuVerifier {
                     mapped_at_creation: false,
                 });
                 self.queue.write_buffer(&new_buf, 0, input_bytes);
-                *cached = Some(new_buf.clone());
-                *capacity = input_bytes.len();
+                cache.input_buffer = Some(new_buf.clone());
+                cache.capacity = input_bytes.len();
                 new_buf
-            }
-        };
+            };
 
-        // 获取或创建缓存的输出缓冲区
-        let output_buffer = {
-            let mut cached = self.cached_output_buffer.lock().unwrap();
-            if let Some(ref buf) = *cached {
+            // 输出缓冲区
+            let output_buffer = if let Some(ref buf) = cache.output_buffer {
                 if buf.size() >= output_byte_size {
                     buf.clone()
                 } else {
@@ -256,7 +261,7 @@ impl GpuVerifier {
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     });
-                    *cached = Some(new_buf.clone());
+                    cache.output_buffer = Some(new_buf.clone());
                     new_buf
                 }
             } else {
@@ -266,15 +271,12 @@ impl GpuVerifier {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
-                *cached = Some(new_buf.clone());
+                cache.output_buffer = Some(new_buf.clone());
                 new_buf
-            }
-        };
+            };
 
-        // 获取或创建缓存的 staging 缓冲区
-        let staging_buffer = {
-            let mut cached = self.cached_staging_buffer.lock().unwrap();
-            if let Some(ref buf) = *cached {
+            // staging 缓冲区
+            let staging_buffer = if let Some(ref buf) = cache.staging_buffer {
                 if buf.size() >= output_byte_size {
                     buf.clone()
                 } else {
@@ -284,7 +286,7 @@ impl GpuVerifier {
                         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     });
-                    *cached = Some(new_buf.clone());
+                    cache.staging_buffer = Some(new_buf.clone());
                     new_buf
                 }
             } else {
@@ -294,9 +296,11 @@ impl GpuVerifier {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                *cached = Some(new_buf.clone());
+                cache.staging_buffer = Some(new_buf.clone());
                 new_buf
-            }
+            };
+
+            (input_buffer, output_buffer, staging_buffer)
         };
 
         // 创建 bind group 并提交 compute pass
@@ -625,6 +629,8 @@ fn bytemuck_cast_slice(data: &[u32]) -> &[u8] {
     // - data 是有效的 u32 切片,其内存区域连续且生命周期覆盖本函数返回切片
     // - u32 与 u8 的字节布局兼容,总字节数为 data.len() * size_of::<u32>(),不会溢出
     // - 返回切片不超出 data 的原始内存范围
+    // - 对齐安全: u32 的对齐要求(4B)严格大于 u8 的对齐要求(1B),
+    //   从严到宽方向转换,as *const u8 指针对齐天然满足
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 

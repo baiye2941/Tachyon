@@ -1,110 +1,176 @@
-import { createStore } from 'solid-js/store'
-import { untrack } from 'solid-js'
+import { createStore } from "solid-js/store";
+import { untrack } from "solid-js";
 
-export type HistoryFilter = 'all' | 'completed' | 'failed' | 'cancelled'
+export type HistoryFilter = "all" | "completed" | "failed" | "cancelled";
 
 export interface HistoryRecord {
-  id: string
-  url: string
-  fileName: string
-  fileSize: number
-  status: 'completed' | 'failed' | 'cancelled'
-  duration: number
-  avgSpeed: number
-  completedAt: string
+  id: string;
+  url: string;
+  fileName: string;
+  fileSize: number;
+  status: "completed" | "failed" | "cancelled";
+  duration: number;
+  avgSpeed: number;
+  completedAt: string;
 }
 
 export interface HistoryStats {
-  totalDownloads: number
-  totalBytes: number
-  avgSpeed: number
-  successRate: number
-  totalDuration: number
-  completedCount: number
-  failedCount: number
-  cancelledCount: number
+  totalDownloads: number;
+  totalBytes: number;
+  avgSpeed: number;
+  successRate: number;
+  totalDuration: number;
+  completedCount: number;
+  failedCount: number;
+  cancelledCount: number;
+  maxSpeed: number;
+  maxFile: HistoryRecord | null;
 }
 
-const STORAGE_KEY = 'tachyon:download_history'
-const MAX_RECORDS = 100
+const STORAGE_KEY = "tachyon:download_history";
+const MAX_RECORDS = 100;
+
+/**
+ * 脱敏 URL 中的敏感查询参数(token, signature, key, secret 等)
+ * 防止 localStorage 中残留认证凭据
+ */
+const SENSITIVE_PARAMS = [
+  "token",
+  "access_token",
+  "auth",
+  "signature",
+  "sign",
+  "key",
+  "secret",
+  "password",
+  "pass",
+  "credential",
+  "session_id",
+  "sessionid",
+  "api_key",
+  "apikey",
+  "private_token",
+];
+
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const paramsToDelete: string[] = [];
+    parsed.searchParams.forEach((_value, key) => {
+      if (SENSITIVE_PARAMS.includes(key.toLowerCase())) {
+        paramsToDelete.push(key);
+      }
+    });
+    paramsToDelete.forEach((key) => parsed.searchParams.set(key, "[REDACTED]"));
+    return parsed.toString();
+  } catch {
+    // URL 解析失败,返回原始值(不阻断业务)
+    return url;
+  }
+}
 
 function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function isValidRecord(r: unknown): r is HistoryRecord {
+  if (typeof r !== "object" || r === null) return false;
+  const rec = r as Record<string, unknown>;
+  return (
+    typeof rec.id === "string" &&
+    typeof rec.url === "string" &&
+    typeof rec.fileName === "string" &&
+    (rec.status === "completed" || rec.status === "failed" || rec.status === "cancelled")
+  );
 }
 
 function loadFromStorage(): HistoryRecord[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed as HistoryRecord[]
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidRecord);
   } catch {
-    return []
+    return [];
   }
 }
 
 function saveToStorage(records: HistoryRecord[]) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(records))
-  } catch {
-    // ignore storage errors (e.g. quota exceeded)
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+  } catch (e) {
+    console.warn("历史记录保存失败,可能存储空间不足:", e);
   }
 }
 
-const [historyRecords, setHistoryRecords] = createStore<HistoryRecord[]>(loadFromStorage())
+const [historyRecords, setHistoryRecords] =
+  createStore<HistoryRecord[]>(loadFromStorage());
 
-export { historyRecords }
+export { historyRecords };
 
 export function addHistoryRecord(
-  record: Omit<HistoryRecord, 'id' | 'completedAt'>
+  record: Omit<HistoryRecord, "id" | "completedAt">,
 ): void {
+  // 脱敏 URL 中的敏感参数(token/signature/key 等),防止 localStorage 泄漏
+  const sanitizedRecord = { ...record, url: redactUrl(record.url) };
   const newRecord: HistoryRecord = {
-    ...record,
+    ...sanitizedRecord,
     id: generateId(),
     completedAt: new Date().toISOString(),
-  }
-  setHistoryRecords(prev => {
-    const updated = [newRecord, ...prev]
+  };
+  setHistoryRecords((prev) => {
+    const updated = [newRecord, ...prev];
     if (updated.length > MAX_RECORDS) {
-      const trimmed = updated.slice(0, MAX_RECORDS)
-      saveToStorage(trimmed)
-      return trimmed
+      const trimmed = updated.slice(0, MAX_RECORDS);
+      saveToStorage(trimmed);
+      return trimmed;
     }
-    saveToStorage(updated)
-    return updated
-  })
+    saveToStorage(updated);
+    return updated;
+  });
 }
 
-export function getHistoryRecords(filter: HistoryFilter = 'all'): HistoryRecord[] {
-  const records = untrack(() => historyRecords)
-  if (filter === 'all') return [...records]
-  return records.filter(r => r.status === filter)
+export function getHistoryRecords(
+  filter: HistoryFilter = "all",
+): HistoryRecord[] {
+  const records = untrack(() => historyRecords);
+  if (filter === "all") return [...records];
+  return records.filter((r) => r.status === filter);
 }
 
 // 单次遍历统计，替代原来 3 次 reduce + 3 次 filter
 export function getHistoryStats(): HistoryStats {
-  const records = untrack(() => historyRecords)
-  let totalBytes = 0
-  let totalDuration = 0
-  let speedSum = 0
-  let completedCount = 0
-  let failedCount = 0
-  let cancelledCount = 0
+  return getHistoryStatsForRecords(untrack(() => historyRecords));
+}
+
+export function getHistoryStatsForRecords(
+  records: HistoryRecord[],
+): HistoryStats {
+  let totalBytes = 0;
+  let totalDuration = 0;
+  let speedSum = 0;
+  let completedCount = 0;
+  let failedCount = 0;
+  let cancelledCount = 0;
+  let maxSpeed = 0;
+  let maxFile: HistoryRecord | null = null;
 
   for (let i = 0; i < records.length; i++) {
-    const r = records[i]!
-    totalBytes += r.fileSize || 0
-    totalDuration += r.duration || 0
-    speedSum += r.avgSpeed || 0
-    if (r.status === 'completed') completedCount++
-    else if (r.status === 'failed') failedCount++
-    else if (r.status === 'cancelled') cancelledCount++
+    const r = records[i]!;
+    totalBytes += r.fileSize || 0;
+    totalDuration += r.duration || 0;
+    speedSum += r.avgSpeed || 0;
+    if ((r.avgSpeed || 0) > maxSpeed) maxSpeed = r.avgSpeed || 0;
+    if (!maxFile || (r.fileSize || 0) > (maxFile.fileSize || 0)) maxFile = r;
+    if (r.status === "completed") completedCount++;
+    else if (r.status === "failed") failedCount++;
+    else if (r.status === "cancelled") cancelledCount++;
   }
 
-  const totalDownloads = records.length
-  const avgSpeed = totalDownloads > 0 ? speedSum / totalDownloads : 0
-  const successRate = totalDownloads > 0 ? completedCount / totalDownloads : 0
+  const totalDownloads = records.length;
+  const avgSpeed = totalDownloads > 0 ? speedSum / totalDownloads : 0;
+  const successRate = totalDownloads > 0 ? completedCount / totalDownloads : 0;
 
   return {
     totalDownloads,
@@ -115,15 +181,17 @@ export function getHistoryStats(): HistoryStats {
     completedCount,
     failedCount,
     cancelledCount,
-  }
+    maxSpeed,
+    maxFile,
+  };
 }
 
 export function clearHistory(): void {
-  setHistoryRecords([])
-  saveToStorage([])
+  setHistoryRecords([]);
+  saveToStorage([]);
 }
 
 export function getRecordById(id: string): HistoryRecord | undefined {
-  const records = untrack(() => historyRecords)
-  return records.find(r => r.id === id)
+  const records = untrack(() => historyRecords);
+  return records.find((r) => r.id === id);
 }

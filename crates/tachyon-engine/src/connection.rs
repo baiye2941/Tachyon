@@ -13,12 +13,23 @@ use tachyon_core::DownloadError;
 use tachyon_core::config::ConnectionConfig;
 
 /// 连接池配置
+///
+/// 与 `tachyon_core::config::ConnectionConfig` 字段对齐,
+/// 连接池据此控制并发、Keep-Alive 和协议启用策略。
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// 单主机最大连接数
     pub max_per_host: u32,
     /// 全局最大连接数
     pub max_global: u32,
+    /// Keep-Alive 超时(秒)
+    pub keep_alive_timeout_secs: u64,
+    /// 连接建立超时(秒)
+    pub connect_timeout_secs: u64,
+    /// 是否启用 HTTP/2
+    pub enable_http2: bool,
+    /// 是否启用 QUIC
+    pub enable_quic: bool,
 }
 
 impl Default for PoolConfig {
@@ -26,6 +37,10 @@ impl Default for PoolConfig {
         Self {
             max_per_host: 16,
             max_global: 256,
+            keep_alive_timeout_secs: 30,
+            connect_timeout_secs: 10,
+            enable_http2: true,
+            enable_quic: false,
         }
     }
 }
@@ -36,6 +51,10 @@ impl From<ConnectionConfig> for PoolConfig {
         Self {
             max_per_host: config.max_connections_per_host,
             max_global: config.max_global_connections,
+            keep_alive_timeout_secs: config.keep_alive_timeout_secs,
+            connect_timeout_secs: config.connect_timeout_secs,
+            enable_http2: config.enable_http2,
+            enable_quic: config.enable_quic,
         }
     }
 }
@@ -46,7 +65,10 @@ impl From<PoolConfig> for ConnectionConfig {
         Self {
             max_connections_per_host: config.max_per_host,
             max_global_connections: config.max_global,
-            ..ConnectionConfig::default()
+            keep_alive_timeout_secs: config.keep_alive_timeout_secs,
+            connect_timeout_secs: config.connect_timeout_secs,
+            enable_http2: config.enable_http2,
+            enable_quic: config.enable_quic,
         }
     }
 }
@@ -181,6 +203,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 2,
             max_global: 10,
+            ..Default::default()
         });
         {
             let _permit = pool.acquire("example.com").await.unwrap();
@@ -194,6 +217,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(PoolConfig {
             max_per_host: 2,
             max_global: 10,
+            ..Default::default()
         }));
         let _p1 = pool.acquire("example.com").await.unwrap();
         let _p2 = pool.acquire("example.com").await.unwrap();
@@ -205,6 +229,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 1,
             max_global: 10,
+            ..Default::default()
         });
         let _p1 = pool.acquire("host1.com").await.unwrap();
         let _p2 = pool.acquire("host2.com").await.unwrap();
@@ -223,6 +248,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 2,
             max_global: 10,
+            ..Default::default()
         });
         {
             let _p1 = pool.acquire("example.com").await.unwrap();
@@ -238,6 +264,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 2,
             max_global: 10,
+            ..Default::default()
         });
         let _active = pool.acquire("busy.com").await.unwrap();
         {
@@ -269,6 +296,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 1,
             max_global: 1,
+            ..Default::default()
         });
         pool.global_semaphore.close();
         let result = pool.acquire("test.com").await;
@@ -289,6 +317,7 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig {
             max_per_host: 1,
             max_global: 1,
+            ..Default::default()
         });
         pool.global_semaphore.close();
         let result = pool.acquire("test.com").await;
@@ -324,11 +353,25 @@ mod tests {
         let pool_cfg = PoolConfig {
             max_per_host: 4,
             max_global: 64,
+            ..Default::default()
         };
         let conn_cfg: tachyon_core::config::ConnectionConfig = pool_cfg.into();
         assert_eq!(conn_cfg.max_connections_per_host, 4);
         assert_eq!(conn_cfg.max_global_connections, 64);
         assert_eq!(conn_cfg.keep_alive_timeout_secs, 30);
         assert_eq!(conn_cfg.connect_timeout_secs, 10);
+    }
+
+    #[tokio::test]
+    async fn test_active_connections_initial() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        assert_eq!(pool.active_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_connections_with_permits() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        let _permit = pool.acquire("example.com").await.unwrap();
+        assert_eq!(pool.active_connections(), 1);
     }
 }

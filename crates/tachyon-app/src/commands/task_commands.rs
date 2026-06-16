@@ -1,23 +1,15 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tachyon_core::config::DownloadConfig;
-use tachyon_core::filename::extract_filename_from_url;
-use tachyon_core::types::DownloadState;
-use tachyon_core::url_safety::redact_url_for_log;
+use tachyon_core::traits::TaskRunner;
+use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::DownloadTask;
 use tachyon_engine::connection::ConnectionPool;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 use url::Url;
-use uuid::Uuid;
 
-use super::config_commands::authorize_download_dir;
-use super::{
-    AppError, AppState, ProgressEvent, TaskInfo, TaskProgress, build_download_config,
-    cleanup_runtime, now_iso8601, persist_task_snapshot, rewrite_hf_url, update_task_status,
-    validate_download_url,
-};
+use super::{AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status};
 
 // ---------------------------------------------------------------------------
 // Core download task function
@@ -31,19 +23,40 @@ pub(crate) async fn task_fn(
     download_dir: String,
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
-    control_rx: watch::Receiver<DownloadState>,
+    control_rx: watch::Receiver<TaskCommand>,
     mirror_urls: Option<Vec<String>>,
 ) {
-    // HF 镜像: 自动将 huggingface.co 替换为 HF_ENDPOINT 或 hf-mirror.com
-    let url = rewrite_hf_url(&url);
+    crate::runtime::DownloadSession::new(
+        state,
+        task_id,
+        url,
+        download_dir,
+        download_config,
+        connection_pool,
+        control_rx,
+        mirror_urls,
+    )
+    .run()
+    .await;
+}
 
-    let download_url = match Url::parse(&url) {
+// ---------------------------------------------------------------------------
+// Helpers: 将 task_fn 的事务脚本拆分为单一职责函数
+// ---------------------------------------------------------------------------
+
+/// URL 解析、host 提取、启动前取消/暂停检查,并设置 Downloading 状态
+pub(crate) async fn validate_and_prepare_url(
+    url: &str,
+    state: &AppState,
+    task_id: &str,
+    control_rx: &watch::Receiver<TaskCommand>,
+) -> Option<String> {
+    let download_url = match Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "URL 解析失败");
-            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-            cleanup_runtime(&state, &task_id);
-            return;
+            mark_task_failed_and_cleanup(state, task_id).await;
+            return None;
         }
     };
 
@@ -51,18 +64,17 @@ pub(crate) async fn task_fn(
         Some(h) => h.to_string(),
         None => {
             tracing::error!(task_id = %task_id, "URL 主机为空");
-            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-            cleanup_runtime(&state, &task_id);
-            return;
+            mark_task_failed_and_cleanup(state, task_id).await;
+            return None;
         }
     };
 
     {
-        if let Some(task) = state.tasks.get(&task_id) {
+        if let Some(task) = state.domain.task_repository.get(task_id) {
             if task.status == DownloadState::Cancelled {
                 tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
-                cleanup_runtime(&state, &task_id);
-                return;
+                cleanup_runtime(state, task_id);
+                return None;
             }
             if task.status == DownloadState::Paused {
                 tracing::info!(task_id = %task_id, "任务已暂停,等待恢复...");
@@ -70,77 +82,122 @@ pub(crate) async fn task_fn(
         }
     }
 
-    tracing::info!(
-        task_id = %task_id,
-        host = %host,
-        download_dir = %download_dir,
-        "开始真实下载"
-    );
-
-    update_task_status(&state.tasks, &task_id, DownloadState::Downloading);
-
-    if let Err(e) = std::fs::create_dir_all(&download_dir) {
-        tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
-        update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-        cleanup_runtime(&state, &task_id);
-        return;
+    // 设置 Downloading 前检查是否已被取消/暂停,防止 cancel 竞态覆盖状态
+    let cmd = *control_rx.borrow();
+    if cmd == TaskCommand::Cancel {
+        tracing::info!(task_id = %task_id, "下载启动前检测到取消信号,终止下载");
+        update_task_status(
+            &state.domain.task_repository,
+            task_id,
+            DownloadState::Cancelled,
+        );
+        cleanup_runtime(state, task_id);
+        return None;
+    }
+    if cmd == TaskCommand::Pause {
+        tracing::info!(task_id = %task_id, "下载启动前检测到暂停信号,等待恢复");
     }
 
-    let mut download_task = match mirror_urls {
+    update_task_status(
+        &state.domain.task_repository,
+        task_id,
+        DownloadState::Downloading,
+    );
+    Some(host)
+}
+
+pub(crate) async fn ensure_download_dir(
+    download_dir: &str,
+    state: &AppState,
+    task_id: &str,
+) -> Result<(), ()> {
+    if let Err(e) = tokio::fs::create_dir_all(download_dir).await {
+        tracing::error!(task_id = %task_id, error = %e, "创建下载目录失败");
+        mark_task_failed_and_cleanup(state, task_id).await;
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn build_download_task(
+    task_id: &str,
+    url: &str,
+    download_config: DownloadConfig,
+    connection_pool: Arc<ConnectionPool>,
+    mirror_urls: Option<Vec<String>>,
+) -> Result<Box<dyn TaskRunner>, ()> {
+    match mirror_urls {
         Some(mirrors) if !mirrors.is_empty() => {
             tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
             match DownloadTask::with_mirrors(
-                url.clone(),
+                url.to_string(),
                 mirrors,
                 download_config,
                 Some(connection_pool),
             )
             .await
             {
-                Ok(t) => t,
+                Ok(t) => Ok(Box::new(t)),
                 Err(e) => {
                     tracing::error!(task_id = %task_id, error = %e, "创建镜像 DownloadTask 失败");
-                    update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-                    cleanup_runtime(&state, &task_id);
-                    return;
+                    Err(())
                 }
             }
         }
         _ => {
-            match DownloadTask::with_pool(url.clone(), download_config, Some(connection_pool)).await
+            match DownloadTask::with_pool(url.to_string(), download_config, Some(connection_pool))
+                .await
             {
-                Ok(t) => t,
+                Ok(t) => Ok(Box::new(t)),
                 Err(e) => {
                     tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
-                    update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-                    cleanup_runtime(&state, &task_id);
-                    return;
+                    Err(())
                 }
             }
         }
-    };
-    download_task.set_control_rx(control_rx.clone());
-
-    // 断点续传:若存在已保存快照,注入已完成分片索引,plan() 后将跳过这些分片
-    if let Ok(Some(snapshot)) = state.task_store.load_snapshot(&task_id)
-        && !snapshot.completed_fragments.is_empty()
-    {
-        tracing::info!(
-            task_id = %task_id,
-            completed = snapshot.completed_fragments.len(),
-            "断点续传:注入已完成分片"
-        );
-        download_task.set_completed_fragments(snapshot.completed_fragments);
     }
+}
 
-    if *control_rx.borrow() == DownloadState::Cancelled {
-        cleanup_runtime(&state, &task_id);
-        return;
+pub(crate) fn should_cancel_before_run(control_rx: &watch::Receiver<TaskCommand>) -> bool {
+    *control_rx.borrow() == TaskCommand::Cancel
+}
+
+pub(crate) async fn inject_resume_snapshot(
+    task: &mut dyn TaskRunner,
+    state: &AppState,
+    task_id: &str,
+) {
+    if let Ok(Some(snapshot)) = state.infra.task_store.load_snapshot(task_id) {
+        if !snapshot.completed_fragments.is_empty() {
+            tracing::info!(
+                task_id = %task_id,
+                completed = snapshot.completed_fragments.len(),
+                "断点续传:注入已完成分片"
+            );
+            task.set_completed_fragments(snapshot.completed_fragments);
+        }
+        if !snapshot.partial_fragments.is_empty() {
+            tracing::info!(
+                task_id = %task_id,
+                partial = snapshot.partial_fragments.len(),
+                "断点续传:注入字节级未完整分片"
+            );
+            task.set_partial_fragments(snapshot.partial_fragments);
+        }
     }
+}
 
+pub(crate) async fn probe_and_save_metadata(
+    task: &mut dyn TaskRunner,
+    state: &AppState,
+    task_id: &str,
+    download_dir: &str,
+    control_rx: &watch::Receiver<TaskCommand>,
+) -> Option<FileMetadata> {
     let mut probe_cancel_rx = control_rx.clone();
     match tokio::select! {
-        result = download_task.probe() => result,
+        result = task.probe() => result,
         cancel = wait_for_cancel_signal(&mut probe_cancel_rx) => {
             match cancel {
                 Err(e) => Err(e),
@@ -163,15 +220,21 @@ pub(crate) async fn task_fn(
                     .file_size
                     .map(|s| s.max(1).div_ceil(1024 * 1024))
                     .unwrap_or(0) as u32;
-                if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
                     task.file_size = meta.file_size;
                     task.fragments_total = total_frags;
                 }
             }
 
-            let snapshot_task = { state.tasks.get(&task_id).map(|r| r.value().clone()) };
+            let snapshot_task = {
+                state
+                    .domain
+                    .task_repository
+                    .get(task_id)
+                    .map(|r| r.value().clone())
+            };
             if let Some(task) = snapshot_task {
-                let save_path = std::path::Path::new(&download_dir)
+                let save_path = std::path::Path::new(download_dir)
                     .join(&meta.file_name)
                     .to_string_lossy()
                     .to_string();
@@ -180,210 +243,58 @@ pub(crate) async fn task_fn(
                     save_path,
                     0,
                     vec![],
+                    std::collections::HashMap::new(),
                     meta.etag.clone(),
                     meta.last_modified.clone(),
                 );
-                if let Err(e) = state.task_store.save_snapshot(&snapshot) {
+                if let Err(e) = state.infra.task_store.save_snapshot(&snapshot) {
                     tracing::warn!(task_id = %task_id, error = %e, "保存元数据快照失败");
                 }
             }
+
+            Some(meta.clone())
         }
         Err(tachyon_core::DownloadError::Cancelled) => {
-            cleanup_runtime(&state, &task_id);
-            return;
+            cleanup_runtime(state, task_id);
+            None
         }
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
-            update_task_status(&state.tasks, &task_id, DownloadState::Failed);
-            cleanup_runtime(&state, &task_id);
-            return;
+            mark_task_failed_and_cleanup(state, task_id).await;
+            None
         }
     }
+}
 
-    let (chunk_progress_tx, mut chunk_progress_rx) =
-        tokio::sync::mpsc::channel::<tachyon_engine::FragmentProgress>(256);
-    download_task.set_progress_sender(chunk_progress_tx);
+pub(crate) async fn mark_task_failed_and_cleanup(state: &AppState, task_id: &str) {
+    update_task_status(
+        &state.domain.task_repository,
+        task_id,
+        DownloadState::Failed,
+    );
+    cleanup_runtime(state, task_id);
+}
 
-    let download_task = Arc::new(tokio::sync::Mutex::new(download_task));
-
-    if *control_rx.borrow() == DownloadState::Cancelled {
-        cleanup_runtime(&state, &task_id);
-        return;
-    }
-
-    let chunk_state = state.clone();
-    let chunk_tid = task_id.clone();
-    tokio::spawn(async move {
-        // 已完成分片集合,用于断点续传 checkpoint
-        let mut completed: BTreeSet<u32> = BTreeSet::new();
-        // 从 state.tasks 读取 probe 阶段已写入的 total_frags (零锁)
-        let total_frags = chunk_state
-            .tasks
-            .get(&chunk_tid)
-            .map(|t| t.fragments_total)
-            .unwrap_or(0);
-        tracing::info!(task_id = %chunk_tid, total_frags, "chunk reader 启动,等待进度事件");
-        // 跟踪每个分片的已下载字节数
-        let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-        let mut total_downloaded: u64 = 0;
-        let mut event_count: u64 = 0;
-        while let Some(progress) = chunk_progress_rx.recv().await {
-            event_count += 1;
-            if progress.completed {
-                completed.insert(progress.fragment_index);
-            }
-            // 增量更新: 替换旧值,差值累加到总数
-            let old = frag_bytes
-                .insert(progress.fragment_index, progress.fragment_downloaded)
-                .unwrap_or(0);
-            total_downloaded =
-                total_downloaded.saturating_add(progress.fragment_downloaded.saturating_sub(old));
-            if event_count == 1 || event_count.is_multiple_of(50) {
-                tracing::info!(
-                    event = event_count,
-                    idx = progress.fragment_index,
-                    done = completed.len(),
-                    total_frags,
-                    total_downloaded,
-                    "chunk reader 进度更新"
-                );
-            }
-            let frags_done = completed.len() as u32;
-            {
-                if let Some(mut task) = chunk_state.tasks.get_mut(&chunk_tid) {
-                    task.downloaded = total_downloaded;
-                    task.fragments_done = frags_done;
-                    task.fragments_total = total_frags;
-                    if total_frags > 0 {
-                        task.progress = frags_done as f64 / total_frags as f64;
-                    }
-                }
-            }
-
-            // 分片整体完成:更新 completed_fragments 并 checkpoint 落盘(断点续传)
-            if progress.completed {
-                completed.insert(progress.fragment_index);
-                if let Ok(Some(mut snapshot)) = chunk_state.task_store.load_snapshot(&chunk_tid) {
-                    snapshot.completed_fragments = completed.iter().copied().collect();
-                    snapshot.downloaded = total_downloaded;
-                    if let Err(e) = chunk_state.task_store.save_snapshot(&snapshot) {
-                        tracing::warn!(task_id = %chunk_tid, error = %e, "checkpoint 落盘失败");
-                    }
-                }
-            }
-        }
-    });
-
-    let monitor_ps = state.clone();
-    let monitor_tid = task_id.clone();
-    let mut progress_control_rx = control_rx.clone();
-    let progress_handle = tokio::spawn(async move {
-        let start = Instant::now();
-        let mut last_downloaded: u64 = 0;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                changed = progress_control_rx.changed() => {
-                    if changed.is_err() {
-                        return 0;
-                    }
-                    let control_state = {
-                        let borrowed = progress_control_rx.borrow_and_update();
-                        *borrowed
-                    };
-                    match control_state {
-                        DownloadState::Cancelled
-                        | DownloadState::Completed
-                        | DownloadState::Failed => return 0,
-                        DownloadState::Paused => {
-                            if let Some(mut task) = monitor_ps.tasks.get_mut(&monitor_tid) {
-                                task.speed = 0;
-                            }
-                            continue;
-                        }
-                        _ => continue,
-                    }
-                }
-            }
-            // 从 state.tasks 读取进度(chunk reader 已写入),不锁 download_task
-            let (downloaded, ds) = {
-                if let Some(task) = monitor_ps.tasks.get(&monitor_tid) {
-                    (task.downloaded, task.status)
-                } else {
-                    continue;
-                }
-            };
-
-            let elapsed = start.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                ((downloaded as f64 - last_downloaded as f64) / 0.5) as u64
-            } else {
-                0
-            };
-            last_downloaded = downloaded;
-
-            {
-                if let Some(mut task) = monitor_ps.tasks.get_mut(&monitor_tid) {
-                    task.speed = speed;
-                }
-            }
-
-            if ds == DownloadState::Completed || ds == DownloadState::Failed {
-                return speed;
-            }
-
-            {
-                let t = match monitor_ps.tasks.get(&monitor_tid) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let event: ProgressEvent = std::iter::once((
-                    monitor_tid.clone(),
-                    TaskProgress {
-                        id: monitor_tid.clone(),
-                        progress: t.progress,
-                        speed,
-                        downloaded,
-                        status: t.status,
-                        fragments_done: t.fragments_done,
-                    },
-                ))
-                .collect();
-                tracing::debug!(
-                    tid = %monitor_tid,
-                    downloaded,
-                    speed,
-                    progress = t.progress,
-                    frags = t.fragments_done,
-                    "广播进度事件"
-                );
-                if monitor_ps.progress_tx.send(event).is_err() {
-                    tracing::warn!("broadcast send 失败(无接收者)");
-                }
-            }
-
-            if ds == DownloadState::Completed || ds == DownloadState::Failed {
-                return speed;
-            }
-        }
-    });
-
-    let (result, final_file_size) = {
-        let mut dt = download_task.lock().await;
-        let result = dt.run().await;
-        let final_file_size = dt.metadata().and_then(|m| m.file_size);
-        (result, final_file_size)
-    };
-
-    let terminal_state = match &result {
+pub(crate) async fn finalize_task_state(
+    state: &AppState,
+    task_id: &str,
+    result: Result<&(), &tachyon_core::DownloadError>,
+    final_file_size: Option<u64>,
+) {
+    match result {
         Ok(()) => {
             let final_size = final_file_size
-                .or_else(|| state.tasks.get(&task_id).and_then(|task| task.file_size))
+                .or_else(|| {
+                    state
+                        .domain
+                        .task_repository
+                        .get(task_id)
+                        .and_then(|task| task.file_size)
+                })
                 .unwrap_or(0);
-            if let Some(mut task) = state.tasks.get_mut(&task_id) {
+            if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
                 if task.status == DownloadState::Cancelled {
                     tracing::info!(task_id = %task_id, "下载完成但任务已被取消");
-                    None
                 } else {
                     task.progress = 1.0;
                     task.file_size = Some(final_size);
@@ -391,78 +302,60 @@ pub(crate) async fn task_fn(
                     task.speed = 0;
                     task.status = DownloadState::Completed;
                     tracing::info!(task_id = %task_id, file_size = final_size, "下载任务完成");
-                    Some(DownloadState::Completed)
                 }
-            } else {
-                None
             }
         }
         Err(e) => {
-            if let Some(mut task) = state.tasks.get_mut(&task_id) {
+            if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
                 if task.status == DownloadState::Cancelled {
                     tracing::info!(task_id = %task_id, "下载失败但任务已被取消,保留取消状态");
-                    None
                 } else {
                     task.status = DownloadState::Failed;
                     task.speed = 0;
                     tracing::error!(task_id = %task_id, error = %e, "下载任务失败");
-                    Some(DownloadState::Failed)
                 }
-            } else {
-                None
             }
         }
-    };
-
-    if let Some(terminal_state) = terminal_state
-        && let Some(control) = state.controls.get(&task_id)
-    {
-        let _ = control.send(terminal_state);
     }
+}
 
-    let mut progress_handle = progress_handle;
-    match tokio::time::timeout(Duration::from_secs(2), &mut progress_handle).await {
-        Ok(Ok(_final_speed)) => {}
+pub(crate) async fn wait_chunk_reader_done(
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+    task_id: &str,
+) -> Result<(), ()> {
+    match tokio::time::timeout(Duration::from_secs(3), done_rx).await {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
-            tracing::warn!(task_id = %task_id, error = %e, "进度监控任务异常退出");
+            tracing::warn!(task_id = %task_id, error = %e, "chunk reader 任务异常退出");
+            Err(())
         }
         Err(_) => {
-            tracing::warn!(task_id = %task_id, "进度监控任务退出超时,强制中止");
-            progress_handle.abort();
-            if let Err(e) = progress_handle.await
-                && !e.is_cancelled()
+            tracing::warn!(task_id = %task_id, "chunk reader 退出超时,强制中止");
+            Err(())
+        }
+    }
+}
+
+pub(crate) fn extract_fail_reason(
+    state: &AppState,
+    task_id: &str,
+    result: Result<&(), &tachyon_core::DownloadError>,
+) -> Option<String> {
+    match result {
+        Ok(()) => None,
+        Err(e) => {
+            if state
+                .domain
+                .task_repository
+                .get(task_id)
+                .is_some_and(|t| t.status == DownloadState::Cancelled)
             {
-                tracing::warn!(task_id = %task_id, error = %e, "进度监控任务中止失败");
+                None
+            } else {
+                Some(e.to_string())
             }
         }
     }
-
-    cleanup_runtime(&state, &task_id);
-
-    {
-        let event: ProgressEvent = state
-            .tasks
-            .iter()
-            .map(|r| {
-                let id = r.key();
-                let t = r.value();
-                (
-                    id.clone(),
-                    TaskProgress {
-                        id: id.clone(),
-                        progress: t.progress,
-                        speed: t.speed,
-                        downloaded: t.downloaded,
-                        status: t.status,
-                        fragments_done: t.fragments_done,
-                    },
-                )
-            })
-            .collect();
-        let _ = state.progress_tx.send(event);
-    }
-
-    persist_task_snapshot(&state, &task_id, None).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,15 +363,12 @@ pub(crate) async fn task_fn(
 // ---------------------------------------------------------------------------
 
 async fn wait_for_cancel_signal(
-    control_rx: &mut watch::Receiver<DownloadState>,
+    control_rx: &mut watch::Receiver<TaskCommand>,
 ) -> Result<(), tachyon_core::DownloadError> {
     loop {
-        let state = *control_rx.borrow_and_update();
-        match state {
-            DownloadState::Cancelled => return Err(tachyon_core::DownloadError::Cancelled),
-            DownloadState::Failed => {
-                return Err(tachyon_core::DownloadError::Other("任务已失败".into()));
-            }
+        let cmd = *control_rx.borrow_and_update();
+        match cmd {
+            TaskCommand::Cancel => return Err(tachyon_core::DownloadError::Cancelled),
             _ => control_rx
                 .changed()
                 .await
@@ -529,7 +419,22 @@ pub async fn cancel_task(
 pub async fn delete_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
+    confirmation_token: Option<String>,
 ) -> Result<(), AppError> {
+    // P1-11b: 验证一次性确认令牌，绑定 action 防止跨操作复用
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "delete_task")?;
+        }
+        None => {
+            return Err(super::AppError::Config(
+                "删除任务需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
     delete_task_inner(&state, task_id).await
 }
 
@@ -556,247 +461,67 @@ pub(crate) async fn create_task_inner(
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
 ) -> Result<String, AppError> {
-    validate_download_url(&url)?;
+    let creation = state
+        .service
+        .task_service
+        .create_task(&url, download_dir.as_deref(), mirror_urls.as_deref())
+        .await?;
 
-    // A-14: 对每个镜像 URL 执行与主 URL 相同的 SSRF 防护验证
-    if let Some(ref mirrors) = mirror_urls {
-        for mirror in mirrors {
-            validate_download_url(mirror)
-                .map_err(|e| AppError::Config(format!("镜像 URL 验证失败: {e}")))?;
-        }
-    }
+    let state_arc = Arc::new(state.clone_for_task());
+    state.runtime.supervisor.start_download(
+        state_arc,
+        &creation.task_id,
+        creation.url,
+        creation.download_dir,
+        creation.download_config,
+        creation.mirror_urls,
+    );
 
-    // 提前获取配置和下载目录,避免在检查-插入间隙中 await(消除 TOCTOU 竞态)
-    let (max_tasks, download_dir_str) = {
-        let cfg = state.config.lock().await;
-        let max_tasks = cfg.max_concurrent_tasks as usize;
-        let requested = download_dir.unwrap_or_else(|| cfg.download.download_dir.clone());
-        let authorized = authorize_download_dir(&cfg, &requested)?;
-        (max_tasks, authorized)
-    };
-
-    let task_id = Uuid::new_v4().to_string();
-    let file_name = extract_filename_from_url(&url);
-    let created_at = now_iso8601();
-    let redacted_url = redact_url_for_log(&url);
-
-    let task = TaskInfo {
-        id: task_id.clone(),
-        url: redacted_url.clone(),
-        file_name,
-        file_size: None,
-        downloaded: 0,
-        speed: 0,
-        status: DownloadState::Pending,
-        progress: 0.0,
-        fragments_total: 0,
-        fragments_done: 0,
-        created_at,
-    };
-
-    // 使用互斥锁保证 check-and-insert 的原子性
-    // 防止并发 create_task 请求导致去重检查和并发计数被绕过
-    {
-        let _create_guard = state.create_task_lock.lock().await;
-
-        if state.tasks.iter().any(|r| {
-            let t = r.value();
-            t.url == redacted_url
-                && t.status != DownloadState::Cancelled
-                && t.status != DownloadState::Completed
-                && t.status != DownloadState::Failed
-        }) {
-            return Err(AppError::TaskAlreadyExists(
-                "相同 URL 的下载任务已存在".to_string(),
-            ));
-        }
-        let active_count = state
-            .tasks
-            .iter()
-            .filter(|r| {
-                let t = r.value();
-                t.status == DownloadState::Downloading || t.status == DownloadState::Pending
-            })
-            .count();
-        if active_count >= max_tasks {
-            return Err(AppError::Config(format!(
-                "已达最大并发任务数({max_tasks}),请等待现有任务完成"
-            )));
-        }
-        // 在锁保护下立即插入,消除竞态窗口
-        state.tasks.insert(task_id.clone(), task);
-    }
-
-    if let Some(task) = state.tasks.get(&task_id).map(|r| r.value().clone()) {
-        let save_path = std::path::Path::new(&download_dir_str)
-            .join(&task.file_name)
-            .to_string_lossy()
-            .to_string();
-        let snapshot =
-            crate::task_store::task_info_to_snapshot(&task, save_path, 0, vec![], None, None);
-        if let Err(e) = state.task_store.save_snapshot(&snapshot) {
-            tracing::warn!(task_id = %task_id, error = %e, "保存初始快照失败");
-        }
-    }
-
-    let download_config = {
-        let cfg = state.config.lock().await;
-        if cfg.download.max_concurrent_fragments == 0 {
-            state.tasks.remove(&task_id);
-            return Err(AppError::Config(
-                "max_concurrent_fragments 不能为 0".to_string(),
-            ));
-        }
-        build_download_config(&cfg, &download_dir_str)
-    };
-
-    let state_arc = Arc::new(AppState {
-        tasks: state.tasks.clone(),
-        config: state.config.clone(),
-        handles: state.handles.clone(),
-        active_permits: state.active_permits.clone(),
-        sniffer: state.sniffer.clone(),
-        sniffer_filters: state.sniffer_filters.clone(),
-        progress_tx: state.progress_tx.clone(),
-        connection_pool: state.connection_pool.clone(),
-        controls: state.controls.clone(),
-        task_store: state.task_store.clone(),
-        create_task_lock: state.create_task_lock.clone(),
-    });
-
-    let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
-    state.controls.insert(task_id.clone(), control_tx);
-
-    let tid = task_id.clone();
-    let url_clone = url.clone();
-    let pool_clone = state_arc.connection_pool.clone();
-    let mirrors = mirror_urls.filter(|v| !v.is_empty());
-    let (start_tx, start_rx) = oneshot::channel();
-    let handle = tokio::spawn(async move {
-        let _ = start_rx.await;
-        task_fn(
-            state_arc,
-            tid,
-            url_clone,
-            download_dir_str,
-            download_config,
-            pool_clone,
-            control_rx,
-            mirrors,
-        )
-        .await;
-    });
-
-    state.handles.insert(task_id.clone(), handle);
-    let _ = start_tx.send(());
-
-    tracing::info!(task_id = %task_id, "创建下载任务并启动后台下载");
-    Ok(task_id)
+    Ok(creation.task_id)
 }
 
 pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-        match task.status {
-            DownloadState::Pending | DownloadState::Downloading => {
-                task.status = DownloadState::Paused;
-                task.speed = 0;
-                if let Some(control) = state.controls.get(&task_id) {
-                    let _ = control.send(DownloadState::Paused);
-                }
-                tracing::info!(task_id = %task_id, "暂停任务");
-            }
-            other => return Err(AppError::Config(format!("当前状态 '{}' 不允许暂停", other))),
-        }
-    }
-    persist_task_snapshot(state, &task_id, None).await;
+    state.service.task_service.pause_task(&task_id).await?;
+    state
+        .runtime
+        .supervisor
+        .send_command(&task_id, TaskCommand::Pause);
     Ok(())
 }
 
 pub(crate) async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-        if task.status == DownloadState::Paused {
-            task.status = DownloadState::Downloading;
-            if let Some(control) = state.controls.get(&task_id) {
-                let _ = control.send(DownloadState::Downloading);
-            }
-            tracing::info!(task_id = %task_id, "恢复任务");
-        } else {
-            return Err(AppError::Config(format!(
-                "仅暂停状态可恢复,当前状态: '{}'",
-                task.status
-            )));
-        }
-    }
-    persist_task_snapshot(state, &task_id, None).await;
+    state.service.task_service.resume_task(&task_id).await?;
+    state
+        .runtime
+        .supervisor
+        .send_command(&task_id, TaskCommand::Resume);
     Ok(())
 }
 
 pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    {
-        let mut task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-        match task.status {
-            DownloadState::Completed | DownloadState::Cancelled => {
-                return Err(AppError::Config(format!("任务已{},无法取消", task.status)));
-            }
-            _ => {
-                if let Some(control) = state.controls.get(&task_id) {
-                    let _ = control.send(DownloadState::Cancelled);
-                }
-                task.status = DownloadState::Cancelled;
-                task.speed = 0;
-                tracing::info!(task_id = %task_id, "取消任务");
-            }
-        }
-    }
-    persist_task_snapshot(state, &task_id, None).await;
+    state.service.task_service.cancel_task(&task_id).await?;
+    state
+        .runtime
+        .supervisor
+        .send_command(&task_id, TaskCommand::Cancel);
     Ok(())
 }
 
 pub(crate) async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    let task = state
-        .tasks
-        .get(&task_id)
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-    match task.status {
-        DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
-            drop(task);
-            state.tasks.remove(&task_id);
-            state.handles.remove(&task_id);
-            state.controls.remove(&task_id);
-            tracing::info!(task_id = %task_id, "删除任务");
-            Ok(())
-        }
-        other => Err(AppError::Config(format!(
-            "当前状态 '{}' 不允许删除,请先取消任务",
-            other
-        ))),
-    }
+    state.service.task_service.delete_task(&task_id)?;
+    state.runtime.supervisor.cleanup(&task_id);
+    Ok(())
 }
 
 pub(crate) async fn get_task_list_inner(state: &AppState) -> Result<Vec<TaskInfo>, AppError> {
-    Ok(state.tasks.iter().map(|r| r.value().clone()).collect())
+    Ok(state.service.task_service.get_task_list())
 }
 
 pub(crate) async fn get_task_detail_inner(
     state: &AppState,
     task_id: String,
 ) -> Result<TaskInfo, AppError> {
-    state
-        .tasks
-        .get(&task_id)
-        .map(|r| r.value().clone())
-        .ok_or(AppError::TaskNotFound(task_id))
+    state.service.task_service.get_task_detail(&task_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -806,8 +531,12 @@ pub(crate) async fn get_task_detail_inner(
 #[cfg(test)]
 mod tests {
     use super::super::tests::test_state;
+    use super::super::{build_download_config, now_iso8601};
     use super::*;
+    use tachyon_core::safety::redact_url_for_log;
     use tachyon_core::types::DownloadState;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     async fn spawn_task_fn_for_test(
         state: Arc<AppState>,
@@ -817,12 +546,16 @@ mod tests {
         download_dir: String,
     ) {
         let download_config = {
-            let cfg = state.config.lock().await;
+            let cfg = state.domain.config.lock().await;
             build_download_config(&cfg, &download_dir)
         };
-        let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
-        state.controls.insert(task_id.clone(), control_tx);
-        state.tasks.insert(
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
+        state
+            .runtime
+            .supervisor
+            .command_channels
+            .insert(task_id.clone(), control_tx);
+        state.domain.task_repository.insert(
             task_id.clone(),
             TaskInfo {
                 id: task_id.clone(),
@@ -836,13 +569,14 @@ mod tests {
                 fragments_total: 0,
                 fragments_done: 0,
                 created_at: now_iso8601(),
+                save_path: String::new(),
             },
         );
 
         let (start_tx, start_rx) = oneshot::channel();
         let handle = tokio::spawn({
             let state = state.clone();
-            let connection_pool = state.connection_pool.clone();
+            let connection_pool = state.infra.connection_pool.clone();
             let task_id = task_id.clone();
             async move {
                 let _ = start_rx.await;
@@ -859,7 +593,7 @@ mod tests {
                 .await;
             }
         });
-        state.handles.insert(task_id, handle);
+        state.runtime.supervisor.handles.insert(task_id, handle);
         let _ = start_tx.send(());
     }
 
@@ -914,7 +648,7 @@ mod tests {
     async fn test_create_task_with_download_dir() {
         let state = test_state();
         // 使用 test_state 中已授权的下载目录的子目录
-        let cfg = state.config.lock().await;
+        let cfg = state.domain.config.lock().await;
         let base_dir = cfg.download.download_dir.clone();
         drop(cfg);
         let sub_dir = std::path::Path::new(&base_dir)
@@ -994,8 +728,73 @@ mod tests {
         );
 
         // 验证 DashMap 中只有 1 条任务记录
-        let task_count = state.tasks.iter().filter(|r| r.value().url == url).count();
+        let task_count = state
+            .domain
+            .task_repository
+            .iter()
+            .filter(|r| r.value().url == url)
+            .count();
         assert_eq!(task_count, 1, "DashMap 中应只有 1 条相同 URL 的任务");
+    }
+
+    /// 压力测试:50 个不同 URL 并发创建,验证并发门控(max_concurrent_tasks=5)
+    /// 成功数应恰等于上限 5,其余应返回"已达最大并发任务数"错误。
+    #[tokio::test]
+    async fn test_concurrent_create_distinct_urls_respects_max_tasks() {
+        let state = test_state();
+        // test_state 的 max_concurrent_tasks = 5
+        const N: usize = 50;
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let state = state.clone();
+            let url = format!("https://stress.example.com/file-{i}.bin");
+            handles.push(tokio::spawn(async move {
+                create_task_inner(&state, url, None, None).await
+            }));
+        }
+
+        let mut successes = 0usize;
+        let mut cap_failures = 0usize;
+        let mut other_failures = 0usize;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => successes += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("已达最大并发任务数") {
+                        cap_failures += 1;
+                    } else {
+                        other_failures += 1;
+                    }
+                }
+            }
+        }
+
+        // 成功数应恰等于上限 5(Pending/Downloading 任务数)
+        assert_eq!(
+            successes, 5,
+            "并发门控应限制活跃任务数为 5,实际成功 {successes} 个"
+        );
+        // 其余 45 个应因并发上限失败
+        assert_eq!(
+            cap_failures,
+            N - 5,
+            "应有 {} 个任务因并发上限失败,实际 {cap_failures} 个",
+            N - 5
+        );
+        // 不应有其他类型失败(URL 校验/去重等)
+        assert_eq!(
+            other_failures, 0,
+            "不应有非并发上限的失败,实际 other_failures={other_failures}"
+        );
+        // DashMap 中应恰有 5 条任务
+        assert_eq!(
+            state.domain.task_repository.len(),
+            5,
+            "DashMap 应恰有 5 条任务,实际 {} 条",
+            state.domain.task_repository.len()
+        );
     }
 
     #[tokio::test]
@@ -1214,7 +1013,7 @@ mod tests {
     async fn test_max_concurrent_tasks_rejects() {
         let state = AppState::new();
         {
-            let mut cfg = state.config.lock().await;
+            let mut cfg = state.domain.config.lock().await;
             cfg.max_concurrent_tasks = 2;
             // 设置有效下载目录，确保 authorized_dirs 校验通过
             let test_dir = std::env::temp_dir().join("tachyon-test-rejects");
@@ -1242,7 +1041,7 @@ mod tests {
     async fn test_zero_max_concurrent_fragments_marks_task_failed() {
         let state = test_state();
         {
-            let mut cfg = state.config.lock().await;
+            let mut cfg = state.domain.config.lock().await;
             cfg.download.max_concurrent_fragments = 0;
         }
         let result =
@@ -1426,15 +1225,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut rx = state.controls.get(&id).unwrap().subscribe();
+        let mut rx = state
+            .runtime
+            .supervisor
+            .command_channels
+            .get(&id)
+            .unwrap()
+            .subscribe();
 
         pause_task_inner(&state, id.clone()).await.unwrap();
         rx.changed().await.unwrap();
-        assert_eq!(*rx.borrow(), DownloadState::Paused);
+        assert_eq!(*rx.borrow(), TaskCommand::Pause);
 
         resume_task_inner(&state, id).await.unwrap();
         rx.changed().await.unwrap();
-        assert_eq!(*rx.borrow(), DownloadState::Downloading);
+        assert_eq!(*rx.borrow(), TaskCommand::Resume);
     }
 
     #[tokio::test]
@@ -1450,7 +1255,7 @@ mod tests {
         .unwrap();
 
         {
-            update_task_status(&state.tasks, &id, DownloadState::Failed);
+            update_task_status(&state.domain.task_repository, &id, DownloadState::Failed);
         }
 
         let task = get_task_detail_inner(&state, id).await.unwrap();
@@ -1469,14 +1274,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut rx = state.controls.get(&id).unwrap().subscribe();
+        let mut rx = state
+            .runtime
+            .supervisor
+            .command_channels
+            .get(&id)
+            .unwrap()
+            .subscribe();
 
         cancel_task_inner(&state, id.clone()).await.unwrap();
         rx.changed().await.unwrap();
-        assert_eq!(*rx.borrow(), DownloadState::Cancelled);
+        assert_eq!(*rx.borrow(), TaskCommand::Cancel);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while state.handles.contains_key(&id) {
+            while state.runtime.supervisor.handles.contains_key(&id) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -1503,10 +1314,18 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let status = state.tasks.get(&task_id).map(|task| task.status);
+                let status = state
+                    .domain
+                    .task_repository
+                    .get(&task_id)
+                    .map(|task| task.status);
                 if status == Some(DownloadState::Failed)
-                    && !state.handles.contains_key(&task_id)
-                    && !state.controls.contains_key(&task_id)
+                    && !state.runtime.supervisor.handles.contains_key(&task_id)
+                    && !state
+                        .runtime
+                        .supervisor
+                        .command_channels
+                        .contains_key(&task_id)
                 {
                     break;
                 }
@@ -1516,14 +1335,18 @@ mod tests {
         .await
         .expect("DownloadTask 构造失败后应写入 Failed 并清理运行态");
 
-        let task = state.tasks.get(&task_id).unwrap();
+        let task = state.domain.task_repository.get(&task_id).unwrap();
         assert_eq!(task.status, DownloadState::Failed);
         assert!(
-            !state.handles.contains_key(&task_id),
+            !state.runtime.supervisor.handles.contains_key(&task_id),
             "DownloadTask 构造失败后应清理后台 JoinHandle"
         );
         assert!(
-            !state.controls.contains_key(&task_id),
+            !state
+                .runtime
+                .supervisor
+                .command_channels
+                .contains_key(&task_id),
             "DownloadTask 构造失败后应清理控制通道"
         );
     }

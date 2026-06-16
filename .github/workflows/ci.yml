@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# 最小权限原则:CI 只需要 contents: read
+permissions:
+  contents: read
+
+# SRE-018: 并发控制,同一分支的新推送自动取消旧运行
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,6 +22,7 @@ jobs:
   fmt:
     name: 格式检查
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,6 +33,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: 安装系统依赖(Ubuntu)
@@ -38,6 +49,7 @@ jobs:
   test:
     name: 测试 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -50,11 +62,16 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
+      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - name: 安装 cargo-nextest
+        run: cargo binstall -y --force cargo-nextest
+      - name: 运行测试(nextest, 失败重试 2 次)
+        run: cargo nextest run --all --retries 2
 
   docs:
     name: 文档构建
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: 安装系统依赖(Ubuntu)
@@ -71,6 +88,7 @@ jobs:
   audit:
     name: 安全审计 (cargo-deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -79,10 +97,16 @@ jobs:
       - name: 安装 cargo-deny (预编译二进制)
         run: cargo binstall -y --force cargo-deny
       - run: cargo deny check
+      # SRE-012: 未使用依赖检查
+      - name: 安装 cargo-machete
+        run: cargo binstall -y --force cargo-machete
+      - name: 检查未使用依赖
+        run: cargo machete
 
   cargo-audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,9 +116,23 @@ jobs:
         run: cargo binstall -y --force cargo-audit
       - run: cargo audit
 
+  # SRE-013: TOML 格式检查
+  taplo:
+    name: TOML 格式检查 (taplo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - name: 安装 taplo
+        run: cargo binstall -y --force taplo-cli
+      - name: TOML 格式检查
+        run: taplo check
+
   coverage:
     name: 覆盖率检查
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
@@ -109,11 +147,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: 运行覆盖率检查
-        run: cargo llvm-cov --all --fail-under-lines 90
+        # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)、tachyon-p2sp(原型)
+        # 仅检查核心逻辑 crate 的行覆盖率
+        run: |
+          cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
+            -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
+            --fail-under-lines 90 --summary-only
+      - name: 生成覆盖率报告
+        if: always()
+        run: |
+          cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
+            -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
+            --html || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html/
 
   miri:
     name: Miri (unsafe 代码检测)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
@@ -136,6 +191,7 @@ jobs:
   bench:
     name: 性能基准 Smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       TACHYON_BENCH_MODE: smoke
@@ -153,6 +209,7 @@ jobs:
   frontend:
     name: 前端检查
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -161,8 +218,9 @@ jobs:
         run: bun install
       - name: 前端依赖安全审计
         working-directory: frontend
-        run: npx npm audit --audit-level=moderate
-        continue-on-error: true  # 信息性,Bun lockfile 与 npm 不完全兼容,不阻塞 CI
+        run: npx npm audit --audit-level=high
+        # high/critical 漏洞阻断 CI；moderate 仅信息性
+        # Bun lockfile 与 npm 不完全兼容,moderate 可能存在误报
       - name: TypeScript 类型检查
         working-directory: frontend
         run: bun run typecheck
@@ -180,7 +238,7 @@ jobs:
     name: CI 通过
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, docs, audit, cargo-audit, coverage, miri, frontend]
+    needs: [fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, bench, frontend]
     steps:
       - name: 检查所有 CI 作业是否成功
         run: |

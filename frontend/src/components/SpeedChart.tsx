@@ -1,47 +1,63 @@
-import { createMemo, onMount } from 'solid-js'
+import { createMemo, onMount, onCleanup, createSignal } from 'solid-js'
 import type { TaskInfo } from '../types'
 import { formatSpeed } from '../utils/format'
+import { getHistory, getPeakSpeed, getAverageSpeed } from '../stores/speedHistory'
 
 interface SpeedChartProps {
   task: TaskInfo
 }
 
-const MAX_POINTS = 120 // 2 minutes at 1 sample/sec
+const MAX_POINTS = 60
 
 export default function SpeedChart(props: SpeedChartProps) {
-  let svgRef: SVGSVGElement | undefined
-  let dataPoints: number[] = []
+  // 1Hz UI 采样:数据源已是 500ms 推送,UI 1Hz 足够,降低 50% path 重建
+  const [tick, setTick] = createSignal(0)
+  let timerId: number | undefined
 
-  // Initialize with some simulated historical data for demo
   onMount(() => {
-    const base = props.task.speed
-    for (let i = 0; i < 60; i++) {
-      const variance = (Math.random() - 0.5) * base * 0.4
-      dataPoints.push(Math.max(0, base + variance))
+    const loop = () => {
+      setTick(t => t + 1)
+      timerId = window.setTimeout(loop, 1000)
     }
+    timerId = window.setTimeout(loop, 1000)
+  })
+
+  onCleanup(() => {
+    if (timerId !== undefined) clearTimeout(timerId)
+  })
+
+  // 真实速度历史:来自 stores/speedHistory 的环形缓冲区(Float64Array, O(1) 写入)
+  const data = createMemo(() => {
+    void tick() // 依赖 tick 触发重算
+    return getHistory()
   })
 
   const pathD = createMemo(() => {
-    const data = dataPoints.length > 0 ? dataPoints : [props.task.speed]
-    const maxVal = Math.max(...data, 1)
+    const history = data()
+    const sample = history.length > 0 ? history : [props.task.speed]
+    // 降采样:最多 MAX_POINTS 个点,避免 path 字符串过长
+    const points = sample.length > MAX_POINTS
+      ? sample.slice(-MAX_POINTS)
+      : sample
+    const maxVal = Math.max(...points, 1)
     const width = 320
     const height = 120
     const padding = 4
 
-    const points = data.map((val, i) => {
+    const coords = points.map((val, i) => {
       const x = (i / (MAX_POINTS - 1)) * width
       const y = height - padding - (val / maxVal) * (height - padding * 2)
       return [x, y] as const
     })
 
-    if (points.length < 2) return { line: '', area: '' }
+    if (coords.length < 2) return { line: '', area: '' }
 
-    // Build smooth line with simple bezier curves
-    const first = points[0]!
+    // 平滑曲线(简单贝塞尔)
+    const first = coords[0]!
     let line = `M ${first[0]} ${first[1]}`
-    for (let i = 1; i < points.length; i++) {
-      const prev = points[i - 1]!
-      const curr = points[i]!
+    for (let i = 1; i < coords.length; i++) {
+      const prev = coords[i - 1]!
+      const curr = coords[i]!
       const cpx1 = prev[0] + (curr[0] - prev[0]) * 0.5
       const cpx2 = prev[0] + (curr[0] - prev[0]) * 0.5
       line += ` C ${cpx1} ${prev[1]}, ${cpx2} ${curr[1]}, ${curr[0]} ${curr[1]}`
@@ -51,12 +67,12 @@ export default function SpeedChart(props: SpeedChartProps) {
     return { line, area }
   })
 
-  const stats = createMemo(() => {
-    const data = dataPoints.length > 0 ? dataPoints : [props.task.speed]
-    const peak = Math.max(...data)
-    const avg = data.reduce((a, b) => a + b, 0) / data.length
-    return { peak, avg }
-  })
+  const stats = createMemo(() => ({
+    peak: getPeakSpeed(),
+    avg: getAverageSpeed(),
+  }))
+
+  const hasData = createMemo(() => data().length > 0)
 
   return (
     <div
@@ -70,17 +86,16 @@ export default function SpeedChart(props: SpeedChartProps) {
         style={{
           'font-size': '12px',
           'font-weight': 600,
-          color: '#6B7280',
+          color: 'var(--color-text-tertiary)',
           'text-transform': 'uppercase',
           'letter-spacing': '0.5px',
           'margin-bottom': '12px',
         }}
       >
-        速度趋势
+        {'速度趋势'}
       </div>
 
       <svg
-        ref={svgRef}
         width="100%"
         height="120"
         viewBox="0 0 320 120"
@@ -88,37 +103,66 @@ export default function SpeedChart(props: SpeedChartProps) {
         style={{ overflow: 'visible' }}
       >
         <defs>
-          <linearGradient id="area-gradient" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="rgba(0, 212, 170, 0.2)" />
-            <stop offset="100%" stop-color="rgba(0, 212, 170, 0)" />
+          <linearGradient id="speed-area-gradient" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--color-speed-soft)" />
+            <stop offset="100%" stop-color="transparent" />
           </linearGradient>
-          <linearGradient id="line-gradient" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stop-color="#00D4AA" />
-            <stop offset="100%" stop-color="#00B4D8" />
+          <linearGradient id="speed-line-gradient" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="var(--color-accent-primary)" />
+            <stop offset="100%" stop-color="var(--color-speed-active)" />
           </linearGradient>
         </defs>
 
-        <path
-          d={pathD().area}
-          fill="url(#area-gradient)"
-          stroke="none"
-        />
-        <path
-          d={pathD().line}
-          fill="none"
-          stroke="url(#line-gradient)"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
+        {hasData() ? (
+          <>
+            <path
+              d={pathD().area}
+              fill="url(#speed-area-gradient)"
+              stroke="none"
+            />
+            <path
+              d={pathD().line}
+              fill="none"
+              stroke="url(#speed-line-gradient)"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </>
+        ) : (
+          <text
+            x="160"
+            y="64"
+            text-anchor="middle"
+            fill="var(--color-text-tertiary)"
+            font-size="12"
+            font-family="var(--font-mono)"
+          >
+            {'等待速度数据...'}
+          </text>
+        )}
       </svg>
 
       <div class="flex items-center justify-between" style={{ 'margin-top': '12px' }}>
-        <span style={{ 'font-size': '14px', color: '#A0A0B0', 'font-family': "'Geist Mono', monospace" }}>
-          峰值: <span style={{ color: '#00D4AA' }}>{formatSpeed(stats().peak)}</span>
+        <span
+          class="mono"
+          style={{
+            'font-size': '14px',
+            color: 'var(--color-text-secondary)',
+          }}
+        >
+          {'峰值: '}
+          <span style={{ color: 'var(--color-speed-active)' }}>{formatSpeed(stats().peak)}</span>
         </span>
-        <span style={{ 'font-size': '14px', color: '#A0A0B0', 'font-family': "'Geist Mono', monospace" }}>
-          平均: {formatSpeed(stats().avg)}
+        <span
+          class="mono"
+          style={{
+            'font-size': '14px',
+            color: 'var(--color-text-secondary)',
+          }}
+        >
+          {'平均: '}
+          {formatSpeed(stats().avg)}
         </span>
       </div>
     </div>

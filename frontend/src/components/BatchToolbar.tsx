@@ -2,7 +2,7 @@ import { Show, onMount, onCleanup } from 'solid-js'
 import { selectedCount, hasSelection, deselectAll, selectAll } from '../stores/selection'
 import { $tasks } from '../stores/downloads'
 import { Icon } from '../utils/icons'
-import { btnIcon } from '../utils/styles'
+import Button from '../shared/ui/Button'
 
 interface BatchToolbarProps {
   onPauseAll: () => void
@@ -35,45 +35,69 @@ export default function BatchToolbar(props: BatchToolbarProps) {
       <div
         role="toolbar"
         aria-label="批量操作"
-        class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1.5 px-3 py-1.5 glass-panel rounded-lg shadow-lg shadow-black/40 backdrop-blur-sm animate-slide-up"
+        class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 px-3 py-2 rounded-lg panel-surface"
+        style={{
+          'box-shadow': 'var(--shadow-lg)',
+          animation: 'card-fade-in 200ms var(--ease-emphasized) forwards',
+        }}
       >
-        <span class="text-[10px] text-text-secondary mr-1 font-mono">
+        <span
+          class="mr-1 mono"
+          style={{
+            'font-size': '11px',
+            color: 'var(--color-text-secondary)',
+          }}
+        >
           已选 {count()} 项
         </span>
 
-        <button
-          class={`flex items-center gap-1 px-2 py-1 text-[10px] rounded ${btnIcon} w-auto h-auto text-text-secondary hover:text-text-primary`}
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={() => props.onPauseAll()}
           aria-label="批量暂停"
         >
-          <Icon name="pause" class="w-4 h-4" /> 暂停
-        </button>
+          <Icon name="pause" class="w-4 h-4" />
+          <span>暂停</span>
+        </Button>
 
-        <button
-          class={`flex items-center gap-1 px-2 py-1 text-[10px] rounded ${btnIcon} w-auto h-auto text-text-secondary hover:text-text-primary`}
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={() => props.onResumeAll()}
           aria-label="批量恢复"
         >
-          <Icon name="play" class="w-4 h-4" /> 恢复
-        </button>
+          <Icon name="play" class="w-4 h-4" />
+          <span>恢复</span>
+        </Button>
 
-        <div class="w-px h-3 bg-border-strong mx-0.5" />
+        <div
+          class="mx-1"
+          style={{
+            width: '1px',
+            height: '14px',
+            background: 'var(--color-border-default)',
+          }}
+        />
 
-        <button
-          class={`flex items-center gap-1 px-2 py-1 text-[10px] rounded ${btnIcon} w-auto h-auto text-error hover:text-error`}
+        <Button
+          variant="danger"
+          size="sm"
           onClick={() => props.onDeleteAll()}
           aria-label="批量删除"
         >
-          <Icon name="trash" class="w-4 h-4" /> 删除
-        </button>
+          <Icon name="trash" class="w-4 h-4" />
+          <span>删除</span>
+        </Button>
 
-        <button
-          class={`flex items-center gap-1 px-2 py-1 text-[10px] rounded ${btnIcon} w-auto h-auto`}
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={deselectAll}
           aria-label="清空选择"
         >
           清空
-        </button>
+        </Button>
       </div>
     </Show>
   )

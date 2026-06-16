@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -127,22 +128,88 @@ impl Store for MemoryStore {
 
 // ── FileStore ────────────────────────────────────────────────────────
 
+/// 持久化写入模式
+///
+/// 控制写入后是否调用 fsync 保证数据落盘。
+/// - `Fast`: 写入后不 fsync,性能最优但崩溃可能丢失最新数据
+/// - `Durable`: 写入后 fsync 数据文件和目录,保证崩溃恢复
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// 快速模式:不 fsync,依赖 OS 页面缓存回写
+    #[default]
+    Fast,
+    /// 持久模式:数据文件 sync_all + 目录 sync,保证 crash-durable
+    Durable,
+}
+
 /// 基于文件系统的 KV 存储（实现 `Store` trait）
 ///
 /// 每个键对应一个 JSON 文件，存放在指定目录下。
 /// 键经过安全转换后作为文件名（仅保留字母、数字和下划线）。
+///
+/// P2-10: 使用 OS 级文件锁（`.lock` 文件）防止跨实例/跨进程写冲突。
+/// 第二个进程尝试打开同一目录时将失败并返回明确错误。
 pub struct FileStore {
     dir: PathBuf,
     write_lock: RwLock<()>,
+    durability: Durability,
+    /// OS 级文件锁句柄，持有期间阻止其他进程打开同一 store 目录
+    _lock_file: std::fs::File,
 }
+
+impl std::fmt::Debug for FileStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStore")
+            .field("dir", &self.dir)
+            .field("durability", &self.durability)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 全局临时文件计数器,确保每次写入使用唯一的临时文件名
+static FILE_STORE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl FileStore {
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::open_with_durability(dir, Durability::default())
+    }
+
+    /// 以指定持久化模式打开存储
+    ///
+    /// P2-10: 获取 OS 级文件锁，防止第二个进程打开同一 store 目录。
+    /// 如果锁已被其他进程持有，返回 `ErrorKind::WouldBlock` 错误。
+    pub fn open_with_durability(
+        dir: impl AsRef<Path>,
+        durability: Durability,
+    ) -> std::io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+
+        // P2-10: 获取 OS 级排他锁
+        // 锁文件仅用作 OS 级互斥句柄,不写入内容。
+        // 使用 .append(true) 明确告知 clippy 我们不打算截断已存在的文件。
+        let lock_path = dir.join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "存储目录已被其他进程占用: {} (锁文件: {})",
+                    e,
+                    lock_path.display()
+                ),
+            )
+        })?;
+
         Ok(Self {
             dir,
             write_lock: RwLock::new(()),
+            durability,
+            _lock_file: lock_file,
         })
     }
 
@@ -232,16 +299,51 @@ impl Store for FileStore {
         })?;
         std::fs::create_dir_all(&self.dir)?;
         let final_path = self.path_for(key);
-        let temp_path = final_path.with_extension("tmp");
-        std::fs::write(&temp_path, &value).map_err(|e| {
-            tracing::warn!(key, error = %e, "KV 操作失败");
-            e
-        })?;
+        // 使用 pid + 计数器生成唯一临时文件名,避免多实例/多进程写冲突
+        let temp_path = final_path.with_extension(format!(
+            "tmp.{}-{}",
+            std::process::id(),
+            FILE_STORE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // 持久模式:使用 File API 以便 sync_all
+        if self.durability == Durability::Durable {
+            let mut file = std::fs::File::create(&temp_path).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 创建临时文件失败");
+                e
+            })?;
+            use std::io::Write;
+            file.write_all(value.as_bytes()).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 写入临时文件失败");
+                e
+            })?;
+            file.sync_all().map_err(|e| {
+                tracing::warn!(key, error = %e, "KV fsync 临时文件失败");
+                e
+            })?;
+        } else {
+            std::fs::write(&temp_path, &value).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 操作失败");
+                e
+            })?;
+        }
+
         std::fs::rename(&temp_path, &final_path).map_err(|e| {
             tracing::warn!(key, error = %e, "KV rename 失败");
             let _ = std::fs::remove_file(&temp_path);
             e
-        })
+        })?;
+
+        // 持久模式:重命名后同步目录以保证目录项更新落盘
+        if self.durability == Durability::Durable
+            && let Ok(dir_file) = std::fs::File::open(&self.dir)
+            && let Err(e) = dir_file.sync_all()
+        {
+            // 目录 sync 失败不阻断写入,仅记录警告
+            tracing::warn!(key, error = %e, "KV 目录 fsync 失败(数据文件已落盘)");
+        }
+
+        Ok(())
     }
 
     fn delete(&self, key: &str) -> std::io::Result<bool> {
@@ -346,8 +448,11 @@ impl KvStore {
     }
 
     /// 检查键是否存在
-    pub fn contains(&self, key: &str) -> bool {
-        self.inner.exists(key).unwrap_or(false)
+    ///
+    /// 与 `Store::exists` 不同,此方法返回 `Result<bool>` 而非吞掉 I/O 错误,
+    /// 允许调用方正确处理文件系统异常(权限拒绝、磁盘故障等)。
+    pub fn contains(&self, key: &str) -> std::io::Result<bool> {
+        self.inner.exists(key)
     }
 }
 
@@ -570,12 +675,13 @@ mod tests {
 
     #[test]
     fn file_and_kv_dir_return_configured_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file_store = FileStore::open(tmp.path()).unwrap();
-        let kv_store = KvStore::open(tmp.path()).unwrap();
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let file_store = FileStore::open(tmp1.path()).unwrap();
+        let kv_store = KvStore::open(tmp2.path()).unwrap();
 
-        assert_eq!(file_store.dir(), tmp.path());
-        assert_eq!(kv_store.dir(), tmp.path());
+        assert_eq!(file_store.dir(), tmp1.path());
+        assert_eq!(kv_store.dir(), tmp2.path());
     }
 
     #[test]
@@ -661,6 +767,36 @@ mod tests {
         assert!(result.is_err());
         assert!(store.set("k", "v".to_string()).is_err());
         assert!(store.delete("k").is_err());
+    }
+
+    /// P2-10: 验证同一目录不允许第二个 FileStore 实例打开
+    #[test]
+    fn file_cross_instance_lock_prevents_second_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _store1 = FileStore::open(tmp.path()).unwrap();
+
+        // 第二个实例尝试打开同一目录应失败
+        let result = FileStore::open(tmp.path());
+        assert!(result.is_err(), "第二个 FileStore 不应成功打开同一目录");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "错误类型应为 WouldBlock: {err}"
+        );
+    }
+
+    /// P2-10: 验证第一个实例 drop 后，第二个实例可以打开
+    #[test]
+    fn file_cross_instance_lock_released_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let _store1 = FileStore::open(tmp.path()).unwrap();
+            // _store1 在此处 drop，释放 OS 级锁
+        }
+        // 第一个实例已 drop，第二个应能成功打开
+        let store2 = FileStore::open(tmp.path());
+        assert!(store2.is_ok(), "第一个实例 drop 后，第二个应能成功打开");
     }
 
     #[test]
@@ -766,9 +902,9 @@ mod tests {
     fn kv_contains() {
         let tmp = tempfile::tempdir().unwrap();
         let store = KvStore::open(tmp.path()).unwrap();
-        assert!(!store.contains("x"));
+        assert!(!store.contains("x").unwrap());
         store.put("x", &"yes").unwrap();
-        assert!(store.contains("x"));
+        assert!(store.contains("x").unwrap());
     }
 
     #[test]

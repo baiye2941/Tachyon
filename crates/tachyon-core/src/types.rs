@@ -82,6 +82,35 @@ impl DownloadState {
     }
 }
 
+/// 任务控制命令
+///
+/// 从前端/用户发出的控制命令,在 engine 层翻译为 `DownloadState`。
+/// 控制通道使用此类型实现命令与状态分离,并避免 app 层为每个下载 spawn 翻译任务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskCommand {
+    /// 启动下载
+    Start,
+    /// 暂停下载
+    Pause,
+    /// 恢复下载
+    Resume,
+    /// 取消下载
+    Cancel,
+}
+
+impl TaskCommand {
+    /// 将控制命令翻译为引擎内部状态
+    pub fn to_download_state(self) -> DownloadState {
+        match self {
+            Self::Start => DownloadState::Downloading,
+            Self::Pause => DownloadState::Paused,
+            Self::Resume => DownloadState::Downloading,
+            Self::Cancel => DownloadState::Cancelled,
+        }
+    }
+}
+
 /// 暂停状态信息，用于跟踪暂停超时
 ///
 /// CLAUDE.md 要求: paused 状态 MUST 有时间上限，不能永久暂停
@@ -202,6 +231,21 @@ pub struct TaskProgress {
 pub struct DownloadStateChange {
     pub task_id: String,
     pub new_state: DownloadState,
+}
+
+/// 分片进度回调消息
+///
+/// 通过 `progress_tx` 通道发送给上层(tachyon-app),用于:
+/// - `completed == false`:增量进度更新(每写一个 chunk 发一次)
+/// - `completed == true`:分片整体下载完成,触发上层 checkpoint 落盘(断点续传)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentProgress {
+    /// 分片索引
+    pub fragment_index: u32,
+    /// 该分片是否已整体完成
+    pub completed: bool,
+    /// 该分片当前已下载字节数
+    pub fragment_downloaded: u64,
 }
 
 #[cfg(test)]
