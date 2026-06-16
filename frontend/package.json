@@ -34,7 +34,7 @@
     "@tailwindcss/vite": "^4.0.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "eslint": "^9.0.0",
+    "eslint": "^10.5.0",
     "eslint-plugin-solid": "^0.14.0",
     "jsdom": "^26.0.0",
     "rollup-plugin-visualizer": "^7.0.1",
