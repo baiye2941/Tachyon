@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-nextest
-        run: cargo binstall -y --force cargo-nextest
+        run: cargo binstall -y --force --locked cargo-nextest
       - name: 运行测试(nextest, 失败重试 2 次)
         run: cargo nextest run --all --retries 2
 

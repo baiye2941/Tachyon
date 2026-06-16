@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/rust-1.96%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/edition-2024-blue?style=flat-square" alt="Edition" />
   <img src="https://img.shields.io/badge/coverage-90%25-brightgreen?style=flat-square" alt="Coverage" />
   <img src="https://img.shields.io/badge/clippy-0%20warnings-green?style=flat-square" alt="Clippy" />
@@ -55,10 +55,10 @@ Tachyon 是一款使用 Rust 语言构建的桌面端高性能文件下载器，
 |:--|:--|:--|
 | SolidJS | ^1.9 | 细粒度响应式 UI 框架 |
 | Tauri API | ^2.11 | 前端-后端 IPC 桥接 |
-| TailwindCSS | ^4.0 | 原子化 CSS 框架 |
-| Vite | ^6.1 | 构建工具 |
+| TailwindCSS | ^4.3 | 原子化 CSS 框架 |
+| Vite | ^7.3 | 构建工具 |
 | Bun | 1.x | 包管理与脚本运行 |
-| Vitest | ^3.0 | 单元测试 |
+| Vitest | ^3.2 | 单元测试 |
 | Playwright | ^1.61 | E2E 测试 |
 | Storybook | 10.4 | 组件开发与文档 |
 | @motionone/solid | ^10.16 | 动画库 |
@@ -695,7 +695,7 @@ cargo build --features "ftp,quic"          # 全协议 (同默认)
 
 | 依赖 | 最低版本 | 说明 |
 |:--|:--|:--|
-| Rust | 1.85+ | edition 2024，见 `rust-toolchain.toml` |
+| Rust | 1.96+ | edition 2024，见 `rust-toolchain.toml` |
 | Bun | 最新 | 前端包管理与构建 (`packageManager: bun@1.x`) |
 | cargo-tauri | 2.x | Tauri 开发与构建 CLI |
 
