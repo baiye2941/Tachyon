@@ -38,6 +38,7 @@ pub enum IoStrategy {
 /// Windows 平台默认使用 IOCP 后端（无锁完成端口 + NO_BUFFERING），
 /// 其他平台默认使用 Standard（TokioFile）。
 #[cfg(target_os = "windows")]
+#[allow(clippy::derivable_impls)]
 impl Default for IoStrategy {
     fn default() -> Self {
         IoStrategy::Iocp
@@ -45,6 +46,7 @@ impl Default for IoStrategy {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(clippy::derivable_impls)]
 impl Default for IoStrategy {
     fn default() -> Self {
         IoStrategy::Standard

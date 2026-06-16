@@ -514,17 +514,23 @@ async fn driver_task(
         if ring.submitter().submit_and_wait(total_sqes).is_err() {
             // 提交失败：通知所有 inflight 请求
             for (_, req) in inflight.drain() {
-                let err = Err(DownloadError::Io(std::io::Error::other(
-                    "io_uring submit_and_wait 失败",
-                )));
                 match req {
                     InflightReq::Write(r) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other(
+                            "io_uring submit_and_wait 失败",
+                        )));
                         let _ = r.done.send(err);
                     }
                     InflightReq::Read(r) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other(
+                            "io_uring submit_and_wait 失败",
+                        )));
                         let _ = r.done.send(err);
                     }
                     InflightReq::Sync(done) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other(
+                            "io_uring submit_and_wait 失败",
+                        )));
                         let _ = done.send(err);
                     }
                 }
@@ -578,15 +584,17 @@ async fn driver_task(
         if !inflight.is_empty() {
             tracing::warn!(remaining = inflight.len(), "io_uring CQE 缺失");
             for (_, req) in inflight.drain() {
-                let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
                 match req {
                     InflightReq::Write(r) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
                         let _ = r.done.send(err);
                     }
                     InflightReq::Read(r) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
                         let _ = r.done.send(err);
                     }
                     InflightReq::Sync(done) => {
+                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
                         let _ = done.send(err);
                     }
                 }

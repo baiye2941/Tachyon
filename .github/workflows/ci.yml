@@ -62,7 +62,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force cargo-nextest
       - name: 运行测试(nextest, 失败重试 2 次)
@@ -93,7 +93,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-deny (预编译二进制)
         run: cargo binstall -y --force cargo-deny
       - run: cargo deny check
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
       - run: cargo audit
@@ -123,7 +123,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: cargo-bins/cargo-binstall@v1.12.3
+      - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 taplo
         run: cargo binstall -y --force taplo-cli
       - name: TOML 格式检查
@@ -218,9 +218,8 @@ jobs:
         run: bun install
       - name: 前端依赖安全审计
         working-directory: frontend
-        run: npx npm audit --audit-level=high
+        run: bun audit --audit-level=high
         # high/critical 漏洞阻断 CI；moderate 仅信息性
-        # Bun lockfile 与 npm 不完全兼容,moderate 可能存在误报
       - name: TypeScript 类型检查
         working-directory: frontend
         run: bun run typecheck
