@@ -35,6 +35,7 @@ pub struct WinFile {
     file: Arc<std::fs::File>,
     no_buffering: bool,
     /// 惰性初始化的 buffered fallback 句柄(仅 no_buffering=true 时使用)
+    #[allow(dead_code)]
     fallback: FallbackHandle,
 }
 

@@ -242,13 +242,13 @@ const O_DIRECT_ALIGN: usize = 4096;
 #[cfg(target_os = "linux")]
 fn validate_odirect_alignment(offset: u64, len: usize) -> DownloadResult<()> {
     let align = O_DIRECT_ALIGN as u64;
-    if offset % align != 0 {
+    if !offset.is_multiple_of(align) {
         return Err(invalid_input(format!(
             "io_uring O_DIRECT 文件偏移 {offset} 未按 {O_DIRECT_ALIGN} 字节对齐"
         )));
     }
     let len_u64 = len as u64;
-    if len_u64 % align != 0 {
+    if !len_u64.is_multiple_of(align) {
         return Err(invalid_input(format!(
             "io_uring O_DIRECT I/O 长度 {len} 未按 {O_DIRECT_ALIGN} 字节对齐"
         )));
@@ -281,6 +281,7 @@ struct IoUringHandle {
     /// fixed buffer 分配位图(1=已占用, 0=空闲)
     buffer_bitmap: AtomicU64,
     /// buffer 数量(用于 alloc 失败时的诊断)
+    #[allow(dead_code)]
     buffer_count: usize,
 }
 
@@ -299,6 +300,7 @@ enum DriverCmd {
         done: tokio::sync::oneshot::Sender<DownloadResult<()>>,
     },
     /// 关闭 driver task
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -540,7 +542,7 @@ async fn driver_task(
 
         // 7. 收集 CQE 并按 user_data 分发结果
         let mut cq = ring.completion();
-        while let Some(cqe) = cq.next() {
+        for cqe in cq.by_ref() {
             let user_data = cqe.user_data();
             let r = cqe.result();
             let Some(req) = inflight.remove(&user_data) else {
