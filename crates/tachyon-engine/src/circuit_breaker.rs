@@ -1,6 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 /// 熔断器状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +87,12 @@ impl CircuitBreaker {
 }
 
 /// 每源熔断器管理器
+///
+/// E-02: 使用 DashMap 替代 Mutex<HashMap>,支持无锁并发读写。
+/// 读操作(allow/record_success)不阻塞写操作(record_failure/allow 的 entry 插入),
+/// 消除热路径中 std::sync::Mutex 对 Tokio worker 线程的阻塞风险。
 pub struct SourceCircuitBreakers {
-    breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
+    breakers: Arc<DashMap<String, CircuitBreaker>>,
     failure_threshold: u32,
     open_duration: Duration,
 }
@@ -105,7 +110,7 @@ impl Clone for SourceCircuitBreakers {
 impl SourceCircuitBreakers {
     pub fn new(failure_threshold: u32, open_duration: Duration) -> Self {
         Self {
-            breakers: Arc::new(Mutex::new(HashMap::new())),
+            breakers: Arc::new(DashMap::new()),
             failure_threshold,
             open_duration,
         }
@@ -113,25 +118,26 @@ impl SourceCircuitBreakers {
 
     /// 检查指定源是否被放行
     pub fn allow(&self, source: &str) -> bool {
-        let mut breakers = self.breakers.lock().unwrap();
-        breakers
+        // 确保条目存在(首次访问时插入)
+        self.breakers
             .entry(source.to_string())
-            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.open_duration))
-            .allow()
+            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.open_duration));
+        // 获取可变引用并调用 allow
+        self.breakers
+            .get_mut(source)
+            .is_some_and(|mut cb| cb.allow())
     }
 
     /// 记录指定源成功
     pub fn record_success(&self, source: &str) {
-        let mut breakers = self.breakers.lock().unwrap();
-        if let Some(b) = breakers.get_mut(source) {
-            b.record_success();
+        if let Some(mut cb) = self.breakers.get_mut(source) {
+            cb.record_success();
         }
     }
 
     /// 记录指定源失败
     pub fn record_failure(&self, source: &str) {
-        let mut breakers = self.breakers.lock().unwrap();
-        breakers
+        self.breakers
             .entry(source.to_string())
             .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.open_duration))
             .record_failure();

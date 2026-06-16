@@ -14,19 +14,22 @@
 //! - `storage_adapter` -- 类型擦除存储包装器 (DynStorage) + 分片进度消息
 //! - `mirror`          -- 多镜像源 Happy Eyeballs 适配器
 
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use tachyon_core::config::DownloadConfig;
-use tachyon_core::rate_limit::RateLimiter;
+use tachyon_core::config::{DownloadConfig, SchedulerConfig};
 use tachyon_core::traits::{DownloadScheduler, Protocol, Verifier};
-use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskId};
-use tachyon_core::{DownloadError, DownloadResult, Metrics};
+
+use crate::rate_limit::RateLimiter;
+use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskCommand, TaskId};
+use tachyon_core::{DownloadError, DownloadResult, FragmentProgress, Metrics};
 use tachyon_crypto::CpuVerifier;
 use tachyon_protocol::http::HttpClient;
 use tachyon_scheduler::AdaptiveDownloadScheduler;
@@ -34,7 +37,6 @@ use tachyon_scheduler::AdaptiveDownloadScheduler;
 use crate::circuit_breaker::SourceCircuitBreakers;
 use crate::mirror::MirrorProtocol;
 use crate::storage_adapter::DynStorage;
-pub use crate::storage_adapter::FragmentProgress;
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
 /// 添加新校验后端只需实现 Verifier trait,无需修改引擎层枚举。
@@ -56,13 +58,29 @@ const VERIFY_HASH_CHUNK_SIZE: usize = 1024 * 1024;
 /// 约每 1.25 MiB 上报一次,平衡延迟与开销。
 const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
 
-type FragmentTaskOk = (u32, u64, Duration);
+/// 分片写入批大小阈值(字节)。网络 chunk 先累积到 `write_buf`,达到此阈值后
+/// 批量刷写存储,减少 `write_at` 系统调用次数。256 KiB 在 HDD/SSD 与默认
+/// 分片大小下均为合理折中,过小则 I/O 放大,过大则内存占用与尾块延迟上升。
+/// 注意:调用方构造 `write_buf` 时须使用同一常量,保证 capacity 与阈值一致,
+/// 避免无限增长。
+const WRITE_BATCH_BYTES: usize = 256 * 1024;
+
+/// 控制通道(暂停/取消)检查频率 — 每 N 个 chunk 检查一次。
+///
+/// watch::Receiver::borrow_and_update 是原子读,单次开销极低,但高速下载
+/// (小 chunk)下每 chunk 检查会累积。降频到每 8 chunk 检查一次,暂停/取消
+/// 响应延迟仍在 MB 级(8 chunk),用户无感。
+const CONTROL_CHECK_CHUNK_INTERVAL: u64 = 8;
+
+type FragmentTaskOk = (u32, u64, Duration, Option<String>);
 type FragmentTaskErr = (u32, DownloadError);
 type FragmentTaskResult = Result<FragmentTaskOk, FragmentTaskErr>;
 
+/// 分片任务规格: (index, start, end, resume_offset, compute_hash)
+type FragmentSpec = (u32, u64, u64, u64, bool);
+
 use crate::connection::ConnectionPool;
 use crate::fragment::FragmentRecord;
-use crate::orchestrator::DownloadOrchestrator;
 
 #[cfg(test)]
 use tachyon_core::test_harness::harness::MockProtocol as MockProto;
@@ -84,10 +102,10 @@ pub struct DownloadTask {
     protocol: Arc<dyn Protocol>,
     /// 延迟初始化:probe() 后通过 init_storage() 创建
     storage: Option<Arc<DynStorage>>,
-    orchestrator: DownloadOrchestrator,
+    scheduler_config: SchedulerConfig,
     scheduler: Arc<dyn DownloadScheduler>,
     pool: Option<Arc<ConnectionPool>>,
-    control_rx: Option<watch::Receiver<DownloadState>>,
+    control_rx: Option<watch::Receiver<TaskCommand>>,
     state: DownloadState,
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
@@ -95,6 +113,8 @@ pub struct DownloadTask {
     #[allow(dead_code)]
     verifier: VerifierKind,
     completed_fragments: Vec<u32>,
+    /// 未完整下载的分片及其已持久化的字节数(字节级断点续传)
+    partial_fragments: HashMap<u32, u64>,
     /// 外部共享限速器(跨任务全局限速)。
     /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -164,32 +184,37 @@ impl DownloadTask {
     ) -> DownloadResult<Self> {
         let _parsed = url::Url::parse(&url)?;
 
-        let protocol: Arc<dyn Protocol> =
-            if url.starts_with("http://") || url.starts_with("https://") {
-                // 注入超时:connect 超时防"连不上"(黑洞 IP),
-                // read 超时防"连上后静默断流"。read 用配置的 request_timeout_secs,
-                // 它限制的是单次读取空闲间隔上限,不会误杀正常的大文件长下载。
-                Arc::new(HttpClient::with_timeouts(
+        let protocol: Arc<dyn Protocol> = if url.starts_with("http://")
+            || url.starts_with("https://")
+        {
+            // 注入超时:connect 超时防"连不上"(黑洞 IP),
+            // read 超时防"连上后静默断流"。read 用配置的 request_timeout_secs,
+            // 它限制的是单次读取空闲间隔上限,不会误杀正常的大文件长下载。
+            //
+            // 连接池调优:若有 ConnectionPool,用其 max_per_host 参数化 reqwest
+            // 空闲连接池大小,使 reqwest 连接复用与信号量并发上限对齐。
+            Arc::new(if let Some(ref p) = pool {
+                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
+                HttpClient::with_connection_config(
+                    &conn_config,
                     config.connect_timeout_secs,
                     config.request_timeout_secs,
-                )?)
+                )?
             } else {
-                return Err(DownloadError::Config(format!("不支持的协议: {url}")));
-            };
-
-        // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
-        let orchestrator = match &pool {
-            Some(p) => DownloadOrchestrator::with_shared_pool(p.clone(), Default::default()),
-            None => DownloadOrchestrator::new(Default::default()),
+                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)?
+            })
+        } else {
+            return Err(DownloadError::Config(format!("不支持的协议: {url}")));
         };
 
+        // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
         Ok(Self {
             id: TaskId::new_v4(),
             url,
             config,
             protocol,
             storage: None,
-            orchestrator,
+            scheduler_config: SchedulerConfig::default(),
             scheduler,
             pool,
             control_rx: None,
@@ -199,6 +224,7 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -229,6 +255,7 @@ impl DownloadTask {
             config.request_timeout_secs,
         )?);
 
+        let total_mirrors = mirror_urls.len();
         let mirrors: Vec<(String, Arc<dyn Protocol>)> = mirror_urls
             .iter()
             .filter_map(|m| {
@@ -237,12 +264,16 @@ impl DownloadTask {
                     .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
             })
             .collect();
+        let failed_mirrors = total_mirrors - mirrors.len();
+        if failed_mirrors > 0 {
+            tracing::warn!(
+                total = total_mirrors,
+                failed = failed_mirrors,
+                "部分镜像源创建 HTTP 客户端失败"
+            );
+        }
 
         let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
-        let orchestrator = match &pool {
-            Some(p) => DownloadOrchestrator::with_shared_pool(p.clone(), Default::default()),
-            None => DownloadOrchestrator::new(Default::default()),
-        };
 
         Ok(Self {
             id: TaskId::new_v4(),
@@ -250,7 +281,7 @@ impl DownloadTask {
             config,
             protocol,
             storage: None,
-            orchestrator,
+            scheduler_config: SchedulerConfig::default(),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool,
             control_rx: None,
@@ -260,6 +291,7 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -279,7 +311,7 @@ impl DownloadTask {
             config,
             protocol,
             storage: Some(Arc::new(storage)),
-            orchestrator: DownloadOrchestrator::new(Default::default()),
+            scheduler_config: SchedulerConfig::default(),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool: None,
             control_rx: None,
@@ -289,13 +321,14 @@ impl DownloadTask {
             progress_tx: None,
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
         }
     }
 
-    pub fn set_control_rx(&mut self, control_rx: watch::Receiver<DownloadState>) {
+    pub fn set_control_rx(&mut self, control_rx: watch::Receiver<TaskCommand>) {
         self.control_rx = Some(control_rx);
     }
 
@@ -317,12 +350,20 @@ impl DownloadTask {
         self.completed_fragments = completed;
     }
 
+    /// 设置未完整下载的分片及其已下载字节数(字节级断点续传)
+    ///
+    /// 必须在 `plan()` 之前调用。`plan()` 会据此调整对应分片的 `resume_offset`,
+    /// 使 `execute()` 从已下载位置继续,避免完整重下整个分片。
+    pub fn set_partial_fragments(&mut self, partial: HashMap<u32, u64>) {
+        self.partial_fragments = partial;
+    }
+
     async fn wait_control_rx(
-        rx: &mut watch::Receiver<DownloadState>,
+        rx: &mut watch::Receiver<TaskCommand>,
         pause_timeout: Duration,
     ) -> DownloadResult<()> {
         loop {
-            let state = *rx.borrow_and_update();
+            let state = rx.borrow_and_update().to_download_state();
             match state {
                 DownloadState::Cancelled => return Err(DownloadError::Cancelled),
                 DownloadState::Failed => return Err(DownloadError::Other("任务已失败".into())),
@@ -343,7 +384,7 @@ impl DownloadTask {
     }
 
     async fn wait_control(
-        control_rx: &mut Option<watch::Receiver<DownloadState>>,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<()> {
         if let Some(rx) = control_rx.as_mut() {
@@ -359,11 +400,11 @@ impl DownloadTask {
     /// 只有在出现 Cancelled/Failed 时返回 `Err`,出现 Paused 时按暂停语义阻塞/超时。
     /// 控制通道关闭时返回错误,避免任务永久挂起。
     async fn watch_for_interrupt(
-        rx: &mut watch::Receiver<DownloadState>,
+        rx: &mut watch::Receiver<TaskCommand>,
         pause_timeout: Duration,
     ) -> DownloadResult<()> {
         loop {
-            let state = *rx.borrow_and_update();
+            let state = rx.borrow_and_update().to_download_state();
             match state {
                 DownloadState::Cancelled => return Err(DownloadError::Cancelled),
                 DownloadState::Failed => return Err(DownloadError::Other("任务已失败".into())),
@@ -481,16 +522,19 @@ impl DownloadTask {
             "调度器建议"
         );
 
+        // 调度器有高置信度带宽预测时使用其建议,否则回退到 scheduler_config 计算,
+        // 避免冷启动时盲目采用默认 min_fragment_size 导致小文件过度分片。
         let suggested_frag_size = if recommendation.confidence > 0.0 {
             Some(recommendation.fragment_size)
         } else {
             None
         };
 
-        let fragments = self.orchestrator.plan_fragments(
+        let fragments = crate::fragment::plan_fragments(
             file_size,
             metadata.supports_range,
             suggested_frag_size,
+            &self.scheduler_config,
         );
 
         info!(count = fragments.len(), "分片规划完成");
@@ -515,6 +559,23 @@ impl DownloadTask {
                 }
             }
             info!(resumed, "断点续传:跳过已完成分片");
+        }
+
+        // 字节级断点续传:对未完整下载的分片注入 resume_offset
+        if !self.partial_fragments.is_empty() {
+            let mut resumed_partial = 0u32;
+            for (&idx, &bytes) in &self.partial_fragments {
+                if let Some(frag) = self.fragments.get_mut(idx as usize)
+                    && frag.state == crate::fragment::FragmentState::Pending
+                    && bytes > 0
+                    && bytes < frag.info.size
+                {
+                    frag.resume_offset = bytes;
+                    frag.info.downloaded = bytes;
+                    resumed_partial += 1;
+                }
+            }
+            info!(resumed_partial, "字节级断点续传:恢复未完整分片");
         }
 
         Ok(fragments)
@@ -743,14 +804,84 @@ impl DownloadTask {
         let mut handles: JoinSet<FragmentTaskResult> = JoinSet::new();
 
         // 仅对未完成(Pending)的分片下载,已完成分片(断点续传)跳过
-        let fragment_specs: Vec<(u32, u64, u64)> = self
+        let fragment_specs: Vec<FragmentSpec> = self
             .fragments
             .iter()
             .filter(|frag| frag.state == crate::fragment::FragmentState::Pending)
-            .map(|frag| (frag.info.index, frag.info.start, frag.info.end))
+            .map(|frag| {
+                (
+                    frag.info.index,
+                    frag.info.start,
+                    frag.info.end,
+                    frag.resume_offset,
+                    frag.info.hash.is_some(),
+                )
+            })
             .collect();
 
-        for (frag_index, frag_start, frag_end) in fragment_specs {
+        // ── dispatcher + per-worker channel model ─────────────────────
+        // 不再让所有 worker 争抢同一个 Arc<Mutex<Receiver>> 锁,
+        // 改为一个 dispatcher 从中央队列读取,round-robin 派发到每个 worker 的
+        // 独立 channel,彻底消除锁争用;同时通过 completed_tx 报告分片完成,
+        // 避免 abort_all 时丢失已完成的碎片状态。
+        let worker_count = effective_concurrency
+            .max(1)
+            .min(fragment_specs.len().max(1));
+        let (frag_tx, mut frag_rx) = mpsc::channel::<FragmentSpec>(worker_count * 2);
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<FragmentTaskResult>();
+
+        let mut worker_txs: Vec<mpsc::Sender<FragmentSpec>> = Vec::with_capacity(worker_count);
+        let mut worker_rxs: Vec<mpsc::Receiver<FragmentSpec>> = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (tx, rx) = mpsc::channel::<FragmentSpec>(1);
+            worker_txs.push(tx);
+            worker_rxs.push(rx);
+        }
+
+        // 将所有待下载分片入队
+        for spec in &fragment_specs {
+            let frag_index = spec.0;
+            if frag_index as usize >= self.fragments.len() {
+                return Err(DownloadError::Config("分片索引越界".into()));
+            }
+            self.fragments[frag_index as usize].start_download()?;
+            if let Some(ref m) = metrics {
+                m.inc_fragment();
+            }
+            if frag_tx.send(*spec).await.is_err() {
+                // worker 全部退出,后续入队无意义
+                break;
+            }
+        }
+        // 释放发送端,worker 在消费完所有分片后自动退出
+        drop(frag_tx);
+
+        // 启动 dispatcher,将中央队列分片 round-robin 派发给 worker
+        let dispatcher_handle = tokio::spawn(async move {
+            let mut next_worker = 0usize;
+            let mut closed = 0usize;
+            while let Some(spec) = frag_rx.recv().await {
+                // 若目标 worker 已退出,尝试下一个,避免卡死
+                loop {
+                    if closed >= worker_count {
+                        break;
+                    }
+                    if worker_txs[next_worker].send(spec).await.is_ok() {
+                        next_worker = (next_worker + 1) % worker_count;
+                        break;
+                    }
+                    closed += 1;
+                    next_worker = (next_worker + 1) % worker_count;
+                }
+                if closed >= worker_count {
+                    break;
+                }
+            }
+            // worker_txs 在此 drop,worker 接收端正常结束
+        });
+
+        // 启动 worker
+        for (worker_id, mut work_rx) in worker_rxs.into_iter().enumerate() {
             let frag_url = url.clone();
             let frag_storage = storage.clone();
             let frag_protocol = protocol.clone();
@@ -761,185 +892,294 @@ impl DownloadTask {
             let frag_control_rx = control_rx.clone();
             let frag_progress_tx = progress_tx.clone();
             let frag_metrics = metrics.clone();
-
             let frag_circuit_breakers = circuit_breakers.clone();
-
-            if frag_index as usize >= self.fragments.len() {
-                return Err(DownloadError::Config("分片索引越界".into()));
-            }
-            self.fragments[frag_index as usize].start_download()?;
-            if let Some(ref m) = metrics {
-                m.inc_fragment();
-            }
+            let completed_tx = completed_tx.clone();
 
             handles.spawn(async move {
-                // spawn 内部重试循环:单次尝试失败后指数退避重试,
-                // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
-                let mut attempt: u32 = 0;
+                // 跨分片复用的写入缓冲区(避免每个分片新建 BytesMut)
+                // capacity 与 WRITE_BATCH_BYTES 一致,保证累积到阈值时一次 split 即可刷写,
+                // 无需重新分配。使用常量而非字面量,确保两处不会漂移。
+                let mut write_buf = bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES);
                 loop {
-                    // 熔断器检查:若源已被熔断,直接跳过本次尝试
-                    if !frag_circuit_breakers.allow(&frag_url) {
-                        if attempt >= max_retries {
-                            return Err((
-                                frag_index,
-                                DownloadError::Network(format!("源 {frag_url} 已被熔断,跳过重试")),
-                            ));
-                        }
-                        warn!(
-                            index = frag_index,
-                            attempt = attempt + 1,
-                            source = %frag_url,
-                            "源处于熔断状态,跳过本次尝试"
-                        );
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    let permit = match frag_semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Err((
-                                frag_index,
-                                DownloadError::Other(format!("信号量获取失败: {e}").into()),
-                            ));
+                    // 从专属 channel 拉取下一个分片
+                    let spec = match work_rx.recv().await {
+                        Some(s) => s,
+                        None => {
+                            let _ = completed_tx.send(Ok((0, 0, Duration::ZERO, None)));
+                            return Ok((0, 0, Duration::ZERO, None));
                         }
                     };
-                    let result = Self::download_single_fragment(
-                        &frag_protocol,
-                        &frag_storage,
-                        &frag_pool,
-                        &frag_host,
-                        &frag_url,
-                        frag_index,
-                        frag_start,
-                        frag_end,
-                        pause_timeout,
-                        frag_limiter.clone(),
-                        &frag_control_rx,
-                        &frag_progress_tx,
-                    )
-                    .await;
-                    drop(permit);
+                    let (frag_index, frag_start, frag_end, resume_offset, compute_hash) = spec;
 
-                    match result {
-                        Ok((downloaded, duration)) => {
-                            frag_circuit_breakers.record_success(&frag_url);
-                            return Ok((frag_index, downloaded, duration));
-                        }
-                        Err(e) => {
-                            // 不可重试的错误(取消、超时、权限、校验等)直接上报
-                            if !e.is_retryable() {
-                                if let Some(ref m) = frag_metrics {
-                                    m.inc_error();
-                                }
-                                frag_circuit_breakers.record_failure(&frag_url);
-                                return Err((frag_index, e));
-                            }
+                    // spawn 内部重试循环:单次尝试失败后指数退避重试,
+                    // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
+                    let mut attempt: u32 = 0;
+                    let frag_result: FragmentTaskResult = loop {
+                        // 熔断器检查:若源已被熔断,直接跳过本次尝试
+                        if !frag_circuit_breakers.allow(&frag_url) {
                             if attempt >= max_retries {
-                                if let Some(ref m) = frag_metrics {
-                                    m.inc_error();
-                                }
-                                frag_circuit_breakers.record_failure(&frag_url);
-                                return Err((frag_index, e));
+                                break Err((
+                                    frag_index,
+                                    DownloadError::Network(format!(
+                                        "源 {frag_url} 已被熔断,跳过重试"
+                                    )),
+                                ));
                             }
-                            // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
-                            // 否则回退到 Full Jitter 指数退避,避免多分片同源失败时惊群
-                            let backoff = match &e {
-                                DownloadError::Throttled {
-                                    retry_after_secs: Some(secs),
-                                } => Duration::from_secs((*secs).min(1024)),
-                                _ => {
-                                    let base_secs = 1u64 << attempt.min(10);
-                                    if base_secs <= 1 {
-                                        // base_secs=1 时无法抖动,直接使用 1s
-                                        Duration::from_secs(1)
-                                    } else {
-                                        // 使用分片索引+尝试次数作为抖动种子,确定性且各分片不同
-                                        let seed = (frag_index as u64)
-                                            .wrapping_mul(0x9E3779B97F4A7C15)
-                                            .wrapping_add(attempt as u64);
-                                        let log2 = base_secs.trailing_zeros();
-                                        let hash = seed.wrapping_mul(0x517cc1b727220a95);
-                                        let jitter = hash >> (64 - log2);
-                                        Duration::from_secs(base_secs.saturating_sub(jitter).max(1))
-                                    }
-                                }
-                            };
                             warn!(
                                 index = frag_index,
                                 attempt = attempt + 1,
-                                max_retries,
-                                backoff_secs = backoff.as_secs(),
-                                error = %e,
-                                "分片下载失败,退避后重试"
+                                source = %frag_url,
+                                worker_id,
+                                "源处于熔断状态,跳过本次尝试"
                             );
-                            frag_circuit_breakers.record_failure(&frag_url);
-                            tokio::time::sleep(backoff).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                             attempt += 1;
+                            continue;
                         }
+
+                        let permit = match frag_semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                break Err((
+                                    frag_index,
+                                    DownloadError::Other(format!("信号量获取失败: {e}").into()),
+                                ));
+                            }
+                        };
+                        write_buf.clear(); // 保留 allocation,仅清空内容(跨分片复用)
+                        let result = Self::download_single_fragment(
+                            &frag_protocol,
+                            &frag_storage,
+                            &frag_pool,
+                            &frag_host,
+                            &frag_url,
+                            frag_index,
+                            frag_start,
+                            frag_end,
+                            resume_offset,
+                            pause_timeout,
+                            frag_limiter.clone(),
+                            &frag_control_rx,
+                            &frag_progress_tx,
+                            compute_hash,
+                            &mut write_buf,
+                        )
+                        .await;
+                        drop(permit);
+
+                        match result {
+                            Ok((downloaded, duration, computed_hash)) => {
+                                frag_circuit_breakers.record_success(&frag_url);
+                                break Ok((frag_index, downloaded, duration, computed_hash));
+                            }
+                            Err(e) => {
+                                // 不可重试的错误(取消、超时、权限、校验等)直接上报
+                                if !e.is_retryable() {
+                                    if let Some(ref m) = frag_metrics {
+                                        m.inc_error();
+                                    }
+                                    frag_circuit_breakers.record_failure(&frag_url);
+                                    break Err((frag_index, e));
+                                }
+                                if attempt >= max_retries {
+                                    if let Some(ref m) = frag_metrics {
+                                        m.inc_error();
+                                    }
+                                    frag_circuit_breakers.record_failure(&frag_url);
+                                    break Err((frag_index, e));
+                                }
+                                // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
+                                // 否则回退到 Full Jitter 指数退避,避免多分片同源失败时惊群
+                                let backoff = match &e {
+                                    DownloadError::Throttled {
+                                        retry_after_secs: Some(secs),
+                                    } => Duration::from_secs((*secs).min(1024)),
+                                    _ => {
+                                        let base_secs = 1u64 << attempt.min(10);
+                                        if base_secs <= 1 {
+                                            Duration::from_secs(1)
+                                        } else {
+                                            let seed = (frag_index as u64)
+                                                .wrapping_mul(0x9E3779B97F4A7C15)
+                                                .wrapping_add(attempt as u64);
+                                            let log2 = base_secs.trailing_zeros();
+                                            let hash = seed.wrapping_mul(0x517cc1b727220a95);
+                                            let jitter = hash >> (64 - log2);
+                                            Duration::from_secs(
+                                                base_secs.saturating_sub(jitter).max(1),
+                                            )
+                                        }
+                                    }
+                                };
+                                warn!(
+                                    index = frag_index,
+                                    attempt = attempt + 1,
+                                    max_retries,
+                                    backoff_secs = backoff.as_secs(),
+                                    error = %e,
+                                    worker_id,
+                                    "分片下载失败,退避后重试"
+                                );
+                                frag_circuit_breakers.record_failure(&frag_url);
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                            }
+                        }
+                    };
+
+                    // 仅上报成功结果:
+                    // 即使外层因其他 worker 失败而 abort_all,已完成分片的状态也不会丢失
+                    if let Ok(tuple) = frag_result {
+                        let _ = completed_tx.send(Ok(tuple));
+                        // 成功,继续拉取下一个分片
+                        continue;
                     }
+                    // 失败由 JoinSet 返回,保留原始 DownloadError 所有权
+                    return frag_result;
                 }
             });
         }
+        // 所有 worker 已持有发送端,释放原始端使 completed_rx 能在结束时关闭
+        drop(completed_tx);
 
-        while let Some(joined) = handles.join_next().await {
-            let result = match joined {
-                Ok(result) => result,
-                Err(error) => {
-                    Self::abort_remaining_fragment_tasks(&mut handles).await;
-                    self.state = DownloadState::Failed;
-                    return Err(DownloadError::Other(
-                        format!("分片任务 panic: {error}").into(),
-                    ));
-                }
-            };
-
-            let (index, downloaded, duration) = match result {
-                Ok(ok) => ok,
-                Err((failed_index, e)) => {
-                    Self::abort_remaining_fragment_tasks(&mut handles).await;
-                    // spawn 内部已耗尽重试,这里精确标记真正失败的分片为终态
-                    if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
-                        frag.force_fail();
+        loop {
+            tokio::select! {
+                Some(result) = completed_rx.recv() => {
+                    match result {
+                        // worker 正常退出(队列已空),跳过虚拟结果
+                        Ok((0, 0, _, _)) => continue,
+                        Ok((index, downloaded, duration, computed_hash)) => {
+                            self.record_completed_fragment(
+                                index,
+                                downloaded,
+                                duration,
+                                computed_hash,
+                            )?;
+                        }
+                        Err((failed_index, e)) => {
+                            Self::abort_remaining_fragment_tasks(&mut handles).await;
+                            dispatcher_handle.abort();
+                            Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
+                            if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
+                                frag.force_fail();
+                            }
+                            self.state = DownloadState::Failed;
+                            return Err(e);
+                        }
                     }
-                    self.state = DownloadState::Failed;
-                    return Err(e);
                 }
-            };
-
-            let frag = &mut self.fragments[index as usize];
-            frag.complete_download_fast(downloaded, duration)?;
-
-            if let Some(ref m) = self.metrics {
-                m.add_bytes(downloaded);
-            }
-
-            // 将带宽数据反馈给调度器
-            if let Some(duration) = frag.last_duration {
-                let bytes_per_sec = if duration.as_secs_f64() > 0.0 {
-                    (downloaded as f64 / duration.as_secs_f64()) as u64
-                } else {
-                    0
-                };
-                if bytes_per_sec > 0 {
-                    self.scheduler.observe_bandwidth(bytes_per_sec);
-                    // 带宽自适应:将观测带宽反馈给限速器动态调整速率
-                    if let Some(ref limiter) = self.rate_limiter {
-                        limiter.update_rate(bytes_per_sec);
+                Some(joined) = handles.join_next() => {
+                    match joined {
+                        Ok(result) => {
+                            // 实际完成结果已由 completed_rx 处理,此处仅作 worker 退出信号
+                            match result {
+                                Ok((0, 0, _, _)) => {}
+                                Ok((index, downloaded, duration, computed_hash)) => {
+                                    // 防御性处理:若 completed_tx 未成功发送,仍从 join 结果补录
+                                    if index != 0 || downloaded != 0 {
+                                        self.record_completed_fragment(
+                                            index,
+                                            downloaded,
+                                            duration,
+                                            computed_hash,
+                                        )?;
+                                    }
+                                }
+                                Err((failed_index, e)) => {
+                                    Self::abort_remaining_fragment_tasks(&mut handles).await;
+                                    dispatcher_handle.abort();
+                                    Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
+                                    if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
+                                        frag.force_fail();
+                                    }
+                                    self.state = DownloadState::Failed;
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            Self::abort_remaining_fragment_tasks(&mut handles).await;
+                            dispatcher_handle.abort();
+                            Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
+                            self.state = DownloadState::Failed;
+                            return Err(DownloadError::Other(
+                                format!("分片任务 panic: {error}").into(),
+                            ));
+                        }
                     }
-                    debug!(
-                        index = index,
-                        bytes_per_sec = bytes_per_sec,
-                        "带宽数据已反馈给调度器和限速器"
-                    );
                 }
+                else => break,
             }
         }
 
+        // dispatcher 在中央队列关闭后自然退出
+        let _ = dispatcher_handle.await;
+
         storage.sync().await?;
+
+        // 显式关闭存储后端,确保 fsync 和资源释放在任务完成前执行
+        // 而非依赖 Arc drop 的不确定时机
+        storage.close().await?;
+
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");
+        Ok(())
+    }
+
+    fn record_completed_fragment(
+        &mut self,
+        index: u32,
+        downloaded: u64,
+        duration: Duration,
+        computed_hash: Option<String>,
+    ) -> DownloadResult<()> {
+        let frag = &mut self.fragments[index as usize];
+        let previous_downloaded = frag.info.downloaded;
+        frag.complete_download_fast(downloaded, duration)?;
+        frag.computed_hash = computed_hash;
+
+        if let Some(ref m) = self.metrics {
+            m.add_bytes(downloaded.saturating_sub(previous_downloaded));
+        }
+
+        // 将带宽数据反馈给调度器
+        if let Some(duration) = frag.last_duration {
+            let bytes_per_sec = if duration.as_secs_f64() > 0.0 {
+                (downloaded.saturating_sub(previous_downloaded) as f64 / duration.as_secs_f64())
+                    as u64
+            } else {
+                0
+            };
+            if bytes_per_sec > 0 {
+                self.scheduler.observe_bandwidth(bytes_per_sec);
+                // 带宽自适应:将观测带宽反馈给限速器动态调整速率
+                if let Some(ref limiter) = self.rate_limiter {
+                    limiter.update_rate(bytes_per_sec);
+                }
+                debug!(
+                    index = index,
+                    bytes_per_sec = bytes_per_sec,
+                    "带宽数据已反馈给调度器和限速器"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_completed_channel(
+        &mut self,
+        completed_rx: &mut mpsc::UnboundedReceiver<FragmentTaskResult>,
+    ) -> DownloadResult<()> {
+        while let Ok(result) = completed_rx.try_recv() {
+            match result {
+                Ok((0, 0, _, _)) => continue,
+                Ok((index, downloaded, duration, computed_hash)) => {
+                    self.record_completed_fragment(index, downloaded, duration, computed_hash)?;
+                }
+                // 错误已在触发 abort 的路径上处理,忽略队列中的滞后错误
+                Err(_) => {}
+            }
+        }
         Ok(())
     }
 
@@ -958,7 +1198,7 @@ impl DownloadTask {
         storage: &StorageKind,
         mut pos: u64,
         mut batch: Bytes,
-        control_rx: &mut Option<watch::Receiver<DownloadState>>,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<u64> {
         let mut total_written = 0u64;
@@ -998,6 +1238,30 @@ impl DownloadTask {
         Ok(total_written)
     }
 
+    /// P1-05: 使用 BytesMut 写入存储，避免 freeze() 复制
+    ///
+    /// 与 `write_all_at` 的区别：
+    /// - 接受 `BytesMut` 而非 `Bytes`，跳过 freeze() 的原子操作
+    /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
+    /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
+    ///
+    /// 对于不支持 write_at_mut 覆写的后端，freeze() 后委托给 write_all_at
+    /// （保证短写循环的正确性）。IOCP 等覆写 write_at_mut 的后端直接使用
+    /// BytesMut 内部缓冲区写入，省去 freeze() 开销。
+    async fn write_all_at_mut(
+        storage: &StorageKind,
+        pos: u64,
+        batch: bytes::BytesMut,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
+        pause_timeout: Duration,
+    ) -> DownloadResult<u64> {
+        // freeze() 将 BytesMut 转为 Bytes，开销极小（一次原子引用计数操作）
+        // 然后委托给 write_all_at（已有完整的短写循环处理）
+        // IOCP 等后端的 write_at_mut 覆写在 write_at_mut 被直接调用时
+        // 才能跳过 freeze，此处委托给 write_all_at 保持正确性
+        Self::write_all_at(storage, pos, batch.freeze(), control_rx, pause_timeout).await
+    }
+
     /// 下载单个分片(一次尝试)
     ///
     /// 由 `execute_fragmented_download` 的 spawn 重试循环调用。
@@ -1013,11 +1277,14 @@ impl DownloadTask {
         frag_index: u32,
         frag_start: u64,
         frag_end: u64,
+        resume_offset: u64,
         pause_timeout: Duration,
         rate_limiter: Option<Arc<RateLimiter>>,
-        control_rx: &Option<watch::Receiver<DownloadState>>,
+        control_rx: &Option<watch::Receiver<TaskCommand>>,
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
-    ) -> DownloadResult<(u64, Duration)> {
+        compute_hash: bool,
+        write_buf: &mut bytes::BytesMut,
+    ) -> DownloadResult<(u64, Duration, Option<String>)> {
         let mut control_rx = control_rx.clone();
 
         // 真实 I/O 前检查暂停/取消
@@ -1036,12 +1303,14 @@ impl DownloadTask {
             index = frag_index,
             start = frag_start,
             end = frag_end,
+            resume_offset,
             "开始下载分片"
         );
 
+        let actual_start = frag_start + resume_offset;
         let stream = if let Some(rx) = control_rx.as_mut() {
             tokio::select! {
-                result = protocol.download_range_stream(url, frag_start, frag_end) => result?,
+                result = protocol.download_range_stream(url, actual_start, frag_end) => result?,
                 control = Self::watch_for_interrupt(rx, pause_timeout) => {
                     control?;
                     return Err(DownloadError::Other("控制信号异常结束".into()));
@@ -1049,33 +1318,90 @@ impl DownloadTask {
             }
         } else {
             protocol
-                .download_range_stream(url, frag_start, frag_end)
+                .download_range_stream(url, actual_start, frag_end)
                 .await?
         };
 
-        let expected_len = frag_end
+        let full_len = frag_end
             .checked_sub(frag_start)
             .and_then(|len| len.checked_add(1))
             .ok_or_else(|| {
                 DownloadError::Fragment(format!("分片范围非法: {frag_start}..={frag_end}"))
             })?;
-        let mut pos = frag_start;
-        let mut total_written: u64 = 0;
+        let expected_len = full_len.saturating_sub(resume_offset);
+        if expected_len == 0 {
+            return Ok((full_len, Duration::ZERO, None));
+        }
+        let mut pos = actual_start;
+        let mut total_written: u64 = resume_offset;
         let mut chunk_count: u64 = 0;
-        // 批量写入缓冲区:累积碎片,达到阈值后一次性写入
-        const WRITE_BATCH_BYTES: usize = 256 * 1024; // 256KB 批量写入阈值
-        let mut write_buf = bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES);
+        // write_buf 由调用方传入(跨分片复用),此处不再新建
+        // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件
+        let mut hasher = compute_hash.then(blake3::Hasher::new);
         tokio::pin!(stream);
         while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
-            if let Some(rx) = control_rx.as_mut() {
+            // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销
+            if let Some(rx) = control_rx.as_mut()
+                && chunk_count.is_multiple_of(CONTROL_CHECK_CHUNK_INTERVAL)
+            {
                 Self::wait_control_rx(rx, pause_timeout).await?;
             }
             let chunk = chunk_result?;
+            // 零拷贝优化: 大 chunk 直接写入,跳过 BytesMut 聚合
+            if chunk.len() >= WRITE_BATCH_BYTES && write_buf.is_empty() {
+                // 流式哈希: 直接在写入前更新
+                if let Some(ref mut h) = hasher {
+                    h.update(&chunk);
+                }
+                let chunk_len = u64::try_from(chunk.len())
+                    .map_err(|_| DownloadError::Fragment("chunk 长度溢出".into()))?;
+                let attempted_written = total_written.checked_add(chunk_len).ok_or_else(|| {
+                    DownloadError::Fragment(format!(
+                        "分片写入长度溢出: index={frag_index}, written={total_written}, len={chunk_len}"
+                    ))
+                })?;
+                if attempted_written > expected_len {
+                    return Err(DownloadError::Fragment(format!(
+                        "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
+                    )));
+                }
+                let w =
+                    Self::write_all_at(storage, pos, chunk, &mut control_rx, pause_timeout).await?;
+                pos = pos.checked_add(w).ok_or_else(|| {
+                    DownloadError::Fragment(format!(
+                        "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
+                    ))
+                })?;
+                total_written += w;
+                chunk_count += 1;
+                // 实时令牌桶限速
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.acquire(w).await;
+                }
+                if let Some(tx) = progress_tx
+                    && chunk_count.is_multiple_of(PROGRESS_REPORT_CHUNK_INTERVAL)
+                {
+                    let _ = tx.try_send(FragmentProgress {
+                        fragment_index: frag_index,
+                        completed: false,
+                        fragment_downloaded: total_written,
+                    }).map_err(|e| {
+                        tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
+                    });
+                    tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                }
+                continue;
+            }
             write_buf.extend_from_slice(&chunk);
             chunk_count += 1;
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
-                let batch = write_buf.split().freeze();
+                // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
+                let batch = write_buf.split();
+                // 流式哈希:在写入前更新(batch 即将写入,内容不再变化)
+                if let Some(ref mut h) = hasher {
+                    h.update(&batch);
+                }
                 let batch_len = u64::try_from(batch.len())
                     .map_err(|_| DownloadError::Fragment("分片批量写入长度溢出".into()))?;
                 let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
@@ -1088,8 +1414,8 @@ impl DownloadTask {
                         "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
                     )));
                 }
-                let w =
-                    Self::write_all_at(storage, pos, batch, &mut control_rx, pause_timeout).await?;
+                let w = Self::write_all_at_mut(storage, pos, batch, &mut control_rx, pause_timeout)
+                    .await?;
                 pos = pos.checked_add(w).ok_or_else(|| {
                     DownloadError::Fragment(format!(
                         "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
@@ -1116,7 +1442,13 @@ impl DownloadTask {
         }
         // 刷写剩余数据
         if !write_buf.is_empty() {
-            let batch = write_buf.freeze();
+            // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
+            // split() 抽取当前全部内容并清空 self,语义等价且适配借用。
+            let batch = write_buf.split();
+            // 流式哈希:尾块也需更新
+            if let Some(ref mut h) = hasher {
+                h.update(&batch);
+            }
             let batch_len = u64::try_from(batch.len())
                 .map_err(|_| DownloadError::Fragment("分片剩余写入长度溢出".into()))?;
             let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
@@ -1129,7 +1461,8 @@ impl DownloadTask {
                     "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
                 )));
             }
-            let w = Self::write_all_at(storage, pos, batch, &mut control_rx, pause_timeout).await?;
+            let w =
+                Self::write_all_at_mut(storage, pos, batch, &mut control_rx, pause_timeout).await?;
             total_written += w;
             // 实时令牌桶限速(最终刷写)
             if let Some(ref limiter) = rate_limiter {
@@ -1137,9 +1470,10 @@ impl DownloadTask {
             }
         }
 
-        if total_written != expected_len {
+        let actual_written = total_written.saturating_sub(resume_offset);
+        if actual_written != expected_len {
             return Err(DownloadError::Fragment(format!(
-                "分片下载数据不完整: index={frag_index}, 预期 {expected_len} 字节, 实际写入 {total_written} 字节"
+                "分片下载数据不完整: index={frag_index}, 预期 {expected_len} 字节, 实际写入 {actual_written} 字节"
             )));
         }
 
@@ -1164,23 +1498,34 @@ impl DownloadTask {
             elapsed_ms = elapsed.as_millis(),
             "分片下载完成"
         );
-        Ok((total_written, elapsed))
+        // 流式哈希结果:若启用了 compute_hash,finalize 为十六进制字符串
+        let computed_hash = hasher.map(|h| h.finalize().to_hex().to_string());
+        Ok((total_written, elapsed, computed_hash))
     }
 
     // ----- 步骤 5: 校验 -----
 
     /// 校验已下载数据的完整性
     ///
-    /// 遍历所有带哈希值的分片,从存储中读取数据并与预期哈希比对。
-    /// 任一分片校验失败即返回 `false`。
+    /// 根据配置的 `verify_strategy` 决定校验行为:
+    /// - `Skip`: 完全跳过校验
+    /// - `BestEffort`: 有 expected hash 时校验,无 hash 时跳过并记录 info 日志
+    /// - `Require`: 必须有 expected hash 且校验通过,否则返回错误
     pub async fn verify(&mut self) -> DownloadResult<()> {
+        // Skip 策略:直接跳过
+        if self.config.verify_strategy == tachyon_core::config::VerifyStrategy::Skip {
+            debug!(task_id = %self.id, "校验策略为 Skip,跳过校验");
+            return Ok(());
+        }
+
+        // 兼容旧版 verify_checksum=false:视为 Skip
         if !self.config.verify_checksum {
-            debug!("校验已禁用,跳过");
+            debug!(task_id = %self.id, "verify_checksum 已禁用,跳过校验");
             return Ok(());
         }
 
         self.state = DownloadState::Verifying;
-        info!("开始校验文件完整性");
+        info!(task_id = %self.id, "开始校验文件完整性");
 
         let storage = self
             .storage
@@ -1191,20 +1536,31 @@ impl DownloadTask {
         for frag in &self.fragments {
             if let Some(ref expected_hash) = frag.info.hash {
                 has_expected_hash = true;
-                let chunk_size = VERIFY_HASH_CHUNK_SIZE;
-                let mut offset = frag.info.start;
-                let end = frag.info.start + frag.info.size;
-                let mut buf = vec![0u8; chunk_size];
-                let mut hasher = blake3::Hasher::new();
 
-                while offset < end {
-                    let read_len = ((end - offset).min(chunk_size as u64)) as usize;
-                    let read = storage.read_at(offset, &mut buf[..read_len]).await?;
-                    hasher.update(&buf[..read]);
-                    offset += read as u64;
-                }
-
-                let computed = hasher.finalize().to_hex().to_string();
+                // 流式哈希优先:下载阶段已边写边算,直接比对,消除 I/O 放大。
+                // 仅断点续传恢复的分片(未经过本次 download_single_fragment)无此字段,
+                // 回退到读盘计算。
+                let computed = if let Some(ref h) = frag.computed_hash {
+                    debug!(index = frag.info.index, "使用流式哈希校验(无需重读文件)");
+                    h.clone()
+                } else {
+                    debug!(
+                        index = frag.info.index,
+                        "无流式哈希,回退读盘计算(断点续传分片)"
+                    );
+                    let chunk_size = VERIFY_HASH_CHUNK_SIZE;
+                    let mut offset = frag.info.start;
+                    let end = frag.info.start + frag.info.size;
+                    let mut buf = vec![0u8; chunk_size];
+                    let mut hasher = blake3::Hasher::new();
+                    while offset < end {
+                        let read_len = ((end - offset).min(chunk_size as u64)) as usize;
+                        let read = storage.read_at(offset, &mut buf[..read_len]).await?;
+                        hasher.update(&buf[..read]);
+                        offset += read as u64;
+                    }
+                    hasher.finalize().to_hex().to_string()
+                };
 
                 if computed != *expected_hash {
                     warn!(
@@ -1223,12 +1579,20 @@ impl DownloadTask {
             }
         }
 
-        if !has_expected_hash {
+        // Require 策略:必须有 expected hash
+        if self.config.verify_strategy == tachyon_core::config::VerifyStrategy::Require
+            && !has_expected_hash
+        {
             self.state = DownloadState::Failed;
             return Err(DownloadError::NoExpectedChecksum);
         }
 
-        info!("文件完整性校验通过");
+        // BestEffort 策略:无 expected hash 时跳过并记录日志
+        if !has_expected_hash {
+            info!(task_id = %self.id, "无 expected hash,跳过校验(BestEffort 策略)");
+        } else {
+            info!(task_id = %self.id, "文件完整性校验通过");
+        }
         Ok(())
     }
 
@@ -1350,7 +1714,7 @@ impl DownloadTask {
     /// 检查是否已被取消,若已取消则立即返回错误
     fn check_cancelled(&self) -> DownloadResult<()> {
         if let Some(rx) = &self.control_rx
-            && matches!(*rx.borrow(), DownloadState::Cancelled)
+            && matches!(rx.borrow().to_download_state(), DownloadState::Cancelled)
         {
             return Err(DownloadError::Cancelled);
         }
@@ -1358,9 +1722,12 @@ impl DownloadTask {
     }
 
     /// 等待取消信号 (仅关注 Cancelled 状态)
-    async fn wait_for_cancel(rx: &mut watch::Receiver<DownloadState>) {
+    async fn wait_for_cancel(rx: &mut watch::Receiver<TaskCommand>) {
         loop {
-            if matches!(*rx.borrow_and_update(), DownloadState::Cancelled) {
+            if matches!(
+                rx.borrow_and_update().to_download_state(),
+                DownloadState::Cancelled
+            ) {
                 return;
             }
             if rx.changed().await.is_err() {
@@ -1407,6 +1774,42 @@ impl DownloadTask {
     /// 获取分片信息(需先调用 plan)
     pub fn fragment_infos(&self) -> Vec<FragmentInfo> {
         self.fragments.iter().map(|f| f.info.clone()).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 实现 core trait,使 app 层可通过动态分发操作任务,无需依赖具体 struct
+// ---------------------------------------------------------------------------
+
+impl tachyon_core::traits::TaskRunner for DownloadTask {
+    fn set_control_rx(&mut self, rx: tokio::sync::watch::Receiver<TaskCommand>) {
+        self.set_control_rx(rx);
+    }
+
+    fn set_completed_fragments(&mut self, fragments: Vec<u32>) {
+        self.set_completed_fragments(fragments);
+    }
+
+    fn set_partial_fragments(&mut self, fragments: std::collections::HashMap<u32, u64>) {
+        self.set_partial_fragments(fragments);
+    }
+
+    fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
+        self.set_progress_sender(tx);
+    }
+
+    fn probe(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>> {
+        Box::pin(self.probe())
+    }
+
+    fn run(&mut self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        Box::pin(self.run())
+    }
+
+    fn metadata(&self) -> Option<&FileMetadata> {
+        self.metadata()
     }
 }
 
@@ -1591,8 +1994,7 @@ mod tests {
         );
 
         // 使用自定义调度器配置创建编排器
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.run().await.expect("下载流程失败");
 
@@ -1655,8 +2057,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -1707,8 +2108,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -1764,8 +2164,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -1900,8 +2299,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -2072,8 +2470,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -2175,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_enabled_without_expected_hash_fails() {
+    async fn test_verify_require_strategy_without_expected_hash_fails() {
         let data = Bytes::from_static(b"missing expected checksum");
         let frag_info = FragmentInfo {
             index: 0,
@@ -2195,6 +2592,7 @@ mod tests {
             storage,
             DownloadConfig {
                 verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Require,
                 ..test_config()
             },
         );
@@ -2228,6 +2626,138 @@ mod tests {
         );
 
         task.verify().await.unwrap();
+    }
+
+    /// BestEffort 策略:无 expected hash 时应跳过校验并返回成功
+    #[tokio::test]
+    async fn test_verify_best_effort_skips_without_expected_hash() {
+        let data = Bytes::from_static(b"best effort no hash");
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: None,
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("be.bin", data.len() as u64)));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                ..test_config()
+            },
+        );
+
+        task.storage
+            .as_ref()
+            .unwrap()
+            .write_at(0, data.clone())
+            .await
+            .unwrap();
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("be.bin", data.len() as u64));
+
+        let result = task.verify().await;
+        assert!(
+            result.is_ok(),
+            "BestEffort 策略下无 expected hash 应跳过校验"
+        );
+    }
+
+    /// BestEffort 策略:有 expected hash 时应正常校验
+    #[tokio::test]
+    async fn test_verify_best_effort_verifies_with_expected_hash() {
+        let data = Bytes::from_static(b"verify this data block");
+        let hash = {
+            let v = CpuVerifier::blake3();
+            v.compute_hash(&data).unwrap()
+        };
+
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: Some(hash),
+        };
+
+        let protocol = Arc::new(MockProto::new(test_metadata(
+            "be-hash.bin",
+            data.len() as u64,
+        )));
+        let storage = StorageKind::memory_with_capacity(data.len());
+
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                ..test_config()
+            },
+        );
+
+        task.storage
+            .as_ref()
+            .unwrap()
+            .write_at(0, data.clone())
+            .await
+            .unwrap();
+
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("be-hash.bin", data.len() as u64));
+
+        task.verify().await.unwrap();
+    }
+
+    /// Skip 策略:完全跳过校验
+    #[tokio::test]
+    async fn test_verify_skip_strategy_always_skips() {
+        let data = Bytes::from_static(b"skip strategy data");
+        let hash = {
+            let v = CpuVerifier::blake3();
+            v.compute_hash(&data).unwrap()
+        };
+
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: Some(hash), // 即使有 hash 也跳过
+        };
+
+        let protocol = Arc::new(MockProto::new(test_metadata("skip.bin", data.len() as u64)));
+        let storage = StorageKind::memory_with_capacity(data.len());
+
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Skip,
+                ..test_config()
+            },
+        );
+
+        task.storage
+            .as_ref()
+            .unwrap()
+            .write_at(0, data.clone())
+            .await
+            .unwrap();
+
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("skip.bin", data.len() as u64));
+
+        let result = task.verify().await;
+        assert!(result.is_ok(), "Skip 策略下应完全跳过校验");
     }
 
     // ------ 10. 空文件处理 -----
@@ -2463,8 +2993,7 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task.scheduler_config = sched_config;
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -2587,8 +3116,7 @@ mod tests {
             protocol1,
             storage1,
         );
-        task1.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config.clone());
+        task1.scheduler_config = sched_config.clone();
 
         task1.probe().await.unwrap();
         task1.plan().unwrap();
@@ -2619,8 +3147,7 @@ mod tests {
             protocol2,
             storage2,
         );
-        task2.orchestrator =
-            DownloadOrchestrator::with_scheduler_config(Default::default(), sched_config);
+        task2.scheduler_config = sched_config;
 
         task2.probe().await.unwrap();
         task2.plan().unwrap();
@@ -2721,6 +3248,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(crate::connection::PoolConfig {
             max_per_host: 1,
             max_global: 4,
+            ..Default::default()
         }));
         let mut task = DownloadTask::new_for_test(
             "http://example.com/pool.bin".into(),
@@ -2733,14 +3261,11 @@ mod tests {
             storage,
         );
         task.pool = Some(pool);
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: 100,
-                max_fragment_size: 100,
-                ..Default::default()
-            },
-        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: 100,
+            max_fragment_size: 100,
+            ..Default::default()
+        };
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -2767,7 +3292,7 @@ mod tests {
             protocol,
             storage,
         );
-        let (control_tx, control_rx) = watch::channel(DownloadState::Paused);
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Pause);
         task.set_control_rx(control_rx);
 
         task.probe().await.unwrap();
@@ -2785,7 +3310,7 @@ mod tests {
             Vec::new()
         };
         assert!(stored.iter().all(|byte| *byte == 0), "暂停期间不应写入数据");
-        control_tx.send(DownloadState::Cancelled).unwrap();
+        control_tx.send(TaskCommand::Cancel).unwrap();
     }
 
     #[tokio::test]
@@ -2806,7 +3331,7 @@ mod tests {
             protocol,
             storage,
         );
-        let (_control_tx, control_rx) = watch::channel(DownloadState::Paused);
+        let (_control_tx, control_rx) = watch::channel(TaskCommand::Pause);
         task.set_control_rx(control_rx);
 
         task.probe().await.unwrap();
@@ -3101,14 +3626,11 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: frag_size,
-                max_fragment_size: frag_size,
-                ..Default::default()
-            },
-        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -3158,14 +3680,11 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: frag_size,
-                max_fragment_size: frag_size,
-                ..Default::default()
-            },
-        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -3215,15 +3734,12 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: frag_size,
-                max_fragment_size: frag_size,
-                ..Default::default()
-            },
-        );
-        let (control_tx, control_rx) = watch::channel(DownloadState::Downloading);
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
         task.set_control_rx(control_rx);
 
         task.probe().await.unwrap();
@@ -3232,7 +3748,7 @@ mod tests {
 
         let cancel_on_write = tokio::spawn(async move {
             write_started.notified().await;
-            control_tx.send(DownloadState::Cancelled).unwrap();
+            control_tx.send(TaskCommand::Cancel).unwrap();
         });
         let result = tokio::time::timeout(Duration::from_millis(500), task.execute())
             .await
@@ -3257,14 +3773,11 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: 100,
-                max_fragment_size: 100,
-                ..Default::default()
-            },
-        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: 100,
+            max_fragment_size: 100,
+            ..Default::default()
+        };
 
         let result = task.run().await;
         assert!(result.is_err(), "缺失分片数据应导致 run 失败");
@@ -3565,16 +4078,13 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: frag_size,
-                max_fragment_size: frag_size,
-                ..Default::default()
-            },
-        );
-        // 生产路径的初始控制状态正是 Downloading
-        let (_tx, rx) = watch::channel(DownloadState::Downloading);
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        // 生产路径的初始控制状态正是 Start(Downloading)
+        let (_tx, rx) = watch::channel(TaskCommand::Start);
         task.set_control_rx(rx);
 
         task.probe().await.unwrap();
@@ -3609,7 +4119,7 @@ mod tests {
                 ..test_config()
             },
         );
-        let (_tx, rx) = watch::channel(DownloadState::Downloading);
+        let (_tx, rx) = watch::channel(TaskCommand::Start);
         task.set_control_rx(rx);
 
         task.probe().await.unwrap();
@@ -3617,7 +4127,7 @@ mod tests {
         task.prepare_storage().await.unwrap();
         task.execute()
             .await
-            .expect("Downloading 控制状态不应导致整块下载失败");
+            .expect("Start 控制状态不应导致整块下载失败");
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
@@ -3723,14 +4233,11 @@ mod tests {
             protocol,
             storage,
         );
-        task.orchestrator = DownloadOrchestrator::with_scheduler_config(
-            Default::default(),
-            tachyon_core::config::SchedulerConfig {
-                min_fragment_size: frag_size,
-                max_fragment_size: frag_size,
-                ..Default::default()
-            },
-        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
         task
     }
 
@@ -3848,6 +4355,39 @@ mod tests {
         task.prepare_storage().await.unwrap();
         task.execute().await.expect("其余分片应成功下载");
         assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// 字节级断点续传:plan() 应为未完整分片注入 resume_offset 并调整进度。
+    #[tokio::test]
+    async fn test_resume_partial_fragment_sets_resume_offset() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+            meta: test_metadata("partial_resume.bin", total),
+            frag_size,
+            fail_start: u64::MAX,
+            fail_times: 0,
+            attempts: Arc::new(AtomicU32::new(0)),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 0);
+
+        task.probe().await.unwrap();
+        let mut partial = std::collections::HashMap::new();
+        partial.insert(1, 50);
+        task.set_partial_fragments(partial);
+        task.plan().unwrap();
+
+        let frag1 = &task.fragments[1];
+        assert_eq!(
+            frag1.resume_offset, 50,
+            "resume_offset 应为持久化的部分字节数"
+        );
+        assert_eq!(frag1.info.downloaded, 50, "downloaded 应反映已下载字节数");
+        assert!(
+            (task.progress() - 50.0 / 300.0).abs() < 0.001,
+            "进度应计入部分分片,实际 {}",
+            task.progress()
+        );
     }
 
     /// 共享限速器跨任务生效:设置 set_rate_limiter 后下载应使用该限速器

@@ -1,9 +1,25 @@
-import { createSignal, batch, createMemo } from 'solid-js'
+import { createSignal, batch } from 'solid-js'
 import { createStore, reconcile } from 'solid-js/store'
 import type { TaskInfo, DownloadStatus, ProgressPayload, DownloadFilter } from '../types'
 import { api } from '../api/invoke'
 import { addToast } from './toast'
 import { addHistoryRecord } from './history'
+import { createRootMemo } from '../utils/reactive'
+
+// ── 高频进度数据(hot 层,250ms 级更新) ─────────────────────────
+//
+// 将进度/速度等高频变化字段拆分到独立 signal,避免每次 progress tick
+// 触发 tasks store 的 reconcile,从而减少低频字段(文件名/URL/路径)
+// 依赖组件的无谓重渲染。hot 层以 task id 为 key,只包含每帧真正变化的数值。
+
+export interface HotProgress {
+  downloaded: number
+  speed: number
+  progress: number
+  fragmentsDone: number
+}
+
+const [hotProgress, setHotProgress] = createSignal<Map<string, HotProgress>>(new Map())
 
 const VALID_STATUSES = new Set<string>(['pending', 'connecting', 'downloading', 'paused', 'resuming', 'verifying', 'completed', 'failed', 'cancelled'])
 
@@ -34,10 +50,25 @@ export function setTasks(newTasks: TaskInfo[]) {
   batch(() => {
     setTasksRaw(reconcile(newTasks, { key: 'id' }))
     rebuildIndexMap()
+    // 同步初始化 hot 层:从全量任务列表提取高频字段
+    const hotMap = new Map<string, HotProgress>()
+    for (const t of newTasks) {
+      hotMap.set(t.id, {
+        downloaded: t.downloaded,
+        speed: t.speed,
+        progress: t.progress,
+        fragmentsDone: t.fragmentsDone,
+      })
+    }
+    setHotProgress(hotMap)
   })
 }
 
 export { setSelectedId, setCurrentFilter }
+
+export const $hotProgress = {
+  get: hotProgress,
+}
 
 export const $tasks = {
   get: () => tasks,
@@ -54,7 +85,7 @@ export const $currentFilter = {
   set: setCurrentFilter,
 }
 
-const filteredTasks = createMemo(() => {
+const filteredTasks = createRootMemo(() => {
   const filter = currentFilter()
   switch (filter) {
     case 'downloading':
@@ -73,7 +104,7 @@ export const $filteredTasks = {
 }
 
 // 单次遍历统计四个计数器，替代原来 3 次独立 filter
-const filterCounts = createMemo(() => {
+const filterCounts = createRootMemo(() => {
   let downloading = 0
   let completed = 0
   let incomplete = 0
@@ -90,7 +121,7 @@ export const $filterCounts = {
   get: filterCounts,
 }
 
-const selectedTask = createMemo(() => {
+const selectedTask = createRootMemo(() => {
   const id = selectedId()
   if (!id) return null
   return tasks.find(t => t.id === id) ?? null
@@ -100,21 +131,24 @@ export const $selectedTask = {
   get: selectedTask,
 }
 
-// totalSpeed 和 activeCount 共享一次遍历
-const speedStats = createMemo(() => {
+// totalSpeed 和 activeCount 从 hot 层读取,避免高频 progress tick
+// 触发 tasks store 的 reconcile 导致低频字段依赖组件无谓重渲染
+const speedStats = createRootMemo(() => {
   let speed = 0
   let count = 0
+  const hot = hotProgress()
   for (let i = 0; i < tasks.length; i++) {
     if (DOWNLOADING_SET.has(tasks[i]!.status)) {
-      speed += tasks[i]!.speed || 0
+      const hp = hot.get(tasks[i]!.id)
+      speed += hp?.speed ?? (tasks[i]!.speed || 0)
       count++
     }
   }
   return { speed, count }
 })
 
-const totalSpeed = createMemo(() => speedStats().speed)
-const activeCount = createMemo(() => speedStats().count)
+const totalSpeed = createRootMemo(() => speedStats().speed)
+const activeCount = createRootMemo(() => speedStats().count)
 
 export const $totalSpeed = {
   get: totalSpeed,
@@ -128,36 +162,79 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
   const TERMINAL_STATUSES = new Set<DownloadStatus>(['completed', 'failed', 'cancelled'])
 
   batch(() => {
+    // hot 层增量更新:收集所有变化的 high-frequency 字段
+    const hotUpdates = new Map<string, HotProgress>()
+
     for (const [id, p] of Object.entries(payload)) {
       const idx = taskIndexMap.get(id)    // O(1) 查找
-      if (idx !== undefined) {
-        const oldStatus = tasks[idx]!.status
-        const newStatus = VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : oldStatus
+      if (idx === undefined) continue
 
-        setTasksRaw(idx, {
-          downloaded: p.downloaded ?? tasks[idx]!.downloaded,
-          speed: p.speed ?? tasks[idx]!.speed,
-          status: newStatus,
-          progress: p.progress ?? tasks[idx]!.progress,
-          fragmentsDone: p.fragmentsDone ?? tasks[idx]!.fragmentsDone,
+      const task = tasks[idx]!
+      const oldStatus = task.status
+      const newStatus = VALID_STATUSES.has(p.status) ? (p.status as DownloadStatus) : oldStatus
+
+      const newDownloaded = p.downloaded ?? task.downloaded
+      const newSpeed = p.speed ?? task.speed
+      const newProgress = p.progress ?? task.progress
+      const newFragmentsDone = p.fragmentsDone ?? task.fragmentsDone
+
+      // hot 层:高频字段变化时更新 hotProgress signal
+      const hotChanged =
+        newDownloaded !== task.downloaded ||
+        newSpeed !== task.speed ||
+        newProgress !== task.progress ||
+        newFragmentsDone !== task.fragmentsDone
+
+      if (hotChanged) {
+        hotUpdates.set(id, {
+          downloaded: newDownloaded,
+          speed: newSpeed,
+          progress: newProgress,
+          fragmentsDone: newFragmentsDone,
         })
-
-        // 检测状态转 terminal：写入历史
-        if (!TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(newStatus)) {
-          const task = tasks[idx]!
-          const duration = task.createdAt ? Date.now() - new Date(task.createdAt).getTime() : 0
-          const avgSpeed = duration > 0 ? (task.downloaded || 0) / (duration / 1000) : 0
-
-          addHistoryRecord({
-            url: task.url,
-            fileName: task.fileName,
-            fileSize: task.fileSize || 0,
-            status: newStatus as 'completed' | 'failed' | 'cancelled',
-            duration: Math.floor(duration / 1000), // 秒
-            avgSpeed,
-          })
-        }
       }
+
+      // cold 层:status 变化时才更新 tasks store(低频)
+      // 同时 hot 层变化时也需同步 tasks store,保持数据一致性
+      const hasChanged = hotChanged || newStatus !== oldStatus
+
+      // 只有至少一个字段真正变化时才更新 store，避免无意义 reconcile
+      if (hasChanged) {
+        setTasksRaw(idx, {
+          downloaded: newDownloaded,
+          speed: newSpeed,
+          status: newStatus,
+          progress: newProgress,
+          fragmentsDone: newFragmentsDone,
+        })
+      }
+
+      // 状态转 terminal：只在 status 真正变化到 terminal 时触发
+      if (oldStatus !== newStatus && !TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(newStatus)) {
+        const updatedTask = tasks[idx]!
+        const duration = updatedTask.createdAt ? Date.now() - new Date(updatedTask.createdAt).getTime() : 0
+        const avgSpeed = duration > 0 ? (updatedTask.downloaded || 0) / (duration / 1000) : 0
+
+        addHistoryRecord({
+          url: updatedTask.url,
+          fileName: updatedTask.fileName,
+          fileSize: updatedTask.fileSize || 0,
+          status: newStatus as 'completed' | 'failed' | 'cancelled',
+          duration: Math.floor(duration / 1000), // 秒
+          avgSpeed,
+        })
+      }
+    }
+
+    // 批量更新 hot 层 signal
+    if (hotUpdates.size > 0) {
+      setHotProgress(prev => {
+        const next = new Map(prev)
+        for (const [id, hp] of hotUpdates) {
+          next.set(id, hp)
+        }
+        return next
+      })
     }
   })
 }

@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { createRoot, createEffect } from 'solid-js'
 import type { TaskInfo } from '../../types'
 
 const mockGetTaskList = vi.fn()
 const mockAddToast = vi.fn()
+const mockAddHistoryRecord = vi.fn()
 
 vi.mock('../../api/invoke', () => ({
   api: {
@@ -12,6 +14,10 @@ vi.mock('../../api/invoke', () => ({
 
 vi.mock('../toast', () => ({
   addToast: (...args: unknown[]) => mockAddToast(...args),
+}))
+
+vi.mock('../history', () => ({
+  addHistoryRecord: (...args: unknown[]) => mockAddHistoryRecord(...args),
 }))
 
 const makeTask = (id: string, overrides: Partial<TaskInfo> = {}): TaskInfo => ({
@@ -26,6 +32,7 @@ const makeTask = (id: string, overrides: Partial<TaskInfo> = {}): TaskInfo => ({
   fragmentsTotal: 4,
   fragmentsDone: 2,
   createdAt: '2026-05-30T00:00:00Z',
+  savePath: '/downloads',
   ...overrides,
 })
 
@@ -36,6 +43,7 @@ describe('downloads store', () => {
     vi.resetModules()
     mockGetTaskList.mockReset()
     mockAddToast.mockReset()
+    mockAddHistoryRecord.mockReset()
     downloadsModule = await import('../downloads')
   })
 
@@ -137,6 +145,105 @@ describe('downloads store', () => {
     expect(downloadsModule.$tasks.get()[1]?.speed).toBe(200)
     expect(downloadsModule.$tasks.get()[1]?.downloaded).toBe(200)
     expect(downloadsModule.$tasks.get()[1]?.fragmentsDone).toBe(2)
+  })
+
+  it('updateProgress 对未变化任务不触发 reactive 更新', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'downloading', speed: 100, downloaded: 100, progress: 0.1, fragmentsDone: 1 }),
+    ])
+
+    let effectRunCount = 0
+    const dispose = createRoot((disposeOuter) => {
+      createEffect(() => {
+        downloadsModule.$totalSpeed.get() // track
+        effectRunCount++
+      })
+      return disposeOuter
+    })
+
+    expect(effectRunCount).toBe(1)
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.1,
+        downloaded: 100,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 1,
+      },
+    })
+
+    expect(effectRunCount).toBe(1)
+    dispose()
+  })
+
+  it('updateProgress 对变化任务正确更新字段', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'downloading', speed: 100, downloaded: 100, progress: 0.1, fragmentsDone: 1 }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.75,
+        downloaded: 750,
+        speed: 250,
+        status: 'downloading',
+        fragmentsDone: 3,
+      },
+    })
+
+    const task = downloadsModule.$tasks.get()[0]
+    expect(task?.progress).toBe(0.75)
+    expect(task?.downloaded).toBe(750)
+    expect(task?.speed).toBe(250)
+    expect(task?.fragmentsDone).toBe(3)
+    expect(task?.status).toBe('downloading')
+  })
+
+  it('updateProgress 状态转到 terminal 时写入历史记录', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'downloading', speed: 100, downloaded: 1024, progress: 0.9, fragmentsDone: 3 }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 1,
+        downloaded: 1024,
+        speed: 0,
+        status: 'completed',
+        fragmentsDone: 4,
+      },
+    })
+
+    expect(mockAddHistoryRecord).toHaveBeenCalledTimes(1)
+    expect(mockAddHistoryRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'completed',
+        fileSize: 1048576,
+      }),
+    )
+  })
+
+  it('updateProgress 对已 terminal 任务重复更新不重复写入历史记录', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'completed', speed: 0, downloaded: 1024, progress: 1, fragmentsDone: 4 }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 1,
+        downloaded: 1024,
+        speed: 0,
+        status: 'completed',
+        fragmentsDone: 4,
+      },
+    })
+
+    expect(mockAddHistoryRecord).not.toHaveBeenCalled()
   })
 
   it('refreshTaskList 成功时更新任务列表', async () => {

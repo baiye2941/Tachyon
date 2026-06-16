@@ -3,32 +3,65 @@
 //! 负责在应用启动时从持久化存储中恢复未完成的下载任务。
 //! 提供 `TaskRecord` / `TaskSnapshot` 类型和 `RecoveryManager` 管理器。
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::kv::KvStore;
 
+/// 当前快照 schema 版本号
+///
+/// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
+/// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
+/// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
 /// 下载任务快照（用于断点续传）
 ///
 /// 记录任务的完整状态，可在应用重启后恢复。
+///
+/// schema_version 字段用于版本检测和未来迁移:
+/// - 旧 JSON(无 schemaVersion 字段)通过 `#[serde(default)]` 自动补为 0
+/// - 新 JSON 带有 schemaVersion=1
+/// - 迁移策略:若 schema_version < SNAPSHOT_SCHEMA_VERSION,可在加载后补填新字段默认值
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
+    /// schema 版本号,用于向前兼容检测
+    ///
+    /// 旧 JSON 不含此字段时默认为 0,加载后可检测并补填。
+    #[serde(default)]
+    pub schema_version: u32,
     pub id: String,
     pub url: String,
     pub save_path: String,
     pub file_name: String,
     pub file_size: Option<u64>,
+    #[serde(default)]
     pub downloaded: u64,
+    #[serde(default)]
     pub completed_fragments: Vec<u32>,
+    /// 未完整下载的分片及其已下载字节数(字节级断点续传)
+    #[serde(default)]
+    pub partial_fragments: HashMap<u32, u64>,
+    #[serde(default)]
     pub total_fragments: u32,
+    #[serde(default)]
     pub fragment_size: u64,
     pub status: tachyon_core::DownloadState,
+    #[serde(default)]
     pub etag: Option<String>,
+    #[serde(default)]
     pub last_modified: Option<String>,
+    #[serde(default)]
     pub content_length: Option<u64>,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
+    #[serde(default)]
     pub fail_reason: Option<String>,
+    #[serde(default)]
     pub retry_count: u32,
 }
 
@@ -71,6 +104,7 @@ impl From<TaskSnapshot> for TaskRecord {
 impl From<TaskRecord> for TaskSnapshot {
     fn from(r: TaskRecord) -> Self {
         Self {
+            schema_version: 0, // 旧记录无 schema 版本,标记为 0 表示需要迁移
             id: r.task_id,
             url: r.url,
             save_path: r.save_path.clone(),
@@ -82,6 +116,7 @@ impl From<TaskRecord> for TaskSnapshot {
             file_size: r.file_size,
             downloaded: r.downloaded,
             completed_fragments: r.completed_fragments,
+            partial_fragments: HashMap::new(),
             total_fragments: r.total_fragments,
             fragment_size: 0,
             status: parse_legacy_status(&r.status),
@@ -101,6 +136,17 @@ fn parse_legacy_status(status: &str) -> tachyon_core::DownloadState {
     // 未知状态字符串回退到 Failed（兼容旧数据）。
     use std::str::FromStr;
     tachyon_core::DownloadState::from_str(status).unwrap_or(tachyon_core::DownloadState::Failed)
+}
+
+/// 恢复结果:包含成功恢复的任务和无法解析的损坏 key
+///
+/// 单个损坏 JSON 不会阻断其他任务的恢复(隔离策略)。
+#[derive(Debug)]
+pub struct RecoveryResult {
+    /// 成功恢复的任务快照
+    pub tasks: Vec<TaskSnapshot>,
+    /// 无法解析的 key 列表(记录日志供排查,不中断恢复流程)
+    pub corrupt_keys: Vec<String>,
 }
 
 /// 恢复管理器
@@ -139,17 +185,28 @@ impl RecoveryManager {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// 加载所有任务快照
-    pub fn load_all_task_snapshots(&self) -> std::io::Result<Vec<TaskSnapshot>> {
+    /// 加载所有任务快照,隔离损坏记录
+    ///
+    /// 单个 key 解析失败不会中断其他任务的恢复,而是记录到 `corrupt_keys` 中。
+    pub fn load_all_task_snapshots(&self) -> std::io::Result<RecoveryResult> {
         let mut tasks = Vec::new();
+        let mut corrupt_keys = Vec::new();
         for key in self.store.keys()? {
-            if key.starts_with("task_")
-                && let Some(snapshot) = self.load_task_snapshot_by_key(&key)?
-            {
-                tasks.push(snapshot);
+            if key.starts_with("task_") {
+                match self.load_task_snapshot_by_key(&key) {
+                    Ok(Some(snapshot)) => tasks.push(snapshot),
+                    Ok(None) => {} // key 存在但无数据,忽略
+                    Err(_) => {
+                        tracing::warn!(key = %key, "快照 JSON 损坏,跳过恢复");
+                        corrupt_keys.push(key);
+                    }
+                }
             }
         }
-        Ok(tasks)
+        Ok(RecoveryResult {
+            tasks,
+            corrupt_keys,
+        })
     }
 
     /// 保存任务记录（旧接口）
@@ -183,19 +240,73 @@ impl RecoveryManager {
         Ok(pending)
     }
 
-    /// 恢复所有未完成的任务（新接口）
-    pub fn recover_pending_snapshots(&self) -> std::io::Result<Vec<TaskSnapshot>> {
-        let mut pending = Vec::new();
-        for snapshot in self.load_all_task_snapshots()? {
-            if matches!(
-                snapshot.status,
-                tachyon_core::DownloadState::Downloading | tachyon_core::DownloadState::Paused
-            ) {
-                tracing::info!(task_id = %snapshot.id, "恢复下载任务");
-                pending.push(snapshot);
+    /// 恢复所有未完成的任务（新接口）,隔离损坏记录
+    ///
+    /// 单个 key 解析失败不会中断恢复,而是记录到 `corrupt_keys` 中。
+    pub fn recover_pending_snapshots(&self) -> std::io::Result<RecoveryResult> {
+        let mut tasks = Vec::new();
+        let mut corrupt_keys = Vec::new();
+        for key in self.store.keys()? {
+            if key.starts_with("task_") {
+                match self.load_task_snapshot_by_key(&key) {
+                    Ok(Some(snapshot))
+                        if matches!(
+                            snapshot.status,
+                            tachyon_core::DownloadState::Downloading
+                                | tachyon_core::DownloadState::Paused
+                        ) =>
+                    {
+                        tracing::info!(task_id = %snapshot.id, "恢复下载任务");
+                        tasks.push(snapshot);
+                    }
+                    Ok(_) => {} // 完成或空,跳过
+                    Err(_) => {
+                        tracing::warn!(key = %key, "快照 JSON 损坏,跳过恢复");
+                        corrupt_keys.push(key);
+                    }
+                }
             }
         }
-        Ok(pending)
+        Ok(RecoveryResult {
+            tasks,
+            corrupt_keys,
+        })
+    }
+
+    /// 原子性地读取-修改-写入任务快照
+    ///
+    /// 内部持有 `progress_lock` 确保 load-modify-save 序列的原子性,
+    /// 防止并发分片进度更新之间的覆盖竞态。
+    ///
+    /// # 参数
+    /// - `task_id`: 任务 ID
+    /// - `patch`: 闭包,接收可变引用到快照,在锁内执行修改
+    ///
+    /// # 返回
+    /// - `Ok(Some(TaskSnapshot))`: 快照存在且已更新
+    /// - `Ok(None)`: 快照不存在
+    /// - `Err`: I/O 或序列化错误
+    pub fn update_snapshot(
+        &self,
+        task_id: &str,
+        patch: impl FnOnce(&mut TaskSnapshot),
+    ) -> std::io::Result<Option<TaskSnapshot>> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let key = format!("task_{task_id}");
+        let mut snapshot = match self.load_task_snapshot_by_key(&key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        patch(&mut snapshot);
+
+        // 确保新写入的快照使用当前 schema 版本
+        if snapshot.schema_version < SNAPSHOT_SCHEMA_VERSION {
+            snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        }
+
+        self.save_task_snapshot(&snapshot)?;
+        Ok(Some(snapshot))
     }
 
     /// 更新分片进度
@@ -238,6 +349,7 @@ mod tests {
 
     fn make_snapshot(id: &str, status: tachyon_core::DownloadState) -> TaskSnapshot {
         TaskSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             id: id.to_string(),
             url: format!("https://example.com/{id}.zip"),
             save_path: format!("/downloads/{id}.zip"),
@@ -245,6 +357,7 @@ mod tests {
             file_size: Some(1024),
             downloaded: 512,
             completed_fragments: vec![0, 1],
+            partial_fragments: HashMap::new(),
             total_fragments: 4,
             fragment_size: 256,
             status,
@@ -346,9 +459,10 @@ mod tests {
         mgr.save_task_snapshot(&make_snapshot("c", tachyon_core::DownloadState::Paused))
             .unwrap();
 
-        let all = mgr.load_all_task_snapshots().unwrap();
-        assert_eq!(all.len(), 3);
-        let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        let result = mgr.load_all_task_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 3);
+        assert!(result.corrupt_keys.is_empty());
+        let ids: Vec<&str> = result.tasks.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"b"));
         assert!(ids.contains(&"c"));
@@ -371,9 +485,10 @@ mod tests {
         mgr.save_task_snapshot(&make_snapshot("p4", tachyon_core::DownloadState::Failed))
             .unwrap();
 
-        let pending = mgr.recover_pending_snapshots().unwrap();
-        assert_eq!(pending.len(), 2);
-        let ids: Vec<&str> = pending.iter().map(|s| s.id.as_str()).collect();
+        let result = mgr.recover_pending_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert!(result.corrupt_keys.is_empty());
+        let ids: Vec<&str> = result.tasks.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"p1"));
         assert!(ids.contains(&"p3"));
     }
@@ -425,17 +540,18 @@ mod tests {
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);
 
-        let pending = mgr.recover_pending_snapshots().unwrap();
+        let result = mgr.recover_pending_snapshots().unwrap();
 
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "legacy-1");
-        assert_eq!(pending[0].file_name, "legacy.bin");
-        assert_eq!(pending[0].status, tachyon_core::DownloadState::Paused);
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].id, "legacy-1");
+        assert_eq!(result.tasks[0].file_name, "legacy.bin");
+        assert_eq!(result.tasks[0].status, tachyon_core::DownloadState::Paused);
     }
 
     #[test]
     fn test_task_snapshot_serializes_typed_status_and_metadata() {
         let snapshot = TaskSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             id: "task-1".to_string(),
             url: "https://example.com/file.bin".to_string(),
             save_path: "/downloads/file.bin".to_string(),
@@ -443,6 +559,7 @@ mod tests {
             file_size: Some(1024),
             downloaded: 512,
             completed_fragments: vec![0, 1],
+            partial_fragments: HashMap::new(),
             total_fragments: 4,
             fragment_size: 256,
             status: tachyon_core::DownloadState::Paused,
@@ -461,5 +578,159 @@ mod tests {
         assert_eq!(loaded.status, tachyon_core::DownloadState::Paused);
         assert_eq!(loaded.completed_fragments, vec![0, 1]);
         assert_eq!(loaded.etag.as_deref(), Some("\"abc\""));
+    }
+
+    // ── schema_version 兼容性测试 ──
+
+    #[test]
+    fn snapshot_old_json_without_schema_version_deserializes() {
+        // 模拟旧版本 JSON(无 schemaVersion 字段)
+        let old_json = r#"{
+            "id":"old-task",
+            "url":"https://example.com/old.bin",
+            "savePath":"/downloads/old.bin",
+            "fileName":"old.bin",
+            "fileSize":2048,
+            "downloaded":512,
+            "completedFragments":[0],
+            "totalFragments":4,
+            "fragmentSize":512,
+            "status":"downloading",
+            "createdAt":"2026-01-01T00:00:00Z",
+            "updatedAt":"2026-01-01T00:00:01Z",
+            "retryCount":0
+        }"#;
+        let snapshot: TaskSnapshot = serde_json::from_str(old_json).unwrap();
+        // 旧 JSON 无 schemaVersion,应默认为 0
+        assert_eq!(snapshot.schema_version, 0);
+        assert_eq!(snapshot.id, "old-task");
+        assert_eq!(snapshot.downloaded, 512);
+    }
+
+    #[test]
+    fn snapshot_new_json_with_schema_version_deserializes() {
+        let new_json = r#"{
+            "schemaVersion":1,
+            "id":"new-task",
+            "url":"https://example.com/new.bin",
+            "savePath":"/downloads/new.bin",
+            "fileName":"new.bin",
+            "fileSize":4096,
+            "downloaded":1024,
+            "completedFragments":[0,1],
+            "totalFragments":8,
+            "fragmentSize":512,
+            "status":"paused",
+            "createdAt":"2026-06-01T00:00:00Z",
+            "updatedAt":"2026-06-01T00:00:01Z",
+            "retryCount":1
+        }"#;
+        let snapshot: TaskSnapshot = serde_json::from_str(new_json).unwrap();
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.id, "new-task");
+    }
+
+    // ── 坏 JSON 隔离测试 ──
+
+    #[test]
+    fn corrupt_json_is_isolated_during_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        // 保存一个正常任务
+        mgr.save_task_snapshot(&make_snapshot(
+            "good",
+            tachyon_core::DownloadState::Downloading,
+        ))
+        .unwrap();
+
+        // 直接写入一个损坏的 JSON 文件
+        let corrupt_path = tmp.path().join("task_corrupt.json");
+        std::fs::write(&corrupt_path, "{ this is not valid json !!!").unwrap();
+
+        // 恢复不应失败,应返回正常任务并标记损坏 key
+        let result = mgr.recover_pending_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].id, "good");
+        assert_eq!(result.corrupt_keys.len(), 1);
+        assert!(result.corrupt_keys[0].contains("corrupt"));
+    }
+
+    #[test]
+    fn corrupt_json_is_isolated_in_load_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        mgr.save_task_snapshot(&make_snapshot(
+            "ok1",
+            tachyon_core::DownloadState::Completed,
+        ))
+        .unwrap();
+        mgr.save_task_snapshot(&make_snapshot("ok2", tachyon_core::DownloadState::Paused))
+            .unwrap();
+
+        let corrupt_path = tmp.path().join("task_bad.json");
+        std::fs::write(&corrupt_path, "not json at all").unwrap();
+
+        let result = mgr.load_all_task_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert_eq!(result.corrupt_keys.len(), 1);
+    }
+
+    // ── update_snapshot 原子性测试 ──
+
+    #[test]
+    fn update_snapshot_applies_patch_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let snap = make_snapshot("atomic", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&snap).unwrap();
+
+        let updated = mgr
+            .update_snapshot("atomic", |s| {
+                s.downloaded = 768;
+                s.completed_fragments.push(2);
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.downloaded, 768);
+        assert!(updated.completed_fragments.contains(&2));
+        assert_eq!(updated.schema_version, SNAPSHOT_SCHEMA_VERSION);
+
+        // 验证持久化
+        let loaded = mgr.load_task_snapshot("atomic").unwrap().unwrap();
+        assert_eq!(loaded.downloaded, 768);
+        assert!(loaded.completed_fragments.contains(&2));
+    }
+
+    #[test]
+    fn update_snapshot_returns_none_for_missing_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let result = mgr.update_snapshot("nonexistent", |_| {}).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn update_snapshot_upgrades_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        // 直接写入旧 schema 版本的 JSON
+        let mut snap = make_snapshot("old-schema", tachyon_core::DownloadState::Paused);
+        snap.schema_version = 0;
+        mgr.save_task_snapshot(&snap).unwrap();
+
+        let updated = mgr.update_snapshot("old-schema", |_| {}).unwrap().unwrap();
+
+        assert_eq!(updated.schema_version, SNAPSHOT_SCHEMA_VERSION);
     }
 }

@@ -13,11 +13,54 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use reqwest::Client;
-use tachyon_core::filename::extract_filename;
+
+// ---------------------------------------------------------------------------
+// Error chain utility
+// ---------------------------------------------------------------------------
+
+/// 构造错误链字符串: `err -> source1 -> source2 -> ...`
+///
+/// T-04: 提取重复的错误链拼接逻辑,消除 http.rs 中 6 处相同代码。
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut chain = String::new();
+    let mut current: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = current {
+        if !chain.is_empty() {
+            chain.push_str(" -> ");
+        }
+        chain.push_str(&err.to_string());
+        current = err.source();
+    }
+    chain
+}
+use tachyon_core::safety::extract_filename;
 use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use tracing::{debug, info, warn};
+
+/// `get_text` 响应体最大允许字节数
+///
+/// 防止恶意或异常服务器返回超大响应导致 OOM。64MB 足以覆盖
+/// 大型模型仓库(HuggingFace)的文件树 JSON 列表。
+/// 与 [`tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE`] 保持一致,
+/// 统一三协议(Hub 元数据 API 同样使用 64MB)的 OOM 防护上限。
+pub const MAX_GET_TEXT_SIZE: u64 = 64 * 1024 * 1024;
+
+/// 校验响应体 Content-Length 是否超出上限
+///
+/// `content_length` 为 `None` 表示服务器未声明(如 chunked 流式),
+/// 此时无法预检,返回 Ok 由 `.text()` 自然读取并受读超时约束。
+pub fn check_response_size_limit(content_length: Option<u64>) -> DownloadResult<()> {
+    if let Some(cl) = content_length
+        && cl > MAX_GET_TEXT_SIZE
+    {
+        return Err(DownloadError::Protocol(format!(
+            "响应体过大: {cl} > 最大允许 {MAX_GET_TEXT_SIZE} 字节"
+        )));
+    }
+    Ok(())
+}
 
 /// HTTP/HTTPS 协议客户端
 pub struct HttpClient {
@@ -40,23 +83,39 @@ impl HttpClient {
     /// - 连接超时防止连接黑洞 IP 永久挂起
     /// - 读取超时防止连接后静默断流,但不会误杀正常的长下载
     pub fn with_timeouts(connect_secs: u64, read_secs: u64) -> DownloadResult<Self> {
-        Self::build_client(connect_secs, read_secs, false)
+        Self::build_client(connect_secs, read_secs, false, 16, 30)
     }
 
-    /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制)
+    /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制与连接池调优)
+    ///
+    /// 将 `ConnectionConfig` 的 `max_connections_per_host` 和 `keep_alive_timeout_secs`
+    /// 透传给 reqwest 连接池,使 reqwest 空闲连接池大小与信号量并发上限对齐。
     pub fn with_connection_config(
         config: &tachyon_core::config::ConnectionConfig,
         connect_secs: u64,
         read_secs: u64,
     ) -> DownloadResult<Self> {
-        Self::build_client(connect_secs, read_secs, config.enable_http2)
+        Self::build_client(
+            connect_secs,
+            read_secs,
+            config.enable_http2,
+            config.max_connections_per_host as usize,
+            config.keep_alive_timeout_secs,
+        )
     }
 
-    fn build_client(connect_secs: u64, read_secs: u64, enable_http2: bool) -> DownloadResult<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn build_client(
+        connect_secs: u64,
+        read_secs: u64,
+        enable_http2: bool,
+        pool_max_idle_per_host: usize,
+        keep_alive_secs: u64,
+    ) -> DownloadResult<Self> {
         let mut builder = Client::builder()
             .user_agent(tachyon_core::config::USER_AGENT)
-            .pool_max_idle_per_host(16)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(pool_max_idle_per_host)
+            .tcp_keepalive(std::time::Duration::from_secs(keep_alive_secs))
             .no_proxy()
             .dns_resolver(PublicDnsResolver::new())
             .redirect(safe_redirect_policy());
@@ -82,9 +141,56 @@ impl HttpClient {
         Self { client }
     }
 
-    /// 获取内部 reqwest Client 引用
-    pub fn inner(&self) -> &Client {
-        &self.client
+    /// 发送 GET 请求并返回响应文本
+    ///
+    /// # 参数
+    /// - `url`: 请求 URL
+    /// - `headers`: 自定义请求头(key-value 对),可为空
+    ///
+    /// # 返回
+    /// 响应文本,或网络错误
+    pub async fn get_text(&self, url: &str, headers: &[(&str, &str)]) -> DownloadResult<String> {
+        let parsed_url = reqwest::Url::parse(url)?;
+        tachyon_core::validate_public_http_url(&parsed_url)?;
+
+        let mut req = self.client.get(url);
+        for (key, value) in headers {
+            req = req.header(*key, *value);
+        }
+
+        let mut response = req.send().await.map_err(|e| {
+            let chain = error_chain(&e);
+            DownloadError::Network(format!("GET 请求失败: {chain}"))
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_http_error(status, response.headers()));
+        }
+
+        // 校验响应体大小,防止超大响应导致 OOM(复用统一的字节上限逻辑)
+        check_response_size_limit(response.content_length())?;
+
+        // S-14: 使用 chunk() 流式读取,对无 Content-Length 的 chunked 响应
+        // 也能在累积大小超限时及时终止,而非等到读超时或 OOM
+        let mut body = String::new();
+        let mut total_size = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| DownloadError::Network(format!("读取响应块失败: {e}")))?
+        {
+            total_size += chunk.len() as u64;
+            if total_size > MAX_GET_TEXT_SIZE {
+                return Err(DownloadError::Protocol(format!(
+                    "响应体过大: {total_size} > 最大允许 {MAX_GET_TEXT_SIZE} 字节"
+                )));
+            }
+            // chunk 是 Bytes (UTF-8 边界安全),直接 extend
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            body.push_str(&chunk_str);
+        }
+        Ok(body)
     }
 }
 
@@ -107,10 +213,16 @@ impl PublicDnsResolver {
     }
 
     /// 清理过期的 DNS 缓存条目
-    #[allow(dead_code)]
-    fn evict_expired(&self) {
-        let ttl = Duration::from_secs(DNS_CACHE_TTL_SECS);
-        self.cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
+    /// 清理过期 DNS 缓存条目
+    ///
+    /// N-03: 在每次 DNS 解析前调用,防止缓存无限增长。
+    /// 使用概率式清理(每 100 次解析触发一次),避免每次都遍历全表。
+    fn maybe_evict_expired(&self) {
+        // 每约 100 次解析触发一次清理,避免频繁遍历
+        if self.cache.len().is_multiple_of(100) {
+            let ttl = Duration::from_secs(DNS_CACHE_TTL_SECS);
+            self.cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
+        }
     }
 }
 
@@ -118,6 +230,9 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         let cache = self.cache.clone();
+
+        // N-03: 定期清理过期 DNS 缓存条目
+        self.maybe_evict_expired();
 
         if let Some(entry) = cache.get(&host)
             && entry.value().1.elapsed() < Duration::from_secs(DNS_CACHE_TTL_SECS)
@@ -191,7 +306,7 @@ fn classify_http_error(
 /// 支持两种格式(RFC 7231):
 /// 1. delay-seconds: 纯整数秒数(如 "120")
 /// 2. HTTP-date: IMF-fixdate 格式(如 "Wed, 21 Oct 2026 07:28:00 GMT")
-fn parse_retry_after(value: &str) -> Option<u64> {
+pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
     // 优先尝试整数秒格式
     if let Ok(secs) = value.trim().parse::<u64>() {
         return Some(secs);
@@ -225,7 +340,7 @@ fn month_num(name: &str) -> Option<u32> {
 ///
 /// 输入: "Wed, 21 Oct 2026 07:28:00 GMT"
 /// 输出: 距离当前 UTC 时间的秒数(若已过期则返回 Some(0))
-fn parse_http_date_to_secs(date_str: &str) -> Option<u64> {
+pub(crate) fn parse_http_date_to_secs(date_str: &str) -> Option<u64> {
     // 解析 "Day, DD Mon YYYY HH:MM:SS GMT"
     let parts: Vec<&str> = date_str.split_whitespace().collect();
     if parts.len() < 6 {
@@ -291,13 +406,7 @@ impl Protocol for HttpClient {
             tachyon_core::validate_public_http_url(&parsed_url)?;
             debug!(url = %tachyon_core::redact_url_for_log(&url), "HTTP HEAD 探测开始");
             let response = client.head(&url).send().await.map_err(|e| {
-                let mut chain = String::new();
-                let mut current: Option<&dyn std::error::Error> = Some(&e);
-                while let Some(err) = current {
-                    if !chain.is_empty() { chain.push_str(" -> "); }
-                    chain.push_str(&err.to_string());
-                    current = err.source();
-                }
+                let chain = error_chain(&e);
                 warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "HEAD 请求连接失败");
                 DownloadError::Network(format!("HEAD 请求失败: {chain}"))
             })?;
@@ -373,13 +482,7 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    let mut chain = String::new();
-                    let mut current: Option<&dyn std::error::Error> = Some(&e);
-                    while let Some(err) = current {
-                        if !chain.is_empty() { chain.push_str(" -> "); }
-                        chain.push_str(&err.to_string());
-                        current = err.source();
-                    }
+                    let chain = error_chain(&e);
                     warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "Range 请求连接失败");
                     DownloadError::Network(format!("Range 请求失败: {chain}"))
                 })?;
@@ -431,13 +534,7 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    let mut chain = String::new();
-                    let mut current: Option<&dyn std::error::Error> = Some(&e);
-                    while let Some(err) = current {
-                        if !chain.is_empty() { chain.push_str(" -> "); }
-                        chain.push_str(&err.to_string());
-                        current = err.source();
-                    }
+                    let chain = error_chain(&e);
                     warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "流式 Range 请求连接失败");
                     DownloadError::Network(format!("Range 请求失败: {chain}"))
                 })?;
@@ -480,13 +577,7 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    let mut chain = String::new();
-                    let mut current: Option<&dyn std::error::Error> = Some(&e);
-                    while let Some(err) = current {
-                        if !chain.is_empty() { chain.push_str(" -> "); }
-                        chain.push_str(&err.to_string());
-                        current = err.source();
-                    }
+                    let chain = error_chain(&e);
                     warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
                     DownloadError::Network(format!("下载请求失败: {chain}"))
                 })?;
@@ -497,13 +588,13 @@ impl Protocol for HttpClient {
             }
 
             // 限制非流式响应大小，防止 OOM
-            const MAX_DOWNLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10MB
             if let Some(content_length) = response.content_length()
-                && content_length > MAX_DOWNLOAD_SIZE
+                && content_length > tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64
             {
                 return Err(DownloadError::Protocol(format!(
                     "响应体过大: {} > 最大允许 {} 字节",
-                    content_length, MAX_DOWNLOAD_SIZE
+                    content_length,
+                    tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE
                 )));
             }
 
@@ -529,13 +620,7 @@ impl Protocol for HttpClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    let mut chain = String::new();
-                    let mut current: Option<&dyn std::error::Error> = Some(&e);
-                    while let Some(err) = current {
-                        if !chain.is_empty() { chain.push_str(" -> "); }
-                        chain.push_str(&err.to_string());
-                        current = err.source();
-                    }
+                    let chain = error_chain(&e);
                     warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
                     DownloadError::Network(format!("下载请求失败: {chain}"))
                 })?;
@@ -548,10 +633,25 @@ impl Protocol for HttpClient {
             info!(url = %tachyon_core::redact_url_for_log(&url), "HTTP 整块流式响应头已接收,开始流式传输");
 
             // 使用 bytes_stream() 逐块产出,峰值内存仅含单个 chunk,
-            // 避免大文件整块进内存
-            let stream = response.bytes_stream().map(|result| {
-                result.map_err(|e| DownloadError::Network(format!("读取响应流数据失败: {e}")))
-            });
+            // 避免大文件整块进内存。scan 累计字节数,超过上限时终止流。
+            let max_bytes = tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64;
+            let stream = response
+                .bytes_stream()
+                .scan(0u64, move |total, result| match result {
+                    Ok(chunk) => {
+                        *total += chunk.len() as u64;
+                        if *total > max_bytes {
+                            futures::future::ready(Some(Err(DownloadError::Protocol(format!(
+                                "HTTP 流式下载超过大小上限: {total} > {max_bytes} 字节"
+                            )))))
+                        } else {
+                            futures::future::ready(Some(Ok(chunk)))
+                        }
+                    }
+                    Err(e) => futures::future::ready(Some(Err(DownloadError::Network(format!(
+                        "读取响应流数据失败: {e}"
+                    ))))),
+                });
 
             Ok(Box::pin(stream) as ByteStream)
         })
@@ -561,7 +661,7 @@ impl Protocol for HttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tachyon_core::filename::parse_content_disposition;
+    use tachyon_core::safety::parse_content_disposition;
 
     #[test]
     fn test_extract_filename_from_url() {
@@ -662,6 +762,48 @@ mod tests {
         // 同时禁用两项超时,不应 panic
         let client = HttpClient::with_timeouts(0, 0);
         assert!(client.is_ok());
+    }
+
+    // --- get_text 响应体大小限制测试 (P2-42) ---
+
+    #[test]
+    fn test_max_get_text_size_constant_is_64mb() {
+        // 64MB 上限足以覆盖 Hub 文件树 JSON,同时防止 OOM
+        assert_eq!(MAX_GET_TEXT_SIZE, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_check_response_size_limit_allows_none() {
+        // Content-Length 缺失(chunked 流式)时无法预检,应放行
+        assert!(check_response_size_limit(None).is_ok());
+    }
+
+    #[test]
+    fn test_check_response_size_limit_allows_under_limit() {
+        // 恰好等于上限:边界值应允许
+        assert!(check_response_size_limit(Some(MAX_GET_TEXT_SIZE)).is_ok());
+        assert!(check_response_size_limit(Some(0)).is_ok());
+        assert!(check_response_size_limit(Some(1024)).is_ok());
+    }
+
+    #[test]
+    fn test_check_response_size_limit_rejects_over_limit() {
+        // 超出上限一字节:应返回 Protocol 错误
+        let result = check_response_size_limit(Some(MAX_GET_TEXT_SIZE + 1));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DownloadError::Protocol(msg) => {
+                assert!(
+                    msg.contains("响应体过大"),
+                    "错误消息应含'响应体过大': {msg}"
+                );
+                assert!(
+                    msg.contains(&MAX_GET_TEXT_SIZE.to_string()),
+                    "错误消息应含上限值: {msg}"
+                );
+            }
+            other => panic!("预期 Protocol 错误,实际: {other:?}"),
+        }
     }
 
     // --- 任务 2: classify_http_error 测试 ---

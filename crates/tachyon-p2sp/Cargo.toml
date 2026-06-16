@@ -11,7 +11,6 @@ ftp = ["tachyon-protocol/ftp"]
 quic = ["tachyon-protocol/quic"]
 
 [dependencies]
-tachyon-core = { path = "../tachyon-core" }
 tachyon-protocol = { path = "../tachyon-protocol", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
@@ -23,6 +22,11 @@ blake3.workspace = true
 getrandom.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+
+# tachyon-protocol 通过 [features] default = ["tachyon-protocol/ftp", ...] 隐式使用,
+# cargo-machete 源码文本匹配会误报,此处显式抑制。
+[package.metadata.cargo-machete]
+ignored = ["tachyon-protocol"]
 
 [dev-dependencies]
 tokio-test.workspace = true

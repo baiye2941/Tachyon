@@ -2,13 +2,13 @@
 //!
 //! 所有 crate 共享的公共接口抽象
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
 use futures::Stream;
 
-use crate::config::DownloadConfig;
 use crate::error::DownloadResult;
 use crate::types::{FileMetadata, FragmentInfo, TaskId};
 
@@ -138,38 +138,67 @@ fn constant_time_eq_str(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// 下载任务 trait:表示一个完整的下载任务
-pub trait DownloadTask: Send + Sync {
-    /// 获取任务 ID
-    fn id(&self) -> TaskId;
+/// 下载任务执行器 trait:抽象下载任务的生命周期操作
+///
+/// 由 tachyon-engine 实现,供 tachyon-app 通过动态分发调用。
+/// 避免 app 层直接依赖 `tachyon_engine::DownloadTask` 具体 struct,
+/// 同时消除 `tachyon_core::traits::DownloadTask` 与 `tachyon_engine::DownloadTask`
+/// 同名带来的语义混淆。
+pub trait TaskRunner: Send + Sync {
+    /// 注入引擎侧控制通道,engine 内部将 TaskCommand 翻译为 DownloadState
+    fn set_control_rx(&mut self, rx: tokio::sync::watch::Receiver<crate::types::TaskCommand>);
 
-    /// 获取下载 URL
-    fn url(&self) -> &str;
+    /// 注入已完成分片索引(断点续传)
+    fn set_completed_fragments(&mut self, fragments: Vec<u32>);
 
-    /// 获取下载配置
-    fn config(&self) -> &DownloadConfig;
+    /// 注入未完整下载的分片及其已下载字节数(字节级断点续传)
+    fn set_partial_fragments(&mut self, fragments: HashMap<u32, u64>);
 
-    /// 获取文件元数据
-    fn metadata(&self) -> DownloadResult<&FileMetadata>;
+    /// 注入分片进度发送端
+    fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>);
 
-    /// 获取所有分片信息
-    fn fragments(&self) -> &[FragmentInfo];
+    /// 探测远程文件元数据
+    fn probe(&mut self)
+    -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>>;
 
-    /// 获取当前状态
-    fn state(&self) -> crate::types::DownloadState;
+    /// 执行完整下载流程
+    fn run(&mut self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
 
-    /// 计算总体下载进度(0.0 ~ 1.0)
-    fn progress(&self) -> f64 {
-        let fragments = self.fragments();
-        if fragments.is_empty() {
-            return 0.0;
-        }
-        let total: u64 = fragments.iter().map(|f| f.size).sum();
-        if total == 0 {
-            return 1.0;
-        }
-        let downloaded: u64 = fragments.iter().map(|f| f.downloaded).sum();
-        downloaded as f64 / total as f64
+    /// 获取已探测到的文件元数据
+    fn metadata(&self) -> Option<&FileMetadata>;
+}
+
+// 为 Box<dyn TaskRunner> 提供默认转发实现,使 app 层可以持有 Box<dyn TaskRunner>
+// 并直接以 &mut dyn TaskRunner 形式传给辅助函数,无需在每个调用点解引用。
+impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
+    fn set_control_rx(&mut self, rx: tokio::sync::watch::Receiver<crate::types::TaskCommand>) {
+        (**self).set_control_rx(rx)
+    }
+
+    fn set_completed_fragments(&mut self, fragments: Vec<u32>) {
+        (**self).set_completed_fragments(fragments)
+    }
+
+    fn set_partial_fragments(&mut self, fragments: HashMap<u32, u64>) {
+        (**self).set_partial_fragments(fragments)
+    }
+
+    fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>) {
+        (**self).set_progress_sender(tx)
+    }
+
+    fn probe(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>> {
+        (**self).probe()
+    }
+
+    fn run(&mut self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        (**self).run()
+    }
+
+    fn metadata(&self) -> Option<&FileMetadata> {
+        (**self).metadata()
     }
 }
 

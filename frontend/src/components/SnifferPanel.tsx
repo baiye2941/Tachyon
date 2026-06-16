@@ -5,15 +5,17 @@ import {
   ImageIcon, ArchiveIcon, PlusIcon, CheckboxIcon,
 } from './icons'
 import { formatSize } from '../utils/format'
+import Button from '../shared/ui/Button'
 
 const typeColors: Record<string, string> = {
-  video: '#F59E0B',
-  audio: '#8B5CF6',
-  document: '#3B82F6',
-  archive: '#F97316',
-  executable: '#6B7280',
-  image: '#10B981',
-  other: '#6B7280',
+  video: 'var(--color-file-video)',
+  audio: 'var(--color-file-audio)',
+  document: 'var(--color-file-document)',
+  archive: 'var(--color-file-archive)',
+  executable: 'var(--color-file-executable)',
+  image: 'var(--color-file-image)',
+  model: 'var(--color-file-model)',
+  other: 'var(--color-file-other)',
 }
 
 const typeIcons: Record<string, () => ReturnType<typeof VideoIcon>> = {
@@ -76,8 +78,11 @@ export default function SnifferPanel(props: SnifferPanelProps) {
   return (
     <div
       class="slide-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="资源嗅探"
       style={{
-        width: '380px',
+        width: 'var(--panel-sniffer-width, 380px)',
         transform: props.visible ? 'translateX(0)' : 'translateX(100%)',
       }}
     >
@@ -96,7 +101,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
       </div>
 
       {/* Filter Bar */}
-      <div class="flex items-center gap-2 flex-wrap" style={{ padding: '12px 20px', 'border-bottom': '1px solid rgba(255,255,255,0.05)' }}>
+      <div class="flex items-center gap-2 flex-wrap" style={{ padding: '12px 20px', 'border-bottom': '1px solid var(--color-border-subtle)' }}>
         <For each={types()}>
           {(type) => (
             <button
@@ -111,23 +116,20 @@ export default function SnifferPanel(props: SnifferPanelProps) {
 
       {/* Batch toggle */}
       <div class="flex items-center justify-between" style={{ padding: '8px 20px' }}>
-        <button
+        <Button
+          variant="ghost"
+          size="sm"
           class="flex items-center gap-1"
-          style={{
-            'font-size': '12px',
-            color: batchMode() ? '#00D4AA' : '#6B7280',
-            background: 'none',
-            border: 'none',
-            cursor: 'pointer',
-          }}
+          style={{ color: batchMode() ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}
           onClick={() => {
+            const wasBatch = batchMode()
             setBatchMode(v => !v)
-            if (batchMode()) setSelectedIds(new Set<string>())
+            if (wasBatch) setSelectedIds(new Set<string>())
           }}
         >
           <CheckboxIcon checked={batchMode()} />
           <span>批量选择</span>
-        </button>
+        </Button>
       </div>
 
       {/* Resource List */}
@@ -142,8 +144,8 @@ export default function SnifferPanel(props: SnifferPanelProps) {
                 style={{
                   padding: '10px 12px',
                   'border-radius': '8px',
-                  background: isSelected() ? 'rgba(0, 212, 170, 0.06)' : 'transparent',
-                  'border-left': isSelected() ? '2px solid #00D4AA' : '2px solid transparent',
+                  background: isSelected() ? 'var(--color-accent-soft)' : 'transparent',
+                  'border-left': isSelected() ? '2px solid var(--color-accent-primary)' : '2px solid transparent',
                   transition: 'all 150ms ease',
                   animation: `card-fade-in 200ms ease forwards`,
                   'animation-delay': `${index() * 40}ms`,
@@ -161,11 +163,11 @@ export default function SnifferPanel(props: SnifferPanelProps) {
                   style={{
                     width: '32px',
                     height: '32px',
-                    color: typeColors[resource.type] || '#6B7280',
+                    color: typeColors[resource.type] || 'var(--color-file-other)',
                   }}
                 >
                   <Show when={batchMode()} fallback={<Icon />}>
-                    <div style={{ color: isSelected() ? '#00D4AA' : '#6B7280' }}>
+                    <div style={{ color: isSelected() ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}>
                       <CheckboxIcon checked={isSelected()} />
                     </div>
                   </Show>
@@ -173,14 +175,14 @@ export default function SnifferPanel(props: SnifferPanelProps) {
 
                 {/* Info */}
                 <div class="flex-1 min-w-0">
-                  <div class="truncate" style={{ 'font-size': '14px', color: '#F0F0F5', 'font-weight': 500 }}>
+                  <div class="truncate" style={{ 'font-size': '14px', color: 'var(--color-text-title)', 'font-weight': 500 }}>
                     {resource.name}
                   </div>
-                  <div style={{ 'font-size': '12px', color: '#6B7280', 'margin-top': '2px' }}>
+                  <div style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
                     {formatSize(resource.size)} · {resource.contentType || resource.type}
                   </div>
                   <Show when={resource.sourcePage}>
-                    <div class="truncate" style={{ 'font-size': '12px', color: '#4A4A5A', 'margin-top': '2px' }}>
+                    <div class="truncate" style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
                       {resource.sourcePage}
                     </div>
                   </Show>
@@ -188,25 +190,18 @@ export default function SnifferPanel(props: SnifferPanelProps) {
 
                 {/* Add button */}
                 <Show when={!batchMode()}>
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     class="hover-accent"
-                    style={{
-                      padding: '4px 10px',
-                      'border-radius': '6px',
-                      'font-size': '12px',
-                      background: 'rgba(0, 212, 170, 0.08)',
-                      color: '#00D4AA',
-                      border: 'none',
-                      cursor: 'pointer',
-                      transition: 'all 150ms ease',
-                    }}
+                    style={{ color: 'var(--color-accent-primary)' }}
                     onClick={(e) => {
                       e.stopPropagation()
                       props.onAddDownload(resource)
                     }}
                   >
                     <PlusIcon />
-                  </button>
+                  </Button>
                 </Show>
               </div>
             )
@@ -220,39 +215,26 @@ export default function SnifferPanel(props: SnifferPanelProps) {
           class="flex items-center justify-between"
           style={{
             padding: '12px 20px',
-            'border-top': '1px solid rgba(255,255,255,0.08)',
-            background: 'rgba(18, 18, 26, 0.95)',
+            'border-top': '1px solid var(--color-border-default)',
+            background: 'var(--color-bg-elevated)',
           }}
         >
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
             class="flex items-center gap-1"
-            style={{
-              'font-size': '13px',
-              color: '#A0A0B0',
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-            }}
             onClick={selectAll}
           >
             <CheckboxIcon />
             <span>全选</span>
-          </button>
-          <span style={{ 'font-size': '12px', color: '#6B7280' }}>
+          </Button>
+          <span style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)' }}>
             已选 {selectedIds().size} 项
           </span>
-          <button
+          <Button
+            variant="primary"
+            size="sm"
             class="flex items-center gap-1"
-            style={{
-              padding: '6px 14px',
-              'border-radius': '8px',
-              'font-size': '13px',
-              background: '#00D4AA',
-              color: '#0A0A0F',
-              border: 'none',
-              cursor: 'pointer',
-              'font-weight': 600,
-            }}
             onClick={() => {
               const selected = props.resources.filter(r => selectedIds().has(r.id))
               selected.forEach(r => props.onAddDownload(r))
@@ -261,7 +243,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
           >
             <PlusIcon />
             批量添加 ({selectedIds().size})
-          </button>
+          </Button>
         </div>
       </Show>
     </div>

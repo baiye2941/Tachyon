@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tachyon_core::filename::extract_filename_from_url;
+use tachyon_core::safety::extract_filename_from_url;
 
 use crate::capture::{CaptureConfig, identify_resource, should_capture};
 
@@ -105,7 +105,10 @@ impl ResourceManager {
         }
 
         let id = generate_id(url);
-        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
+        let mut resources = self.resources.write().unwrap_or_else(|e| {
+            tracing::warn!("RwLock 中毒,恢复使用内部数据");
+            e.into_inner()
+        });
 
         if resources.contains_key(&id) {
             return false;
@@ -135,7 +138,10 @@ impl ResourceManager {
 
     /// 获取所有已发现的资源
     pub fn get_all(&self) -> Vec<SnifferResource> {
-        let resources = self.resources.read().expect("RwLock 不应被毒化");
+        let resources = self.resources.read().unwrap_or_else(|e| {
+            tracing::warn!("RwLock 中毒,恢复使用内部数据");
+            e.into_inner()
+        });
         let mut list: Vec<_> = resources.values().cloned().collect();
         list.sort_by_key(|r| std::cmp::Reverse(r.discovered_at));
         list
@@ -151,19 +157,28 @@ impl ResourceManager {
 
     /// 移除资源
     pub fn remove(&self, id: &str) -> bool {
-        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
+        let mut resources = self.resources.write().unwrap_or_else(|e| {
+            tracing::warn!("RwLock 中毒,恢复使用内部数据");
+            e.into_inner()
+        });
         resources.remove(id).is_some()
     }
 
     /// 清空所有资源
     pub fn clear(&self) {
-        let mut resources = self.resources.write().expect("RwLock 不应被毒化");
+        let mut resources = self.resources.write().unwrap_or_else(|e| {
+            tracing::warn!("RwLock 中毒,恢复使用内部数据");
+            e.into_inner()
+        });
         resources.clear();
     }
 
     /// 资源数量
     pub fn count(&self) -> usize {
-        let resources = self.resources.read().expect("RwLock 不应被毒化");
+        let resources = self.resources.read().unwrap_or_else(|e| {
+            tracing::warn!("RwLock 中毒,恢复使用内部数据");
+            e.into_inner()
+        });
         resources.len()
     }
 

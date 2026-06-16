@@ -1,4 +1,4 @@
-use tachyon_core::config::AppConfig;
+use tachyon_core::config::{AppConfig, ConfigPatch};
 
 use super::{AppError, AppState};
 
@@ -14,9 +14,24 @@ pub async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, 
 #[tauri::command]
 pub async fn update_config(
     state: tauri::State<'_, AppState>,
-    config: AppConfig,
+    patch: ConfigPatch,
+    confirmation_token: Option<String>,
 ) -> Result<(), AppError> {
-    update_config_inner(&state, config).await
+    // P1-11b: 验证一次性确认令牌，绑定 action 防止跨操作复用
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "update_config")?;
+        }
+        None => {
+            return Err(super::AppError::Config(
+                "更新配置需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    update_config_inner(&state, patch).await
 }
 
 // ---------------------------------------------------------------------------
@@ -24,15 +39,35 @@ pub async fn update_config(
 // ---------------------------------------------------------------------------
 
 async fn get_config_inner(state: &AppState) -> Result<AppConfig, AppError> {
-    let cfg = state.config.lock().await;
+    let cfg = state.domain.config.lock().await;
     Ok(cfg.clone())
 }
 
-async fn update_config_inner(state: &AppState, config: AppConfig) -> Result<(), AppError> {
-    validate_config(&config)?;
-    let mut cfg = state.config.lock().await;
-    *cfg = config;
-    tracing::info!("应用配置已更新");
+async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(), AppError> {
+    let mut cfg = state.domain.config.lock().await;
+    let updated = patch.apply_to(&cfg);
+    // 校验在锁内执行,避免 drop 后重新获取锁的 TOCTOU 竞态
+    // 路径校验(authorized_dirs canonicalize/create_dir)是轻量元数据操作,
+    // 在 spawn_blocking 中执行以避免阻塞 Tokio 工作线程,但仍在锁的保护下
+    let updated = tokio::task::spawn_blocking(move || -> Result<AppConfig, AppError> {
+        validate_config(&updated)?;
+        Ok(updated)
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("配置校验任务失败: {e}")))??;
+
+    // 在写入新配置前记录新的 download_dir(避免写后读竞态)
+    let new_download_dir = updated.download.download_dir.clone();
+    *cfg = updated;
+    drop(cfg);
+    // 同步更新 TaskService 的缓存 download_dir,确保 persist_snapshot
+    // 热路径读到最新值,无需再次获取 config 锁
+    state
+        .service
+        .task_service
+        .update_cached_download_dir(new_download_dir)
+        .await;
+    tracing::info!("应用配置已更新(白名单补丁模式)");
     Ok(())
 }
 
@@ -76,6 +111,30 @@ pub(crate) fn validate_config(config: &AppConfig) -> Result<(), AppError> {
             return Err(AppError::Config(format!(
                 "authorized_dirs 不允许包含系统根目录: {dir}"
             )));
+        }
+    }
+
+    // S-02: 校验 download_dir 必须在 authorized_dirs 之下
+    // 防止通过 update_config 将 download_dir 设置为 authorized_dirs 之外的路径,
+    // 后续 create_task 会因 authorize_download_dir 校验失败而拒绝所有下载
+    if !config.download.authorized_dirs.is_empty() {
+        let download_path = std::path::Path::new(&config.download.download_dir);
+        if download_path.is_absolute() {
+            // download_dir 可能还不存在(新配置),尝试 canonicalize 现有前缀
+            if let Ok(canonical_dl) = canonicalize_existing(download_path) {
+                let roots = canonical_authorized_roots(config)?;
+                if !roots
+                    .iter()
+                    .any(|root| canonical_dl.starts_with(root.as_path()))
+                {
+                    return Err(AppError::Config(format!(
+                        "download_dir 不在 authorized_dirs 下: {}",
+                        config.download.download_dir
+                    )));
+                }
+            }
+            // 如果 canonicalize_existing 失败(路径完全不存在),
+            // 不阻断配置更新,等实际创建时 authorize_download_dir 再校验
         }
     }
 
@@ -182,6 +241,9 @@ fn create_authorized_dir_chain(
             continue;
         }
 
+        // 目录创建是快速元数据操作(<1ms),但在 async 上下文中仍应避免
+        // 直接阻塞 Tokio 工作线程。使用 std::fs 而非 tokio::fs 因为
+        // 此函数是同步的,且调用频率极低(仅用户修改配置时触发)。
         std::fs::create_dir(&candidate).map_err(|e| {
             AppError::Config(format!("创建下载目录失败: {}: {e}", requested.display()))
         })?;
@@ -283,7 +345,36 @@ fn is_forbidden_authorized_root(canonical: &std::path::Path) -> bool {
         }
     });
     let is_unix_system_top_dir = matches!(first_normal_component, Some("usr" | "etc" | "System"));
-    is_root || is_unix_system_top_dir
+    // Windows 系统目录保护
+    #[cfg(target_os = "windows")]
+    let is_windows_system_top_dir = matches!(
+        first_normal_component,
+        Some("Windows" | "Program Files" | "Program Files (x86)" | "ProgramData")
+    );
+    #[cfg(not(target_os = "windows"))]
+    let is_windows_system_top_dir = false;
+    is_root || is_unix_system_top_dir || is_windows_system_top_dir
+}
+
+/// 对路径的已存在前缀执行 canonicalize
+///
+/// 如果路径本身存在,直接 canonicalize;否则找到最深已存在祖先并 canonicalize。
+/// 用于校验 download_dir 与 authorized_dirs 的归属关系,
+/// 即使 download_dir 尚未创建(新配置场景),只要已存在部分在授权根下即可。
+fn canonicalize_existing(path: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
+    if path.exists() {
+        path.canonicalize()
+            .map_err(|_| AppError::Config(format!("路径无法解析: {}", path.display())))
+    } else if let Some(ancestor) = deepest_existing_ancestor(path) {
+        ancestor
+            .canonicalize()
+            .map_err(|_| AppError::Config(format!("路径前缀无法解析: {}", ancestor.display())))
+    } else {
+        Err(AppError::Config(format!(
+            "路径及其父目录均不存在: {}",
+            path.display()
+        )))
+    }
 }
 
 fn deepest_existing_ancestor(path: &std::path::Path) -> Option<&std::path::Path> {
@@ -315,11 +406,16 @@ mod tests {
     use super::super::tests::test_state;
     use super::super::{build_download_config, persist_task_snapshot};
     use super::*;
-    use tachyon_core::config::{IoStrategy, USER_AGENT};
+    use tachyon_core::config::{
+        ConfigPatch, ConnectionPatch, DownloadPatch, IoStrategy, USER_AGENT,
+    };
 
-    /// 创建临时测试路径，在所有平台上均有效
+    /// 创建临时测试路径,确保在 authorized_dirs (tachyon-test-downloads) 下
+    /// S-02: validate_config 要求 download_dir 在 authorized_dirs 下
     fn test_tmp_path(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("tachyon-test-{name}"));
+        let dir = std::env::temp_dir()
+            .join("tachyon-test-downloads")
+            .join(format!("sub-{name}"));
         let _ = std::fs::create_dir_all(&dir);
         dir.to_string_lossy().to_string()
     }
@@ -341,6 +437,7 @@ mod tests {
                 request_timeout_secs: 30,
                 connect_timeout_secs: 10,
                 verify_checksum,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
@@ -361,6 +458,39 @@ mod tests {
         }
     }
 
+    /// 构建测试用 ConfigPatch,设置关键 patchable 字段
+    fn make_test_patch(
+        max_concurrent_tasks: Option<u32>,
+        download_dir: Option<String>,
+        max_concurrent_fragments: Option<u32>,
+        max_connections_per_host: Option<u32>,
+        enable_quic: Option<bool>,
+        verify_checksum: Option<bool>,
+    ) -> ConfigPatch {
+        ConfigPatch {
+            max_concurrent_tasks,
+            download: Some(DownloadPatch {
+                download_dir,
+                max_concurrent_fragments,
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: None,
+                io_strategy: None,
+            }),
+            connection: Some(ConnectionPatch {
+                max_connections_per_host,
+                max_global_connections: None,
+                keep_alive_timeout_secs: None,
+                connect_timeout_secs: None,
+                enable_http2: None,
+                enable_quic,
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn test_get_config_returns_defaults() {
         let state = test_state();
@@ -373,41 +503,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_config_roundtrip() {
+    async fn test_update_config_patch_roundtrip() {
         let state = test_state();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dl_dir = temp_dir.path().join("downloads");
+        // S-02: download_dir 必须在 authorized_dirs 下,test_state 的 authorized_dirs
+        // 为 tachyon-test-downloads,所以新 download_dir 必须在其子目录下
+        let existing_auth_dir = std::env::temp_dir().join("tachyon-test-downloads");
+        let _ = std::fs::create_dir_all(&existing_auth_dir);
+        let dl_dir = existing_auth_dir.join("sub-downloads");
         std::fs::create_dir_all(&dl_dir).unwrap();
         let dl_dir_str = dl_dir.to_string_lossy().to_string();
 
-        let new_cfg = AppConfig {
-            max_concurrent_tasks: 10,
-            download: tachyon_core::config::DownloadConfig {
-                download_dir: dl_dir_str.clone(),
-                max_concurrent_fragments: 32,
-                max_retries: 3,
-                request_timeout_secs: 30,
-                connect_timeout_secs: 10,
-                verify_checksum: false,
-                user_agent: USER_AGENT.to_string(),
-                headers: std::collections::HashMap::new(),
-                pause_timeout_secs: 300,
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(10),
+            download: Some(DownloadPatch {
+                download_dir: Some(dl_dir_str.clone()),
+                max_concurrent_fragments: Some(32),
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: Some(false),
+                pause_timeout_secs: None,
                 rate_limit_bytes_per_sec: None,
-                max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
-                authorized_dirs: vec![dl_dir_str.clone()],
-                io_strategy: IoStrategy::default(),
-            },
-            connection: tachyon_core::config::ConnectionConfig {
-                max_connections_per_host: 8,
-                max_global_connections: 256,
-                keep_alive_timeout_secs: 30,
-                connect_timeout_secs: 10,
-                enable_http2: true,
-                enable_quic: true,
-            },
-            scheduler: tachyon_core::config::SchedulerConfig::default(),
+                io_strategy: None,
+            }),
+            connection: Some(ConnectionPatch {
+                max_connections_per_host: Some(8),
+                max_global_connections: None,
+                keep_alive_timeout_secs: None,
+                connect_timeout_secs: None,
+                enable_http2: None,
+                enable_quic: Some(true),
+            }),
         };
-        update_config_inner(&state, new_cfg).await.unwrap();
+        update_config_inner(&state, patch).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
         assert_eq!(cfg.download.download_dir, dl_dir_str);
         assert_eq!(cfg.max_concurrent_tasks, 10);
@@ -418,13 +546,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_config_patch_preserves_unpatched_fields() {
+        let state = test_state();
+
+        // 先设置一些非默认值
+        let setup_patch = ConfigPatch {
+            max_concurrent_tasks: Some(7),
+            download: Some(DownloadPatch {
+                download_dir: None,
+                max_concurrent_fragments: Some(24),
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: None,
+                io_strategy: None,
+            }),
+            connection: None,
+        };
+        update_config_inner(&state, setup_patch).await.unwrap();
+
+        // 只 patch connection,不传 download
+        let partial_patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: None,
+            connection: Some(ConnectionPatch {
+                max_connections_per_host: Some(4),
+                max_global_connections: None,
+                keep_alive_timeout_secs: None,
+                connect_timeout_secs: None,
+                enable_http2: None,
+                enable_quic: Some(true),
+            }),
+        };
+        update_config_inner(&state, partial_patch).await.unwrap();
+        let cfg = get_config_inner(&state).await.unwrap();
+
+        // download 字段应保持之前 patch 的值
+        assert_eq!(cfg.max_concurrent_tasks, 7);
+        assert_eq!(cfg.download.max_concurrent_fragments, 24);
+        // connection 中 patch 的字段应更新
+        assert_eq!(cfg.connection.max_connections_per_host, 4);
+        assert!(cfg.connection.enable_quic);
+        // 安全字段 user_agent/headers/authorized_dirs 应保持不变
+        assert_eq!(cfg.download.user_agent, USER_AGENT);
+        assert!(cfg.download.headers.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_update_config_rejects_invalid_without_mutating_current_config() {
         let state = test_state();
         let before = get_config_inner(&state).await.unwrap();
-        let mut invalid = before.clone();
-        invalid.download.max_concurrent_fragments = 257;
 
-        let result = update_config_inner(&state, invalid).await;
+        // 使用 patch 设置超范围的 max_concurrent_fragments
+        let invalid_patch = make_test_patch(None, None, Some(257), None, None, None);
+        let result = update_config_inner(&state, invalid_patch).await;
 
         assert!(result.is_err());
         let after = get_config_inner(&state).await.unwrap();
@@ -479,21 +656,30 @@ mod tests {
             fragments_total: 4,
             fragments_done: 1,
             created_at: "2026-05-29T00:00:00Z".to_string(),
+            save_path: "/custom/file.bin".to_string(),
         };
-        state.tasks.insert(task.id.clone(), task.clone());
+        state
+            .domain
+            .task_repository
+            .insert(task.id.clone(), task.clone());
         let original_snapshot = crate::task_store::task_info_to_snapshot(
             &task,
             "/custom/file.bin".to_string(),
             256,
             vec![0],
+            std::collections::HashMap::new(),
             None,
             None,
         );
-        state.task_store.save_snapshot(&original_snapshot).unwrap();
+        state
+            .infra
+            .task_store
+            .save_snapshot(&original_snapshot)
+            .unwrap();
 
         persist_task_snapshot(&state, &task.id, None).await;
 
-        let loaded = state.task_store.load_recoverable().unwrap();
+        let loaded = state.infra.task_store.load_recoverable().unwrap();
         let snapshot = loaded
             .iter()
             .find(|snapshot| snapshot.id == task.id)
@@ -512,6 +698,7 @@ mod tests {
                 request_timeout_secs: 30,
                 connect_timeout_secs: 10,
                 verify_checksum: false,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
                 pause_timeout_secs: 300,
@@ -543,7 +730,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(0, &test_tmp_path("z"), 16, 16, false, true),
+            make_test_patch(Some(0), None, None, None, None, None),
         )
         .await;
         assert!(result.is_err());
@@ -560,7 +747,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(5, &test_tmp_path("a"), 0, 16, false, true),
+            make_test_patch(None, None, Some(0), None, None, None),
         )
         .await;
         assert!(result.is_err());
@@ -577,7 +764,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(101, &test_tmp_path("b"), 16, 16, false, true),
+            make_test_patch(Some(101), None, None, None, None, None),
         )
         .await;
         assert!(result.is_err());
@@ -594,7 +781,7 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(5, &test_tmp_path("c"), 257, 16, false, true),
+            make_test_patch(None, None, Some(257), None, None, None),
         )
         .await;
         assert!(result.is_err());
@@ -609,8 +796,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_config_rejects_empty_download_dir() {
         let state = test_state();
-        let result =
-            update_config_inner(&state, make_test_app_config(5, "", 16, 16, false, true)).await;
+        let result = update_config_inner(
+            &state,
+            make_test_patch(None, Some("".to_string()), None, None, None, None),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("download_dir"));
     }
@@ -620,17 +810,99 @@ mod tests {
         let state = test_state();
         let result = update_config_inner(
             &state,
-            make_test_app_config(1, &test_tmp_path("d"), 1, 1, false, true),
+            make_test_patch(
+                Some(1),
+                Some(test_tmp_path("d")),
+                Some(1),
+                Some(1),
+                None,
+                Some(true),
+            ),
         )
         .await;
         assert!(result.is_ok());
 
         let result = update_config_inner(
             &state,
-            make_test_app_config(64, &test_tmp_path("e"), 32, 16, false, true),
+            make_test_patch(
+                Some(64),
+                Some(test_tmp_path("e")),
+                Some(32),
+                Some(16),
+                None,
+                None,
+            ),
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_config_empty_patch_preserves_all_fields() {
+        let state = test_state();
+        let before = get_config_inner(&state).await.unwrap();
+
+        let empty_patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: None,
+            connection: None,
+        };
+        update_config_inner(&state, empty_patch).await.unwrap();
+        let after = get_config_inner(&state).await.unwrap();
+
+        assert_eq!(after.max_concurrent_tasks, before.max_concurrent_tasks);
+        assert_eq!(after.download.download_dir, before.download.download_dir);
+        assert_eq!(
+            after.download.max_concurrent_fragments,
+            before.download.max_concurrent_fragments
+        );
+        assert_eq!(after.download.user_agent, before.download.user_agent);
+        assert_eq!(
+            after.download.authorized_dirs,
+            before.download.authorized_dirs
+        );
+    }
+
+    #[test]
+    fn test_config_patch_serialization_roundtrip() {
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(10),
+            download: Some(DownloadPatch {
+                download_dir: Some("/new/dir".to_string()),
+                max_concurrent_fragments: Some(32),
+                max_retries: Some(5),
+                request_timeout_secs: Some(60),
+                connect_timeout_secs: Some(15),
+                verify_checksum: Some(false),
+                pause_timeout_secs: Some(600),
+                rate_limit_bytes_per_sec: Some(Some(1_048_576)),
+                io_strategy: Some(IoStrategy::WinAligned),
+            }),
+            connection: Some(ConnectionPatch {
+                max_connections_per_host: Some(8),
+                max_global_connections: Some(512),
+                keep_alive_timeout_secs: Some(60),
+                connect_timeout_secs: Some(15),
+                enable_http2: Some(false),
+                enable_quic: Some(true),
+            }),
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        let deserialized: ConfigPatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.max_concurrent_tasks, Some(10));
+        assert_eq!(
+            deserialized.download.unwrap().download_dir,
+            Some("/new/dir".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_patch_deserializes_partial() {
+        let json = r#"{"maxConcurrentTasks":7}"#;
+        let patch: ConfigPatch = serde_json::from_str(json).unwrap();
+        assert_eq!(patch.max_concurrent_tasks, Some(7));
+        assert!(patch.download.is_none());
+        assert!(patch.connection.is_none());
     }
 
     #[test]
@@ -867,5 +1139,35 @@ mod tests {
         let err = authorize_download_dir(&config, "/nonexistent/path").unwrap_err();
         // 当请求目录不存在且不在授权列表中时,应拒绝
         assert!(err.to_string().contains("未授权"));
+    }
+
+    #[test]
+    fn test_is_forbidden_authorized_root_rejects_unix_system_dirs() {
+        assert!(is_forbidden_authorized_root(std::path::Path::new("/usr")));
+        assert!(is_forbidden_authorized_root(std::path::Path::new("/etc")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_is_forbidden_authorized_root_rejects_windows_system_dirs() {
+        assert!(is_forbidden_authorized_root(std::path::Path::new(
+            "C:\\Windows"
+        )));
+        assert!(is_forbidden_authorized_root(std::path::Path::new(
+            "C:\\Program Files"
+        )));
+        assert!(is_forbidden_authorized_root(std::path::Path::new(
+            "C:\\Program Files (x86)"
+        )));
+        assert!(is_forbidden_authorized_root(std::path::Path::new(
+            "C:\\ProgramData"
+        )));
+    }
+
+    #[test]
+    fn test_is_forbidden_authorized_root_allows_user_dirs() {
+        assert!(!is_forbidden_authorized_root(std::path::Path::new(
+            "/home/user/downloads"
+        )));
     }
 }

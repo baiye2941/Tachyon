@@ -21,6 +21,7 @@ fn temp_dir() -> PathBuf {
 
 fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u32) -> TaskSnapshot {
     TaskSnapshot {
+        schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
         id: id.to_string(),
         url: format!("https://example.com/{}.bin", id),
         save_path: format!("/tmp/{}.bin", id),
@@ -28,14 +29,15 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
         file_size: Some(1024 * 1024),
         downloaded,
         completed_fragments: (0..fragments / 2).collect(),
+        partial_fragments: std::collections::HashMap::new(),
         total_fragments: fragments,
         fragment_size: 1024 * 1024 / fragments as u64,
         status,
         etag: Some("etag123".to_string()),
         last_modified: Some("2026-01-01T00:00:00Z".to_string()),
         content_length: Some(1024 * 1024),
-        created_at: "2026-05-29T00:00:00Z".to_string(),
-        updated_at: "2026-05-29T00:00:01Z".to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
         fail_reason: None,
         retry_count: 0,
     }

@@ -1,0 +1,169 @@
+import { Show } from "solid-js";
+import { Portal } from "solid-js/web";
+import { CloseIcon } from "./icons";
+import { useFocusTrap } from "../hooks/useFocusTrap";
+
+interface ConfirmDialogProps {
+  /** 是否显示对话框 */
+  open: boolean;
+  /** 对话框标题 */
+  title: string;
+  /** 对话框描述信息 */
+  message: string;
+  /** 确认按钮文本，默认"确认" */
+  confirmLabel?: string;
+  /** 取消按钮文本，默认"取消" */
+  cancelLabel?: string;
+  /** 确认操作是否正在执行中 */
+  loading?: boolean;
+  /** 确认回调 */
+  onConfirm: () => void;
+  /** 取消/关闭回调 */
+  onCancel: () => void;
+}
+
+/**
+ * 可复用的确认对话框组件(P1-11)
+ *
+ * 替代 window.confirm，提供:
+ * - 完整的无障碍支持: role="dialog", aria-modal, 焦点陷阱, Esc 关闭
+ * - 与应用 glass morphism 主题一致的视觉风格
+ * - 加载状态支持
+ */
+export default function ConfirmDialog(props: ConfirmDialogProps) {
+  let dialogRef: HTMLDivElement | undefined;
+  let confirmBtnRef: HTMLButtonElement | undefined;
+
+  useFocusTrap({
+    active: () => props.open,
+    container: dialogRef,
+    onEscape: () => props.onCancel(),
+  });
+
+  return (
+    <Portal mount={document.body}>
+      <Show when={props.open}>
+        {/* 遮罩层 */}
+        <div
+          class="fixed inset-0 z-[300]"
+          style={{
+            background: "var(--color-overlay-scrim)",
+            "backdrop-filter": "blur(4px)",
+            animation: "fadeIn 150ms ease forwards",
+          }}
+          onClick={() => props.onCancel()}
+        />
+
+        {/* 对话框 */}
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-dialog-title"
+          aria-describedby="confirm-dialog-desc"
+          class="fixed z-[310] flex flex-col"
+          style={{
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: "min(400px, calc(100vw - 32px))",
+            background: "var(--color-bg-elevated)",
+            "border-radius": "12px",
+            border: "1px solid var(--color-border-subtle)",
+            "box-shadow": "var(--shadow-xl)",
+            padding: "24px",
+            animation: "fadeIn 150ms ease forwards",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* 标题行 */}
+          <div
+            class="flex items-start justify-between"
+            style={{ "margin-bottom": "12px" }}
+          >
+            <h3
+              id="confirm-dialog-title"
+              style={{
+                "font-size": "15px",
+                "font-weight": 600,
+                color: "var(--color-text-title)",
+                "line-height": "1.4",
+              }}
+            >
+              {props.title}
+            </h3>
+            <button
+              aria-label="关闭"
+              style={{
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                color: "var(--color-text-tertiary)",
+                padding: "2px",
+                "flex-shrink": 0,
+                "margin-left": "8px",
+              }}
+              onClick={() => props.onCancel()}
+            >
+              <CloseIcon />
+            </button>
+          </div>
+
+          {/* 描述 */}
+          <p
+            id="confirm-dialog-desc"
+            style={{
+              "font-size": "13px",
+              color: "var(--color-text-secondary)",
+              "line-height": "1.5",
+              "margin-bottom": "20px",
+              "word-break": "break-word",
+            }}
+          >
+            {props.message}
+          </p>
+
+          {/* 按钮行 */}
+          <div class="flex items-center justify-end gap-2">
+            <button
+              style={{
+                padding: "6px 16px",
+                "font-size": "13px",
+                "border-radius": "6px",
+                background: "var(--graphite-2)",
+                color: "var(--color-text-secondary)",
+                border: "none",
+                cursor: "pointer",
+                transition: "background 150ms ease",
+              }}
+              onClick={() => props.onCancel()}
+              disabled={props.loading}
+            >
+              {props.cancelLabel ?? "取消"}
+            </button>
+            <button
+              ref={confirmBtnRef}
+              data-autofocus
+              style={{
+                padding: "6px 16px",
+                "font-size": "13px",
+                "font-weight": 500,
+                "border-radius": "6px",
+                background: "var(--color-accent-primary)",
+                color: "var(--color-text-inverse)",
+                border: "none",
+                cursor: props.loading ? "wait" : "pointer",
+                opacity: props.loading ? 0.7 : 1,
+                transition: "opacity 150ms ease",
+              }}
+              onClick={() => props.onConfirm()}
+              disabled={props.loading}
+            >
+              {props.loading ? "处理中..." : (props.confirmLabel ?? "确认")}
+            </button>
+          </div>
+        </div>
+      </Show>
+    </Portal>
+  );
+}

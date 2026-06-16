@@ -20,6 +20,8 @@
 //! - 其他平台:编译为空桩,构造函数返回 `Unsupported` 错误
 
 #[cfg(target_os = "windows")]
+use std::cell::UnsafeCell;
+#[cfg(target_os = "windows")]
 use std::future::Future;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
@@ -34,34 +36,199 @@ use tachyon_core::{DownloadError, DownloadResult};
 
 /// pending 写入上下文。
 ///
-/// `data` 必须由完成注册表持有到内核完成通知抵达,避免调用方取消
+/// `data` 必须由完成 slot 持有到内核完成通知抵达,避免调用方取消
 /// `write_at` future 后提前释放传给 `WriteFile` 的缓冲区。
 #[cfg(target_os = "windows")]
 struct PendingWrite {
     completion: tokio::sync::oneshot::Sender<DownloadResult<usize>>,
     data: Bytes,
-    overlapped: Box<KernelOverlapped>,
 }
 
-/// 完成回调注册表:OVERLAPPED 堆地址 -> pending 写入上下文
-///
-/// 每个异步 I/O 操作将自身的 OVERLAPPED 指针作为键注册,
-/// 完成后由轮询线程查找、发送结果并释放缓冲区和 OVERLAPPED。
+// ── B1: Slot array 完成注册表(无锁,替换原 Mutex<HashMap>) ──────
+
+/// Slot 状态
 #[cfg(target_os = "windows")]
-type CompletionRegistry = std::collections::HashMap<usize, PendingWrite>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SlotState {
+    /// 空闲,可分配
+    Free = 0,
+    /// 已分配并提交 WriteFile,等待完成通知
+    Submitted = 1,
+}
+
+/// 完成槽:每个槽持有一个 OVERLAPPED(固定地址)+ pending 写入上下文
+///
+/// OVERLAPPED 结构体的**固定地址**是核心:Windows 内核在完成通知中原样返回
+/// 提交时的 OVERLAPPED 指针,因此 `(returned_ptr - base) / sizeof::<Slot>()`
+/// 即可恢复 slot 索引,完全无锁、无需 HashMap 查找。
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct CompletionSlot {
+    /// Windows 内核 OVERLAPPED 结构(内核原样返回此字段地址)
+    overlapped: UnsafeCell<KernelOverlapped>,
+    /// slot 状态(Free/Submitted),原子操作驱动分配/回收
+    state: std::sync::atomic::AtomicU8,
+    /// pending 写入上下文(仅 state==Submitted 时有效)
+    pending: UnsafeCell<Option<PendingWrite>>,
+}
 
 #[cfg(target_os = "windows")]
-fn lock_completion_registry(
-    registry: &parking_lot::Mutex<CompletionRegistry>,
-) -> parking_lot::MutexGuard<'_, CompletionRegistry> {
-    registry.lock()
+impl CompletionSlot {
+    const FREE: u8 = SlotState::Free as u8;
+    const SUBMITTED: u8 = SlotState::Submitted as u8;
+}
+
+// Safety: CompletionSlot 含两个 UnsafeCell(overlapped + pending),跨线程共享看似违反 Rust 别名规则,
+// 但实际访问受 slot 生命周期状态机保护:
+// - overlapped:仅在 slot 处于 Free->Submitted 转换时(alloc 后、WriteFile 前)由提交线程写入 reset;
+//   提交后到完成前由 Windows 内核独占访问(Internal/InternalHigh 字段);完成后内核不再触碰。
+// - pending:仅在 Submitted 状态下,提交线程写入(write_at),poller 单线程读取(complete_pending_write)。
+//   state 从 Submitted->Free 的转换是单向且由 poller 单线程执行,配合 Release/Acquire 内存序保证可见性。
+// 因此不存在两个线程同时对同一 UnsafeCell 执行写操作的情况。
+#[cfg(target_os = "windows")]
+unsafe impl Send for CompletionSlot {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for CompletionSlot {}
+
+/// 默认 slot 容量:256(覆盖 256 并发分片)
+#[cfg(target_os = "windows")]
+const IOCP_SLOT_CAPACITY: usize = 256;
+
+/// 无锁完成槽数组 + 位图分配器
+#[cfg(target_os = "windows")]
+struct CompletionSlots {
+    slots: Box<[CompletionSlot]>,
+    free_bitmap: Box<[std::sync::atomic::AtomicU64]>,
+    base_addr: usize,
+    slot_stride: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl CompletionSlots {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        let slots: Box<[CompletionSlot]> = (0..IOCP_SLOT_CAPACITY)
+            .map(|_| CompletionSlot {
+                overlapped: UnsafeCell::new(KernelOverlapped::new_for_offset(0)),
+                state: std::sync::atomic::AtomicU8::new(CompletionSlot::FREE),
+                pending: UnsafeCell::new(None),
+            })
+            .collect();
+        let bitmap_words = IOCP_SLOT_CAPACITY.div_ceil(64);
+        // 位图语义: 0=空闲,1=已占用。最后一个 word 的超出容量的位预置为 1(已占用),
+        // 防止 alloc() 分配到越界 slot,与 io_uring 的 used_mask 模式一致。
+        let free_bitmap: Box<[AtomicU64]> = (0..bitmap_words)
+            .map(|word_idx| {
+                let excess = (word_idx as i64 + 1) * 64 - IOCP_SLOT_CAPACITY as i64;
+                if excess > 0 {
+                    // 最后一个 word: 超出容量的高位标记为已占用
+                    AtomicU64::new((!0u64) << (64 - excess as usize))
+                } else {
+                    AtomicU64::new(0)
+                }
+            })
+            .collect();
+        let base_addr = slots.as_ptr() as usize;
+        let slot_stride = std::mem::size_of::<CompletionSlot>();
+        Self {
+            slots,
+            free_bitmap,
+            base_addr,
+            slot_stride,
+        }
+    }
+
+    fn alloc(&self) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        for (word_idx, word) in self.free_bitmap.iter().enumerate() {
+            let mut current = word.load(Ordering::Relaxed);
+            loop {
+                if current == u64::MAX {
+                    break;
+                }
+                let bit = (!current).trailing_zeros() as usize;
+                let global_slot = word_idx * 64 + bit;
+                if global_slot >= IOCP_SLOT_CAPACITY {
+                    return None;
+                }
+                let new_val = current | (1u64 << bit);
+                match word.compare_exchange_weak(
+                    current,
+                    new_val,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.slots[global_slot]
+                            .state
+                            .store(CompletionSlot::SUBMITTED, Ordering::Release);
+                        return Some(global_slot);
+                    }
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        None
+    }
+
+    fn release(&self, slot_index: usize) {
+        use std::sync::atomic::Ordering;
+        let word_idx = slot_index / 64;
+        let bit = slot_index % 64;
+        let mask = !(1u64 << bit);
+        let mut current = self.free_bitmap[word_idx].load(Ordering::Relaxed);
+        loop {
+            let new_val = current & mask;
+            match self.free_bitmap[word_idx].compare_exchange_weak(
+                current,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 从 OVERLAPPED 指针恢复 slot 索引
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证 `ptr` 来自 `self.slots` 数组中某个 slot 的
+    /// `overlapped.get()` 返回值,或者是一个明显不在范围内的值(函数
+    /// 会校验范围并返回 None)。传入非法地址可能触发未定义行为。
+    unsafe fn slot_index_from_ptr(&self, ptr: usize) -> Option<usize> {
+        if ptr < self.base_addr || self.slot_stride == 0 {
+            return None;
+        }
+        let offset = ptr - self.base_addr;
+        let index = offset / self.slot_stride;
+        if !offset.is_multiple_of(self.slot_stride) || index >= IOCP_SLOT_CAPACITY {
+            return None;
+        }
+        let slot_ptr = self.base_addr + index * self.slot_stride;
+        if slot_ptr != ptr {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn pending_count(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.free_bitmap
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+            .sum()
+    }
 }
 
 #[cfg(target_os = "windows")]
 struct PendingWriteCancelGuard {
     file_handle: usize,
-    overlapped_key: usize,
-    registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
+    slot_index: usize,
+    slots: std::sync::Arc<CompletionSlots>,
     armed: bool,
 }
 
@@ -69,13 +236,13 @@ struct PendingWriteCancelGuard {
 impl PendingWriteCancelGuard {
     fn new(
         file_handle: windows_sys::Win32::Foundation::HANDLE,
-        overlapped_key: usize,
-        registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
+        slot_index: usize,
+        slots: std::sync::Arc<CompletionSlots>,
     ) -> Self {
         Self {
             file_handle: file_handle as usize,
-            overlapped_key,
-            registry,
+            slot_index,
+            slots,
             armed: true,
         }
     }
@@ -91,27 +258,36 @@ impl Drop for PendingWriteCancelGuard {
         if !self.armed {
             return;
         }
-
-        let map = lock_completion_registry(&self.registry);
-        if !map.contains_key(&self.overlapped_key) {
+        // 防御性检查:如果 poller 已完成该 slot(state != SUBMITTED),
+        // 则 OVERLAPPED 可能已被 alloc() 分配给新的 I/O 操作,
+        // 此时调用 CancelIoEx 会错误取消无关的 I/O。
+        // Acquire 序保证看到 poller 的 Release 写入(state→FREE)。
+        let current_state = self.slots.slots[self.slot_index]
+            .state
+            .load(std::sync::atomic::Ordering::Acquire);
+        if current_state != CompletionSlot::SUBMITTED {
+            tracing::debug!(
+                slot = self.slot_index,
+                state = current_state,
+                "CancelGuard: slot 已被 poller 回收,跳过 CancelIoEx"
+            );
             return;
         }
-
         let file_handle = self.file_handle as windows_sys::Win32::Foundation::HANDLE;
-        let overlapped = self.overlapped_key as *mut windows_sys::Win32::System::IO::OVERLAPPED;
-        // Safety:
-        // - file_handle 来自仍存活的 IoCpStorage 文件句柄
-        // - overlapped_key 命中 registry,对应的 Box<KernelOverlapped> 仍由 registry 持有
-        // - CancelIoEx 只请求取消该 pending I/O,不释放 OVERLAPPED 或缓冲区
-        let ok = unsafe { windows_sys::Win32::System::IO::CancelIoEx(file_handle, overlapped) };
+        let overlapped_ptr = self.slots.slots[self.slot_index].overlapped.get()
+            as *mut windows_sys::Win32::System::IO::OVERLAPPED;
+        // Safety: file_handle 来自仍存活的 IoCpStorage 文件句柄;overlapped_ptr 指向 slot_index
+        // 对应的 slot.overlapped,且上方 Acquire 检查确认 state 仍为 Submitted,
+        // 即该 slot 仍持有我们提交的 I/O 操作(overlapped 地址有效)。
+        // CancelIoEx 只请求取消该 pending I/O,不释放 OVERLAPPED 或缓冲区,内核保证线程安全。
+        // 注意:CancelIoEx 调用与 state 检查之间存在微小窗口,poller 可能在此期间完成 I/O
+        // 并将 state 设为 FREE——但此时 CancelIoEx 会返回 ERROR_NOT_FOUND,
+        // 下方的错误过滤会正确忽略此错误码。
+        let ok = unsafe { windows_sys::Win32::System::IO::CancelIoEx(file_handle, overlapped_ptr) };
         if ok == 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32) {
-                tracing::warn!(
-                    ptr = self.overlapped_key,
-                    error = %err,
-                    "取消 IOCP pending write 失败"
-                );
+                tracing::warn!(slot = self.slot_index, error = %err, "取消 IOCP pending write 失败");
             }
         }
     }
@@ -168,50 +344,10 @@ impl KernelOverlapped {
         self.offset_high = (offset >> 32) as u32;
         // h_event 保持 null_mut(),IOCP 不需要事件句柄
     }
-
-    /// 获取内核兼容的 OVERLAPPED 指针
-    fn as_overlapped_ptr(&mut self) -> *mut windows_sys::Win32::System::IO::OVERLAPPED {
-        self as *mut Self as *mut windows_sys::Win32::System::IO::OVERLAPPED
-    }
-}
-
-/// OVERLAPPED 对象池
-///
-/// IOCP 每次写入都需要一个 OVERLAPPED 结构;频繁 `Box::new` 分配与释放
-/// 会成为高并发写入路径上的 GC/分配热点。对象池允许在完成通知到达后
-/// 回收并复用 OVERLAPPED,显著降低 Windows 下载路径上的堆分配压力。
-#[cfg(target_os = "windows")]
-struct OverlappedPool {
-    available: crossbeam_queue::SegQueue<Box<KernelOverlapped>>,
-}
-
-#[cfg(target_os = "windows")]
-impl OverlappedPool {
-    fn new() -> Self {
-        Self {
-            available: crossbeam_queue::SegQueue::new(),
-        }
-    }
-
-    /// 获取一个 OVERLAPPED,优先从池中复用
-    fn acquire(&self, offset: u64) -> Box<KernelOverlapped> {
-        if let Some(mut ov) = self.available.pop() {
-            ov.reset(offset);
-            ov
-        } else {
-            Box::new(KernelOverlapped::new_for_offset(offset))
-        }
-    }
-
-    /// 归还 OVERLAPPED 到池中复用
-    fn release(&self, mut ov: Box<KernelOverlapped>) {
-        ov.reset(0);
-        self.available.push(ov);
-    }
 }
 
 // Safety: KernelOverlapped 是提交给 Windows 内核的 POD 状态块,实际内存由
-// PendingWrite 中的 Box 固定在堆上,只在完成通知抵达后由 poller 线程释放。
+// CompletionSlots 数组固定,只在完成通知抵达后由 poller 线程处理。
 // 结构体本身没有 Rust 引用字段,跨线程移动所有权不会破坏别名规则。
 #[cfg(target_os = "windows")]
 unsafe impl Send for KernelOverlapped {}
@@ -234,15 +370,12 @@ pub struct IoCpStorage {
     poller: Option<std::thread::JoinHandle<()>>,
     /// 轮询线程退出信号(false=继续运行,true=请求退出)
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 完成回调注册表:OVERLAPPED 堆地址 -> oneshot Sender
+    /// 无锁完成槽数组(替换原 Mutex<HashMap> + OverlappedPool)
     ///
-    /// 由 parking_lot::Mutex 保护,写入操作注册 Sender,轮询线程完成时取出。
-    /// 使用 parking_lot 降低 Windows 高并发写入时的锁竞争开销。
-    registry: std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
-    /// OVERLAPPED 对象池
-    ///
-    /// 复用已完成 I/O 的 OVERLAPPED 结构,减少高并发写入时的堆分配。
-    overlapped_pool: std::sync::Arc<OverlappedPool>,
+    /// 256 个固定 slot,每个 slot 持有 OVERLAPPED(固定地址)+ pending 上下文。
+    /// Windows 内核完成通知原样返回 OVERLAPPED 地址,通过指针算术恢复 slot 索引,
+    /// 完全消除原 parking_lot::Mutex 的串行化瓶颈。
+    slots: std::sync::Arc<CompletionSlots>,
 }
 
 // Safety: IoCpStorage 的所有字段均可安全跨线程共享:
@@ -267,10 +400,7 @@ impl IoCpStorage {
             port: None,
             poller: None,
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            registry: std::sync::Arc::new(
-                parking_lot::Mutex::new(std::collections::HashMap::new()),
-            ),
-            overlapped_pool: std::sync::Arc::new(OverlappedPool::new()),
+            slots: std::sync::Arc::new(CompletionSlots::new()),
         }
     }
 
@@ -377,8 +507,7 @@ impl IoCpStorage {
         }
 
         let shutdown_flag = self.shutdown.clone();
-        let registry = self.registry.clone();
-        let overlapped_pool = self.overlapped_pool.clone();
+        let slots = self.slots.clone();
         // 通过 usize 传递句柄到线程(*mut c_void 不实现 Send)
         let port_raw = port_handle as usize;
 
@@ -388,7 +517,7 @@ impl IoCpStorage {
             .spawn(move || {
                 // Safety: port_raw 来自成功的 CreateIoCompletionPort,转换回 HANDLE 安全
                 let port = port_raw as windows_sys::Win32::Foundation::HANDLE;
-                Self::poller_loop(port, &shutdown_flag, &registry, &overlapped_pool);
+                Self::poller_loop(port, &shutdown_flag, &slots);
             }) {
             Ok(poller) => poller,
             Err(error) => {
@@ -421,8 +550,7 @@ impl IoCpStorage {
     fn poller_loop(
         port: windows_sys::Win32::Foundation::HANDLE,
         shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-        registry: &std::sync::Arc<parking_lot::Mutex<CompletionRegistry>>,
-        overlapped_pool: &std::sync::Arc<OverlappedPool>,
+        slots: &std::sync::Arc<CompletionSlots>,
     ) {
         use windows_sys::Win32::System::IO::OVERLAPPED_ENTRY;
 
@@ -435,89 +563,113 @@ impl IoCpStorage {
                 break;
             }
 
-            // Safety:
-            // - port 是合法的 IOCP 句柄(创建时已验证)
-            // - entries 数组地址有效且生命周期覆盖整个调用
-            // - lpNumberOfBytesTransferred 指向合法的栈变量
-            // - dwMilliseconds=100 让线程每 100ms 检查 shutdown 标志
-            // - fAlertable=0 不使用 APC
+            // SAFETY: port 是通过 CreateIoCompletionPort 成功创建的合法 IOCP 句柄;
+            // entries 数组在栈上分配,生命周期覆盖调用期间;
+            // num_entries 是合法的输出指针;超时 100ms 和 alertable=false 为合法参数。
             let ok = unsafe {
                 windows_sys::Win32::System::IO::GetQueuedCompletionStatusEx(
                     port,
                     entries.as_mut_ptr(),
                     entries.len() as u32,
                     &mut num_entries,
-                    100, // 100ms 超时,用于定期检查 shutdown 标志
-                    0,   // fAlertable = FALSE
+                    100,
+                    0,
                 )
             };
 
             if ok != 0 && num_entries > 0 {
                 tracing::debug!(count = num_entries, "IOCP 完成事件");
-
-                // 分发完成事件到等待中的 oneshot 通道
                 for entry in &entries[..num_entries as usize] {
-                    // lpOverlapped 来自内核完成通知。只有注册表命中的指针
-                    // 才属于本模块提交的 write_at;未知指针不能释放。
                     let overlapped_ptr = entry.lpOverlapped as usize;
                     let bytes = entry.dwNumberOfBytesTransferred as usize;
-                    // Internal 字段是 NTSTATUS; 0 = STATUS_SUCCESS
                     let status = entry.Internal as i32;
-
-                    Self::complete_pending_write(
-                        registry.as_ref(),
-                        overlapped_pool.as_ref(),
-                        overlapped_ptr,
-                        bytes,
-                        status,
-                    );
+                    Self::complete_pending_write(slots.as_ref(), overlapped_ptr, bytes, status);
                 }
             }
-            // ok == 0 且 GetLastError == WAIT_TIMEOUT:正常超时,继续循环
         }
 
         tracing::debug!("IOCP 轮询线程退出");
     }
 
+    /// 处理单个完成事件:恢复 slot 索引,读取 pending,发送结果,回收 slot
     fn complete_pending_write(
-        registry: &parking_lot::Mutex<CompletionRegistry>,
-        overlapped_pool: &OverlappedPool,
+        slots: &CompletionSlots,
         overlapped_ptr: usize,
         bytes: usize,
         status: i32,
     ) -> bool {
-        let pending = {
-            let mut map = lock_completion_registry(registry);
-            map.remove(&overlapped_ptr)
+        use std::sync::atomic::Ordering;
+
+        // SAFETY: slot_index_from_ptr 是 unsafe fn,要求传入的 ptr 来自 slot 数组内的
+        // overlapped 地址。此处的 overlapped_ptr 来自 IOCP 完成事件的
+        // OVERLAPPED_ENTRY::lpOverlapped,由 Windows 内核原样返回提交时的地址,
+        // 而提交时的地址正是 slot.overlapped.get(),在 slot 数组范围内。
+        let slot_index = match unsafe { slots.slot_index_from_ptr(overlapped_ptr) } {
+            Some(idx) => idx,
+            None => {
+                // 防御性回退:slot_index_from_ptr 依赖地址算术,极端情况下(如内核返回
+                // 被修改的指针、内存损坏)可能计算失败。遍历 slot 数组线性搜索匹配的
+                // OVERLAPPED 指针,避免因地址计算失败导致 slot 永久泄漏(bitmap 位无法释放)。
+                let mut found: Option<usize> = None;
+                for i in 0..IOCP_SLOT_CAPACITY {
+                    if slots.slots[i].overlapped.get() as usize == overlapped_ptr {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                match found {
+                    Some(idx) => {
+                        tracing::warn!(
+                            ptr = overlapped_ptr,
+                            slot = idx,
+                            "IOCP slot_index_from_ptr 计算失败,线性扫描找到匹配 slot"
+                        );
+                        idx
+                    }
+                    None => {
+                        // ptr 不属于任何 slot:不是我们提交的 I/O(可能是外部代码向同一
+                        // IOCP port 投递的完成事件)。不释放任何 bitmap 位是正确的。
+                        tracing::error!(
+                            ptr = overlapped_ptr,
+                            "IOCP 完成事件指针不在 slot 数组范围内,无法恢复 slot 索引"
+                        );
+                        return false;
+                    }
+                }
+            }
         };
 
-        let Some(pending) = pending else {
+        let slot = &slots.slots[slot_index];
+        let current_state = slot.state.load(Ordering::Acquire);
+        if current_state != CompletionSlot::SUBMITTED {
             tracing::warn!(
-                ptr = overlapped_ptr,
-                "IOCP 完成事件无对应注册,跳过未知 OVERLAPPED"
+                slot = slot_index,
+                state = current_state,
+                "IOCP 完成 slot 状态非 Submitted,跳过"
             );
             return false;
-        };
+        }
 
+        // Safety: slot.state 已校验为 Submitted(Acquire 序),poller 是唯一将 state
+        // 从 Submitted->Free 的执行者,此处 take 与 write_at 提交方的写入无并发别名。
+        let pending = unsafe { (*slot.pending.get()).take() };
         let result = if status == 0 {
             Ok(bytes)
         } else {
             Err(map_ntstatus_error(status))
         };
-        let PendingWrite {
-            completion,
-            data,
-            overlapped,
-        } = pending;
-        let _ = completion.send(result);
-        drop(data);
-        // 将 OVERLAPPED 归还对象池复用,避免下次写入重新堆分配
-        overlapped_pool.release(overlapped);
+        slot.state.store(CompletionSlot::FREE, Ordering::Release);
+        slots.release(slot_index);
+
+        if let Some(PendingWrite { completion, data }) = pending {
+            let _ = completion.send(result);
+            drop(data);
+        }
         true
     }
 
     fn pending_count(&self) -> usize {
-        lock_completion_registry(&self.registry).len()
+        self.slots.pending_count()
     }
 
     fn cancel_pending_operations(&self) {
@@ -574,9 +726,9 @@ impl Drop for IoCpStorage {
             if remaining > 0 {
                 tracing::error!(
                     remaining,
-                    "IOCP pending I/O 未在超时内完成,泄漏 registry 以避免释放内核仍可能使用的缓冲区"
+                    "IOCP pending I/O 未在超时内完成,泄漏 slots 以避免释放内核仍可能使用的缓冲区"
                 );
-                std::mem::forget(self.registry.clone());
+                std::mem::forget(self.slots.clone());
             }
         }
 
@@ -609,16 +761,20 @@ impl Drop for IoCpStorage {
 impl crate::storage::AsyncStorage for IoCpStorage {
     /// 通过 IOCP 完成端口提交异步写入
     ///
-    /// 流程:
-    /// 1. 使用 KernelOverlapped(内核兼容布局)提交 WriteFile
-    /// 2. pending I/O 由 poller 线程从完成端口接收通知
-    /// 3. 同步完成时直接返回,不会再投递完成包
+    /// 流程(B1 无锁 slot array):
+    /// 1. 从 CompletionSlots 分配一个空闲 slot(原子 CAS,无锁)
+    /// 2. 在 slot 中存储 pending 上下文(oneshot Sender + data)
+    /// 3. 用 slot 的 OVERLAPPED 地址提交 WriteFile
+    /// 4. 同步完成:直接回收 slot 返回;异步完成:poller 通过指针算术恢复 slot 索引
     fn write_at(
         &self,
         offset: u64,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
         Box::pin(async move {
+            use std::os::windows::io::AsRawHandle;
+            use std::sync::atomic::Ordering;
+
             if self.state != IoCpState::Ready {
                 return Err(DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
@@ -626,12 +782,20 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 )));
             }
 
-            use std::os::windows::io::AsRawHandle;
+            let slot_index = self.slots.alloc().ok_or_else(|| {
+                DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "IOCP slot 容量耗尽(256 并发 pending 写入上限)",
+                ))
+            })?;
 
-            // 1. 从对象池获取 OVERLAPPED,减少高并发写入时的堆分配。
-            // 复用的 OVERLAPPED 会由 registry 持有直到完成通知抵达,再归还池中。
-            let mut overlapped = self.overlapped_pool.acquire(offset);
-            let ov_ptr = overlapped.as_overlapped_ptr();
+            let slot = &self.slots.slots[slot_index];
+            // Safety: slot 刚由 alloc() 分配(state=Submitted),此线程是唯一持有者,
+            // 内核尚未接触此 OVERLAPPED(WriteFile 未调用)。reset 写入 offset 字段安全。
+            unsafe {
+                (*slot.overlapped.get()).reset(offset);
+            }
+            let ov_ptr = slot.overlapped.get() as *mut windows_sys::Win32::System::IO::OVERLAPPED;
 
             let file = self.file.as_ref().ok_or_else(|| {
                 DownloadError::Io(std::io::Error::new(
@@ -640,27 +804,25 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 ))
             })?;
             let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-            let overlapped_key = ov_ptr as usize;
             let data_ptr = data.as_ptr();
             let data_len = data.len();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            {
-                let mut map = lock_completion_registry(&self.registry);
-                map.insert(
-                    overlapped_key,
-                    PendingWrite {
-                        completion: tx,
-                        data,
-                        overlapped,
-                    },
-                );
+            let mut bytes_written: u32 = 0;
+
+            // Safety: slot.state 已由 alloc() 置为 Submitted(Release 序),此处 Acquire 序
+            // 保证可见性。write_at 提交方是唯一写入者,poller 在完成事件到达后才读取。
+            unsafe {
+                *slot.pending.get() = Some(PendingWrite {
+                    completion: tx,
+                    data,
+                });
             }
 
-            let mut bytes_written: u32 = 0;
-            // Safety:
-            // - file_handle 来自 init() 中 FILE_FLAG_OVERLAPPED 打开的文件
-            // - data_ptr 指向 registry 中 PendingWrite 持有的 Bytes 缓冲区
-            // - ov_ptr 指向 registry 中 PendingWrite 持有的 KernelOverlapped
+            // SAFETY: file_handle 来自 self.file(合法 File 句柄,as_raw_handle 转换);
+            // data_ptr 来自 Bytes.as_ptr(),指向 data 的有效内存区域,Bytes 在
+            // PendingWrite 中持有到完成通知抵达;data_len 已验证不溢出 u32;
+            // bytes_written 为合法输出变量;ov_ptr 来自 slot.overlapped.get(),
+            // slot 刚由 alloc() 分配,OVERLAPPED 生命周期覆盖 WriteFile 调用期间。
             let write_ok = unsafe {
                 windows_sys::Win32::Storage::FileSystem::WriteFile(
                     file_handle,
@@ -672,33 +834,31 @@ impl crate::storage::AsyncStorage for IoCpStorage {
             };
 
             if write_ok != 0 {
-                // 同步完成(fast path):WriteFile 直接写入成功
                 tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
-                {
-                    let mut map = lock_completion_registry(&self.registry);
-                    if let Some(pending) = map.remove(&overlapped_key) {
-                        self.overlapped_pool.release(pending.overlapped);
-                    }
+                // Safety: 同步完成时 poller 不会收到完成通知(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
+                // slot 仍处于 Submitted,由本路径安全回收 pending。
+                unsafe {
+                    let _ = (*slot.pending.get()).take();
                 }
+                slot.state.store(CompletionSlot::FREE, Ordering::Release);
+                self.slots.release(slot_index);
                 return Ok(bytes_written as usize);
             }
 
-            // 4. 检查是否为 ERROR_IO_PENDING(异步进行中)
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
-                // 真正的写入失败
-                {
-                    let mut map = lock_completion_registry(&self.registry);
-                    if let Some(pending) = map.remove(&overlapped_key) {
-                        self.overlapped_pool.release(pending.overlapped);
-                    }
+                // Safety: WriteFile 提交失败,内核不会发送完成通知,slot 仍处于 Submitted,
+                // 由本路径安全回收 pending。
+                unsafe {
+                    let _ = (*slot.pending.get()).take();
                 }
+                slot.state.store(CompletionSlot::FREE, Ordering::Release);
+                self.slots.release(slot_index);
                 return Err(map_writefile_submission_error(err));
             }
 
-            // pending I/O 的缓冲区和 OVERLAPPED 继续由 registry 持有到完成通知。
             let mut cancel_guard =
-                PendingWriteCancelGuard::new(file_handle, overlapped_key, self.registry.clone());
+                PendingWriteCancelGuard::new(file_handle, slot_index, self.slots.clone());
             let completion = rx.await.map_err(|_| {
                 DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -764,6 +924,24 @@ impl crate::storage::AsyncStorage for IoCpStorage {
 
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move { self.sync().await })
+    }
+
+    /// P1-05: IOCP 覆盖 write_at_mut
+    ///
+    /// IOCP 的 write_at 直接使用 data.as_ptr() 作为写入源地址，
+    /// BytesMut.freeze() 只是将引用计数从 1 变为共享（无内存复制），
+    /// 所以覆盖 write_at_mut 的性能收益主要在于避免 BytesMut → Bytes
+    /// 的原子操作开销（freeze() 需要设置 shared 标志位）。
+    ///
+    /// 实现策略：将 BytesMut 冻结为 Bytes 后走标准 write_at 路径。
+    /// 这比默认实现（vtable dispatch → freeze → write_at）少一次间接调用，
+    /// 且编译器可内联优化。
+    fn write_at_mut(
+        &self,
+        offset: u64,
+        data: bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        self.write_at(offset, data.freeze())
     }
 }
 
@@ -937,47 +1115,43 @@ mod tests {
 
     // ── write_at 测试 (Windows only,需要 tokio runtime) ────────
 
-    /// 验证未知 completion 不会被当作本模块拥有的 OVERLAPPED 释放。
+    /// 验证未知 completion 指针(不在 slot 数组范围)不会被误处理。
     #[cfg(target_os = "windows")]
     #[test]
     fn test_iocp_unknown_completion_is_not_owned() {
-        let registry = parking_lot::Mutex::new(std::collections::HashMap::new());
-        let pool = OverlappedPool::new();
-
+        let slots = CompletionSlots::new();
         assert!(
-            !IoCpStorage::complete_pending_write(&registry, &pool, 0xDEAD_BEEF, 0, 0),
-            "未知 completion 应被忽略,不能释放外部 OVERLAPPED"
+            !IoCpStorage::complete_pending_write(&slots, 0xDEAD_BEEF, 0, 0),
+            "未知 completion 指针应被忽略"
         );
-        assert_eq!(lock_completion_registry(&registry).len(), 0);
+        assert_eq!(slots.pending_count(), 0);
     }
 
-    /// 验证注册表命中的 completion 才会移除 pending 并发送写入结果。
+    /// 验证 slot 命中的 completion 才会移除 pending 并发送写入结果。
     #[cfg(target_os = "windows")]
     #[test]
     fn test_iocp_registered_completion_resolves_pending_write() {
-        let registry = parking_lot::Mutex::new(std::collections::HashMap::new());
-        let pool = OverlappedPool::new();
+        let slots = std::sync::Arc::new(CompletionSlots::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut overlapped = Box::new(KernelOverlapped::new_for_offset(0));
-        let key = overlapped.as_overlapped_ptr() as usize;
-
-        {
-            let mut map = lock_completion_registry(&registry);
-            map.insert(
-                key,
-                PendingWrite {
-                    completion: tx,
-                    data: Bytes::from_static(b"abc"),
-                    overlapped,
-                },
-            );
+        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let slot = &slots.slots[slot_index];
+        // SAFETY: slot 已由 alloc() 分配(state=Submitted),此线程是唯一持有者,
+        // UnsafeCell.get() 返回内部指针,写入 Some(PendingWrite) 不会与
+        // poller 线程产生并发别名(poller 仅在完成事件到达后读取 pending)。
+        unsafe {
+            *slot.pending.get() = Some(PendingWrite {
+                completion: tx,
+                data: Bytes::from_static(b"abc"),
+            });
         }
+        let key = slot.overlapped.get() as usize;
+        assert_eq!(slots.pending_count(), 1);
 
         assert!(
-            IoCpStorage::complete_pending_write(&registry, &pool, key, 3, 0),
-            "注册表命中的 completion 应完成 pending write"
+            IoCpStorage::complete_pending_write(&slots, key, 3, 0),
+            "slot 命中的 completion 应完成 pending write"
         );
-        assert_eq!(lock_completion_registry(&registry).len(), 0);
+        assert_eq!(slots.pending_count(), 0);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let written = rt
@@ -987,38 +1161,212 @@ mod tests {
         assert_eq!(written, 3);
     }
 
-    /// 验证 pending write 的取消 guard 只请求取消,不抢占 registry 所有权。
+    /// 验证 pending write 的取消 guard 只请求取消,不移除 slot pending。
     #[cfg(target_os = "windows")]
     #[test]
-    fn test_iocp_cancel_guard_preserves_pending_registry_entry() {
-        let registry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    fn test_iocp_cancel_guard_preserves_pending_slot_entry() {
+        let slots = std::sync::Arc::new(CompletionSlots::new());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let mut overlapped = Box::new(KernelOverlapped::new_for_offset(0));
-        let key = overlapped.as_overlapped_ptr() as usize;
-
+        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let slot = &slots.slots[slot_index];
+        // SAFETY: 同上,test_iocp_registered_completion_resolves_pending_write。
+        unsafe {
+            *slot.pending.get() = Some(PendingWrite {
+                completion: tx,
+                data: Bytes::from_static(b"cancel"),
+            });
+        }
         {
-            let mut map = lock_completion_registry(&registry);
-            map.insert(
-                key,
-                PendingWrite {
-                    completion: tx,
-                    data: Bytes::from_static(b"cancel"),
-                    overlapped,
-                },
+            let _guard =
+                PendingWriteCancelGuard::new(std::ptr::null_mut(), slot_index, slots.clone());
+        }
+        assert_eq!(
+            slot.state.load(std::sync::atomic::Ordering::Acquire),
+            CompletionSlot::SUBMITTED,
+            "取消 guard 不能移除 pending"
+        );
+        assert_eq!(slots.pending_count(), 1);
+    }
+
+    /// 验证 CancelGuard 在 slot 已被 poller 回收(state=FREE)时不调用 CancelIoEx。
+    ///
+    /// D-02 修复:当 poller 已完成 slot 并将 state 设为 FREE 后,CancelGuard::drop
+    /// 应检测到 state != SUBMITTED 并跳过 CancelIoEx,防止错误取消新分配的 I/O。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_cancel_guard_skips_when_slot_already_free() {
+        let slots = std::sync::Arc::new(CompletionSlots::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let slot = &slots.slots[slot_index];
+        // SAFETY: slot 已由 alloc() 分配(state=Submitted),此线程是唯一持有者。
+        unsafe {
+            *slot.pending.get() = Some(PendingWrite {
+                completion: tx,
+                data: Bytes::from_static(b"racing"),
+            });
+        }
+
+        // 模拟 poller 已完成该 slot:state→FREE,release bitmap
+        unsafe {
+            let _ = (*slot.pending.get()).take();
+        }
+        slot.state
+            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+        slots.release(slot_index);
+
+        // 此时 CancelGuard::drop 应检测到 state=FREE 并跳过 CancelIoEx
+        {
+            let _guard =
+                PendingWriteCancelGuard::new(std::ptr::null_mut(), slot_index, slots.clone());
+        }
+
+        // slot 应仍可重新分配(验证 bitmap 未被破坏)
+        let reused = slots.alloc().expect("回收后的 slot 应可重新分配");
+        // 注意:reused 不一定等于 slot_index(其他线程可能分配了其他 slot),
+        // 但 pending_count 应从 0 恢复到 1
+        assert_eq!(slots.pending_count(), 1);
+
+        // 清理
+        slots.slots[reused]
+            .state
+            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+        slots.release(reused);
+    }
+
+    /// 验证 complete_pending_write 对未知指针不泄漏 bitmap 位。
+    ///
+    /// D-03 增强:未知指针不对应任何 slot,不应影响 bitmap 分配能力。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_complete_pending_write_unknown_ptr_no_bitmap_leak() {
+        let slots = CompletionSlots::new();
+        let initial_count = slots.pending_count();
+
+        // 传入一个不在 slot 数组范围内的指针
+        assert!(
+            !IoCpStorage::complete_pending_write(&slots, 0xDEAD_BEEF, 0, 0),
+            "未知完成指针应返回 false"
+        );
+
+        // bitmap 不应受影响:pending_count 不变
+        assert_eq!(slots.pending_count(), initial_count);
+
+        // 所有 slot 应仍可正常分配
+        for _ in 0..IOCP_SLOT_CAPACITY {
+            assert!(slots.alloc().is_some(), "所有 slot 应仍可分配");
+        }
+    }
+
+    // ── B1: CompletionSlots 无锁分配器测试 ──
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_completion_slots_alloc_release() {
+        let slots = CompletionSlots::new();
+        assert_eq!(slots.pending_count(), 0);
+        let mut allocated = Vec::new();
+        for _ in 0..IOCP_SLOT_CAPACITY {
+            let idx = slots.alloc().expect("应有空闲 slot");
+            allocated.push(idx);
+        }
+        assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY);
+        assert!(slots.alloc().is_none(), "容量耗尽后 alloc 应返回 None");
+        for i in 0..IOCP_SLOT_CAPACITY / 2 {
+            slots.slots[allocated[i]]
+                .state
+                .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+            slots.release(allocated[i]);
+        }
+        assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY / 2);
+        let reused = slots.alloc().expect("回收后应有空闲 slot");
+        assert!(allocated[..IOCP_SLOT_CAPACITY / 2].contains(&reused));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_completion_slots_ptr_to_index_roundtrip() {
+        let slots = CompletionSlots::new();
+        for i in 0..IOCP_SLOT_CAPACITY {
+            let ptr = slots.slots[i].overlapped.get() as usize;
+            // SAFETY: slot_index_from_ptr 是 unsafe fn,此处的 ptr 来自
+            // slots.slots[i].overlapped.get(),是 slot 数组内的合法地址。
+            let recovered = unsafe { slots.slot_index_from_ptr(ptr) };
+            assert_eq!(recovered, Some(i), "slot {i} 指针应恢复为索引 {i}");
+        }
+        // SAFETY: 0xDEAD_BEEF 不在 slot 数组范围内,slot_index_from_ptr
+        // 内部会校验范围并返回 None,不会产生未定义行为。
+        assert_eq!(unsafe { slots.slot_index_from_ptr(0xDEAD_BEEF) }, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_completion_slots_concurrent_alloc_no_duplicates() {
+        let slots = std::sync::Arc::new(CompletionSlots::new());
+        let num_threads = 8;
+        let allocs_per_thread = IOCP_SLOT_CAPACITY / num_threads;
+        let allocated: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let slots = slots.clone();
+                std::thread::spawn(move || {
+                    let mut local = Vec::new();
+                    for _ in 0..allocs_per_thread {
+                        if let Some(idx) = slots.alloc() {
+                            local.push(idx);
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut all: Vec<usize> = allocated
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort();
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(all.len(), deduped.len(), "并发 alloc 不应产生重复 slot");
+        assert_eq!(all.len(), num_threads * allocs_per_thread);
+        assert_eq!(slots.pending_count(), num_threads * allocs_per_thread);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_iocp_high_concurrency_64_writes() {
+        use crate::storage::AsyncStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iocp_concurrent_64.dat");
+        let mut storage = IoCpStorage::new(&path);
+        storage.init().expect("IOCP init 应成功");
+        storage.allocate(64 * 512).await.unwrap();
+        let storage = std::sync::Arc::new(storage);
+        let mut handles = Vec::new();
+        for index in 0u8..64 {
+            let storage = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let offset = index as u64 * 512;
+                let payload = Bytes::from(vec![index; 512]);
+                let written = storage.write_at(offset, payload).await?;
+                assert_eq!(written, 512);
+                Ok::<_, tachyon_core::DownloadError>(())
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        for index in 0u8..64 {
+            let offset = index as u64 * 512;
+            let mut buf = vec![0u8; 512];
+            let read = storage.read_at(offset, &mut buf).await.unwrap();
+            assert_eq!(read, 512);
+            assert!(
+                buf.iter().all(|&byte| byte == index),
+                "并发写入区域 {offset} 数据不一致"
             );
         }
-
-        {
-            let _guard = PendingWriteCancelGuard::new(std::ptr::null_mut(), key, registry.clone());
-        }
-
-        let mut map = lock_completion_registry(&registry);
-        assert!(
-            map.contains_key(&key),
-            "取消 guard 不能移除 pending,必须等 completion poller 统一释放"
-        );
-        map.remove(&key);
+        storage.sync().await.unwrap();
+        storage.close().await.unwrap();
     }
 
     /// 验证基本写入:写入 4096 字节并确认返回正确字节数

@@ -1,10 +1,15 @@
 //! 文件名提取与 Content-Disposition 解析
 //!
-//! 整合了散布在 tachyon-app、tachyon-protocol(http/quic)中的重复实现,
-//! 提供统一的文件名提取入口:
+//! 提供统一的文件名提取入口与路径穿越防护:
 //! - `extract_filename_from_url` — 从 URL 路径提取文件名(含 percent-decode)
 //! - `parse_content_disposition` — 解析 Content-Disposition 头
 //! - `extract_filename` — 先尝试 Content-Disposition,再回退到 URL
+//! - `sanitize_filename` — 清洗文件名防止路径遍历
+//! - `validate_save_path` — 纵深防御的保存路径校验
+
+// ---------------------------------------------------------------------------
+// 文件名处理
+// ---------------------------------------------------------------------------
 
 /// 清洗文件名,防止路径遍历攻击
 ///
@@ -69,7 +74,7 @@ pub fn sanitize_filename(name: &str) -> String {
         }
     }
 
-    // 后处理: 移除纯点序列 token (如 "..", "....")，防止变体路径遍历
+    // 后处理: 移除纯点序列 token (如 "..", "...."),防止变体路径遍历
     let result: String = filtered
         .split_whitespace()
         .filter(|token| !token.chars().all(|c| c == '.'))
@@ -149,42 +154,83 @@ pub fn validate_save_path(
         .parent()
         .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无父目录".into()))?;
 
-    if !parent.exists() {
-        std::fs::create_dir_all(parent).map_err(crate::DownloadError::Io)?;
-    }
-
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|e| crate::DownloadError::Config(format!("无法解析父目录: {e}")))?;
-
-    if !canonical_parent.starts_with(&canonical_base) {
-        return Err(crate::DownloadError::Config(format!(
-            "父目录逃逸检测: {:?} 不在预期目录 {:?} 内",
-            canonical_parent, canonical_base
-        )));
-    }
-
-    // 基于 canonical_parent 构建最终路径,防止 TOCTOU 符号链接攻击
-    let file_name = final_path
-        .file_name()
-        .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无文件名".into()))?;
-    let result = canonical_parent.join(file_name);
-
-    // 如果路径已存在（例如符号链接），解析实际目标并验证不逃逸出基目录
-    if result.exists() {
-        let canonical_final = result
+    // 3. 先做逻辑路径校验,再创建目录(防止 create_dir_all 副作用在校验失败时残留)
+    //    当父目录不存在时,先通过逻辑路径拼接做逃逸检查,再创建目录
+    if parent.exists() {
+        let canonical_parent = parent
             .canonicalize()
-            .map_err(|e| crate::DownloadError::Config(format!("无法解析文件路径: {e}")))?;
-        if !canonical_final.starts_with(&canonical_base) {
+            .map_err(|e| crate::DownloadError::Config(format!("无法解析父目录: {e}")))?;
+
+        if !canonical_parent.starts_with(&canonical_base) {
             return Err(crate::DownloadError::Config(format!(
-                "符号链接逃逸检测: {:?} 实际指向 {:?}，不在预期目录 {:?} 内",
-                result, canonical_final, canonical_base
+                "父目录逃逸检测: {:?} 不在预期目录 {:?} 内",
+                canonical_parent, canonical_base
             )));
         }
-        return Ok(canonical_final);
-    }
 
-    Ok(result)
+        // 基于 canonical_parent 构建最终路径,防止 TOCTOU 符号链接攻击
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无文件名".into()))?;
+        let result = canonical_parent.join(file_name);
+
+        // 如果路径已存在(例如符号链接),解析实际目标并验证不逃逸出基目录
+        if result.exists() {
+            let canonical_final = result
+                .canonicalize()
+                .map_err(|e| crate::DownloadError::Config(format!("无法解析文件路径: {e}")))?;
+            if !canonical_final.starts_with(&canonical_base) {
+                return Err(crate::DownloadError::Config(format!(
+                    "符号链接逃逸检测: {:?} 实际指向 {:?},不在预期目录 {:?} 内",
+                    result, canonical_final, canonical_base
+                )));
+            }
+            return Ok(canonical_final);
+        }
+
+        Ok(result)
+    } else {
+        // 父目录不存在:先做逻辑路径校验,再创建目录
+        // 将 parent 拼接到 canonical_base 后做逻辑校验
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无文件名".into()))?;
+
+        // 逻辑校验:parent 必须是 expected_base 的子路径
+        // 使用路径组件逐级检查,防止 .. 逃逸
+        let mut check_path = canonical_base.clone();
+        let suffix = parent.strip_prefix(expected_base).map_err(|_| {
+            crate::DownloadError::Config(format!(
+                "父目录逃逸检测(逻辑): {:?} 不在预期目录 {:?} 内",
+                parent, expected_base
+            ))
+        })?;
+        check_path.push(suffix);
+        // 规范化后检查是否仍在 base 内
+        let canonical_check = check_path.canonicalize().unwrap_or(check_path.clone());
+        if !canonical_check.starts_with(&canonical_base) && canonical_check != canonical_base {
+            // 父目录尚不存在时 canonicalize 可能失败,此时用组件比较做保守检查
+            let base_components: Vec<_> = canonical_base.components().collect();
+            let check_components: Vec<_> = check_path.components().collect();
+            if check_components.len() < base_components.len()
+                || check_components[..base_components.len()] != base_components
+            {
+                return Err(crate::DownloadError::Config(format!(
+                    "父目录逃逸检测(逻辑): {:?} 不在预期目录 {:?} 内",
+                    parent, expected_base
+                )));
+            }
+        }
+
+        // 校验通过,现在可以安全创建目录
+        std::fs::create_dir_all(parent).map_err(crate::DownloadError::Io)?;
+
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|e| crate::DownloadError::Config(format!("创建目录后无法解析父目录: {e}")))?;
+
+        Ok(canonical_parent.join(file_name))
+    }
 }
 
 /// 解析 Content-Disposition 头中的文件名
@@ -419,12 +465,10 @@ mod tests {
 
     #[test]
     fn test_parse_content_disposition_rejects_substring_attack() {
-        // "xfilename*=" 不应被错误匹配为 "filename*="
         assert_eq!(
             parse_content_disposition("attachment; xfilename*=UTF-8''evil.exe; filename=safe.pdf"),
             Some("safe.pdf".to_string())
         );
-        // "xfilename=" 不应被错误匹配为 "filename="
         assert_eq!(
             parse_content_disposition("attachment; xfilename=evil.exe; filename=safe.pdf"),
             Some("safe.pdf".to_string())
@@ -452,8 +496,6 @@ mod tests {
         assert_eq!(percent_decode("%FF%FE"), None);
     }
 
-    // ------ 路径遍历防护测试 ------
-
     #[test]
     fn test_sanitize_filename_basic() {
         assert_eq!(sanitize_filename("file.zip"), "file.zip");
@@ -461,19 +503,16 @@ mod tests {
 
     #[test]
     fn test_sanitize_filename_path_traversal_dotdot() {
-        // ../../etc/passwd -> etc passwd (路径分隔符替换为空格)
         assert_eq!(sanitize_filename("../../etc/passwd"), "etc passwd");
     }
 
     #[test]
     fn test_sanitize_filename_path_traversal_slash() {
-        // foo/bar/baz.txt -> foo bar baz.txt
         assert_eq!(sanitize_filename("foo/bar/baz.txt"), "foo bar baz.txt");
     }
 
     #[test]
     fn test_sanitize_filename_path_traversal_backslash() {
-        // foo\bar\baz.txt -> foo bar baz.txt
         assert_eq!(sanitize_filename("foo\\bar\\baz.txt"), "foo bar baz.txt");
     }
 
@@ -502,7 +541,6 @@ mod tests {
 
     #[test]
     fn test_sanitize_filename_complex_traversal() {
-        // 复杂的路径遍历尝试
         assert_eq!(
             sanitize_filename("....//....//....//etc/passwd"),
             "etc passwd"
@@ -511,14 +549,11 @@ mod tests {
 
     #[test]
     fn test_sanitize_filename_windows_reserved_chars() {
-        // Windows 保留字符应被移除
         assert_eq!(sanitize_filename("file:name*test?.txt"), "filenametest.txt");
     }
 
     #[test]
     fn test_extract_filename_from_url_traversal() {
-        // URL 中的路径遍历应被防护
-        // URL 解析器只提取最后一段 "passwd"
         assert_eq!(
             extract_filename_from_url("https://example.com/../../etc/passwd"),
             "passwd"
@@ -527,7 +562,6 @@ mod tests {
 
     #[test]
     fn test_extract_filename_content_disposition_traversal() {
-        // Content-Disposition 中的路径遍历应被防护
         assert_eq!(
             extract_filename(
                 "https://example.com/file.zip",
@@ -539,7 +573,6 @@ mod tests {
 
     #[test]
     fn test_extract_filename_normal_file() {
-        // 正常文件名应保持不变
         assert_eq!(
             extract_filename("https://example.com/document.pdf", None),
             "document.pdf"
@@ -548,7 +581,6 @@ mod tests {
 
     #[test]
     fn test_extract_filename_with_spaces() {
-        // 带空格的文件名应保持不变
         assert_eq!(
             extract_filename("https://example.com/my%20document.pdf", None),
             "my document.pdf"
@@ -557,7 +589,6 @@ mod tests {
 
     #[test]
     fn test_extract_filename_complex_traversal() {
-        // 复杂的路径遍历攻击
         assert_eq!(
             extract_filename(
                 "https://example.com/safe.txt",
@@ -566,8 +597,6 @@ mod tests {
             "Windows System32 config sam"
         );
     }
-
-    // ------ validate_save_path 测试 ------
 
     #[test]
     fn test_validate_save_path_normal_file() {
@@ -588,7 +617,6 @@ mod tests {
         std::fs::create_dir(&base).unwrap();
         let final_path = base.join("new_file.txt");
 
-        // 文件不存在但父目录存在
         let result = validate_save_path(&final_path, &base);
         assert!(result.is_ok(), "新文件在合法目录内应通过校验");
     }
@@ -600,7 +628,6 @@ mod tests {
         std::fs::create_dir(&base).unwrap();
         let final_path = base.join("subdir").join("file.txt");
 
-        // 父目录不存在,函数应创建
         let result = validate_save_path(&final_path, &base);
         assert!(result.is_ok(), "应自动创建子目录");
         assert!(base.join("subdir").exists(), "子目录应被创建");
@@ -612,7 +639,6 @@ mod tests {
         let base = temp.path().join("downloads");
         std::fs::create_dir(&base).unwrap();
 
-        // 构造路径逃逸: downloads/../../../etc/passwd
         let malicious = base
             .join("..")
             .join("..")
@@ -654,7 +680,6 @@ mod tests {
         let base = temp.path().join("downloads");
         std::fs::create_dir(&base).unwrap();
 
-        // 创建指向外部的符号链接
         let outside_file = temp.path().join("secret.txt");
         std::fs::write(&outside_file, b"secret data").unwrap();
         let evil_link = base.join("innocent.txt");
@@ -673,7 +698,6 @@ mod tests {
         let base = temp.path().join("downloads");
         std::fs::create_dir(&base).unwrap();
 
-        // 内部符号链接(合法)
         let real_file = base.join("real.txt");
         std::fs::write(&real_file, b"data").unwrap();
         let link = base.join("link.txt");
@@ -749,7 +773,6 @@ mod tests {
         std::fs::write(&final_path, b"test").unwrap();
 
         let result = validate_save_path(&final_path, &base).unwrap();
-        // 返回的路径应是 canonical 形式
         assert!(result.is_absolute(), "返回路径应为绝对路径: {:?}", result);
     }
 

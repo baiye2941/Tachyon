@@ -7,20 +7,29 @@
   "scripts": {
     "dev": "bun --bun vite",
     "build": "bun --bun vite build",
+    "analyze": "ANALYZE=true bun run build",
     "preview": "bun --bun vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "lint": "eslint src/",
-    "typecheck": "tsc --noEmit"
+    "lint:colors": "bun run scripts/lint-color-hardcode.ts",
+    "typecheck": "tsc --noEmit",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
   },
   "dependencies": {
     "@motionone/solid": "^10.16.4",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-notification": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "solid-i18n": "^1.1.0",
     "solid-js": "^1.9.13"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "@solidjs/testing-library": "^0.8.10",
     "@tailwindcss/vite": "^4.0.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
@@ -28,6 +37,9 @@
     "eslint": "^9.0.0",
     "eslint-plugin-solid": "^0.14.0",
     "jsdom": "^26.0.0",
+    "rollup-plugin-visualizer": "^7.0.1",
+    "storybook": "10.4.4",
+    "storybook-solidjs-vite": "^10.4.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.3",
     "vite": "^6.1.0",

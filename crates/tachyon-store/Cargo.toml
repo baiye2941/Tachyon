@@ -10,6 +10,7 @@ tachyon-core = { path = "../tachyon-core" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

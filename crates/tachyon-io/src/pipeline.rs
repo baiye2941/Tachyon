@@ -31,13 +31,17 @@ pub struct WritePipeline<S: AsyncStorage> {
 impl<S: AsyncStorage> WritePipeline<S> {
     /// 创建新的写入管道
     ///
-    /// `buffer_size` 和 `capacity` 用于配置信号量许可数(= capacity),
-    /// 控制最大并发写入数。`buffer_size` 保留用于 write_batch 的 flush 阈值计算。
+    /// `buffer_size` 和 `capacity` 用于配置信号量许可数:
+    /// 总字节预算 = `capacity * buffer_size`。
+    /// 每次写入按实际字节数消耗许可,使 1B 与 256KB 不再等价,
+    /// 反压控制与真实内存占用成正比。
+    /// `buffer_size` 同时保留用于 write_batch 的 flush 阈值计算。
     pub fn new(storage: S, buffer_size: usize, capacity: usize) -> Self {
+        let semaphore_capacity = capacity.saturating_mul(buffer_size);
         Self {
             storage,
-            semaphore: Arc::new(Semaphore::new(capacity)),
-            semaphore_capacity: capacity,
+            semaphore: Arc::new(Semaphore::new(semaphore_capacity)),
+            semaphore_capacity,
             max_pending: 64,
             buffer_size,
         }
@@ -57,7 +61,7 @@ impl<S: AsyncStorage> WritePipeline<S> {
     pub async fn write(&self, offset: u64, data: &[u8]) -> DownloadResult<usize> {
         let _permit = self
             .semaphore
-            .acquire()
+            .acquire_many(data.len().min(self.semaphore_capacity) as u32)
             .await
             .expect("WritePipeline 信号量不应被关闭");
         self.storage
@@ -74,7 +78,7 @@ impl<S: AsyncStorage> WritePipeline<S> {
     pub async fn write_bytes(&self, offset: u64, data: &Bytes) -> DownloadResult<usize> {
         let _permit = self
             .semaphore
-            .acquire()
+            .acquire_many(data.len().min(self.semaphore_capacity) as u32)
             .await
             .expect("WritePipeline 信号量不应被关闭");
         self.storage.write_at(offset, data.clone()).await
@@ -87,7 +91,7 @@ impl<S: AsyncStorage> WritePipeline<S> {
         Ok(written)
     }
 
-    /// 获取信号量可用许可数
+    /// 获取信号量可用字节预算
     pub fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
     }
@@ -131,13 +135,14 @@ impl<S: AsyncStorage> WritePipeline<S> {
         // S-14: 统一合并规划 -- 先计算合并后的写入批次,再获取精确数量的信号量许可
         // 旧实现中 dry-run 计数与实际执行使用独立的合并逻辑,存在 permit 计数不匹配风险
         let batches = Self::plan_batches(segments, &sorted_indices, flush_threshold);
-        // M-6 修复: clamp write_count 不超过信号量容量,防止 acquire_many 永久阻塞
-        let raw_count = batches.len().max(1) as u32;
-        let write_count = raw_count.min(self.semaphore_capacity as u32).max(1);
+        // M-6 修复: permit 按字节粒度计算,1B 与 256KB 不再等价。
+        // clamp 到信号量总容量,防止超大 payload 导致 acquire_many 永久阻塞。
+        let total_bytes: usize = segments.iter().map(|(_, data)| data.len()).sum();
+        let write_permits = total_bytes.min(self.semaphore_capacity).max(1) as u32;
 
         let _permit = self
             .semaphore
-            .acquire_many(write_count)
+            .acquire_many(write_permits)
             .await
             .expect("WritePipeline 信号量不应被关闭");
 
@@ -490,5 +495,20 @@ mod tests {
         let storage = TokioFile::open(tmp.path()).await.unwrap();
         let pipeline = WritePipeline::new(storage, 4096, 4).with_max_pending(0);
         assert_eq!(pipeline.max_pending, 1);
+    }
+
+    /// M-6 回归: 信号量容量按字节预算初始化,确保 1B 与 256KB 不再等价
+    #[tokio::test]
+    async fn test_pipeline_byte_capacity_initialization() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        // 容量 = 2 * 4096 = 8192 字节
+        let pipeline = WritePipeline::new(storage, 4096, 2);
+        assert_eq!(pipeline.available_permits(), 8192);
+
+        // 写入完成后许可应立即归还,可用预算恢复为总容量
+        let written = pipeline.write(0, &[0u8; 100]).await.unwrap();
+        assert_eq!(written, 100);
+        assert_eq!(pipeline.available_permits(), 8192);
     }
 }

@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tachyon_core::{DownloadError, DownloadResult};
 
 use crate::storage::AsyncStorage;
@@ -17,10 +18,24 @@ mod win_flags {
     pub const FILE_SHARE_DELETE: u32 = 0x00000004;
 }
 
+/// NO_BUFFERING 模式的扇区对齐要求
+#[cfg(target_os = "windows")]
+const SECTOR_SIZE: u64 = 512;
+
+/// WinFile 持有的惰性 buffered fallback 句柄
+///
+/// NO_BUFFERING 模式下,主句柄要求所有写入 offset/length 对齐到扇区(512B)。
+/// 下载尾批次几乎必然非对齐,因此惰性初始化一个普通 buffered 句柄,
+/// 非对齐写入自动路由到它。两个句柄通过 FILE_SHARE_READ|WRITE|DELETE
+/// 共享同一文件,写入顺序由 sync() 统一 flush 保证。
+type FallbackHandle = Mutex<Option<Arc<std::fs::File>>>;
+
 pub struct WinFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
     no_buffering: bool,
+    /// 惰性初始化的 buffered fallback 句柄(仅 no_buffering=true 时使用)
+    fallback: FallbackHandle,
 }
 
 impl WinFile {
@@ -42,6 +57,7 @@ impl WinFile {
             path,
             file: Arc::new(file),
             no_buffering: true,
+            fallback: Mutex::new(None),
         })
     }
 
@@ -62,6 +78,7 @@ impl WinFile {
             path,
             file: Arc::new(file),
             no_buffering: false,
+            fallback: Mutex::new(None),
         })
     }
 
@@ -79,7 +96,44 @@ impl WinFile {
             path,
             file: Arc::new(file),
             no_buffering: false,
+            fallback: Mutex::new(None),
         })
+    }
+
+    /// 惰性获取 buffered fallback 句柄(NO_BUFFERING 模式专用)
+    ///
+    /// 首次调用时用 open_standard 同路径打开 buffered 句柄并缓存,
+    /// 后续直接返回缓存。两个句柄通过 FILE_SHARE 共享同一文件。
+    #[cfg(target_os = "windows")]
+    fn get_or_init_fallback(&self) -> DownloadResult<Arc<std::fs::File>> {
+        // fast path: 已初始化则直接 clone
+        {
+            let guard = self.fallback.lock();
+            if let Some(ref f) = *guard {
+                return Ok(f.clone());
+            }
+        }
+        // slow path: 打开 buffered 句柄
+        // 注意:此处不复用 open_standard 以避免 async(本函数是同步的,
+        // 在 spawn_blocking 内调用)。直接用 OpenOptions。
+        use std::os::windows::fs::OpenOptionsExt;
+        use win_flags::*;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&self.path)
+            .map_err(DownloadError::Io)?;
+        let file = Arc::new(file);
+        let mut guard = self.fallback.lock();
+        // 双检:另一线程可能已初始化
+        if let Some(ref existing) = *guard {
+            return Ok(existing.clone());
+        }
+        *guard = Some(file.clone());
+        Ok(file)
     }
 
     pub async fn preallocate(&self, size: u64) -> DownloadResult<()> {
@@ -114,28 +168,36 @@ impl AsyncStorage for WinFile {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
-            if self.no_buffering {
-                const SECTOR_SIZE: u64 = 512;
-                if !offset.is_multiple_of(SECTOR_SIZE) {
-                    return Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
-                    )));
-                }
-                if !(data.len() as u64).is_multiple_of(SECTOR_SIZE) {
-                    return Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "NO_BUFFERING 模式下数据长度 {} 未对齐到 {SECTOR_SIZE} 字节",
-                            data.len()
-                        ),
-                    )));
-                }
-            }
 
-            let file = self.file.clone();
+            // NO_BUFFERING 模式下检测对齐:非对齐写入路由到惰性 buffered fallback 句柄
+            let needs_fallback = if self.no_buffering {
+                !offset.is_multiple_of(SECTOR_SIZE)
+                    || !(data.len() as u64).is_multiple_of(SECTOR_SIZE)
+            } else {
+                false
+            };
+
+            let target_file = if needs_fallback {
+                // 非对齐写(如下载尾批次)走 buffered 句柄,保证正确性
+                // get_or_init_fallback 是同步函数,但仅首次调用有 I/O(打开句柄),
+                // 后续直接返回 Arc clone,开销可忽略
+                let path = self.path.clone();
+                let fallback_ref = self.get_or_init_fallback()?;
+                tracing::debug!(
+                    path = %path.display(),
+                    offset,
+                    len = data.len(),
+                    "NO_BUFFERING 非对齐写入路由到 buffered fallback 句柄",
+                );
+                fallback_ref
+            } else {
+                self.file.clone()
+            };
+
             tokio::task::spawn_blocking(move || {
-                file.seek_write(&data, offset).map_err(DownloadError::Io)
+                target_file
+                    .seek_write(&data, offset)
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
@@ -149,30 +211,24 @@ impl AsyncStorage for WinFile {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
-            if self.no_buffering {
-                const SECTOR_SIZE: u64 = 512;
-                if !offset.is_multiple_of(SECTOR_SIZE) {
-                    return Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("NO_BUFFERING 模式下偏移量 {offset} 未对齐到 {SECTOR_SIZE} 字节"),
-                    )));
-                }
-                if !(buf.len() as u64).is_multiple_of(SECTOR_SIZE) {
-                    return Err(DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "NO_BUFFERING 模式下缓冲区长度 {} 未对齐到 {SECTOR_SIZE} 字节",
-                            buf.len()
-                        ),
-                    )));
-                }
-            }
+            // 读路径:NO_BUFFERING 模式下非对齐读也走 buffered fallback
+            let needs_fallback = if self.no_buffering {
+                !offset.is_multiple_of(SECTOR_SIZE)
+                    || !(buf.len() as u64).is_multiple_of(SECTOR_SIZE)
+            } else {
+                false
+            };
 
-            let file = self.file.clone();
+            let target_file = if needs_fallback {
+                self.get_or_init_fallback()?
+            } else {
+                self.file.clone()
+            };
+
             let buf_len = buf.len();
             let mut owned_buf = vec![0u8; buf_len];
             let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = file.seek_read(&mut owned_buf, offset)?;
+                let n = target_file.seek_read(&mut owned_buf, offset)?;
                 Ok::<_, std::io::Error>((n, owned_buf))
             })
             .await
@@ -185,10 +241,22 @@ impl AsyncStorage for WinFile {
 
     fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
+            // 主句柄 sync
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
                 .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+                .map_err(|e| DownloadError::Io(e.into()))??;
+
+            // 若 fallback 句柄已初始化,也需 sync 以保证缓冲数据落盘
+            let fallback = self.fallback.lock().clone();
+            if let Some(fallback_file) = fallback {
+                tokio::task::spawn_blocking(move || {
+                    fallback_file.sync_data().map_err(DownloadError::Io)
+                })
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))??;
+            }
+            Ok(())
         })
     }
 
@@ -212,7 +280,16 @@ impl AsyncStorage for WinFile {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
                 .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+                .map_err(|e| DownloadError::Io(e.into()))??;
+            let fallback = self.fallback.lock().clone();
+            if let Some(fallback_file) = fallback {
+                tokio::task::spawn_blocking(move || {
+                    fallback_file.sync_data().map_err(DownloadError::Io)
+                })
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))??;
+            }
+            Ok(())
         })
     }
 }
@@ -404,5 +481,82 @@ mod tests {
         );
         let aligned_len = 512u64;
         assert!(aligned_len.is_multiple_of(sector_size));
+    }
+
+    /// P0-A: NO_BUFFERING 模式下非对齐写入应自动 fallback 到 buffered 句柄
+    ///
+    /// 修复前:write_at(offset=100, len=7) 会返回 InvalidInput 错误。
+    /// 修复后:自动路由到惰性 buffered 句柄,写入成功且数据可读回。
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_winfile_no_buffering_unaligned_write_fallback() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_optimized(tmp.path()).await.unwrap();
+        assert!(file.is_no_buffering());
+
+        // 先写一个对齐块(512B),建立基准
+        let aligned_data = Bytes::from(vec![0xAAu8; 512]);
+        file.write_at(0, aligned_data).await.unwrap();
+
+        // 非对齐尾块:offset=100, len=7(均非 512 对齐)
+        // 修复前会返回 InvalidInput,修复后应自动 fallback 到 buffered 句柄
+        let tail = Bytes::from_static(b"goodbye");
+        let written = file.write_at(100, tail).await.unwrap();
+        assert_eq!(written, 7);
+
+        // 验证数据可读回(buffered fallback 句柄)
+        let mut buf = [0u8; 7];
+        let n = file.read_at(100, &mut buf).await.unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&buf, b"goodbye");
+    }
+
+    /// P0-A: NO_BUFFERING 模式下对齐写入仍走主句柄(zero page cache)
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_winfile_no_buffering_aligned_write_uses_main_handle() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_optimized(tmp.path()).await.unwrap();
+        assert!(file.is_no_buffering());
+
+        // 对齐写入(offset 和 len 都是 512 倍数)应走主 NO_BUFFERING 句柄
+        let data = Bytes::from(vec![0xBBu8; 1024]);
+        let written = file.write_at(0, data).await.unwrap();
+        assert_eq!(written, 1024);
+
+        // 读回验证
+        let mut buf = vec![0u8; 1024];
+        let n = file.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(n, 1024);
+        assert!(buf.iter().all(|&b| b == 0xBB));
+    }
+
+    /// P0-A: 混合对齐+非对齐写入,验证数据完整性
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_winfile_mixed_aligned_and_unaligned_writes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_optimized(tmp.path()).await.unwrap();
+
+        // 对齐写:block 0
+        file.write_at(0, Bytes::from(vec![0x11u8; 512]))
+            .await
+            .unwrap();
+        // 对齐写:block 1
+        file.write_at(512, Bytes::from(vec![0x22u8; 512]))
+            .await
+            .unwrap();
+        // 非对齐写:跨 block 边界(offset=500, len=24)
+        file.write_at(500, Bytes::from(vec![0x33u8; 24]))
+            .await
+            .unwrap();
+
+        // 验证:500-512 是 0x33,524-511 之前的位置被 0x33 覆盖
+        let mut buf = [0u8; 24];
+        file.read_at(500, &mut buf).await.unwrap();
+        assert!(buf.iter().all(|&b| b == 0x33), "非对齐区域应全为 0x33");
+
+        // sync 应同时 flush 主句柄和 fallback 句柄
+        file.sync().await.unwrap();
     }
 }

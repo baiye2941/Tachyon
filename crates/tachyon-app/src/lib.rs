@@ -1,9 +1,14 @@
 //! Tachyon Tauri 应用库
 
 pub mod commands;
+pub mod projection;
+pub mod repository;
+pub mod runtime;
+pub mod service;
 pub mod task_store;
 
 pub use commands::AppError;
+pub use commands::TaskCommand;
 pub use commands::TaskInfo;
 
 use commands::*;
@@ -31,12 +36,34 @@ pub fn run() {
         .with_target(true)
         .init();
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
         .setup(|app| {
             let state = app.state::<AppState>();
+            let handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
-                if let Err(e) = state.load_recovered_tasks().await {
-                    tracing::warn!(error = %e, "恢复未完成任务失败");
+                // 在 reactor 上下文中启动 progress aggregator
+                // （构造期间不能 spawn,此时 reactor 尚未就绪）
+                state.runtime.progress_broker.spawn_aggregator();
+                match state.load_recovered_tasks().await {
+                    Ok(corrupt_keys) => {
+                        // 损坏快照非空时向 UI 广播一次性恢复告警
+                        if !corrupt_keys.is_empty() {
+                            use tauri::Emitter;
+                            let count = corrupt_keys.len();
+                            tracing::warn!(
+                                count,
+                                keys = ?corrupt_keys,
+                                "启动恢复检测到损坏快照,已跳过"
+                            );
+                            let warning = RecoveryWarning {
+                                corrupt_keys,
+                                count,
+                            };
+                            let _ = handle.emit("recovery-warning", &warning);
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "恢复未完成任务失败"),
                 }
             });
             Ok(())
@@ -45,6 +72,8 @@ pub fn run() {
             // 应用信息
             get_app_info,
             supported_protocols,
+            // 确认令牌(P1-11b)
+            request_confirmation,
             // 任务管理
             create_task,
             pause_task,
@@ -95,15 +124,16 @@ async fn any_fragment() {
         fragments_total: 4,
         fragments_done: 0,
         created_at: chrono::Local::now().to_rfc3339(),
+        save_path: String::new(),
     };
-    state.tasks.insert(task_id.clone(), task);
+    state.domain.task_repository.insert(task_id.clone(), task);
 
     {
-        if let Some(mut t) = state.tasks.get_mut(&task_id) {
+        if let Some(mut t) = state.domain.task_repository.get_mut(&task_id) {
             t.status = tachyon_core::types::DownloadState::Failed;
         }
     }
-    let t = state.tasks.get(&task_id).unwrap();
+    let t = state.domain.task_repository.get(&task_id).unwrap();
     assert_eq!(
         t.status,
         tachyon_core::types::DownloadState::Failed,
@@ -119,14 +149,14 @@ async fn max_concurrent() {
 
     let state = AppState::new();
     {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = state.domain.config.lock().await;
         cfg.max_concurrent_tasks = 2;
     }
 
     // 插入 2 个活跃任务
     {
         for i in 0..2 {
-            state.tasks.insert(
+            state.domain.task_repository.insert(
                 format!("task-{i}"),
                 TaskInfo {
                     id: format!("task-{i}"),
@@ -140,13 +170,15 @@ async fn max_concurrent() {
                     fragments_total: 0,
                     fragments_done: 0,
                     created_at: chrono::Local::now().to_rfc3339(),
+                    save_path: String::new(),
                 },
             );
         }
     }
 
     let active = state
-        .tasks
+        .domain
+        .task_repository
         .iter()
         .filter(|r| {
             let t = r.value();
@@ -154,7 +186,7 @@ async fn max_concurrent() {
                 || t.status == tachyon_core::types::DownloadState::Pending
         })
         .count();
-    let max = state.config.lock().await.max_concurrent_tasks as usize;
+    let max = state.domain.config.lock().await.max_concurrent_tasks as usize;
     assert!(
         active >= max,
         "活跃任务数 {active} 应 >= 上限 {max},验证门控逻辑生效"
@@ -201,5 +233,31 @@ fn app_error() {
     assert!(
         json.contains("任务已取消"),
         "序列化应包含 DownloadError 消息: {json}"
+    );
+}
+
+/// 验证 RecoveryWarning 序列化为 camelCase(P1-06续)
+///
+/// 前端 `RecoveryWarningPayload` 期望 `corruptKeys`(camelCase),
+/// 若后端缺 `#[serde(rename_all)]` 会序列化为 `corrupt_keys` 导致字段名漂移。
+#[cfg(test)]
+#[test]
+fn recovery_warning_camel_case() {
+    let warning = commands::RecoveryWarning {
+        corrupt_keys: vec!["task_abc".to_string(), "task_def".to_string()],
+        count: 2,
+    };
+    let json = serde_json::to_string(&warning).unwrap();
+    assert!(
+        json.contains("corruptKeys"),
+        "序列化应使用 camelCase: corruptKeys,实际: {json}"
+    );
+    assert!(
+        !json.contains("corrupt_keys"),
+        "序列化不应含 snake_case: corrupt_keys,实际: {json}"
+    );
+    assert!(
+        json.contains("\"count\":2"),
+        "count 字段应正确序列化: {json}"
     );
 }

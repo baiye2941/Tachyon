@@ -26,13 +26,11 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
-    "BSL-1.0",
     "CC0-1.0",
-    "OpenSSL",
-    "MPL-2.0",
     "CDLA-Permissive-2.0",
+    # OpenSSL: rustls 间接相关,保留以避免误报
+    "OpenSSL",
 ]
 # 对未列出的许可证发出警告而非报错
 confidence-threshold = 0.8

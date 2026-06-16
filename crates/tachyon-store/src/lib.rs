@@ -20,8 +20,10 @@ pub mod recovery;
 pub mod store;
 
 pub use kv::KvStore;
-pub use recovery::{RecoveryManager, TaskRecord, TaskSnapshot};
-pub use store::{FileStore, MemoryStore, Store};
+pub use recovery::{
+    RecoveryManager, RecoveryResult, SNAPSHOT_SCHEMA_VERSION, TaskRecord, TaskSnapshot,
+};
+pub use store::{Durability, FileStore, MemoryStore, Store};
 
 // 验证测试:放在 crate 根级别，以便 `--exact` 匹配
 

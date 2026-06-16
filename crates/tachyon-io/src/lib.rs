@@ -53,7 +53,7 @@ async fn write_pipeline() {
     let storage = TokioFile::open(tmp.path()).await.unwrap();
     let pipeline = WritePipeline::new(storage, 4096, 4);
 
-    assert_eq!(pipeline.available_permits(), 4);
+    assert_eq!(pipeline.available_permits(), 4 * 4096);
     assert_eq!(pipeline.buffer_size(), 4096);
 
     let written = pipeline.write(0, b"hello pipeline").await.unwrap();

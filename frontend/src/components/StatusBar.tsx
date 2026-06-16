@@ -1,90 +1,116 @@
-import { createMemo } from 'solid-js'
-import { ArrowDownIcon, ChevronDownIcon } from './icons'
-import Sparkline from './Sparkline'
-import { formatSpeed } from '../utils/format'
+import { createMemo } from "solid-js";
+import { ArrowDownIcon, ChevronDownIcon } from "./icons";
+import Sparkline from "./Sparkline";
+import Button from "../shared/ui/Button";
+import LanguageSwitcher from "../shared/ui/LanguageSwitcher";
+import { formatSpeed } from "../utils/format";
+import { getHistory } from "../stores/speedHistory";
+import { useI18n } from "../i18n";
 
 interface StatusBarProps {
-  isIdle: boolean
-  totalSpeed: number
-  activeCount: number
-  pausedCount: number
-  totalCount: number
-}
-
-function generateSpeedHistory(currentSpeed: number): number[] {
-  if (currentSpeed === 0) return []
-  const points: number[] = []
-  for (let i = 0; i < 30; i++) {
-    const variance = (Math.random() - 0.5) * currentSpeed * 0.5
-    points.push(Math.max(0, currentSpeed + variance))
-  }
-  return points
+  isIdle: boolean;
+  totalSpeed: number;
+  activeCount: number;
+  pausedCount: number;
+  totalCount: number;
 }
 
 export default function StatusBar(props: StatusBarProps) {
-  const speedHistory = createMemo(() => generateSpeedHistory(props.totalSpeed))
+  const i18n = useI18n();
+
+  // 真实速度历史:取最近 30 个采样点,删除 Math.random 伪造数据
+  const speedHistory = createMemo(() => {
+    const history = getHistory();
+    return history.slice(-30);
+  });
 
   return (
     <div
       class="flex items-center justify-between flex-shrink-0"
       style={{
-        height: '28px',
-        background: '#12121A',
-        'border-top': '1px solid rgba(255,255,255,0.05)',
-        padding: '0 12px',
-        'font-size': '12px',
+        height: "28px",
+        background: "var(--color-bg-secondary)",
+        "border-top": "1px solid var(--color-border-subtle)",
+        padding: "0 12px",
+        "font-size": "12px",
       }}
     >
       {/* Left */}
-      <div class="flex items-center gap-2">
+      <div
+        class="flex items-center gap-2"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         <div
           style={{
-            width: '8px',
-            height: '8px',
-            'border-radius': '50%',
-            background: props.isIdle ? '#6B7280' : '#00D4AA',
+            width: "8px",
+            height: "8px",
+            "border-radius": "50%",
+            // 下载中 = 品牌紫(状态语义:紫=活跃工作)
+            background: props.isIdle
+              ? "var(--color-text-tertiary)"
+              : "var(--color-accent-primary)",
           }}
-          class={props.isIdle ? '' : "status-indicator-active"}
+          class={props.isIdle ? "" : "status-indicator-active"}
+          aria-hidden="true"
         />
-        <span style={{ color: '#A0A0B0' }}>
-          {props.isIdle ? '空闲' : '下载中'}
+        <span style={{ color: "var(--color-text-secondary)" }}>
+          {props.isIdle ? i18n.t("status.idle") : i18n.t("status.downloading")}
         </span>
         <span
+          class="mono"
           style={{
-            color: props.isIdle ? '#A0A0B0' : '#00D4AA',
-            'font-family': "'Geist Mono', monospace",
-            display: 'flex',
-            'align-items': 'center',
-            gap: '4px',
-            transition: 'color 300ms ease',
+            // Neon Cyan 仅限实时速度数字(速度 = 能量隐喻)
+            color: props.isIdle
+              ? "var(--color-text-secondary)"
+              : "var(--color-speed-active)",
+            display: "flex",
+            "align-items": "center",
+            gap: "4px",
+            transition: "color 300ms ease",
           }}
         >
-          <ArrowDownIcon />
+          <ArrowDownIcon aria-hidden="true" />
           {formatSpeed(props.totalSpeed)}
         </span>
-        <Sparkline data={speedHistory()} width={80} height={16} />
+        <span aria-hidden="true">
+          <Sparkline data={speedHistory()} width={80} height={16} />
+        </span>
 
-        <span style={{ color: '#6B7280' }}>
-          {props.activeCount} 活跃 · {props.pausedCount} 暂停 · {props.totalCount} 总计
+        <span style={{ color: "var(--color-text-tertiary)" }}>
+          {i18n.t("status.countSummary", {
+            active: props.activeCount,
+            paused: props.pausedCount,
+            total: props.totalCount,
+          })}
         </span>
       </div>
 
       {/* Right */}
       <div class="flex items-center gap-3">
-        <button
-          class="flex items-center gap-1 hover-light"
-          style={{ color: '#6B7280' }}
+        <Button
+          variant="ghost"
+          size="sm"
+          class="flex items-center gap-1"
+          aria-label={i18n.t("status.speedLimit") as string}
+          disabled
+          title={i18n.t("status.speedLimitTooltip") as string}
         >
-          <span>无限制</span>
+          <span>{i18n.t("status.unlimited")}</span>
           <ChevronDownIcon />
-        </button>
-        <button
-          class="hover-light"
-          style={{ color: '#6B7280' }}
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={i18n.t("status.feedback") as string}
+          disabled
+          title={i18n.t("status.feedbackTooltip") as string}
         >
-          反馈
-        </button>
+          {i18n.t("status.feedback")}
+        </Button>
+        <LanguageSwitcher />
       </div>
     </div>
-  )
+  );
 }

@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use tachyon_core::config::SchedulerConfig;
 use tachyon_core::types::FragmentInfo;
 use tachyon_core::{DownloadError, DownloadResult};
 
@@ -32,6 +33,16 @@ pub struct FragmentRecord {
     pub retry_count: u32,
     pub max_retries: u32,
     pub last_duration: Option<Duration>,
+    /// 流式哈希结果:下载阶段边写边算的 blake3 十六进制字符串。
+    ///
+    /// 仅当分片有 expected hash(`info.hash.is_some()`)时在下载时计算,
+    /// 供 `verify()` 直接比对,避免重读已写入的数据(I/O 放大消除)。
+    /// 断点续传恢复的分片无此字段,`verify()` 回退到读盘计算。
+    pub computed_hash: Option<String>,
+    /// 字节级断点续传偏移:已持久化的该分片字节数。
+    /// 下载时应从 `info.start + resume_offset` 处继续写入,
+    /// 避免崩溃后完整重下整个分片。
+    pub resume_offset: u64,
 }
 
 impl FragmentRecord {
@@ -43,6 +54,8 @@ impl FragmentRecord {
             retry_count: 0,
             max_retries,
             last_duration: None,
+            computed_hash: None,
+            resume_offset: 0,
         }
     }
 
@@ -263,6 +276,73 @@ pub fn compute_fragment_size(
     adjusted.clamp(min_size, max_size)
 }
 
+/// 计算分片策略
+///
+/// 根据文件大小、服务端 Range 支持情况和当前带宽估计,生成分片列表。
+/// - 文件大小为 0 时返回空列表
+/// - 服务端不支持 Range 时返回单个分片覆盖整个文件
+/// - 当 `suggested_frag_size` 为 `Some(size)` 且 `size > 0` 时,优先使用调度器建议的分片大小
+/// - 否则依据调度配置的目标分片数计算动态分片大小
+#[tracing::instrument]
+pub fn plan_fragments(
+    file_size: u64,
+    supports_range: bool,
+    suggested_frag_size: Option<u64>,
+    scheduler_config: &SchedulerConfig,
+) -> Vec<FragmentInfo> {
+    if file_size == 0 {
+        return Vec::new();
+    }
+
+    if !supports_range {
+        return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
+    }
+
+    let frag_size = match suggested_frag_size {
+        Some(size) if size > 0 => size,
+        _ => {
+            // 未提供建议大小时,仅依据配置的目标分片数计算,
+            // 不再维护独立的 EWMA 带宽模型,避免与 scheduler 的 Holt 模型不一致。
+            let base = file_size / scheduler_config.default_target_fragments.max(1) as u64;
+            base.clamp(
+                scheduler_config.min_fragment_size,
+                scheduler_config.max_fragment_size,
+            )
+        }
+    };
+
+    // frag_size 为 0 的防御(理论上 file_size > 0 时不会发生)
+    if frag_size == 0 {
+        return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
+    }
+
+    // 防止超大文件导致分片数溢出: 硬上限 1,000,000 个分片
+    // 超过此阈值时强制增大 frag_size
+    const MAX_FRAGMENT_COUNT: u64 = 1_000_000;
+    let mut effective_frag_size = frag_size;
+    let estimated_count = file_size / effective_frag_size;
+    if estimated_count > MAX_FRAGMENT_COUNT {
+        effective_frag_size = file_size.div_ceil(MAX_FRAGMENT_COUNT);
+    }
+
+    let mut fragments = Vec::new();
+    let mut offset: u64 = 0;
+    let mut index: u32 = 0;
+
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let size = remaining.min(effective_frag_size);
+        let end = offset + size - 1;
+
+        fragments.push(FragmentInfo::new(index, offset, end, size));
+
+        offset += size;
+        index = index.checked_add(1).expect("分片数超过 u32::MAX,文件过大");
+    }
+
+    fragments
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +525,192 @@ mod tests {
             10 * 1024 * 1024,
         );
         assert_eq!(size, 1024); // clamp to min
+    }
+    #[cfg(test)]
+    mod plan_tests {
+        use super::*;
+        use tachyon_core::config::SchedulerConfig;
+
+        // ------ 正常路径测试 ------
+
+        #[test]
+        fn test_plan_fragments_normal_range_supported() {
+            let config = SchedulerConfig::default();
+            // 100MB 文件,支持 Range
+            let frags = plan_fragments(100 * 1024 * 1024, true, None, &config);
+            assert!(!frags.is_empty(), "应至少生成一个分片");
+
+            // 验证连续性和完整性
+            assert_eq!(frags[0].start, 0);
+            let total_size: u64 = frags.iter().map(|f| f.size).sum();
+            assert_eq!(total_size, 100 * 1024 * 1024);
+
+            // 验证索引连续
+            for (i, frag) in frags.iter().enumerate() {
+                assert_eq!(frag.index, i as u32);
+                assert_eq!(frag.downloaded, 0);
+                assert!(frag.hash.is_none());
+            }
+
+            // 验证相邻分片无缝衔接
+            for window in frags.windows(2) {
+                assert_eq!(window[0].end + 1, window[1].start);
+            }
+
+            // 最后一个分片的 end 应覆盖到文件末尾
+            let last = frags.last().unwrap();
+            assert_eq!(last.end, 100 * 1024 * 1024 - 1);
+        }
+
+        #[test]
+        fn test_plan_fragments_small_file() {
+            let config = SchedulerConfig::default();
+            // 500 字节文件,支持 Range —— 小于 min_fragment_size
+            let frags = plan_fragments(500, true, None, &config);
+            assert_eq!(frags.len(), 1, "小于最小分片的文件应只产生一个分片");
+            assert_eq!(frags[0].start, 0);
+            assert_eq!(frags[0].end, 499);
+            assert_eq!(frags[0].size, 500);
+        }
+
+        #[test]
+        fn test_plan_fragments_exactly_one_page() {
+            let config = SchedulerConfig::default();
+            // 恰好等于 min_fragment_size (1MB)
+            let size = 1024 * 1024u64;
+            let frags = plan_fragments(size, true, None, &config);
+            let total: u64 = frags.iter().map(|f| f.size).sum();
+            assert_eq!(total, size);
+        }
+
+        // ------ 边界值测试 ------
+
+        #[test]
+        fn test_plan_fragments_empty_file() {
+            let config = SchedulerConfig::default();
+            let frags = plan_fragments(0, true, None, &config);
+            assert!(frags.is_empty(), "空文件不应产生任何分片");
+        }
+
+        #[test]
+        fn test_plan_fragments_empty_file_no_range() {
+            let config = SchedulerConfig::default();
+            let frags = plan_fragments(0, false, None, &config);
+            assert!(frags.is_empty(), "空文件无论是否支持 Range 都不应产生分片");
+        }
+
+        #[test]
+        fn test_plan_fragments_single_byte() {
+            let config = SchedulerConfig::default();
+            let frags = plan_fragments(1, true, None, &config);
+            assert_eq!(frags.len(), 1);
+            assert_eq!(frags[0].size, 1);
+            assert_eq!(frags[0].start, 0);
+            assert_eq!(frags[0].end, 0);
+        }
+
+        // ------ 不支持 Range 测试 ------
+
+        #[test]
+        fn test_plan_fragments_no_range_support() {
+            let config = SchedulerConfig::default();
+            let file_size = 50 * 1024 * 1024u64; // 50MB
+            let frags = plan_fragments(file_size, false, None, &config);
+            assert_eq!(frags.len(), 1, "不支持 Range 时应只产生单个分片");
+            assert_eq!(frags[0].index, 0);
+            assert_eq!(frags[0].start, 0);
+            assert_eq!(frags[0].end, file_size - 1);
+            assert_eq!(frags[0].size, file_size);
+        }
+
+        // ------ 自定义配置测试 ------
+
+        #[test]
+        fn test_with_scheduler_config() {
+            let config = SchedulerConfig {
+                min_fragment_size: 512 * 1024,       // 512KB
+                max_fragment_size: 32 * 1024 * 1024, // 32MB
+                sampling_interval_secs: 30,
+                ewma_alpha: 0.5,
+                ..Default::default()
+            };
+
+            // 验证配置被正确传入(通过检查分片大小约束)
+            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config);
+            for frag in &frags {
+                assert!(frag.size >= config.min_fragment_size || frag.size == 10 * 1024 * 1024);
+            }
+        }
+
+        // ------ 分片完整性回归测试 ------
+
+        #[test]
+        fn test_plan_fragments_large_file_total_coverage() {
+            let config = SchedulerConfig::default();
+            let file_size = 1024 * 1024 * 1024u64; // 1GB
+            let frags = plan_fragments(file_size, true, None, &config);
+            let total: u64 = frags.iter().map(|f| f.size).sum();
+            assert_eq!(total, file_size, "所有分片大小之和必须等于文件大小");
+
+            // 确保没有重叠:每段的 start == 前一段 end + 1
+            for window in frags.windows(2) {
+                assert_eq!(window[0].end + 1, window[1].start, "相邻分片之间不应有间隙");
+            }
+        }
+
+        // ------ suggested_frag_size 测试 ------
+
+        #[test]
+        fn test_plan_fragments_with_suggested_size() {
+            let config = SchedulerConfig::default();
+            let file_size = 10 * 1024 * 1024u64;
+            let suggested = 2 * 1024 * 1024u64;
+
+            let frags = plan_fragments(file_size, true, Some(suggested), &config);
+            assert!(!frags.is_empty());
+
+            // 每个分片(除最后一个)大小应为 suggested
+            for frag in &frags[..frags.len() - 1] {
+                assert_eq!(frag.size, suggested, "非末尾分片大小应为建议值");
+            }
+
+            let total: u64 = frags.iter().map(|f| f.size).sum();
+            assert_eq!(total, file_size);
+        }
+
+        #[test]
+        fn test_plan_fragments_suggested_size_zero_falls_back() {
+            let config = SchedulerConfig::default();
+            let file_size = 10 * 1024 * 1024u64;
+
+            // suggested=0 应回退到内部计算
+            let frags_zero = plan_fragments(file_size, true, Some(0), &config);
+            let frags_none = plan_fragments(file_size, true, None, &config);
+            assert_eq!(
+                frags_zero.len(),
+                frags_none.len(),
+                "suggested=0 应与 None 结果一致"
+            );
+        }
+
+        #[test]
+        fn test_plan_fragments_uses_scheduler_target_not_pool_max() {
+            let config = SchedulerConfig {
+                min_fragment_size: 1024 * 1024,
+                max_fragment_size: 64 * 1024 * 1024,
+                default_target_fragments: 100,
+                ..Default::default()
+            };
+
+            // 10MB file, 100 target fragments -> 102KB per fragment -> clamped to min 1MB -> 10 fragments
+            // If max_global=4 was used as target_fragments: 10MB/4 = 2.5MB -> still clamped -> 4 fragments
+            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config);
+            assert_eq!(
+                frags.len(),
+                10,
+                "应使用 SchedulerConfig::default_target_fragments 而非 PoolConfig::max_global"
+            );
+        }
     }
 }
 

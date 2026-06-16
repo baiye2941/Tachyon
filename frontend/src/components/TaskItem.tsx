@@ -1,6 +1,7 @@
 import { createMemo, For, Show } from 'solid-js'
 import type { TaskInfo, ListDensity } from '../types'
 import { CheckboxIcon } from './icons'
+import { COLUMN_WIDTH } from './taskColumns'
 import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel } from '../utils/format'
 
 interface TaskItemProps {
@@ -15,53 +16,48 @@ interface TaskItemProps {
   staggerIndex?: number
 }
 
+/**
+ * 搜索高亮文本组件。
+ *
+ * 用 String.split(regex) 单次分割(O(n))替代原先的 indexOf 循环(O(n×m)),
+ * 大小写不敏感由正则 i 标志处理,无需预先 toLowerCase 整串。
+ * 无 query 时返回 null,fallback 直接渲染原文,避免无谓的数组创建。
+ *
+ * 高亮用 <mark class="search-highlight"> 语义化标签,样式走 CSS token。
+ */
 function HighlightedText(props: { text: string; query: string }) {
-  const parts = createMemo(() => {
-    const text = props.text
+  const segments = createMemo(() => {
     const query = props.query.trim()
+    if (!query) return null // null = 无高亮,直接渲染原文
 
-    if (!query) return [{ text, highlight: false }]
-
-    const lowerText = text.toLowerCase()
-    const lowerQuery = query.toLowerCase()
-    const result: { text: string; highlight: boolean }[] = []
-
-    let i = 0
-    while (i < text.length) {
-      const idx = lowerText.indexOf(lowerQuery, i)
-      if (idx === -1) {
-        result.push({ text: text.slice(i), highlight: false })
-        break
-      }
-      if (idx > i) {
-        result.push({ text: text.slice(i, idx), highlight: false })
-      }
-      result.push({ text: text.slice(idx, idx + query.length), highlight: true })
-      i = idx + query.length
+    try {
+      // 转义正则特殊字符,避免恶意输入触发 ReDoS
+      const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const regex = new RegExp(`(${escaped})`, 'gi')
+      const result = props.text.split(regex)
+      // split 带捕获组会保留分隔符:奇数下标 = 匹配项
+      return result.length > 1 ? result : null
+    } catch {
+      return null // 非法正则回退
     }
-
-    return result
   })
 
   return (
-    <>
-      <For each={parts()}>
-        {(part) => part.highlight ? (
-          <span
-            style={{
-              background: 'rgba(0, 212, 170, 0.2)',
-              color: '#00D4AA',
-              'border-radius': '2px',
-              padding: '0 2px',
-            }}
-          >
-            {part.text}
-          </span>
-        ) : (
-          <>{part.text}</>
-        )}
-      </For>
-    </>
+    <Show when={segments()} fallback={props.text}>
+      {(segs) => (
+        <For each={segs()}>
+          {(seg, i) => {
+            // eslint-disable-next-line solid/reactivity -- <For> 回调是 tracked scope,i() 安全
+            const isMatch = i() % 2 === 1
+            return isMatch ? (
+              <mark class="search-highlight">{seg}</mark>
+            ) : (
+              seg
+            )
+          }}
+        </For>
+      )}
+    </Show>
   )
 }
 
@@ -87,15 +83,17 @@ export default function TaskItem(props: TaskItemProps) {
       role="button"
       tabindex="0"
       aria-label={ariaLabel()}
-      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00D4AA] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A12]"
+      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter focus:outline-none focus-visible:focus-ring"
       style={{
-        padding: isCompact() ? '8px 16px' : '12px 16px',
+        padding: isCompact() ? '6px 16px' : '12px 16px',
         background: props.isMultiSelected
-          ? 'rgba(0, 212, 170, 0.08)'
+          ? 'var(--color-accent-soft)'
           : props.isSelected
-            ? 'rgba(0, 212, 170, 0.04)'
+            ? 'var(--color-accent-faint)'
             : 'transparent',
-        'border-left': props.isMultiSelected ? '2px solid #00D4AA' : '2px solid transparent',
+        'border-left': props.isMultiSelected
+          ? '2px solid var(--color-accent-primary)'
+          : '2px solid transparent',
         '--stagger-index': props.staggerIndex ?? 0,
       }}
       onClick={() => props.onClick()}
@@ -108,10 +106,13 @@ export default function TaskItem(props: TaskItemProps) {
             class="flex items-center justify-center flex-shrink-0"
             role="checkbox"
             aria-checked={props.isMultiSelected}
+            aria-label={`选择任务：${props.task.fileName}`}
             style={{
               width: '20px',
               height: '20px',
-              color: props.isMultiSelected ? '#00D4AA' : '#6B7280',
+              color: props.isMultiSelected
+                ? 'var(--color-accent-primary)'
+                : 'var(--color-text-tertiary)',
             }}
           >
             <CheckboxIcon checked={props.isMultiSelected} />
@@ -121,8 +122,8 @@ export default function TaskItem(props: TaskItemProps) {
         <div
           class="flex items-center justify-center flex-shrink-0"
           style={{
-            width: isCompact() ? '32px' : '40px',
-            height: isCompact() ? '32px' : '40px',
+            width: isCompact() ? '28px' : '40px',
+            height: isCompact() ? '28px' : '40px',
             color: fileInfo().color,
           }}
         >
@@ -138,19 +139,20 @@ export default function TaskItem(props: TaskItemProps) {
               <div
                 class="truncate"
                 style={{
-                  'font-size': '14px',
+                  'font-size': isCompact() ? '13px' : '14px',
                   'font-weight': 500,
-                  color: '#F0F0F5',
+                  color: 'var(--color-text-title)',
                 }}
               >
                 <HighlightedText text={props.task.fileName} query={props.searchQuery || ''} />
               </div>
+              {/* compact 模式隐藏元信息行,换取信息密度 */}
               <Show when={!isCompact()}>
                 <div
                   class="truncate"
                   style={{
                     'font-size': '12px',
-                    color: '#A0A0B0',
+                    color: 'var(--color-text-secondary)',
                     'margin-top': '2px',
                   }}
                 >
@@ -166,10 +168,10 @@ export default function TaskItem(props: TaskItemProps) {
               class="flex-shrink-0"
               style={{
                 'min-width': '60px',
-                width: '120px',
+                width: COLUMN_WIDTH.progress,
                 'text-align': 'right',
-                'font-size': '14px',
-                color: '#A0A0B0',
+                'font-size': isCompact() ? '12px' : '14px',
+                color: 'var(--color-text-secondary)',
                 'font-family': "'Geist Mono', monospace",
               }}
             >
@@ -180,10 +182,14 @@ export default function TaskItem(props: TaskItemProps) {
               class="flex-shrink-0"
               style={{
                 'min-width': '60px',
-                width: '100px',
+                width: COLUMN_WIDTH.speed,
                 'text-align': 'right',
-                'font-size': '13px',
-                color: props.task.status === 'downloading' ? '#00D4AA' : '#A0A0B0',
+                'font-size': isCompact() ? '12px' : '13px',
+                // 下载中速度用 Neon Cyan(能量隐喻),其余中性灰
+                color:
+                  props.task.status === 'downloading'
+                    ? 'var(--color-speed-active)'
+                    : 'var(--color-text-secondary)',
                 'font-family': "'Geist Mono', monospace",
                 'overflow': 'hidden',
                 'text-overflow': 'ellipsis',
@@ -197,9 +203,9 @@ export default function TaskItem(props: TaskItemProps) {
               class="flex-shrink-0"
               style={{
                 'min-width': '40px',
-                width: '80px',
+                width: COLUMN_WIDTH.status,
                 'text-align': 'right',
-                'font-size': '12px',
+                'font-size': isCompact() ? '11px' : '12px',
                 color: getStatusColor(props.task.status),
                 'overflow': 'hidden',
                 'text-overflow': 'ellipsis',
@@ -214,9 +220,9 @@ export default function TaskItem(props: TaskItemProps) {
             class="relative overflow-hidden"
             style={{
               height: isCompact() ? '2px' : '3px',
-              'margin-top': isCompact() ? '6px' : '8px',
+              'margin-top': isCompact() ? '4px' : '8px',
               'border-radius': '9999px',
-              background: '#1A1A25',
+              background: 'var(--color-bg-tertiary)',
             }}
           >
             <div
@@ -224,11 +230,15 @@ export default function TaskItem(props: TaskItemProps) {
               style={{
                 width: `${props.task.progress * 100}%`,
                 'border-radius': '9999px',
-                background: props.task.status === 'failed'
-                  ? '#EF4444'
-                  : props.task.status === 'downloading'
-                    ? undefined
-                    : 'linear-gradient(90deg, #00D4AA 0%, #00B4D8 100%)',
+                // 完成态用 emerald,失败用 red,下载中由 .progress-bar-active 接管(紫色 shimmer)
+                background:
+                  props.task.status === 'failed'
+                    ? 'var(--color-status-error)'
+                    : props.task.status === 'completed'
+                      ? 'var(--color-status-completed)'
+                      : props.task.status === 'downloading'
+                        ? undefined
+                        : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
                 transition: 'width 300ms ease-out',
               }}
             />

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use tachyon_core::DownloadResult;
 use tachyon_io::TokioFile;
@@ -28,6 +28,11 @@ pub(crate) trait ErasedStorage: Send + Sync {
         offset: u64,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
+    fn write_at_mut_erased(
+        &self,
+        offset: u64,
+        data: BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
     fn read_at_erased<'a>(
         &'a self,
         offset: u64,
@@ -39,6 +44,7 @@ pub(crate) trait ErasedStorage: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
     fn sync_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
     fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>>;
+    fn close_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
 }
 
 impl<S: AsyncStorage + 'static> ErasedStorage for S {
@@ -48,6 +54,14 @@ impl<S: AsyncStorage + 'static> ErasedStorage for S {
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
         self.write_at(offset, data)
+    }
+
+    fn write_at_mut_erased(
+        &self,
+        offset: u64,
+        data: BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        self.write_at_mut(offset, data)
     }
 
     fn read_at_erased<'a>(
@@ -72,6 +86,10 @@ impl<S: AsyncStorage + 'static> ErasedStorage for S {
     fn file_size_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
         self.file_size()
     }
+
+    fn close_erased(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+        self.close()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +107,14 @@ impl DynStorage {
     /// 从任意 AsyncStorage 实现创建
     pub fn new<S: AsyncStorage + 'static>(storage: S) -> Self {
         Self(Arc::new(storage))
+    }
+
+    /// 显式关闭存储后端
+    ///
+    /// 确保数据 fsync 和资源释放（轮询线程退出、pending I/O 排空）
+    /// 在调用方确定的时机执行,而非依赖 Arc drop 的不确定时机。
+    pub async fn close(&self) -> DownloadResult<()> {
+        self.0.close_erased().await
     }
 
     /// 从 Arc 包装的 AsyncStorage 创建
@@ -180,6 +206,11 @@ impl DynStorage {
         self.0.write_at_erased(offset, data).await
     }
 
+    /// 写入 BytesMut 数据（避免 freeze() 产生额外复制）
+    pub async fn write_at_mut(&self, offset: u64, data: BytesMut) -> DownloadResult<usize> {
+        self.0.write_at_mut_erased(offset, data).await
+    }
+
     /// 从指定偏移读取数据
     pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> DownloadResult<usize> {
         self.0.read_at_erased(offset, buf).await
@@ -259,21 +290,5 @@ impl DynStorage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FragmentProgress: 分片进度回调消息
-// ---------------------------------------------------------------------------
-
-/// 分片进度回调消息
-///
-/// 通过 `progress_tx` 通道发送给上层(tachyon-app),用于:
-/// - `completed == false`:增量进度更新(每写一个 chunk 发一次)
-/// - `completed == true`:分片整体下载完成,触发上层 checkpoint 落盘(断点续传)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FragmentProgress {
-    /// 分片索引
-    pub fragment_index: u32,
-    /// 该分片是否已整体完成
-    pub completed: bool,
-    /// 该分片当前已下载字节数
-    pub fragment_downloaded: u64,
-}
+// FragmentProgress 已移动到 tachyon-core::types,本模块不再定义该类型,
+// 相关实现统一通过 tachyon_core::FragmentProgress 引用。

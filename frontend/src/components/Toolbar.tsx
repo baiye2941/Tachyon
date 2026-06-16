@@ -1,186 +1,167 @@
-import { For, Show } from 'solid-js'
+import { For, Show, createSignal } from "solid-js";
 import {
-  PlusIcon, SearchIcon, PauseIcon, PlayIcon, SettingsIcon,
-  SelectIcon, CheckboxIcon, XIcon, TrashIcon,
-} from './icons'
+  PlusIcon,
+  SearchIcon,
+  PauseIcon,
+  PlayIcon,
+  SettingsIcon,
+  SelectIcon,
+  CheckboxIcon,
+  XIcon,
+  TrashIcon,
+} from "./icons";
+import Button from "../shared/ui/Button";
 
 function getFilterColor(type: string): string {
   switch (type) {
-    case 'status': return '#00D4AA'
-    case 'type': return '#00B4D8'
-    case 'size': return '#F59E0B'
-    case 'speed': return '#8B5CF6'
-    case 'name': return '#A0A0B0'
-    default: return '#A0A0B0'
+    case "status":
+      return "var(--color-accent-primary)"; // Tachyon Violet - 状态筛选
+    case "type":
+      return "var(--color-status-connecting)"; // cyan-400 - 类型筛选
+    case "size":
+      return "var(--color-warning)"; // amber - 大小筛选
+    case "speed":
+      return "var(--color-speed-active)"; // Neon Cyan - 速度筛选
+    case "name":
+      return "var(--color-text-secondary)"; // silver - 名称筛选
+    default:
+      return "var(--color-text-secondary)";
   }
 }
 
 function getFilterBorderColor(type: string): string {
   switch (type) {
-    case 'status': return 'rgba(0, 212, 170, 0.3)'
-    case 'type': return 'rgba(0, 180, 216, 0.3)'
-    case 'size': return 'rgba(245, 158, 11, 0.3)'
-    case 'speed': return 'rgba(139, 92, 246, 0.3)'
-    case 'name': return 'rgba(255, 255, 255, 0.1)'
-    default: return 'rgba(255, 255, 255, 0.1)'
+    case "status":
+      return "var(--color-accent-glow)";
+    case "type":
+      return "var(--color-info-soft)";
+    case "size":
+      return "var(--color-warning-soft)";
+    case "speed":
+      return "var(--color-speed-soft)";
+    case "name":
+      return "var(--color-border-default)";
+    default:
+      return "var(--color-border-default)";
   }
 }
 
 interface FilterTag {
-  type: string
-  value: string
-  raw: string
+  type: string;
+  value: string;
+  raw: string;
 }
 
 interface ToolbarProps {
-  searchQuery: string
-  onSearchChange: (q: string) => void
-  filters: FilterTag[]
-  onRemoveFilter: (raw: string) => void
-  isMultiSelectMode: boolean
-  onToggleMultiSelect: () => void
-  selectedCount: number
-  onSelectAll: () => void
-  onPauseSelected: () => void
-  onResumeSelected: () => void
-  onDeleteSelected: () => void
-  onExitMultiSelect: () => void
-  listDensity: 'comfortable' | 'compact'
-  onToggleDensity: () => void
-  onNewTask: () => void
-  onOpenSettings: () => void
+  searchQuery: string;
+  onSearchChange: (q: string) => void;
+  filters: FilterTag[];
+  onRemoveFilter: (raw: string) => void;
+  isMultiSelectMode: boolean;
+  onToggleMultiSelect: () => void;
+  selectedCount: number;
+  onSelectAll: () => void;
+  onPauseSelected: () => void;
+  onResumeSelected: () => void;
+  onDeleteSelected: () => void;
+  onExitMultiSelect: () => void;
+  listDensity: "comfortable" | "compact";
+  onToggleDensity: () => void;
+  onNewTask: () => void;
+  onOpenSettings: () => void;
+  onPauseAll: () => void;
+  onResumeAll: () => void;
 }
 
 export default function Toolbar(props: ToolbarProps) {
+  const [searchExpanded, setSearchExpanded] = createSignal(false);
+
   return (
     <div
       class="flex items-center justify-between flex-shrink-0"
       style={{
-        height: '56px',
-        padding: '0 16px',
-        'border-bottom': '1px solid rgba(255,255,255,0.05)',
+        height: "56px",
+        padding: "0 16px",
+        "border-bottom": "1px solid var(--color-border-subtle)",
       }}
     >
       {props.isMultiSelectMode ? (
         <div class="flex items-center gap-3 flex-1">
-          <button
-            class="hover-light flex items-center gap-2"
-            style={{
-              padding: '6px 12px',
-              'border-radius': '6px',
-              'font-size': '14px',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-            onClick={props.onSelectAll}
-          >
+          <Button variant="ghost" size="md" onClick={props.onSelectAll}>
             <CheckboxIcon checked={props.selectedCount > 0} />
             <span>全选</span>
-          </button>
+          </Button>
 
-          <span style={{ 'font-size': '14px', color: '#A0A0B0' }}>
+          <span
+            style={{
+              "font-size": "14px",
+              color: "var(--color-text-secondary)",
+            }}
+          >
             已选 {props.selectedCount} 项
           </span>
 
           <div class="flex-1" />
 
-          <button
-            class="hover-light flex items-center gap-1"
-            style={{
-              padding: '6px 12px',
-              'border-radius': '6px',
-              'font-size': '14px',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-            onClick={props.onPauseSelected}
-          >
+          <Button variant="ghost" size="md" onClick={props.onPauseSelected}>
             <PauseIcon />
             <span>暂停</span>
-          </button>
+          </Button>
 
-          <button
-            class="hover-light flex items-center gap-1"
-            style={{
-              padding: '6px 12px',
-              'border-radius': '6px',
-              'font-size': '14px',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-            onClick={props.onResumeSelected}
-          >
+          <Button variant="ghost" size="md" onClick={props.onResumeSelected}>
             <PlayIcon />
             <span>恢复</span>
-          </button>
+          </Button>
 
-          <button
-            class="hover-danger flex items-center gap-1"
-            style={{
-              padding: '6px 12px',
-              'border-radius': '6px',
-              'font-size': '14px',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-            onClick={props.onDeleteSelected}
-          >
+          <Button variant="danger" size="md" onClick={props.onDeleteSelected}>
             <TrashIcon />
             <span>删除</span>
-          </button>
+          </Button>
 
-          <button
-            class="hover-light flex items-center gap-1"
-            style={{
-              padding: '6px 12px',
-              'border-radius': '6px',
-              'font-size': '14px',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-            onClick={props.onExitMultiSelect}
-          >
+          <Button variant="ghost" size="md" onClick={props.onExitMultiSelect}>
             <XIcon />
             <span>退出</span>
-          </button>
+          </Button>
         </div>
       ) : (
         <div class="flex items-center gap-3 flex-1">
-          <button
-            class="btn-primary hover-lift flex items-center gap-2"
-            style={{ 'font-size': '14px' }}
+          <Button
+            variant="primary"
+            size="md"
+            class="hover-lift"
             onClick={props.onNewTask}
           >
             <PlusIcon />
             <span>新建下载</span>
-          </button>
+          </Button>
 
           <div class="relative flex flex-col gap-2">
             <div class="relative">
               <div
                 class="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                style={{ color: '#6B7280' }}
+                style={{ color: "var(--color-text-tertiary)" }}
               >
                 <SearchIcon />
               </div>
               <input
                 type="text"
-                placeholder="搜索任务或设置..."
+                placeholder="搜索任务或设置 (例: status:downloading size:>1gb)"
                 value={props.searchQuery}
-                onInput={e => props.onSearchChange(e.currentTarget.value)}
+                onInput={(e) => props.onSearchChange(e.currentTarget.value)}
                 class="input"
                 style={{
-                  'padding-left': '36px',
-                  width: '280px',
-                  'font-size': '14px',
-                  transition: 'all 200ms ease',
+                  "padding-left": "36px",
+                  width: searchExpanded() ? "320px" : "280px",
+                  "font-size": "14px",
+                  transition:
+                    "width var(--duration-normal) var(--ease-standard)",
                 }}
-                onFocus={e => {
-                  e.currentTarget.style.width = '320px'
+                onFocus={() => {
+                  setSearchExpanded(true);
                 }}
-                onBlur={e => {
-                  if (!e.currentTarget.value) {
-                    e.currentTarget.style.width = '280px'
+                onBlur={() => {
+                  if (!props.searchQuery) {
+                    setSearchExpanded(false);
                   }
                 }}
               />
@@ -193,10 +174,10 @@ export default function Toolbar(props: ToolbarProps) {
                     <div
                       class="flex items-center gap-1"
                       style={{
-                        padding: '2px 8px',
-                        'border-radius': '4px',
-                        'font-size': '12px',
-                        background: 'rgba(255, 255, 255, 0.06)',
+                        padding: "2px 8px",
+                        "border-radius": "4px",
+                        "font-size": "12px",
+                        background: "var(--color-bg-hover)",
                         border: `1px solid ${getFilterBorderColor(filter.type)}`,
                         color: getFilterColor(filter.type),
                       }}
@@ -205,15 +186,16 @@ export default function Toolbar(props: ToolbarProps) {
                       <button
                         class="flex items-center justify-center"
                         style={{
-                          width: '14px',
-                          height: '14px',
-                          background: 'none',
-                          border: 'none',
-                          cursor: 'pointer',
-                          color: 'inherit',
+                          width: "14px",
+                          height: "14px",
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          color: "inherit",
                           opacity: 0.7,
                         }}
                         onClick={() => props.onRemoveFilter(filter.raw)}
+                        aria-label={`移除筛选 ${filter.raw}`}
                       >
                         <XIcon />
                       </button>
@@ -226,23 +208,47 @@ export default function Toolbar(props: ToolbarProps) {
 
           <div class="flex-1" />
 
-          <button class="icon-btn" title="暂停全部">
+          <Button
+            variant="ghost"
+            shape="icon"
+            title="暂停全部"
+            aria-label="暂停全部"
+            onClick={props.onPauseAll}
+          >
             <PauseIcon />
-          </button>
+          </Button>
 
-          <button class="icon-btn" title="恢复全部">
+          <Button
+            variant="ghost"
+            shape="icon"
+            title="恢复全部"
+            aria-label="恢复全部"
+            onClick={props.onResumeAll}
+          >
             <PlayIcon />
-          </button>
+          </Button>
 
-          <button class="icon-btn" title="设置" onClick={props.onOpenSettings}>
+          <Button
+            variant="ghost"
+            shape="icon"
+            title="设置"
+            aria-label="设置"
+            onClick={props.onOpenSettings}
+          >
             <SettingsIcon />
-          </button>
+          </Button>
 
-          <button class="icon-btn" onClick={props.onToggleMultiSelect} title="多选模式">
+          <Button
+            variant="ghost"
+            shape="icon"
+            title="多选模式"
+            aria-label="多选模式"
+            onClick={props.onToggleMultiSelect}
+          >
             <SelectIcon />
-          </button>
+          </Button>
         </div>
       )}
     </div>
-  )
+  );
 }

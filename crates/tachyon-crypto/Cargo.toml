@@ -9,7 +9,6 @@ description = "Tachyon 校验层:GPU 加速哈希与完整性校验"
 tachyon-core = { path = "../tachyon-core" }
 blake3.workspace = true
 sha2.workspace = true
-bytes.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

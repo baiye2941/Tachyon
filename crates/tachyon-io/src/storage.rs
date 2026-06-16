@@ -3,9 +3,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
-use tachyon_core::DownloadResult;
+use tachyon_core::{DownloadError, DownloadResult};
 
 pub trait AsyncStorage: Send + Sync {
     fn write_at(
@@ -13,6 +13,20 @@ pub trait AsyncStorage: Send + Sync {
         offset: u64,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
+
+    /// 写入 BytesMut 数据（避免 freeze() 产生额外复制）
+    ///
+    /// P1-05: 默认实现调用 `write_at(data.freeze())`，后端可覆盖以直接
+    /// 使用 BytesMut 内部缓冲区，省去 freeze() 的原子引用计数操作。
+    /// 对于 IOCP 等已预分配对齐缓冲区的后端，覆盖此方法可直接
+    /// 从 BytesMut 的连续内存区拷贝到对齐缓冲区，无需中间 Bytes 转换。
+    fn write_at_mut(
+        &self,
+        offset: u64,
+        data: BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        Box::pin(async move { self.write_at(offset, data.freeze()).await })
+    }
 
     fn read_at<'a>(
         &'a self,
@@ -43,10 +57,11 @@ pub trait AsyncStorage: Send + Sync {
         alignment: u64,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
         Box::pin(async move {
-            assert!(
-                alignment > 0 && alignment.is_power_of_two(),
-                "alignment 必须为 2 的正整数幂"
-            );
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(DownloadError::Config(format!(
+                    "alignment 必须为 2 的正整数幂, 实际值: {alignment}"
+                )));
+            }
 
             if data.is_empty() {
                 return Ok(0);
