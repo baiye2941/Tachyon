@@ -1,7 +1,7 @@
 <h1 align="center">Tachyon</h1>
 
 <p align="center">
-  <strong>基于 Rust + Tauri v2 构建的超高性能桌面下载器</strong>
+  <strong>基于 Rust + Tauri v2 构建的高性能桌面下载器</strong>
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
 
 ## 1. 项目概述
 
-Tachyon 是一款使用 Rust 语言构建的桌面端超高性能文件下载器，以 Tauri v2 为 GUI 框架、SolidJS 为前端渲染引擎。项目以 Cargo workspace 组织 11 个 crate，覆盖从网络协议到磁盘 I/O 的完整下载链路。
+Tachyon 是一款使用 Rust 语言构建的桌面端高性能文件下载器，以 Tauri v2 为 GUI 框架、SolidJS 为前端渲染引擎。项目以 Cargo workspace 组织 11 个 crate，覆盖从网络协议到磁盘 I/O 的完整下载链路。
 
 **解决的问题**
 
@@ -26,7 +26,7 @@ Tachyon 是一款使用 Rust 语言构建的桌面端超高性能文件下载器
 - 现有下载工具缺乏 HuggingFace 模型仓库的原生集成
 - 桌面端缺少一款在 I/O 路径上做到零拷贝、GPU 加速校验的极致性能工具
 
-**核心能力（均基于代码实际实现）**
+**核心能力（均基于代码实际）**
 
 | 能力 | 说明 |
 |:--|:--|
