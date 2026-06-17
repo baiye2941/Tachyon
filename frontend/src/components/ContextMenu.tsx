@@ -16,6 +16,7 @@ import {
   RefreshIcon,
   TrashIcon,
 } from "./icons";
+import { tr, type MessageKey } from "../i18n";
 
 interface MenuItem {
   id: string;
@@ -45,6 +46,7 @@ const MENU_PADDING_Y = 6;
 const MENU_ITEM_HEIGHT = 40; // 32px item + 8px gap-ish
 
 export default function ContextMenu(props: ContextMenuProps) {
+  const t = (key: MessageKey) => tr(key);
   let menuRef: HTMLDivElement | undefined;
   let itemRefs: (HTMLButtonElement | undefined)[] = [];
   const [adjustedPos, setAdjustedPos] = createSignal<{ x: number; y: number }>({
@@ -64,7 +66,7 @@ export default function ContextMenu(props: ContextMenuProps) {
     if (canPause()) {
       items.push({
         id: "pause",
-        label: "暂停",
+        label: t("common.pause"),
         icon: () => <PauseIcon />,
         action: () => props.onPause(props.task!.id),
       });
@@ -72,7 +74,7 @@ export default function ContextMenu(props: ContextMenuProps) {
     if (canResume()) {
       items.push({
         id: "resume",
-        label: "恢复",
+        label: t("common.resume"),
         icon: () => <PlayIcon />,
         action: () => props.onResume(props.task!.id),
       });
@@ -83,14 +85,14 @@ export default function ContextMenu(props: ContextMenuProps) {
     if (isCompleted()) {
       items.push({
         id: "open-folder",
-        label: "打开文件所在文件夹",
+        label: t("detail.openFolder"),
         icon: () => <FolderOpenIcon />,
         action: () => props.onOpenFolder(props.task!.id),
       });
     }
     items.push({
       id: "copy-link",
-      label: "复制下载链接",
+      label: t("detail.copyLink"),
       icon: () => <LinkIcon />,
       action: () => props.onCopyLink(props.task!.id),
     });
@@ -99,13 +101,13 @@ export default function ContextMenu(props: ContextMenuProps) {
 
     items.push({
       id: "redownload",
-      label: "重新下载",
+      label: t("detail.redownload"),
       icon: () => <RefreshIcon />,
       action: () => props.onRedownload(props.task!.id),
     });
     items.push({
       id: "delete",
-      label: "删除任务",
+      label: t("detail.action.delete"),
       icon: () => <TrashIcon />,
       danger: true,
       action: () => props.onDelete(props.task!.id),

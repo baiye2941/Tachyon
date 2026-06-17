@@ -10,6 +10,7 @@ import {
 import { THREAD_COLORS } from "../utils/format";
 import { resolveToken } from "../utils/resolveToken";
 import { useReducedMotion } from "../hooks/useReducedMotion";
+import { tr, type MessageKey } from "../i18n";
 
 interface ChunkMatrixProps {
   fragmentsTotal: number;
@@ -88,21 +89,19 @@ export function buildBlocks(
   return blocks;
 }
 
-function statusLabelForChunk(chunk: ChunkData) {
-  if (chunk.isDone) return "已完成";
-  if (chunk.isDownloading) return "下载中";
-  return "等待中";
+function statusLabelForChunk(chunk: ChunkData): string {
+  if (chunk.isDone) return tr("status.label.completed");
+  if (chunk.isDownloading) return tr("status.label.downloading");
+  return tr("status.label.pending");
 }
 
-function statusLabelForBlock(status: ChunkBlock["status"]) {
-  switch (status) {
-    case "done":
-      return "已完成";
-    case "downloading":
-      return "下载中";
-    case "pending":
-      return "等待中";
-  }
+function statusLabelForBlock(status: ChunkBlock["status"]): string {
+  const map: Record<ChunkBlock["status"], MessageKey> = {
+    done: "status.label.completed",
+    downloading: "status.label.downloading",
+    pending: "status.label.pending",
+  };
+  return tr(map[status]);
 }
 
 export default function ChunkMatrix(props: ChunkMatrixProps) {
@@ -329,10 +328,10 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   return (
     <div>
       <div class="section-label" style={{ "margin-bottom": "12px" }}>
-        分片分布
+        {tr("chunk.sectionLabel")}
         <span
           class="chunk-info-hint"
-          title="分片按批次聚合显示,颜色代表下载状态(已完成/下载中/等待),非线程分配"
+          title={tr("chunk.infoHint")}
         >
           ?
         </span>
@@ -413,7 +412,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
               />
               <div class="chunk-tooltip-body">
                 <div class="chunk-tooltip-title">
-                  {"分片"} #{tooltip.idx + 1}
+                  {tr("chunk.tooltip.fragment")} #{tooltip.idx + 1}
                   <span class="chunk-tooltip-subtitle">/ {tooltip.total}</span>
                 </div>
                 <div class="chunk-tooltip-meta">
@@ -455,7 +454,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
               />
               <div class="chunk-tooltip-body">
                 <div class="chunk-tooltip-title">
-                  {"分片"} #{tooltip.block.start + 1}-#{tooltip.block.end}
+                  {tr("chunk.tooltip.fragment")} #{tooltip.block.start + 1}-#{tooltip.block.end}
                 </div>
                 <div class="chunk-tooltip-meta">
                   <span
@@ -472,7 +471,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                   </span>
                 </div>
                 <div class="chunk-tooltip-row" style={{ "margin-top": "4px" }}>
-                  <div class="chunk-tooltip-label">{"已完成"}</div>
+                  <div class="chunk-tooltip-label">{tr("chunk.tooltip.completed")}</div>
                   <div class="chunk-tooltip-value">
                     {tooltip.block.done} / {tooltip.block.total}
                   </div>
@@ -484,14 +483,14 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
         {/* Legend */}
         <div class="flex items-center gap-4" style={{ "margin-top": "12px" }}>
-          <LegendItem color="var(--color-status-completed)" label={"已完成"} />
-          <LegendItem color="var(--color-bg-tertiary)" label={"未开始"} />
+          <LegendItem color="var(--color-status-completed)" label={tr("status.label.completed")} />
+          <LegendItem color="var(--color-bg-tertiary)" label={tr("status.label.notStarted")} />
           <LegendItem
             color="var(--color-status-downloading)"
-            label={"下载中"}
+            label={tr("status.label.downloading")}
             pulse
           />
-          <LegendItem color="var(--color-status-error)" label={"错误"} />
+          <LegendItem color="var(--color-status-error)" label={tr("status.label.error")} />
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { createSignal, Show, For, untrack } from "solid-js";
+import { Show, For, untrack, createMemo } from "solid-js";
 import type { JSX } from "solid-js";
 import type { SidebarFilter, FileTypeFilter } from "../types";
 import {
@@ -19,62 +19,48 @@ import {
   setSidebarFilter,
   setFileTypeFilter,
 } from "../stores/taskFilter";
-import { $ui } from "../stores/ui";
+import {
+  $ui,
+  SIDEBAR_RAIL_WIDTH as RAIL_WIDTH,
+  SIDEBAR_MIN_EXPANDED_WIDTH as MIN_EXPANDED_WIDTH,
+  SIDEBAR_MAX_WIDTH as MAX_WIDTH,
+} from "../stores/ui";
 import Button from "../shared/ui/Button";
+import { useReducedMotion } from "../hooks/useReducedMotion";
+import { useIsNarrowScreen } from "../hooks/useMediaQuery";
+import { tr, type MessageKey } from "../i18n";
 
-const SIDEBAR_STORAGE_KEY = "tachyon-sidebar-state";
-const MIN_WIDTH = 60;
-const MAX_WIDTH = 300;
-const DEFAULT_WIDTH = 200;
-const EDGE_ZONE_WIDTH = 20;
+const EDGE_ZONE_WIDTH = 6;
+const HOVER_COLLAPSE_DELAY = 240;
 type IconComponent = (props: { class?: string }) => JSX.Element;
 
-const statusItems: {
+interface NavEntry {
   key: SidebarFilter;
-  label: string;
+  labelKey: MessageKey;
   icon: IconComponent;
-}[] = [
-  { key: "all", label: "\u5168\u90E8\u6587\u4EF6", icon: FileIcon },
-  { key: "downloading", label: "\u4E0B\u8F7D\u4E2D", icon: FileIcon },
-  { key: "completed", label: "\u5DF2\u5B8C\u6210", icon: FileIcon },
-  { key: "paused", label: "\u5DF2\u6682\u505C", icon: FileIcon },
-  { key: "failed", label: "\u5931\u8D25", icon: FileIcon },
+}
+
+const statusItems: NavEntry[] = [
+  { key: "all", labelKey: "sidebar.filter.all", icon: FileIcon },
+  { key: "downloading", labelKey: "status.label.downloading", icon: FileIcon },
+  { key: "completed", labelKey: "status.label.completed", icon: FileIcon },
+  { key: "paused", labelKey: "status.label.paused", icon: FileIcon },
+  { key: "failed", labelKey: "sidebar.filter.failed", icon: FileIcon },
 ];
 
-const typeItems: { key: FileTypeFilter; label: string; icon: IconComponent }[] =
+const typeItems: { key: FileTypeFilter; labelKey: MessageKey; icon: IconComponent }[] =
   [
-    { key: "video", label: "\u89C6\u9891", icon: VideoIcon },
-    { key: "audio", label: "\u97F3\u9891", icon: AudioIcon },
-    { key: "document", label: "\u6587\u6863", icon: DocumentIcon },
-    { key: "image", label: "\u56FE\u7247", icon: ImageIcon },
-    { key: "archive", label: "\u538B\u7F29\u5305", icon: ArchiveIcon },
-    { key: "other", label: "\u5176\u4ED6", icon: AttachmentIcon },
+    { key: "video", labelKey: "sidebar.filter.video", icon: VideoIcon },
+    { key: "audio", labelKey: "sidebar.filter.audio", icon: AudioIcon },
+    { key: "document", labelKey: "sidebar.filter.document", icon: DocumentIcon },
+    { key: "image", labelKey: "sidebar.filter.image", icon: ImageIcon },
+    { key: "archive", labelKey: "sidebar.filter.archive", icon: ArchiveIcon },
+    { key: "other", labelKey: "sidebar.filter.other", icon: AttachmentIcon },
   ];
-
-function loadSidebarState() {
-  try {
-    const raw = localStorage.getItem(SIDEBAR_STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as { width: number; pinned: boolean };
-  } catch {
-    /* ignore */
-  }
-  return { width: DEFAULT_WIDTH, pinned: false };
-}
-
-function saveSidebarState(w: number, pinned: boolean) {
-  try {
-    localStorage.setItem(
-      SIDEBAR_STORAGE_KEY,
-      JSON.stringify({ width: w, pinned }),
-    );
-  } catch {
-    /* ignore */
-  }
-}
 
 type NavItemProps = {
   icon: IconComponent;
-  label: string;
+  labelKey: MessageKey;
   count: number;
   active: boolean;
   expanded: boolean;
@@ -83,11 +69,12 @@ type NavItemProps = {
 
 const NavItem = (p: NavItemProps) => {
   const Icon = untrack(() => p.icon);
+  const label = () => tr(p.labelKey);
   return (
     <button
-      class={`sidebar-nav-item flex items-center justify-between cursor-pointer select-none focus:outline-none focus-visible:focus-ring ${p.active ? "" : "hover-light"}`}
+      class={`sidebar-nav-item flex items-center cursor-pointer select-none focus:outline-none focus-visible:focus-ring ${p.active ? "" : "hover-light"}`}
       style={{
-        height: "36px",
+        height: "34px",
         padding: p.expanded ? "0 12px" : "0",
         "border-radius": "8px",
         background: p.active ? "var(--color-accent-soft)" : "transparent",
@@ -97,15 +84,15 @@ const NavItem = (p: NavItemProps) => {
         color: p.active
           ? "var(--color-accent-primary)"
           : "var(--color-text-secondary)",
-        transition: "all 200ms ease",
+        transition: "background 150ms ease, color 150ms ease",
         "justify-content": p.expanded ? "space-between" : "center",
         border: "none",
         width: "100%",
       }}
       onClick={() => p.onClick()}
       aria-current={p.active ? "page" : undefined}
-      aria-label={p.label}
-      title={p.label}
+      aria-label={label()}
+      title={label()}
     >
       <div
         class="flex items-center min-w-0"
@@ -125,7 +112,7 @@ const NavItem = (p: NavItemProps) => {
         </div>
         <Show when={p.expanded}>
           <span class="truncate" style={{ "font-size": "14px" }}>
-            {p.label}
+            {label()}
           </span>
         </Show>
       </div>
@@ -144,48 +131,87 @@ const NavItem = (p: NavItemProps) => {
   );
 };
 
+const divider = () => (
+  <div
+    style={{
+      height: "1px",
+      background: "var(--color-bg-hover)",
+      margin: "4px 10px",
+    }}
+  />
+);
+
+const SectionLabel = (props: { children: string }) => (
+  <div
+    style={{
+      "font-size": "11px",
+      "font-weight": 600,
+      color: "var(--color-text-tertiary)",
+      "text-transform": "uppercase",
+      "letter-spacing": "0.5px",
+      padding: "0 8px",
+      "margin-bottom": "4px",
+    }}
+  >
+    {props.children}
+  </div>
+);
+
 export default function Sidebar() {
-  const saved = loadSidebarState();
-  const [width, setWidth] = createSignal(saved.width);
-  const [isPinned, setIsPinned] = createSignal(saved.pinned);
-  const [isHovering, setIsHovering] = createSignal(false);
-  const [isDragging, setIsDragging] = createSignal(false);
-  let hideTimer: number | null = null;
+  // 状态全部来自全局 store(Iteration 13 迁移)
+  const width = () => $ui.sidebarWidth();
+  const isPinned = () => $ui.sidebarPinned();
+  const isCollapsed = () => $ui.sidebarCollapsed();
 
-  const isExpanded = () => isPinned() || isHovering();
-  const displayWidth = () =>
-    isExpanded() ? Math.max(width(), DEFAULT_WIDTH) : MIN_WIDTH;
+  // 响应式 + 动效偏好
+  const isNarrow = useIsNarrowScreen();
+  const reducedMotion = useReducedMotion();
 
-  const showSidebar = () => {
-    if (hideTimer) {
-      clearTimeout(hideTimer);
-      hideTimer = null;
+  // 窄屏强制 collapsed + 取消 pin(不可展开,只能用轨道)
+  const effectiveCollapsed = () => isNarrow() || isCollapsed();
+  const effectivePinned = () => !isNarrow() && isPinned();
+
+  let hoverTimer: number | null = null;
+
+  const expand = () => {
+    if (effectivePinned() || isNarrow()) return;
+    if (hoverTimer) {
+      clearTimeout(hoverTimer);
+      hoverTimer = null;
     }
-    setIsHovering(true);
+    $ui.setSidebarCollapsed(false);
   };
 
-  const hideSidebar = () => {
-    if (isPinned() || isDragging()) return;
-    hideTimer = window.setTimeout(() => setIsHovering(false), 300);
+  const scheduleCollapse = () => {
+    if (effectivePinned() || isNarrow()) return;
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTimer = window.setTimeout(
+      () => $ui.setSidebarCollapsed(true),
+      HOVER_COLLAPSE_DELAY,
+    );
   };
+
+  // 占位宽度:collapsed 仅留轨道;展开 = 面板宽度
+  const placeholderWidth = () =>
+    effectiveCollapsed() ? RAIL_WIDTH : width();
 
   const handleDragStart = (e: MouseEvent) => {
+    if (isNarrow()) return; // 窄屏不可调宽
     e.preventDefault();
-    setIsDragging(true);
     const startX = e.clientX;
     const startWidth = width();
+    document.body.style.cursor = "col-resize";
 
     const handleMove = (ev: MouseEvent) => {
       const newWidth = Math.max(
-        MIN_WIDTH,
+        MIN_EXPANDED_WIDTH,
         Math.min(MAX_WIDTH, startWidth + ev.clientX - startX),
       );
-      setWidth(newWidth);
+      $ui.commitSidebarWidth(newWidth);
     };
 
     const handleUp = () => {
-      setIsDragging(false);
-      saveSidebarState(width(), isPinned());
+      document.body.style.cursor = "";
       document.removeEventListener("mousemove", handleMove);
       document.removeEventListener("mouseup", handleUp);
     };
@@ -194,56 +220,141 @@ export default function Sidebar() {
     document.addEventListener("mouseup", handleUp);
   };
 
-  const togglePin = () => {
-    const next = !isPinned();
-    setIsPinned(next);
-    if (next && width() < DEFAULT_WIDTH) setWidth(DEFAULT_WIDTH);
-    saveSidebarState(width(), next);
-  };
-
   const taskCounts = () => $taskFilter.taskCounts();
   const fileTypeCounts = () => $taskFilter.fileTypeCounts();
   const sidebarFilter = () => $taskFilter.sidebarFilter();
   const fileTypeFilter = () => $taskFilter.fileTypeFilter();
 
+  // 展开面板固定宽度,transform 滑入滑出(合成层,零 reflow)
+  const panelWidth = () => Math.max(width(), MIN_EXPANDED_WIDTH);
+  const panelTranslateX = () =>
+    effectiveCollapsed() ? `-${panelWidth()}px` : "0px";
+
+  // 动效:reducedMotion 时即时,否则平滑过渡
+  const transitionStyle = () =>
+    reducedMotion() ? "none" : "transform 200ms cubic-bezier(0.32, 0.72, 0, 1)";
+  const widthTransitionStyle = () =>
+    reducedMotion() ? "none" : "width 220ms cubic-bezier(0.32, 0.72, 0, 1)";
+
+  // 轨道图标列表(collapsed 态可见)
+  const railEntries = createMemo(() => [
+    ...statusItems.map((it) => ({
+      key: `s-${it.key}`,
+      labelKey: it.labelKey,
+      icon: it.icon,
+      active: sidebarFilter() === it.key,
+      onClick: () => setSidebarFilter(it.key),
+    })),
+    ...typeItems.map((it) => ({
+      key: `t-${it.key}`,
+      labelKey: it.labelKey,
+      icon: it.icon,
+      active: fileTypeFilter() === it.key,
+      onClick: () => setFileTypeFilter(it.key),
+    })),
+    {
+      key: "hub",
+      labelKey: "command.nav.sniffer.label" as MessageKey,
+      icon: HubIcon,
+      active: false,
+      onClick: $ui.openHub,
+    },
+    {
+      key: "history",
+      labelKey: "command.nav.history.label" as MessageKey,
+      icon: HistoryIcon,
+      active: false,
+      onClick: $ui.openHistory,
+    },
+  ]);
+
   return (
     <>
-      {/* Edge trigger zone - only when collapsed and not pinned */}
-      <Show when={!isPinned() && !isHovering()}>
+      {/* Edge trigger zone — 仅 collapsed 且非 pinned 且非窄屏时 */}
+      <Show when={!effectivePinned() && effectiveCollapsed() && !isNarrow()}>
         <div
           class="fixed left-0 top-0 bottom-0 z-[5]"
           style={{ width: `${EDGE_ZONE_WIDTH}px` }}
-          onMouseEnter={showSidebar}
-          onMouseLeave={hideSidebar}
+          onMouseEnter={expand}
         />
       </Show>
 
-      {/* Sidebar panel */}
+      {/* 占位容器:宽度过渡是唯一 reflow 源 */}
       <div
         class="relative flex-shrink-0 h-full overflow-hidden"
         style={{
-          width: `${displayWidth()}px`,
-          transition: isDragging()
-            ? "none"
-            : "width 250ms cubic-bezier(0.32, 0.72, 0, 1)",
+          width: `${placeholderWidth()}px`,
+          transition: widthTransitionStyle(),
           "will-change": "width",
         }}
-        onMouseEnter={showSidebar}
-        onMouseLeave={hideSidebar}
+        onMouseEnter={expand}
+        onMouseLeave={scheduleCollapse}
       >
+        {/* 常驻轨道:始终显示图标,collapsed 态可用 */}
         <div
           class="h-full flex flex-col"
           style={{
-            width: `${Math.max(displayWidth(), DEFAULT_WIDTH)}px`,
+            width: `${RAIL_WIDTH}px`,
             background: "var(--color-bg-secondary)",
             "border-right": "1px solid var(--color-border-subtle)",
-            "pointer-events": isExpanded() ? "auto" : "none",
-            opacity: isExpanded() ? 1 : 0,
-            transition: "opacity 200ms ease",
             position: "absolute",
             left: 0,
             top: 0,
             bottom: 0,
+            padding: "6px 8px",
+            gap: "2px",
+            "z-index": "1",
+          }}
+        >
+          <div
+            class="flex items-center justify-center flex-shrink-0"
+            style={{ height: "34px", "margin-bottom": "2px" }}
+          >
+            <Button
+              variant="ghost"
+              shape="icon-sm"
+              aria-label={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              title={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              class={effectivePinned() ? "is-pinned" : ""}
+              onClick={$ui.toggleSidebarPin}
+              disabled={isNarrow()}
+            >
+              {effectivePinned() ? <PinIcon /> : <PinOffIcon />}
+            </Button>
+          </div>
+          {divider()}
+          <For each={railEntries()}>
+            {(entry) => (
+              <NavItem
+                icon={entry.icon}
+                labelKey={entry.labelKey}
+                count={0}
+                active={entry.active}
+                expanded={false}
+                onClick={entry.onClick}
+              />
+            )}
+          </For>
+          <div class="flex-1" />
+        </div>
+
+        {/* 展开面板:固定宽度,transform 滑入滑出 */}
+        <div
+          class="h-full flex flex-col"
+          style={{
+            width: `${panelWidth()}px`,
+            background: "var(--color-bg-secondary)",
+            "border-right": "1px solid var(--color-border-subtle)",
+            transform: `translateX(${panelTranslateX()})`,
+            transition: transitionStyle(),
+            "will-change": "transform",
+            position: "absolute",
+            left: 0,
+            top: 0,
+            bottom: 0,
+            "z-index": "2",
+            "pointer-events": effectiveCollapsed() ? "none" : "auto",
+            "box-shadow": effectiveCollapsed() ? "none" : "var(--shadow-md)",
           }}
         >
           {/* Pin header */}
@@ -251,143 +362,87 @@ export default function Sidebar() {
             class="flex items-center justify-between flex-shrink-0"
             style={{
               height: "40px",
-              padding: isExpanded() ? "0 12px" : "0 4px",
+              padding: "0 12px",
               "border-bottom": "1px solid var(--color-border-subtle)",
             }}
           >
-            <Show when={isExpanded()}>
-              <span
-                style={{
-                  "font-size": "11px",
-                  "font-weight": 600,
-                  color: "var(--color-text-tertiary)",
-                  "letter-spacing": "0.5px",
-                }}
-              >
-                {"\u5BFC\u822A"}
-              </span>
-            </Show>
+            <span
+              style={{
+                "font-size": "11px",
+                "font-weight": 600,
+                color: "var(--color-text-tertiary)",
+                "letter-spacing": "0.5px",
+              }}
+            >
+              {tr("sidebar.nav")}
+            </span>
             <Button
               variant="ghost"
               shape="icon-sm"
-              aria-label={isPinned() ? "取消固定" : "固定侧边栏"}
-              title={isPinned() ? "取消固定" : "固定侧边栏"}
-              class={isPinned() ? "is-pinned" : ""}
-              onClick={togglePin}
+              aria-label={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              title={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              class={effectivePinned() ? "is-pinned" : ""}
+              onClick={$ui.toggleSidebarPin}
             >
-              {isPinned() ? <PinIcon /> : <PinOffIcon />}
+              {effectivePinned() ? <PinIcon /> : <PinOffIcon />}
             </Button>
           </div>
 
           {/* Status section */}
           <div class="flex flex-col gap-1" style={{ padding: "8px 6px" }}>
-            <Show when={isExpanded()}>
-              <div
-                style={{
-                  "font-size": "11px",
-                  "font-weight": 600,
-                  color: "var(--color-text-tertiary)",
-                  "text-transform": "uppercase",
-                  "letter-spacing": "0.5px",
-                  padding: "0 8px",
-                  "margin-bottom": "4px",
-                }}
-              >
-                {"\u72B6\u6001"}
-              </div>
-            </Show>
+            <SectionLabel>{tr("sidebar.section.status")}</SectionLabel>
             <For each={statusItems}>
               {(item) => (
                 <NavItem
                   icon={item.icon}
-                  label={item.label}
+                  labelKey={item.labelKey}
                   count={taskCounts()[item.key]}
                   active={sidebarFilter() === item.key}
-                  expanded={isExpanded()}
+                  expanded={true}
                   onClick={() => setSidebarFilter(item.key)}
                 />
               )}
             </For>
           </div>
 
-          <div
-            style={{
-              height: "1px",
-              background: "var(--color-bg-hover)",
-              margin: "4px 10px",
-            }}
-          />
+          {divider()}
 
           {/* Type section */}
           <div class="flex flex-col gap-1" style={{ padding: "8px 6px" }}>
-            <Show when={isExpanded()}>
-              <div
-                style={{
-                  "font-size": "11px",
-                  "font-weight": 600,
-                  color: "var(--color-text-tertiary)",
-                  "text-transform": "uppercase",
-                  "letter-spacing": "0.5px",
-                  padding: "0 8px",
-                  "margin-bottom": "4px",
-                }}
-              >
-                {"\u5206\u7C7B"}
-              </div>
-            </Show>
+            <SectionLabel>{tr("sidebar.section.type")}</SectionLabel>
             <For each={typeItems}>
               {(item) => (
                 <NavItem
                   icon={item.icon}
-                  label={item.label}
+                  labelKey={item.labelKey}
                   count={fileTypeCounts()[item.key]}
                   active={fileTypeFilter() === item.key}
-                  expanded={isExpanded()}
+                  expanded={true}
                   onClick={() => setFileTypeFilter(item.key)}
                 />
               )}
             </For>
           </div>
 
-          <div
-            style={{
-              height: "1px",
-              background: "var(--color-bg-hover)",
-              margin: "4px 10px",
-            }}
-          />
+          {divider()}
 
           {/* Lab section */}
           <div class="flex flex-col gap-1" style={{ padding: "8px 6px" }}>
-            <Show when={isExpanded()}>
-              <div
-                style={{
-                  "font-size": "11px",
-                  "font-weight": 600,
-                  color: "var(--color-text-tertiary)",
-                  "text-transform": "uppercase",
-                  "letter-spacing": "0.5px",
-                  padding: "0 8px",
-                  "margin-bottom": "4px",
-                }}
-              >
-                {"\u5B9E\u9A8C\u5BA4"}
-              </div>
-            </Show>
+            <SectionLabel>{tr("sidebar.section.lab")}</SectionLabel>
             <NavItem
               icon={HubIcon}
-              label={"HuggingFace"}
+              labelKey={"command.nav.sniffer.label"}
               count={0}
               active={false}
-              expanded={isExpanded()}
+              expanded={true}
               onClick={$ui.openHub}
             />
             <NavItem
               icon={HistoryIcon}
-              label={"\u5386\u53F2"}
+              labelKey={"command.nav.history.label"}
               count={0}
               active={false}
-              expanded={isExpanded()}
+              expanded={true}
               onClick={$ui.openHistory}
             />
           </div>
@@ -399,9 +454,7 @@ export default function Sidebar() {
             class="resize-handle absolute right-0 top-0 bottom-0 cursor-col-resize z-10"
             style={{
               width: "4px",
-              background: isDragging()
-                ? "var(--color-accent-glow-strong)"
-                : "transparent",
+              background: "transparent",
               transition: "background 150ms ease",
             }}
             onMouseDown={handleDragStart}

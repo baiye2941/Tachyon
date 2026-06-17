@@ -3,6 +3,7 @@ import { api } from "../api/invoke";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { refreshTaskList } from "../stores/downloads";
 import { addToast } from "../stores/toast";
+import { tr } from "../i18n";
 
 /**
  * 全局拖放创建下载任务。
@@ -38,7 +39,7 @@ export function useDragDrop() {
     urls.forEach((url) => {
       api
         .createTask(url.trim())
-        .catch((e) => addToast(`创建任务失败: ${e}`, "error"));
+        .catch((e) => addToast(tr("toast.createTaskFailed", { error: e }), "error"));
     });
     setTimeout(() => refreshTaskList(), 300);
   };

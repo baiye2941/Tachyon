@@ -4,9 +4,11 @@ const mockPauseTask = vi.fn()
 const mockResumeTask = vi.fn()
 const mockDeleteTask = vi.fn()
 const mockGetTaskList = vi.fn()
-const mockConfirm = vi.fn()
+const mockRequestConfirm = vi.fn()
 const mockAddToast = vi.fn()
 
+// Iteration 11:不再 mock 整个 api 模块(会掩盖 invoke 包装层副作用),
+// 改为 mock confirm store + 真实 api(其 deleteTask 接收 opts.skipConfirm)。
 vi.mock('../../api/invoke', () => ({
   api: {
     pauseTask: (...args: unknown[]) => mockPauseTask(...args),
@@ -16,8 +18,8 @@ vi.mock('../../api/invoke', () => ({
   },
 }))
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({
-  confirm: (...args: unknown[]) => mockConfirm(...args),
+vi.mock('../confirm', () => ({
+  requestConfirm: (...args: unknown[]) => mockRequestConfirm(...args),
 }))
 
 vi.mock('../toast', () => ({
@@ -52,7 +54,7 @@ beforeEach(async () => {
   mockResumeTask.mockReset()
   mockDeleteTask.mockReset()
   mockGetTaskList.mockReset()
-  mockConfirm.mockReset()
+  mockRequestConfirm.mockReset()
   mockAddToast.mockReset()
 
   downloadsModule = await import('../downloads')
@@ -91,24 +93,32 @@ describe('batchActions store', () => {
     expect(mockResumeTask).toHaveBeenCalledWith('t2')
   })
 
-  it('deleteSelected 弹出确认对话框后删除选中任务', async () => {
+  it('deleteSelected 确认后删除并透传 skipConfirm:true', async () => {
     downloadsModule.setTasks([makeTask('t1'), makeTask('t2')])
     selectionModule.selectAll(['t1'])
-    mockConfirm.mockResolvedValue(true)
+    mockRequestConfirm.mockResolvedValue(true)
     mockDeleteTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
     await batchActionsModule.deleteSelected()
 
-    expect(mockConfirm).toHaveBeenCalledWith('确定要删除选中的 1 个任务吗？', expect.any(Object))
-    expect(mockDeleteTask).toHaveBeenCalledWith('t1')
+    // Iteration 11:走应用层 ConfirmDialog,不再依赖 Tauri plugin-dialog
+    expect(mockRequestConfirm).toHaveBeenCalledTimes(1)
+    expect(mockRequestConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: '删除选中任务',
+        tone: 'danger',
+      }),
+    )
+    // 关键断言:deleteTask 收到 skipConfirm:true,跳过 invoke 内 window.confirm
+    expect(mockDeleteTask).toHaveBeenCalledWith('t1', { skipConfirm: true })
     expect(selectionModule.$selectedIds.get().size).toBe(0)
   })
 
   it('deleteSelected 用户取消时不删除', async () => {
     downloadsModule.setTasks([makeTask('t1')])
     selectionModule.selectAll(['t1'])
-    mockConfirm.mockResolvedValue(false)
+    mockRequestConfirm.mockResolvedValue(false)
     mockDeleteTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
@@ -116,6 +126,26 @@ describe('batchActions store', () => {
 
     expect(mockDeleteTask).not.toHaveBeenCalled()
     expect(selectionModule.$selectedIds.get().size).toBe(1)
+  })
+
+  it('deleteSelected 批量 10 任务只弹一次确认', async () => {
+    // Iteration 11 回归测试:防止级联 confirm 灾难复发
+    const ids = Array.from({ length: 10 }, (_, i) => `t${i}`)
+    downloadsModule.setTasks(ids.map(id => makeTask(id)))
+    selectionModule.selectAll(ids)
+    mockRequestConfirm.mockResolvedValue(true)
+    mockDeleteTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.deleteSelected()
+
+    // 确认请求只应有一次(而非 N+1)
+    expect(mockRequestConfirm).toHaveBeenCalledTimes(1)
+    // 每个 deleteTask 都传 skipConfirm:true
+    expect(mockDeleteTask).toHaveBeenCalledTimes(10)
+    ids.forEach(id => {
+      expect(mockDeleteTask).toHaveBeenCalledWith(id, { skipConfirm: true })
+    })
   })
 
   it('pauseAll 暂停所有活跃任务', async () => {

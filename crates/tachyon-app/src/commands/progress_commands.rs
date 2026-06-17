@@ -179,6 +179,7 @@ mod tests {
             "https://example.com/progress.bin".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -223,12 +224,24 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_progress_initial_full_snapshot() {
         let state = test_state();
-        let id1 = create_task_inner(&state, "https://example.com/1.bin".to_string(), None, None)
-            .await
-            .unwrap();
-        let id2 = create_task_inner(&state, "https://example.com/2.bin".to_string(), None, None)
-            .await
-            .unwrap();
+        let id1 = create_task_inner(
+            &state,
+            "https://example.com/1.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let id2 = create_task_inner(
+            &state,
+            "https://example.com/2.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let event = build_initial_progress_event(&state.domain.task_repository);
         assert_eq!(event.len(), 2);

@@ -8,40 +8,43 @@
  * Platform 字段在渲染时把 'Ctrl' 替换为 'Cmd'(macOS)。
  */
 
+import type { MessageKey } from '../i18n'
+
 export type ShortcutGroup = 'global' | 'navigation' | 'task' | 'list'
 
 export interface Shortcut {
   /** 键序列(显示用),如 ['Ctrl', 'K'] */
   keys: string[]
-  /** 描述 */
-  label: string
+  /** i18n key(渲染时翻译) */
+  labelKey: MessageKey
   group: ShortcutGroup
 }
 
-export const GROUP_LABELS: Record<ShortcutGroup, string> = {
-  global: '全局',
-  navigation: '导航',
-  task: '任务',
-  list: '列表',
+export const GROUP_LABEL_KEYS: Record<ShortcutGroup, MessageKey> = {
+  global: 'shortcutGroup.global',
+  navigation: 'shortcutGroup.navigation',
+  task: 'shortcutGroup.task',
+  list: 'shortcutGroup.list',
 }
 
 /** 全部快捷键(单一数据源) */
 export const SHORTCUTS: Shortcut[] = [
   // 全局
-  { keys: ['Ctrl', 'K'], label: '打开命令面板', group: 'global' },
-  { keys: ['Ctrl', '/'], label: '快捷键帮助(本页)', group: 'global' },
+  { keys: ['Ctrl', 'K'], labelKey: 'shortcut.openCommandPalette', group: 'global' },
+  { keys: ['Ctrl', '/'], labelKey: 'shortcut.shortcutHelp', group: 'global' },
+  { keys: ['Ctrl', 'B'], labelKey: 'shortcut.toggleSidebar', group: 'global' },
   // 导航
-  { keys: ['Ctrl', '1'], label: '下载管理', group: 'navigation' },
-  { keys: ['Ctrl', '2'], label: '资源嗅探', group: 'navigation' },
-  { keys: ['Ctrl', ','], label: '设置', group: 'navigation' },
+  { keys: ['Ctrl', '1'], labelKey: 'shortcut.nav.downloads', group: 'navigation' },
+  { keys: ['Ctrl', '2'], labelKey: 'shortcut.nav.sniffer', group: 'navigation' },
+  { keys: ['Ctrl', ','], labelKey: 'shortcut.nav.settings', group: 'navigation' },
   // 任务
-  { keys: ['Ctrl', 'N'], label: '新建下载', group: 'task' },
-  { keys: ['Ctrl', 'Shift', 'P'], label: '全部暂停', group: 'task' },
-  { keys: ['Ctrl', 'Shift', 'R'], label: '全部恢复', group: 'task' },
+  { keys: ['Ctrl', 'N'], labelKey: 'shortcut.task.new', group: 'task' },
+  { keys: ['Ctrl', 'Shift', 'P'], labelKey: 'shortcut.task.pauseAll', group: 'task' },
+  { keys: ['Ctrl', 'Shift', 'R'], labelKey: 'shortcut.task.resumeAll', group: 'task' },
   // 列表
-  { keys: ['Enter'], label: '打开任务详情', group: 'list' },
-  { keys: ['Space'], label: '暂停/恢复选中任务', group: 'list' },
-  { keys: ['Delete'], label: '删除选中任务', group: 'list' },
+  { keys: ['Enter'], labelKey: 'shortcut.list.openDetail', group: 'list' },
+  { keys: ['Space'], labelKey: 'shortcut.list.togglePause', group: 'list' },
+  { keys: ['Delete'], labelKey: 'shortcut.list.delete', group: 'list' },
 ]
 
 /** 把 'Ctrl' 替换为平台对应修饰键(macOS 显示 Cmd) */

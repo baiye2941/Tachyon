@@ -166,6 +166,8 @@ mod tests {
                 fragments_done: 2,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
         repository.insert(
@@ -183,6 +185,8 @@ mod tests {
                 fragments_done: 2,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 
@@ -221,6 +225,8 @@ mod tests {
                 fragments_done: 2,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 
@@ -271,6 +277,8 @@ mod tests {
                 fragments_done: 2,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 
@@ -304,6 +312,8 @@ mod tests {
                 fragments_done: 2,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 

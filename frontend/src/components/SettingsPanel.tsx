@@ -14,6 +14,7 @@ import type { AppConfig, ConfigPatch } from "../types";
 import { CloseIcon } from "./icons";
 import ConfirmDialog from "./ConfirmDialog";
 import Button from "../shared/ui/Button";
+import { tr, type MessageKey } from "../i18n";
 
 type SettingsTab =
   | "general"
@@ -49,6 +50,8 @@ interface ConfigDraft {
 }
 
 export default function SettingsPanel(props: SettingsPanelProps) {
+  const t = (key: MessageKey, values?: Record<string, string | number>) =>
+    tr(key, values as Record<string, string | number | unknown>);
   const [activeTab, setActiveTab] = createSignal<SettingsTab>("general");
   const initialVisible = untrack(() => props.visible);
   const [shouldRender, setShouldRender] = createSignal(initialVisible);
@@ -86,12 +89,12 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     }
   });
 
-  const tabs: { id: SettingsTab; label: string }[] = [
-    { id: "general", label: "通用" },
-    { id: "download", label: "下载" },
-    { id: "connection", label: "连接" },
-    { id: "scheduler", label: "调度" },
-    { id: "about", label: "关于" },
+  const tabs: { id: SettingsTab; labelKey: MessageKey }[] = [
+    { id: "general", labelKey: "settings.tab.general" },
+    { id: "download", labelKey: "settings.tab.download" },
+    { id: "connection", labelKey: "settings.tab.connection" },
+    { id: "scheduler", labelKey: "settings.tab.scheduler" },
+    { id: "about", labelKey: "settings.tab.about" },
   ];
 
   const [draft, setDraft] = createStore<ConfigDraft>({
@@ -148,7 +151,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       $config.set(cfg);
       applyConfig(cfg);
     } catch (e) {
-      addToast("加载配置失败: " + String(e), "error");
+      addToast(tr("toast.configLoadFailed", { error: String(e) }), "error");
     } finally {
       $configLoading.set(false);
     }
@@ -186,9 +189,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       const fresh = await api.getConfig();
       $config.set(fresh);
       applyConfig(fresh);
-      addToast("配置已保存", "success");
+      addToast(tr("toast.configSaved"), "success");
     } catch (e) {
-      addToast("保存配置失败: " + String(e), "error");
+      addToast(tr("toast.configSaveFailed", { error: String(e) }), "error");
     } finally {
       setSaving(false);
     }
@@ -202,7 +205,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         setDraft("download", "downloadDir", selected);
       }
     } catch (e) {
-      addToast("无法打开目录选择器: " + String(e), "error");
+      addToast(tr("toast.openDirPickerFailed", { error: String(e) }), "error");
     }
   };
 
@@ -273,7 +276,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                 }}
                 onClick={() => setActiveTab(tab.id)}
               >
-                {tab.label}
+                {t(tab.labelKey)}
               </button>
             )}
           </For>
@@ -290,13 +293,13 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                 color: "var(--color-text-title)",
               }}
             >
-              {tabs.find((t) => t.id === activeTab())?.label}设置
+              {t(tabs.find((tb) => tb.id === activeTab())!.labelKey) + t("settings.titleSuffix")}
             </span>
             <Button
               variant="ghost"
               shape="icon-sm"
               class="hover-light"
-              aria-label="关闭设置"
+              aria-label={t("settings.aria.close")}
               onClick={() => props.onClose()}
             >
               <CloseIcon />
@@ -314,7 +317,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     "font-size": "14px",
                   }}
                 >
-                  加载配置中...
+                  {t("settings.loadingConfig")}
                 </div>
               }
             >
@@ -328,7 +331,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                         "margin-bottom": "8px",
                       }}
                     >
-                      默认下载路径
+                      {t("settings.general.defaultDir")}
                     </div>
                     <div class="flex items-center gap-2">
                       <input
@@ -349,7 +352,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                         size="sm"
                         onClick={handleChooseDownloadDir}
                       >
-                        浏览
+                        {t("common.browse")}
                       </Button>
                     </div>
                   </div>
@@ -359,7 +362,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               <Show when={activeTab() === "download"}>
                 <div class="flex flex-col gap-5">
                   <SliderItem
-                    label="最大并发任务数"
+                    label={t("settings.download.maxConcurrentTasks")}
                     value={draft.maxConcurrentTasks}
                     min={1}
                     max={16}
@@ -367,7 +370,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     displayValue={`${draft.maxConcurrentTasks}`}
                   />
                   <SliderItem
-                    label="最大并发分片数"
+                    label={t("settings.download.maxConcurrentFragments")}
                     value={draft.download.maxConcurrentFragments}
                     min={1}
                     max={32}
@@ -377,15 +380,15 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     displayValue={`${draft.download.maxConcurrentFragments}`}
                   />
                   <SliderItem
-                    label="最大重试次数"
+                    label={t("settings.download.maxRetries")}
                     value={draft.download.maxRetries}
                     min={0}
                     max={10}
                     onChange={(v) => setDraft("download", "maxRetries", v)}
-                    displayValue={`${draft.download.maxRetries} 次`}
+                    displayValue={t("settings.download.maxRetriesValue", { n: draft.download.maxRetries })}
                   />
                   <ToggleItem
-                    label="校验文件完整性"
+                    label={t("settings.download.verifyChecksum")}
                     value={draft.download.verifyChecksum}
                     onChange={(v) => setDraft("download", "verifyChecksum", v)}
                   />
@@ -395,7 +398,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               <Show when={activeTab() === "connection"}>
                 <div class="flex flex-col gap-5">
                   <SliderItem
-                    label="每个主机最大连接数"
+                    label={t("settings.connection.maxConnectionsPerHost")}
                     value={draft.connection.maxConnectionsPerHost}
                     min={1}
                     max={16}
@@ -405,22 +408,22 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     displayValue={`${draft.connection.maxConnectionsPerHost}`}
                   />
                   <SliderItem
-                    label="连接超时"
+                    label={t("settings.connection.connectTimeout")}
                     value={draft.connection.connectTimeoutSecs}
                     min={5}
                     max={120}
                     onChange={(v) =>
                       setDraft("connection", "connectTimeoutSecs", v)
                     }
-                    displayValue={`${draft.connection.connectTimeoutSecs} 秒`}
+                    displayValue={t("settings.connection.connectTimeoutValue", { n: draft.connection.connectTimeoutSecs })}
                   />
                   <ToggleItem
-                    label="启用 HTTP/2"
+                    label={t("settings.connection.enableHttp2")}
                     value={draft.connection.enableHttp2}
                     onChange={(v) => setDraft("connection", "enableHttp2", v)}
                   />
                   <ToggleItem
-                    label="启用 QUIC"
+                    label={t("settings.connection.enableQuic")}
                     value={draft.connection.enableQuic}
                     onChange={(v) => setDraft("connection", "enableQuic", v)}
                   />
@@ -430,7 +433,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               <Show when={activeTab() === "scheduler"}>
                 <div class="flex flex-col gap-5">
                   <SliderItem
-                    label="最小分片大小"
+                    label={t("settings.scheduler.minFragmentSize")}
                     value={draft.scheduler.minFragmentSize}
                     min={262144}
                     max={10485760}
@@ -440,7 +443,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     displayValue={`${(draft.scheduler.minFragmentSize / 1048576).toFixed(1)} MB`}
                   />
                   <SliderItem
-                    label="最大分片大小"
+                    label={t("settings.scheduler.maxFragmentSize")}
                     value={draft.scheduler.maxFragmentSize}
                     min={10485760}
                     max={134217728}
@@ -450,7 +453,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     displayValue={`${(draft.scheduler.maxFragmentSize / 1048576).toFixed(0)} MB`}
                   />
                   <SliderItem
-                    label="EWMA 平滑系数"
+                    label={t("settings.scheduler.ewmaAlpha")}
                     value={draft.scheduler.ewmaAlpha}
                     min={0.1}
                     max={0.9}
@@ -497,7 +500,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                       color: "var(--color-text-tertiary)",
                     }}
                   >
-                    版本 0.1.0 · Rust + Tauri
+                    {t("settings.about.version")}
                   </div>
                   <div
                     style={{
@@ -506,7 +509,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                       "margin-top": "8px",
                     }}
                   >
-                    高性能多线程下载加速器
+                    {t("settings.about.tagline")}
                   </div>
                 </div>
               </Show>
@@ -525,7 +528,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               size="sm"
               onClick={() => props.onClose()}
             >
-              取消
+              {t("common.cancel")}
             </Button>
             <Button
               variant="primary"
@@ -533,7 +536,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               loading={$configLoading.get() || saving()}
               onClick={handleSave}
             >
-              {saving() ? "保存中..." : "保存配置"}
+              {saving() ? t("common.saving") : t("settings.save")}
             </Button>
           </div>
         </div>
@@ -542,9 +545,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       {/* 配置保存确认对话框(P1-11) */}
       <ConfirmDialog
         open={confirmOpen()}
-        title="确认修改配置"
-        message="修改下载器配置可能影响安全相关字段（如下载目录、授权路径等），请确认是否继续？"
-        confirmLabel="确认保存"
+        title={t("confirm.updateConfig.title")}
+        message={t("confirm.updateConfig.message")}
+        confirmLabel={t("confirm.updateConfig.confirmLabel")}
         loading={saving()}
         onConfirm={handleConfirmSave}
         onCancel={() => setConfirmOpen(false)}

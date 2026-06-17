@@ -11,6 +11,8 @@ import {
   TrashIcon,
 } from "./icons";
 import Button from "../shared/ui/Button";
+import { useI18n } from "../i18n";
+import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 
 function getFilterColor(type: string): string {
   switch (type) {
@@ -74,6 +76,8 @@ interface ToolbarProps {
 }
 
 export default function Toolbar(props: ToolbarProps) {
+  const i18n = useI18n();
+  const isNarrow = useIsNarrowScreen();
   const [searchExpanded, setSearchExpanded] = createSignal(false);
 
   return (
@@ -81,61 +85,108 @@ export default function Toolbar(props: ToolbarProps) {
       class="flex items-center justify-between flex-shrink-0"
       style={{
         height: "56px",
-        padding: "0 16px",
+        padding: isNarrow() ? "0 8px" : "0 16px",
         "border-bottom": "1px solid var(--color-border-subtle)",
+        gap: "8px",
       }}
     >
       {props.isMultiSelectMode ? (
-        <div class="flex items-center gap-3 flex-1">
-          <Button variant="ghost" size="md" onClick={props.onSelectAll}>
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onSelectAll}
+            aria-label={i18n.t("toolbar.selectAll") as string}
+            title={i18n.t("toolbar.selectAll") as string}
+          >
             <CheckboxIcon checked={props.selectedCount > 0} />
-            <span>全选</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.selectAll")}</span>
+            </Show>
           </Button>
 
-          <span
-            style={{
-              "font-size": "14px",
-              color: "var(--color-text-secondary)",
-            }}
-          >
-            已选 {props.selectedCount} 项
-          </span>
+          <Show when={!isNarrow()}>
+            <span
+              style={{
+                "font-size": "14px",
+                color: "var(--color-text-secondary)",
+              }}
+            >
+              {i18n.t("toolbar.selectedCount", { count: props.selectedCount })}
+            </span>
+          </Show>
 
           <div class="flex-1" />
 
-          <Button variant="ghost" size="md" onClick={props.onPauseSelected}>
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onPauseSelected}
+            aria-label={i18n.t("toolbar.pause") as string}
+            title={i18n.t("toolbar.pause") as string}
+          >
             <PauseIcon />
-            <span>暂停</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.pause")}</span>
+            </Show>
           </Button>
 
-          <Button variant="ghost" size="md" onClick={props.onResumeSelected}>
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onResumeSelected}
+            aria-label={i18n.t("toolbar.resume") as string}
+            title={i18n.t("toolbar.resume") as string}
+          >
             <PlayIcon />
-            <span>恢复</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.resume")}</span>
+            </Show>
           </Button>
 
-          <Button variant="danger" size="md" onClick={props.onDeleteSelected}>
+          <Button
+            variant="danger"
+            size="md"
+            onClick={props.onDeleteSelected}
+            aria-label={i18n.t("toolbar.delete") as string}
+            title={i18n.t("toolbar.delete") as string}
+          >
             <TrashIcon />
-            <span>删除</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.delete")}</span>
+            </Show>
           </Button>
 
-          <Button variant="ghost" size="md" onClick={props.onExitMultiSelect}>
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onExitMultiSelect}
+            aria-label={i18n.t("toolbar.exit") as string}
+            title={i18n.t("toolbar.exit") as string}
+          >
             <XIcon />
-            <span>退出</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.exit")}</span>
+            </Show>
           </Button>
         </div>
       ) : (
-        <div class="flex items-center gap-3 flex-1">
+        <div class="flex items-center gap-2 flex-1 min-w-0">
           <Button
             variant="primary"
             size="md"
             class="hover-lift"
             onClick={props.onNewTask}
+            aria-label={i18n.t("toolbar.newDownload") as string}
+            title={i18n.t("toolbar.newDownload") as string}
           >
             <PlusIcon />
-            <span>新建下载</span>
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.newDownload")}</span>
+            </Show>
           </Button>
 
-          <div class="relative flex flex-col gap-2">
+          <div class="relative flex flex-col gap-2 min-w-0 flex-1 max-w-[360px]">
             <div class="relative">
               <div
                 class="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
@@ -145,13 +196,13 @@ export default function Toolbar(props: ToolbarProps) {
               </div>
               <input
                 type="text"
-                placeholder="搜索任务或设置 (例: status:downloading size:>1gb)"
+                placeholder={i18n.t("toolbar.searchPlaceholder") as string}
                 value={props.searchQuery}
                 onInput={(e) => props.onSearchChange(e.currentTarget.value)}
                 class="input"
                 style={{
                   "padding-left": "36px",
-                  width: searchExpanded() ? "320px" : "280px",
+                  width: isNarrow() ? "100%" : searchExpanded() ? "320px" : "280px",
                   "font-size": "14px",
                   transition:
                     "width var(--duration-normal) var(--ease-standard)",
@@ -195,7 +246,11 @@ export default function Toolbar(props: ToolbarProps) {
                           opacity: 0.7,
                         }}
                         onClick={() => props.onRemoveFilter(filter.raw)}
-                        aria-label={`移除筛选 ${filter.raw}`}
+                        aria-label={
+                          i18n.t("toolbar.removeFilter", {
+                            filter: filter.raw,
+                          }) as string
+                        }
                       >
                         <XIcon />
                       </button>
@@ -211,8 +266,8 @@ export default function Toolbar(props: ToolbarProps) {
           <Button
             variant="ghost"
             shape="icon"
-            title="暂停全部"
-            aria-label="暂停全部"
+            title={i18n.t("toolbar.pauseAll") as string}
+            aria-label={i18n.t("toolbar.pauseAll") as string}
             onClick={props.onPauseAll}
           >
             <PauseIcon />
@@ -221,8 +276,8 @@ export default function Toolbar(props: ToolbarProps) {
           <Button
             variant="ghost"
             shape="icon"
-            title="恢复全部"
-            aria-label="恢复全部"
+            title={i18n.t("toolbar.resumeAll") as string}
+            aria-label={i18n.t("toolbar.resumeAll") as string}
             onClick={props.onResumeAll}
           >
             <PlayIcon />
@@ -231,8 +286,8 @@ export default function Toolbar(props: ToolbarProps) {
           <Button
             variant="ghost"
             shape="icon"
-            title="设置"
-            aria-label="设置"
+            title={i18n.t("toolbar.settings") as string}
+            aria-label={i18n.t("toolbar.settings") as string}
             onClick={props.onOpenSettings}
           >
             <SettingsIcon />
@@ -241,8 +296,8 @@ export default function Toolbar(props: ToolbarProps) {
           <Button
             variant="ghost"
             shape="icon"
-            title="多选模式"
-            aria-label="多选模式"
+            title={i18n.t("toolbar.multiSelect") as string}
+            aria-label={i18n.t("toolbar.multiSelect") as string}
             onClick={props.onToggleMultiSelect}
           >
             <SelectIcon />

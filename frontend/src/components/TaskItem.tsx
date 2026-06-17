@@ -3,6 +3,7 @@ import type { TaskInfo, ListDensity } from '../types'
 import { CheckboxIcon } from './icons'
 import { COLUMN_WIDTH } from './taskColumns'
 import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel } from '../utils/format'
+import { tr } from '../i18n'
 
 interface TaskItemProps {
   task: TaskInfo
@@ -75,7 +76,7 @@ export default function TaskItem(props: TaskItemProps) {
   const ariaLabel = () => {
     const progress = (props.task.progress * 100).toFixed(1)
     const status = getStatusLabel(props.task.status)
-    return `任务：${props.task.fileName}，进度 ${progress}%，状态 ${status}`
+    return tr('taskList.aria.taskItem', { name: props.task.fileName, progress, status })
   }
 
   return (
@@ -106,7 +107,7 @@ export default function TaskItem(props: TaskItemProps) {
             class="flex items-center justify-center flex-shrink-0"
             role="checkbox"
             aria-checked={props.isMultiSelected}
-            aria-label={`选择任务：${props.task.fileName}`}
+            aria-label={tr('taskList.aria.selectTask', { name: props.task.fileName })}
             style={{
               width: '20px',
               height: '20px',
@@ -156,7 +157,7 @@ export default function TaskItem(props: TaskItemProps) {
                     'margin-top': '2px',
                   }}
                 >
-                  {props.task.fileSize ? formatSize(props.task.fileSize) : '未知大小'}
+                  {props.task.fileSize ? formatSize(props.task.fileSize) : tr('taskList.unknownSize')}
                   {' · '}
                   {props.task.url.split(':')[0]?.toUpperCase() ?? ''}
                   {props.task.speed > 0 && ` · ${formatSpeed(props.task.speed)}`}

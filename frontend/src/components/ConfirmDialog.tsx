@@ -2,6 +2,7 @@ import { Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { CloseIcon } from "./icons";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { tr } from "../i18n";
 
 interface ConfirmDialogProps {
   /** 是否显示对话框 */
@@ -14,6 +15,8 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   /** 取消按钮文本，默认"取消" */
   cancelLabel?: string;
+  /** 确认按钮调性:danger 用于删除等破坏性操作(红色按钮),默认 primary */
+  tone?: "primary" | "danger";
   /** 确认操作是否正在执行中 */
   loading?: boolean;
   /** 确认回调 */
@@ -93,7 +96,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
               {props.title}
             </h3>
             <button
-              aria-label="关闭"
+              aria-label={tr("confirmDialog.aria.close")}
               style={{
                 background: "transparent",
                 border: "none",
@@ -139,7 +142,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
               onClick={() => props.onCancel()}
               disabled={props.loading}
             >
-              {props.cancelLabel ?? "取消"}
+              {props.cancelLabel ?? tr("common.cancel")}
             </button>
             <button
               ref={confirmBtnRef}
@@ -149,17 +152,21 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
                 "font-size": "13px",
                 "font-weight": 500,
                 "border-radius": "6px",
-                background: "var(--color-accent-primary)",
+                // danger 调性:删除等破坏性操作用红色警示(primary 默认品牌紫)
+                background:
+                  props.tone === "danger"
+                    ? "var(--color-error)"
+                    : "var(--color-accent-primary)",
                 color: "var(--color-text-inverse)",
                 border: "none",
                 cursor: props.loading ? "wait" : "pointer",
                 opacity: props.loading ? 0.7 : 1,
-                transition: "opacity 150ms ease",
+                transition: "opacity 150ms ease, background 150ms ease",
               }}
               onClick={() => props.onConfirm()}
               disabled={props.loading}
             >
-              {props.loading ? "处理中..." : (props.confirmLabel ?? "确认")}
+              {props.loading ? tr("common.processing") : (props.confirmLabel ?? tr("common.confirm"))}
             </button>
           </div>
         </div>

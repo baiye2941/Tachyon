@@ -106,6 +106,9 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
         fragments_done: snapshot.completed_fragments.len() as u32,
         created_at: snapshot.created_at.clone(),
         save_path: snapshot.save_path.clone(),
+        // 从快照恢复时保留失败原因与重试计数,前端诊断面板可直接使用后端原文
+        error_reason: snapshot.fail_reason.clone(),
+        retry_count: snapshot.retry_count,
     }
 }
 
@@ -144,8 +147,9 @@ pub fn task_info_to_snapshot(
         content_length: task.file_size,
         created_at: task.created_at.clone(),
         updated_at: now,
-        fail_reason: None,
-        retry_count: 0,
+        // 保留 TaskInfo 上的失败原因与重试计数,避免持久化时丢失
+        fail_reason: task.error_reason.clone(),
+        retry_count: task.retry_count,
     }
 }
 
@@ -308,6 +312,8 @@ mod tests {
             fragments_done: 0,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             save_path: "/downloads/file.bin".to_string(),
+            error_reason: None,
+            retry_count: 0,
         };
 
         let snapshot = task_info_to_snapshot(

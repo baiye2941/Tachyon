@@ -3,12 +3,13 @@ import { Icon } from "../utils/icons";
 import type { ViewName } from "../types";
 import {
   COMMANDS,
-  GROUP_LABELS,
+  GROUP_LABEL_KEYS,
   type Command,
   type CommandContext,
   type CommandGroup,
 } from "../commands/registry";
 import { fuzzySearch } from "../utils/fuzzySearch";
+import { tr, type MessageKey } from "../i18n";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -17,6 +18,7 @@ interface CommandPaletteProps {
   onNewDownload?: () => void;
   onPauseAll?: () => void;
   onResumeAll?: () => void;
+  onToggleSidebar?: () => void;
 }
 
 /** 高亮匹配字符:根据 matchedIndices 在 label 中包裹 <mark> */
@@ -56,6 +58,7 @@ function highlight(text: string, indices: number[]): JSX.Element {
 export default function CommandPalette(props: CommandPaletteProps) {
   let inputRef: HTMLInputElement | undefined;
   let listRef: HTMLDivElement | undefined;
+  const t = (key: MessageKey) => tr(key);
   const [query, setQuery] = createSignal("");
   const [activeIndex, setActiveIndex] = createSignal(0);
 
@@ -78,11 +81,19 @@ export default function CommandPalette(props: CommandPaletteProps) {
     get onResumeAll() {
       return props.onResumeAll;
     },
+    get onToggleSidebar() {
+      return props.onToggleSidebar;
+    },
   };
 
-  // fuzzy 搜索(子序列匹配 + 评分排序),替换原 includes
+  // fuzzy 搜索(子序列匹配 + 评分排序),替换原 includes。
+  // 搜索文本用当前语言翻译后的 label/hint,保证用户输入中文可命中。
   const results = createMemo(() =>
-    fuzzySearch(COMMANDS, query(), (c) => `${c.label} ${c.hint ?? ""}`),
+    fuzzySearch(
+      COMMANDS,
+      query(),
+      (c) => `${t(c.labelKey)} ${c.hintKey ? t(c.hintKey) : ""}`,
+    ),
   );
 
   // 按分组聚合(保持 fuzzy score 排序内的分组)
@@ -158,7 +169,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
         class="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh]"
         role="dialog"
         aria-modal="true"
-        aria-label="命令面板"
+        aria-label={t("commandPalette.aria")}
         style={{
           background: "var(--color-overlay-scrim)",
           "backdrop-filter": "blur(4px)",
@@ -196,7 +207,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                 "font-size": "14px",
                 color: "var(--color-text-primary)",
               }}
-              placeholder="搜索命令或导航..."
+              placeholder={t("commandPalette.searchPlaceholder")}
               value={query()}
               onInput={(e) => {
                 setQuery(e.currentTarget.value);
@@ -222,7 +233,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
             ref={listRef}
             class="overflow-y-auto py-1.5"
             role="listbox"
-            aria-label="命令列表"
+            aria-label={t("commandPalette.listAria")}
           >
             <Show when={results().length === 0}>
               <div
@@ -232,7 +243,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                   color: "var(--color-text-tertiary)",
                 }}
               >
-                未找到匹配的命令
+                {t("commandPalette.noResults")}
               </div>
             </Show>
 
@@ -247,7 +258,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                       color: "var(--color-text-tertiary)",
                     }}
                   >
-                    {GROUP_LABELS[gkey]}
+                    {t(GROUP_LABEL_KEYS[gkey])}
                   </div>
                   <For each={grouped()[gkey]}>
                     {(entry) => {
@@ -286,9 +297,9 @@ export default function CommandPalette(props: CommandPaletteProps) {
                           </span>
                           <div class="flex-1 min-w-0">
                             <span class="block truncate">
-                              {highlight(entry.cmd.label, entry.indices)}
+                              {highlight(t(entry.cmd.labelKey), entry.indices)}
                             </span>
-                            <Show when={entry.cmd.hint}>
+                            <Show when={entry.cmd.hintKey}>
                               <span
                                 class="block truncate"
                                 style={{
@@ -296,7 +307,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                                   color: "var(--color-text-tertiary)",
                                 }}
                               >
-                                {entry.cmd.hint}
+                                {t(entry.cmd.hintKey!)}
                               </span>
                             </Show>
                           </div>

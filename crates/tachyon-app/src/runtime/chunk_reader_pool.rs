@@ -43,18 +43,51 @@ pub struct ChunkReaderJob {
 pub struct ChunkReaderPool {
     /// 任务提交通道
     job_tx: mpsc::Sender<ChunkReaderJob>,
+    /// 共享 receiver（worker 启动后持有）
+    job_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<ChunkReaderJob>>>>,
+    /// worker 是否已 spawn（幂等防护）
+    workers_spawned: std::sync::atomic::AtomicBool,
+    /// 预设 worker 数量
+    worker_count: usize,
 }
 
 impl ChunkReaderPool {
-    /// 创建新的 ChunkReaderPool
+    /// 创建新的 ChunkReaderPool（不启动 worker）
+    ///
+    /// 构造期间不 spawn worker，因为构造可能发生在 Tokio reactor
+    /// 尚未就绪的上下文（如 Tauri Builder::manage 同步阶段）。
+    /// 生产环境应在 Tauri `setup` 钩子中调用 `spawn_workers()`。
     ///
     /// `worker_count` 通常等于 max_concurrent_tasks，确保每个并发下载有一个 worker。
     pub fn new(worker_count: usize) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<ChunkReaderJob>(worker_count * 2);
-        let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+        Self {
+            job_tx,
+            job_rx: Some(Arc::new(tokio::sync::Mutex::new(job_rx))),
+            workers_spawned: std::sync::atomic::AtomicBool::new(false),
+            worker_count,
+        }
+    }
 
-        for worker_id in 0..worker_count {
-            let rx = job_rx.clone();
+    /// 启动 worker 协程
+    ///
+    /// **必须在 Tokio reactor 上下文中调用**（如 Tauri `setup` 钩子内）。
+    /// 幂等：多次调用只启动一组 worker（通过 AtomicBool 防重复）。
+    pub fn spawn_workers(&self) {
+        if self
+            .workers_spawned
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        // spawn_workers 仅在首次调用时执行，此时 job_rx 必定存在
+        let rx = self
+            .job_rx
+            .as_ref()
+            .expect("spawn_workers: job_rx 不应为 None（仅首次调用时消费）")
+            .clone();
+        for worker_id in 0..self.worker_count {
+            let rx = rx.clone();
             tokio::spawn(async move {
                 loop {
                     // 从共享 receiver 拉取 job
@@ -74,8 +107,6 @@ impl ChunkReaderPool {
                 }
             });
         }
-
-        Self { job_tx }
     }
 
     /// 提交进度处理任务到池
@@ -266,6 +297,7 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_reader_pool_processes_progress() {
         let pool = ChunkReaderPool::new(2);
+        pool.spawn_workers();
         let task_repository = TaskRepository::new();
         let task_store = test_task_store();
         let task_id = "test-pool-job".to_string();
@@ -286,6 +318,8 @@ mod tests {
                 fragments_done: 0,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 
@@ -337,6 +371,7 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_reader_pool_multiple_jobs() {
         let pool = ChunkReaderPool::new(2);
+        pool.spawn_workers();
         let task_repository = TaskRepository::new();
         let task_store = test_task_store();
 
@@ -359,6 +394,8 @@ mod tests {
                     fragments_done: 0,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     save_path: "/tmp/file.bin".to_string(),
+                    error_reason: None,
+                    retry_count: 0,
                 },
             );
 

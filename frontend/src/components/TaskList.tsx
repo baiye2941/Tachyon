@@ -193,7 +193,7 @@ export default function TaskList(props: TaskListProps) {
                 }}
                 tabindex={col.sortable ? 0 : undefined}
               >
-                <span>{col.label}</span>
+                <span>{i18n.t(col.labelKey) as string}</span>
                 <Show when={col.sortable}>
                   <span
                     style={{

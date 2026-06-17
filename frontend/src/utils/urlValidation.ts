@@ -19,8 +19,8 @@ export interface UrlValidation {
   valid: boolean
   /** 协议类型 */
   protocol: UrlProtocol
-  /** 额外提示(用于 UI 反馈,如「磁力链接暂不支持」) */
-  hint?: string
+  /** 额外提示的 i18n key(调用方用 tr() 翻译) */
+  hintKey?: 'url.hint.magnet' | 'url.hint.huggingface' | 'url.hint.invalid'
 }
 
 const HTTP_RE = /^https?:\/\/[^\s/$.?#].[^\s]*$/i
@@ -47,7 +47,7 @@ export function validateUrl(raw: string): UrlValidation {
     return {
       valid: false,
       protocol: 'magnet',
-      hint: '磁力链接暂不支持,将在后续版本接入 BT 协议',
+      hintKey: 'url.hint.magnet',
     }
   }
 
@@ -55,7 +55,7 @@ export function validateUrl(raw: string): UrlValidation {
     return {
       valid: true,
       protocol: 'huggingface',
-      hint: '检测到 HuggingFace 链接',
+      hintKey: 'url.hint.huggingface',
     }
   }
 
@@ -73,7 +73,7 @@ export function validateUrl(raw: string): UrlValidation {
   return {
     valid: false,
     protocol: 'unknown',
-    hint: '请输入以 http:// 或 https:// 开头的链接',
+    hintKey: 'url.hint.invalid',
   }
 }
 

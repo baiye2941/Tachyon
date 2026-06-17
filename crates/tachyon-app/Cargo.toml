@@ -38,6 +38,7 @@ uuid.workspace = true
 chrono.workspace = true
 url.workspace = true
 dashmap.workspace = true
+tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2.3.5"
 
 [dev-dependencies]

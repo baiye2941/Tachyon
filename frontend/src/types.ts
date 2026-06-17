@@ -22,6 +22,10 @@ export interface TaskInfo {
   fragmentsDone: number
   createdAt: string
   savePath: string
+  /** 失败原因原文(仅 status='failed' 时有值),后端 TaskInfo.error_reason */
+  errorReason?: string
+  /** 任务级重试计数(保留字段,当前恒为 0) */
+  retryCount?: number
 }
 
 export interface DownloadConfig {

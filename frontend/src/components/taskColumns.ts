@@ -6,12 +6,15 @@
  * 支持列排序(sortable),供 taskSort store 驱动。
  */
 
+import type { MessageKey } from '../i18n'
+
 export type SortKey = 'name' | 'progress' | 'speed' | 'status'
 export type SortDir = 'asc' | 'desc'
 
 export interface ColumnDef {
   key: SortKey
-  label: string
+  /** i18n key(渲染时翻译) */
+  labelKey: MessageKey
   /** CSS 宽度。'flex-1' 表示弹性填充(文件名列) */
   width: string
   align: 'left' | 'right'
@@ -21,10 +24,10 @@ export interface ColumnDef {
 
 /** 列定义(顺序 = 渲染顺序) */
 export const COLUMNS: ColumnDef[] = [
-  { key: 'name', label: '文件名', width: 'flex-1', align: 'left', sortable: false },
-  { key: 'progress', label: '进度', width: '120px', align: 'right', sortable: true },
-  { key: 'speed', label: '速度', width: '100px', align: 'right', sortable: true },
-  { key: 'status', label: '状态', width: '80px', align: 'right', sortable: true },
+  { key: 'name', labelKey: 'taskList.column.name', width: 'flex-1', align: 'left', sortable: false },
+  { key: 'progress', labelKey: 'taskList.column.progress', width: '120px', align: 'right', sortable: true },
+  { key: 'speed', labelKey: 'taskList.column.speed', width: '100px', align: 'right', sortable: true },
+  { key: 'status', labelKey: 'taskList.column.status', width: '80px', align: 'right', sortable: true },
 ]
 
 /** 可排序列 */

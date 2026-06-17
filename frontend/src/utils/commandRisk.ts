@@ -12,6 +12,8 @@
  * Token 一次性使用+60秒过期,防止 XSS/供应链注入后静默调用。
  */
 
+import { tr } from '../i18n'
+
 /** 命令风险等级 */
 export type RiskTier = 'safe' | 'mutate' | 'destructive'
 
@@ -48,10 +50,10 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   update_config: 'destructive',
 }
 
-/** 破坏性命令的中文确认提示 */
-const DESTRUCTIVE_CONFIRM_LABELS: Record<string, string> = {
-  delete_task: '删除该下载任务记录',
-  update_config: '修改下载器配置(含安全相关字段)',
+/** 破坏性命令的确认提示 i18n key */
+const DESTRUCTIVE_CONFIRM_KEYS: Record<string, 'confirm.destructive.deleteTask' | 'confirm.destructive.updateConfig'> = {
+  delete_task: 'confirm.destructive.deleteTask',
+  update_config: 'confirm.destructive.updateConfig',
 }
 
 /** 获取命令风险等级,未登记的命令默认为 destructive(白名单原则) */
@@ -71,13 +73,14 @@ export async function confirmDestructive(command: string): Promise<boolean> {
   const tier = getRiskTier(command)
   if (tier !== 'destructive') return true
 
-  const description = DESTRUCTIVE_CONFIRM_LABELS[command] ?? '该操作不可撤销'
+  const key = DESTRUCTIVE_CONFIRM_KEYS[command]
+  const description = key ? tr(key) : tr('confirm.destructive.default')
 
   // 使用浏览器原生确认对话框:同步、可靠、在 Tauri WebView 中可用,
   // 且易于在测试中 mock(window.confirm)。
   // 不使用 toast 系统,因为 toast 的自动消失与 Promise 解析难以可靠关联。
   if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
-    return window.confirm(`确认执行此操作?\n\n${description}`)
+    return window.confirm(tr('confirm.destructive.prompt', { description }))
   }
 
   // 非浏览器环境(如 SSR)默认拒绝,安全优先

@@ -1,4 +1,5 @@
 import type { DownloadStatus } from '../types'
+import type { MessageKey } from '../i18n'
 
 // 完整状态顺序：理想路径 + 分支路径
 export const STATE_ORDER: DownloadStatus[] = [
@@ -7,7 +8,8 @@ export const STATE_ORDER: DownloadStatus[] = [
 
 export interface StateNode {
   id: DownloadStatus
-  label: string
+  /** i18n key(渲染时翻译,避免模块加载时固化语言) */
+  labelKey: MessageKey
   x: number
   y: number
 }
@@ -18,15 +20,15 @@ export interface StateEdge {
 }
 
 export const STATE_NODES: StateNode[] = [
-  { id: 'pending', label: '等待中', x: 40, y: 80 },
-  { id: 'connecting', label: '连接中', x: 160, y: 80 },
-  { id: 'downloading', label: '下载中', x: 280, y: 80 },
-  { id: 'paused', label: '已暂停', x: 280, y: 20 },
-  { id: 'resuming', label: '恢复中', x: 220, y: 20 },
-  { id: 'verifying', label: '校验中', x: 400, y: 80 },
-  { id: 'completed', label: '已完成', x: 520, y: 80 },
-  { id: 'failed', label: '失败', x: 400, y: 140 },
-  { id: 'cancelled', label: '已取消', x: 280, y: 140 },
+  { id: 'pending', labelKey: 'status.label.pending', x: 40, y: 80 },
+  { id: 'connecting', labelKey: 'status.label.connecting', x: 160, y: 80 },
+  { id: 'downloading', labelKey: 'status.label.downloading', x: 280, y: 80 },
+  { id: 'paused', labelKey: 'status.label.paused', x: 280, y: 20 },
+  { id: 'resuming', labelKey: 'status.label.resuming', x: 220, y: 20 },
+  { id: 'verifying', labelKey: 'status.label.verifying', x: 400, y: 80 },
+  { id: 'completed', labelKey: 'status.label.completed', x: 520, y: 80 },
+  { id: 'failed', labelKey: 'status.label.failed', x: 400, y: 140 },
+  { id: 'cancelled', labelKey: 'status.label.cancelled', x: 280, y: 140 },
 ]
 
 export const STATE_EDGES: StateEdge[] = [

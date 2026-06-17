@@ -36,6 +36,7 @@ pub fn run() {
         .with_target(true)
         .init();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
         .setup(|app| {
@@ -45,6 +46,9 @@ pub fn run() {
                 // 在 reactor 上下文中启动 progress aggregator
                 // （构造期间不能 spawn,此时 reactor 尚未就绪）
                 state.runtime.progress_broker.spawn_aggregator();
+                // 在 reactor 上下文中启动 chunk reader worker
+                // （构造期间不能 spawn,此时 reactor 尚未就绪）
+                state.infra.chunk_reader_pool.spawn_workers();
                 match state.load_recovered_tasks().await {
                     Ok(corrupt_keys) => {
                         // 损坏快照非空时向 UI 广播一次性恢复告警
@@ -125,6 +129,8 @@ async fn any_fragment() {
         fragments_done: 0,
         created_at: chrono::Local::now().to_rfc3339(),
         save_path: String::new(),
+        error_reason: None,
+        retry_count: 0,
     };
     state.domain.task_repository.insert(task_id.clone(), task);
 
@@ -171,6 +177,8 @@ async fn max_concurrent() {
                     fragments_done: 0,
                     created_at: chrono::Local::now().to_rfc3339(),
                     save_path: String::new(),
+                    error_reason: None,
+                    retry_count: 0,
                 },
             );
         }

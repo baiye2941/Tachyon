@@ -8,6 +8,7 @@ import {
   GearIcon,
   AttachmentIcon,
 } from "../components/icons";
+import { tr, type MessageKey } from "../i18n";
 
 /**
  * 分片线程/批次着色色板(仅 Canvas 场景使用)。
@@ -34,7 +35,7 @@ export const THREAD_COLORS = [
 ];
 
 export function formatSize(bytes: number | null | undefined): string {
-  if (bytes === null || bytes === undefined) return "未知";
+  if (bytes === null || bytes === undefined) return tr("common.unknown");
   if (bytes === 0) return "0 B";
   if (bytes >= 1024 * 1024 * 1024 * 1024)
     return `${(bytes / 1024 / 1024 / 1024 / 1024).toFixed(1)} TB`;
@@ -161,40 +162,32 @@ export function getStatusColor(status: string): string {
 }
 
 export function getStatusLabel(status: string): string {
-  switch (status) {
-    case "downloading":
-      return "下载中";
-    case "pending":
-      return "等待中";
-    case "paused":
-      return "已暂停";
-    case "completed":
-      return "已完成";
-    case "failed":
-      return "出错";
-    case "connecting":
-      return "连接中";
-    case "verifying":
-      return "校验中";
-    case "resuming":
-      return "恢复中";
-    default:
-      return status;
-  }
+  const map: Record<string, MessageKey> = {
+    downloading: "status.label.downloading",
+    pending: "status.label.pending",
+    paused: "status.label.paused",
+    completed: "status.label.completed",
+    failed: "status.label.failed",
+    connecting: "status.label.connecting",
+    verifying: "status.label.verifying",
+    resuming: "status.label.resuming",
+  };
+  const key = map[status];
+  return key ? tr(key) : status;
 }
 
 export function formatETA(speed: number, remaining: number): string {
   if (speed <= 0 || remaining <= 0) return "---";
   const seconds = Math.ceil(remaining / speed);
-  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 60) return tr("time.seconds", { n: seconds });
   if (seconds < 3600) {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
-    return `${m} 分 ${s} 秒`;
+    return tr("time.minutesSeconds", { m, s });
   }
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  return `${h} 小时 ${m} 分`;
+  return tr("time.hoursMinutes", { h, m });
 }
 
 export function formatDate(iso: string): string {

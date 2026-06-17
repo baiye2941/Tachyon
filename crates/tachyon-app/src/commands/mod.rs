@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::Local;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tachyon_core::config::{AppConfig, ConnectionConfig, DownloadConfig};
+use tachyon_core::config::{AppConfig, DownloadConfig};
 use tachyon_core::types::DownloadState;
 use tachyon_engine::connection::{ConnectionPool, PoolConfig};
 use tachyon_sniffer::capture::ResourceType;
@@ -116,6 +116,13 @@ pub struct TaskInfo {
     pub fragments_done: u32,
     pub created_at: String,
     pub save_path: String,
+    /// 失败原因原文（仅 status=Failed 时有值）。
+    /// 前端诊断面板据此展示真实错误，无需启发式推断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+    /// 任务级重试计数（保留字段，当前恒为 0，为后续重试策略预留接口）。
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 /// 序列化 URL 时脱敏，前端只看到不含敏感参数的 URL
@@ -242,17 +249,34 @@ impl Default for AppState {
 
 impl AppState {
     pub fn try_new() -> Result<Self, AppError> {
-        let config = AppConfig {
-            max_concurrent_tasks: 5,
-            download: DownloadConfig::default(),
-            connection: ConnectionConfig::default(),
-            scheduler: Default::default(),
+        let config = match crate::commands::config_commands::load_persisted_config() {
+            Ok(cfg) => {
+                // 校验持久化配置,失败则回退默认配置并记录警告
+                if let Err(e) = crate::commands::config_commands::validate_config(&cfg) {
+                    tracing::warn!(error = %e, "持久化配置校验失败,使用默认配置");
+                    AppConfig::default()
+                } else {
+                    cfg
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "加载持久化配置失败,使用默认配置");
+                AppConfig::default()
+            }
         };
         let connection_pool = ConnectionPool::new(PoolConfig::from(config.connection.clone()));
-        let store_dir = tachyon_core::config::dirs()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".aimd")
-            .join("store");
+        let data_root =
+            tachyon_core::config::dirs().unwrap_or_else(|| std::path::PathBuf::from("."));
+        // 兼容旧版 .aimd 数据目录:若 .aimd 存在但 .tachyon 不存在,自动重命名
+        let legacy_dir = data_root.join(".aimd");
+        let new_dir = data_root.join(".tachyon");
+        if legacy_dir.exists() && !new_dir.exists() {
+            std::fs::rename(&legacy_dir, &new_dir).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "旧数据目录 .aimd 迁移到 .tachyon 失败");
+            });
+        }
+        let store_dir = new_dir.join("store");
+        let _ = std::fs::create_dir_all(&store_dir);
         let task_store = Arc::new(
             TaskStore::open(&store_dir)
                 .map_err(|e| AppError::Config(format!("任务存储初始化失败: {e}")))?,
@@ -445,6 +469,11 @@ pub(crate) async fn persist_task_snapshot(
     task_id: &str,
     fail_reason: Option<String>,
 ) {
+    // 1. 同步更新内存中 TaskInfo 的 error_reason,前端查询时立即可见
+    if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
+        task.error_reason = fail_reason.clone();
+    }
+
     let task = {
         state
             .domain
@@ -687,6 +716,8 @@ pub(crate) mod tests {
             fragments_done: 2,
             created_at: "2025-01-01T00:00:00+08:00".to_string(),
             save_path: "/downloads/file.zip".to_string(),
+            error_reason: None,
+            retry_count: 0,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();
@@ -701,6 +732,7 @@ pub(crate) mod tests {
         let id = task_commands::create_task_inner(
             &state,
             "https://example.com/fail.bin".to_string(),
+            None,
             None,
             None,
         )
@@ -794,6 +826,7 @@ pub(crate) mod tests {
             "http://example.com/gate1.bin".into(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -802,12 +835,14 @@ pub(crate) mod tests {
             "http://example.com/gate2.bin".into(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let result = task_commands::create_task_inner(
             &state,
             "http://example.com/gate3.bin".into(),
+            None,
             None,
             None,
         )
@@ -978,6 +1013,7 @@ pub(crate) mod tests {
             "https://example.com/no-token.bin".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1007,6 +1043,7 @@ pub(crate) mod tests {
         let id = task_commands::create_task_inner(
             &state,
             "https://example.com/valid-token.bin".to_string(),
+            None,
             None,
             None,
         )

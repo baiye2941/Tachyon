@@ -741,25 +741,11 @@ impl Protocol for HttpClient {
             info!(url = %tachyon_core::redact_url_for_log(&url), "HTTP 整块流式响应头已接收,开始流式传输");
 
             // 使用 bytes_stream() 逐块产出,峰值内存仅含单个 chunk,
-            // 避免大文件整块进内存。scan 累计字节数,超过上限时终止流。
-            let max_bytes = tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64;
-            let stream = response
-                .bytes_stream()
-                .scan(0u64, move |total, result| match result {
-                    Ok(chunk) => {
-                        *total += chunk.len() as u64;
-                        if *total > max_bytes {
-                            futures::future::ready(Some(Err(DownloadError::Protocol(format!(
-                                "HTTP 流式下载超过大小上限: {total} > {max_bytes} 字节"
-                            )))))
-                        } else {
-                            futures::future::ready(Some(Ok(chunk)))
-                        }
-                    }
-                    Err(e) => futures::future::ready(Some(Err(DownloadError::Network(format!(
-                        "读取响应流数据失败: {e}"
-                    ))))),
-                });
+            // 避免大文件整块进内存。流式下载本身不会 OOM,大小上限由引擎层
+            // 的 `max_full_stream_bytes` 控制(未知大小时),因此协议层不再额外限制。
+            let stream = response.bytes_stream().map(|result| {
+                result.map_err(|e| DownloadError::Network(format!("读取响应流数据失败: {e}")))
+            });
 
             Ok(Box::pin(stream) as ByteStream)
         })

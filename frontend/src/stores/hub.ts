@@ -2,6 +2,7 @@ import { createSignal } from 'solid-js'
 import type { HubFileInfo } from '../types'
 import { api } from '../api/invoke'
 import { addToast } from './toast'
+import { tr } from '../i18n'
 
 const [repoFiles, setRepoFiles] = createSignal<HubFileInfo[]>([])
 const [loading, setLoading] = createSignal(false)
@@ -23,7 +24,7 @@ export async function listRepoFiles(repoId: string, revision?: string) {
   } catch (e) {
     const msg = String(e)
     setError(msg)
-    addToast(`获取仓库文件列表失败: ${msg}`, 'error')
+    addToast(tr('toast.hubListFailed', { error: msg }), 'error')
     return []
   } finally {
     setLoading(false)
@@ -39,7 +40,7 @@ export async function getHfDownloadUrl(repoId: string, path: string, revision?: 
   try {
     return await api.getHfDownloadUrl(repoId, path, revision)
   } catch (e) {
-    addToast(`获取下载链接失败: ${String(e)}`, 'error')
+    addToast(tr('toast.hubUrlFailed', { error: String(e) }), 'error')
     return null
   }
 }

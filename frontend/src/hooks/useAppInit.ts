@@ -9,6 +9,7 @@ import {
 import { addToast } from "../stores/toast";
 import * as speedHistory from "../stores/speedHistory";
 import type { SnifferResource } from "../types";
+import { tr } from "../i18n";
 import { useProgressListener } from "./useTauriEvent";
 import { useRafThrottle } from "./useRafThrottle";
 
@@ -27,24 +28,24 @@ export function useAppInit(
 
     api
       .subscribeProgress()
-      .catch((e) => addToast(`进度订阅失败: ${e}`, "error"));
+      .catch((e) => addToast(tr("toast.progressSubscribeFailed", { error: e }), "error"));
 
     // 监听启动恢复告警(损坏的断点续传快照已被跳过)
     onRecoveryWarning((payload) => {
       if (payload && payload.count > 0) {
         // 兼容层 addToast 仅支持 info/success/error 三态,warning 语义映射为 info
         addToast(
-          `检测到 ${payload.count} 个损坏的断点续传记录，已跳过恢复`,
+          tr("toast.recoveryWarning", { count: payload.count }),
           "info",
         );
       }
-    }).catch((e) => addToast(`恢复告警监听失败: ${e}`, "error"));
+    }).catch((e) => addToast(tr("toast.recoveryListenFailed", { error: e }), "error"));
 
     // 加载 sniffer 资源
     api
       .getSnifferResources()
       .then(setSnifferResources)
-      .catch((e) => addToast(`嗅探资源加载失败: ${e}`, "error"));
+      .catch((e) => addToast(tr("toast.snifferLoadFailed", { error: e }), "error"));
   });
 
   // speedHistory effect:500ms 时间节流 + rAF 批量,避免 reactive storm

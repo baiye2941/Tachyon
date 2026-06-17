@@ -1,5 +1,6 @@
 import { createStore } from "solid-js/store";
 import { untrack } from "solid-js";
+import { tr } from "../i18n";
 
 export type HistoryFilter = "all" | "completed" | "failed" | "cancelled";
 
@@ -100,7 +101,7 @@ function saveToStorage(records: HistoryRecord[]) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
   } catch (e) {
-    console.warn("历史记录保存失败,可能存储空间不足:", e);
+    console.warn(tr("toast.historySaveFailed"), e);
   }
 }
 

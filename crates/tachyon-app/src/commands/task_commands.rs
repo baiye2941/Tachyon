@@ -387,8 +387,9 @@ pub async fn create_task(
     url: String,
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
+    file_name: Option<String>,
 ) -> Result<String, AppError> {
-    create_task_inner(&state, url, download_dir, mirror_urls).await
+    create_task_inner(&state, url, download_dir, mirror_urls, file_name).await
 }
 
 #[tauri::command]
@@ -460,11 +461,17 @@ pub(crate) async fn create_task_inner(
     url: String,
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
+    file_name: Option<String>,
 ) -> Result<String, AppError> {
     let creation = state
         .service
         .task_service
-        .create_task(&url, download_dir.as_deref(), mirror_urls.as_deref())
+        .create_task(
+            &url,
+            download_dir.as_deref(),
+            mirror_urls.as_deref(),
+            file_name.as_deref(),
+        )
         .await?;
 
     let state_arc = Arc::new(state.clone_for_task());
@@ -570,6 +577,8 @@ mod tests {
                 fragments_done: 0,
                 created_at: now_iso8601(),
                 save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
             },
         );
 
@@ -605,6 +614,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -617,6 +627,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://cdn.example.org/releases/app-v2.0.tar.gz".to_string(),
+            None,
             None,
             None,
         )
@@ -632,6 +643,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/data.bin".to_string(),
+            None,
             None,
             None,
         )
@@ -662,6 +674,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             Some(sub_dir.clone()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -677,12 +690,14 @@ mod tests {
             "https://dup.example.com/once.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let result = create_task_inner(
             &state,
             "https://dup.example.com/once.zip".to_string(),
+            None,
             None,
             None,
         )
@@ -703,7 +718,7 @@ mod tests {
         for _ in 0..10 {
             let state = state.clone();
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url.to_string(), None, None).await
+                create_task_inner(&state, url.to_string(), None, None, None).await
             }));
         }
 
@@ -750,7 +765,7 @@ mod tests {
             let state = state.clone();
             let url = format!("https://stress.example.com/file-{i}.bin");
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url, None, None).await
+                create_task_inner(&state, url, None, None, None).await
             }));
         }
 
@@ -805,6 +820,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -820,6 +836,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
         )
@@ -839,6 +856,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -854,6 +872,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
         )
@@ -872,6 +891,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -886,6 +906,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
         )
@@ -905,6 +926,7 @@ mod tests {
             "https://example.com/file.zip".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -913,12 +935,46 @@ mod tests {
         assert!(get_task_detail_inner(&state, id).await.is_err());
     }
 
+    /// 删除终态任务时,应同步清理本地已下载文件和断点续传快照。
+    #[tokio::test]
+    async fn test_delete_cancelled_task_removes_local_file() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        cancel_task_inner(&state, id.clone()).await.unwrap();
+
+        // 构造一个临时文件模拟已下载文件,并写入任务记录
+        let tmp_path = std::env::temp_dir().join(format!("tachyon-delete-test-{id}"));
+        std::fs::write(&tmp_path, b"test data").unwrap();
+        let save_path = tmp_path.to_string_lossy().to_string();
+        {
+            if let Some(mut task) = state.domain.task_repository.get_mut(&id) {
+                task.save_path = save_path.clone();
+            }
+        }
+
+        delete_task_inner(&state, id.clone()).await.unwrap();
+        assert!(get_task_detail_inner(&state, id).await.is_err());
+        assert!(!tmp_path.exists(), "删除任务时应同步删除已下载的本地文件");
+
+        // 清理(若删除逻辑异常,此处也做兜底)
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
     #[tokio::test]
     async fn test_delete_pending_task_fails() {
         let state = test_state();
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
         )
@@ -932,12 +988,24 @@ mod tests {
     #[tokio::test]
     async fn test_get_task_list_returns_all_tasks() {
         let state = test_state();
-        let id1 = create_task_inner(&state, "https://example.com/a.zip".to_string(), None, None)
-            .await
-            .unwrap();
-        let id2 = create_task_inner(&state, "https://example.com/b.zip".to_string(), None, None)
-            .await
-            .unwrap();
+        let id1 = create_task_inner(
+            &state,
+            "https://example.com/a.zip".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let id2 = create_task_inner(
+            &state,
+            "https://example.com/b.zip".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let list = get_task_list_inner(&state).await.unwrap();
         let ids: Vec<&String> = list.iter().map(|t| &t.id).collect();
         assert!(ids.contains(&&id1));
@@ -965,6 +1033,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/lifecycle.bin".to_string(),
+            None,
             None,
             None,
         )
@@ -1022,14 +1091,32 @@ mod tests {
             cfg.download.download_dir = test_dir_str.clone();
             cfg.download.authorized_dirs = vec![test_dir_str];
         }
-        let _id1 = create_task_inner(&state, "http://example.com/file1.bin".into(), None, None)
-            .await
-            .unwrap();
-        let _id2 = create_task_inner(&state, "http://example.com/file2.bin".into(), None, None)
-            .await
-            .unwrap();
-        let result =
-            create_task_inner(&state, "http://example.com/file3.bin".into(), None, None).await;
+        let _id1 = create_task_inner(
+            &state,
+            "http://example.com/file1.bin".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let _id2 = create_task_inner(
+            &state,
+            "http://example.com/file2.bin".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let result = create_task_inner(
+            &state,
+            "http://example.com/file3.bin".into(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err(), "超过 max_concurrent_tasks 应返回错误");
         assert!(
             result.unwrap_err().to_string().contains("最大并发任务数"),
@@ -1044,8 +1131,14 @@ mod tests {
             let mut cfg = state.domain.config.lock().await;
             cfg.download.max_concurrent_fragments = 0;
         }
-        let result =
-            create_task_inner(&state, "http://example.com/zero-sem.bin".into(), None, None).await;
+        let result = create_task_inner(
+            &state,
+            "http://example.com/zero-sem.bin".into(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(
             result.is_err(),
             "max_concurrent_fragments=0 时应拒绝创建任务"
@@ -1064,6 +1157,7 @@ mod tests {
             let id = create_task_inner(
                 &state,
                 format!("http://example.com/deadlock-test-{i}.bin"),
+                None,
                 None,
                 None,
             )
@@ -1125,6 +1219,7 @@ mod tests {
                 format!("http://example.com/to-delete-{i}.bin"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1140,6 +1235,7 @@ mod tests {
                 create_task_inner(
                     &state_clone,
                     format!("http://example.com/new-task-{i}.bin"),
+                    None,
                     None,
                     None,
                 )
@@ -1184,6 +1280,7 @@ mod tests {
             "http://example.com/pause-resume-test.bin".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1222,6 +1319,7 @@ mod tests {
             "http://example.com/control-pause.bin".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1250,6 +1348,7 @@ mod tests {
             "https://example.com/status-failed.bin".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1269,6 +1368,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "http://example.com/control-cancel.bin".to_string(),
+            None,
             None,
             None,
         )
@@ -1349,5 +1449,69 @@ mod tests {
                 .contains_key(&task_id),
             "DownloadTask 构造失败后应清理控制通道"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_with_custom_filename() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/long-auto-name.tar.gz".to_string(),
+            None,
+            None,
+            Some("my_model.bin".to_string()),
+        )
+        .await
+        .unwrap();
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.file_name, "my_model.bin");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_custom_filename_sanitizes_path_traversal() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/safe.zip".to_string(),
+            None,
+            None,
+            Some("../../etc/passwd".to_string()),
+        )
+        .await
+        .unwrap();
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.file_name, "etc passwd");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_none_filename_falls_back_to_url() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://cdn.example.org/releases/v2.0.tar.gz".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.file_name, "v2.0.tar.gz");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_blank_filename_falls_back_to_url() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/model.bin".to_string(),
+            None,
+            None,
+            Some("   ".to_string()),
+        )
+        .await
+        .unwrap();
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.file_name, "model.bin");
     }
 }

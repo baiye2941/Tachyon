@@ -1,5 +1,6 @@
 import { createSignal, onCleanup, onMount } from 'solid-js'
 import { LogoIcon, MinimizeIcon, MaximizeIcon, RestoreIcon, CloseIcon } from './icons'
+import { tr } from '../i18n'
 
 type AppWindow = {
   minimize: () => Promise<void>
@@ -112,24 +113,24 @@ export default function TitleBar() {
         <button
           class="win-btn"
           onClick={handleMinimize}
-          aria-label="最小化窗口"
-          title="最小化"
+          aria-label={tr("titleBar.aria.minimize")}
+          title={tr("titleBar.minimize")}
         >
           <MinimizeIcon />
         </button>
         <button
           class="win-btn"
           onClick={handleMaximize}
-          aria-label={isMaximized() ? '恢复窗口' : '最大化窗口'}
-          title={isMaximized() ? '恢复' : '最大化'}
+          aria-label={isMaximized() ? tr("titleBar.aria.restore") : tr("titleBar.aria.maximize")}
+          title={isMaximized() ? tr("titleBar.restore") : tr("titleBar.maximize")}
         >
           {isMaximized() ? <RestoreIcon /> : <MaximizeIcon />}
         </button>
         <button
           class="win-btn win-btn-close"
           onClick={handleClose}
-          aria-label="关闭窗口"
-          title="关闭"
+          aria-label={tr("titleBar.aria.close")}
+          title={tr("titleBar.close")}
         >
           <CloseIcon />
         </button>

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { COMMANDS, GROUP_LABELS, getCommand, type CommandContext } from '../registry'
+import { COMMANDS, GROUP_LABEL_KEYS, getCommand, type CommandContext } from '../registry'
 
 const makeCtx = (overrides: Partial<CommandContext> = {}): CommandContext => ({
   onViewChange: vi.fn(),
@@ -13,10 +13,10 @@ describe('命令注册表(Iteration 07 DI-1)', () => {
     expect(new Set(ids).size).toBe(ids.length)
   })
 
-  it('每个命令有必需字段(id/label/group/icon/run)', () => {
+  it('每个命令有必需字段(id/labelKey/group/icon/run)', () => {
     for (const c of COMMANDS) {
       expect(c.id).toBeTruthy()
-      expect(c.label).toBeTruthy()
+      expect(c.labelKey).toBeTruthy()
       expect(c.group).toBeTruthy()
       expect(c.icon).toBeTruthy()
       expect(typeof c.run).toBe('function')
@@ -26,7 +26,7 @@ describe('命令注册表(Iteration 07 DI-1)', () => {
   it('分组标签覆盖所有出现的 group', () => {
     const groups = new Set(COMMANDS.map((c) => c.group))
     for (const g of groups) {
-      expect(GROUP_LABELS[g]).toBeTruthy()
+      expect(GROUP_LABEL_KEYS[g]).toBeTruthy()
     }
   })
 
@@ -39,7 +39,7 @@ describe('命令注册表(Iteration 07 DI-1)', () => {
   })
 
   it('getCommand 按 id 查找', () => {
-    expect(getCommand('nav-downloads')?.label).toBe('下载管理')
+    expect(getCommand('nav-downloads')?.labelKey).toBe('command.nav.downloads.label')
     expect(getCommand('nonexistent')).toBeUndefined()
   })
 

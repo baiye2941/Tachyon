@@ -102,4 +102,55 @@ describe('ui store', () => {
     uiModule.closeView('command')
     expect(read(() => uiModule.$ui.commandPaletteOpen())).toBe(false)
   })
+
+  // —— 侧边栏状态(Iteration 13)——
+  it('toggleSidebarPin 切换 pinned 状态并同步 collapsed', () => {
+    const initialPinned = read(() => uiModule.$ui.sidebarPinned())
+    const initialCollapsed = read(() => uiModule.$ui.sidebarCollapsed())
+
+    uiModule.$ui.toggleSidebarPin()
+
+    expect(read(() => uiModule.$ui.sidebarPinned())).toBe(!initialPinned)
+    // pinned 时 collapsed 必为 false;非 pinned 时 collapsed 必为 true
+    if (!initialPinned) {
+      expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(false)
+    } else {
+      expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(true)
+    }
+
+    // 恢复
+    uiModule.$ui.toggleSidebarPin()
+    expect(read(() => uiModule.$ui.sidebarPinned())).toBe(initialPinned)
+    expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(initialCollapsed)
+  })
+
+  it('toggleSidebar 在非 pinned 时切换 collapsed', () => {
+    // 确保非 pinned
+    if (read(() => uiModule.$ui.sidebarPinned())) {
+      uiModule.$ui.toggleSidebarPin()
+    }
+    uiModule.$ui.setSidebarCollapsed(true)
+    expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(true)
+
+    uiModule.toggleSidebar()
+    expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(false)
+
+    uiModule.toggleSidebar()
+    expect(read(() => uiModule.$ui.sidebarCollapsed())).toBe(true)
+  })
+
+  it('commitSidebarWidth 更新宽度并持久化', () => {
+    uiModule.$ui.commitSidebarWidth(250)
+    expect(read(() => uiModule.$ui.sidebarWidth())).toBe(250)
+
+    const stored = JSON.parse(localStorage.getItem('tachyon-sidebar-state') ?? '{}')
+    expect(stored.width).toBe(250)
+  })
+
+  it('侧边栏常量已导出且符合设计约束', () => {
+    expect(uiModule.SIDEBAR_RAIL_WIDTH).toBe(56)
+    expect(uiModule.SIDEBAR_MIN_EXPANDED_WIDTH).toBe(200)
+    expect(uiModule.SIDEBAR_MAX_WIDTH).toBe(300)
+    expect(uiModule.SIDEBAR_DEFAULT_WIDTH).toBe(220)
+  })
 })

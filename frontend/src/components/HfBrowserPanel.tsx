@@ -9,6 +9,7 @@ import { detectQuant, isModelWeight, isLargeFile, type QuantLevel } from '../uti
 import { buildTree, countByType, type TreeNode } from '../utils/hfTree'
 import { buildHfMirrorUrl } from '../utils/hfMirror'
 import Button from '../shared/ui/Button'
+import { tr } from '../i18n'
 
 interface HfBrowserPanelProps {
   visible: boolean
@@ -76,10 +77,10 @@ function TreeNodeItem(props: {
       if (url) {
         await api.createTask(url)
         refreshTaskList()
-        addToast(`已添加下载: ${props.node.name}`, 'success')
+        addToast(tr('toast.hubAddedDownload', { name: props.node.name }), 'success')
       }
     } catch (e) {
-      addToast(`下载失败: ${String(e)}`, 'error')
+      addToast(tr('toast.hubDownloadFailed', { error: String(e) }), 'error')
     }
     props.onDownload(props.node.path)
   }
@@ -177,7 +178,7 @@ function TreeNodeItem(props: {
         {/* 大文件标记 */}
         <Show when={!props.node.isDirectory && props.node.size && isLargeFile(props.node.size)}>
           <span style={{ 'font-size': '10px', color: 'var(--color-warning)', 'flex-shrink': 0 }}>
-            大
+            {tr("hub.largeTag")}
           </span>
         </Show>
 
@@ -201,7 +202,7 @@ function TreeNodeItem(props: {
           <Button
             variant="ghost"
             size="sm"
-            aria-label={`下载 ${props.node.name}`}
+            aria-label={tr("hub.aria.downloadFile", { name: props.node.name })}
             onClick={handleDownload}
           >
             <ArrowDownIcon />
@@ -243,11 +244,11 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   const handleBrowse = async () => {
     const id = repoId().trim()
     if (!id) {
-      addToast('请输入仓库 ID', 'error')
+      addToast(tr('toast.hubEnterRepoId'), 'error')
       return
     }
     if (!id.includes('/') || id.split('/').length !== 2) {
-      addToast('仓库 ID 格式应为 owner/repo', 'error')
+      addToast(tr('toast.hubInvalidId'), 'error')
       return
     }
     await listRepoFiles(id, revision() || undefined)
@@ -275,7 +276,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
       (f: HubFileInfo) => f.type !== 'directory' && isModelWeight(f.path),
     )
     if (modelFiles.length === 0) {
-      addToast('未发现模型权重文件', 'info')
+      addToast(tr('toast.hubNoWeights'), 'info')
       return
     }
     const ggufFiles = modelFiles.filter((f: HubFileInfo) => f.path.endsWith('.gguf'))
@@ -287,13 +288,13 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
         q4km ??
         ggufFiles.reduce((min: HubFileInfo, f: HubFileInfo) => (f.size < min.size ? f : min))
       setSelectedPaths(new Set([target.path]))
-      addToast(`智能选择: ${target.path}`, 'success')
+      addToast(tr('toast.hubSmartSelect', { path: target.path }), 'success')
       return
     }
     const stFiles = modelFiles.filter((f: HubFileInfo) => f.path.endsWith('.safetensors'))
     if (stFiles.length > 0) {
       setSelectedPaths(new Set(stFiles.map((f: HubFileInfo) => f.path)))
-      addToast(`已选择 ${stFiles.length} 个 safetensors 文件`, 'success')
+      addToast(tr('toast.hubSelectedSafetensors', { count: stFiles.length }), 'success')
     }
   }
 
@@ -312,7 +313,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   const handleBatchDownload = async (useMirror: boolean) => {
     const paths = Array.from(selectedPaths())
     if (paths.length === 0) {
-      addToast('请先勾选要下载的文件', 'error')
+      addToast(tr('toast.hubSelectFilesFirst'), 'error')
       return
     }
     const id = repoId().trim()
@@ -322,7 +323,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
       const results = await Promise.allSettled(
         paths.map(async (path) => {
           const originalUrl = await api.getHfDownloadUrl(id, path, rev)
-          if (!originalUrl) throw new Error(`无法获取 ${path} 的下载链接`)
+          if (!originalUrl) throw new Error(tr('toast.hubUrlMissing', { path }))
           if (useMirror) {
             // 镜像主源:基于 repoId 构造 hf-mirror resolve URL(鲁棒,绕过 CDN 域名)
             const mirrorUrl = buildHfMirrorUrl(id, rev, path)
@@ -334,13 +335,13 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
       const failed = results.filter((r) => r.status === 'rejected')
       if (failed.length === 0) {
         addToast(
-          useMirror ? `已通过 hf-mirror 镜像创建 ${paths.length} 个下载任务` : `已创建 ${paths.length} 个下载任务`,
+          useMirror ? tr('toast.hubMirrorCreated', { count: paths.length }) : tr('toast.hubCreated', { count: paths.length }),
           'success',
         )
       } else if (failed.length === paths.length) {
-        addToast('创建下载任务失败', 'error')
+        addToast(tr('toast.hubCreateFailed'), 'error')
       } else {
-        addToast(`${paths.length - failed.length} 成功, ${failed.length} 失败`, 'info')
+        addToast(tr('toast.batchPartialShort', { success: paths.length - failed.length, failed: failed.length }), 'info')
       }
       refreshTaskList()
       props.onClose()
@@ -377,11 +378,11 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     return set
   })
 
-  const filterTabs: { key: FilterKey; label: string; count: () => number }[] = [
-    { key: 'all', label: '全部', count: () => counts().all },
-    { key: 'gguf', label: 'GGUF', count: () => counts().gguf },
-    { key: 'safetensors', label: 'Safetensors', count: () => counts().safetensors },
-    { key: 'large', label: '大文件', count: () => counts().large },
+  const filterTabs: { key: FilterKey; label: () => string; count: () => number }[] = [
+    { key: 'all', label: () => tr('hub.filter.all'), count: () => counts().all },
+    { key: 'gguf', label: () => 'GGUF', count: () => counts().gguf },
+    { key: 'safetensors', label: () => 'Safetensors', count: () => counts().safetensors },
+    { key: 'large', label: () => tr('hub.filter.large'), count: () => counts().large },
   ]
 
   return (
@@ -394,7 +395,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
         class="fixed z-[210] flex flex-col hf-panel"
         role="dialog"
         aria-modal="true"
-        aria-label="HuggingFace Hub"
+        aria-label={tr("hub.aria")}
         style={{
           top: '50%',
           left: '50%',
@@ -406,7 +407,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           <span style={{ 'font-size': '15px', 'font-weight': 600, color: 'var(--color-text-title)' }}>
             HuggingFace Hub
           </span>
-          <Button variant="ghost" shape="icon-sm" class="hover-light" aria-label="关闭" onClick={() => props.onClose()}>
+          <Button variant="ghost" shape="icon-sm" class="hover-light" aria-label={tr("hub.aria.close")} onClick={() => props.onClose()}>
             <CloseIcon />
           </Button>
         </div>
@@ -419,7 +420,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
               ref={inputRef}
               type="text"
               class="flex-1"
-              placeholder="owner/repo (如: bert-base-uncased)"
+              placeholder={tr("hub.placeholder.repoId")}
               value={repoId()}
               onInput={(e) => setRepoId(e.currentTarget.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleBrowse()}
@@ -434,7 +435,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           </div>
           <input
             type="text"
-            placeholder="revision (默认 main)"
+            placeholder={tr("hub.placeholder.revision")}
             value={revision()}
             onInput={(e) => setRevision(e.currentTarget.value)}
             style={{
@@ -449,7 +450,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
             }}
           />
           <Button variant="primary" size="sm" loading={loading()} onClick={handleBrowse}>
-            浏览
+            {tr("hub.browse")}
           </Button>
         </div>
 
@@ -462,10 +463,10 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                 <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" />
               </svg>
               <div style={{ 'font-size': '14px', color: 'var(--color-text-tertiary)' }}>
-                输入 HuggingFace 仓库 ID 开始浏览
+                {tr("hub.empty")}
               </div>
               <div style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', opacity: 0.6 }}>
-                例如: meta-llama/Llama-3.2-1B, openai/clip-vit-base-patch32
+                {tr("hub.emptyHint")}
               </div>
             </div>
           </Show>
@@ -488,13 +489,13 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                 <line x1="12" y1="16" x2="12.01" y2="16" />
               </svg>
               <div style={{ 'font-size': '14px', color: 'var(--color-error)' }}>
-                加载仓库文件列表失败
+                {tr("hub.loadFailed")}
               </div>
               <div class="mono" style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)' }}>
                 {error()}
               </div>
               <Button variant="secondary" size="sm" onClick={handleRetry}>
-                重试
+                {tr("hub.retry")}
               </Button>
             </div>
           </Show>
@@ -502,7 +503,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           {/* 文件树 */}
           <Show when={!loading() && !error() && browsed() && repoFiles().length > 0}>
             {/* DI-5:筛选条 + 类型计数(radiogroup 语义) */}
-            <div role="radiogroup" aria-label="文件类型筛选" class="flex items-center gap-1 flex-wrap" style={{ 'margin-bottom': '8px', padding: '4px 8px' }}>
+            <div role="radiogroup" aria-label={tr("hub.aria.filterType")} class="flex items-center gap-1 flex-wrap" style={{ 'margin-bottom': '8px', padding: '4px 8px' }}>
               <For each={filterTabs}>
                 {(tab) => (
                   <button
@@ -514,7 +515,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                     disabled={tab.key !== 'all' && tab.count() === 0}
                     onClick={() => setFilter(tab.key)}
                   >
-                    {tab.label} <span class="hf-filter-count">{tab.count()}</span>
+                    {tab.label()} <span class="hf-filter-count">{tab.count()}</span>
                   </button>
                 )}
               </For>
@@ -522,30 +523,30 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                 <SearchIcon />
                 <input
                   type="text"
-                  placeholder="搜索文件..."
+                  placeholder={tr("hub.searchPlaceholder")}
                   value={searchInput()}
                   onInput={(e) => onSearchInput(e.currentTarget.value)}
                   class="hf-filter-search"
-                  aria-label="搜索文件"
+                  aria-label={tr("hub.aria.searchFiles")}
                 />
               </div>
             </div>
 
             <div class="flex items-center" style={{ 'margin-bottom': '8px', padding: '4px 8px' }}>
               <span style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)' }}>
-                {repoId()} · {fileCount()} 个文件
+                {tr("hub.fileCount", { repoId: repoId(), count: fileCount() })}
               </span>
               <Button
                 variant="ghost"
                 size="sm"
                 class="ml-auto"
                 onClick={smartSelect}
-                title="智能选择最佳量化(GGUF 优先 Q4_K_M)"
+                title={tr("hub.smartSelectTitle")}
               >
-                智能选择
+                {tr("hub.smartSelect")}
               </Button>
             </div>
-            <div role="tree" aria-label={`${repoId()} 文件树`}>
+            <div role="tree" aria-label={tr("hub.aria.fileTree", { repoId: repoId() })}>
               <For each={tree()}>
                 {(node) => (
                   <TreeNodeItem
@@ -573,7 +574,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           <Show when={!loading() && !error() && browsed() && repoFiles().length === 0}>
             <div class="flex flex-col items-center justify-center gap-3" style={{ padding: '60px 20px' }}>
               <div style={{ 'font-size': '14px', color: 'var(--color-text-tertiary)' }}>
-                该仓库没有可浏览的文件
+                {tr("hub.emptyRepo")}
               </div>
             </div>
           </Show>
@@ -590,7 +591,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
             }}
           >
             <span style={{ 'font-size': '13px', color: 'var(--color-text-secondary)' }}>
-              已选 {selectedPaths().size} 个 · {formatSize(selectedSize())}
+              {tr("hub.selectedSummary", { count: selectedPaths().size, size: formatSize(selectedSize()) })}
             </span>
             <div style={{ 'margin-left': 'auto' }} class="flex items-center gap-2">
               <Button
@@ -598,20 +599,20 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                 size="md"
                 loading={batchDownloading()}
                 onClick={() => handleBatchDownload(false)}
-                title="直接从 HuggingFace 下载"
+                title={tr("hub.downloadTitle")}
               >
                 <ArrowDownIcon />
-                <span>下载</span>
+                <span>{tr("hub.download")}</span>
               </Button>
               <Button
                 variant="primary"
                 size="md"
                 loading={batchDownloading()}
                 onClick={() => handleBatchDownload(true)}
-                title="通过 hf-mirror.com 镜像下载(国内加速),原始链接作为容灾"
+                title={tr("hub.mirrorDownloadTitle")}
               >
                 <ArrowDownIcon />
-                <span>镜像下载</span>
+                <span>{tr("hub.mirrorDownload")}</span>
               </Button>
             </div>
           </div>

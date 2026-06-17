@@ -2,6 +2,7 @@ import { For, createSignal, onCleanup, onMount } from 'solid-js'
 import type { ToastMessage } from '../types'
 import { XIcon } from './icons'
 import Button from '../shared/ui/Button'
+import { tr } from '../i18n'
 
 const [toasts, setToasts] = createSignal<ToastMessage[]>([])
 
@@ -137,7 +138,7 @@ function ToastItem(props: { toast: ToastMessage }) {
                 <Button
                   variant="ghost"
                   size="sm"
-                  aria-label="关闭提示"
+                  aria-label={tr("toast.aria.closeToast")}
                   style={{ 'font-size': '12px', padding: '0 4px' }}
                   onClick={() => {
                     action.onClick()
@@ -156,7 +157,7 @@ function ToastItem(props: { toast: ToastMessage }) {
       <Button
         variant="ghost"
         shape="icon-sm"
-        aria-label="关闭通知"
+        aria-label={tr("toast.aria.closeNotification")}
         onClick={() => removeToast(props.toast.id)}
       >
         <XIcon />

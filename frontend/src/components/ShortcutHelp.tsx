@@ -3,11 +3,12 @@ import { CloseIcon } from "./icons";
 import Button from "../shared/ui/Button";
 import {
   groupedShortcuts,
-  GROUP_LABELS,
+  GROUP_LABEL_KEYS,
   platformKeys,
   type ShortcutGroup,
 } from "../commands/shortcuts";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { tr, type MessageKey } from "../i18n";
 
 interface ShortcutHelpProps {
   visible: boolean;
@@ -22,6 +23,7 @@ interface ShortcutHelpProps {
  */
 export default function ShortcutHelp(props: ShortcutHelpProps) {
   let panelRef: HTMLDivElement | undefined;
+  const t = (key: MessageKey) => tr(key);
 
   // macOS 检测(显示 Cmd 替代 Ctrl)
   const isMac =
@@ -73,13 +75,13 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
               color: "var(--color-text-title)",
             }}
           >
-            快捷键
+            {t("shortcutHelp.title")}
           </span>
           <Button
             variant="ghost"
             shape="icon-sm"
             class="hover-light"
-            aria-label="关闭"
+            aria-label={t("common.close")}
             onClick={() => props.onClose()}
           >
             <CloseIcon />
@@ -101,7 +103,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
                     color: "var(--color-text-tertiary)",
                   }}
                 >
-                  {GROUP_LABELS[gkey]}
+                  {t(GROUP_LABEL_KEYS[gkey])}
                 </div>
                 <For each={groups()[gkey]}>
                   {(s) => (
@@ -110,7 +112,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
                       style={{ padding: "6px 20px", "font-size": "13px" }}
                     >
                       <span style={{ color: "var(--color-text-secondary)" }}>
-                        {s.label}
+                        {t(s.labelKey)}
                       </span>
                       <span class="flex items-center gap-1">
                         <For each={platformKeys(s.keys, isMac)}>
@@ -149,7 +151,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
             color: "var(--color-text-tertiary)",
           }}
         >
-          macOS 下 Ctrl 显示为 Cmd
+          {t("shortcutHelp.macHint")}
         </div>
       </div>
     </Show>

@@ -1,14 +1,13 @@
 import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
+import { tr } from '../i18n'
 
 async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
   try {
     const mod = await import('@tauri-apps/api/core')
     return mod.invoke
   } catch {
-    throw new Error(
-      'Tauri API 不可用。请通过 `cargo tauri dev` 启动应用，不要直接在浏览器中打开。',
-    )
+    throw new Error(tr('toast.tauriUnavailable'))
   }
 }
 
@@ -41,7 +40,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>, skipConfir
   if (!skipConfirm) {
     const confirmed = await confirmDestructive(cmd)
     if (!confirmed) {
-      throw new Error(`用户取消了操作: ${cmd}`)
+      throw new Error(tr('toast.userCancelled', { cmd }))
     }
   }
 
@@ -72,7 +71,8 @@ export const api = {
   /** 获取支持的协议列表 */
   getSupportedProtocols: () => invoke<string[]>('supported_protocols'),
   /** 创建下载任务 */
-  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[]) => invoke<string>('create_task', { url, downloadDir, mirrorUrls }),
+  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string) =>
+    invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName }),
   /** 获取任务列表 */
   getTaskList: () => invoke<TaskInfo[]>('get_task_list'),
   /** 获取任务详情 */
@@ -83,8 +83,15 @@ export const api = {
   resumeTask: (taskId: string) => invoke<void>('resume_task', { taskId }),
   /** 取消任务 */
   cancelTask: (taskId: string) => invoke<void>('cancel_task', { taskId }),
-  /** 删除任务(破坏性操作,需确认令牌) */
-  deleteTask: (taskId: string) => invoke<void>('delete_task', { taskId }),
+  /**
+   * 删除任务(破坏性操作,需确认令牌)
+   *
+   * @param opts.skipConfirm - 调用方已在应用层 ConfirmDialog 确认过,
+   *   跳过 invoke 内置的 window.confirm。后端 confirmation token 仍会请求,
+   *   安全边界不受影响。
+   */
+  deleteTask: (taskId: string, opts?: { skipConfirm?: boolean }) =>
+    invoke<void>('delete_task', { taskId }, opts?.skipConfirm),
   /** 打开文件夹 */
   openFolder: (path: string) => openPath(path),
   /** 获取下载进度详情 */

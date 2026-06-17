@@ -6,6 +6,7 @@ import {
 } from './icons'
 import { formatSize } from '../utils/format'
 import Button from '../shared/ui/Button'
+import { tr } from '../i18n'
 
 const typeColors: Record<string, string> = {
   video: 'var(--color-file-video)',
@@ -80,7 +81,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
       class="slide-panel"
       role="dialog"
       aria-modal="true"
-      aria-label="资源嗅探"
+      aria-label={tr("sniffer.aria")}
       style={{
         width: 'var(--panel-sniffer-width, 380px)',
         transform: props.visible ? 'translateX(0)' : 'translateX(100%)',
@@ -90,7 +91,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
       <div class="panel-header">
         <div class="panel-title">
           <BrowserIcon />
-          <span>嗅探到 {props.resources.length} 个资源</span>
+          <span>{tr("sniffer.title", { count: props.resources.length })}</span>
         </div>
         <button
           class="icon-btn-sm hover-light"
@@ -108,7 +109,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
               class={filterType() === type ? 'pill-btn pill-btn-active' : 'pill-btn pill-btn-default'}
               onClick={() => setFilterType(type)}
             >
-              {type === 'all' ? '全部' : type}
+              {type === 'all' ? tr("common.all") : type}
             </button>
           )}
         </For>
@@ -128,7 +129,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
           }}
         >
           <CheckboxIcon checked={batchMode()} />
-          <span>批量选择</span>
+          <span>{tr("sniffer.batchSelect")}</span>
         </Button>
       </div>
 
@@ -226,10 +227,10 @@ export default function SnifferPanel(props: SnifferPanelProps) {
             onClick={selectAll}
           >
             <CheckboxIcon />
-            <span>全选</span>
+            <span>{tr("common.selectAll")}</span>
           </Button>
           <span style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)' }}>
-            已选 {selectedIds().size} 项
+            {tr("batch.selectedCount", { count: selectedIds().size })}
           </span>
           <Button
             variant="primary"
@@ -242,7 +243,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
             }}
           >
             <PlusIcon />
-            批量添加 ({selectedIds().size})
+            {tr("sniffer.batchAdd", { count: selectedIds().size })}
           </Button>
         </div>
       </Show>

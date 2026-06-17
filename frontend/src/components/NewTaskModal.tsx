@@ -2,10 +2,12 @@ import { createSignal, createMemo, Show, For } from "solid-js";
 import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon } from "./icons";
 import { api } from "../api/invoke";
 import { addToast } from "../stores/toast";
+import { refreshTaskList } from "../stores/downloads";
 import Button from "../shared/ui/Button";
 import { parseUrlLines, validateUrl } from "../utils/urlValidation";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { tr } from "../i18n";
 
 interface NewTaskModalProps {
   onClose: () => void;
@@ -17,6 +19,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // 镜像源动态行
   const [mirrors, setMirrors] = createSignal<string[]>([]);
   const [savePath, setSavePath] = createSignal("");
+  const [fileName, setFileName] = createSignal("");
   const [autoStart, setAutoStart] = createSignal(true);
   const [isDragOver, setIsDragOver] = createSignal(false);
   const [creating, setCreating] = createSignal(false);
@@ -63,7 +66,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
         setSavePath(selected as string);
       }
     } catch (err) {
-      console.warn("文件夹选择不可用(浏览器或 SSR 环境):", err);
+      console.warn(tr("newTask.folderPickerUnavailable"), err);
     }
   };
 
@@ -88,7 +91,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   const handleSubmit = async () => {
     const urls = validUrls();
     if (urls.length === 0) {
-      addToast("请输入有效的下载链接", "error");
+      addToast(tr("toast.invalidUrl"), "error");
       return;
     }
 
@@ -96,10 +99,13 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     try {
       const dir = savePath().trim() || undefined;
       const mirrorList = validMirrors().length > 0 ? validMirrors() : undefined;
+      // 重命名仅单 URL 时生效,批量时忽略(避免一个名字套多个文件)
+      const name =
+        validCount() === 1 ? fileName().trim() || undefined : undefined;
 
       // 批量创建,共享 savePath/mirrors;allSettled 部分失败不阻断
       const results = await Promise.allSettled(
-        urls.map((u) => api.createTask(u, dir, mirrorList)),
+        urls.map((u) => api.createTask(u, dir, mirrorList, name)),
       );
 
       // autoStart 过渡容错:后端创建即启动,取消自动开始时延迟 pause 消除竞态
@@ -118,24 +124,38 @@ export default function NewTaskModal(props: NewTaskModalProps) {
 
       const failed = results.filter((r) => r.status === "rejected");
       if (failed.length === 0) {
-        addToast(`已创建 ${urls.length} 个任务`, "success");
+        addToast(tr("toast.tasksCreated", { count: urls.length }), "success");
       } else if (failed.length === urls.length) {
-        addToast("创建任务失败", "error");
+        const first = failed[0];
+        const reason =
+          first && first.status === "rejected" ? String(first.reason) : "";
+        addToast(tr("toast.createTaskError", { error: reason }), "error");
       } else {
+        const reasons = failed
+          .map((r) => (r.status === "rejected" ? String(r.reason) : ""))
+          .join("; ");
         addToast(
-          `${urls.length - failed.length} 成功, ${failed.length} 失败`,
+          tr("toast.batchPartial", {
+            success: urls.length - failed.length,
+            failed: failed.length,
+            reasons,
+          }),
           "info",
         );
       }
+
+      // 刷新任务列表,确保新创建的任务立即显示
+      await refreshTaskList();
 
       // 重置并关闭
       setUrlText("");
       setMirrors([]);
       setSavePath("");
+      setFileName("");
       setAutoStart(true);
       props.onClose();
     } catch (err) {
-      addToast(`创建任务失败: ${err}`, "error");
+      addToast(tr("toast.createTaskError", { error: err }), "error");
     } finally {
       setCreating(false);
     }
@@ -144,10 +164,10 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // 主按钮文案:动态显示任务数
   const submitLabel = createMemo(() => {
     const n = validCount();
-    if (creating()) return "创建中...";
-    if (n === 0) return "开始下载";
-    if (n === 1) return "开始下载";
-    return `开始下载(${n})`;
+    if (creating()) return tr("newTask.submit.creating");
+    if (n === 0) return tr("newTask.submit.start");
+    if (n === 1) return tr("newTask.submit.start");
+    return tr("newTask.submit.startN", { count: n });
   });
 
   return (
@@ -188,12 +208,12 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               color: "var(--color-text-title)",
             }}
           >
-            添加下载任务
+            {tr("newTask.title")}
           </span>
           <Button
             variant="ghost"
             shape="icon-sm"
-            aria-label="关闭"
+            aria-label={tr("common.close")}
             onClick={() => props.onClose()}
           >
             <CloseIcon />
@@ -212,13 +232,13 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               "margin-bottom": "6px",
             }}
           >
-            下载链接(支持多行批量添加)
+            {tr("newTask.urlLabel")}
           </label>
           <textarea
             id="new-task-url-input"
             ref={urlInputRef}
             data-autofocus
-            placeholder={"粘贴下载链接,每行一个\n支持拖拽 .txt 文件"}
+            placeholder={tr("newTask.urlPlaceholder")}
             value={urlText()}
             onInput={(e) => setUrlText(e.currentTarget.value)}
             class={`input${isDragOver() ? " input-drag-over" : ""}`}
@@ -274,9 +294,9 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                     : "var(--color-status-completed)",
               }}
             >
-              {validCount()} 个有效链接
+              {tr("newTask.validCount", { count: validCount() })}
               <Show when={invalidCount() > 0}>
-                , {invalidCount()} 个无效将被忽略
+                {tr("newTask.invalidCount", { count: invalidCount() })}
               </Show>
             </div>
           </Show>
@@ -294,7 +314,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                 "margin-bottom": "6px",
               }}
             >
-              镜像源(主源失败时自动切换)
+              {tr("newTask.mirrorLabel")}
             </label>
             <For each={mirrors()}>
               {(mirror, i) => (
@@ -305,7 +325,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                   <input
                     data-mirror="true"
                     type="text"
-                    placeholder="https://mirror.example.com/same-file.gguf"
+                    placeholder={tr("newTask.mirrorPlaceholder")}
                     value={mirror}
                     onInput={(e) => updateMirror(i(), e.currentTarget.value)}
                     class="input"
@@ -318,7 +338,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                   <Button
                     variant="ghost"
                     shape="icon-sm"
-                    aria-label={`移除镜像源 ${i() + 1}`}
+                    aria-label={tr("newTask.removeMirror", { index: i() + 1 })}
                     onClick={() => removeMirror(i())}
                   >
                     <XIcon />
@@ -329,7 +349,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           </Show>
           <Button variant="ghost" size="sm" onClick={addMirror}>
             <PlusIcon />
-            <span>添加镜像源</span>
+            <span>{tr("newTask.addMirror")}</span>
           </Button>
         </div>
 
@@ -345,13 +365,13 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               "margin-bottom": "6px",
             }}
           >
-            保存到
+            {tr("newTask.saveTo")}
           </label>
           <div class="flex items-center gap-2">
             <input
               id="new-task-save-input"
               type="text"
-              placeholder="默认下载目录"
+              placeholder={tr("newTask.savePlaceholder")}
               value={savePath()}
               onInput={(e) => setSavePath(e.currentTarget.value)}
               class="input"
@@ -364,10 +384,41 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               onClick={handleBrowse}
             >
               <FolderOpenIcon />
-              <span>浏览</span>
+              <span>{tr("common.browse")}</span>
             </Button>
           </div>
         </div>
+
+        {/* 重命名(仅单 URL 时显示,批量时一个名字套多个文件有歧义) */}
+        <Show when={validCount() === 1}>
+          <div style={{ "margin-bottom": "16px" }}>
+            <label
+              for="new-task-filename-input"
+              style={{
+                display: "block",
+                "font-size": "12px",
+                "font-weight": 500,
+                color: "var(--color-text-secondary)",
+                "margin-bottom": "6px",
+              }}
+            >
+              {tr("newTask.fileNameLabel")}
+            </label>
+            <input
+              id="new-task-filename-input"
+              type="text"
+              placeholder={tr("newTask.fileNamePlaceholder")}
+              value={fileName()}
+              onInput={(e) => setFileName(e.currentTarget.value)}
+              class="input"
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                "font-size": "14px",
+              }}
+            />
+          </div>
+        </Show>
 
         {/* Auto Start */}
         <div
@@ -422,14 +473,14 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               color: "var(--color-text-secondary)",
             }}
           >
-            自动开始下载
+            {tr("newTask.autoStart")}
           </span>
         </div>
 
         {/* Actions */}
         <div class="flex items-center justify-end gap-3">
           <Button variant="ghost" size="md" onClick={() => props.onClose()}>
-            取消
+            {tr("common.cancel")}
           </Button>
           <Button
             variant="primary"

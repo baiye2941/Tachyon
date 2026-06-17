@@ -2,6 +2,7 @@ import { createMemo, onMount, onCleanup, createSignal } from 'solid-js'
 import type { TaskInfo } from '../types'
 import { formatSpeed } from '../utils/format'
 import { getHistory, getPeakSpeed, getAverageSpeed } from '../stores/speedHistory'
+import { tr } from '../i18n'
 
 interface SpeedChartProps {
   task: TaskInfo
@@ -92,7 +93,7 @@ export default function SpeedChart(props: SpeedChartProps) {
           'margin-bottom': '12px',
         }}
       >
-        {'速度趋势'}
+        {tr('speedChart.title')}
       </div>
 
       <svg
@@ -138,7 +139,7 @@ export default function SpeedChart(props: SpeedChartProps) {
             font-size="12"
             font-family="var(--font-mono)"
           >
-            {'等待速度数据...'}
+            {tr('speedChart.waiting')}
           </text>
         )}
       </svg>
@@ -151,7 +152,7 @@ export default function SpeedChart(props: SpeedChartProps) {
             color: 'var(--color-text-secondary)',
           }}
         >
-          {'峰值: '}
+          {tr('speedChart.peak')}
           <span style={{ color: 'var(--color-speed-active)' }}>{formatSpeed(stats().peak)}</span>
         </span>
         <span
@@ -161,7 +162,7 @@ export default function SpeedChart(props: SpeedChartProps) {
             color: 'var(--color-text-secondary)',
           }}
         >
-          {'平均: '}
+          {tr('speedChart.average')}
           {formatSpeed(stats().avg)}
         </span>
       </div>

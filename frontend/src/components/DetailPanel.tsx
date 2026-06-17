@@ -28,15 +28,31 @@ import {
   CopyIcon,
   FolderOpenIcon,
   RefreshIcon,
+  ChevronDownIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
 import { addToast } from "../stores/toast";
+import { requestConfirm } from "../stores/confirm";
+import { useReducedMotion } from "../hooks/useReducedMotion";
+import { useIsNarrowScreen } from "../hooks/useMediaQuery";
+import { useFocusTrap } from "../hooks/useFocusTrap";
+import { tr, type MessageKey } from "../i18n";
 import SpeedChart from "./SpeedChart";
 import Button from "../shared/ui/Button";
-import { inferFailure } from "../utils/errorReason";
+import { inferFailure, parseHfUrl, type FailureInsight } from "../utils/errorReason";
+import { buildHfMirrorUrl } from "../utils/hfMirror";
 
 const ChunkMatrix = lazy(() => import("./ChunkMatrix"));
+
+const DIAGNOSTICS_CATEGORY_KEY: Record<FailureInsight["category"], MessageKey> = {
+  network: "detail.diagnostics.category.network",
+  auth: "detail.diagnostics.category.auth",
+  disk: "detail.diagnostics.category.disk",
+  ssl: "detail.diagnostics.category.ssl",
+  cancelled: "detail.diagnostics.category.cancelled",
+  unknown: "detail.diagnostics.category.unknown",
+};
 
 interface DetailPanelProps {
   task: TaskInfo | null;
@@ -44,15 +60,28 @@ interface DetailPanelProps {
 }
 
 export default function DetailPanel(props: DetailPanelProps) {
+  const t = (key: MessageKey, values?: Record<string, string | number>) =>
+    tr(key, values as Record<string, string | number | unknown>);
   const [displayTask, setDisplayTask] = createSignal<TaskInfo | null>(null);
   const [shouldRender, setShouldRender] = createSignal(false);
   const [visible, setVisible] = createSignal(false);
   const [menuOpen, setMenuOpen] = createSignal(false);
   const [copied, setCopied] = createSignal<string | null>(null);
+  const [diagnosticsExpanded, setDiagnosticsExpanded] = createSignal(false);
+  const [metadataExpanded, setMetadataExpanded] = createSignal(false);
+  // 重试 loading 态:防止重复点击(Iteration 16)
+  const [retrying, setRetrying] = createSignal(false);
+  const [mirrorRetrying, setMirrorRetrying] = createSignal(false);
+
+  // 响应式 + 动效偏好(Iteration 13)
+  const isNarrow = useIsNarrowScreen();
+  const reducedMotion = useReducedMotion();
 
   let closeTimer: number | null = null;
   let copiedTimer: number | null = null;
   let menuRef: HTMLDivElement | undefined;
+  let menuTriggerRef: HTMLButtonElement | undefined;
+  let panelContentRef: HTMLDivElement | undefined;
 
   const cancelCloseTimer = () => {
     if (closeTimer !== null) {
@@ -67,6 +96,8 @@ export default function DetailPanel(props: DetailPanelProps) {
       cancelCloseTimer();
       setDisplayTask(task);
       setMenuOpen(false);
+      setDiagnosticsExpanded(false);
+      setMetadataExpanded(false);
       if (!shouldRender()) {
         setShouldRender(true);
         requestAnimationFrame(() => {
@@ -98,6 +129,65 @@ export default function DetailPanel(props: DetailPanelProps) {
     };
     document.addEventListener("mousedown", handler);
     onCleanup(() => document.removeEventListener("mousedown", handler));
+  });
+
+  // 更多菜单:打开时聚焦首项,关闭时还原焦点到触发按钮(Iteration 15)
+  createEffect(() => {
+    if (!menuOpen()) return;
+    const raf = requestAnimationFrame(() => {
+      const first = menuRef?.querySelector<HTMLButtonElement>(".detail-menu-item");
+      first?.focus();
+    });
+    const handler = (e: KeyboardEvent) => {
+      if (!menuRef) return;
+      const items = Array.from(
+        menuRef.querySelectorAll<HTMLButtonElement>(".detail-menu-item"),
+      ).filter((el) => !el.disabled);
+      if (items.length === 0) return;
+      const idx = items.findIndex((el) => el === document.activeElement);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMenuOpen(false);
+        menuTriggerRef?.focus();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        items[(idx + 1) % items.length]!.focus();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        items[(idx - 1 + items.length) % items.length]!.focus();
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        items[0]!.focus();
+      } else if (e.key === "End") {
+        e.preventDefault();
+        items[items.length - 1]!.focus();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    onCleanup(() => {
+      cancelAnimationFrame(raf);
+      document.removeEventListener("keydown", handler);
+    });
+  });
+
+  // 窄屏 sheet:focus trap + Esc 关闭(Iteration 13 遗留,Iteration 15 补齐)
+  useFocusTrap({
+    active: () => isNarrow() && visible(),
+    container: panelContentRef,
+    onEscape: () => handleClose(),
+  });
+
+  // 宽屏侧栏:Esc 关闭(非 trap,侧栏与列表共存,仅关面板)
+  createEffect(() => {
+    if (isNarrow() || !visible()) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !menuOpen()) {
+        e.preventDefault();
+        handleClose();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    onCleanup(() => document.removeEventListener("keydown", handler));
   });
 
   const handleClose = () => {
@@ -149,61 +239,115 @@ export default function DetailPanel(props: DetailPanelProps) {
   const currentTask = () => task();
 
   const handlePause = async () => {
-    const t = currentTask();
-    if (!t) return;
+    const t2 = currentTask();
+    if (!t2) return;
     try {
-      await api.pauseTask(t.id);
+      await api.pauseTask(t2.id);
       await refreshTaskList();
     } catch (e) {
-      addToast(`暂停失败: ${e}`, "error");
+      addToast(tr("toast.pauseFailed", { error: e }), "error");
     }
   };
 
   const handleResume = async () => {
-    const t = currentTask();
-    if (!t) return;
+    const t2 = currentTask();
+    if (!t2) return;
+    // 重试 loading 态:防止重复点击(Iteration 16)
+    if (retrying() || mirrorRetrying()) return;
+    setRetrying(true);
     try {
-      await api.resumeTask(t.id);
+      await api.resumeTask(t2.id);
       await refreshTaskList();
+      addToast(tr("toast.resumeSuccess"), "success");
     } catch (e) {
-      addToast(`恢复失败: ${e}`, "error");
+      addToast(tr("toast.resumeFailed", { error: e }), "error");
+    } finally {
+      setRetrying(false);
     }
   };
 
   const handleDelete = async () => {
-    const t = currentTask();
-    if (!t) return;
+    const t2 = currentTask();
+    if (!t2) return;
+    // Iteration 11:走应用层 ConfirmDialog(danger tone),
+    // 不再触发 invoke 内置 window.confirm,与 Tachyon 品牌视觉一致。
+    const ok = await requestConfirm({
+      title: tr("confirm.delete.title"),
+      message: tr("confirm.delete.message", { name: t2.fileName }),
+      confirmLabel: tr("confirm.delete.confirmLabel"),
+      tone: "danger",
+    });
+    if (!ok) return;
     try {
-      await api.deleteTask(t.id);
+      await api.deleteTask(t2.id, { skipConfirm: true });
       props.onClose();
       await refreshTaskList();
     } catch (e) {
-      addToast(`删除失败: ${e}`, "error");
+      addToast(tr("toast.deleteFailed", { error: e }), "error");
     }
   };
 
   const handleRedownload = async () => {
-    const t = currentTask();
-    if (!t) return;
+    const t2 = currentTask();
+    if (!t2) return;
+    if (retrying() || mirrorRetrying()) return;
+    setRetrying(true);
     try {
-      await api.createTask(t.url);
+      await api.createTask(t2.url);
       await refreshTaskList();
+      addToast(tr("toast.redownloadSuccess"), "success");
     } catch (e) {
-      addToast(`重新下载失败: ${e}`, "error");
+      addToast(tr("toast.redownloadFailed", { error: e }), "error");
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  /**
+   * 通过 hf-mirror 镜像重试 HuggingFace 失败任务(Iteration 16)。
+   *
+   * 策略:
+   * - 主源:hf-mirror.com 镜像 URL(基于 repoId 构造,绕过 CDN 域名差异)
+   * - 容灾:原始 HF 链接(传给 mirrorUrls,主源失败时后端自动切换)
+   *
+   * 仅对可解析的 HuggingFace URL 显示此按钮(parseHfUrl 返回非 null)。
+   */
+  const handleRetryWithMirror = async () => {
+    const t2 = currentTask();
+    if (!t2 || !t2.url) return;
+    if (retrying() || mirrorRetrying()) return;
+    const parsed = parseHfUrl(t2.url);
+    if (!parsed) {
+      addToast(tr("toast.mirrorParseFailed"), "error");
+      return;
+    }
+    setMirrorRetrying(true);
+    try {
+      const mirrorUrl = buildHfMirrorUrl(parsed.repoId, parsed.revision, parsed.filePath);
+      // 镜像主源 + 原始链接容灾:与 HfBrowserPanel 镜像下载策略一致
+      await api.createTask(mirrorUrl, undefined, [t2.url]);
+      await refreshTaskList();
+      addToast(tr("toast.mirrorRetrySuccess"), "success");
+      // 镜像重试创建新任务后,关闭当前失败任务的详情面板
+      handleClose();
+    } catch (e) {
+      addToast(tr("toast.mirrorRetryFailed", { error: e }), "error");
+    } finally {
+      setMirrorRetrying(false);
     }
   };
 
   const handleOpenFolder = async () => {
-    const t = currentTask();
-    if (!t) return;
-    if (t.savePath) {
+    const t2 = currentTask();
+    if (!t2) return;
+    if (t2.savePath) {
       try {
-        await api.openFolder(t.savePath);
+        await api.openFolder(t2.savePath);
       } catch {
-        addToast("打开文件夹失败", "error");
+        addToast(tr("toast.openFolderFailed"), "error");
       }
     } else {
-      addToast("该任务暂无保存路径信息", "info");
+      addToast(tr("toast.noSavePath"), "info");
     }
   };
 
@@ -217,39 +361,79 @@ export default function DetailPanel(props: DetailPanelProps) {
 
   return (
     <Show when={shouldRender()}>
-      <div
-          style={{
-            display: "grid",
-            "grid-template-columns": visible() ? "var(--panel-detail-width, 400px)" : "0px",
-            "grid-template-rows": "1fr",
-            transition:
-              "grid-template-columns 280ms cubic-bezier(0.32, 0.72, 0, 1)",
-            overflow: "hidden",
-            "min-height": 0,
-            height: "100%",
-            opacity: visible() ? 1 : 0,
-            "pointer-events": visible() ? "auto" : "none",
-          }}
-      >
+      {/* 外层容器:窄屏 fixed 全屏 sheet + 遮罩;宽屏 grid 列宽过渡。
+          内容树只写一份,通过动态 style 切换布局模式(Iteration 13)。
+          窄屏用 fixed 定位天然脱离文档流,z-index 覆盖主内容,无需 Portal。 */}
+      <Show when={isNarrow() && visible()}>
         <div
-          role="complementary"
-          aria-label="任务详情"
+          class="fixed inset-0 z-[280]"
           style={{
-            width: "var(--panel-detail-width, 400px)",
+            background: "var(--color-overlay-scrim)",
+            "backdrop-filter": "blur(4px)",
+            animation: reducedMotion() ? "none" : "fadeIn 150ms ease forwards",
+          }}
+          onClick={() => props.onClose()}
+        />
+      </Show>
+      <div
+        style={isNarrow()
+          ? {
+              position: "fixed",
+              top: 0,
+              right: 0,
+              bottom: 0,
+              width: "min(420px, 100vw)",
+              "max-width": "100vw",
+              background: "var(--color-bg-secondary)",
+              "border-left": "1px solid var(--color-border-subtle)",
+              "box-shadow": "var(--shadow-xl)",
+              transform: visible() ? "translateX(0)" : "translateX(100%)",
+              transition: reducedMotion()
+                ? "none"
+                : "transform 260ms cubic-bezier(0.32, 0.72, 0, 1)",
+              "z-index": "290",
+              overflow: "hidden",
+            }
+          : {
+              display: "grid",
+              "grid-template-columns": visible() ? "var(--panel-detail-width, 400px)" : "0px",
+              "grid-template-rows": "1fr",
+              transition: reducedMotion()
+                ? "none"
+                : "grid-template-columns 280ms cubic-bezier(0.32, 0.72, 0, 1)",
+              overflow: "hidden",
+              "min-height": 0,
+              height: "100%",
+              opacity: visible() ? 1 : 0,
+              "pointer-events": visible() ? "auto" : "none",
+            }
+        }
+      >
+          <div
+            ref={panelContentRef}
+            role="complementary"
+            aria-label={t("detail.aria")}
+          tabIndex={isNarrow() ? -1 : undefined}
+          style={{
+            width: isNarrow() ? "100%" : "var(--panel-detail-width, 400px)",
             "max-width": "100%",
+            height: "100%",
             background: "var(--color-bg-secondary)",
             "border-left": "1px solid var(--color-border-subtle)",
-            transition: "opacity 220ms ease",
+            transition: reducedMotion() ? "none" : "opacity 220ms ease",
           }}
           class="flex flex-col h-full overflow-y-auto overflow-x-hidden"
         >
-          {/* Header - compact */}
           <div class="panel-header">
             <div class="flex items-center gap-2">
               <Show when={isCompleted()}>
-                <Button variant="secondary" size="sm" onClick={handleOpenFolder}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleOpenFolder}
+                >
                   <OpenFileIcon />
-                  <span>{"\u6253\u5F00"}</span>
+                  <span>{t("detail.action.open")}</span>
                 </Button>
               </Show>
               <Show when={!isCompleted()}>
@@ -262,12 +446,12 @@ export default function DetailPanel(props: DetailPanelProps) {
                   {isDownloading() ? (
                     <>
                       <PauseIcon />
-                      <span>{"\u6682\u505C"}</span>
+                      <span>{t("common.pause")}</span>
                     </>
                   ) : (
                     <>
                       <PlayIcon />
-                      <span>{"\u6062\u590D"}</span>
+                      <span>{t("common.resume")}</span>
                     </>
                   )}
                 </Button>
@@ -278,7 +462,10 @@ export default function DetailPanel(props: DetailPanelProps) {
                 <Button
                   variant="ghost"
                   shape="icon-sm"
-                  aria-label="更多操作"
+                  aria-label={t("detail.moreActions")}
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen()}
+                  ref={menuTriggerRef}
                   onClick={() => setMenuOpen((v) => !v)}
                 >
                   <MoreIcon />
@@ -293,7 +480,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                       }}
                     >
                       <CopyIcon />
-                      <span>{"\u590D\u5236\u94FE\u63A5"}</span>
+                      <span>{t("detail.copyLink")}</span>
                     </button>
                     <button
                       class="detail-menu-item"
@@ -303,7 +490,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                       }}
                     >
                       <FolderOpenIcon />
-                      <span>{"\u6253\u5F00\u6587\u4EF6\u5939"}</span>
+                      <span>{t("detail.openFolder")}</span>
                     </button>
                     <button
                       class="detail-menu-item"
@@ -313,7 +500,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                       }}
                     >
                       <RefreshIcon />
-                      <span>{"\u91CD\u65B0\u4E0B\u8F7D"}</span>
+                      <span>{t("detail.redownload")}</span>
                     </button>
                   </div>
                 </Show>
@@ -321,7 +508,7 @@ export default function DetailPanel(props: DetailPanelProps) {
               <Button
                 variant="ghost"
                 shape="icon-sm"
-                aria-label="关闭详情"
+                aria-label={t("detail.closeAria")}
                 onClick={handleClose}
               >
                 <CloseIcon />
@@ -449,7 +636,8 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* Error State - 真实诊断,不硬编码错误文案 */}
+          {/* 失败诊断 — 可展开:分类徽标 + 标题常驻;展开显示完整 hint + 后端原文(Iteration 15)
+              Iteration 16 增强:重试按钮 loading 态 + HuggingFace 镜像重试入口 */}
           <Show when={isFailed() && failureInsight()}>
             {(insight) => (
               <div style={{ padding: "0 20px 12px" }}>
@@ -466,113 +654,183 @@ export default function DetailPanel(props: DetailPanelProps) {
                     </span>
                   </div>
                   <div class="flex-1 min-w-0">
-                    <div
-                      style={{
-                        "font-size": "13px",
-                        color: "var(--color-status-error)",
-                        "font-weight": 500,
-                      }}
-                    >
-                      {insight().title}
+                    <div class="flex items-center gap-2">
+                      <span
+                        class={`detail-category-badge detail-category-badge--${insight().category}`}
+                      >
+                        {t(DIAGNOSTICS_CATEGORY_KEY[insight().category])}
+                      </span>
+                      <span
+                        class="detail-error-title"
+                        style={{ color: "var(--color-status-error)" }}
+                      >
+                        {insight().title}
+                      </span>
                     </div>
-                    <div
-                      class="truncate"
-                      style={{
-                        "font-size": "12px",
-                        color: "var(--color-text-secondary)",
-                        "margin-top": "2px",
-                      }}
-                    >
-                      {insight().hint}
-                    </div>
+                    <Show when={diagnosticsExpanded()}>
+                      <p
+                        id="detail-diagnostics-detail"
+                        class="detail-diagnostics-hint"
+                      >
+                        {insight().hint}
+                      </p>
+                      <Show when={insight().rawReason}>
+                        <div class="detail-diagnostics-backend">
+                          <span class="detail-diagnostics-backend-label">
+                            {t("detail.diagnostics.backend")}
+                          </span>
+                          <pre class="detail-diagnostics-backend-pre">
+                            {insight().rawReason}
+                          </pre>
+                        </div>
+                      </Show>
+                      <Show when={(task()?.retryCount ?? 0) > 0}>
+                        <p class="detail-diagnostics-retry-count">
+                          {t("detail.diagnostics.retryCount", { count: task()?.retryCount ?? 0 })}
+                        </p>
+                      </Show>
+                    </Show>
+                    {/* 镜像重试入口:仅 HuggingFace 可解析链接显示(Iteration 16) */}
+                    <Show when={insight().canRetryWithMirror && task()?.url && parseHfUrl(task()!.url)}>
+                      <button
+                        class="detail-mirror-retry-link"
+                        onClick={handleRetryWithMirror}
+                        disabled={retrying() || mirrorRetrying()}
+                        title={t("detail.retryWithMirrorHint")}
+                      >
+                        {t("detail.retryWithMirror")}
+                      </button>
+                    </Show>
                   </div>
-                  <Show when={insight().retryable}>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      class="flex-shrink-0"
-                      onClick={handleResume}
+                  <div class="flex items-start gap-1 flex-shrink-0">
+                    <Show when={insight().retryable}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={retrying()}
+                        disabled={mirrorRetrying()}
+                        onClick={handleResume}
+                      >
+                        <RefreshIcon />
+                        <span>{t("detail.retry")}</span>
+                      </Button>
+                    </Show>
+                    <button
+                      class="detail-disclosure-btn"
+                      aria-expanded={diagnosticsExpanded()}
+                      aria-controls="detail-diagnostics-detail"
+                      aria-label={
+                        diagnosticsExpanded()
+                          ? t("detail.diagnostics.collapse")
+                          : t("detail.diagnostics.expand")
+                      }
+                      onClick={() => setDiagnosticsExpanded((v) => !v)}
                     >
-                      <RefreshIcon />
-                      <span>重试</span>
-                    </Button>
-                  </Show>
+                      <ChevronDownIcon
+                        class={`detail-disclosure-chevron${
+                          diagnosticsExpanded()
+                            ? " detail-disclosure-chevron--open"
+                            : ""
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
           </Show>
 
-          {/* Stats Grid - 3 columns, moved UP before charts */}
+          {/* Tier 2 — 活动指标:仅 downloading/paused 显示。消除冗余:
+              size→进度行已显示总大小;downloaded→进度行已显示;status→文件头已显示 */}
+          <Show
+            when={
+              isDownloading() ||
+              task()?.status === "paused" ||
+              task()?.status === "connecting" ||
+              task()?.status === "resuming"
+            }
+          >
+            <div
+              style={{
+                padding: "0 20px 12px",
+                "border-top": "1px solid var(--color-border-subtle)",
+              }}
+            >
+              <div class="detail-stat-grid" style={{ "min-width": 0 }}>
+                <div class="detail-stat-cell">
+                  <div class="detail-stat-label">{t("detail.label.speed")}</div>
+                  <div class="detail-stat-value detail-stat-value--highlight">
+                    {formatSpeed(task()?.speed || 0)}
+                  </div>
+                </div>
+                <div class="detail-stat-cell">
+                  <div class="detail-stat-label">{t("detail.label.remaining")}</div>
+                  <div class="detail-stat-value detail-stat-value--highlight">
+                    {eta()}
+                  </div>
+                </div>
+                <div class="detail-stat-cell">
+                  <div class="detail-stat-label">{t("detail.label.fragments")}</div>
+                  <div class="detail-stat-value">
+                    {`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </Show>
+
+          {/* Tier 4 — 元数据:可折叠「更多详情」,默认收起,降低默认扫描成本 */}
           <div
             style={{
               padding: "0 20px 12px",
               "border-top": "1px solid var(--color-border-subtle)",
             }}
           >
-            <div class="detail-stat-grid" style={{ "min-width": 0 }}>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u5927\u5C0F"}</div>
-                <div class="detail-stat-value">
-                  {task()?.fileSize
-                    ? formatSize(task()!.fileSize!)
-                    : "\u672A\u77E5"}
-                </div>
+            <button
+              class="detail-disclosure-row"
+              aria-expanded={metadataExpanded()}
+              aria-controls="detail-metadata-detail"
+              onClick={() => setMetadataExpanded((v) => !v)}
+            >
+              <span class="detail-disclosure-row-label">
+                {t("detail.section.metadata")}
+              </span>
+              <ChevronDownIcon
+                class={`detail-disclosure-chevron${
+                  metadataExpanded() ? " detail-disclosure-chevron--open" : ""
+                }`}
+              />
+            </button>
+            <Show when={metadataExpanded()}>
+              <div id="detail-metadata-detail" class="detail-metadata-detail">
+                <InfoRow
+                  label={t("detail.label.size")}
+                  value={
+                    task()?.fileSize
+                      ? formatSize(task()!.fileSize!)
+                      : t("common.unknown")
+                  }
+                />
+                <InfoRow
+                  label={t("detail.label.savePath")}
+                  value={task()?.savePath || t("detail.savePathPending")}
+                  copyable
+                  copied={copied() === "path"}
+                  onCopy={() => copyToClipboard(task()?.savePath || "", "path")}
+                />
+                <InfoRow
+                  label={t("detail.label.url")}
+                  value={task()?.url || ""}
+                  copyable
+                  copied={copied() === "url"}
+                  onCopy={() => copyToClipboard(task()?.url || "", "url")}
+                />
+                <InfoRow
+                  label={t("detail.label.createdAt")}
+                  value={task()?.createdAt ? formatDate(task()!.createdAt) : "---"}
+                />
               </div>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u901F\u5EA6"}</div>
-                <div
-                  class={`detail-stat-value${isDownloading() ? " detail-stat-value--highlight" : ""}`}
-                >
-                  {formatSpeed(task()?.speed || 0)}
-                </div>
-              </div>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u5269\u4F59"}</div>
-                <div
-                  class={`detail-stat-value${isDownloading() ? " detail-stat-value--highlight" : ""}`}
-                >
-                  {eta()}
-                </div>
-              </div>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u5206\u7247"}</div>
-                <div class="detail-stat-value">{`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}</div>
-              </div>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u5DF2\u4E0B\u8F7D"}</div>
-                <div class="detail-stat-value">
-                  {formatSize(task()?.downloaded || 0)}
-                </div>
-              </div>
-              <div class="detail-stat-cell">
-                <div class="detail-stat-label">{"\u72B6\u6001"}</div>
-                <div class="detail-stat-value">
-                  {getStatusLabel(task()?.status || "")}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* URL & Path - compact */}
-          <div style={{ padding: "0 20px 12px" }}>
-            <InfoRow
-              label="下载链接"
-              value={task()?.url || ""}
-              copyable
-              copied={copied() === "url"}
-              onCopy={() => copyToClipboard(task()?.url || "", "url")}
-            />
-            <InfoRow
-              label="保存路径"
-              value={task()?.savePath || "下载尚未开始,路径待确定"}
-              copyable
-              copied={copied() === "path"}
-              onCopy={() => copyToClipboard(task()?.savePath || "", "path")}
-            />
-            <InfoRow
-              label="创建时间"
-              value={task()?.createdAt ? formatDate(task()!.createdAt) : "---"}
-            />
+            </Show>
           </div>
 
           {/* Speed Chart - collapsible, after stats */}
@@ -613,8 +871,8 @@ export default function DetailPanel(props: DetailPanelProps) {
                 onClick={handlePrimaryAction}
               >
                 {isDownloading()
-                  ? "\u6682\u505C\u4E0B\u8F7D"
-                  : "\u6062\u590D\u4E0B\u8F7D"}
+                  ? t("detail.action.pause")
+                  : t("detail.action.resume")}
               </Button>
             </Show>
             <Button
@@ -624,7 +882,7 @@ export default function DetailPanel(props: DetailPanelProps) {
               fullWidth
               onClick={handleDelete}
             >
-              {"\u5220\u9664\u4EFB\u52A1"}
+              {t("detail.action.delete")}
             </Button>
           </div>
         </div>
@@ -651,7 +909,8 @@ function InfoRow(props: {
           class="icon-btn-sm"
           style={{ "flex-shrink": 0, width: "24px", height: "24px" }}
           onClick={() => props.onCopy?.()}
-          title={props.copied ? "\u5DF2\u590D\u5236" : "\u590D\u5236"}
+          aria-label={props.copied ? tr("detail.copied.aria") : tr("detail.copy.aria")}
+          title={props.copied ? tr("detail.copied.aria") : tr("detail.copy.aria")}
         >
           <Show when={props.copied} fallback={<CopyIcon />}>
             <span

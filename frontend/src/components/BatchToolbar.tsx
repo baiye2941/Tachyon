@@ -3,6 +3,7 @@ import { selectedCount, hasSelection, deselectAll, selectAll } from '../stores/s
 import { $tasks } from '../stores/downloads'
 import { Icon } from '../utils/icons'
 import Button from '../shared/ui/Button'
+import { tr } from '../i18n'
 
 interface BatchToolbarProps {
   onPauseAll: () => void
@@ -34,7 +35,7 @@ export default function BatchToolbar(props: BatchToolbarProps) {
     <Show when={visible()}>
       <div
         role="toolbar"
-        aria-label="批量操作"
+        aria-label={tr("batch.aria")}
         class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 px-3 py-2 rounded-lg panel-surface"
         style={{
           'box-shadow': 'var(--shadow-lg)',
@@ -48,27 +49,27 @@ export default function BatchToolbar(props: BatchToolbarProps) {
             color: 'var(--color-text-secondary)',
           }}
         >
-          已选 {count()} 项
+          {tr('batch.selectedCount', { count: count() })}
         </span>
 
         <Button
           variant="ghost"
           size="sm"
           onClick={() => props.onPauseAll()}
-          aria-label="批量暂停"
+          aria-label={tr("batch.aria.pause")}
         >
           <Icon name="pause" class="w-4 h-4" />
-          <span>暂停</span>
+          <span>{tr("common.pause")}</span>
         </Button>
 
         <Button
           variant="ghost"
           size="sm"
           onClick={() => props.onResumeAll()}
-          aria-label="批量恢复"
+          aria-label={tr("batch.aria.resume")}
         >
           <Icon name="play" class="w-4 h-4" />
-          <span>恢复</span>
+          <span>{tr("common.resume")}</span>
         </Button>
 
         <div
@@ -84,19 +85,19 @@ export default function BatchToolbar(props: BatchToolbarProps) {
           variant="danger"
           size="sm"
           onClick={() => props.onDeleteAll()}
-          aria-label="批量删除"
+          aria-label={tr("batch.aria.delete")}
         >
           <Icon name="trash" class="w-4 h-4" />
-          <span>删除</span>
+          <span>{tr("common.delete")}</span>
         </Button>
 
         <Button
           variant="ghost"
           size="sm"
           onClick={deselectAll}
-          aria-label="清空选择"
+          aria-label={tr("batch.aria.clear")}
         >
-          清空
+          {tr("common.clearSelection")}
         </Button>
       </div>
     </Show>

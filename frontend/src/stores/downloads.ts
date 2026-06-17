@@ -5,6 +5,7 @@ import { api } from '../api/invoke'
 import { addToast } from './toast'
 import { addHistoryRecord } from './history'
 import { createRootMemo } from '../utils/reactive'
+import { tr } from '../i18n'
 
 // ── 高频进度数据(hot 层,250ms 级更新) ─────────────────────────
 //
@@ -244,6 +245,6 @@ export async function refreshTaskList() {
     const tasks = await api.getTaskList()
     setTasks(tasks)
   } catch (e) {
-    addToast('刷新任务列表失败: ' + String(e), 'error')
+    addToast(tr('toast.refreshTasksFailed', { error: String(e) }), 'error')
   }
 }

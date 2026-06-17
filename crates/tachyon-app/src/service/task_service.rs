@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use tachyon_core::config::{AppConfig, DownloadConfig};
-use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log};
+use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log, sanitize_filename};
 use tachyon_core::types::DownloadState;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -97,6 +97,7 @@ impl TaskService {
         url: &str,
         download_dir: Option<&str>,
         mirror_urls: Option<&[String]>,
+        file_name: Option<&str>,
     ) -> Result<TaskCreation, AppError> {
         validate_download_url(url)?;
 
@@ -111,7 +112,7 @@ impl TaskService {
         // 提前获取配置和下载目录,避免在检查-插入间隙中 await(消除 TOCTOU 竞态)
         // 同时预校验 max_concurrent_fragments,避免锁外失败需要回滚 tasks.insert
         let (max_tasks, download_dir_str, download_config) = {
-            let cfg = self.config.lock().await;
+            let mut cfg = self.config.lock().await;
             if cfg.download.max_concurrent_fragments == 0 {
                 return Err(AppError::Config(
                     "max_concurrent_fragments 不能为 0".to_string(),
@@ -121,13 +122,39 @@ impl TaskService {
             let requested = download_dir
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| cfg.download.download_dir.clone());
-            let authorized = authorize_download_dir(&cfg, &requested)?;
+            let authorized = match authorize_download_dir(&cfg, &requested) {
+                Ok(dir) => dir,
+                Err(_) if download_dir.is_some() => {
+                    // 用户通过对话框明确选择了目录,但不在 authorized_dirs 中
+                    // 执行基本安全验证后自动授权该目录
+                    let validated =
+                        crate::commands::config_commands::validate_explicit_download_dir(
+                            &requested,
+                        )?;
+                    cfg.download.authorized_dirs.push(validated.clone());
+                    // 将新的授权目录持久化,避免重启后丢失
+                    let config_to_save = cfg.clone();
+                    if let Err(e) =
+                        crate::commands::config_commands::persist_config(&config_to_save)
+                    {
+                        tracing::warn!(error = %e, "自动授权目录后持久化配置失败");
+                    } else {
+                        tracing::info!(dir = %validated, "已自动授权下载目录并持久化配置");
+                    }
+                    // 重新授权(此时目录已在 authorized_dirs 中)
+                    authorize_download_dir(&cfg, &requested)?
+                }
+                Err(e) => return Err(e),
+            };
             let config = build_download_config(&cfg, &authorized);
             (max_tasks, authorized, config)
         };
 
         let task_id = Uuid::new_v4().to_string();
-        let file_name = extract_filename_from_url(url);
+        let file_name = match file_name {
+            Some(n) if !n.trim().is_empty() => sanitize_filename(n),
+            _ => extract_filename_from_url(url),
+        };
         let created_at = now_iso8601();
         let redacted_url = redact_url_for_log(url);
 
@@ -144,6 +171,8 @@ impl TaskService {
             fragments_done: 0,
             created_at,
             save_path: download_dir_str.clone(),
+            error_reason: None,
+            retry_count: 0,
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性
@@ -282,6 +311,9 @@ impl TaskService {
     }
 
     /// 删除任务（仅终态可删除）
+    ///
+    /// 删除任务记录的同时,清理持久化快照和已下载的本地文件。
+    /// 文件/快照清理失败仅记录警告,不阻断任务记录删除。
     pub fn delete_task(&self, task_id: &str) -> Result<(), AppError> {
         let task = self
             .task_repository
@@ -289,8 +321,42 @@ impl TaskService {
             .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
         match task.status {
             DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
+                let save_path = task.save_path.clone();
                 drop(task);
                 self.task_repository.remove(task_id);
+
+                // 清理断点续传快照
+                match self.task_store.remove_snapshot(task_id) {
+                    Ok(true) => {
+                        tracing::debug!(task_id = %task_id, "已删除任务快照");
+                    }
+                    Ok(false) => {
+                        tracing::debug!(task_id = %task_id, "任务快照不存在,跳过清理");
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = %task_id, error = %e, "删除任务快照失败");
+                    }
+                }
+
+                // 清理已下载文件(文件可能已被用户手动删除,失败仅警告)
+                if !save_path.is_empty() {
+                    let path = std::path::Path::new(&save_path);
+                    if path.exists() {
+                        if let Err(e) = std::fs::remove_file(path) {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                path = %save_path,
+                                error = %e,
+                                "删除任务文件失败"
+                            );
+                        } else {
+                            tracing::info!(task_id = %task_id, path = %save_path, "已删除任务文件");
+                        }
+                    } else {
+                        tracing::debug!(task_id = %task_id, path = %save_path, "任务文件不存在,跳过清理");
+                    }
+                }
+
                 tracing::info!(task_id = %task_id, "删除任务");
                 Ok(())
             }
@@ -332,6 +398,11 @@ impl TaskService {
 
     /// 持久化任务快照
     async fn persist_snapshot(&self, task_id: &str, fail_reason: Option<String>) {
+        // 1. 同步更新内存中 TaskInfo 的 error_reason,前端查询时立即可见
+        if let Some(mut task) = self.task_repository.get_mut(task_id) {
+            task.error_reason = fail_reason.clone();
+        }
+
         let task = { self.task_repository.get(task_id).map(|r| r.value().clone()) };
         if let Some(task) = task {
             let existing = self.task_store.load_snapshot(task_id).ok().flatten();

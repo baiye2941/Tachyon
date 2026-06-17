@@ -2,10 +2,15 @@ import { onMount, onCleanup } from "solid-js";
 import {
   toggleCommandPalette,
   toggleShortcutHelp,
+  toggleSidebar,
 } from "../stores/ui";
 
 /**
- * 全局键盘快捷键：Ctrl/Cmd+K 打开命令面板，Ctrl/Cmd+/ 或 ? 打开快捷键帮助。
+ * 全局键盘快捷键:
+ * - Ctrl/Cmd+K:命令面板
+ * - Ctrl/Cmd+/:快捷键帮助
+ * - ?(非输入框):快捷键帮助
+ * - Ctrl/Cmd+B:切换侧边栏(Iteration 13)
  */
 export function useGlobalKeyboard() {
   function handleGlobalKey(e: KeyboardEvent) {
@@ -13,6 +18,13 @@ export function useGlobalKeyboard() {
     if ((e.ctrlKey || e.metaKey) && e.key === "k") {
       e.preventDefault();
       toggleCommandPalette();
+      return;
+    }
+
+    // Ctrl+B:切换侧边栏(Iteration 13)
+    if ((e.ctrlKey || e.metaKey) && e.key === "b") {
+      e.preventDefault();
+      toggleSidebar();
       return;
     }
 

@@ -180,7 +180,7 @@ describe("ContextMenu 可访问性", () => {
       });
     }));
 
-  it('已完成任务应显示"打开文件所在文件夹"', () => {
+  it('已完成任务应显示"打开文件夹"', () => {
     const { container } = render(() => (
       <ContextMenu
         x={100}
@@ -197,7 +197,7 @@ describe("ContextMenu 可访问性", () => {
       />
     ));
 
-    expect(container.textContent).toContain("打开文件所在文件夹");
+    expect(container.textContent).toContain("打开文件夹");
   });
 
   it('已暂停任务应显示"恢复"而非"暂停"', () => {

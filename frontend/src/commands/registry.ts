@@ -12,6 +12,7 @@
  */
 
 import type { ViewName } from '../types'
+import type { MessageKey } from '../i18n'
 
 export type CommandGroup = 'navigation' | 'action' | 'task'
 
@@ -22,12 +23,15 @@ export interface CommandContext {
   onNewDownload?: () => void
   onPauseAll?: () => void
   onResumeAll?: () => void
+  onToggleSidebar?: () => void
 }
 
 export interface Command {
   id: string
-  label: string
-  hint?: string
+  /** i18n key(渲染时翻译,避免模块加载时固化语言) */
+  labelKey: MessageKey
+  /** i18n key(可选) */
+  hintKey?: MessageKey
   group: CommandGroup
   /** Icon 组件名(对应 utils/icons.tsx 的 ICONS 映射) */
   icon: string
@@ -37,11 +41,11 @@ export interface Command {
   run: (ctx: CommandContext) => void
 }
 
-/** 命令分组标签(用于命令面板分组渲染) */
-export const GROUP_LABELS: Record<CommandGroup, string> = {
-  navigation: '导航',
-  action: '操作',
-  task: '任务',
+/** 命令分组标签 i18n key */
+export const GROUP_LABEL_KEYS: Record<CommandGroup, MessageKey> = {
+  navigation: 'commandGroup.navigation',
+  action: 'commandGroup.action',
+  task: 'commandGroup.task',
 }
 
 /** 全部命令(单一数据源) */
@@ -49,8 +53,8 @@ export const COMMANDS: Command[] = [
   // 导航
   {
     id: 'nav-downloads',
-    label: '下载管理',
-    hint: '查看所有下载任务',
+    labelKey: 'command.nav.downloads.label',
+    hintKey: 'command.nav.downloads.hint',
     group: 'navigation',
     icon: 'list-bullet',
     shortcut: ['Ctrl', '1'],
@@ -61,8 +65,8 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'nav-sniffer',
-    label: '资源嗅探',
-    hint: '嗅探网页中的可下载资源',
+    labelKey: 'command.nav.sniffer.label',
+    hintKey: 'command.nav.sniffer.hint',
     group: 'navigation',
     icon: 'magnifying-glass',
     shortcut: ['Ctrl', '2'],
@@ -73,8 +77,8 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'nav-history',
-    label: '历史',
-    hint: '下载历史记录',
+    labelKey: 'command.nav.history.label',
+    hintKey: 'command.nav.history.hint',
     group: 'navigation',
     icon: 'clock',
     run: (c) => {
@@ -84,8 +88,8 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'nav-stats',
-    label: '统计',
-    hint: '下载速度与数据统计',
+    labelKey: 'command.nav.stats.label',
+    hintKey: 'command.nav.stats.hint',
     group: 'navigation',
     icon: 'chart-bar',
     run: (c) => {
@@ -95,8 +99,8 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'nav-settings',
-    label: '设置',
-    hint: '应用配置与偏好',
+    labelKey: 'command.nav.settings.label',
+    hintKey: 'command.nav.settings.hint',
     group: 'navigation',
     icon: 'cog-6-tooth',
     shortcut: ['Ctrl', ','],
@@ -108,8 +112,8 @@ export const COMMANDS: Command[] = [
   // 任务
   {
     id: 'task-new',
-    label: '新建下载',
-    hint: '添加新的下载任务',
+    labelKey: 'command.task.new.label',
+    hintKey: 'command.task.new.hint',
     group: 'task',
     icon: 'plus',
     shortcut: ['Ctrl', 'N'],
@@ -121,8 +125,8 @@ export const COMMANDS: Command[] = [
   // 操作
   {
     id: 'act-pause-all',
-    label: '全部暂停',
-    hint: '暂停所有进行中的下载',
+    labelKey: 'command.act.pauseAll.label',
+    hintKey: 'command.act.pauseAll.hint',
     group: 'action',
     icon: 'pause-circle',
     shortcut: ['Ctrl', 'Shift', 'P'],
@@ -133,13 +137,25 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'act-resume-all',
-    label: '全部恢复',
-    hint: '恢复所有已暂停的下载',
+    labelKey: 'command.act.resumeAll.label',
+    hintKey: 'command.act.resumeAll.hint',
     group: 'action',
     icon: 'play',
     shortcut: ['Ctrl', 'Shift', 'R'],
     run: (c) => {
       c.onResumeAll?.()
+      c.onClose()
+    },
+  },
+  {
+    id: 'act-toggle-sidebar',
+    labelKey: 'command.act.toggleSidebar.label',
+    hintKey: 'command.act.toggleSidebar.hint',
+    group: 'action',
+    icon: 'list-bullet',
+    shortcut: ['Ctrl', 'B'],
+    run: (c) => {
+      c.onToggleSidebar?.()
       c.onClose()
     },
   },

@@ -9,12 +9,13 @@ import {
   TrophyIcon,
   PackageIcon,
 } from "./icons";
-import { formatSize, formatSpeed } from "../utils/format";
+import { formatSize, formatSpeed, getStatusLabel } from "../utils/format";
 import {
   historyRecords,
   getHistoryStatsForRecords,
   type HistoryRecord,
 } from "../stores/history";
+import { tr, type MessageKey } from "../i18n";
 
 interface HistoryPanelProps {
   visible: boolean;
@@ -55,27 +56,21 @@ function isWithinDays(iso: string, days: number): boolean {
 function timeAgo(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime();
   const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-  if (days === 0) return "今天";
-  if (days === 1) return "昨天";
-  if (days < 7) return `${days}天前`;
-  if (days < 30) return `${Math.floor(days / 7)}周前`;
-  return `${Math.floor(days / 30)}月前`;
+  if (days === 0) return tr("time.today");
+  if (days === 1) return tr("time.yesterday");
+  if (days < 7) return tr("time.daysAgo", { n: days });
+  if (days < 30) return tr("time.weeksAgo", { n: Math.floor(days / 7) });
+  return tr("time.monthsAgo", { n: Math.floor(days / 30) });
 }
 
-function getStatusLabel(status: HistoryRecord["status"]): string {
-  switch (status) {
-    case "completed":
-      return "已完成";
-    case "failed":
-      return "出错";
-    case "cancelled":
-      return "已取消";
-    default:
-      return status;
-  }
+function historyStatusLabel(status: HistoryRecord["status"]): string {
+  // 复用共享状态标签(completed/failed/cancelled 共享 status.label.* keys)
+  return getStatusLabel(status);
 }
 
 export default function HistoryPanel(props: HistoryPanelProps) {
+  const t = (key: MessageKey, values?: Record<string, string | number>) =>
+    tr(key, values as Record<string, string | number | unknown>);
   const [timeRange, setTimeRange] = createSignal<"7d" | "30d" | "all">("all");
   const [searchQuery, setSearchQuery] = createSignal("");
 
@@ -125,7 +120,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
       class="slide-panel"
       role="dialog"
       aria-modal="true"
-      aria-label="下载历史"
+      aria-label={t("history.aria")}
       style={{
         width: "min(480px, calc(100vw - 32px))",
         transform: props.visible ? "translateX(0)" : "translateX(100%)",
@@ -136,7 +131,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
       <div class="panel-header">
         <div class="panel-title">
           <HistoryIcon />
-          <span>下载历史</span>
+          <span>{t("history.title")}</span>
         </div>
         <div class="flex items-center gap-2">
           <For each={["7d", "30d", "all"] as const}>
@@ -150,17 +145,17 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 onClick={() => setTimeRange(range)}
               >
                 {range === "7d"
-                  ? "近7天"
+                  ? t("history.range.7d")
                   : range === "30d"
-                    ? "近30天"
-                    : "全部"}
+                    ? t("history.range.30d")
+                    : t("history.range.all")}
               </button>
             )}
           </For>
           <button
             class="icon-btn-sm hover-light"
             onClick={() => props.onClose()}
-            aria-label="关闭历史面板"
+            aria-label={t("history.closeAria")}
           >
             <CloseIcon />
           </button>
@@ -202,7 +197,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              总下载量
+              {t("history.stat.totalBytes")}
             </div>
           </div>
           <div
@@ -230,7 +225,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              任务总数
+              {t("history.stat.totalDownloads")}
             </div>
           </div>
           <div
@@ -258,7 +253,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              平均速度
+              {t("history.stat.avgSpeed")}
             </div>
           </div>
           <div
@@ -286,7 +281,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              最快记录
+              {t("history.stat.maxSpeed")}
             </div>
           </div>
           <div
@@ -316,7 +311,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              成功率
+              {t("history.stat.successRate")}
             </div>
           </div>
           <div
@@ -346,7 +341,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 "margin-top": "4px",
               }}
             >
-              最大文件
+              {t("history.stat.maxFile")}
             </div>
           </div>
         </div>
@@ -368,7 +363,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
               "margin-bottom": "12px",
             }}
           >
-            下载量趋势
+            {t("history.trend")}
           </div>
           <div class="flex items-end gap-1" style={{ height: "120px" }}>
             <For each={trendData()}>
@@ -426,7 +421,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                   color: "var(--color-text-tertiary)",
                 }}
               >
-                最快记录
+                {t("history.stat.maxSpeed")}
               </span>
             </div>
             <div
@@ -444,11 +439,11 @@ export default function HistoryPanel(props: HistoryPanelProps) {
 
         {/* Records */}
         <div class="section-label" style={{ "margin-bottom": "12px" }}>
-          历史记录
+          {t("history.records")}
         </div>
         <input
           type="text"
-          placeholder="搜索历史记录..."
+          placeholder={t("history.searchPlaceholder")}
           value={searchQuery()}
           onInput={(e) => setSearchQuery(e.currentTarget.value)}
           class="input"
@@ -462,7 +457,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           when={filteredRecords().length > 0}
           fallback={
             <div style={{ color: "var(--color-text-tertiary)", "font-size": "13px" }}>
-              暂无历史记录
+              {t("history.empty")}
             </div>
           }
         >
@@ -494,7 +489,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                     }}
                   >
                     {formatSize(record.fileSize || 0)} ·{" "}
-                    {getStatusLabel(record.status)} ·{" "}
+                    {historyStatusLabel(record.status)} ·{" "}
                     {timeAgo(record.completedAt)}
                   </div>
                 </div>
@@ -502,21 +497,21 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                   <button
                     class="icon-btn-sm hover-light"
                     onClick={() => props.onOpenFolder(record.id)}
-                    aria-label={`打开目录 ${record.fileName}`}
+                    aria-label={t("history.aria.openFolder", { name: record.fileName })}
                   >
                     <FolderOpenIcon />
                   </button>
                   <button
                     class="icon-btn-sm hover-light"
                     onClick={() => props.onRedownload(recordToTaskInfo(record))}
-                    aria-label={`重新下载 ${record.fileName}`}
+                    aria-label={t("history.aria.redownload", { name: record.fileName })}
                   >
                     <RefreshIcon />
                   </button>
                   <button
                     class="icon-btn-sm hover-danger"
                     onClick={() => props.onDeleteRecord(record.id)}
-                    aria-label={`删除记录 ${record.fileName}`}
+                    aria-label={t("history.aria.delete", { name: record.fileName })}
                   >
                     <TrashIcon />
                   </button>

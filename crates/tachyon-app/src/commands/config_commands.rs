@@ -59,6 +59,8 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     // 在写入新配置前记录新的 download_dir(避免写后读竞态)
     let new_download_dir = updated.download.download_dir.clone();
     *cfg = updated;
+    // 将配置变更持久化到磁盘,避免重启后丢失
+    let config_to_save = cfg.clone();
     drop(cfg);
     // 同步更新 TaskService 的缓存 download_dir,确保 persist_snapshot
     // 热路径读到最新值,无需再次获取 config 锁
@@ -67,7 +69,12 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
         .task_service
         .update_cached_download_dir(new_download_dir)
         .await;
-    tracing::info!("应用配置已更新(白名单补丁模式)");
+    tokio::task::spawn_blocking(move || {
+        crate::commands::config_commands::persist_config(&config_to_save)
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
+    tracing::info!("应用配置已更新并持久化(白名单补丁模式)");
     Ok(())
 }
 
@@ -159,6 +166,55 @@ pub(crate) fn validate_config(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 配置持久化
+// ---------------------------------------------------------------------------
+
+const CONFIG_FILE_NAME: &str = "config.json";
+
+/// 获取持久化配置文件路径
+///
+/// 配置文件位于 `tachyon_core::config::dirs()/.tachyon/config.json`。
+fn config_file_path() -> std::path::PathBuf {
+    let data_root = tachyon_core::config::dirs().unwrap_or_else(|| std::path::PathBuf::from("."));
+    data_root.join(".tachyon").join(CONFIG_FILE_NAME)
+}
+
+/// 将当前配置持久化到磁盘
+///
+/// 使用临时文件+重命名实现原子写入,避免写一半导致配置文件损坏。
+/// 调用方应在非阻塞上下文中使用(如在 `spawn_blocking` 中调用)。
+pub(crate) fn persist_config(config: &AppConfig) -> Result<(), AppError> {
+    let path = config_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::Config(format!("创建配置目录失败: {e}")))?;
+    }
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| AppError::Config(format!("序列化配置失败: {e}")))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|e| AppError::Config(format!("写入配置临时文件失败: {e}")))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| AppError::Config(format!("重命名配置文件失败: {e}")))?;
+    Ok(())
+}
+
+/// 从磁盘加载持久化配置
+///
+/// 若配置文件不存在则返回默认配置;若解析失败则返回错误,由调用方决定是否回退。
+pub(crate) fn load_persisted_config() -> Result<AppConfig, AppError> {
+    let path = config_file_path();
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+    let json = std::fs::read_to_string(&path)
+        .map_err(|e| AppError::Config(format!("读取配置文件失败: {e}")))?;
+    let config: AppConfig = serde_json::from_str(&json)
+        .map_err(|e| AppError::Config(format!("解析配置文件失败: {e}")))?;
+    Ok(config)
+}
+
 pub(crate) fn authorize_download_dir(
     config: &AppConfig,
     requested_dir: &str,
@@ -224,6 +280,78 @@ pub(crate) fn authorize_download_dir(
     }
 
     Ok(canonical_requested.to_string_lossy().to_string())
+}
+
+/// 对用户明确选择的下载目录执行基本安全验证
+///
+/// 当用户通过对话框选择目录时调用,无需 authorized_dirs 白名单,
+/// 但仍执行纵深防御:绝对路径、无路径遍历、非符号链接、非系统根目录。
+/// 若目录不存在则自动创建。
+/// 返回 canonicalize 后的路径,可直接加入 authorized_dirs。
+pub(crate) fn validate_explicit_download_dir(requested_dir: &str) -> Result<String, AppError> {
+    let requested = std::path::Path::new(requested_dir);
+    if requested.as_os_str().is_empty() {
+        return Err(AppError::Config("下载目录不能为空路径".to_string()));
+    }
+    if !requested.is_absolute() {
+        return Err(AppError::Config(format!(
+            "下载目录必须是绝对路径: {}",
+            requested.display()
+        )));
+    }
+    if requested
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Config(format!(
+            "下载目录不能包含路径遍历: {}",
+            requested.display()
+        )));
+    }
+
+    // 若目录不存在则创建
+    if !requested.exists() {
+        std::fs::create_dir_all(requested).map_err(|e| {
+            AppError::Config(format!("创建下载目录失败: {}: {e}", requested.display()))
+        })?;
+    }
+
+    let existing_ancestor = deepest_existing_ancestor(requested)
+        .ok_or_else(|| AppError::Config(format!("下载目录路径无效: {}", requested.display())))?;
+
+    // 纵深防御:拒绝符号链接/reparse point
+    ensure_not_symlink_or_reparse(existing_ancestor, requested)?;
+    if !existing_ancestor.is_dir() {
+        return Err(AppError::Config(format!(
+            "路径已存在但不是目录: {}",
+            existing_ancestor.display()
+        )));
+    }
+
+    let canonical = existing_ancestor
+        .canonicalize()
+        .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+
+    // 禁止系统根目录
+    if is_forbidden_authorized_root(&canonical) {
+        return Err(AppError::Config(format!(
+            "不允许使用系统根目录: {}",
+            requested.display()
+        )));
+    }
+
+    // 若请求路径比 existing_ancestor 更深,沿路径创建缺失目录并 canonicalize
+    if requested != existing_ancestor {
+        std::fs::create_dir_all(requested).map_err(|e| {
+            AppError::Config(format!("创建下载目录失败: {}: {e}", requested.display()))
+        })?;
+        let canonical_requested = requested
+            .canonicalize()
+            .map_err(|_| AppError::Config(format!("下载目录无法解析: {}", requested.display())))?;
+        return Ok(canonical_requested.to_string_lossy().to_string());
+    }
+
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 fn create_authorized_dir_chain(
@@ -657,6 +785,8 @@ mod tests {
             fragments_done: 1,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             save_path: "/custom/file.bin".to_string(),
+            error_reason: None,
+            retry_count: 0,
         };
         state
             .domain

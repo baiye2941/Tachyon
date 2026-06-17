@@ -47,6 +47,9 @@ import StatusBar from "./components/StatusBar";
 import ToastContainer from "./components/ToastContainer";
 import ContextMenu from "./components/ContextMenu";
 import BatchToolbar from "./components/BatchToolbar";
+import ConfirmDialog from "./components/ConfirmDialog";
+import { $confirm, requestConfirm, resolveConfirm } from "./stores/confirm";
+import { tr } from "./i18n";
 
 const SnifferPanel = lazy(() => import("./components/SnifferPanel"));
 const HistoryPanel = lazy(() => import("./components/HistoryPanel"));
@@ -104,21 +107,33 @@ function AppContent() {
     api
       .createTask(resource.url)
       .then(() => refreshTaskList())
-      .catch((e) => addToast(`创建任务失败: ${e}`, "error"));
+      .catch((e) => addToast(tr("toast.createTaskFailed", { error: e }), "error"));
   };
 
   const handleRedownload = (task: TaskInfo) => {
     api
       .createTask(task.url)
       .then(() => refreshTaskList())
-      .catch((e) => addToast(`重新下载失败: ${e}`, "error"));
+      .catch((e) => addToast(tr("toast.redownloadFailed", { error: e }), "error"));
   };
 
-  const handleDeleteRecord = (taskId: string) => {
-    api
-      .deleteTask(taskId)
-      .then(() => refreshTaskList())
-      .catch((e) => addToast(`删除记录失败: ${e}`, "error"));
+  const handleDeleteRecord = async (taskId: string) => {
+    // 历史记录删除同样走应用层 ConfirmDialog(Iteration 11)
+    const task = $tasks.get().find((t) => t.id === taskId);
+    const fileName = task?.fileName ?? taskId;
+    const ok = await requestConfirm({
+      title: tr("confirm.deleteHistory.title"),
+      message: tr("confirm.deleteHistory.message", { name: fileName }),
+      confirmLabel: tr("confirm.deleteHistory.confirmLabel"),
+      tone: "danger",
+    });
+    if (!ok) return;
+    try {
+      await api.deleteTask(taskId, { skipConfirm: true });
+      await refreshTaskList();
+    } catch (e) {
+      addToast(tr("toast.deleteRecordFailed", { error: e }), "error");
+    }
   };
 
   return (
@@ -169,7 +184,7 @@ function AppContent() {
                 "font-weight": 500,
               }}
             >
-              拖放链接到此处开始下载
+              {tr("dragdrop.hint")}
             </span>
           </div>
         </div>
@@ -243,6 +258,20 @@ function AppContent() {
 
       <ToastContainer />
 
+      {/* 全局应用内确认对话框(Iteration 11):
+          所有破坏性操作(单/批量删除)走 requestConfirm,统一品牌视觉,
+          替代 OS 原生 window.confirm / Tauri plugin-dialog。 */}
+      <ConfirmDialog
+        open={$confirm.pending() !== null}
+        title={$confirm.pending()?.title ?? ""}
+        message={$confirm.pending()?.message ?? ""}
+        confirmLabel={$confirm.pending()?.confirmLabel}
+        cancelLabel={$confirm.pending()?.cancelLabel}
+        tone={$confirm.pending()?.tone}
+        onConfirm={() => resolveConfirm(true)}
+        onCancel={() => resolveConfirm(false)}
+      />
+
       <Show when={$ui.newTaskModalOpen()}>
         <Suspense
           fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
@@ -262,22 +291,22 @@ function AppContent() {
           api
             .pauseTask(taskId)
             .then(() => refreshTaskList())
-            .catch((e) => addToast(`暂停失败: ${e}`, "error"));
+            .catch((e) => addToast(tr("toast.pauseFailed", { error: e }), "error"));
         }}
         onResume={(taskId) => {
           api
             .resumeTask(taskId)
             .then(() => refreshTaskList())
-            .catch((e) => addToast(`恢复失败: ${e}`, "error"));
+            .catch((e) => addToast(tr("toast.resumeFailed", { error: e }), "error"));
         }}
         onOpenFolder={(taskId) => {
           const task = $tasks.get().find((t) => t.id === taskId);
           if (task?.savePath) {
             api.openFolder(task.savePath).catch(() => {
-              addToast("打开文件夹失败", "error");
+              addToast(tr("toast.openFolderFailed"), "error");
             });
           } else {
-            addToast("该任务暂无保存路径信息", "info");
+            addToast(tr("toast.noSavePath"), "info");
           }
         }}
         onCopyLink={(taskId) => {
@@ -289,11 +318,23 @@ function AppContent() {
           if (task) handleRedownload(task);
         }}
         onDelete={(taskId) => {
-          api
-            .deleteTask(taskId)
-            .then(() => refreshTaskList())
-            .catch((e) => addToast(`删除失败: ${e}`, "error"));
-          if ($selectedId.get() === taskId) $selectedId.set(null);
+          // Iteration 11:走应用层 ConfirmDialog,与品牌视觉一致;
+          // 后端 confirmation token 仍在 invoke 层执行,安全边界不变。
+          const task = $tasks.get().find((t) => t.id === taskId);
+          const fileName = task?.fileName ?? taskId;
+          requestConfirm({
+            title: tr("confirm.delete.title"),
+            message: tr("confirm.delete.message", { name: fileName }),
+            confirmLabel: tr("confirm.delete.confirmLabel"),
+            tone: "danger",
+          }).then((ok) => {
+            if (!ok) return;
+            api
+              .deleteTask(taskId, { skipConfirm: true })
+              .then(() => refreshTaskList())
+              .catch((e) => addToast(tr("toast.deleteFailed", { error: e }), "error"));
+            if ($selectedId.get() === taskId) $selectedId.set(null);
+          });
         }}
       />
 
@@ -323,10 +364,10 @@ function AppContent() {
               const task = $tasks.get().find((t) => t.id === taskId);
               if (task?.savePath) {
                 api.openFolder(task.savePath).catch(() => {
-                  addToast("打开文件夹失败", "error");
+                  addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {
-                addToast("该记录暂无保存路径信息", "info");
+                addToast(tr("toast.noSavePathRecord"), "info");
               }
             }}
             onRedownload={handleRedownload}
@@ -365,6 +406,7 @@ function AppContent() {
             onNewDownload={openNewTaskModal}
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
+            onToggleSidebar={$ui.toggleSidebar}
           />
         </Suspense>
       </Show>
