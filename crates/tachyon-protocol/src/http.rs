@@ -278,7 +278,27 @@ fn safe_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// 根据 HTTP 状态码和响应头对错误进行精确分类
+/// 解析 `Content-Range` 头中的文件总字节数
+///
+/// 支持 RFC 7233 规范格式 `bytes 0-0/<total>` 与未定大小 `bytes 0-0/*`。
+/// 仅在 `<total>` 为具体数值时返回 `Some`;`*` 或解析失败返回 `None`。
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let after = value.strip_prefix("bytes")?.trim_start();
+    let after = after.strip_prefix("0-0")?.trim_start();
+    let total = after.strip_prefix('/')?.trim();
+    (total != "*").then(|| total.parse::<u64>().ok()).flatten()
+}
+
+/// 判断 HEAD 失败状态码是否应回退到 GET 探测
+///
+/// 部分签名 CDN（如字节跳动 bytetos）仅对 GET 方法签名,HEAD 被拒成 403/405,
+/// 401 同理。这类状态码下回退 GET + Range 有望成功;其余(200 不会进此分支,
+/// 404/500 等真实错误)不回退。
+fn head_status_should_fallback(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 405)
+}
+
 ///
 /// - 429/503: 返回 Throttled,尝试解析 Retry-After 头中的秒数(整数或 HTTP-date)
 /// - 401/403: 返回 Forbidden
@@ -394,6 +414,108 @@ fn days_from_epoch(year: u32, month: u32, day: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// 从响应头提取文件元数据
+///
+/// `range_response = true` 表示响应来自 `GET Range: bytes=0-0`(206 Partial Content):
+/// 文件大小取自 `Content-Range: bytes 0-0/<total>`,`supports_range` 恒为 true(服务端
+/// 已确认支持 Range)。`range_response = false` 表示 HEAD/200:`file_size` 取自
+/// `Content-Length`,`supports_range` 取自 `Accept-Ranges` 头。
+fn metadata_from_headers(
+    url: &str,
+    headers: &reqwest::header::HeaderMap,
+    range_response: bool,
+) -> FileMetadata {
+    let content_disposition = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok());
+    let file_name = extract_filename(url, content_disposition);
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let etag = headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let last_modified = headers
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
+    let (file_size, supports_range) = if range_response {
+        let total = headers
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range_total);
+        (total, true)
+    } else {
+        let size = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let supports = headers
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("bytes"))
+            .unwrap_or(false);
+        (size, supports)
+    };
+
+    FileMetadata {
+        file_name,
+        file_size,
+        content_type,
+        supports_range,
+        etag,
+        last_modified,
+    }
+}
+
+/// HEAD 被签名 CDN 拒绝后,用 GET + Range:0-0 回退探测元数据
+///
+/// - 206 Partial Content:从 `Content-Range` 取总大小,`supports_range = true`
+/// - 200:服务端忽略 Range,返回完整文件;仅取响应头(`Content-Length` 即总大小),
+///   不消费响应体,`supports_range` 取自 `Accept-Ranges`(通常为 false)
+/// - 其他错误:返回 GET 的真实错误分类(不再回退)
+async fn probe_via_get_range(client: &Client, url: &str) -> DownloadResult<FileMetadata> {
+    debug!(url = %tachyon_core::redact_url_for_log(url), "GET Range 探测开始");
+    let response = client
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| {
+            let chain = error_chain(&e);
+            warn!(url = %tachyon_core::redact_url_for_log(url), error = %e, error_chain = %chain, "GET Range 探测连接失败");
+            DownloadError::Network(format!("GET Range 探测失败: {chain}"))
+        })?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let metadata = metadata_from_headers(url, response.headers(), true);
+        info!(
+            url = %tachyon_core::redact_url_for_log(url),
+            file_size = ?metadata.file_size,
+            supports_range = metadata.supports_range,
+            "GET Range 探测完成(206)"
+        );
+        return Ok(metadata);
+    }
+    if status.is_success() {
+        // 200:服务端忽略 Range。仅取头,不消费响应体。
+        let metadata = metadata_from_headers(url, response.headers(), false);
+        info!(
+            url = %tachyon_core::redact_url_for_log(url),
+            file_size = ?metadata.file_size,
+            supports_range = metadata.supports_range,
+            "GET Range 探测完成(200,服务端忽略 Range)"
+        );
+        return Ok(metadata);
+    }
+    warn!(url = %tachyon_core::redact_url_for_log(url), status = %status, "GET Range 探测返回非成功状态码");
+    Err(classify_http_error(status, response.headers()))
+}
+
 impl Protocol for HttpClient {
     fn probe(
         &self,
@@ -405,61 +527,47 @@ impl Protocol for HttpClient {
             let parsed_url = reqwest::Url::parse(&url)?;
             tachyon_core::validate_public_http_url(&parsed_url)?;
             debug!(url = %tachyon_core::redact_url_for_log(&url), "HTTP HEAD 探测开始");
-            let response = client.head(&url).send().await.map_err(|e| {
-                let chain = error_chain(&e);
-                warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "HEAD 请求连接失败");
-                DownloadError::Network(format!("HEAD 请求失败: {chain}"))
-            })?;
+            // HEAD 请求:签名 CDN(如 bytetos)可能拒绝 HEAD 方法导致 403/405,
+            // 也可能直接超时断连(签名 URL 对 HEAD 的连接策略不同于 GET)。
+            // 两种场景均回退到 GET + Range:0-0 探测。
+            let response = match client.head(&url).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let chain = error_chain(&e);
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&url),
+                        error = %e, error_chain = %chain,
+                        "HEAD 请求失败,回退 GET Range 探测"
+                    );
+                    return probe_via_get_range(&client, &url).await;
+                }
+            };
 
             let status = response.status();
             if !status.is_success() {
+                // 部分签名 CDN(如字节跳动 bytetos)仅对 GET 方法签名,HEAD 被拒成
+                // 403/401/405。此时回退到 GET Range:0-0 探测,有望拿到真实元数据。
+                if head_status_should_fallback(status) {
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&url),
+                        status = %status,
+                        "HEAD 探测被拒,回退 GET Range 探测"
+                    );
+                    return probe_via_get_range(&client, &url).await;
+                }
                 warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "HEAD 请求返回非成功状态码");
                 return Err(classify_http_error(status, response.headers()));
             }
 
-            let headers = response.headers();
-            let content_disposition = headers
-                .get("content-disposition")
-                .and_then(|v| v.to_str().ok());
-            let file_name = extract_filename(&url, content_disposition);
-            let file_size = headers
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            let content_type = headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string());
-            let supports_range = headers
-                .get("accept-ranges")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.contains("bytes"))
-                .unwrap_or(false);
-            let etag = headers
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string());
-            let last_modified = headers
-                .get("last-modified")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string());
-
+            let metadata = metadata_from_headers(&url, response.headers(), false);
             info!(
                 url = %tachyon_core::redact_url_for_log(&url),
-                file_size = ?file_size,
-                supports_range = supports_range,
-                content_type = ?content_type,
+                file_size = ?metadata.file_size,
+                supports_range = metadata.supports_range,
+                content_type = ?metadata.content_type,
                 "HTTP HEAD 探测完成"
             );
-
-            Ok(FileMetadata {
-                file_name,
-                file_size,
-                content_type,
-                supports_range,
-                etag,
-                last_modified,
-            })
+            Ok(metadata)
         })
     }
 
@@ -900,5 +1008,96 @@ mod tests {
             }
             other => panic!("预期 Protocol,实际: {other:?}"),
         }
+    }
+
+    // --- HEAD 回退 GET 探测:Content-Range 解析 ---
+
+    #[test]
+    fn test_parse_content_range_total_with_size() {
+        assert_eq!(
+            super::parse_content_range_total("bytes 0-0/12345"),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn test_parse_content_range_total_unknown() {
+        assert_eq!(super::parse_content_range_total("bytes 0-0/*"), None);
+    }
+
+    #[test]
+    fn test_parse_content_range_total_malformed() {
+        assert_eq!(super::parse_content_range_total("not-a-range"), None);
+        assert_eq!(super::parse_content_range_total("bytes 0-0/"), None);
+    }
+
+    // --- HEAD 回退 GET 探测:回退判定 ---
+
+    #[test]
+    fn test_head_should_fallback_on_signed_cdn_codes() {
+        use reqwest::StatusCode;
+        assert!(super::head_status_should_fallback(StatusCode::FORBIDDEN));
+        assert!(super::head_status_should_fallback(StatusCode::UNAUTHORIZED));
+        assert!(super::head_status_should_fallback(
+            StatusCode::METHOD_NOT_ALLOWED
+        ));
+    }
+
+    #[test]
+    fn test_head_should_not_fallback_on_real_errors() {
+        use reqwest::StatusCode;
+        assert!(!super::head_status_should_fallback(StatusCode::NOT_FOUND));
+        assert!(!super::head_status_should_fallback(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    // --- HEAD 回退 GET 探测:从响应头提取元数据 ---
+
+    #[test]
+    fn test_metadata_from_range_response_with_total() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 0-0/5000".parse().unwrap());
+        headers.insert("content-type", "video/mp4".parse().unwrap());
+        let meta = super::metadata_from_headers(
+            "https://cdn.example.com/path/video.mp4?a=1",
+            &headers,
+            true,
+        );
+        assert_eq!(meta.file_size, Some(5000));
+        assert!(meta.supports_range);
+        assert_eq!(meta.content_type.as_deref(), Some("video/mp4"));
+    }
+
+    #[test]
+    fn test_metadata_from_range_response_unknown_total() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 0-0/*".parse().unwrap());
+        let meta =
+            super::metadata_from_headers("https://cdn.example.com/stream.mp4", &headers, true);
+        assert!(meta.file_size.is_none());
+        // 206 已确认支持 Range
+        assert!(meta.supports_range);
+    }
+
+    #[test]
+    fn test_metadata_from_head_uses_content_length_and_accept_ranges() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-length", "1024".parse().unwrap());
+        headers.insert("accept-ranges", "bytes".parse().unwrap());
+        let meta =
+            super::metadata_from_headers("https://cdn.example.com/file.bin", &headers, false);
+        assert_eq!(meta.file_size, Some(1024));
+        assert!(meta.supports_range);
+    }
+
+    #[test]
+    fn test_metadata_from_head_no_accept_ranges() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-length", "2048".parse().unwrap());
+        let meta =
+            super::metadata_from_headers("https://cdn.example.com/file.bin", &headers, false);
+        assert_eq!(meta.file_size, Some(2048));
+        assert!(!meta.supports_range);
     }
 }
