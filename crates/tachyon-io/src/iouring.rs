@@ -612,26 +612,13 @@ async fn driver_task(
 impl IoUringHandle {
     /// 原子分配一个空闲 fixed buffer 索引。
     ///
-    /// 使用 AtomicU64 位图进行无锁分配,返回的索引范围 [0, buffers.len()-1],
-    /// 对应 `buffers` 中的位置。当所有 buffer 都被占用时返回 None。
+    /// 位图不变量: 每一位对应一个 fixed buffer, `1` = 已占用, `0` = 空闲。
+    /// 超出 `buffers.len()` 的高位在初始化时被预置为 `1`(见 `init` 中的 `used_mask`),
+    /// 因此本函数只会选中 `[0, buffers.len()-1]` 范围内的位。
+    ///
+    /// 返回的索引保证落在 `buffers` 内,当所有 buffer 都被占用时返回 None。
     fn alloc_buffer_index(&self) -> Option<usize> {
-        let mut current = self.buffer_bitmap.load(Ordering::Relaxed);
-        loop {
-            let idx = current.trailing_zeros();
-            if idx >= 64 {
-                return None; // 所有 buffer 都被占用
-            }
-            let next = current | (1 << idx);
-            match self.buffer_bitmap.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(idx as usize),
-                Err(actual) => current = actual,
-            }
-        }
+        bitmap_alloc_first_free(&self.buffer_bitmap, self.buffer_count)
     }
 
     /// 释放 fixed buffer 索引,使其可被后续操作重新分配。
@@ -640,6 +627,36 @@ impl IoUringHandle {
             return;
         }
         self.buffer_bitmap.fetch_and(!(1 << idx), Ordering::Relaxed);
+    }
+}
+
+/// 在 AtomicU64 位图上无锁查找并占用第一个空闲位。
+///
+/// 位图不变量: `1` = 已占用, `0` = 空闲。
+/// 算法: `(!current).trailing_zeros()` 找出第一个 0 位的索引,
+/// CAS 设置该位以原子声明占用。
+///
+/// 返回的索引保证 `< buffer_count`(超出范围则返回 None)。
+#[cfg(target_os = "linux")]
+fn bitmap_alloc_first_free(bitmap: &AtomicU64, buffer_count: usize) -> Option<usize> {
+    let mut current = bitmap.load(Ordering::Relaxed);
+    loop {
+        // 取反后 trailing_zeros 给出第一个空闲位(原值的第一个 0)。
+        // 直接对 current 取 trailing_zeros 会得到第一个"已占用"位,语义相反。
+        let idx = (!current).trailing_zeros();
+        if idx >= 64 {
+            return None; // 所有 64 位均为 1, 无空闲 buffer
+        }
+        // 防御性边界: 超出实际 buffer 数量的位不应被选中
+        // (正常情况下 init 的 used_mask 已保证, 此处为双重保险)
+        if idx as usize >= buffer_count {
+            return None;
+        }
+        let next = current | (1u64 << idx);
+        match bitmap.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(idx as usize),
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -1557,5 +1574,77 @@ mod tests {
             (buf.as_ptr() as usize).is_multiple_of(4096),
             "buffer 地址应按 4096 对齐"
         );
+    }
+
+    /// 回归测试: buffer_count=16 时,首次分配必须返回 idx=0 而非 16。
+    ///
+    /// 此前 bug: `alloc_buffer_index` 直接用 `current.trailing_zeros()` 取
+    /// 第一个置位(已占用)位,与"找第一个空闲位"语义相反。
+    /// 初始化 used_mask = (!0u64) << 16 = 0xFFFFFFFFFFFF0000 时,
+    /// trailing_zeros 返回 16, 导致 buffers[16] 越界 panic。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_alloc_first_free_returns_zero_with_initial_used_mask() {
+        let buffer_count = 16;
+        let used_mask = (!0u64) << buffer_count;
+        let bitmap = AtomicU64::new(used_mask);
+
+        let idx = bitmap_alloc_first_free(&bitmap, buffer_count);
+        assert_eq!(idx, Some(0), "首次分配必须返回索引 0");
+
+        // 第二次分配应返回 1
+        let idx2 = bitmap_alloc_first_free(&bitmap, buffer_count);
+        assert_eq!(idx2, Some(1), "第二次分配应返回索引 1");
+    }
+
+    /// 回归测试: 所有 buffer 占用时返回 None,不越界。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_alloc_first_free_returns_none_when_all_used() {
+        let buffer_count = 4;
+        // bits 0-3 占用, bits 4-63 由 used_mask 预占
+        let bitmap = AtomicU64::new(!0u64);
+        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), None);
+    }
+
+    /// 回归测试: 防御性边界检查 - 即使 used_mask 漏掉高位,也不会返回越界索引。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_alloc_first_free_respects_buffer_count_boundary() {
+        let buffer_count = 8;
+        // 模拟错误的 used_mask: 只占用 bits 0-3, bits 4-63 全空闲
+        let bitmap = AtomicU64::new(0b1111);
+        // 应返回 4 (在 buffer_count=8 范围内)
+        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), Some(4));
+
+        // 占满 0-7 后, 即使位图高位(8-63)为 0, 也不应返回越界索引
+        let bitmap_full_in_range = AtomicU64::new(0xFF);
+        assert_eq!(
+            bitmap_alloc_first_free(&bitmap_full_in_range, buffer_count),
+            None,
+            "超出 buffer_count 的位不应被分配"
+        );
+    }
+
+    /// 回归测试: 释放后可重新分配。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_alloc_free_reuse_cycle() {
+        let buffer_count = 4;
+        let used_mask = (!0u64) << buffer_count;
+        let bitmap = AtomicU64::new(used_mask);
+
+        // 占满 4 个槽
+        for expected in 0..4 {
+            assert_eq!(
+                bitmap_alloc_first_free(&bitmap, buffer_count),
+                Some(expected)
+            );
+        }
+        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), None);
+
+        // 释放索引 2 (清除 bit 2)
+        bitmap.fetch_and(!(1u64 << 2), Ordering::Relaxed);
+        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), Some(2));
     }
 }
