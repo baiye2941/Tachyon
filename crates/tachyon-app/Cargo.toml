@@ -25,6 +25,7 @@ tauri-build = { version = "2", features = [] }
 tachyon-core = { path = "../tachyon-core" }
 tachyon-engine = { path = "../tachyon-engine", default-features = false }
 tachyon-hub = { path = "../tachyon-hub", default-features = false }
+tachyon-io = { path = "../tachyon-io" }
 tachyon-sniffer = { path = "../tachyon-sniffer" }
 tachyon-store = { path = "../tachyon-store" }
 tauri.workspace = true

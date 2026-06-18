@@ -12,7 +12,25 @@ import { createSignal } from 'solid-js'
 /** 确认按钮视觉调性 */
 export type ConfirmTone = 'primary' | 'danger'
 
-export interface ConfirmRequest {
+export interface ConfirmOptions {
+  /** 是否显示“同时删除本地文件”复选项 */
+  showDeleteLocalFileOption?: boolean
+  /** 复选项文案 */
+  deleteLocalFileLabel?: string
+  /** 复选项说明 */
+  deleteLocalFileDescription?: string
+  /** 复选项默认值。删除本地文件是高风险动作,默认保持 false。 */
+  deleteLocalFileDefault?: boolean
+}
+
+export interface ConfirmResult {
+  /** 用户是否确认执行 */
+  ok: boolean
+  /** 用户是否选择同时删除本地文件 */
+  deleteLocalFile: boolean
+}
+
+export interface ConfirmRequest extends ConfirmOptions {
   /** 对话框标题 */
   title: string
   /** 对话框描述信息 */
@@ -24,7 +42,7 @@ export interface ConfirmRequest {
   /** 确认按钮调性:danger 用于删除等破坏性操作(红色按钮) */
   tone?: ConfirmTone
   /** 确认回调,由 ConfirmDialog 在用户点击后调用 */
-  resolve: (ok: boolean) => void
+  resolve: (result: ConfirmResult) => void
 }
 
 const [pending, setPending] = createSignal<ConfirmRequest | null>(null)
@@ -39,8 +57,8 @@ const [pending, setPending] = createSignal<ConfirmRequest | null>(null)
  */
 export function requestConfirm(
   opts: Omit<ConfirmRequest, 'resolve'>,
-): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+): Promise<ConfirmResult> {
+  return new Promise<ConfirmResult>((resolve) => {
     setPending({ ...opts, resolve })
   })
 }
@@ -50,11 +68,11 @@ export function requestConfirm(
  *
  * 由 App 根渲染的 ConfirmDialog 在用户点击确认/取消时调用。
  */
-export function resolveConfirm(ok: boolean): void {
+export function resolveConfirm(result: boolean | ConfirmResult): void {
   const req = pending()
   if (req) {
     setPending(null)
-    req.resolve(ok)
+    req.resolve(typeof result === 'boolean' ? { ok: result, deleteLocalFile: false } : result)
   }
 }
 

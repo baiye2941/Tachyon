@@ -36,7 +36,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 #[cfg(target_os = "linux")]
 use std::cell::UnsafeCell;
@@ -309,8 +309,8 @@ enum DriverCmd {
 struct WriteReq {
     /// 文件偏移
     offset: u64,
-    /// 待写入数据
-    data: Bytes,
+    /// 待写入数据长度(字节)
+    len: usize,
     /// 文件描述符
     fd: i32,
     /// fixed buffer 索引
@@ -414,7 +414,7 @@ async fn driver_task(
                 let write_op = io_uring::opcode::WriteFixed::new(
                     io_uring::types::Fd(req.fd),
                     buf.ptr() as *const u8,
-                    req.data.len() as u32,
+                    req.len as u32,
                     req.buf_idx as u16,
                 )
                 .offset(req.offset)
@@ -985,7 +985,7 @@ impl IoUringStorage {
     /// 然后通过 channel 发送 WriteReq，driver task 批量收集并提交 SQE。
     /// 调用方通过 oneshot channel 异步等待完成结果。
     #[cfg(target_os = "linux")]
-    async fn submit_write(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
+    async fn submit_write(&self, offset: u64, data: &[u8]) -> DownloadResult<usize> {
         let ring_handle = match &self.ring {
             Some(h) => h.clone(), // Arc clone, Send + 'static
             None => {
@@ -1029,7 +1029,7 @@ impl IoUringStorage {
         let buf = &ring_handle.buffers[buf_idx];
         // Safety: alloc_buffer_index 保证同一时刻只有一个操作使用该 buffer 索引
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr(), len) };
-        dst.copy_from_slice(&data[..len]);
+        dst.copy_from_slice(data);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
@@ -1037,7 +1037,7 @@ impl IoUringStorage {
             .cmd_tx
             .send(DriverCmd::Write(WriteReq {
                 offset,
-                data,
+                len,
                 fd,
                 buf_idx,
                 done: done_tx,
@@ -1085,7 +1085,7 @@ impl AsyncStorage for IoUringStorage {
                         if is_aligned {
                             // 快速路径:已对齐,直接写入
                             validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
-                            return self.submit_write(_offset, _data).await;
+                            return self.submit_write(_offset, &_data).await;
                         }
 
                         // 慢速路径:非对齐写入,自动填充对齐
@@ -1110,7 +1110,62 @@ impl AsyncStorage for IoUringStorage {
                         padded[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
-                        self.submit_write(aligned_offset, Bytes::from(padded)).await
+                        self.submit_write(aligned_offset, &padded).await
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        unreachable!("非 Linux 平台不可能处于 Ready 状态")
+                    }
+                }
+                _ => Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "io_uring 存储引擎未初始化,请先调用 init() 或使用 TokioFile",
+                ))),
+            }
+        })
+    }
+
+    fn write_at_mut<'a>(
+        &'a self,
+        _offset: u64,
+        _data: &'a mut BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.state {
+                IoUringState::Ready => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let align = O_DIRECT_ALIGN as u64;
+                        let align_mask = align - 1;
+                        let data_len = _data.len() as u64;
+                        let is_aligned =
+                            _offset.is_multiple_of(align) && data_len.is_multiple_of(align);
+
+                        if is_aligned {
+                            validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
+                            return self.submit_write(_offset, _data).await;
+                        }
+
+                        let aligned_offset = _offset & !align_mask;
+                        let front_pad = (_offset - aligned_offset) as usize;
+                        let total_len = front_pad + _data.len();
+                        let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
+
+                        if padded_len > self.config.buffer_size {
+                            return Err(DownloadError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "io_uring 非对齐写入填充后 {padded_len} 字节超过 fixed buffer 大小 {}",
+                                    self.config.buffer_size
+                                ),
+                            )));
+                        }
+
+                        let mut padded = vec![0u8; padded_len];
+                        padded[front_pad..front_pad + _data.len()].copy_from_slice(_data);
+
+                        validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
+                        self.submit_write(aligned_offset, &padded).await
                     }
                     #[cfg(not(target_os = "linux"))]
                     {

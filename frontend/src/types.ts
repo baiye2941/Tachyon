@@ -43,7 +43,7 @@ export interface DownloadConfig {
   authorizedDirs: string[]
   userAgent: string
   headers: Record<string, string>
-  /** I/O 存储后端策略(后端默认 standard)。可选以兼容旧版无此字段的快照 */
+  /** I/O 存储后端策略。后端默认按平台自适应: Windows→iocp, Linux 5.4+→ioUring, 其他→standard。可选以兼容旧版无此字段的快照 */
   ioStrategy?: IoStrategy
 }
 

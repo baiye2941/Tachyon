@@ -36,15 +36,27 @@ export async function deleteSelected(): Promise<void> {
   const ids = Array.from($selectedIds.get())
   if (ids.length === 0) return
 
-  const ok = await requestConfirm({
+  const result = await requestConfirm({
     title: tr('confirm.deleteBatch.title'),
     message: tr('confirm.deleteBatch.message', { count: ids.length }),
     confirmLabel: tr('confirm.delete.confirmLabel'),
     tone: 'danger',
+    showDeleteLocalFileOption: true,
+    deleteLocalFileDefault: false,
   })
-  if (!ok) return
+  if (!result.ok) return
 
-  await Promise.allSettled(ids.map(id => api.deleteTask(id, { skipConfirm: true })))
+  const results = await Promise.allSettled(ids.map(id => api.deleteTask(id, {
+    skipConfirm: true,
+    deleteLocalFile: result.deleteLocalFile,
+  })))
+  const failures = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[]
+  if (failures.length > 0) {
+    addToast(tr('toast.deleteBatchPartialFailed', {
+      count: failures.length,
+      error: failures[0]?.reason ?? '',
+    }), 'error')
+  }
   deselectAll()
   await refreshTaskList()
 }

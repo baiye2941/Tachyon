@@ -6,6 +6,7 @@ use tachyon_core::traits::TaskRunner;
 use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::DownloadTask;
 use tachyon_engine::connection::ConnectionPool;
+use tachyon_io::BufferPool;
 use tokio::sync::watch;
 use url::Url;
 
@@ -23,8 +24,10 @@ pub(crate) async fn task_fn(
     download_dir: String,
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
+    buffer_pool: Arc<BufferPool>,
     control_rx: watch::Receiver<TaskCommand>,
     mirror_urls: Option<Vec<String>>,
+    preferred_file_name: Option<String>,
 ) {
     crate::runtime::DownloadSession::new(
         state,
@@ -33,8 +36,10 @@ pub(crate) async fn task_fn(
         download_dir,
         download_config,
         connection_pool,
+        buffer_pool,
         control_rx,
         mirror_urls,
+        preferred_file_name,
     )
     .run()
     .await;
@@ -45,11 +50,14 @@ pub(crate) async fn task_fn(
 // ---------------------------------------------------------------------------
 
 /// URL 解析、host 提取、启动前取消/暂停检查,并设置 Downloading 状态
+///
+/// 检测到暂停信号时等待恢复(带超时上限),不会覆盖 Paused 状态为 Downloading。
 pub(crate) async fn validate_and_prepare_url(
     url: &str,
     state: &AppState,
     task_id: &str,
-    control_rx: &watch::Receiver<TaskCommand>,
+    control_rx: &mut watch::Receiver<TaskCommand>,
+    pause_timeout_secs: u64,
 ) -> Option<String> {
     let download_url = match Url::parse(url) {
         Ok(u) => u,
@@ -70,19 +78,16 @@ pub(crate) async fn validate_and_prepare_url(
     };
 
     {
-        if let Some(task) = state.domain.task_repository.get(task_id) {
-            if task.status == DownloadState::Cancelled {
-                tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
-                cleanup_runtime(state, task_id);
-                return None;
-            }
-            if task.status == DownloadState::Paused {
-                tracing::info!(task_id = %task_id, "任务已暂停,等待恢复...");
-            }
+        if let Some(task) = state.domain.task_repository.get(task_id)
+            && task.status == DownloadState::Cancelled
+        {
+            tracing::info!(task_id = %task_id, "任务已取消,跳过下载");
+            cleanup_runtime(state, task_id);
+            return None;
         }
     }
 
-    // 设置 Downloading 前检查是否已被取消/暂停,防止 cancel 竞态覆盖状态
+    // 设置 Downloading 前检查是否已被取消/暂停,防止竞态覆盖状态
     let cmd = *control_rx.borrow();
     if cmd == TaskCommand::Cancel {
         tracing::info!(task_id = %task_id, "下载启动前检测到取消信号,终止下载");
@@ -96,6 +101,35 @@ pub(crate) async fn validate_and_prepare_url(
     }
     if cmd == TaskCommand::Pause {
         tracing::info!(task_id = %task_id, "下载启动前检测到暂停信号,等待恢复");
+        let pause_timeout = Duration::from_secs(pause_timeout_secs);
+        match wait_for_resume_or_cancel(control_rx, pause_timeout).await {
+            ResumeOrCancel::Resume => {
+                tracing::info!(task_id = %task_id, "暂停已恢复,继续下载");
+            }
+            ResumeOrCancel::Cancel => {
+                update_task_status(
+                    &state.domain.task_repository,
+                    task_id,
+                    DownloadState::Cancelled,
+                );
+                cleanup_runtime(state, task_id);
+                return None;
+            }
+            ResumeOrCancel::Timeout => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    timeout_secs = pause_timeout_secs,
+                    "暂停等待超时,取消任务"
+                );
+                update_task_status(
+                    &state.domain.task_repository,
+                    task_id,
+                    DownloadState::Cancelled,
+                );
+                cleanup_runtime(state, task_id);
+                return None;
+            }
+        }
     }
 
     update_task_status(
@@ -125,6 +159,7 @@ pub(crate) async fn build_download_task(
     url: &str,
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
+    buffer_pool: Arc<BufferPool>,
     mirror_urls: Option<Vec<String>>,
 ) -> Result<Box<dyn TaskRunner>, ()> {
     match mirror_urls {
@@ -138,7 +173,10 @@ pub(crate) async fn build_download_task(
             )
             .await
             {
-                Ok(t) => Ok(Box::new(t)),
+                Ok(mut t) => {
+                    t.set_buffer_pool(buffer_pool.clone());
+                    Ok(Box::new(t))
+                }
                 Err(e) => {
                     tracing::error!(task_id = %task_id, error = %e, "创建镜像 DownloadTask 失败");
                     Err(())
@@ -149,7 +187,10 @@ pub(crate) async fn build_download_task(
             match DownloadTask::with_pool(url.to_string(), download_config, Some(connection_pool))
                 .await
             {
-                Ok(t) => Ok(Box::new(t)),
+                Ok(mut t) => {
+                    t.set_buffer_pool(buffer_pool.clone());
+                    Ok(Box::new(t))
+                }
                 Err(e) => {
                     tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
                     Err(())
@@ -159,8 +200,76 @@ pub(crate) async fn build_download_task(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper: wait for resume or cancel (暂停等待,带超时上限)
+// ---------------------------------------------------------------------------
+
+/// 暂停等待结果
+pub(crate) enum ResumeOrCancel {
+    /// 收到恢复信号
+    Resume,
+    /// 收到取消信号
+    Cancel,
+    /// 暂停超时
+    Timeout,
+}
+
+/// 等待暂停解除(Resume)或取消(Cancel),带超时上限
+///
+/// CLAUDE.md 规则: paused 状态 MUST 有时间上限,不能永久暂停
+pub(crate) async fn wait_for_resume_or_cancel(
+    control_rx: &mut watch::Receiver<TaskCommand>,
+    pause_timeout: Duration,
+) -> ResumeOrCancel {
+    match tokio::time::timeout(pause_timeout, async {
+        loop {
+            let cmd = *control_rx.borrow_and_update();
+            match cmd {
+                TaskCommand::Resume => return ResumeOrCancel::Resume,
+                TaskCommand::Cancel => return ResumeOrCancel::Cancel,
+                _ => {
+                    if control_rx.changed().await.is_err() {
+                        // 控制通道关闭,视为取消
+                        return ResumeOrCancel::Cancel;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => ResumeOrCancel::Timeout,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: pre-run check (取消/暂停检查)
+// ---------------------------------------------------------------------------
+
+/// 执行前检查结果
+pub(crate) enum PreRunCheck {
+    /// 可以继续执行
+    Continue,
+    /// 已取消
+    Cancelled,
+    /// 已暂停,需等待恢复
+    Paused,
+}
+
+/// 执行前检查控制信号,同时识别取消和暂停
+pub(crate) fn should_stop_before_run(control_rx: &watch::Receiver<TaskCommand>) -> PreRunCheck {
+    let cmd = *control_rx.borrow();
+    match cmd {
+        TaskCommand::Cancel => PreRunCheck::Cancelled,
+        TaskCommand::Pause => PreRunCheck::Paused,
+        _ => PreRunCheck::Continue,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn should_cancel_before_run(control_rx: &watch::Receiver<TaskCommand>) -> bool {
-    *control_rx.borrow() == TaskCommand::Cancel
+    matches!(should_stop_before_run(control_rx), PreRunCheck::Cancelled)
 }
 
 pub(crate) async fn inject_resume_snapshot(
@@ -193,15 +302,31 @@ pub(crate) async fn probe_and_save_metadata(
     state: &AppState,
     task_id: &str,
     download_dir: &str,
-    control_rx: &watch::Receiver<TaskCommand>,
+    control_rx: &mut watch::Receiver<TaskCommand>,
+    pause_timeout_secs: u64,
 ) -> Option<FileMetadata> {
-    let mut probe_cancel_rx = control_rx.clone();
+    let mut probe_control_rx = control_rx.clone();
+    let pause_timeout = Duration::from_secs(pause_timeout_secs);
     match tokio::select! {
         result = task.probe() => result,
-        cancel = wait_for_cancel_signal(&mut probe_cancel_rx) => {
-            match cancel {
-                Err(e) => Err(e),
-                Ok(()) => Err(tachyon_core::DownloadError::Other("控制信号异常结束".into())),
+        signal = wait_for_cancel_or_pause(&mut probe_control_rx) => {
+            match signal {
+                ProbeInterrupt::Cancel => Err(tachyon_core::DownloadError::Cancelled),
+                ProbeInterrupt::Pause => {
+                    // 探测期间暂停:等待恢复或超时
+                    match wait_for_resume_or_cancel(&mut probe_control_rx, pause_timeout).await {
+                        ResumeOrCancel::Resume => {
+                            // 恢复后重新探测
+                            task.probe().await
+                        }
+                        ResumeOrCancel::Cancel | ResumeOrCancel::Timeout => {
+                            Err(tachyon_core::DownloadError::Cancelled)
+                        }
+                    }
+                }
+                ProbeInterrupt::ChannelClosed => {
+                    Err(tachyon_core::DownloadError::Other("控制通道已关闭".into()))
+                }
             }
         }
     } {
@@ -362,17 +487,35 @@ pub(crate) fn extract_fail_reason(
 // Helper: wait for cancel signal
 // ---------------------------------------------------------------------------
 
-async fn wait_for_cancel_signal(
-    control_rx: &mut watch::Receiver<TaskCommand>,
-) -> Result<(), tachyon_core::DownloadError> {
+// ---------------------------------------------------------------------------
+// Helper: wait for cancel or pause signal (探测期间中断检查)
+// ---------------------------------------------------------------------------
+
+/// 探测期间中断信号
+enum ProbeInterrupt {
+    /// 收到取消信号
+    Cancel,
+    /// 收到暂停信号
+    Pause,
+    /// 控制通道关闭
+    ChannelClosed,
+}
+
+/// 等待取消或暂停信号(不阻塞,仅检查当前值和首次变化)
+///
+/// 用于探测阶段的 `tokio::select!` 中,与 `task.probe()` 竞速。
+/// 探测是快速操作,只需在开始时检查一次,然后等待首次信号变化。
+async fn wait_for_cancel_or_pause(control_rx: &mut watch::Receiver<TaskCommand>) -> ProbeInterrupt {
     loop {
         let cmd = *control_rx.borrow_and_update();
         match cmd {
-            TaskCommand::Cancel => return Err(tachyon_core::DownloadError::Cancelled),
-            _ => control_rx
-                .changed()
-                .await
-                .map_err(|_| tachyon_core::DownloadError::Other("控制通道已关闭".into()))?,
+            TaskCommand::Cancel => return ProbeInterrupt::Cancel,
+            TaskCommand::Pause => return ProbeInterrupt::Pause,
+            _ => {
+                if control_rx.changed().await.is_err() {
+                    return ProbeInterrupt::ChannelClosed;
+                }
+            }
         }
     }
 }
@@ -421,6 +564,7 @@ pub async fn delete_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
     confirmation_token: Option<String>,
+    delete_local_file: Option<bool>,
 ) -> Result<(), AppError> {
     // P1-11b: 验证一次性确认令牌，绑定 action 防止跨操作复用
     match confirmation_token {
@@ -436,7 +580,8 @@ pub async fn delete_task(
             ));
         }
     }
-    delete_task_inner(&state, task_id).await
+    let delete_local_file = delete_local_file.unwrap_or(false);
+    delete_task_inner(&state, task_id, delete_local_file).await
 }
 
 #[tauri::command]
@@ -482,6 +627,7 @@ pub(crate) async fn create_task_inner(
         creation.download_dir,
         creation.download_config,
         creation.mirror_urls,
+        creation.preferred_file_name,
     );
 
     Ok(creation.task_id)
@@ -514,8 +660,22 @@ pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Resu
     Ok(())
 }
 
-pub(crate) async fn delete_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
-    state.service.task_service.delete_task(&task_id)?;
+pub(crate) async fn delete_task_inner(
+    state: &AppState,
+    task_id: String,
+    delete_local_file: bool,
+) -> Result<(), AppError> {
+    // 先发送 Cancel 命令停止活跃下载,再从仓库删除记录。
+    // 对于终态任务 Cancel 命令会被忽略(无活跃 handle),不影响正确性。
+    state
+        .runtime
+        .supervisor
+        .send_command(&task_id, TaskCommand::Cancel);
+    state
+        .service
+        .task_service
+        .delete_task(&task_id, delete_local_file)
+        .await?;
     state.runtime.supervisor.cleanup(&task_id);
     Ok(())
 }
@@ -544,6 +704,13 @@ mod tests {
     use tachyon_core::types::DownloadState;
     use tokio::sync::oneshot;
     use uuid::Uuid;
+
+    async fn set_test_download_root(state: &AppState, root: &std::path::Path) {
+        let root = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let mut cfg = state.domain.config.lock().await;
+        cfg.download.download_dir = root.clone();
+        cfg.download.authorized_dirs = vec![root];
+    }
 
     async fn spawn_task_fn_for_test(
         state: Arc<AppState>,
@@ -586,6 +753,9 @@ mod tests {
         let handle = tokio::spawn({
             let state = state.clone();
             let connection_pool = state.infra.connection_pool.clone();
+            // 切片2 夹具修复:task_fn 新签名增加 buffer_pool 参数,
+            // 从 AppState.infra.buffer_pool 取池注入,使 worker 用池化 buffer。
+            let buffer_pool = state.infra.buffer_pool.clone();
             let task_id = task_id.clone();
             async move {
                 let _ = start_rx.await;
@@ -596,7 +766,9 @@ mod tests {
                     download_dir,
                     download_config,
                     connection_pool,
+                    buffer_pool,
                     control_rx,
+                    None,
                     None,
                 )
                 .await;
@@ -931,8 +1103,185 @@ mod tests {
         .await
         .unwrap();
         cancel_task_inner(&state, id.clone()).await.unwrap();
-        delete_task_inner(&state, id.clone()).await.unwrap();
+        delete_task_inner(&state, id.clone(), false).await.unwrap();
         assert!(get_task_detail_inner(&state, id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_default_option_preserves_local_file_and_temp_candidates() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/preserve-local-file.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        cancel_task_inner(&state, id.clone()).await.unwrap();
+
+        let token = state
+            .service
+            .confirmation_service
+            .request("delete_task")
+            .unwrap();
+
+        let temp_root = tempfile::tempdir().unwrap();
+        let final_path = temp_root.path().join("preserve-local-file.bin");
+        let temp_candidate_1 = temp_root.path().join("preserve-local-file.bin.part");
+        let temp_candidate_2 = temp_root.path().join("preserve-local-file.bin.tachyon.tmp");
+        std::fs::write(&final_path, b"final payload").unwrap();
+        std::fs::write(&temp_candidate_1, b"partial payload").unwrap();
+        std::fs::write(&temp_candidate_2, b"resume payload").unwrap();
+
+        {
+            if let Some(mut task) = state.domain.task_repository.get_mut(&id) {
+                task.save_path = final_path.to_string_lossy().to_string();
+            }
+        }
+
+        state
+            .service
+            .confirmation_service
+            .validate_and_consume(&token, "delete_task")
+            .unwrap();
+        delete_task_inner(&state, id.clone(), false).await.unwrap();
+
+        assert!(get_task_detail_inner(&state, id.clone()).await.is_err());
+        assert!(
+            state.infra.task_store.load_snapshot(&id).unwrap().is_none(),
+            "删除任务后应移除断点续传快照"
+        );
+        assert!(final_path.exists(), "默认删除任务不应删除最终本地文件");
+        assert!(
+            temp_candidate_1.exists(),
+            "默认删除任务不应删除确定性的临时文件候选"
+        );
+        assert!(
+            temp_candidate_2.exists(),
+            "默认删除任务不应删除确定性的临时文件候选"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_with_delete_local_file_option_removes_file_and_temp_candidates() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/remove-local-file.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        cancel_task_inner(&state, id.clone()).await.unwrap();
+
+        let temp_root = tempfile::tempdir().unwrap();
+        set_test_download_root(&state, temp_root.path()).await;
+        let final_path = temp_root.path().join("remove-local-file.bin");
+        let temp_candidate_1 = std::path::PathBuf::from(format!("{}.part", final_path.display()));
+        let temp_candidate_2 = std::path::PathBuf::from(format!("{}.tmp", final_path.display()));
+        let temp_candidate_3 =
+            std::path::PathBuf::from(format!("{}.download", final_path.display()));
+        let temp_candidate_4 = temp_root.path().join(format!("{id}.part"));
+        let temp_candidate_5 = temp_root.path().join(format!("{id}.tmp"));
+        std::fs::write(&final_path, b"final payload").unwrap();
+        std::fs::write(&temp_candidate_1, b"partial payload").unwrap();
+        std::fs::write(&temp_candidate_2, b"tmp payload").unwrap();
+        std::fs::write(&temp_candidate_3, b"download payload").unwrap();
+        std::fs::write(&temp_candidate_4, b"task id part payload").unwrap();
+        std::fs::write(&temp_candidate_5, b"task id tmp payload").unwrap();
+
+        {
+            if let Some(mut task) = state.domain.task_repository.get_mut(&id) {
+                task.save_path = final_path.to_string_lossy().to_string();
+            }
+        }
+
+        delete_task_inner(&state, id.clone(), true).await.unwrap();
+
+        assert!(get_task_detail_inner(&state, id.clone()).await.is_err());
+        assert!(
+            state.infra.task_store.load_snapshot(&id).unwrap().is_none(),
+            "删除任务后应移除断点续传快照"
+        );
+        assert!(
+            !final_path.exists(),
+            "启用删除本地文件选项时应删除最终本地文件"
+        );
+        assert!(
+            !temp_candidate_1.exists(),
+            "启用删除本地文件选项时应删除 <save_path>.part"
+        );
+        assert!(
+            !temp_candidate_2.exists(),
+            "启用删除本地文件选项时应删除 <save_path>.tmp"
+        );
+        assert!(
+            !temp_candidate_3.exists(),
+            "启用删除本地文件选项时应删除 <save_path>.download"
+        );
+        assert!(
+            !temp_candidate_4.exists(),
+            "启用删除本地文件选项时应删除 task-id sidecar .part"
+        );
+        assert!(
+            !temp_candidate_5.exists(),
+            "启用删除本地文件选项时应删除 task-id sidecar .tmp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_with_delete_local_file_option_preserves_task_and_snapshot_when_candidate_delete_fails()
+     {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/delete-failure.bin".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        cancel_task_inner(&state, id.clone()).await.unwrap();
+
+        let snapshot_before_delete = state.infra.task_store.load_snapshot(&id).unwrap();
+        assert!(snapshot_before_delete.is_some(), "前置条件: 任务快照应存在");
+
+        let temp_root = tempfile::tempdir().unwrap();
+        set_test_download_root(&state, temp_root.path()).await;
+
+        let final_path = temp_root.path().join("delete-failure.bin");
+        let undeletable_candidate =
+            std::path::PathBuf::from(format!("{}.part", final_path.display()));
+        std::fs::write(&final_path, b"final payload").unwrap();
+        std::fs::create_dir_all(&undeletable_candidate).unwrap();
+
+        {
+            if let Some(mut task) = state.domain.task_repository.get_mut(&id) {
+                task.save_path = final_path.to_string_lossy().to_string();
+            }
+        }
+
+        let result = delete_task_inner(&state, id.clone(), true).await;
+
+        assert!(result.is_err(), "删除候选失败时应向调用方返回错误");
+        assert!(
+            get_task_detail_inner(&state, id.clone()).await.is_ok(),
+            "删除失败时应保留任务记录"
+        );
+        assert!(
+            state.infra.task_store.load_snapshot(&id).unwrap().is_some(),
+            "删除失败时应保留断点续传快照"
+        );
+        assert!(final_path.exists(), "删除失败时应保留最终本地文件");
+        assert!(
+            undeletable_candidate.exists(),
+            "删除失败时应保留删除失败的候选路径"
+        );
     }
 
     /// 删除终态任务时,应同步清理本地已下载文件和断点续传快照。
@@ -951,7 +1300,9 @@ mod tests {
         cancel_task_inner(&state, id.clone()).await.unwrap();
 
         // 构造一个临时文件模拟已下载文件,并写入任务记录
-        let tmp_path = std::env::temp_dir().join(format!("tachyon-delete-test-{id}"));
+        let temp_root = tempfile::tempdir().unwrap();
+        set_test_download_root(&state, temp_root.path()).await;
+        let tmp_path = temp_root.path().join(format!("tachyon-delete-test-{id}"));
         std::fs::write(&tmp_path, b"test data").unwrap();
         let save_path = tmp_path.to_string_lossy().to_string();
         {
@@ -960,7 +1311,7 @@ mod tests {
             }
         }
 
-        delete_task_inner(&state, id.clone()).await.unwrap();
+        delete_task_inner(&state, id.clone(), true).await.unwrap();
         assert!(get_task_detail_inner(&state, id).await.is_err());
         assert!(!tmp_path.exists(), "删除任务时应同步删除已下载的本地文件");
 
@@ -969,7 +1320,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_pending_task_fails() {
+    async fn test_delete_pending_task_succeeds() {
+        // 恢复的任务状态为 Pending,用户应能直接删除(无需先取消)
         let state = test_state();
         let id = create_task_inner(
             &state,
@@ -980,9 +1332,28 @@ mod tests {
         )
         .await
         .unwrap();
-        let result = delete_task_inner(&state, id.clone()).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("不允许删除"));
+        // Pending 状态的任务应可直接删除
+        delete_task_inner(&state, id.clone(), false).await.unwrap();
+        assert!(get_task_detail_inner(&state, id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_paused_task_succeeds() {
+        // 恢复的断点续传任务状态为 Paused,用户应能直接删除
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/paused-delete.zip".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        pause_task_inner(&state, id.clone()).await.unwrap();
+        // Paused 状态的任务应可直接删除
+        delete_task_inner(&state, id.clone(), false).await.unwrap();
+        assert!(get_task_detail_inner(&state, id).await.is_err());
     }
 
     #[tokio::test]
@@ -1074,7 +1445,7 @@ mod tests {
             DownloadState::Cancelled
         );
 
-        delete_task_inner(&state, id.clone()).await.unwrap();
+        delete_task_inner(&state, id.clone(), false).await.unwrap();
         assert!(get_task_detail_inner(&state, id).await.is_err());
     }
 
@@ -1249,7 +1620,7 @@ mod tests {
             let state_clone = state.clone();
             let tid = id.clone();
             delete_handles.push(tokio::spawn(async move {
-                delete_task_inner(&state_clone, tid).await
+                delete_task_inner(&state_clone, tid, false).await
             }));
         }
 
@@ -1513,5 +1884,379 @@ mod tests {
         .unwrap();
         let task = get_task_detail_inner(&state, id).await.unwrap();
         assert_eq!(task.file_name, "model.bin");
+    }
+
+    // ---- wait_for_resume_or_cancel 测试 ----
+
+    #[tokio::test]
+    async fn test_wait_for_resume_or_cancel_resume() {
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        // 在另一个任务中延迟发送 Resume
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(TaskCommand::Resume);
+        });
+
+        let result = wait_for_resume_or_cancel(&mut rx, Duration::from_secs(5)).await;
+        assert!(matches!(result, ResumeOrCancel::Resume));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_resume_or_cancel_cancel() {
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(TaskCommand::Cancel);
+        });
+
+        let result = wait_for_resume_or_cancel(&mut rx, Duration::from_secs(5)).await;
+        assert!(matches!(result, ResumeOrCancel::Cancel));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_resume_or_cancel_timeout() {
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        let result = wait_for_resume_or_cancel(&mut rx, Duration::from_millis(200)).await;
+        // 保持 tx 存活直到测试结束,避免控制通道关闭被误判为取消
+        drop(tx);
+        assert!(matches!(result, ResumeOrCancel::Timeout));
+    }
+
+    // ---- should_stop_before_run 测试 ----
+
+    #[test]
+    fn test_should_stop_before_run_continue() {
+        let (_, rx) = watch::channel(TaskCommand::Start);
+        assert!(matches!(should_stop_before_run(&rx), PreRunCheck::Continue));
+    }
+
+    #[test]
+    fn test_should_stop_before_run_cancelled() {
+        let (_, rx) = watch::channel(TaskCommand::Cancel);
+        assert!(matches!(
+            should_stop_before_run(&rx),
+            PreRunCheck::Cancelled
+        ));
+    }
+
+    #[test]
+    fn test_should_stop_before_run_paused() {
+        let (_, rx) = watch::channel(TaskCommand::Pause);
+        assert!(matches!(should_stop_before_run(&rx), PreRunCheck::Paused));
+    }
+
+    #[test]
+    fn test_should_cancel_before_run_delegates_to_should_stop() {
+        let (_, rx) = watch::channel(TaskCommand::Cancel);
+        assert!(should_cancel_before_run(&rx));
+
+        let (_, rx) = watch::channel(TaskCommand::Start);
+        assert!(!should_cancel_before_run(&rx));
+
+        // Pause 不算取消
+        let (_, rx) = watch::channel(TaskCommand::Pause);
+        assert!(!should_cancel_before_run(&rx));
+    }
+
+    // ---- validate_and_prepare_url 暂停处理测试 ----
+
+    /// 辅助:创建测试用 TaskInfo 并插入仓库,返回 task_id
+    fn insert_test_task(state: &AppState, status: DownloadState) -> String {
+        let task_id = Uuid::new_v4().to_string();
+        state.domain.task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.zip".to_string(),
+                file_name: "file.zip".to_string(),
+                file_size: None,
+                downloaded: 0,
+                speed: 0,
+                status,
+                progress: 0.0,
+                fragments_total: 0,
+                fragments_done: 0,
+                created_at: now_iso8601(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+            },
+        );
+        task_id
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_prepare_url_pause_then_resume() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Pending);
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        // 延迟发送 Resume
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(TaskCommand::Resume);
+        });
+
+        let result =
+            validate_and_prepare_url("https://example.com/file.zip", &state, &task_id, &mut rx, 5)
+                .await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "example.com");
+        // 暂停恢复后应设置为 Downloading
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Downloading);
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_prepare_url_pause_timeout() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Pending);
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        let result = validate_and_prepare_url(
+            "https://example.com/file.zip",
+            &state,
+            &task_id,
+            &mut rx,
+            // 使用极短超时
+            1,
+        )
+        .await;
+        // 保持 tx 存活
+        drop(tx);
+        assert!(result.is_none());
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_prepare_url_pause_then_cancel() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Pending);
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let mut rx = rx;
+
+        // 延迟发送 Cancel
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(TaskCommand::Cancel);
+        });
+
+        let result =
+            validate_and_prepare_url("https://example.com/file.zip", &state, &task_id, &mut rx, 5)
+                .await;
+        assert!(result.is_none());
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_prepare_url_cancel_directly() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Pending);
+        let (tx, rx) = watch::channel(TaskCommand::Cancel);
+        let mut rx = rx;
+
+        let result =
+            validate_and_prepare_url("https://example.com/file.zip", &state, &task_id, &mut rx, 5)
+                .await;
+        drop(tx);
+        assert!(result.is_none());
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_validate_and_prepare_url_normal_flow() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Pending);
+        let (tx, rx) = watch::channel(TaskCommand::Start);
+        let mut rx = rx;
+
+        let result =
+            validate_and_prepare_url("https://example.com/file.zip", &state, &task_id, &mut rx, 5)
+                .await;
+        drop(tx);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "example.com");
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Downloading);
+    }
+
+    // ── BufferPool 链路注入(切片2) RED 测试 ──────────────────────────
+    //
+    // 目标:验证全局 BufferPool 经 task_fn -> DownloadSession::new ->
+    // build_download_task 链路注入到 DownloadTask,使 worker 用池化 buffer。
+    //
+    // 可观测性限制(app 层无法做完整运行时 RED 的原因):
+    //   1. build_download_task 内部硬编码 DownloadTask::with_pool/with_mirrors,
+    //      创建真实 HttpClient,无协议注入入口。app crate 无法访问 engine 的
+    //      new_for_test(cfg(test) 私有)或 tachyon-core 的 MockProtocol
+    //      (需 test-harness feature,app dev-deps 未启用,且即便启用也无注入点)。
+    //   2. DownloadTask.buffer_pool 为私有字段,build_download_task 返回
+    //      Box<dyn TaskRunner>,TaskRunner trait 无 buffer_pool 查询方法
+    //      (core 不能依赖 io,加方法违反层序)。
+    //
+    // 因此切片2 的 RED 信号采用"编译期契约 + 运行时不变量"双轨:
+    //   - 编译期:测试调用 task_fn / DownloadSession::new 的新签名(含 buffer_pool
+    //     参数)。Coder 改签名前 -> 参数数量不匹配 -> 编译失败(RED)。
+    //     Coder 改签名后 -> 编译通过 -> 测试体执行(GREEN)。
+    //   - 运行时:构造失败路径(ftp URL,with_pool 对非 http 返回 Err)下,buffer_pool
+    //     不被消费(available == capacity),且任务进入 Failed。这验证夹具接线正确
+    //     (task_fn 新签名被实际调用且不 panic)与构造失败不泄漏 buffer 引用。
+    //
+    // 成功注入路径(真实 http 下载)的正确性由 engine 层 set_buffer_pool 测试
+    // (downloader.rs: test_buffer_pool_returns_buffers_after_run 等) +
+    // 编译保证 + 既有 app 下载测试不回归共同覆盖。
+
+    /// 验证 DownloadSession::new 接受 buffer_pool 参数(编译期契约)
+    ///
+    /// 调用新签名构造会话,断言构造不副作用消费 buffer(available 保持 capacity)。
+    /// RED:Coder 改 DownloadSession::new 签名前,buffer_pool 参数不存在,
+    /// 编译失败(参数数量不匹配)。
+    #[tokio::test]
+    async fn test_download_session_new_accepts_buffer_pool() {
+        let state = test_state();
+        let capacity = state.infra.buffer_pool.capacity();
+        let download_config = {
+            let cfg = state.domain.config.lock().await;
+            build_download_config(&cfg, "/tmp/tachyon-slice2-unused")
+        };
+        let (_control_tx, control_rx) = watch::channel(TaskCommand::Start);
+
+        // 调用新签名:传入 state.infra.buffer_pool.clone() 作为 buffer_pool 参数。
+        // 仅构造会话,不调用 run()(run 会触发真实下载)。
+        let _session = crate::runtime::DownloadSession::new(
+            state.clone(),
+            "slice2-signature-contract".to_string(),
+            "https://example.com/slice2-signature.bin".to_string(),
+            "/tmp/tachyon-slice2-unused".to_string(),
+            download_config,
+            state.infra.connection_pool.clone(),
+            state.infra.buffer_pool.clone(),
+            control_rx,
+            None,
+            None,
+        );
+
+        // 构造只是存储 Arc<BufferPool>,不应消费任何许可。
+        assert_eq!(
+            state.infra.buffer_pool.available(),
+            capacity,
+            "DownloadSession::new 构造不应消费 buffer_pool 许可"
+        );
+    }
+
+    /// 验证构造失败路径不消费 buffer_pool(运行时不变量 + 夹具接线)
+    ///
+    /// ftp URL 使 build_download_task 内部 with_pool 返回
+    /// Err(DownloadError::Config("不支持的协议")),任务进入 Failed。
+    /// 此路径在 set_buffer_pool 之前返回,buffer_pool 不应被消费。
+    /// 同时验证 spawn_task_fn_for_test 夹具已按新签名传 buffer_pool,
+    /// task_fn 被实际调用且不 panic。
+    ///
+    /// RED:Coder 改 task_fn 签名前,夹具调用 task_fn(..., buffer_pool, ...)
+    /// 编译失败;改后本测试运行,验证构造失败不变量。
+    #[tokio::test]
+    async fn test_task_fn_construct_failure_does_not_consume_buffer_pool() {
+        let state = test_state();
+        let capacity = state.infra.buffer_pool.capacity();
+        let task_id = "slice2-construct-fail-no-bp-consume".to_string();
+        let download_root = tempfile::tempdir().unwrap();
+        let download_dir = download_root.path().to_string_lossy().to_string();
+        // ftp 协议:with_pool 返回 Err,触发构造失败路径(不接触 set_buffer_pool)
+        let url = "ftp://example.com/slice2-construct-fail.bin".to_string();
+
+        spawn_task_fn_for_test(
+            state.clone(),
+            task_id.clone(),
+            url,
+            "slice2-construct-fail.bin".to_string(),
+            download_dir,
+        )
+        .await;
+
+        // 等待任务进入 Failed 且运行态清理完成
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = state
+                    .domain
+                    .task_repository
+                    .get(&task_id)
+                    .map(|task| task.status);
+                if status == Some(DownloadState::Failed)
+                    && !state.runtime.supervisor.handles.contains_key(&task_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("构造失败后应写入 Failed 并清理后台句柄");
+
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            DownloadState::Failed,
+            "ftp URL 应触发构造失败,任务进入 Failed"
+        );
+
+        // 构造失败路径在 set_buffer_pool 之前返回,buffer_pool 不应被消费
+        assert_eq!(
+            state.infra.buffer_pool.available(),
+            capacity,
+            "构造失败路径不应消费 buffer_pool 许可(无泄漏)"
+        );
+    }
+
+    /// 验证 build_download_task 接受 buffer_pool 参数(编译期契约 + 构造失败不变量)
+    ///
+    /// 直接调用 build_download_task 新签名(含 buffer_pool),用 ftp URL 使
+    /// with_pool 返回 Err,断言返回 Err 且 buffer_pool 未被消费。
+    /// 这覆盖链路第三环 build_download_task 的签名契约。
+    ///
+    /// RED:Coder 改 build_download_task 签名前,buffer_pool 参数不存在,
+    /// 编译失败(参数数量不匹配)。
+    #[tokio::test]
+    async fn test_build_download_task_accepts_buffer_pool() {
+        let state = test_state();
+        let capacity = state.infra.buffer_pool.capacity();
+        let download_config = {
+            let cfg = state.domain.config.lock().await;
+            build_download_config(&cfg, "/tmp/tachyon-slice2-bdt-unused")
+        };
+
+        // 调用新签名:传入 state.infra.buffer_pool.clone() 作为 buffer_pool 参数。
+        // ftp 协议使 with_pool 返回 Err,build_download_task 应返回 Err。
+        let result = build_download_task(
+            "slice2-bdt-contract",
+            "ftp://example.com/slice2-bdt.bin",
+            download_config,
+            state.infra.connection_pool.clone(),
+            state.infra.buffer_pool.clone(),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "ftp URL 应使 build_download_task 构造失败返回 Err"
+        );
+
+        // 构造失败在 set_buffer_pool 之前返回,buffer_pool 不应被消费
+        assert_eq!(
+            state.infra.buffer_pool.available(),
+            capacity,
+            "build_download_task 构造失败不应消费 buffer_pool 许可"
+        );
     }
 }

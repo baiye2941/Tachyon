@@ -115,6 +115,7 @@ impl HttpClient {
         let mut builder = Client::builder()
             .user_agent(tachyon_core::config::USER_AGENT)
             .pool_max_idle_per_host(pool_max_idle_per_host)
+            .pool_idle_timeout(std::time::Duration::from_secs(keep_alive_secs))
             .tcp_keepalive(std::time::Duration::from_secs(keep_alive_secs))
             .no_proxy()
             .dns_resolver(PublicDnsResolver::new())
@@ -301,11 +302,78 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 
 /// 判断 HEAD 失败状态码是否应回退到 GET 探测
 ///
+/// 判断响应是否为 HTML 页面(而非可下载文件)
+///
+/// 用户经常误把网页 URL(如管理后台、商品详情页)当作下载链接粘贴。
+/// 此时服务端返回 `Content-Type: text/html` 或 `application/xhtml+xml`,
+/// 应在探测阶段直接拒绝,避免后续把 HTML 当文件下载浪费带宽和存储。
+///
+/// 没有 Content-Type 时返回 `false`(无法判定即放行,不在此处误伤)。
+fn is_html_response(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(value) = headers.get("content-type").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    // 只比较 MIME 主类型,忽略 charset 等参数;大小写不敏感
+    let mime = value
+        .split(';')
+        .next()
+        .map(|s| s.trim())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    mime == "text/html" || mime == "application/xhtml+xml"
+}
+
+/// 格式化 probe 阶段的 URL 上下文,用于错误消息和日志
+///
+/// 当请求 URL 与最终 URL 不同(发生重定向)时,以 `原始 -> 最终` 形式展示;
+/// 否则只显示一份。两端均经 `redact_url_for_log` 脱敏,避免签名/Token 泄漏到日志。
+///
+/// 用户场景:粘贴管理后台 URL 后被服务端 301 到登录页 / 错误页。错误消息
+/// 仅显示最终 404 时,用户无法判断"为什么我贴的是 A 却变成 B"。
+fn format_probe_url_context(request_url: &str, final_url: &str) -> String {
+    let req = redact_url_keep_path(request_url);
+    if request_url == final_url {
+        return req;
+    }
+    let dest = redact_url_keep_path(final_url);
+    if req == dest {
+        // 脱敏后相同(如仅 query 不同),退化为单 URL,避免冗余
+        return req;
+    }
+    format!("{req} -> {dest}")
+}
+
+/// 脱敏 URL 用于错误消息,保留完整路径(query/fragment/userinfo 被丢弃)
+///
+/// 与 `tachyon_core::redact_url_for_log` 的区别:后者只保留 basename,适合
+/// 简短日志;此函数保留完整路径,适合错误诊断,让用户看到重定向前后的路径差异。
+fn redact_url_keep_path(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<invalid-url>".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<invalid-url>".to_string();
+    };
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{}://{host}{port}{}", parsed.scheme(), parsed.path())
+}
+
+/// 判断 HEAD 失败状态码是否应回退到 GET 探测
+///
 /// 部分签名 CDN（如字节跳动 bytetos）仅对 GET 方法签名,HEAD 被拒成 403/405,
-/// 401 同理。这类状态码下回退 GET + Range 有望成功;其余(200 不会进此分支,
-/// 404/500 等真实错误)不回退。
+/// 401 同理。429 限流时回退也无害(可能 GET 不被限流)。
+/// 5xx 一律回退:CDN 对 HEAD 返回非标准 5xx(如 wo.cn 的 519、Cloudflare 的
+/// 520/521 等)本质是方法被拒,GET 请求有望成功;标准 5xx(500/502/503)同理,
+/// 服务端可能对 HEAD 和 GET 有不同处理逻辑。
+/// 其余 4xx(400/404/410 等)表示客户端请求有误,回退无意义,不回退。
 fn head_status_should_fallback(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 401 | 403 | 405)
+    let code = status.as_u16();
+    // 5xx 一律回退:CDN 对 HEAD 返回非标准 5xx(519/520/521 等)本质是方法被拒
+    if code >= 500 {
+        return true;
+    }
+    // 4xx 中仅对 HEAD 方法被拒或限流的码回退
+    matches!(code, 401 | 403 | 405 | 429)
 }
 
 ///
@@ -328,6 +396,84 @@ fn classify_http_error(
         401 | 403 => DownloadError::Forbidden { status: code },
         _ => DownloadError::Protocol(format!("HTTP {status}")),
     }
+}
+
+/// 分类 HTTP 错误,并附带请求 URL 上下文,用于诊断
+///
+/// 与 `classify_http_error` 行为一致:
+/// - 429/503 仍归类为 `Throttled`,URL 上下文不影响重试语义(避免破坏外层重试逻辑)
+/// - 401/403 仍归类为 `Forbidden`,URL 不进入消息体(类型字段足够区分)
+/// - 其他状态码进入 `Protocol`,消息中带上 URL 上下文,帮助用户定位问题
+fn classify_http_error_with_context(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    url_context: &str,
+) -> DownloadError {
+    let code = status.as_u16();
+    match code {
+        429 | 503 => {
+            let retry_after_secs = headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after);
+            DownloadError::Throttled { retry_after_secs }
+        }
+        401 | 403 => DownloadError::Forbidden { status: code },
+        _ => DownloadError::Protocol(format!("{url_context} 返回 HTTP {status}")),
+    }
+}
+
+/// `evaluate_head_response` 的非成功结果
+///
+/// 拆出 `NeedFallback` 让调用方决定是否启动 GET Range 回退;`Final` 表示
+/// 终态错误,直接向上传播。这种结构允许把判定逻辑(纯)与 IO(异步)分离。
+#[derive(Debug)]
+enum HeadEvalError {
+    /// HEAD 被签名 CDN 拒绝等场景,需要回退到 GET Range:0-0 探测
+    NeedFallback,
+    /// 终态错误,直接向上传播
+    Final(DownloadError),
+}
+
+/// 把 HEAD 响应判定为元数据 / 回退信号 / 终态错误
+///
+/// 这是 probe() 的核心语义,从 reqwest IO 中抽出后可纯函数测试。
+///
+/// 决策顺序:
+/// 1. 状态码非 2xx → `head_status_should_fallback` 决定是回退还是分类错误
+/// 2. 状态码 2xx 但 `Content-Type` 是 HTML → 终态错误,告知用户该链接不是文件
+/// 3. 否则 → 提取元数据
+///
+/// 所有错误消息均附带 URL 上下文(若发生过重定向,以 `原始 -> 最终` 形式展示)。
+fn evaluate_head_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    request_url: &str,
+    final_url: &str,
+) -> Result<FileMetadata, HeadEvalError> {
+    let url_context = format_probe_url_context(request_url, final_url);
+
+    if !status.is_success() {
+        return if head_status_should_fallback(status) {
+            Err(HeadEvalError::NeedFallback)
+        } else {
+            Err(HeadEvalError::Final(classify_http_error_with_context(
+                status,
+                headers,
+                &url_context,
+            )))
+        };
+    }
+
+    // 2xx 成功但响应是 HTML 页面 → 用户粘错链接,直接终态拒绝
+    if is_html_response(headers) {
+        return Err(HeadEvalError::Final(DownloadError::Protocol(format!(
+            "{url_context} 返回 HTML 页面而非可下载文件,请确认链接是否正确"
+        ))));
+    }
+
+    // 提取元数据时使用 final_url(重定向后的真实地址),与文件名解析保持一致
+    Ok(metadata_from_headers(final_url, headers, false))
 }
 
 /// 解析 Retry-After 头部值
@@ -485,25 +631,27 @@ fn metadata_from_headers(
 /// - 206 Partial Content:从 `Content-Range` 取总大小,`supports_range = true`
 /// - 200:服务端忽略 Range,返回完整文件;仅取响应头(`Content-Length` 即总大小),
 ///   不消费响应体,`supports_range` 取自 `Accept-Ranges`(通常为 false)
-/// - 其他错误:返回 GET 的真实错误分类(不再回退)
-async fn probe_via_get_range(client: &Client, url: &str) -> DownloadResult<FileMetadata> {
-    debug!(url = %tachyon_core::redact_url_for_log(url), "GET Range 探测开始");
+/// - 其他错误:返回 GET 的真实错误分类(不再回退),错误消息含 URL 上下文
+async fn probe_via_get_range(client: &Client, request_url: &str) -> DownloadResult<FileMetadata> {
+    debug!(url = %tachyon_core::redact_url_for_log(request_url), "GET Range 探测开始");
     let response = client
-        .get(url)
+        .get(request_url)
         .header("Range", "bytes=0-0")
         .send()
         .await
         .map_err(|e| {
             let chain = error_chain(&e);
-            warn!(url = %tachyon_core::redact_url_for_log(url), error = %e, error_chain = %chain, "GET Range 探测连接失败");
+            warn!(url = %tachyon_core::redact_url_for_log(request_url), error = %e, error_chain = %chain, "GET Range 探测连接失败");
             DownloadError::Network(format!("GET Range 探测失败: {chain}"))
         })?;
 
+    let final_url = response.url().as_str().to_owned();
+    let url_context = format_probe_url_context(request_url, &final_url);
     let status = response.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let metadata = metadata_from_headers(url, response.headers(), true);
+        let metadata = metadata_from_headers(&final_url, response.headers(), true);
         info!(
-            url = %tachyon_core::redact_url_for_log(url),
+            url = %tachyon_core::redact_url_for_log(&final_url),
             file_size = ?metadata.file_size,
             supports_range = metadata.supports_range,
             "GET Range 探测完成(206)"
@@ -512,17 +660,31 @@ async fn probe_via_get_range(client: &Client, url: &str) -> DownloadResult<FileM
     }
     if status.is_success() {
         // 200:服务端忽略 Range。仅取头,不消费响应体。
-        let metadata = metadata_from_headers(url, response.headers(), false);
+        // 同样需要识别 HTML 页面,避免把网页当文件下载。
+        if is_html_response(response.headers()) {
+            warn!(
+                url = %tachyon_core::redact_url_for_log(&final_url),
+                "GET Range 探测返回 HTML 页面,拒绝下载"
+            );
+            return Err(DownloadError::Protocol(format!(
+                "{url_context} 返回 HTML 页面而非可下载文件,请确认链接是否正确"
+            )));
+        }
+        let metadata = metadata_from_headers(&final_url, response.headers(), false);
         info!(
-            url = %tachyon_core::redact_url_for_log(url),
+            url = %tachyon_core::redact_url_for_log(&final_url),
             file_size = ?metadata.file_size,
             supports_range = metadata.supports_range,
             "GET Range 探测完成(200,服务端忽略 Range)"
         );
         return Ok(metadata);
     }
-    warn!(url = %tachyon_core::redact_url_for_log(url), status = %status, "GET Range 探测返回非成功状态码");
-    Err(classify_http_error(status, response.headers()))
+    warn!(url = %tachyon_core::redact_url_for_log(&final_url), status = %status, "GET Range 探测返回非成功状态码");
+    Err(classify_http_error_with_context(
+        status,
+        response.headers(),
+        &url_context,
+    ))
 }
 
 impl Protocol for HttpClient {
@@ -552,31 +714,40 @@ impl Protocol for HttpClient {
                 }
             };
 
+            let final_url = response.url().as_str().to_owned();
             let status = response.status();
-            if !status.is_success() {
-                // 部分签名 CDN(如字节跳动 bytetos)仅对 GET 方法签名,HEAD 被拒成
-                // 403/401/405。此时回退到 GET Range:0-0 探测,有望拿到真实元数据。
-                if head_status_should_fallback(status) {
+            // reqwest 自动跟随 301/302 重定向,这里 final_url 可能与原始 url 不同。
+            // 把判定逻辑从 IO 中抽离到 `evaluate_head_response`,便于纯函数测试。
+            match evaluate_head_response(status, response.headers(), &url, &final_url) {
+                Ok(metadata) => {
+                    info!(
+                        url = %tachyon_core::redact_url_for_log(&final_url),
+                        file_size = ?metadata.file_size,
+                        supports_range = metadata.supports_range,
+                        content_type = ?metadata.content_type,
+                        "HTTP HEAD 探测完成"
+                    );
+                    Ok(metadata)
+                }
+                Err(HeadEvalError::NeedFallback) => {
                     warn!(
-                        url = %tachyon_core::redact_url_for_log(&url),
+                        url = %tachyon_core::redact_url_for_log(&final_url),
                         status = %status,
                         "HEAD 探测被拒,回退 GET Range 探测"
                     );
-                    return probe_via_get_range(&client, &url).await;
+                    probe_via_get_range(&client, &url).await
                 }
-                warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "HEAD 请求返回非成功状态码");
-                return Err(classify_http_error(status, response.headers()));
+                Err(HeadEvalError::Final(err)) => {
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&final_url),
+                        status = %status,
+                        redirected = url != final_url,
+                        error = %err,
+                        "HEAD 探测终态错误"
+                    );
+                    Err(err)
+                }
             }
-
-            let metadata = metadata_from_headers(&url, response.headers(), false);
-            info!(
-                url = %tachyon_core::redact_url_for_log(&url),
-                file_size = ?metadata.file_size,
-                supports_range = metadata.supports_range,
-                content_type = ?metadata.content_type,
-                "HTTP HEAD 探测完成"
-            );
-            Ok(metadata)
         })
     }
 
@@ -1005,6 +1176,170 @@ mod tests {
         }
     }
 
+    // --- HTML 响应识别 ---
+    // 行为:用户粘贴管理后台 URL(如 console.volcengine.com/...)时,
+    // 服务端返回 200 + text/html。此时不应当成可下载文件继续下载,
+    // 而是返回带说明的 Protocol 错误,告知用户该链接不是文件。
+
+    #[test]
+    fn test_is_html_response_with_text_html() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        assert!(super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_with_text_html_charset() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        assert!(super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_with_xhtml() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "application/xhtml+xml".parse().unwrap());
+        assert!(super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_with_octet_stream_is_false() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        assert!(!super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_with_video_is_false() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "video/mp4".parse().unwrap());
+        assert!(!super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_with_no_content_type_is_false() {
+        // 没有 Content-Type 头时,无法判定为 HTML,默认放行(纵深防御:
+        // 后续步骤仍可能识别问题)
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(!super::is_html_response(&headers));
+    }
+
+    #[test]
+    fn test_is_html_response_case_insensitive() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "TEXT/HTML".parse().unwrap());
+        assert!(super::is_html_response(&headers));
+    }
+
+    // --- URL 上下文格式化(支持重定向链路) ---
+    // 行为:错误消息和日志需要同时显示用户提交的原始 URL 与请求最终落点。
+    // 当原始 URL == 最终 URL 时,只显示一份;当不同时,以 "原始 -> 最终" 形式展示,
+    // 帮助用户判断"我的链接被重定向到哪里"。
+
+    #[test]
+    fn test_format_probe_url_context_no_redirect() {
+        // 没有重定向:request_url 与 final_url 相同,只显示一份
+        let ctx = super::format_probe_url_context(
+            "https://cdn.example.com/file.bin",
+            "https://cdn.example.com/file.bin",
+        );
+        assert_eq!(ctx, "https://cdn.example.com/file.bin");
+    }
+
+    #[test]
+    fn test_format_probe_url_context_with_redirect() {
+        // 发生过重定向:显示 "原始 -> 最终",中间用箭头清晰区分
+        let ctx = super::format_probe_url_context(
+            "https://console.example.com/page?a=1",
+            "https://console.example.com/login",
+        );
+        assert!(
+            ctx.contains("console.example.com/page"),
+            "应包含原始 URL host+path: {ctx}"
+        );
+        assert!(
+            ctx.contains("console.example.com/login"),
+            "应包含最终 URL host+path: {ctx}"
+        );
+        assert!(ctx.contains("->"), "应使用箭头分隔: {ctx}");
+    }
+
+    #[test]
+    fn test_format_probe_url_context_redacts_sensitive_query() {
+        // 带签名/Token 的 URL 应被脱敏(不让密钥泄进日志/错误链)
+        let ctx = super::format_probe_url_context(
+            "https://cdn.example.com/file.bin?Signature=abc&Token=xyz",
+            "https://cdn.example.com/file.bin?Signature=abc&Token=xyz",
+        );
+        assert!(
+            !ctx.contains("Signature=abc"),
+            "Signature 不应明文出现: {ctx}"
+        );
+        assert!(!ctx.contains("Token=xyz"), "Token 不应明文出现: {ctx}");
+    }
+
+    // --- classify_http_error 携带 URL 上下文 ---
+    // 行为:用户原本只看到 "协议错误: HTTP 404 Not Found",无法定位是哪个链接、
+    // 是否经过重定向。带上下文版本应将 URL 注入错误消息。
+
+    #[test]
+    fn test_classify_404_with_context_includes_url() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = super::classify_http_error_with_context(
+            reqwest::StatusCode::NOT_FOUND,
+            &headers,
+            "https://console.example.com/page",
+        );
+        match err {
+            DownloadError::Protocol(msg) => {
+                assert!(msg.contains("404"), "应保留状态码: {msg}");
+                assert!(
+                    msg.contains("https://console.example.com/page"),
+                    "应包含 URL 上下文: {msg}"
+                );
+            }
+            other => panic!("预期 Protocol,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_with_context_redirect_chain_in_message() {
+        // 包含 "->" 的上下文(重定向场景)应原样进入错误消息
+        let headers = reqwest::header::HeaderMap::new();
+        let ctx = super::format_probe_url_context(
+            "https://a.example.com/orig",
+            "https://b.example.com/dest",
+        );
+        let err =
+            super::classify_http_error_with_context(reqwest::StatusCode::NOT_FOUND, &headers, &ctx);
+        match err {
+            DownloadError::Protocol(msg) => {
+                assert!(msg.contains("->"), "应保留重定向箭头: {msg}");
+                assert!(msg.contains("orig"), "应包含原始路径: {msg}");
+                assert!(msg.contains("dest"), "应包含最终路径: {msg}");
+            }
+            other => panic!("预期 Protocol,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_with_context_throttled_unaffected() {
+        // 429/503 仍走 Throttled 分支,URL 上下文不影响重试语义
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        let err = super::classify_http_error_with_context(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            "https://cdn.example.com/file.bin",
+        );
+        match err {
+            DownloadError::Throttled { retry_after_secs } => {
+                assert_eq!(retry_after_secs, Some(30));
+            }
+            other => panic!("预期 Throttled,实际: {other:?}"),
+        }
+    }
+
     // --- HEAD 回退 GET 探测:Content-Range 解析 ---
 
     #[test]
@@ -1041,10 +1376,47 @@ mod tests {
     #[test]
     fn test_head_should_not_fallback_on_real_errors() {
         use reqwest::StatusCode;
+        // 404 表示资源不存在,回退 GET 也找不到
         assert!(!super::head_status_should_fallback(StatusCode::NOT_FOUND));
-        assert!(!super::head_status_should_fallback(
+    }
+
+    #[test]
+    fn test_head_should_fallback_on_non_standard_5xx() {
+        use reqwest::StatusCode;
+        // wo.cn CDN 对 HEAD 返回 519,Cloudflare 返回 520/521/522 等
+        assert!(super::head_status_should_fallback(
+            StatusCode::from_u16(519).unwrap()
+        ));
+        assert!(super::head_status_should_fallback(
+            StatusCode::from_u16(520).unwrap()
+        ));
+        assert!(super::head_status_should_fallback(
+            StatusCode::from_u16(521).unwrap()
+        ));
+        // 标准 5xx 也应回退(如 500/502/503,CDN 可能对 HEAD 返回这些码)
+        assert!(super::head_status_should_fallback(
             StatusCode::INTERNAL_SERVER_ERROR
         ));
+        assert!(super::head_status_should_fallback(StatusCode::BAD_GATEWAY));
+        assert!(super::head_status_should_fallback(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn test_head_should_fallback_on_429_throttled() {
+        use reqwest::StatusCode;
+        assert!(super::head_status_should_fallback(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+    }
+
+    #[test]
+    fn test_head_should_not_fallback_on_4xx_client_errors() {
+        use reqwest::StatusCode;
+        assert!(!super::head_status_should_fallback(StatusCode::BAD_REQUEST));
+        assert!(!super::head_status_should_fallback(StatusCode::NOT_FOUND));
+        assert!(!super::head_status_should_fallback(StatusCode::GONE));
     }
 
     // --- HEAD 回退 GET 探测:从响应头提取元数据 ---
@@ -1094,5 +1466,151 @@ mod tests {
             super::metadata_from_headers("https://cdn.example.com/file.bin", &headers, false);
         assert_eq!(meta.file_size, Some(2048));
         assert!(!meta.supports_range);
+    }
+
+    // --- ConnectionPool 与 reqwest 连接池对齐测试 ---
+
+    #[test]
+    fn test_with_connection_config_creates_client() {
+        // 验证 with_connection_config 能正确创建客户端
+        let config = tachyon_core::config::ConnectionConfig::default();
+        let client = HttpClient::with_connection_config(&config, 10, 30);
+        assert!(client.is_ok(), "with_connection_config 应成功创建客户端");
+    }
+
+    #[test]
+    fn test_with_connection_config_custom_keep_alive() {
+        // 验证自定义 keep_alive_timeout_secs 不导致创建失败
+        let config = tachyon_core::config::ConnectionConfig {
+            keep_alive_timeout_secs: 60,
+            ..Default::default()
+        };
+        let client = HttpClient::with_connection_config(&config, 10, 30);
+        assert!(
+            client.is_ok(),
+            "自定义 keep_alive 应成功创建客户端(已对齐 pool_idle_timeout)"
+        );
+    }
+
+    #[test]
+    fn test_build_client_pool_idle_timeout_aligned_with_keep_alive() {
+        // 验证 build_client 在 keep_alive_secs=60 时能正常创建
+        // pool_idle_timeout 应与 keep_alive_secs 对齐,
+        // 避免 reqwest 默认 90s idle timeout 与 semaphore 侧不一致
+        let client = HttpClient::build_client(10, 30, false, 16, 60);
+        assert!(
+            client.is_ok(),
+            "build_client(keep_alive=60) 应成功(已配置 pool_idle_timeout)"
+        );
+    }
+
+    // --- evaluate_head_response: HEAD 响应判定的核心纯逻辑 ---
+    // 行为:把 probe() 中"接到 HEAD 响应后做什么"的判定逻辑抽成纯函数,
+    // 三种结果之一:
+    //   1. 成功提取元数据 -> Ok(FileMetadata)
+    //   2. 应回退 GET Range -> Err(NeedFallback)
+    //   3. 终态错误 -> Err(Final(DownloadError))
+    // 测试覆盖原日志案例的修复:HEAD 200 + HTML 应被识别为终态错误。
+
+    #[test]
+    fn test_evaluate_head_html_response_is_rejected() {
+        // 用户粘贴控制台 URL 后被 200 + HTML 拒绝(原日志场景的回归测试)
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            "https://console.example.com/page",
+            "https://console.example.com/login",
+        );
+        match result {
+            Err(super::HeadEvalError::Final(DownloadError::Protocol(msg))) => {
+                assert!(
+                    msg.contains("HTML") || msg.contains("html"),
+                    "应说明这是 HTML 页面: {msg}"
+                );
+                assert!(
+                    msg.contains("console.example.com"),
+                    "应包含 URL 上下文: {msg}"
+                );
+            }
+            other => panic!("预期 HTML 终态错误,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_head_html_redirect_chain_in_message() {
+        // 重定向 + HTML 双信号:错误消息应同时包含原始与最终 URL
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            "https://console.example.com/ark/subscription/coding-plan",
+            "https://console.example.com/coding-plan",
+        );
+        match result {
+            Err(super::HeadEvalError::Final(DownloadError::Protocol(msg))) => {
+                assert!(msg.contains("->"), "应保留重定向箭头: {msg}");
+                assert!(msg.contains("coding-plan"), "应含路径片段: {msg}");
+            }
+            other => panic!("预期 HTML 终态错误,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_head_normal_2xx_returns_metadata() {
+        // 正常 2xx + 二进制 Content-Type:返回元数据
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-length", "1024".parse().unwrap());
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        headers.insert("accept-ranges", "bytes".parse().unwrap());
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            "https://cdn.example.com/file.bin",
+            "https://cdn.example.com/file.bin",
+        );
+        match result {
+            Ok(meta) => {
+                assert_eq!(meta.file_size, Some(1024));
+                assert!(meta.supports_range);
+            }
+            other => panic!("预期成功,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_head_403_signals_fallback() {
+        // 签名 CDN 的 HEAD 403:应返回 NeedFallback
+        let headers = reqwest::header::HeaderMap::new();
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            "https://cdn.example.com/signed.bin",
+            "https://cdn.example.com/signed.bin",
+        );
+        assert!(matches!(result, Err(super::HeadEvalError::NeedFallback)));
+    }
+
+    #[test]
+    fn test_evaluate_head_404_includes_url_in_error() {
+        // 真 404:应进入终态错误并把 URL 上下文带上
+        // 这是日志中报告的修复场景:用户原本只看到 "HTTP 404 Not Found"
+        let headers = reqwest::header::HeaderMap::new();
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::NOT_FOUND,
+            &headers,
+            "https://console.example.com/ark/subscription/coding-plan",
+            "https://console.example.com/coding-plan",
+        );
+        match result {
+            Err(super::HeadEvalError::Final(DownloadError::Protocol(msg))) => {
+                assert!(msg.contains("404"), "应保留状态码: {msg}");
+                assert!(msg.contains("console.example.com"), "应包含 host: {msg}");
+                assert!(msg.contains("->"), "重定向应在消息中体现: {msg}");
+            }
+            other => panic!("预期带 URL 的 Protocol 错误,实际: {other:?}"),
+        }
     }
 }

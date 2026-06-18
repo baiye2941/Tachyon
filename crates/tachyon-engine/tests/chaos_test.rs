@@ -372,11 +372,10 @@ async fn run_chaos_download(
             Ok(Ok(())) => {}
             Ok(Err(DownloadError::Cancelled)) => cancelled = true,
             Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
-            Err(_) => {
-                if first_err.is_none() {
-                    first_err = Some(DownloadError::Other("分片任务 panic".into()));
-                }
+            Err(_) if first_err.is_none() => {
+                first_err = Some(DownloadError::Other("分片任务 panic".into()));
             }
+            Err(_) => {}
             _ => {}
         }
     }

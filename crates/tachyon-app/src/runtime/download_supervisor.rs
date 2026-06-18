@@ -44,6 +44,9 @@ impl DownloadSupervisor {
     ///
     /// 创建 control channel 并 spawn task_fn，注册 JoinHandle。
     /// `start_tx/start_rx` 确保任务在所有资源注册完成后才开始执行。
+    /// `preferred_file_name` 为用户在「新建任务」中显式传入的重命名(已 sanitize),
+    /// 透传给引擎以在 probe 后覆盖协议侧文件名。
+    #[allow(clippy::too_many_arguments)]
     pub fn start_download(
         &self,
         state: Arc<AppState>,
@@ -52,12 +55,16 @@ impl DownloadSupervisor {
         download_dir: String,
         download_config: tachyon_core::config::DownloadConfig,
         mirror_urls: Option<Vec<String>>,
+        preferred_file_name: Option<String>,
     ) {
         let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
         self.command_channels
             .insert(task_id.to_string(), control_tx);
 
         let pool_clone = self.connection_pool.clone();
+        // 切片2:从 AppState.infra 取全局 BufferPool 经 task_fn 注入到 DownloadTask,
+        // 使 worker 用池化 buffer 写入磁盘(反压 + 内存有界)。
+        let buffer_pool_clone = state.infra.buffer_pool.clone();
         let tid = task_id.to_string();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
@@ -70,8 +77,10 @@ impl DownloadSupervisor {
                 download_dir,
                 download_config,
                 pool_clone,
+                buffer_pool_clone,
                 control_rx,
                 mirror_urls,
+                preferred_file_name,
             )
             .await;
         });

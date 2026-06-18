@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 use tachyon_core::config::AppConfig;
 use tachyon_engine::connection::ConnectionPool;
+use tachyon_io::BufferPool;
 
 use crate::projection::ProgressBroker;
 use crate::repository::TaskRepository;
@@ -36,6 +37,9 @@ pub struct InfraState {
     pub connection_pool: Arc<ConnectionPool>,
     pub task_store: Arc<TaskStore>,
     pub chunk_reader_pool: Arc<ChunkReaderPool>,
+    /// 全局 buffer 池：供下载 worker 复用写盘 buffer,带 Semaphore 反压。
+    /// 容量 = max_concurrent_tasks × max_concurrent_fragments,buffer_size = WRITE_BATCH_BYTES。
+    pub buffer_pool: Arc<BufferPool>,
 }
 
 /// 应用服务状态：业务服务层

@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { CloseIcon } from "./icons";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -19,8 +19,16 @@ interface ConfirmDialogProps {
   tone?: "primary" | "danger";
   /** 确认操作是否正在执行中 */
   loading?: boolean;
+  /** 是否显示“同时删除本地文件”复选项 */
+  showDeleteLocalFileOption?: boolean;
+  /** 复选项文案 */
+  deleteLocalFileLabel?: string;
+  /** 复选项说明 */
+  deleteLocalFileDescription?: string;
+  /** 复选项默认值 */
+  deleteLocalFileDefault?: boolean;
   /** 确认回调 */
-  onConfirm: () => void;
+  onConfirm: (options: { deleteLocalFile: boolean }) => void;
   /** 取消/关闭回调 */
   onCancel: () => void;
 }
@@ -36,6 +44,14 @@ interface ConfirmDialogProps {
 export default function ConfirmDialog(props: ConfirmDialogProps) {
   let dialogRef: HTMLDivElement | undefined;
   let confirmBtnRef: HTMLButtonElement | undefined;
+
+  const [deleteLocalFile, setDeleteLocalFile] = createSignal(false);
+
+  createEffect(() => {
+    if (props.open) {
+      setDeleteLocalFile(props.deleteLocalFileDefault ?? false);
+    }
+  });
 
   useFocusTrap({
     active: () => props.open,
@@ -126,6 +142,57 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
             {props.message}
           </p>
 
+          {/* 删除本地文件选项 */}
+          <Show when={props.showDeleteLocalFileOption}>
+            <label
+              class="flex items-start gap-3"
+              style={{
+                padding: "12px",
+                "border-radius": "10px",
+                border: "1px solid var(--color-border-subtle)",
+                background: "var(--color-bg-secondary)",
+                "box-shadow": "inset 0 1px 0 rgba(255,255,255,0.04)",
+                "margin-bottom": "20px",
+                cursor: props.loading ? "not-allowed" : "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={deleteLocalFile()}
+                disabled={props.loading}
+                onChange={(e) => setDeleteLocalFile(e.currentTarget.checked)}
+                style={{
+                  width: "16px",
+                  height: "16px",
+                  "margin-top": "2px",
+                  "accent-color": "var(--color-error)",
+                  cursor: props.loading ? "not-allowed" : "pointer",
+                }}
+              />
+              <span class="flex flex-col" style={{ gap: "3px" }}>
+                <span
+                  style={{
+                    "font-size": "13px",
+                    "font-weight": 600,
+                    color: "var(--color-text-title)",
+                    "line-height": "1.35",
+                  }}
+                >
+                  {props.deleteLocalFileLabel ?? tr("confirm.deleteLocalFile.label")}
+                </span>
+                <span
+                  style={{
+                    "font-size": "12px",
+                    color: "var(--color-text-tertiary)",
+                    "line-height": "1.45",
+                  }}
+                >
+                  {props.deleteLocalFileDescription ?? tr("confirm.deleteLocalFile.description")}
+                </span>
+              </span>
+            </label>
+          </Show>
+
           {/* 按钮行 */}
           <div class="flex items-center justify-end gap-2">
             <button
@@ -163,7 +230,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
                 opacity: props.loading ? 0.7 : 1,
                 transition: "opacity 150ms ease, background 150ms ease",
               }}
-              onClick={() => props.onConfirm()}
+              onClick={() => props.onConfirm({ deleteLocalFile: deleteLocalFile() })}
               disabled={props.loading}
             >
               {props.loading ? tr("common.processing") : (props.confirmLabel ?? tr("common.confirm"))}

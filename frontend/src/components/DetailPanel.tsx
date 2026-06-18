@@ -271,15 +271,17 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (!t2) return;
     // Iteration 11:走应用层 ConfirmDialog(danger tone),
     // 不再触发 invoke 内置 window.confirm,与 Tachyon 品牌视觉一致。
-    const ok = await requestConfirm({
+    const result = await requestConfirm({
       title: tr("confirm.delete.title"),
       message: tr("confirm.delete.message", { name: t2.fileName }),
       confirmLabel: tr("confirm.delete.confirmLabel"),
       tone: "danger",
+      showDeleteLocalFileOption: true,
+      deleteLocalFileDefault: false,
     });
-    if (!ok) return;
+    if (!result.ok) return;
     try {
-      await api.deleteTask(t2.id, { skipConfirm: true });
+      await api.deleteTask(t2.id, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile });
       props.onClose();
       await refreshTaskList();
     } catch (e) {

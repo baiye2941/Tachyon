@@ -10,6 +10,15 @@ pub const USER_AGENT: &str = "Tachyon/0.1.0";
 /// 用于统一 HTTP / QUIC / FTP 三协议的 OOM 防护上限。
 pub const MAX_FULL_DOWNLOAD_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
+/// 分片写入批大小阈值(字节)。网络 chunk 先累积到 write_buf,达到此阈值后
+/// 批量刷写存储,减少 write_at 系统调用次数。256 KiB 在 HDD/SSD 与默认
+/// 分片大小下均为合理折中,过小则 I/O 放大,过大则内存占用与尾块延迟上升。
+///
+/// 跨层公共常量:tachyon-engine 的分片写入循环、tachyon-app 构造全局
+/// BufferPool 时的 buffer_size 均引用此值,保证池中 buffer 尺寸与 worker
+/// 写入阈值一致,避免池化 buffer 与实际批大小错配。
+pub const WRITE_BATCH_BYTES: usize = 256 * 1024;
+
 /// I/O 存储后端策略
 ///
 /// 控制下载写入时使用的文件 I/O 后端。

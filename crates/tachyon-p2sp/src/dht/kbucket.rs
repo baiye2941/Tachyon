@@ -162,11 +162,11 @@ impl KBucket {
     ///
     /// 调用方在确认最旧节点无响应后调用此方法。
     pub fn replace_oldest(&mut self) {
-        if let Some(replacement) = self.replacement_cache.pop() {
-            if !self.nodes.is_empty() {
-                self.last_activity = Instant::now();
-                self.nodes[0] = replacement;
-            }
+        if let Some(replacement) = self.replacement_cache.pop()
+            && !self.nodes.is_empty()
+        {
+            self.last_activity = Instant::now();
+            self.nodes[0] = replacement;
         }
     }
 
@@ -384,10 +384,10 @@ impl RoutingTable {
         for i in 0..NUM_BUCKETS {
             if let Some(bucket) = self.bucket(i) {
                 for node in bucket.nodes().iter() {
-                    if let Some(node_subnet) = extract_subnet_key(&node.addr) {
-                        if node_subnet == subnet_key {
-                            count += 1;
-                        }
+                    if let Some(node_subnet) = extract_subnet_key(&node.addr)
+                        && node_subnet == subnet_key
+                    {
+                        count += 1;
                     }
                 }
             }

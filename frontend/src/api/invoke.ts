@@ -90,8 +90,8 @@ export const api = {
    *   跳过 invoke 内置的 window.confirm。后端 confirmation token 仍会请求,
    *   安全边界不受影响。
    */
-  deleteTask: (taskId: string, opts?: { skipConfirm?: boolean }) =>
-    invoke<void>('delete_task', { taskId }, opts?.skipConfirm),
+  deleteTask: (taskId: string, opts?: { skipConfirm?: boolean; deleteLocalFile?: boolean }) =>
+    invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm),
   /** 打开文件夹 */
   openFolder: (path: string) => openPath(path),
   /** 获取下载进度详情 */

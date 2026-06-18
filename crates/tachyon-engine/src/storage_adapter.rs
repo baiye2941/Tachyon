@@ -28,11 +28,11 @@ pub(crate) trait ErasedStorage: Send + Sync {
         offset: u64,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
-    fn write_at_mut_erased(
-        &self,
+    fn write_at_mut_erased<'a>(
+        &'a self,
         offset: u64,
-        data: BytesMut,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
+        data: &'a mut BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>>;
     fn read_at_erased<'a>(
         &'a self,
         offset: u64,
@@ -56,11 +56,11 @@ impl<S: AsyncStorage + 'static> ErasedStorage for S {
         self.write_at(offset, data)
     }
 
-    fn write_at_mut_erased(
-        &self,
+    fn write_at_mut_erased<'a>(
+        &'a self,
         offset: u64,
-        data: BytesMut,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+        data: &'a mut BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
         self.write_at_mut(offset, data)
     }
 
@@ -207,7 +207,7 @@ impl DynStorage {
     }
 
     /// 写入 BytesMut 数据（避免 freeze() 产生额外复制）
-    pub async fn write_at_mut(&self, offset: u64, data: BytesMut) -> DownloadResult<usize> {
+    pub async fn write_at_mut(&self, offset: u64, data: &mut BytesMut) -> DownloadResult<usize> {
         self.0.write_at_mut_erased(offset, data).await
     }
 
@@ -384,10 +384,8 @@ mod tests {
             .write_at(0, Bytes::from_static(b"hello"))
             .await
             .unwrap();
-        storage
-            .write_at_mut(5, BytesMut::from(&b" world"[..]))
-            .await
-            .unwrap();
+        let mut tail = BytesMut::from(&b" world"[..]);
+        storage.write_at_mut(5, &mut tail).await.unwrap();
         let mut buf = [0u8; 11];
         let read = storage.read_at(0, &mut buf).await.unwrap();
         assert_eq!(read, 11);

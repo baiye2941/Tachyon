@@ -165,6 +165,11 @@ pub trait TaskRunner: Send + Sync {
     /// 注入分片进度发送端
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>);
 
+    /// 注入用户重命名(可选):若为 `Some`,在 `probe()` 拿到元数据后会以此名覆盖
+    /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
+    /// 调用方负责传入已 sanitize 的合法文件名。
+    fn set_preferred_file_name(&mut self, name: String);
+
     /// 探测远程文件元数据
     fn probe(&mut self)
     -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>>;
@@ -193,6 +198,10 @@ impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
 
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>) {
         (**self).set_progress_sender(tx)
+    }
+
+    fn set_preferred_file_name(&mut self, name: String) {
+        (**self).set_preferred_file_name(name)
     }
 
     fn probe(
@@ -335,6 +344,7 @@ mod tests {
         completed_fragments_set: bool,
         partial_fragments_set: bool,
         progress_sender_set: bool,
+        preferred_file_name: Option<String>,
         probe_called: bool,
         run_called: bool,
     }
@@ -359,6 +369,10 @@ mod tests {
 
         fn set_progress_sender(&mut self, _tx: mpsc::Sender<FragmentProgress>) {
             self.state.lock().unwrap().progress_sender_set = true;
+        }
+
+        fn set_preferred_file_name(&mut self, name: String) {
+            self.state.lock().unwrap().preferred_file_name = Some(name);
         }
 
         fn probe(
@@ -402,6 +416,7 @@ mod tests {
         runner.set_partial_fragments(HashMap::from([(2, 100)]));
         let (progress_tx, _progress_rx) = mpsc::channel::<FragmentProgress>(1);
         runner.set_progress_sender(progress_tx);
+        runner.set_preferred_file_name("renamed.bin".into());
 
         let meta_ref = runner.probe().await.unwrap();
         assert_eq!(meta_ref.file_name, "test.bin");
@@ -412,6 +427,7 @@ mod tests {
         assert!(s.completed_fragments_set);
         assert!(s.partial_fragments_set);
         assert!(s.progress_sender_set);
+        assert_eq!(s.preferred_file_name.as_deref(), Some("renamed.bin"));
         assert!(s.probe_called);
         assert!(s.run_called);
     }

@@ -1,10 +1,12 @@
 //! QUIC 传输实现
 //!
-//! 基于 quinn 的 QUIC 客户端,通过 HTTP/1.1-over-QUIC 简化方案实现
-//! Protocol trait 的三个核心方法:probe、download_range、download_full。
+//! 基于 quinn + h3 crate 的 HTTP/3 客户端,实现 Protocol trait 的
+//! 三个核心方法:probe、download_range、download_full。
 //!
-//! 注意:真实 HTTP/3 使用 QPACK 头压缩,此处为简化实现,
-//! 在 QUIC 双向流上发送 HTTP/1.1 格式请求。
+//! 使用 h3 crate 完整实现 HTTP/3 协议:
+//! - QPACK 头压缩(h3 自动处理)
+//! - HEADERS/DATA 帧格式
+//! - 控制流与流管理
 //!
 //! 支持:
 //! - 0-RTT 连接建立

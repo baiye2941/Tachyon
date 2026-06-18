@@ -50,8 +50,8 @@ pub(crate) fn generate_random_id_in_bucket_range(local_id: &NodeId, bucket_index
     let mut rng = SplitMix64::new(seed);
 
     // 用随机数据填充 1-bit 之后的字节
-    for i in (byte_idx + 1)..20 {
-        distance[i] = rng.next_u8();
+    for byte in distance.iter_mut().skip(byte_idx + 1) {
+        *byte = rng.next_u8();
     }
 
     // 随机化目标字节中 1-bit 之后的低位
@@ -141,7 +141,7 @@ impl KademliaDht {
             .routing_table
             .bucket_index(&node.id)
             .and_then(|idx| self.routing_table.bucket(idx))
-            .map_or(false, |b| b.contains(&node.id));
+            .is_some_and(|b| b.contains(&node.id));
 
         if exists {
             self.routing_table.update(node);
@@ -324,14 +324,14 @@ impl KademliaDht {
         // 注意:此处仅更新已知节点,不自动添加未知节点到路由表
         // (添加未知节点需要额外验证,如 Ping 验证)
         let bucket_idx = self.routing_table.bucket_index(&sender_id);
-        if let Some(idx) = bucket_idx {
-            if let Some(bucket) = self.routing_table.bucket_mut(idx) {
-                // H-9 修复: 单次 position() 扫描替代 contains() + position() + update() 三重扫描
-                if let Some(pos) = bucket.nodes().iter().position(|n| n.id == sender_id) {
-                    let mut node = bucket.nodes()[pos].clone();
-                    node.touch();
-                    bucket.update(node);
-                }
+        if let Some(idx) = bucket_idx
+            && let Some(bucket) = self.routing_table.bucket_mut(idx)
+        {
+            // H-9 修复: 单次 position() 扫描替代 contains() + position() + update() 三重扫描
+            if let Some(pos) = bucket.nodes().iter().position(|n| n.id == sender_id) {
+                let mut node = bucket.nodes()[pos].clone();
+                node.touch();
+                bucket.update(node);
             }
         }
     }
@@ -638,11 +638,7 @@ mod tests {
         }
         // 对每个非空 bucket 执行刷新
         let non_empty: Vec<usize> = (0..NUM_BUCKETS)
-            .filter(|&i| {
-                dht.routing_table()
-                    .bucket(i)
-                    .map_or(false, |b| !b.is_empty())
-            })
+            .filter(|&i| dht.routing_table().bucket(i).is_some_and(|b| !b.is_empty()))
             .collect();
         assert!(!non_empty.is_empty(), "应有非空 bucket");
 

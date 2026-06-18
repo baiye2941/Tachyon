@@ -38,10 +38,11 @@ use tachyon_core::{DownloadError, DownloadResult};
 ///
 /// `data` 必须由完成 slot 持有到内核完成通知抵达,避免调用方取消
 /// `write_at` future 后提前释放传给 `WriteFile` 的缓冲区。
+/// 当 `write_at_mut` 调用方在 await 期间保证缓冲区存活时,可置为 `None`。
 #[cfg(target_os = "windows")]
 struct PendingWrite {
     completion: tokio::sync::oneshot::Sender<DownloadResult<usize>>,
-    data: Bytes,
+    data: Option<Bytes>,
 }
 
 // ── B1: Slot array 完成注册表(无锁,替换原 Mutex<HashMap>) ──────
@@ -474,6 +475,120 @@ impl IoCpStorage {
             .map_err(DownloadError::Io)
     }
 
+    /// 提交 IOCP 写入请求。
+    ///
+    /// `data_ptr`/`data_len` 描述待写入缓冲区，`keep_alive` 在需要时持有缓冲区所有权
+    /// 以保证内核完成通知到达前内存有效。调用 `write_at_mut` 时由调用方通过
+    /// `&mut BytesMut` 生命周期保证有效性，因此 `keep_alive` 可为 `None`。
+    #[cfg(target_os = "windows")]
+    async fn submit_iocp_write(
+        &self,
+        offset: u64,
+        data_ptr: usize,
+        data_len: usize,
+        keep_alive: Option<Bytes>,
+    ) -> DownloadResult<usize> {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::Ordering;
+
+        if data_len > u32::MAX as usize {
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("IOCP 单次写入长度 {data_len} 超过 u32 最大值"),
+            )));
+        }
+
+        if self.state != IoCpState::Ready {
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "IOCP 存储引擎未初始化",
+            )));
+        }
+
+        let slot_index = self.slots.alloc().ok_or_else(|| {
+            DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "IOCP slot 容量耗尽(256 并发 pending 写入上限)",
+            ))
+        })?;
+
+        let slot = &self.slots.slots[slot_index];
+        // Safety: slot 刚由 alloc() 分配(state=Submitted),此线程是唯一持有者,
+        // 内核尚未接触此 OVERLAPPED(WriteFile 未调用)。reset 写入 offset 字段安全。
+        unsafe {
+            (*slot.overlapped.get()).reset(offset);
+        }
+        let ov_ptr = slot.overlapped.get() as *mut windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let file = self.file.as_ref().ok_or_else(|| {
+            DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "IOCP 文件句柄未初始化",
+            ))
+        })?;
+        let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let mut bytes_written: u32 = 0;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Safety: slot.state 已由 alloc() 置为 Submitted(Release 序),此处 Acquire 序
+        // 保证可见性。write_at 提交方是唯一写入者,poller 在完成事件到达后才读取。
+        unsafe {
+            *slot.pending.get() = Some(PendingWrite {
+                completion: tx,
+                data: keep_alive,
+            });
+        }
+
+        // SAFETY: file_handle 来自 self.file(合法 File 句柄,as_raw_handle 转换);
+        // data_ptr 指向有效缓冲区,keep_alive 或调用方生命周期保证其在内核完成前有效;
+        // data_len 已验证不溢出 u32; bytes_written 为合法输出变量;ov_ptr 来自 slot.overlapped.get(),
+        // slot 刚由 alloc() 分配,OVERLAPPED 生命周期覆盖 WriteFile 调用期间。
+        let write_ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                file_handle,
+                data_ptr as *const u8,
+                data_len as u32,
+                &mut bytes_written,
+                ov_ptr,
+            )
+        };
+
+        if write_ok != 0 {
+            tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
+            // Safety: 同步完成时 poller 不会收到完成通知(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
+            // slot 仍处于 Submitted,由本路径安全回收 pending。
+            unsafe {
+                let _ = (*slot.pending.get()).take();
+            }
+            slot.state.store(CompletionSlot::FREE, Ordering::Release);
+            self.slots.release(slot_index);
+            return Ok(bytes_written as usize);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
+            // Safety: WriteFile 提交失败,内核不会发送完成通知,slot 仍处于 Submitted,
+            // 由本路径安全回收 pending。
+            unsafe {
+                let _ = (*slot.pending.get()).take();
+            }
+            slot.state.store(CompletionSlot::FREE, Ordering::Release);
+            self.slots.release(slot_index);
+            return Err(map_writefile_submission_error(err));
+        }
+
+        let mut cancel_guard =
+            PendingWriteCancelGuard::new(file_handle, slot_index, self.slots.clone());
+        let completion = rx.await.map_err(|_| {
+            DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "IOCP 完成通知通道关闭",
+            ))
+        });
+        cancel_guard.disarm();
+        completion?
+    }
+
     /// 初始化完成端口
     ///
     /// 流程:
@@ -818,12 +933,22 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
         Box::pin(async move {
-            use std::os::windows::io::AsRawHandle;
-            use std::sync::atomic::Ordering;
-
-            // NO_BUFFERING 非对齐写入路由到 buffered fallback
+            // 状态校验:fallback 路径会绕过 submit_iocp_write 的 state 检查,需在此前置。
+            if self.state != IoCpState::Ready {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "IOCP 存储引擎未初始化",
+                )));
+            }
+            // NO_BUFFERING 三重对齐要求(任一不满足都会返回 ERROR_INVALID_PARAMETER):
+            // 1. 文件偏移按扇区对齐
+            // 2. 写入长度按扇区对齐
+            // 3. 缓冲区指针(内存地址)按扇区对齐 — 堆分配通常仅 16B 对齐,
+            //    bytes::Bytes 内部 Vec<u8> 不保证 512B 对齐,需显式校验。
+            let buf_addr = data.as_ptr() as usize as u64;
             let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE);
+                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE)
+                || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
             if needs_fallback {
                 let fallback_file = self.get_or_init_fallback()?;
                 return tokio::task::spawn_blocking(move || {
@@ -836,98 +961,10 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 .map_err(|e| DownloadError::Io(e.into()))?;
             }
 
-            if self.state != IoCpState::Ready {
-                return Err(DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "IOCP 存储引擎未初始化",
-                )));
-            }
-
-            let slot_index = self.slots.alloc().ok_or_else(|| {
-                DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "IOCP slot 容量耗尽(256 并发 pending 写入上限)",
-                ))
-            })?;
-
-            let slot = &self.slots.slots[slot_index];
-            // Safety: slot 刚由 alloc() 分配(state=Submitted),此线程是唯一持有者,
-            // 内核尚未接触此 OVERLAPPED(WriteFile 未调用)。reset 写入 offset 字段安全。
-            unsafe {
-                (*slot.overlapped.get()).reset(offset);
-            }
-            let ov_ptr = slot.overlapped.get() as *mut windows_sys::Win32::System::IO::OVERLAPPED;
-
-            let file = self.file.as_ref().ok_or_else(|| {
-                DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "IOCP 文件句柄未初始化",
-                ))
-            })?;
-            let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-            let data_ptr = data.as_ptr();
+            let data_ptr = data.as_ptr() as usize;
             let data_len = data.len();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let mut bytes_written: u32 = 0;
-
-            // Safety: slot.state 已由 alloc() 置为 Submitted(Release 序),此处 Acquire 序
-            // 保证可见性。write_at 提交方是唯一写入者,poller 在完成事件到达后才读取。
-            unsafe {
-                *slot.pending.get() = Some(PendingWrite {
-                    completion: tx,
-                    data,
-                });
-            }
-
-            // SAFETY: file_handle 来自 self.file(合法 File 句柄,as_raw_handle 转换);
-            // data_ptr 来自 Bytes.as_ptr(),指向 data 的有效内存区域,Bytes 在
-            // PendingWrite 中持有到完成通知抵达;data_len 已验证不溢出 u32;
-            // bytes_written 为合法输出变量;ov_ptr 来自 slot.overlapped.get(),
-            // slot 刚由 alloc() 分配,OVERLAPPED 生命周期覆盖 WriteFile 调用期间。
-            let write_ok = unsafe {
-                windows_sys::Win32::Storage::FileSystem::WriteFile(
-                    file_handle,
-                    data_ptr,
-                    data_len as u32,
-                    &mut bytes_written,
-                    ov_ptr,
-                )
-            };
-
-            if write_ok != 0 {
-                tracing::debug!(bytes = bytes_written, "IOCP write_at 同步完成");
-                // Safety: 同步完成时 poller 不会收到完成通知(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
-                // slot 仍处于 Submitted,由本路径安全回收 pending。
-                unsafe {
-                    let _ = (*slot.pending.get()).take();
-                }
-                slot.state.store(CompletionSlot::FREE, Ordering::Release);
-                self.slots.release(slot_index);
-                return Ok(bytes_written as usize);
-            }
-
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
-                // Safety: WriteFile 提交失败,内核不会发送完成通知,slot 仍处于 Submitted,
-                // 由本路径安全回收 pending。
-                unsafe {
-                    let _ = (*slot.pending.get()).take();
-                }
-                slot.state.store(CompletionSlot::FREE, Ordering::Release);
-                self.slots.release(slot_index);
-                return Err(map_writefile_submission_error(err));
-            }
-
-            let mut cancel_guard =
-                PendingWriteCancelGuard::new(file_handle, slot_index, self.slots.clone());
-            let completion = rx.await.map_err(|_| {
-                DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "IOCP 完成通知通道关闭",
-                ))
-            });
-            cancel_guard.disarm();
-            completion?
+            self.submit_iocp_write(offset, data_ptr, data_len, Some(data))
+                .await
         })
     }
 
@@ -939,29 +976,22 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
 
-            // NO_BUFFERING 非对齐读取路由到 buffered fallback
-            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !(buf.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE);
-            if needs_fallback {
-                let fallback_file = self.get_or_init_fallback()?;
-                let buf_len = buf.len();
-                let mut owned_buf = vec![0u8; buf_len];
-                let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                    let n = fallback_file.seek_read(&mut owned_buf, offset)?;
-                    Ok::<_, std::io::Error>((n, owned_buf))
-                })
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
-                .map_err(DownloadError::Io)?;
-                buf[..n].copy_from_slice(&owned_buf[..n]);
-                return Ok(n);
+            // 状态校验:fallback 路径会绕过 IOCP 主句柄的 state 检查,需在此前置。
+            if self.state != IoCpState::Ready {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "IOCP 存储引擎未初始化",
+                )));
             }
-
-            let file = self.clone_ready_file()?;
+            // NO_BUFFERING 主句柄要求 offset/length/缓冲区指针 三者均按扇区对齐。
+            // 内部 owned_buf 是 Vec<u8>(堆分配,通常仅 16B 对齐),无法保证扇区对齐;
+            // 因此 IOCP 主句柄不适合通用读取,统一路由到 buffered fallback 句柄,
+            // 它无对齐限制且能正确读到最新数据(主句柄写入已 flush 到文件系统)。
+            let fallback_file = self.get_or_init_fallback()?;
             let buf_len = buf.len();
             let mut owned_buf = vec![0u8; buf_len];
             let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = file.seek_read(&mut owned_buf, offset)?;
+                let n = fallback_file.seek_read(&mut owned_buf, offset)?;
                 Ok::<_, std::io::Error>((n, owned_buf))
             })
             .await
@@ -996,8 +1026,36 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         Box::pin(async move {
             let file = self.clone_ready_file()?;
             tokio::task::spawn_blocking(move || {
-                // 先 set_len 扩展文件大小
+                // 先 set_len 扩展文件逻辑大小(EOF)
                 file.set_len(size).map_err(DownloadError::Io)?;
+                // 使用 SetFileInformationByHandle(FileAllocationInfo) 真正预分配物理磁盘块,
+                // 避免稀疏文件仅扩展逻辑大小而不分配空间。
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                    let info = windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO {
+                        AllocationSize: size as i64,
+                    };
+                    // Safety:
+                    // - handle 来自合法的 File 句柄(通过 clone_ready_file 获取)
+                    // - info 指针指向有效的 FILE_ALLOCATION_INFO 结构
+                    // - FileAllocationInfo 是 Windows 定义的标准信息类
+                    // - 失败时通过 last_os_error 返回错误,不破坏文件已有状态
+                    let result = unsafe {
+                        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+                            handle,
+                            windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
+                            &info as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of::<
+                                windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO,
+                            >() as u32,
+                        )
+                    };
+                    if result == 0 {
+                        return Err(DownloadError::Io(std::io::Error::last_os_error()));
+                    }
+                }
                 // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
                 // 失败时静默回退(文件已通过 set_len 正确扩展,只是较慢)
                 // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
@@ -1009,7 +1067,7 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                     // Safety:
                     // - handle 来自合法的 File 句柄(通过 clone_ready_file 获取)
                     // - size 由调用方传入,来自文件元数据的合法大小值
-                    // - 内核保证:失败时不影响文件现有状态
+                    // - 内核保证:失败时不影响文件已有状态
                     let result = unsafe {
                         windows_sys::Win32::Storage::FileSystem::SetFileValidData(
                             handle,
@@ -1048,20 +1106,46 @@ impl crate::storage::AsyncStorage for IoCpStorage {
 
     /// P1-05: IOCP 覆盖 write_at_mut
     ///
-    /// IOCP 的 write_at 直接使用 data.as_ptr() 作为写入源地址，
-    /// BytesMut.freeze() 只是将引用计数从 1 变为共享（无内存复制），
-    /// 所以覆盖 write_at_mut 的性能收益主要在于避免 BytesMut → Bytes
-    /// 的原子操作开销（freeze() 需要设置 shared 标志位）。
-    ///
-    /// 实现策略：将 BytesMut 冻结为 Bytes 后走标准 write_at 路径。
-    /// 这比默认实现（vtable dispatch → freeze → write_at）少一次间接调用，
-    /// 且编译器可内联优化。
-    fn write_at_mut(
-        &self,
+    /// 直接读取 `BytesMut` 内部缓冲区，避免 `freeze()` 的原子引用计数操作。
+    /// 对于短写场景，调用方 `write_all_at_mut` 会根据返回值 `advance` 并循环补写。
+    fn write_at_mut<'a>(
+        &'a self,
         offset: u64,
-        data: bytes::BytesMut,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
-        self.write_at(offset, data.freeze())
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            // 状态校验:fallback 路径会绕过 submit_iocp_write 的 state 检查,需在此前置。
+            if self.state != IoCpState::Ready {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "IOCP 存储引擎未初始化",
+                )));
+            }
+            // NO_BUFFERING 三重对齐要求(同 write_at):offset/length/buffer pointer
+            let buf_addr = data.as_ptr() as usize as u64;
+            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
+                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE)
+                || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
+            if needs_fallback {
+                let fallback_file = self.get_or_init_fallback()?;
+                let data_ptr = data.as_mut_ptr() as usize;
+                let data_len = data.len();
+                return tokio::task::spawn_blocking(move || {
+                    use std::os::windows::fs::FileExt;
+                    // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                    let slice =
+                        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                    fallback_file
+                        .seek_write(slice, offset)
+                        .map_err(DownloadError::Io)
+                })
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?;
+            }
+
+            self.submit_iocp_write(offset, data.as_mut_ptr() as usize, data.len(), None)
+                .await
+        })
     }
 }
 
@@ -1168,6 +1252,30 @@ fn map_ntstatus_error(status: i32) -> DownloadError {
 mod tests {
     use super::*;
 
+    /// 获取 Windows 文件分配大小(物理磁盘分配)
+    #[cfg(target_os = "windows")]
+    fn file_allocation_size(path: &std::path::Path) -> u64 {
+        use std::os::windows::io::AsRawHandle;
+        let file = std::fs::File::open(path).unwrap();
+        let mut info: windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO =
+            unsafe { std::mem::zeroed() };
+        // Safety:
+        // - file 是合法打开的文件句柄
+        // - info 指针指向长度为 size_of::<FILE_STANDARD_INFO>() 的可写内存
+        // - FileStandardInfo 是 Windows 定义的标准信息类
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                windows_sys::Win32::Storage::FileSystem::FileStandardInfo,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO>()
+                    as u32,
+            )
+        };
+        assert!(ok != 0, "GetFileInformationByHandleEx 失败");
+        info.AllocationSize as u64
+    }
+
     /// 验证 IOCP 初始化后状态转换为 Ready
     #[test]
     fn test_iocp_init_state_ready() {
@@ -1261,7 +1369,7 @@ mod tests {
         unsafe {
             *slot.pending.get() = Some(PendingWrite {
                 completion: tx,
-                data: Bytes::from_static(b"abc"),
+                data: Some(Bytes::from_static(b"abc")),
             });
         }
         let key = slot.overlapped.get() as usize;
@@ -1293,7 +1401,7 @@ mod tests {
         unsafe {
             *slot.pending.get() = Some(PendingWrite {
                 completion: tx,
-                data: Bytes::from_static(b"cancel"),
+                data: Some(Bytes::from_static(b"cancel")),
             });
         }
         {
@@ -1323,7 +1431,7 @@ mod tests {
         unsafe {
             *slot.pending.get() = Some(PendingWrite {
                 completion: tx,
-                data: Bytes::from_static(b"racing"),
+                data: Some(Bytes::from_static(b"racing")),
             });
         }
 
@@ -1392,11 +1500,11 @@ mod tests {
         }
         assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY);
         assert!(slots.alloc().is_none(), "容量耗尽后 alloc 应返回 None");
-        for i in 0..IOCP_SLOT_CAPACITY / 2 {
-            slots.slots[allocated[i]]
+        for &idx in allocated.iter().take(IOCP_SLOT_CAPACITY / 2) {
+            slots.slots[idx]
                 .state
                 .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
-            slots.release(allocated[i]);
+            slots.release(idx);
         }
         assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY / 2);
         let reused = slots.alloc().expect("回收后应有空闲 slot");
@@ -1486,6 +1594,71 @@ mod tests {
             );
         }
         storage.sync().await.unwrap();
+        storage.close().await.unwrap();
+    }
+
+    /// Windows:allocate 后文件物理分配大小应达到请求大小
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_allocate_physical_size_windows() {
+        use crate::storage::AsyncStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iocp_allocate_physical.dat");
+        let mut storage = IoCpStorage::new(&path);
+        storage.init().expect("IOCP init 应成功");
+        storage.allocate(4096).await.unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), 4096);
+        let alloc = file_allocation_size(&path);
+        assert!(
+            alloc >= 4096,
+            "预分配后文件物理分配大小 {} 小于请求大小 4096",
+            alloc
+        );
+        storage.close().await.unwrap();
+    }
+
+    /// 回归测试:offset 与 length 均扇区对齐,但缓冲区指针未对齐时,
+    /// 写入仍应通过 fallback 句柄成功,而非抛 ERROR_INVALID_PARAMETER (os error 87)。
+    ///
+    /// 故障场景(修复前):HTTP 流式下载产生的 Bytes 内部 Vec<u8> 通常仅 16B 对齐,
+    /// 当 chunk 长度恰好为 512 倍数(如 16 KiB)且累积偏移也对齐时,会进入
+    /// IOCP NO_BUFFERING 主句柄路径,触发内核参数错误。
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_iocp_write_at_unaligned_buffer_ptr_fallback() {
+        use crate::storage::AsyncStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iocp_unaligned_buf.dat");
+        let mut storage = IoCpStorage::new(&path);
+        storage.init().expect("IOCP init 应成功");
+        storage.allocate(8192).await.unwrap();
+
+        // 构造一个长度对齐(1024B = 2 sectors),但起始指针几乎肯定不是 512B 对齐的 Bytes:
+        // 先做一个稍大的 Vec,再切片偏移 16 字节,得到对齐于 16B 但绝不是 512B 的指针。
+        let mut backing = vec![0u8; 1024 + 16];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let bytes = bytes::Bytes::from(backing).slice(16..(16 + 1024));
+        let buf_addr = bytes.as_ptr() as usize as u64;
+        // 该缓冲区: len=1024 对齐,但 ptr 大概率不对齐(若恰好对齐则跳过断言但测试仍验证主路径)
+        let len_aligned = (bytes.len() as u64).is_multiple_of(512);
+        assert!(len_aligned, "len 必须扇区对齐才能命中故障路径");
+        let _ptr_unaligned = !buf_addr.is_multiple_of(512);
+
+        // 即使指针不对齐,写入也应成功(通过 fallback 路径)
+        let written = storage
+            .write_at(0, bytes.clone())
+            .await
+            .expect("非对齐指针写入应通过 fallback 成功,而非返回 ERROR_INVALID_PARAMETER");
+        assert_eq!(written, 1024);
+
+        // 数据可读回验证
+        let mut buf = vec![0u8; 1024];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 1024);
+        assert_eq!(&buf[..], &bytes[..]);
         storage.close().await.unwrap();
     }
 

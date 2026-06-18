@@ -63,15 +63,12 @@ impl ProgressBroker {
         let task_repository_ref = self.task_repository.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
-            let mut last_version: u64 = 0;
             loop {
                 interval.tick().await;
-                // 仅在任务仓库有变更时才构建进度事件,避免无变化时的全量扫描
-                let current_version = task_repository_ref.version();
-                if current_version == last_version {
-                    continue;
-                }
-                last_version = current_version;
+                // 直接构建并发送全量事件:进度字段(downloaded/speed/progress/fragments_done)
+                // 通过 DashMap 的 get_mut 直接写入,不会触发 TaskRepository::version() 递增,
+                // 因此不能用 version 做短路,否则下载期间的进度更新永远无法广播。
+                // 下游 compute_progress_delta 会按值过滤掉无变化任务,保证前端不会收到冗余数据。
                 let event = build_progress_event(&task_repository_ref);
                 let _ = tx.send(event);
             }
@@ -292,6 +289,70 @@ mod tests {
         // 应在 AGGREGATOR_INTERVAL_MS 内收到事件
         let result = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
         assert!(result.is_ok(), "aggregator 应在 500ms 内发送事件");
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_broadcasts_progress_field_updates_via_get_mut() {
+        // 回归测试:确保 aggregator 不再依赖 version 短路。
+        // 进度字段(downloaded/speed/progress/fragments_done)通过 DashMap 的 get_mut
+        // 直接写入,不会触发 TaskRepository::version() 递增。aggregator 必须仍能广播,
+        // 否则下载期间前端进度永远不更新,直到任务终态(update_status)才显示完成。
+        let repository = make_test_repository();
+        let broker = ProgressBroker::start(repository.clone());
+        broker.spawn_aggregator();
+        let mut rx = broker.subscribe();
+
+        repository.insert(
+            "t1".to_string(),
+            TaskInfo {
+                id: "t1".to_string(),
+                url: "https://example.com/a.bin".to_string(),
+                file_name: "a.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 4,
+                fragments_done: 0,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+            },
+        );
+
+        // 消费 insert 触发的初始广播
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+        let _ = rx.borrow_and_update();
+        let version_before = repository.version();
+
+        // 模拟 chunk_reader_pool 的进度更新路径:get_mut 改字段,不调 update_status
+        if let Some(mut task) = repository.get_mut("t1") {
+            task.downloaded = 512;
+            task.progress = 0.5;
+            task.speed = 100;
+            task.fragments_done = 2;
+        }
+        // 关键不变量:进度字段写入不应递增 version
+        assert_eq!(
+            repository.version(),
+            version_before,
+            "get_mut 修改进度字段不应递增 version"
+        );
+
+        // aggregator 仍必须在下一个 tick 广播出新值
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+        assert!(
+            result.is_ok(),
+            "进度字段通过 get_mut 更新后,aggregator 必须广播(不能依赖 version 短路)"
+        );
+        let snapshot = rx.borrow_and_update().clone();
+        let tp = snapshot.get("t1").expect("t1 应在快照中");
+        assert_eq!(tp.downloaded, 512);
+        assert_eq!(tp.speed, 100);
+        assert!((tp.progress - 0.5).abs() < f64::EPSILON);
+        assert_eq!(tp.fragments_done, 2);
     }
 
     #[tokio::test]

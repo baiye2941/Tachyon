@@ -37,6 +37,7 @@ use tachyon_scheduler::AdaptiveDownloadScheduler;
 use crate::circuit_breaker::SourceCircuitBreakers;
 use crate::mirror::MirrorProtocol;
 use crate::storage_adapter::DynStorage;
+use tachyon_io::buffer::{BufferGuard, BufferPool};
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
 /// 添加新校验后端只需实现 Verifier trait,无需修改引擎层枚举。
@@ -64,7 +65,10 @@ const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
 /// 分片大小下均为合理折中,过小则 I/O 放大,过大则内存占用与尾块延迟上升。
 /// 注意:调用方构造 `write_buf` 时须使用同一常量,保证 capacity 与阈值一致,
 /// 避免无限增长。
-const WRITE_BATCH_BYTES: usize = 256 * 1024;
+///
+/// 引用 `tachyon_core::config::WRITE_BATCH_BYTES` 公共常量,使 tachyon-app
+/// 构造全局 BufferPool 时能引用同一值,保证池化 buffer 尺寸与写入阈值一致。
+const WRITE_BATCH_BYTES: usize = tachyon_core::config::WRITE_BATCH_BYTES;
 
 /// 控制通道(暂停/取消)检查频率 — 每 N 个 chunk 检查一次。
 ///
@@ -106,6 +110,7 @@ pub struct DownloadTask {
     scheduler_config: SchedulerConfig,
     scheduler: Arc<dyn DownloadScheduler>,
     pool: Option<Arc<ConnectionPool>>,
+    buffer_pool: Option<Arc<BufferPool>>,
     control_rx: Option<watch::Receiver<TaskCommand>>,
     state: DownloadState,
     metadata: Option<FileMetadata>,
@@ -123,6 +128,30 @@ pub struct DownloadTask {
     metrics: Option<Arc<Metrics>>,
     /// 每源熔断器,防止持续失败的源浪费连接资源
     circuit_breakers: SourceCircuitBreakers,
+    /// 用户重命名(可选):若为 `Some`,在 `probe()` 拿到元数据后会以此名覆盖
+    /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
+    /// 调用方负责传入已 sanitize 的合法文件名(由 app 层 service 完成)。
+    preferred_file_name: Option<String>,
+}
+
+/// 跨分片复用的写入缓冲区包装。
+///
+/// 统一池化(`BufferGuard`,RAII,Drop 自动归还)与非池化(`BytesMut`,Drop 释放内存)
+/// 两条路径,使 worker 在被 `abort_all` 取消(future 在 await 点被丢弃)时,
+/// `Guard` 变体仍能通过 `BufferGuard::drop` 正确归还 buffer,避免池许可泄漏。
+enum WriteBuf {
+    Guard(BufferGuard),
+    Owned(bytes::BytesMut),
+}
+
+impl WriteBuf {
+    /// 以 `&mut BytesMut` 暴露内部缓冲区,供 `download_single_fragment` 使用。
+    fn as_mut(&mut self) -> &mut bytes::BytesMut {
+        match self {
+            WriteBuf::Guard(g) => g.buf_mut(),
+            WriteBuf::Owned(b) => b,
+        }
+    }
 }
 
 impl DownloadTask {
@@ -218,6 +247,7 @@ impl DownloadTask {
             scheduler_config: SchedulerConfig::default(),
             scheduler,
             pool,
+            buffer_pool: None,
             control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
@@ -229,7 +259,21 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            preferred_file_name: None,
         })
+    }
+
+    /// 设置共享 buffer 池,用于控制分片 worker 写入缓冲区的内存占用与反压。
+    pub fn set_buffer_pool(&mut self, pool: Arc<BufferPool>) {
+        self.buffer_pool = Some(pool);
+    }
+
+    /// 设置用户重命名(在 `probe()` 之后覆盖 `metadata.file_name`)。
+    ///
+    /// 调用方负责传入已 sanitize 的合法文件名;若 `probe()` 已经执行过,
+    /// 此处不会回填到已缓存的 `self.metadata`(只影响首次 probe 的写入路径)。
+    pub fn set_preferred_file_name(&mut self, name: String) {
+        self.preferred_file_name = Some(name);
     }
 
     /// 设置共享限速器(跨任务全局限速)
@@ -285,6 +329,7 @@ impl DownloadTask {
             scheduler_config: SchedulerConfig::default(),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool,
+            buffer_pool: None,
             control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
@@ -296,6 +341,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            preferred_file_name: None,
         })
     }
 
@@ -315,6 +361,7 @@ impl DownloadTask {
             scheduler_config: SchedulerConfig::default(),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool: None,
+            buffer_pool: None,
             control_rx: None,
             state: DownloadState::Pending,
             metadata: None,
@@ -326,6 +373,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            preferred_file_name: None,
         }
     }
 
@@ -448,7 +496,18 @@ impl DownloadTask {
             return Ok(meta);
         }
         info!(url = %self.url, "开始探测文件元数据");
-        let metadata = self.protocol.probe(&self.url).await?;
+        let mut metadata = self.protocol.probe(&self.url).await?;
+        // 若用户在「新建任务」中显式重命名,以用户指定名覆盖协议探测得到的文件名。
+        // 调用方(app 层 service)已对该名做过 sanitize,此处不再二次清洗,
+        // 仅在源头覆盖一次保证下游 init_storage / 快照 / UI 全部读到同一个值。
+        if let Some(ref preferred) = self.preferred_file_name {
+            info!(
+                probed = %metadata.file_name,
+                preferred = %preferred,
+                "应用用户重命名,覆盖探测得到的文件名"
+            );
+            metadata.file_name = preferred.clone();
+        }
         info!(
             file_name = %metadata.file_name,
             file_size = ?metadata.file_size,
@@ -782,6 +841,7 @@ impl DownloadTask {
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
         let protocol = self.protocol.clone();
         let pool = self.pool.clone();
+        let buffer_pool = self.buffer_pool.clone();
         let host = self.request_host()?;
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
         let control_rx = self.control_rx.clone();
@@ -834,12 +894,20 @@ impl DownloadTask {
         let mut worker_txs: Vec<mpsc::Sender<FragmentSpec>> = Vec::with_capacity(worker_count);
         let mut worker_rxs: Vec<mpsc::Receiver<FragmentSpec>> = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let (tx, rx) = mpsc::channel::<FragmentSpec>(1);
+            // per-worker 容量=2:配合 try-send 跳过策略,减少 dispatcher 阻塞概率。
+            // 容量过大会使慢 worker 积压过多分片(导致其他 worker 空闲);
+            // 容量为 1 时 try-send 几乎总是失败( dispatcher 被迫阻塞),退化为旧模型。
+            let (tx, rx) = mpsc::channel::<FragmentSpec>(2);
             worker_txs.push(tx);
             worker_rxs.push(rx);
         }
 
         // 将所有待下载分片入队
+        // 入队前检查暂停/取消信号,避免在暂停状态下无意义地启动 worker
+        if let Some(ref rx) = control_rx {
+            let mut check_rx = rx.clone();
+            Self::wait_control_rx(&mut check_rx, pause_timeout).await?;
+        }
         for spec in &fragment_specs {
             let frag_index = spec.0;
             if frag_index as usize >= self.fragments.len() {
@@ -857,12 +925,45 @@ impl DownloadTask {
         // 释放发送端,worker 在消费完所有分片后自动退出
         drop(frag_tx);
 
-        // 启动 dispatcher,将中央队列分片 round-robin 派发给 worker
+        // 启动 dispatcher,将中央队列分片派发给 worker
+        // 使用 try-send + skip-to-next-idle 策略避免 HOL blocking:
+        // 1. 优先 try_send 到目标 worker(非阻塞)
+        // 2. try_send 失败时跳到下一个 worker(寻找空闲 worker)
+        // 3. 所有 worker 都满时回退到 send().await(保持反压)
         let dispatcher_handle = tokio::spawn(async move {
             let mut next_worker = 0usize;
             let mut closed = 0usize;
             while let Some(spec) = frag_rx.recv().await {
-                // 若目标 worker 已退出,尝试下一个,避免卡死
+                // 第一轮:try_send 非阻塞扫描,寻找可立即接收的 worker
+                let mut dispatched = false;
+                for i in 0..worker_count {
+                    let idx = (next_worker + i) % worker_count;
+                    match worker_txs[idx].try_send(spec) {
+                        Ok(()) => {
+                            next_worker = (idx + 1) % worker_count;
+                            dispatched = true;
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            closed += 1;
+                            if closed >= worker_count {
+                                break;
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // 跳过满 worker,继续扫描
+                        }
+                    }
+                }
+                if closed >= worker_count {
+                    break;
+                }
+                if dispatched {
+                    continue;
+                }
+
+                // 第二轮:所有 worker 都满,回退到阻塞等待(保持反压)
+                // 从 next_worker 开始,等待任意 worker 消费后腾出空间
                 loop {
                     if closed >= worker_count {
                         break;
@@ -888,6 +989,7 @@ impl DownloadTask {
             let frag_protocol = protocol.clone();
             let frag_semaphore = semaphore.clone();
             let frag_pool = pool.clone();
+            let frag_buffer_pool = buffer_pool.clone();
             let frag_host = host.clone();
             let frag_limiter = rate_limiter.clone();
             let frag_control_rx = control_rx.clone();
@@ -897,17 +999,22 @@ impl DownloadTask {
             let completed_tx = completed_tx.clone();
 
             handles.spawn(async move {
-                // 跨分片复用的写入缓冲区(避免每个分片新建 BytesMut)
-                // capacity 与 WRITE_BATCH_BYTES 一致,保证累积到阈值时一次 split 即可刷写,
-                // 无需重新分配。使用常量而非字面量,确保两处不会漂移。
-                let mut write_buf = bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES);
-                loop {
+                // 跨分片复用的写入缓冲区:优先从 BufferPool 异步分配,容量耗尽时阻塞反压;
+                // 未配置 pool 时回退到直接分配。Some 分支使用 `BufferGuard`(RAII),
+                // worker 被 `abort_all` 取消(future 在 await 点被丢弃)时,
+                // `BufferGuard::drop` 自动归还 buffer,避免池许可泄漏。
+                let mut write_buf = match frag_buffer_pool {
+                    Some(ref bp) => WriteBuf::Guard(bp.alloc_guarded().await),
+                    None => WriteBuf::Owned(bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES)),
+                };
+
+                let worker_result: FragmentTaskResult = loop {
                     // 从专属 channel 拉取下一个分片
                     let spec = match work_rx.recv().await {
                         Some(s) => s,
                         None => {
                             let _ = completed_tx.send(Ok((0, 0, Duration::ZERO, None)));
-                            return Ok((0, 0, Duration::ZERO, None));
+                            break Ok((0, 0, Duration::ZERO, None));
                         }
                     };
                     let (frag_index, frag_start, frag_end, resume_offset, compute_hash) = spec;
@@ -947,7 +1054,7 @@ impl DownloadTask {
                                 ));
                             }
                         };
-                        write_buf.clear(); // 保留 allocation,仅清空内容(跨分片复用)
+                        write_buf.as_mut().clear(); // 保留 allocation,仅清空内容(跨分片复用)
                         let result = Self::download_single_fragment(
                             &frag_protocol,
                             &frag_storage,
@@ -963,7 +1070,7 @@ impl DownloadTask {
                             &frag_control_rx,
                             &frag_progress_tx,
                             compute_hash,
-                            &mut write_buf,
+                            write_buf.as_mut(),
                         )
                         .await;
                         drop(permit);
@@ -1038,8 +1145,13 @@ impl DownloadTask {
                         continue;
                     }
                     // 失败由 JoinSet 返回,保留原始 DownloadError 所有权
-                    return frag_result;
-                }
+                    break frag_result;
+                };
+
+                // worker 退出(正常或被 abort_all 取消)时 `write_buf` 析构自动归还:
+                // Guard 变体经 `BufferGuard::drop` 归还到池并恢复许可;
+                // Owned 变体的 `BytesMut` 正常释放内存。无需手动 release。
+                worker_result
             });
         }
         // 所有 worker 已持有发送端,释放原始端使 completed_rx 能在结束时关闭
@@ -1195,16 +1307,39 @@ impl DownloadTask {
         }
     }
 
+    /// 将 `Bytes` 批量写入存储，内部转换为 `BytesMut` 后复用 `write_all_at_mut` 循环。
+    ///
+    /// P1-05: 通过 `BytesMut::from(batch)` 避免 `batch.clone()` 的引用计数递增，
+    /// 在 batch 独占所有权时可直接接管其内存；否则回退到复制，语义与 clone 等价。
     async fn write_all_at(
         storage: &StorageKind,
+        pos: u64,
+        batch: Bytes,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
+        pause_timeout: Duration,
+    ) -> DownloadResult<u64> {
+        let batch_mut = bytes::BytesMut::from(batch);
+        Self::write_all_at_mut(storage, pos, batch_mut, control_rx, pause_timeout).await
+    }
+
+    /// P1-05: 使用 BytesMut 写入存储，避免 freeze() 复制
+    ///
+    /// 与 `write_all_at` 的区别：
+    /// - 接受 `BytesMut` 而非 `Bytes`，跳过 freeze() 的原子操作
+    /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
+    /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
+    ///
+    /// 通过 `batch.advance(written)` 处理后端短写，保证数据完整落盘。
+    async fn write_all_at_mut(
+        storage: &StorageKind,
         mut pos: u64,
-        mut batch: Bytes,
+        mut batch: bytes::BytesMut,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<u64> {
         let mut total_written = 0u64;
         while !batch.is_empty() {
-            let write = storage.write_at(pos, batch.clone());
+            let write = storage.write_at_mut(pos, &mut batch);
             let written = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
                     result = write => result?,
@@ -1237,28 +1372,6 @@ impl DownloadTask {
             batch.advance(written);
         }
         Ok(total_written)
-    }
-
-    /// P1-05: 使用 BytesMut 写入存储，避免 freeze() 复制
-    ///
-    /// 与 `write_all_at` 的区别：
-    /// - 接受 `BytesMut` 而非 `Bytes`，跳过 freeze() 的原子操作
-    /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
-    /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
-    ///
-    /// 写入 BytesMut 数据到存储
-    ///
-    /// 内部委托给 `write_all_at`(freeze + 短写循环),保证短写正确性。
-    /// IOCP 等后端的 `write_at_mut` 覆写因短写时数据丢失风险无法直接使用。
-    /// freeze() 的原子引用计数操作开销极小,不影响整体吞吐。
-    async fn write_all_at_mut(
-        storage: &StorageKind,
-        pos: u64,
-        batch: bytes::BytesMut,
-        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
-        pause_timeout: Duration,
-    ) -> DownloadResult<u64> {
-        Self::write_all_at(storage, pos, batch.freeze(), control_rx, pause_timeout).await
     }
 
     /// 下载单个分片(一次尝试)
@@ -1333,17 +1446,21 @@ impl DownloadTask {
         }
         let mut pos = actual_start;
         let mut total_written: u64 = resume_offset;
-        let mut chunk_count: u64 = 0;
+        // 控制通道/进度上报降频计数器，用递减替代 is_multiple_of 模运算
+        let mut control_check_countdown = 0u64; // 0 保证第一个 chunk 先检查一次
+        let mut progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
         // write_buf 由调用方传入(跨分片复用),此处不再新建
         // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件
         let mut hasher = compute_hash.then(blake3::Hasher::new);
         tokio::pin!(stream);
         while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
             // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销
-            if let Some(rx) = control_rx.as_mut()
-                && chunk_count.is_multiple_of(CONTROL_CHECK_CHUNK_INTERVAL)
-            {
-                Self::wait_control_rx(rx, pause_timeout).await?;
+            if let Some(rx) = control_rx.as_mut() {
+                if control_check_countdown == 0 {
+                    Self::wait_control_rx(rx, pause_timeout).await?;
+                    control_check_countdown = CONTROL_CHECK_CHUNK_INTERVAL;
+                }
+                control_check_countdown -= 1;
             }
             let chunk = chunk_result?;
             // 零拷贝优化: 大 chunk 直接写入,跳过 BytesMut 聚合
@@ -1372,27 +1489,28 @@ impl DownloadTask {
                     ))
                 })?;
                 total_written += w;
-                chunk_count += 1;
+                progress_report_countdown = progress_report_countdown.saturating_sub(1);
                 // 实时令牌桶限速
                 if let Some(ref limiter) = rate_limiter {
                     limiter.acquire(w).await;
                 }
-                if let Some(tx) = progress_tx
-                    && chunk_count.is_multiple_of(PROGRESS_REPORT_CHUNK_INTERVAL)
-                {
-                    let _ = tx.try_send(FragmentProgress {
-                        fragment_index: frag_index,
-                        completed: false,
-                        fragment_downloaded: total_written,
-                    }).map_err(|e| {
-                        tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
-                    });
+                if progress_report_countdown == 0 {
+                    if let Some(tx) = progress_tx {
+                        let _ = tx.try_send(FragmentProgress {
+                            fragment_index: frag_index,
+                            completed: false,
+                            fragment_downloaded: total_written,
+                        }).map_err(|e| {
+                            tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
+                        });
+                    }
                     tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                    progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
                 }
                 continue;
             }
             write_buf.extend_from_slice(&chunk);
-            chunk_count += 1;
+            progress_report_countdown = progress_report_countdown.saturating_sub(1);
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
@@ -1425,9 +1543,11 @@ impl DownloadTask {
                 if let Some(ref limiter) = rate_limiter {
                     limiter.acquire(w).await;
                 }
-                if let Some(tx) = progress_tx
-                    && chunk_count.is_multiple_of(PROGRESS_REPORT_CHUNK_INTERVAL)
-                {
+            }
+            // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
+            // countdown 也能正常重置,避免 u64 下溢 panic
+            if progress_report_countdown == 0 {
+                if let Some(tx) = progress_tx {
                     let _ = tx.try_send(FragmentProgress {
                         fragment_index: frag_index,
                         completed: false,
@@ -1435,8 +1555,9 @@ impl DownloadTask {
                     }).map_err(|e| {
                         tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
                     });
-                    tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
                 }
+                tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
             }
         }
         // 刷写剩余数据
@@ -1467,6 +1588,20 @@ impl DownloadTask {
             if let Some(ref limiter) = rate_limiter {
                 limiter.acquire(w).await;
             }
+        }
+        // 与原始 is_multiple_of 行为对齐:当 chunk 总数为 PROGRESS_REPORT_CHUNK_INTERVAL
+        // 整数倍时,尾刷再发送一次进度事件(可能重复)。
+        if progress_report_countdown == PROGRESS_REPORT_CHUNK_INTERVAL {
+            if let Some(tx) = progress_tx {
+                let _ = tx.try_send(FragmentProgress {
+                    fragment_index: frag_index,
+                    completed: false,
+                    fragment_downloaded: total_written,
+                }).map_err(|e| {
+                    tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
+                });
+            }
+            tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
         }
 
         let actual_written = total_written.saturating_sub(resume_offset);
@@ -1797,6 +1932,10 @@ impl tachyon_core::traits::TaskRunner for DownloadTask {
         self.set_progress_sender(tx);
     }
 
+    fn set_preferred_file_name(&mut self, name: String) {
+        self.set_preferred_file_name(name);
+    }
+
     fn probe(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>> {
@@ -1890,6 +2029,38 @@ mod tests {
 
         let result = task.probe().await;
         assert!(result.is_err());
+    }
+
+    /// 用户在「新建下载」中显式重命名后,probe() 应以用户名覆盖协议探测得到的文件名,
+    /// 使下游 init_storage / 快照 / UI 全部读到统一的文件名。
+    #[tokio::test]
+    async fn test_preferred_file_name_overrides_probed_name() {
+        let meta = test_metadata("original.bin", 4096);
+        let protocol = Arc::new(MockProto::new(meta));
+        let storage = StorageKind::memory();
+        let mut task = make_task(protocol, storage, test_config());
+
+        task.set_preferred_file_name("user_renamed.bin".into());
+        let probed = task.probe().await.expect("probe 应成功");
+        assert_eq!(
+            probed.file_name, "user_renamed.bin",
+            "probe 后 metadata.file_name 应被用户重命名覆盖"
+        );
+
+        // 再次访问 metadata 也应保持覆盖结果
+        assert_eq!(task.metadata().unwrap().file_name, "user_renamed.bin");
+    }
+
+    /// 未设置 preferred_file_name 时,probe() 行为不变。
+    #[tokio::test]
+    async fn test_probe_keeps_protocol_file_name_when_no_preference() {
+        let meta = test_metadata("from-protocol.bin", 4096);
+        let protocol = Arc::new(MockProto::new(meta));
+        let storage = StorageKind::memory();
+        let mut task = make_task(protocol, storage, test_config());
+
+        let probed = task.probe().await.expect("probe 应成功");
+        assert_eq!(probed.file_name, "from-protocol.bin");
     }
 
     // ------ 3. plan 根据元数据生成分片 -----
@@ -3341,6 +3512,141 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(1500), task.execute()).await;
         assert!(result.is_ok(), "暂停超时后不应永久等待控制信号");
         assert!(result.unwrap().is_err(), "暂停超时应返回错误");
+    }
+
+    // ------ Head-Of-Line Blocking 韧性测试 ------
+
+    /// 验证 dispatcher 不会因单个慢 worker 阻塞其他 fragment 分发(HOL 韧性)
+    ///
+    /// 模型: 3 个 fragment, 2 个 worker,第 1 个 fragment 故意延迟。
+    /// 如果 dispatcher 存在 HOL blocking(round-robin + 阻塞 send),则
+    /// fragment 2 会被阻塞等待 worker 0 处理完 fragment 0。
+    /// 修复后(try-send + skip),fragment 1 应能被分配到空闲的 worker 1,
+    /// 使 fragment 1 在 fragment 0 之前完成。
+    #[tokio::test]
+    async fn test_dispatcher_no_hol_blocking_slow_worker() {
+        use std::sync::atomic::AtomicU64;
+
+        let frag_size = 100u64;
+        let total_size = frag_size * 3;
+
+        let meta = test_metadata("hol.bin", total_size);
+
+        // 跟踪每个 fragment 完成的时间戳
+        let completion_times: Arc<std::sync::Mutex<Vec<u64>>> =
+            Arc::new(std::sync::Mutex::new(vec![0u64; 3]));
+        let epoch = Arc::new(AtomicU64::new(0));
+
+        struct SlowFirstProtocol {
+            meta: FileMetadata,
+            completion_times: Arc<std::sync::Mutex<Vec<u64>>>,
+            epoch: Arc<AtomicU64>,
+        }
+
+        impl Clone for SlowFirstProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    completion_times: Arc::clone(&self.completion_times),
+                    epoch: Arc::clone(&self.epoch),
+                }
+            }
+        }
+
+        impl Protocol for SlowFirstProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>,
+            > {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                _start: u64,
+                _end: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::new()) })
+            }
+
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let completion_times = Arc::clone(&self.completion_times);
+                let epoch = Arc::clone(&self.epoch);
+                Box::pin(async move {
+                    // fragment 0 (start=0) 故意延迟,模拟慢网络
+                    if start == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    // 记录完成时间
+                    let now = epoch.fetch_add(1, AtomicOrdering::SeqCst);
+                    let frag_index = (start / 100) as usize;
+                    if let Ok(mut times) = completion_times.lock()
+                        && frag_index < times.len()
+                    {
+                        times[frag_index] = now;
+                    }
+                    let data = Bytes::from(vec![0xAA; (end - start + 1) as usize]);
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::new()) })
+            }
+        }
+
+        let protocol: Arc<dyn Protocol> = Arc::new(SlowFirstProtocol {
+            meta,
+            completion_times: Arc::clone(&completion_times),
+            epoch,
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/hol.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 2, // 2 个 worker
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = sched_config;
+
+        task.run().await.expect("下载应成功完成");
+
+        // 验证: fragment 1 的完成时间应早于 fragment 0
+        // epoch 递增:先完成的拿到更小值
+        let times = completion_times.lock().unwrap();
+        assert!(
+            times[1] < times[0],
+            "fragment 1 应在 fragment 0 之前完成(无 HOL blocking), \
+             实际: frag0={}, frag1={}",
+            times[0],
+            times[1],
+        );
     }
 
     #[derive(Clone)]
@@ -5243,5 +5549,651 @@ mod tests {
         assert!((task.progress() - 0.0).abs() < f64::EPSILON);
         assert!(task.metadata().is_none());
         assert!(task.fragment_infos().is_empty());
+    }
+
+    /// 用于 BufferPool 并发限制测试的阻塞协议:进入 stream 时增加 active 计数,
+    /// 并在 release_rx 为 true 前保持阻塞。
+    #[derive(Clone)]
+    struct BlockingBufferPoolProtocol {
+        meta: FileMetadata,
+        active: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+        release_rx: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl Protocol for BlockingBufferPoolProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async move { Ok(Bytes::from(vec![0xDD; (end - start + 1) as usize])) })
+        }
+
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
+        {
+            let active = Arc::clone(&self.active);
+            let peak = Arc::clone(&self.peak);
+            let mut release_rx = self.release_rx.clone();
+            Box::pin(async move {
+                let now = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak.fetch_max(now, AtomicOrdering::SeqCst);
+                while !*release_rx.borrow() {
+                    release_rx
+                        .changed()
+                        .await
+                        .map_err(|_| DownloadError::Other("释放信号关闭".into()))?;
+                }
+                active.fetch_sub(1, AtomicOrdering::SeqCst);
+                let data = Bytes::from(vec![0xDD; (end - start + 1) as usize]);
+                Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            Box::pin(async move { Ok(Bytes::new()) })
+        }
+    }
+
+    // ------ BufferPool 集成测试 ------
+
+    /// BufferPool 容量应成为分片下载的有效并发上限,超出容量的 worker 在 alloc 处阻塞,
+    /// 不会继续发起网络请求。验证内存压力通过池容量被限制。
+    #[tokio::test]
+    async fn test_buffer_pool_limits_concurrent_fragment_downloads() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 4;
+        let active = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let (_release_tx, release_rx) = tokio::sync::watch::channel(false);
+
+        let protocol: Arc<dyn Protocol> = Arc::new(BlockingBufferPoolProtocol {
+            meta: test_metadata("bp-limit.bin", total_size),
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            release_rx,
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let pool = Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 2));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/bp-limit.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 4,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.set_buffer_pool(pool);
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let run = tokio::time::timeout(Duration::from_millis(200), task.execute()).await;
+        assert!(run.is_err(), "BufferPool 容量耗尽时应限制并发");
+        assert_eq!(
+            peak.load(AtomicOrdering::SeqCst),
+            2,
+            "并发数应被限制为 pool 容量"
+        );
+    }
+
+    /// 下载结束后,所有 worker 应将 buffer 归还到池中,池可用许可恢复为 capacity。
+    #[tokio::test]
+    async fn test_buffer_pool_returns_buffers_after_run() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 3;
+
+        let mut mock = MockProto::new(test_metadata("bp-return.bin", total_size));
+        for i in 0..3u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xA0 | i as u8; frag_size as usize]),
+            );
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let pool = Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 2));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/bp-return.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.set_buffer_pool(pool.clone());
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.run().await.expect("带 BufferPool 的下载应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert_eq!(
+            pool.available(),
+            pool.capacity(),
+            "下载结束后 buffer 应全部归还"
+        );
+    }
+
+    /// 当池容量已满时,新进入的 worker 在 alloc() 处阻塞;归还 buffer 后 worker 被唤醒并继续。
+    #[tokio::test]
+    async fn test_buffer_pool_backpressure_blocks_until_release() {
+        let frag_size = 100u64;
+        // 必须产生 >1 个分片,确保走 execute_fragmented_download 路径
+        let total_size = frag_size * 2;
+        let active = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+
+        let protocol: Arc<dyn Protocol> = Arc::new(BlockingBufferPoolProtocol {
+            meta: test_metadata("bp-backpressure.bin", total_size),
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            release_rx,
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let pool = Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 1));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/bp-backpressure.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.set_buffer_pool(pool.clone());
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // 预先占用唯一 buffer
+        let held = pool.alloc().await;
+        assert_eq!(pool.available(), 0);
+
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(task.execute().await);
+        });
+
+        // worker 因无法分配到 buffer 而阻塞,不会开始下载流
+        let blocked = tokio::time::timeout(Duration::from_millis(200), &mut done_rx).await;
+        assert!(blocked.is_err(), "pool 满时 execute 应阻塞");
+        assert_eq!(
+            active.load(AtomicOrdering::SeqCst),
+            0,
+            "阻塞期间不应开始流下载"
+        );
+
+        // 归还 buffer 并放行协议层,worker 应被唤醒并完成
+        pool.release(held);
+        release_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("归还后应在超时内完成")
+            .expect("结果通道不应关闭");
+        result.expect("下载应成功");
+
+        assert_eq!(pool.available(), pool.capacity(), "完成后 buffer 应归还");
+    }
+
+    /// pool 为 None 时保持原有行为:直接分配 BytesMut,下载仍可成功。
+    #[tokio::test]
+    async fn test_no_buffer_pool_runs_successfully() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 3;
+
+        let mut mock = MockProto::new(test_metadata("no-bp.bin", total_size));
+        for i in 0..3u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xC0 | i as u8; frag_size as usize]),
+            );
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/no-bp.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 3,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.run().await.expect("无 BufferPool 时下载应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    /// abort 泄漏回归测试(切片3 RED):
+    ///
+    /// 当一个分片失败触发 `abort_remaining_fragment_tasks` 取消其他正在运行
+    /// 的 worker 时,被取消的 worker future 直接丢弃,其持有的 `write_buf`
+    /// 不会执行手动 `bp.release(write_buf)`。当前 worker 用裸 `alloc()` +
+    /// 手动 release(仅在正常退出路径执行),因此 abort 路径下 buffer 泄漏,
+    /// 信号量许可永久丢失,池 `available()` 无法恢复到 capacity。
+    ///
+    /// 场景构造(复用 `FailAfterPeerStartsProtocol`):
+    /// - 2 个分片,`max_concurrent_fragments: 2`,pool `capacity: 2`
+    /// - 两个 worker spawn 后各自 `alloc()` 拿到 1 个 buffer(available: 2 -> 0)
+    /// - 分片 0(start==0)等待分片 1 启动后返回错误,分片 1 阻塞在
+    ///   `release_rx.changed().await`(持有 buffer,卡在 stream await 点)
+    /// - 分片 0 失败(`max_retries: 0` 立即 break Err) -> 主循环 abort 分片 1
+    ///   的 worker future -> 分片 1 的 `release` 不执行 -> buffer 泄漏
+    ///
+    /// 断言 `pool.available() == pool.capacity()`(修复后期望):
+    /// - 当前(裸 alloc/release):泄漏使 available 停在 1 != 2 -> FAIL = RED
+    /// - 修复后(BufferGuard RAII,Drop 在 future cancel 时执行):available 恢复
+    ///   到 2 == 2 -> PASS = GREEN
+    #[tokio::test]
+    async fn test_buffer_pool_no_leak_on_fragment_abort() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 2;
+        // 保持 release_tx 存活,使分片 1 的 stream 持续阻塞在 changed().await,
+        // 确保被 abort 时确实持有 buffer(而非因通道关闭提前返回)。
+        let (_release_tx, release_rx) = watch::channel(false);
+        let protocol: Arc<dyn Protocol> = Arc::new(FailAfterPeerStartsProtocol {
+            meta: test_metadata("abort-leak.bin", total_size),
+            started: Arc::new(AtomicU32::new(0)),
+            both_started: Arc::new(tokio::sync::Notify::new()),
+            release_rx,
+            panic_first_fragment: false,
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let pool = Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 2));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/abort-leak.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.set_buffer_pool(pool.clone());
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let result = task.execute().await;
+        assert!(result.is_err(), "首分片失败应导致执行失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+
+        // RED:abort 路径下分片 1 的 buffer 泄漏,available 无法恢复到 capacity。
+        // GREEN(Coder 用 BufferGuard 修复后):Drop 在 future cancel 时归还,
+        // available 恢复到 capacity。
+        assert_eq!(
+            pool.available(),
+            pool.capacity(),
+            "abort 取消其他 worker 后,其持有的 buffer 应通过 RAII 归还,池许可应恢复到 capacity"
+        );
+    }
+
+    // ------ 切片 4: 磁盘慢时反压生效,在途 buffer 有界 ------
+
+    /// 慢速存储:每次 `write_at` 人为延迟,模拟磁盘写入慢。
+    ///
+    /// 与 `BlockingBufferPoolProtocol`(协议层阻塞)不同,本存储让数据快速到达、
+    /// 但写入耗时,从而使 buffer 归还慢、池许可耗尽,触发反压链路:
+    /// 磁盘慢 -> buffer 归还慢 -> 池许可耗尽 -> 网络层阻塞 -> 自动限速。
+    #[derive(Clone)]
+    struct SlowStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        write_delay: Duration,
+    }
+
+    impl SlowStorage {
+        fn with_capacity(capacity: usize, write_delay: Duration) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0; capacity])),
+                write_delay,
+            }
+        }
+    }
+
+    impl AsyncStorage for SlowStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let delay = self.write_delay;
+            let data_inner = self.data.clone();
+            Box::pin(async move {
+                // 模拟慢磁盘:写入前阻塞,使 buffer 在 worker 手中停留更久,
+                // 池许可耗尽,触发反压
+                tokio::time::sleep(delay).await;
+                let len = data.len();
+                let start = offset as usize;
+                let end = start + len;
+                let mut buf = data_inner.lock().unwrap();
+                if end > buf.len() {
+                    buf.resize(end, 0);
+                }
+                buf[start..end].copy_from_slice(&data);
+                Ok(len)
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move {
+                let data = data_inner.lock().unwrap();
+                let start = offset as usize;
+                let available = data.len().saturating_sub(start);
+                let to_read = buf.len().min(available);
+                if to_read > 0 {
+                    buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+                }
+                Ok(to_read)
+            })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move {
+                let mut data = data_inner.lock().unwrap();
+                data.resize(size as usize, 0);
+                Ok(())
+            })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move { Ok(data_inner.lock().unwrap().len() as u64) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// 切片 4:磁盘慢时反压生效,在途 buffer 数始终 ≤ pool capacity(内存有界)。
+    ///
+    /// 场景:慢速 Storage(write 延迟 50ms)+ 小容量池(capacity=2)+ 高并发
+    /// (4 分片,max_concurrent_fragments=4)。磁盘慢使 worker 持有 buffer 时间
+    /// 延长,池许可耗尽,超出 capacity 的 worker 在 `alloc()` 阻塞,不会继续
+    /// 累积在途 buffer。
+    ///
+    /// 可观测量:由 BufferPool 不变量 `available_permits + outstanding == capacity`,
+    /// `outstanding = capacity - available()`。反压保证 `available >= 0`,
+    /// 即 `outstanding <= capacity`,内存有界。
+    ///
+    /// 断言:
+    /// 1. 下载进行中,available 曾降至 0(反压确实触发,而非空跑)
+    /// 2. 采样期间 outstanding 始终 ≤ capacity(内存有界,反压生效)
+    /// 3. 下载最终成功完成(反压不导致死锁)
+    /// 4. 结束后 available == capacity(buffer 全部归还,无泄漏)
+    #[tokio::test]
+    async fn test_slow_storage_backpressure_bounds_inflight_buffers() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 4;
+        let write_delay = Duration::from_millis(50);
+
+        // MockProto 一次性返回整块分片数据,数据快速到达,压力集中在慢速写入
+        let mut mock = MockProto::new(test_metadata("slow-disk-bp.bin", total_size));
+        for i in 0..4u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xD0 | i as u8; frag_size as usize]),
+            );
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let slow_storage = SlowStorage::with_capacity(total_size as usize, write_delay);
+        let storage = StorageKind::new(slow_storage);
+        let pool = Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 2));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/slow-disk-bp.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 4,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.set_buffer_pool(pool.clone());
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let capacity = pool.capacity();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(task.execute().await);
+        });
+
+        // 周期采样 pool.available(),捕捉反压触发与在途上界
+        let mut min_available = capacity;
+        let mut touched_zero = false;
+        let mut max_outstanding = 0usize;
+        let sample_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    let avail = pool.available();
+                    if avail < min_available {
+                        min_available = avail;
+                    }
+                    if avail == 0 {
+                        touched_zero = true;
+                    }
+                    let outstanding = capacity.saturating_sub(avail);
+                    if outstanding > max_outstanding {
+                        max_outstanding = outstanding;
+                    }
+                }
+                res = &mut done_rx => {
+                    let result = res.expect("执行结果通道不应关闭");
+                    result.expect("慢磁盘下下载应成功完成,反压不应导致死锁");
+                    break;
+                }
+            }
+            if std::time::Instant::now() > sample_deadline {
+                panic!("采样超时:下载未在 5s 内完成,可能死锁");
+            }
+        }
+
+        // 1. 反压确实触发:磁盘慢使池许可耗尽,available 曾降至 0
+        assert!(
+            touched_zero,
+            "磁盘慢时反压应触发,available 应曾降至 0(实际最低 {min_available})"
+        );
+        // 2. 在途 buffer 有界:outstanding 始终 ≤ capacity(内存有界)
+        assert!(
+            max_outstanding <= capacity,
+            "在途 buffer 数应 ≤ pool capacity({capacity}),实际峰值 {max_outstanding}"
+        );
+        // 3. 下载成功完成已在上文 select 分支断言
+        // 4. 无泄漏:结束后 buffer 全部归还
+        assert_eq!(
+            pool.available(),
+            capacity,
+            "下载结束后 buffer 应全部归还,池许可恢复到 capacity"
+        );
+    }
+
+    // ------ progress_report_countdown 下溢修复测试 ------
+
+    /// 模拟流式返回多个小 chunk 的协议,每个 chunk 远小于 WRITE_BATCH_BYTES(256KB)。
+    /// 用于验证 progress_report_countdown 在小 chunk 路径中不会 u64 下溢 panic。
+    #[derive(Clone)]
+    struct SmallChunkProtocol {
+        meta: FileMetadata,
+        chunk_size: usize,
+        total_data: Bytes,
+    }
+
+    impl Protocol for SmallChunkProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>>
+        {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            let data = self.total_data.slice(start as usize..=(end as usize));
+            Box::pin(async move { Ok(data) })
+        }
+
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            start: u64,
+            end: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
+        {
+            let slice = self.total_data.slice(start as usize..=(end as usize));
+            let chunk_size = self.chunk_size;
+            Box::pin(async move {
+                // 将数据拆分为多个小 chunk,模拟真实网络流
+                let chunks: Vec<Result<Bytes, DownloadError>> = slice
+                    .chunks(chunk_size)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect();
+                let stream = futures::stream::iter(chunks);
+                Ok(Box::pin(stream) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+        {
+            let data = self.total_data.clone();
+            Box::pin(async move { Ok(data) })
+        }
+    }
+
+    /// 验证：当流式下载返回大量小 chunk（每个 < WRITE_BATCH_BYTES）时，
+    /// progress_report_countdown 不会因 u64 下溢而 panic。
+    ///
+    /// 复现场景：PROGRESS_REPORT_CHUNK_INTERVAL=5，如果连续 6+ 个小 chunk
+    /// 累积不满 WRITE_BATCH_BYTES(256KB)，旧代码中 countdown 从 5 减到 0 后
+    /// 继续减 1 导致 `attempt to subtract with overflow` panic。
+    #[tokio::test]
+    async fn test_small_chunks_no_progress_countdown_panic() {
+        // 1KB 分片,chunk_size=100 字节(远小于 256KB),产生 10 个小 chunk
+        let frag_size = 1000u64;
+        let total_size = frag_size;
+        let chunk_size = 100; // 10 个 chunk,远超 PROGRESS_REPORT_CHUNK_INTERVAL(5)
+
+        let data = Bytes::from(vec![0xABu8; total_size as usize]);
+        let protocol: Arc<dyn Protocol> = Arc::new(SmallChunkProtocol {
+            meta: test_metadata("small-chunks.bin", total_size),
+            chunk_size,
+            total_data: data,
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/small-chunks.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        // 旧代码会 panic,修复后应正常完成
+        task.run().await.expect("小 chunk 流式下载不应 panic");
+        assert_eq!(task.state(), DownloadState::Completed);
     }
 }

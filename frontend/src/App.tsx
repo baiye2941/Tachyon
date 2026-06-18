@@ -121,15 +121,17 @@ function AppContent() {
     // 历史记录删除同样走应用层 ConfirmDialog(Iteration 11)
     const task = $tasks.get().find((t) => t.id === taskId);
     const fileName = task?.fileName ?? taskId;
-    const ok = await requestConfirm({
+    const result = await requestConfirm({
       title: tr("confirm.deleteHistory.title"),
       message: tr("confirm.deleteHistory.message", { name: fileName }),
       confirmLabel: tr("confirm.deleteHistory.confirmLabel"),
       tone: "danger",
+      showDeleteLocalFileOption: true,
+      deleteLocalFileDefault: false,
     });
-    if (!ok) return;
+    if (!result.ok) return;
     try {
-      await api.deleteTask(taskId, { skipConfirm: true });
+      await api.deleteTask(taskId, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile });
       await refreshTaskList();
     } catch (e) {
       addToast(tr("toast.deleteRecordFailed", { error: e }), "error");
@@ -268,7 +270,11 @@ function AppContent() {
         confirmLabel={$confirm.pending()?.confirmLabel}
         cancelLabel={$confirm.pending()?.cancelLabel}
         tone={$confirm.pending()?.tone}
-        onConfirm={() => resolveConfirm(true)}
+        showDeleteLocalFileOption={$confirm.pending()?.showDeleteLocalFileOption}
+        deleteLocalFileLabel={$confirm.pending()?.deleteLocalFileLabel}
+        deleteLocalFileDescription={$confirm.pending()?.deleteLocalFileDescription}
+        deleteLocalFileDefault={$confirm.pending()?.deleteLocalFileDefault}
+        onConfirm={(options) => resolveConfirm({ ok: true, ...options })}
         onCancel={() => resolveConfirm(false)}
       />
 
@@ -326,11 +332,13 @@ function AppContent() {
             title: tr("confirm.delete.title"),
             message: tr("confirm.delete.message", { name: fileName }),
             confirmLabel: tr("confirm.delete.confirmLabel"),
+            showDeleteLocalFileOption: true,
+            deleteLocalFileDefault: false,
             tone: "danger",
-          }).then((ok) => {
-            if (!ok) return;
+          }).then((result) => {
+            if (!result.ok) return;
             api
-              .deleteTask(taskId, { skipConfirm: true })
+              .deleteTask(taskId, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile })
               .then(() => refreshTaskList())
               .catch((e) => addToast(tr("toast.deleteFailed", { error: e }), "error"));
             if ($selectedId.get() === taskId) $selectedId.set(null);

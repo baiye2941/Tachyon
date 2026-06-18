@@ -140,7 +140,36 @@ impl WinFile {
     pub async fn preallocate(&self, size: u64) -> DownloadResult<()> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
+            // 先设置文件逻辑大小(EOF)
             file.set_len(size).map_err(DownloadError::Io)?;
+            // 使用 SetFileInformationByHandle(FileAllocationInfo) 真正预分配物理磁盘块,
+            // 避免稀疏文件仅扩展逻辑大小而不分配空间。
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::io::AsRawHandle;
+                let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                let info = windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO {
+                    AllocationSize: size as i64,
+                };
+                // Safety:
+                // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
+                // - info 指针指向有效的 FILE_ALLOCATION_INFO 结构
+                // - FileAllocationInfo 是 Windows 定义的标准信息类
+                // - 失败时通过 last_os_error 返回错误,不破坏文件已有状态
+                let result = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+                        handle,
+                        windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
+                        &info as *const _ as *const std::ffi::c_void,
+                        std::mem::size_of::<
+                            windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO,
+                        >() as u32,
+                    )
+                };
+                if result == 0 {
+                    return Err(DownloadError::Io(std::io::Error::last_os_error()));
+                }
+            }
             // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
             // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
             // 但下载数据会立即覆盖,安全风险极低。
@@ -151,7 +180,7 @@ impl WinFile {
                 // Safety:
                 // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
                 // - size 由调用方传入,来自文件元数据的合法大小值
-                // - 内核保证:失败时不影响文件现有状态
+                // - 内核保证:失败时不影响文件已有状态
                 let result = unsafe {
                     windows_sys::Win32::Storage::FileSystem::SetFileValidData(handle, size as i64)
                 };
@@ -194,10 +223,16 @@ impl AsyncStorage for WinFile {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
 
-            // NO_BUFFERING 模式下检测对齐:非对齐写入路由到惰性 buffered fallback 句柄
+            // NO_BUFFERING 三重对齐要求(任一不满足都会返回 ERROR_INVALID_PARAMETER):
+            // 1. 文件偏移按扇区对齐
+            // 2. 写入长度按扇区对齐
+            // 3. 缓冲区指针(内存地址)按扇区对齐 — bytes::Bytes 内部 Vec<u8> 通常仅
+            //    16B 对齐,需显式校验,否则恰好 offset/len 对齐时会触发内核报错。
             let needs_fallback = if self.no_buffering {
+                let buf_addr = data.as_ptr() as usize as u64;
                 !offset.is_multiple_of(SECTOR_SIZE)
                     || !(data.len() as u64).is_multiple_of(SECTOR_SIZE)
+                    || !buf_addr.is_multiple_of(SECTOR_SIZE)
             } else {
                 false
             };
@@ -229,6 +264,53 @@ impl AsyncStorage for WinFile {
         })
     }
 
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::windows::fs::FileExt;
+
+            // NO_BUFFERING 三重对齐要求(同 write_at):offset/length/buffer pointer
+            let needs_fallback = if self.no_buffering {
+                let buf_addr = data.as_ptr() as usize as u64;
+                !offset.is_multiple_of(SECTOR_SIZE)
+                    || !(data.len() as u64).is_multiple_of(SECTOR_SIZE)
+                    || !buf_addr.is_multiple_of(SECTOR_SIZE)
+            } else {
+                false
+            };
+
+            let target_file = if needs_fallback {
+                // 非对齐写(如下载尾批次)走 buffered 句柄,保证正确性
+                let path = self.path.clone();
+                let fallback_ref = self.get_or_init_fallback()?;
+                tracing::debug!(
+                    path = %path.display(),
+                    offset,
+                    len = data.len(),
+                    "NO_BUFFERING 非对齐写入路由到 buffered fallback 句柄",
+                );
+                fallback_ref
+            } else {
+                self.file.clone()
+            };
+
+            let data_ptr = data.as_mut_ptr() as usize;
+            let data_len = data.len();
+            tokio::task::spawn_blocking(move || {
+                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                target_file
+                    .seek_write(slice, offset)
+                    .map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
     fn read_at<'a>(
         &'a self,
         offset: u64,
@@ -236,13 +318,10 @@ impl AsyncStorage for WinFile {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
-            // 读路径:NO_BUFFERING 模式下非对齐读也走 buffered fallback
-            let needs_fallback = if self.no_buffering {
-                !offset.is_multiple_of(SECTOR_SIZE)
-                    || !(buf.len() as u64).is_multiple_of(SECTOR_SIZE)
-            } else {
-                false
-            };
+            // 读路径:NO_BUFFERING 主句柄要求 offset/length/buffer 三者均按扇区对齐。
+            // 内部 owned_buf 是 Vec<u8>(堆分配,通常仅 16B 对齐),无法保证扇区对齐,
+            // 因此 NO_BUFFERING 模式下统一走 buffered fallback 句柄(无对齐限制)。
+            let needs_fallback = self.no_buffering;
 
             let target_file = if needs_fallback {
                 self.get_or_init_fallback()?
@@ -337,6 +416,26 @@ impl AsyncStorage for WinFile {
         })
     }
 
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.clone();
+            let data_ptr = data.as_mut_ptr() as usize;
+            let data_len = data.len();
+            tokio::task::spawn_blocking(move || {
+                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                file.write_at(slice, offset).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
     fn read_at<'a>(
         &'a self,
         offset: u64,
@@ -398,6 +497,30 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// 获取 Windows 文件分配大小(物理磁盘分配)
+    #[cfg(target_os = "windows")]
+    fn file_allocation_size(path: &std::path::Path) -> u64 {
+        use std::os::windows::io::AsRawHandle;
+        let file = std::fs::File::open(path).unwrap();
+        let mut info: windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO =
+            unsafe { std::mem::zeroed() };
+        // Safety:
+        // - file 是合法打开的文件句柄
+        // - info 指针指向长度为 size_of::<FILE_STANDARD_INFO>() 的可写内存
+        // - FileStandardInfo 是 Windows 定义的标准信息类
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                windows_sys::Win32::Storage::FileSystem::FileStandardInfo,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO>()
+                    as u32,
+            )
+        };
+        assert!(ok != 0, "GetFileInformationByHandleEx 失败");
+        info.AllocationSize as u64
+    }
+
     #[tokio::test]
     async fn test_open_standard_and_write() {
         let tmp = NamedTempFile::new().unwrap();
@@ -438,6 +561,38 @@ mod tests {
         let file = WinFile::open_standard(tmp.path()).await.unwrap();
         file.allocate(8192).await.unwrap();
         assert_eq!(file.file_size().await.unwrap(), 8192);
+    }
+
+    /// Windows:preallocate 后文件物理分配大小应达到请求大小
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_preallocate_physical_size_windows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_standard(tmp.path()).await.unwrap();
+        file.preallocate(4096).await.unwrap();
+        assert_eq!(file.file_size().await.unwrap(), 4096);
+        let alloc = file_allocation_size(tmp.path());
+        assert!(
+            alloc >= 4096,
+            "预分配后文件物理分配大小 {} 小于请求大小 4096",
+            alloc
+        );
+    }
+
+    /// Windows:通过 trait allocate 后文件物理分配大小应达到请求大小
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_allocate_via_trait_physical_size_windows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_standard(tmp.path()).await.unwrap();
+        file.allocate(8192).await.unwrap();
+        assert_eq!(file.file_size().await.unwrap(), 8192);
+        let alloc = file_allocation_size(tmp.path());
+        assert!(
+            alloc >= 8192,
+            "预分配后文件物理分配大小 {} 小于请求大小 8192",
+            alloc
+        );
     }
 
     #[tokio::test]

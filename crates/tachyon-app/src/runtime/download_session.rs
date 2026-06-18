@@ -6,16 +6,19 @@
 //! 下载执行、终态处理、资源清理与快照持久化。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tachyon_core::config::DownloadConfig;
 use tachyon_core::traits::TaskRunner;
 use tachyon_engine::connection::ConnectionPool;
+use tachyon_io::BufferPool;
 use tokio::sync::{Mutex, watch};
 
 use crate::commands::task_commands::{
-    build_download_task, ensure_download_dir, extract_fail_reason, finalize_task_state,
-    inject_resume_snapshot, mark_task_failed_and_cleanup, probe_and_save_metadata,
-    should_cancel_before_run, validate_and_prepare_url, wait_chunk_reader_done,
+    PreRunCheck, ResumeOrCancel, build_download_task, ensure_download_dir, extract_fail_reason,
+    finalize_task_state, inject_resume_snapshot, mark_task_failed_and_cleanup,
+    probe_and_save_metadata, should_stop_before_run, validate_and_prepare_url,
+    wait_chunk_reader_done, wait_for_resume_or_cancel,
 };
 use crate::commands::{
     AppState, TaskCommand, cleanup_runtime, persist_task_snapshot, rewrite_hf_url,
@@ -31,8 +34,14 @@ pub struct DownloadSession {
     download_dir: String,
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
+    buffer_pool: Arc<BufferPool>,
     control_rx: watch::Receiver<TaskCommand>,
     mirror_urls: Option<Vec<String>>,
+    /// 用户在「新建任务」中显式输入的重命名(已 sanitize)。
+    /// 在 `build_download_task` 之后透传给引擎,
+    /// 由 `DownloadTask::probe()` 在拿到元数据后用此名覆盖,
+    /// 保证磁盘文件名 = 列表显示名 = 快照路径。
+    preferred_file_name: Option<String>,
 }
 
 impl DownloadSession {
@@ -45,8 +54,10 @@ impl DownloadSession {
         download_dir: String,
         download_config: DownloadConfig,
         connection_pool: Arc<ConnectionPool>,
+        buffer_pool: Arc<BufferPool>,
         control_rx: watch::Receiver<TaskCommand>,
         mirror_urls: Option<Vec<String>>,
+        preferred_file_name: Option<String>,
     ) -> Self {
         Self {
             state,
@@ -55,8 +66,52 @@ impl DownloadSession {
             download_dir,
             download_config,
             connection_pool,
+            buffer_pool,
             control_rx,
             mirror_urls,
+            preferred_file_name,
+        }
+    }
+
+    /// 执行前检查控制信号(取消/暂停),返回 true 表示可以继续
+    ///
+    /// 独立函数而非方法,避免借用整个 self 导致 move 后无法调用
+    async fn check_pause_or_cancel(
+        state: &AppState,
+        task_id: &str,
+        control_rx: &mut watch::Receiver<TaskCommand>,
+        pause_timeout_secs: u64,
+    ) -> bool {
+        match should_stop_before_run(control_rx) {
+            PreRunCheck::Continue => true,
+            PreRunCheck::Cancelled => {
+                update_task_status(
+                    &state.domain.task_repository,
+                    task_id,
+                    tachyon_core::types::DownloadState::Cancelled,
+                );
+                cleanup_runtime(state, task_id);
+                false
+            }
+            PreRunCheck::Paused => {
+                tracing::info!(task_id = %task_id, "执行前检测到暂停信号,等待恢复");
+                let pause_timeout = Duration::from_secs(pause_timeout_secs);
+                match wait_for_resume_or_cancel(control_rx, pause_timeout).await {
+                    ResumeOrCancel::Resume => {
+                        tracing::info!(task_id = %task_id, "暂停已恢复,继续");
+                        true
+                    }
+                    ResumeOrCancel::Cancel | ResumeOrCancel::Timeout => {
+                        update_task_status(
+                            &state.domain.task_repository,
+                            task_id,
+                            tachyon_core::types::DownloadState::Cancelled,
+                        );
+                        cleanup_runtime(state, task_id);
+                        false
+                    }
+                }
+            }
         }
     }
 
@@ -66,13 +121,19 @@ impl DownloadSession {
         self.url = rewrite_hf_url(&self.url);
 
         // 1. URL 校验与启动前状态守卫
-        let host =
-            match validate_and_prepare_url(&self.url, &self.state, &self.task_id, &self.control_rx)
-                .await
-            {
-                Some(h) => h,
-                None => return,
-            };
+        let pause_timeout_secs = self.download_config.pause_timeout_secs;
+        let host = match validate_and_prepare_url(
+            &self.url,
+            &self.state,
+            &self.task_id,
+            &mut self.control_rx,
+            pause_timeout_secs,
+        )
+        .await
+        {
+            Some(h) => h,
+            None => return,
+        };
 
         tracing::info!(
             task_id = %self.task_id,
@@ -89,12 +150,25 @@ impl DownloadSession {
             return;
         }
 
+        // 构建前检查取消/暂停信号
+        if !Self::check_pause_or_cancel(
+            &self.state,
+            &self.task_id,
+            &mut self.control_rx,
+            pause_timeout_secs,
+        )
+        .await
+        {
+            return;
+        }
+
         // 3. 构造下载任务
         let mut download_task: Box<dyn TaskRunner> = match build_download_task(
             &self.task_id,
             &self.url,
             self.download_config,
             self.connection_pool,
+            self.buffer_pool.clone(),
             self.mirror_urls,
         )
         .await
@@ -106,41 +180,68 @@ impl DownloadSession {
             }
         };
 
-        // 构建后再次检查取消信号
-        if should_cancel_before_run(&self.control_rx) {
-            update_task_status(
-                &self.state.domain.task_repository,
-                &self.task_id,
-                tachyon_core::types::DownloadState::Cancelled,
-            );
-            cleanup_runtime(&self.state, &self.task_id);
+        // 构建后再检查(构建是异步操作,期间可能收到暂停信号)
+        if !Self::check_pause_or_cancel(
+            &self.state,
+            &self.task_id,
+            &mut self.control_rx,
+            pause_timeout_secs,
+        )
+        .await
+        {
             return;
         }
 
         // 4. 注入控制通道
         download_task.set_control_rx(self.control_rx.clone());
 
+        // 4.1 注入用户重命名(若有):必须在 probe() 之前设置,
+        // probe() 拿到协议侧元数据后会以此名覆盖 metadata.file_name,
+        // 使下游 init_storage / 快照 / UI 全部读到统一文件名。
+        if let Some(name) = self.preferred_file_name.take() {
+            download_task.set_preferred_file_name(name);
+        }
+
         // 5. 断点续传快照注入
         inject_resume_snapshot(&mut download_task, &self.state, &self.task_id).await;
 
-        if should_cancel_before_run(&self.control_rx) {
-            cleanup_runtime(&self.state, &self.task_id);
+        if !Self::check_pause_or_cancel(
+            &self.state,
+            &self.task_id,
+            &mut self.control_rx,
+            pause_timeout_secs,
+        )
+        .await
+        {
             return;
         }
 
-        // 6. 探测远程文件元数据并持久化初始快照
+        // 6. 探测远程文件元数据并持久化初始快照(支持探测期间暂停)
         let _metadata = match probe_and_save_metadata(
             &mut download_task,
             &self.state,
             &self.task_id,
             &self.download_dir,
-            &self.control_rx,
+            &mut self.control_rx,
+            pause_timeout_secs,
         )
         .await
         {
             Some(m) => m,
             None => return,
         };
+
+        // 探测完成后、执行前检查暂停信号
+        if !Self::check_pause_or_cancel(
+            &self.state,
+            &self.task_id,
+            &mut self.control_rx,
+            pause_timeout_secs,
+        )
+        .await
+        {
+            return;
+        }
 
         // 7. 设置进度通道并提交到共享 ChunkReaderPool
         let (chunk_progress_tx, chunk_progress_rx) =

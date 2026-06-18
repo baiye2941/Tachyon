@@ -205,7 +205,7 @@ impl DhtTransport {
                 let now = std::time::Instant::now();
                 (0..NUM_BUCKETS)
                     .filter(|&i| {
-                        rt.bucket(i).map_or(false, |b| {
+                        rt.bucket(i).is_some_and(|b| {
                             !b.is_empty()
                                 && now.duration_since(b.last_activity()) > BUCKET_STALE_THRESHOLD
                         })

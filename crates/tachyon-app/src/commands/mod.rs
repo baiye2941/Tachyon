@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tachyon_core::config::{AppConfig, DownloadConfig};
 use tachyon_core::types::DownloadState;
 use tachyon_engine::connection::{ConnectionPool, PoolConfig};
+use tachyon_io::BufferPool;
 use tachyon_sniffer::capture::ResourceType;
 use url::Url;
 
@@ -283,9 +284,16 @@ impl AppState {
         );
         let task_repository = TaskRepository::new();
         let max_concurrent_tasks = config.max_concurrent_tasks;
+        let max_concurrent_fragments = config.download.max_concurrent_fragments;
         let config_arc = Arc::new(tokio::sync::Mutex::new(config));
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
         let connection_pool_arc = Arc::new(connection_pool);
+        // 全局 buffer 池:容量 = 任务并发 × 分片并发,buffer_size = WRITE_BATCH_BYTES。
+        // 惰性分配(用 new 而非 with_prefill),首次 alloc 才创建 buffer,降低启动内存开销。
+        let buffer_pool = Arc::new(BufferPool::new(
+            tachyon_core::config::WRITE_BATCH_BYTES,
+            (max_concurrent_tasks as usize) * (max_concurrent_fragments as usize),
+        ));
 
         let task_service = Arc::new(TaskService::new(
             task_repository.clone(),
@@ -308,6 +316,7 @@ impl AppState {
                 connection_pool: connection_pool_arc,
                 task_store,
                 chunk_reader_pool,
+                buffer_pool,
             },
             service: ServiceState {
                 task_service,
@@ -576,6 +585,7 @@ pub(crate) mod tests {
     use super::*;
     use tachyon_core::config::{ConnectionConfig, DownloadConfig};
     use tachyon_core::safety::{extract_filename_from_url, parse_content_disposition};
+    use tachyon_io::BufferPool;
 
     /// 共享测试辅助:创建测试用 AppState
     pub(crate) fn test_state() -> Arc<AppState> {
@@ -614,6 +624,12 @@ pub(crate) mod tests {
         let supervisor = Arc::new(DownloadSupervisor::new(connection_pool.clone()));
         let sniffer_service = Arc::new(SnifferService::new());
         let chunk_reader_pool = Arc::new(ChunkReaderPool::new(5));
+        // 夹具修复:InfraState 新增 buffer_pool 字段后,字面量构造需同步补字段。
+        // 此处用默认规格(WRITE_BATCH_BYTES, 5*16=80)构造池,仅满足结构体契约。
+        let buffer_pool = Arc::new(BufferPool::new(
+            tachyon_core::config::WRITE_BATCH_BYTES,
+            5 * 16,
+        ));
 
         Arc::new(AppState {
             domain: DomainState {
@@ -624,6 +640,7 @@ pub(crate) mod tests {
                 connection_pool,
                 task_store,
                 chunk_reader_pool,
+                buffer_pool,
             },
             service: ServiceState {
                 task_service,
@@ -1068,7 +1085,7 @@ pub(crate) mod tests {
             "有效 token 应验证通过"
         );
         // delete_task_inner 不需要 token(验证在 command 层),直接调用
-        task_commands::delete_task_inner(&state, id.clone())
+        task_commands::delete_task_inner(&state, id.clone(), false)
             .await
             .unwrap();
         assert!(
@@ -1076,6 +1093,130 @@ pub(crate) mod tests {
                 .await
                 .is_err(),
             "已删除任务应不存在"
+        );
+    }
+
+    // ── BufferPool 全局接入(切片1) RED 测试 ──────────────────────────
+    //
+    // 验证 AppState::new() 构造的 infra.buffer_pool 存在且规格正确。
+    // 规格:
+    //   buffer_size = tachyon_core::config::WRITE_BATCH_BYTES (256 KiB)
+    //   capacity    = max_concurrent_tasks × max_concurrent_fragments (默认 5×16=80)
+    //   available   = capacity (初始全可用)
+    //
+    // RED 原因:InfraState 尚未新增 buffer_pool 字段,且 AppState::try_new
+    // 尚未构造池。Coder 实现 InfraState.buffer_pool 字段 + try_new 构造逻辑后,
+    // 本测试应转为 GREEN。
+
+    #[test]
+    fn test_app_state_buffer_pool_spec() {
+        // 测试环境隔离:AppState::new() -> try_new -> load_persisted_config 会从
+        // dirs()/.tachyon/config.json 加载持久化配置(dirs() 在 Windows 用 USERPROFILE,
+        // Linux/macOS 用 HOME)。本机或其他环境若存在 ~/.tachyon/config.json 且含
+        // max_concurrent_tasks/max_concurrent_fragments 的非默认值,会导致 buffer_pool
+        // capacity 偏离默认 80,使绝对值断言失败。
+        //
+        // 修复:将 USERPROFILE/HOME 指向临时目录,使 config.json 不存在 -> 回退
+        // AppConfig::default() -> capacity = 5×16 = 80。测试结束恢复原值。
+        let temp_home = tempfile::tempdir().unwrap();
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        let original_home = std::env::var_os("HOME");
+
+        // Safety:测试代码,仅修改当前进程环境变量。本测试为同步 #[test],
+        // 不与其他读写 USERPROFILE/HOME 的测试并发运行,无跨线程竞争风险。
+        unsafe {
+            std::env::set_var("USERPROFILE", temp_home.path());
+            std::env::set_var("HOME", temp_home.path());
+        }
+
+        // RAII guard:确保测试体(含 panic 路径)结束后恢复环境变量。
+        // guard 先于 temp_home 声明 -> drop 顺序为 guard(恢复环境) -> temp_home(删临时目录),
+        // 避免恢复后的 USERPROFILE 指向已被删除的临时目录。
+        struct EnvRestore {
+            userprofile: Option<std::ffi::OsString>,
+            home: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // Safety:同上,测试结束阶段单线程恢复环境变量。
+                unsafe {
+                    match &self.userprofile {
+                        Some(v) => std::env::set_var("USERPROFILE", v),
+                        None => std::env::remove_var("USERPROFILE"),
+                    }
+                    match &self.home {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        let _restore = EnvRestore {
+            userprofile: original_userprofile,
+            home: original_home,
+        };
+
+        let state = AppState::new();
+        let pool = &state.infra.buffer_pool;
+
+        // buffer_size 应等于 WRITE_BATCH_BYTES(256 KiB)
+        assert_eq!(
+            pool.buffer_size(),
+            tachyon_core::config::WRITE_BATCH_BYTES,
+            "buffer_pool.buffer_size 应等于 WRITE_BATCH_BYTES"
+        );
+
+        // capacity 应等于默认配置 max_concurrent_tasks(5) × max_concurrent_fragments(16) = 80
+        let expected_capacity = {
+            let cfg = AppConfig::default();
+            (cfg.max_concurrent_tasks as usize) * (cfg.download.max_concurrent_fragments as usize)
+        };
+        assert_eq!(
+            expected_capacity, 80,
+            "默认配置容量应为 5 × 16 = 80(前置断言)"
+        );
+        assert_eq!(
+            pool.capacity(),
+            expected_capacity,
+            "buffer_pool.capacity 应等于 max_concurrent_tasks × max_concurrent_fragments"
+        );
+
+        // 初始状态下所有许可可用(池未被消费)
+        assert_eq!(
+            pool.available(),
+            pool.capacity(),
+            "初始状态 available 应等于 capacity"
+        );
+    }
+
+    /// 验证 buffer_pool 在 clone_for_task 后共享同一底层池实例
+    ///
+    /// clone_for_task 通过 InfraState::clone 共享 Arc<BufferPool>,
+    /// 两个 AppState 应看到相同的信号量状态。
+    #[tokio::test]
+    async fn test_buffer_pool_shared_across_clone_for_task() {
+        let state = AppState::new();
+        let capacity = state.infra.buffer_pool.capacity();
+
+        // 在原 state 上 alloc 一个 buffer,消耗一个许可
+        let _buf = state.infra.buffer_pool.alloc().await;
+        assert_eq!(
+            state.infra.buffer_pool.available(),
+            capacity - 1,
+            "alloc 后原 state 可用许可应减 1"
+        );
+
+        // clone_for_task 应共享同一池实例,可用许可一致
+        let cloned = state.clone_for_task();
+        assert_eq!(
+            Arc::as_ptr(&cloned.infra.buffer_pool),
+            Arc::as_ptr(&state.infra.buffer_pool),
+            "clone_for_task 应共享同一 Arc<BufferPool> 实例"
+        );
+        assert_eq!(
+            cloned.infra.buffer_pool.available(),
+            capacity - 1,
+            "克隆态应看到相同的可用许可数"
         );
     }
 }

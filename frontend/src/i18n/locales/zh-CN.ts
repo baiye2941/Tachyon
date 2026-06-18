@@ -427,6 +427,11 @@ const zhCN = {
 
   // —— 确认对话框内部 ——
   "confirmDialog.aria.close": "关闭",
+
+  // —— 删除本地文件选项 ——
+  "confirm.deleteLocalFile.label": "同时删除本地文件",
+  "confirm.deleteLocalFile.description": "删除最终保存文件及确定性临时文件(如 .part/.tmp)。此操作不可撤销。",
+  "toast.deleteBatchPartialFailed": "批量删除部分失败({count} 个): {error}",
 } as const;
 
 export default zhCN;

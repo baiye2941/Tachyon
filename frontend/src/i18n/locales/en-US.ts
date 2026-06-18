@@ -442,6 +442,11 @@ const enUS = {
 
   // —— Confirm dialog internal ——
   "confirmDialog.aria.close": "Close",
+
+  // —— Delete local files option ——
+  "confirm.deleteLocalFile.label": "Also delete local files",
+  "confirm.deleteLocalFile.description": "Remove the saved file and deterministic temp files (.part/.tmp). This action cannot be undone.",
+  "toast.deleteBatchPartialFailed": "Batch delete partially failed ({count}): {error}",
 } as const;
 
 export default enUS;

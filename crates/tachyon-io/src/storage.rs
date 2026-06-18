@@ -16,16 +16,21 @@ pub trait AsyncStorage: Send + Sync {
 
     /// 写入 BytesMut 数据（避免 freeze() 产生额外复制）
     ///
-    /// P1-05: 默认实现调用 `write_at(data.freeze())`，后端可覆盖以直接
-    /// 使用 BytesMut 内部缓冲区，省去 freeze() 的原子引用计数操作。
-    /// 对于 IOCP 等已预分配对齐缓冲区的后端，覆盖此方法可直接
-    /// 从 BytesMut 的连续内存区拷贝到对齐缓冲区，无需中间 Bytes 转换。
-    fn write_at_mut(
-        &self,
+    /// P1-05: 默认实现复制一份 `Bytes` 后调用 `write_at`，后端应覆盖此方法
+    /// 以直接从 `BytesMut` 内部缓冲区写入，避免复制/原子引用计数开销。
+    ///
+    /// 语义约定：
+    /// - 方法返回实际写入的字节数 `n`，`data` 本身不会被修改。
+    /// - 调用方需根据返回值自行 `data.advance(n)`，以处理短写循环。
+    fn write_at_mut<'a>(
+        &'a self,
         offset: u64,
-        data: BytesMut,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
-        Box::pin(async move { self.write_at(offset, data.freeze()).await })
+        data: &'a mut BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        // 默认实现通过复制构造 Bytes，避免将 &mut BytesMut 的借用带入 async 块。
+        // 后端覆盖时应直接读取 data 的连续内存，且不消费 data。
+        let frozen = Bytes::copy_from_slice(data);
+        Box::pin(async move { self.write_at(offset, frozen).await })
     }
 
     fn read_at<'a>(
@@ -240,9 +245,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_at_mut_delegates_to_write_at() {
         let (storage, writes) = MockStorage::new();
-        let data = BytesMut::from(&b"hello"[..]);
-        let result = storage.write_at_mut(10, data).await.unwrap();
+        let mut data = BytesMut::from(&b"hello"[..]);
+        let result = storage.write_at_mut(10, &mut data).await.unwrap();
         assert_eq!(result, 5);
+        assert_eq!(&data[..], b"hello", "默认实现不应修改原始 BytesMut");
 
         let captured = writes.lock().unwrap();
         assert_eq!(captured.len(), 1);

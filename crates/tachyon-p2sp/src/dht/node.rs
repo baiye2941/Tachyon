@@ -66,9 +66,9 @@ pub fn xor_distance(a: &NodeId, b: &NodeId) -> NodeId {
 /// ```
 #[must_use]
 pub fn leading_zeros(distance: &NodeId) -> u32 {
-    for i in 0..20 {
-        if distance[i] != 0 {
-            return (i as u32) * 8 + distance[i].leading_zeros();
+    for (i, &byte) in distance.iter().enumerate() {
+        if byte != 0 {
+            return (i as u32) * 8 + byte.leading_zeros();
         }
     }
     160
@@ -409,7 +409,7 @@ mod tests {
     fn test_node_not_stale_initially() {
         let mut id = [0u8; 20];
         id[0] = 1;
-        let node = DhtNode::new(id, format!("192.168.1.1:8080"));
+        let node = DhtNode::new(id, "192.168.1.1:8080".to_string());
         assert!(!node.is_stale());
     }
 

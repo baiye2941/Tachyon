@@ -96,7 +96,7 @@ describe('batchActions store', () => {
   it('deleteSelected 确认后删除并透传 skipConfirm:true', async () => {
     downloadsModule.setTasks([makeTask('t1'), makeTask('t2')])
     selectionModule.selectAll(['t1'])
-    mockRequestConfirm.mockResolvedValue(true)
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
     mockDeleteTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
@@ -111,14 +111,14 @@ describe('batchActions store', () => {
       }),
     )
     // 关键断言:deleteTask 收到 skipConfirm:true,跳过 invoke 内 window.confirm
-    expect(mockDeleteTask).toHaveBeenCalledWith('t1', { skipConfirm: true })
+    expect(mockDeleteTask).toHaveBeenCalledWith('t1', { skipConfirm: true, deleteLocalFile: false })
     expect(selectionModule.$selectedIds.get().size).toBe(0)
   })
 
   it('deleteSelected 用户取消时不删除', async () => {
     downloadsModule.setTasks([makeTask('t1')])
     selectionModule.selectAll(['t1'])
-    mockRequestConfirm.mockResolvedValue(false)
+    mockRequestConfirm.mockResolvedValue({ ok: false, deleteLocalFile: false })
     mockDeleteTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
@@ -133,7 +133,7 @@ describe('batchActions store', () => {
     const ids = Array.from({ length: 10 }, (_, i) => `t${i}`)
     downloadsModule.setTasks(ids.map(id => makeTask(id)))
     selectionModule.selectAll(ids)
-    mockRequestConfirm.mockResolvedValue(true)
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
     mockDeleteTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
@@ -144,7 +144,7 @@ describe('batchActions store', () => {
     // 每个 deleteTask 都传 skipConfirm:true
     expect(mockDeleteTask).toHaveBeenCalledTimes(10)
     ids.forEach(id => {
-      expect(mockDeleteTask).toHaveBeenCalledWith(id, { skipConfirm: true })
+      expect(mockDeleteTask).toHaveBeenCalledWith(id, { skipConfirm: true, deleteLocalFile: false })
     })
   })
 

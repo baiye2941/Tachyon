@@ -21,7 +21,7 @@ describe('confirm store', () => {
     expect(p).toBeInstanceOf(Promise)
     // 立即 resolve 为 false,避免悬挂 Promise 影响后续测试
     confirmModule.resolveConfirm(false)
-    return expect(p).resolves.toBe(false)
+    return expect(p).resolves.toMatchObject({ ok: false, deleteLocalFile: false })
   })
 
   it('requestConfirm 写入 pending 信号', () => {
@@ -41,22 +41,22 @@ describe('confirm store', () => {
     confirmModule.resolveConfirm(false)
   })
 
-  it('resolveConfirm(true) 使 Promise resolve 为 true', async () => {
+  it('resolveConfirm(true) 使 Promise resolve 为 ok=true', async () => {
     const p = confirmModule.requestConfirm({
       title: 't',
       message: 'm',
     })
     confirmModule.resolveConfirm(true)
-    await expect(p).resolves.toBe(true)
+    await expect(p).resolves.toMatchObject({ ok: true, deleteLocalFile: false })
   })
 
-  it('resolveConfirm(false) 使 Promise resolve 为 false', async () => {
+  it('resolveConfirm(false) 使 Promise resolve 为 ok=false', async () => {
     const p = confirmModule.requestConfirm({
       title: 't',
       message: 'm',
     })
     confirmModule.resolveConfirm(false)
-    await expect(p).resolves.toBe(false)
+    await expect(p).resolves.toMatchObject({ ok: false, deleteLocalFile: false })
   })
 
   it('resolveConfirm 后 pending 清空', () => {

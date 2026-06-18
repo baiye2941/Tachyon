@@ -6,6 +6,7 @@
 //! TaskService 与 AppState 共享同一个 [`TaskRepository`]，
 //! 确保所有读取/写入都操作同一份内存数据。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tachyon_core::config::{AppConfig, DownloadConfig};
@@ -20,6 +21,7 @@ use crate::commands::{
 };
 use crate::repository::TaskRepository;
 use crate::task_store::{TaskStore, task_info_to_snapshot};
+use tachyon_store::TaskSnapshot;
 
 /// 任务创建结果
 ///
@@ -30,6 +32,10 @@ pub struct TaskCreation {
     pub download_dir: String,
     pub download_config: DownloadConfig,
     pub mirror_urls: Option<Vec<String>>,
+    /// 用户在「新建任务」中显式输入的重命名(已 sanitize)。
+    /// 仅当用户传入非空 file_name 时为 `Some`,否则保持 `None`,
+    /// 走协议层探测得到的原始文件名。
+    pub preferred_file_name: Option<String>,
 }
 
 /// 任务应用服务
@@ -55,6 +61,149 @@ pub struct TaskService {
     /// 仅在 config 变更时更新(极低频)。RwLock 允许多个读者并发读取,
     /// 比 Mutex 更适合读多写少场景。
     cached_download_dir: Arc<RwLock<String>>,
+}
+
+fn resolve_delete_save_path(task: &TaskInfo, snapshot: Option<&TaskSnapshot>) -> Option<String> {
+    let task_path = (!task.save_path.is_empty()).then(|| Path::new(&task.save_path));
+    if let Some(path) = task_path
+        && (path.is_file()
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == task.file_name))
+    {
+        return Some(task.save_path.clone());
+    }
+
+    snapshot
+        .and_then(|s| (!s.save_path.is_empty()).then(|| s.save_path.clone()))
+        .or_else(|| task_path.map(|path| path.join(&task.file_name).to_string_lossy().to_string()))
+}
+
+fn delete_local_file_candidates(
+    config: &AppConfig,
+    task_id: &str,
+    save_path: &str,
+) -> Result<(), AppError> {
+    let save_path = Path::new(save_path);
+    let safe_path = validate_local_delete_path(config, save_path)?;
+    let candidates = local_delete_candidates(task_id, &safe_path);
+
+    let existing_candidates: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            let exists = candidate.exists();
+            if !exists {
+                tracing::debug!(task_id = %task_id, path = %candidate.display(), "任务文件不存在,跳过清理");
+            }
+            exists
+        })
+        .collect();
+
+    for candidate in &existing_candidates {
+        validate_delete_candidate(candidate)?;
+    }
+
+    for candidate in existing_candidates {
+        std::fs::remove_file(&candidate).map_err(|e| {
+            AppError::Config(format!("删除任务文件失败: {}: {e}", candidate.display()))
+        })?;
+        tracing::info!(task_id = %task_id, path = %candidate.display(), "已删除任务文件");
+    }
+
+    Ok(())
+}
+
+fn validate_local_delete_path(config: &AppConfig, save_path: &Path) -> Result<PathBuf, AppError> {
+    if save_path.as_os_str().is_empty() || !save_path.is_absolute() {
+        return Err(AppError::Config(format!(
+            "任务文件路径未授权: {}",
+            save_path.display()
+        )));
+    }
+    if save_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Config(format!(
+            "任务文件路径不能包含路径遍历: {}",
+            save_path.display()
+        )));
+    }
+
+    let parent = save_path
+        .parent()
+        .ok_or_else(|| AppError::Config("任务文件路径缺少父目录".to_string()))?;
+    let canonical_parent = authorize_download_dir(config, &parent.to_string_lossy())?;
+    let file_name = save_path
+        .file_name()
+        .ok_or_else(|| AppError::Config("任务文件路径缺少文件名".to_string()))?;
+    Ok(Path::new(&canonical_parent).join(file_name))
+}
+
+fn local_delete_candidates(task_id: &str, save_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_unique_path(&mut candidates, save_path.to_path_buf());
+
+    let path_text = save_path.to_string_lossy();
+    for suffix in [".part", ".tmp", ".download"] {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(format!("{path_text}{suffix}")),
+        );
+    }
+
+    if let Some(parent) = save_path.parent() {
+        for suffix in [".part", ".tmp", ".download"] {
+            push_unique_path(
+                &mut candidates,
+                parent.join(format!(".tachyon-{task_id}{suffix}")),
+            );
+            push_unique_path(&mut candidates, parent.join(format!("{task_id}{suffix}")));
+        }
+    }
+
+    candidates
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &path) {
+        candidates.push(path);
+    }
+}
+
+fn validate_delete_candidate(path: &Path) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        AppError::Config(format!("读取任务文件元数据失败: {}: {e}", path.display()))
+    })?;
+    if is_symlink_or_reparse(&metadata) {
+        return Err(AppError::Config(format!(
+            "拒绝删除符号链接或 reparse point: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(AppError::Config(format!(
+            "拒绝删除非文件路径: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::{FileTypeExt, MetadataExt};
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file_type = metadata.file_type();
+    file_type.is_symlink_dir()
+        || file_type.is_symlink_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 impl TaskService {
@@ -151,10 +300,19 @@ impl TaskService {
         };
 
         let task_id = Uuid::new_v4().to_string();
-        let file_name = match file_name {
-            Some(n) if !n.trim().is_empty() => sanitize_filename(n),
-            _ => extract_filename_from_url(url),
-        };
+        // 区分两层语义:
+        // - `preferred_file_name`: 用户**显式**传入并 sanitize 后的重命名,贯穿到引擎
+        //   `DownloadTask::set_preferred_file_name`,在 probe 之后覆盖协议侧文件名,
+        //   保证磁盘文件名 = 列表显示名 = 快照路径。
+        // - `file_name`: TaskInfo 上立即显示的文件名,同样取这一份(若无重命名则
+        //   退化到 URL 推断,probe 完成后会被 update 为协议探测得到的真实名)。
+        let preferred_file_name: Option<String> = file_name
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .map(sanitize_filename);
+        let file_name = preferred_file_name
+            .clone()
+            .unwrap_or_else(|| extract_filename_from_url(url));
         let created_at = now_iso8601();
         let redacted_url = redact_url_for_log(url);
 
@@ -241,6 +399,7 @@ impl TaskService {
             download_dir: download_dir_str.to_string(),
             download_config,
             mirror_urls: mirror_urls.map(|v| v.to_vec()),
+            preferred_file_name,
         })
     }
 
@@ -310,61 +469,62 @@ impl TaskService {
         Ok(())
     }
 
-    /// 删除任务（仅终态可删除）
+    /// 删除任务
     ///
-    /// 删除任务记录的同时,清理持久化快照和已下载的本地文件。
-    /// 文件/快照清理失败仅记录警告,不阻断任务记录删除。
-    pub fn delete_task(&self, task_id: &str) -> Result<(), AppError> {
+    /// 终态(Completed/Cancelled/Failed)直接删除;非终态(Pending/Paused/Downloading 等)
+    /// 先自动取消再删除,避免恢复的任务卡在非终态无法删除。
+    /// 默认仅清理任务记录和持久化快照;仅当 `delete_local_file=true` 时删除本地文件。
+    /// 文件删除失败会保留任务记录和快照,便于用户重试。
+    pub async fn delete_task(
+        &self,
+        task_id: &str,
+        delete_local_file: bool,
+    ) -> Result<(), AppError> {
         let task = self
             .task_repository
             .get(task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
-        match task.status {
-            DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed => {
-                let save_path = task.save_path.clone();
-                drop(task);
-                self.task_repository.remove(task_id);
+            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?
+            .value()
+            .clone();
+        let is_terminal = matches!(
+            task.status,
+            DownloadState::Completed | DownloadState::Cancelled | DownloadState::Failed
+        );
 
-                // 清理断点续传快照
-                match self.task_store.remove_snapshot(task_id) {
-                    Ok(true) => {
-                        tracing::debug!(task_id = %task_id, "已删除任务快照");
-                    }
-                    Ok(false) => {
-                        tracing::debug!(task_id = %task_id, "任务快照不存在,跳过清理");
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id = %task_id, error = %e, "删除任务快照失败");
-                    }
-                }
-
-                // 清理已下载文件(文件可能已被用户手动删除,失败仅警告)
-                if !save_path.is_empty() {
-                    let path = std::path::Path::new(&save_path);
-                    if path.exists() {
-                        if let Err(e) = std::fs::remove_file(path) {
-                            tracing::warn!(
-                                task_id = %task_id,
-                                path = %save_path,
-                                error = %e,
-                                "删除任务文件失败"
-                            );
-                        } else {
-                            tracing::info!(task_id = %task_id, path = %save_path, "已删除任务文件");
-                        }
-                    } else {
-                        tracing::debug!(task_id = %task_id, path = %save_path, "任务文件不存在,跳过清理");
-                    }
-                }
-
-                tracing::info!(task_id = %task_id, "删除任务");
-                Ok(())
-            }
-            other => Err(AppError::Config(format!(
-                "当前状态 '{}' 不允许删除,请先取消任务",
-                other
-            ))),
+        if !is_terminal {
+            // 非终态任务:先标记取消再删除,避免残留快照在下次重启时被恢复
+            tracing::info!(
+                task_id = %task_id,
+                status = %task.status,
+                "删除非终态任务,自动取消"
+            );
         }
+
+        if delete_local_file {
+            let snapshot = self.task_store.load_snapshot(task_id)?;
+            if let Some(save_path) = resolve_delete_save_path(&task, snapshot.as_ref()) {
+                let config = self.config.lock().await.clone();
+                delete_local_file_candidates(&config, task_id, &save_path)?;
+            }
+        }
+
+        self.task_repository.remove(task_id);
+
+        // 清理断点续传快照
+        match self.task_store.remove_snapshot(task_id) {
+            Ok(true) => {
+                tracing::debug!(task_id = %task_id, "已删除任务快照");
+            }
+            Ok(false) => {
+                tracing::debug!(task_id = %task_id, "任务快照不存在,跳过清理");
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "删除任务快照失败");
+            }
+        }
+
+        tracing::info!(task_id = %task_id, delete_local_file, "删除任务");
+        Ok(())
     }
 
     /// 获取任务列表

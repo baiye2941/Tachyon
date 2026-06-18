@@ -62,22 +62,12 @@ pub struct GpuVerifier {
 }
 
 /// GPU 缓冲区缓存,合并为单一结构体保证容量和缓冲区原子更新
+#[derive(Default)]
 struct GpuCache {
     input_buffer: Option<wgpu::Buffer>,
     output_buffer: Option<wgpu::Buffer>,
     staging_buffer: Option<wgpu::Buffer>,
     capacity: usize,
-}
-
-impl Default for GpuCache {
-    fn default() -> Self {
-        Self {
-            input_buffer: None,
-            output_buffer: None,
-            staging_buffer: None,
-            capacity: 0,
-        }
-    }
 }
 
 /// 小于此阈值的数据直接使用 CPU 计算,避免 GPU 启动开销超过收益
@@ -915,9 +905,9 @@ mod tests {
         let mut padded = [0u8; 64];
         padded[..data.len()].copy_from_slice(data);
         let mut block_words = [0u32; 16];
-        for i in 0..16 {
+        for (i, word) in block_words.iter_mut().enumerate() {
             let off = i * 4;
-            block_words[i] = u32::from_le_bytes([
+            *word = u32::from_le_bytes([
                 padded[off],
                 padded[off + 1],
                 padded[off + 2],

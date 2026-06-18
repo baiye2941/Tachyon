@@ -95,6 +95,28 @@ impl AsyncStorage for TokioFile {
         })
     }
 
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::windows::fs::FileExt;
+            let file = self.file.clone();
+            let write_lock = self.write_lock.clone();
+            let data_ptr = data.as_mut_ptr() as usize;
+            let data_len = data.len();
+            tokio::task::spawn_blocking(move || {
+                let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                file.seek_write(slice, offset).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
     fn read_at<'a>(
         &'a self,
         offset: u64,
@@ -131,7 +153,35 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
+                // 先设置文件逻辑大小(EOF)
                 file.set_len(size).map_err(DownloadError::Io)?;
+                // 使用 SetFileInformationByHandle(FileAllocationInfo) 真正预分配物理磁盘块,
+                // 避免稀疏文件仅扩展逻辑大小而不分配空间。
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                    let info = windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO {
+                        AllocationSize: size as i64,
+                    };
+                    // Safety:
+                    // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
+                    // - info 指针指向有效的 FILE_ALLOCATION_INFO 结构
+                    // - FileAllocationInfo 是 Windows 定义的标准信息类
+                    // - 失败时通过 last_os_error 返回错误,不破坏文件已有状态
+                    let result = unsafe {
+                        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+                            handle,
+                            windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
+                            &info as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of::<
+                                windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO,
+                            >() as u32,
+                        )
+                    };
+                    if result == 0 {
+                        return Err(DownloadError::Io(std::io::Error::last_os_error()));
+                    }
+                }
                 // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
                 // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
                 // 但下载数据会立即覆盖,安全风险极低。
@@ -141,7 +191,7 @@ impl AsyncStorage for TokioFile {
                     // Safety:
                     // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
                     // - size 由调用方传入,来自文件元数据的合法大小值
-                    // - 内核保证:失败时不影响文件现有状态
+                    // - 内核保证:失败时不影响文件已有状态
                     let result = unsafe {
                         windows_sys::Win32::Storage::FileSystem::SetFileValidData(
                             handle,
@@ -195,6 +245,26 @@ impl AsyncStorage for TokioFile {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
                 file.write_at(&data, offset).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.clone();
+            let data_ptr = data.as_mut_ptr() as usize;
+            let data_len = data.len();
+            tokio::task::spawn_blocking(move || {
+                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                file.write_at(slice, offset).map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
@@ -289,6 +359,26 @@ impl AsyncStorage for TokioFile {
         })
     }
 
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut bytes::BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.clone();
+            let data_ptr = data.as_mut_ptr() as usize;
+            let data_len = data.len();
+            tokio::task::spawn_blocking(move || {
+                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
+                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                file.write_at(slice, offset).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
+        })
+    }
+
     fn read_at<'a>(
         &'a self,
         offset: u64,
@@ -353,6 +443,30 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// 获取 Windows 文件分配大小(物理磁盘分配)
+    #[cfg(target_os = "windows")]
+    fn file_allocation_size(path: &std::path::Path) -> u64 {
+        use std::os::windows::io::AsRawHandle;
+        let file = std::fs::File::open(path).unwrap();
+        let mut info: windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO =
+            unsafe { std::mem::zeroed() };
+        // Safety:
+        // - file 是合法打开的文件句柄
+        // - info 指针指向长度为 size_of::<FILE_STANDARD_INFO>() 的可写内存
+        // - FileStandardInfo 是 Windows 定义的标准信息类
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                windows_sys::Win32::Storage::FileSystem::FileStandardInfo,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO>()
+                    as u32,
+            )
+        };
+        assert!(ok != 0, "GetFileInformationByHandleEx 失败");
+        info.AllocationSize as u64
+    }
+
     #[tokio::test]
     async fn test_open_and_write() {
         let tmp = NamedTempFile::new().unwrap();
@@ -410,6 +524,22 @@ mod tests {
         let storage = TokioFile::open(tmp.path()).await.unwrap();
         storage.allocate(1024).await.unwrap();
         assert_eq!(storage.file_size().await.unwrap(), 1024);
+    }
+
+    /// Windows:预分配后文件物理分配大小应达到请求大小
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_allocate_physical_size_windows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        storage.allocate(1024).await.unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), 1024);
+        let alloc = file_allocation_size(tmp.path());
+        assert!(
+            alloc >= 1024,
+            "预分配后文件物理分配大小 {} 小于请求大小 1024",
+            alloc
+        );
     }
 
     #[tokio::test]

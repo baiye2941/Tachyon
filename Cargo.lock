@@ -4589,6 +4589,7 @@ dependencies = [
  "tachyon-core",
  "tachyon-engine",
  "tachyon-hub",
+ "tachyon-io",
  "tachyon-sniffer",
  "tachyon-store",
  "tauri",
