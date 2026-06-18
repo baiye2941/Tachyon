@@ -1,0 +1,49 @@
+[package]
+name = "tachyon-fuzz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { workspace = true }
+serde_json = { workspace = true }
+tachyon-core = { path = "../crates/tachyon-core" }
+tachyon-protocol = { path = "../crates/tachyon-protocol", default-features = false }
+
+[dependencies.tokio]
+workspace = true
+features = ["macros", "rt-multi-thread"]
+
+[[bin]]
+name = "url_safety"
+path = "fuzz_targets/url_safety.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http_headers"
+path = "fuzz_targets/http_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "file_metadata"
+path = "fuzz_targets/file_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ipc_deserialize"
+path = "fuzz_targets/ipc_deserialize.rs"
+test = false
+doc = false
