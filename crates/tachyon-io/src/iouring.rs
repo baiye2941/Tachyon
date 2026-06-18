@@ -1498,10 +1498,13 @@ mod tests {
         };
 
         let err = storage
-            .write_at(0, Bytes::from(vec![0u8; 4097]))
+            .write_at(0, Bytes::from(vec![0u8; 8192]))
             .await
             .expect_err("超过 fixed buffer 大小时 write_at 必须先返回错误");
 
+        // 对齐 payload (8192) 走快速路径, validate_fixed_buffer_write_len 直接拒绝
+        // 给出 "exceeds fixed buffer size" 错误。非对齐 payload 会走 padding 路径
+        // 产生不同错误消息, 故此处使用对齐尺寸验证快速路径前置校验语义。
         assert_invalid_input_error(err, "exceeds fixed buffer size");
     }
 
