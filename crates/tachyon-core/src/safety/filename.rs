@@ -138,6 +138,25 @@ pub fn extract_filename(url: &str, content_disposition: Option<&str>) -> String 
 /// # 返回
 /// - `Ok(canonical_path)`: 规范化后的绝对路径
 /// - `Err(DownloadError::Config)`: 路径校验失败
+// 不访问文件系统的逻辑路径规范化：解析 `.` 和 `..` 组件。
+fn normalize_logical_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 仅弹出普通目录组件，保留根/前缀
+                if matches!(stack.last(), Some(Component::Normal(_))) {
+                    stack.pop();
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    stack.iter().collect()
+}
+
 pub fn validate_save_path(
     final_path: &std::path::Path,
     expected_base: &std::path::Path,
@@ -190,39 +209,30 @@ pub fn validate_save_path(
 
         Ok(result)
     } else {
-        // 父目录不存在:先做逻辑路径校验,再创建目录
-        // 将 parent 拼接到 canonical_base 后做逻辑校验
+        // 父目录不存在: 先做逻辑路径校验, 再创建目录
         let file_name = final_path
             .file_name()
             .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无文件名".into()))?;
 
-        // 逻辑校验:parent 必须是 expected_base 的子路径
-        // 使用路径组件逐级检查,防止 .. 逃逸
-        let mut check_path = canonical_base.clone();
+        // 逻辑校验: parent 必须是 expected_base 的子路径
         let suffix = parent.strip_prefix(expected_base).map_err(|_| {
             crate::DownloadError::Config(format!(
                 "父目录逃逸检测(逻辑): {:?} 不在预期目录 {:?} 内",
                 parent, expected_base
             ))
         })?;
-        check_path.push(suffix);
-        // 规范化后检查是否仍在 base 内
-        let canonical_check = check_path.canonicalize().unwrap_or(check_path.clone());
-        if !canonical_check.starts_with(&canonical_base) && canonical_check != canonical_base {
-            // 父目录尚不存在时 canonicalize 可能失败,此时用组件比较做保守检查
-            let base_components: Vec<_> = canonical_base.components().collect();
-            let check_components: Vec<_> = check_path.components().collect();
-            if check_components.len() < base_components.len()
-                || check_components[..base_components.len()] != base_components
-            {
-                return Err(crate::DownloadError::Config(format!(
-                    "父目录逃逸检测(逻辑): {:?} 不在预期目录 {:?} 内",
-                    parent, expected_base
-                )));
-            }
+
+        // 逻辑规范化 canonical_base + suffix, 解析 . 和 .. 后检查是否仍在 base 内
+        let check_path = canonical_base.join(suffix);
+        let normalized = normalize_logical_path(&check_path);
+        if !normalized.starts_with(&canonical_base) && normalized != canonical_base {
+            return Err(crate::DownloadError::Config(format!(
+                "父目录逃逸检测(逻辑): {:?} 规范化后不在预期目录 {:?} 内",
+                parent, canonical_base
+            )));
         }
 
-        // 校验通过,现在可以安全创建目录
+        // 校验通过, 现在可以安全创建目录
         std::fs::create_dir_all(parent).map_err(crate::DownloadError::Io)?;
 
         let canonical_parent = parent

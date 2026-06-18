@@ -41,6 +41,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = validate_save_path(&final_path, &temp_base);
 
     // 6. 同时测试 PathBuf 直接构造(可能含空组件)
-    let raw_path = PathBuf::from(&input);
+    let raw_path = PathBuf::from(input.as_ref());
     let _ = validate_save_path(&raw_path, &temp_base);
 });

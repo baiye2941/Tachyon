@@ -497,10 +497,7 @@ mod tests {
         assert_eq!(expired.remaining_secs(), 0);
 
         // 未过期时剩余不超过 max_duration_secs 且大于 0
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix_secs();
         let active = PauseInfo {
             paused_at_secs: now,
             max_duration_secs: 60,

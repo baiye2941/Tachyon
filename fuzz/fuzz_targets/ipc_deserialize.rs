@@ -9,8 +9,7 @@
 use libfuzzer_sys::fuzz_target;
 use tachyon_core::event::{DownloadEvent, FragmentEvent, PeerEvent};
 use tachyon_core::types::{
-    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, FragmentProgress, TaskCommand,
-    TaskProgress,
+    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskCommand, TaskProgress,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -25,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let _: Result<FileMetadata, _> = serde_json::from_str(&input);
     let _: Result<FragmentInfo, _> = serde_json::from_str(&input);
     let _: Result<DownloadStateChange, _> = serde_json::from_str(&input);
-    let _: Result<FragmentProgress, _> = serde_json::from_str(&input);
+
     let _: Result<TaskProgress, _> = serde_json::from_str(&input);
     let _: Result<DownloadState, _> = serde_json::from_str(&input);
     let _: Result<TaskCommand, _> = serde_json::from_str(&input);

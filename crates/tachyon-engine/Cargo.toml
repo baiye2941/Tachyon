@@ -25,7 +25,6 @@ futures.workspace = true
 serde.workspace = true
 url.workspace = true
 dashmap.workspace = true
-crossbeam-utils.workspace = true
 
 [dev-dependencies]
 tachyon-core = { path = "../tachyon-core", features = ["test-harness"] }

@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_download_config_io_strategy_defaults_to_standard() {
+    fn test_download_config_io_strategy_defaults_to_platform() {
         let json = r#"{
             "downloadDir":"/tmp",
             "maxConcurrentFragments":4,
@@ -986,10 +986,7 @@ mod tests {
         }"#;
         let config: DownloadConfig = serde_json::from_str(json).unwrap();
         // 缺少 ioStrategy 字段时使用平台默认值
-        #[cfg(target_os = "windows")]
-        assert_eq!(config.io_strategy, IoStrategy::Iocp);
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(config.io_strategy, IoStrategy::Standard);
+        assert_eq!(config.io_strategy, IoStrategy::default());
     }
 
     #[test]
