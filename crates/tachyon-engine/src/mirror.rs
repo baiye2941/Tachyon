@@ -51,6 +51,11 @@ impl MirrorProtocol {
         }
     }
 
+    /// 清除已选中的源,使下次下载重新竞速所有镜像
+    pub(crate) async fn clear_selected(&self) {
+        *self.selected.lock().await = None;
+    }
+
     /// 通用镜像源竞速核心逻辑
     ///
     /// 执行流程: selected 快径 -> 主源 500ms 快速尝试 -> 镜像并行竞速
@@ -126,6 +131,10 @@ impl MirrorProtocol {
 }
 
 impl Protocol for MirrorProtocol {
+    fn clear_selected(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.clear_selected().await })
+    }
+
     fn probe(
         &self,
         url: &str,
@@ -242,5 +251,264 @@ impl Protocol for MirrorProtocol {
             )
             .await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    use super::MirrorProtocol;
+    use tachyon_core::traits::Protocol;
+    use tachyon_core::types::FileMetadata;
+    use tachyon_core::{ByteStream, DownloadError, DownloadResult};
+
+    #[derive(Clone)]
+    struct MockProtocol {
+        probe_delay: Duration,
+        probe_meta: Result<FileMetadata, String>,
+        download_data: Result<Bytes, String>,
+    }
+
+    impl MockProtocol {
+        fn new() -> Self {
+            Self {
+                probe_delay: Duration::ZERO,
+                probe_meta: Ok(FileMetadata {
+                    file_name: "mock".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                }),
+                download_data: Ok(Bytes::from_static(b"mock")),
+            }
+        }
+
+        fn with_probe_delay(mut self, delay: Duration) -> Self {
+            self.probe_delay = delay;
+            self
+        }
+
+        fn with_probe_meta(mut self, meta: Result<FileMetadata, String>) -> Self {
+            self.probe_meta = meta;
+            self
+        }
+
+        fn with_download_data(mut self, data: Result<Bytes, String>) -> Self {
+            self.download_data = data;
+            self
+        }
+    }
+
+    impl Protocol for MockProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>> {
+            let delay = self.probe_delay;
+            let result = self.probe_meta.clone();
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                result.map_err(DownloadError::Protocol)
+            })
+        }
+
+        fn download_range(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+            let result = self.download_data.clone();
+            Box::pin(async move { result.map_err(DownloadError::Protocol) })
+        }
+
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+            let result = self.download_data.clone();
+            Box::pin(async move {
+                let data = result.map_err(DownloadError::Protocol)?;
+                let stream = futures::stream::once(async move { Ok(data) });
+                Ok(Box::pin(stream) as ByteStream)
+            })
+        }
+
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+            let result = self.download_data.clone();
+            Box::pin(async move { result.map_err(DownloadError::Protocol) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_probe_selects_fastest_mirror() {
+        tokio::time::pause();
+
+        let slow_primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_delay(Duration::from_secs(10))
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "primary".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                })),
+        );
+
+        let fast_mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_delay(Duration::from_millis(100))
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "mirror".into(),
+                    file_size: Some(200),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                })),
+        );
+
+        let mirror_protocol = MirrorProtocol::new(
+            slow_primary,
+            vec![("http://mirror.com/file".into(), fast_mirror)],
+        );
+
+        let result = mirror_protocol.probe("http://primary.com/file").await;
+        assert!(result.is_ok(), "probe 应返回最快镜像的结果");
+        assert_eq!(
+            result.unwrap().file_size,
+            Some(200),
+            "应选择最快镜像(file_size=200)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_selected_resets_probe_choice() {
+        let primary = Arc::new(MockProtocol::new().with_probe_meta(Ok(FileMetadata {
+            file_name: "primary".into(),
+            file_size: Some(100),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        })));
+
+        let mirror = Arc::new(MockProtocol::new().with_probe_meta(Ok(FileMetadata {
+            file_name: "mirror".into(),
+            file_size: Some(200),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        })));
+
+        let mirror_protocol =
+            MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+
+        let meta = mirror_protocol
+            .probe("http://primary.com/file")
+            .await
+            .unwrap();
+        assert_eq!(meta.file_size, Some(100), "竞速应选中主源");
+        assert!(
+            mirror_protocol.selected.lock().await.is_some(),
+            "probe 后应记录已选源"
+        );
+
+        mirror_protocol.clear_selected().await;
+        assert!(
+            mirror_protocol.selected.lock().await.is_none(),
+            "clear_selected 后应清空已选源"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_fallback_to_mirror_when_primary_fails() {
+        let failing_primary =
+            Arc::new(MockProtocol::new().with_download_data(Err("primary failed".into())));
+
+        let working_mirror = Arc::new(
+            MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"mirror data"))),
+        );
+
+        let mirror_protocol = MirrorProtocol::new(
+            failing_primary,
+            vec![("http://mirror.com/file".into(), working_mirror)],
+        );
+
+        let result = mirror_protocol
+            .download_full("http://primary.com/file")
+            .await;
+        assert_eq!(
+            result.unwrap(),
+            Bytes::from_static(b"mirror data"),
+            "主源失败时应回退到镜像源"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_range_fallback_to_mirror_when_primary_fails() {
+        let failing_primary =
+            Arc::new(MockProtocol::new().with_download_data(Err("primary range failed".into())));
+
+        let working_mirror = Arc::new(
+            MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"mirror range"))),
+        );
+
+        let mirror_protocol = MirrorProtocol::new(
+            failing_primary,
+            vec![("http://mirror.com/file".into(), working_mirror)],
+        );
+
+        let result = mirror_protocol
+            .download_range("http://primary.com/file", 0, 99)
+            .await;
+        assert_eq!(
+            result.unwrap(),
+            Bytes::from_static(b"mirror range"),
+            "主源 range 失败时应回退到镜像源"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_range_stream_fallback_to_mirror_when_primary_fails() {
+        let failing_primary =
+            Arc::new(MockProtocol::new().with_download_data(Err("primary stream failed".into())));
+
+        let working_mirror = Arc::new(
+            MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"mirror stream"))),
+        );
+
+        let mirror_protocol = MirrorProtocol::new(
+            failing_primary,
+            vec![("http://mirror.com/file".into(), working_mirror)],
+        );
+
+        let result = mirror_protocol
+            .download_range_stream("http://primary.com/file", 0, 99)
+            .await;
+        assert!(result.is_ok(), "主源流式失败时应回退到镜像源");
+
+        let mut stream = result.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk, Bytes::from_static(b"mirror stream"));
     }
 }

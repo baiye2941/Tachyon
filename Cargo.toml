@@ -80,6 +80,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # 并发
 crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
 dashmap = "6"
 parking_lot = "0.12"
 
@@ -89,6 +90,9 @@ url = "2"
 # 枚举辅助
 strum = { version = "0.26", features = ["derive"] }
 
+# 内存分配器
+mimalloc = "0.1"
+
 # 开发依赖
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -96,6 +100,7 @@ mockall = "0.13"
 rstest = "0.22"
 tempfile = "3"
 tokio-test = "0.4"
+libfuzzer-sys = "0.4"
 
 [package]
 name = "tachyon"
@@ -143,7 +148,7 @@ sha2 = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [profile.dev]
 opt-level = 1

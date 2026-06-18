@@ -3,6 +3,9 @@
 //! 每个下载任务不再 spawn 独立的 chunk_reader_handle tokio task，
 //! 而是通过共享的 ChunkReaderPool 提交进度处理任务。
 //! 工作池固定 N 个 worker（N = max_concurrent_tasks），避免随任务数线性增长的 tokio task 数量。
+//!
+//! 架构: submit → mpsc channel → dispatcher task → per-worker channel → worker tasks
+//! 消除原 `Arc<Mutex<Receiver>>` 导致的 worker 串行化问题。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,13 +41,14 @@ pub struct ChunkReaderJob {
 
 /// 共享 ChunkReader 工作池
 ///
-/// N 个 worker 从共享 mpsc receiver 拉取 job，执行进度处理逻辑。
-/// 每个 job 独立运行，互不干扰。
+/// 使用 dispatcher + per-worker channel 架构,避免 worker 串行化。
+/// submit() 将 job 发送到 mpsc channel,dispatcher 任务 round-robin
+/// 分发到 N 个 worker 的专用 channel,每个 worker 独立拉取 job。
 pub struct ChunkReaderPool {
     /// 任务提交通道
     job_tx: mpsc::Sender<ChunkReaderJob>,
-    /// 共享 receiver（worker 启动后持有）
-    job_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<ChunkReaderJob>>>>,
+    /// 中心 receiver（spawn_workers 时消费,交给 dispatcher）
+    job_rx: std::sync::Mutex<Option<mpsc::Receiver<ChunkReaderJob>>>,
     /// worker 是否已 spawn（幂等防护）
     workers_spawned: std::sync::atomic::AtomicBool,
     /// 预设 worker 数量
@@ -63,7 +67,7 @@ impl ChunkReaderPool {
         let (job_tx, job_rx) = mpsc::channel::<ChunkReaderJob>(worker_count * 2);
         Self {
             job_tx,
-            job_rx: Some(Arc::new(tokio::sync::Mutex::new(job_rx))),
+            job_rx: std::sync::Mutex::new(Some(job_rx)),
             workers_spawned: std::sync::atomic::AtomicBool::new(false),
             worker_count,
         }
@@ -81,30 +85,46 @@ impl ChunkReaderPool {
             return;
         }
         // spawn_workers 仅在首次调用时执行，此时 job_rx 必定存在
-        let rx = self
+        let mut job_rx = self
             .job_rx
-            .as_ref()
-            .expect("spawn_workers: job_rx 不应为 None（仅首次调用时消费）")
-            .clone();
-        for worker_id in 0..self.worker_count {
-            let rx = rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    // 从共享 receiver 拉取 job
-                    let job = {
-                        let mut guard = rx.lock().await;
-                        guard.recv().await
-                    };
-                    match job {
-                        Some(job) => {
-                            run_chunk_reader(job).await;
-                        }
-                        None => {
-                            tracing::debug!(worker_id, "chunk reader worker 退出:通道已关闭");
-                            break;
-                        }
-                    }
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("spawn_workers: job_rx 不应为 None（仅首次调用时消费）");
+
+        // 创建 per-worker channel（buffer=1 允许 dispatcher 预派发一个 job）
+        let mut worker_txs: Vec<mpsc::Sender<ChunkReaderJob>> = Vec::new();
+        let mut worker_rxs: Vec<mpsc::Receiver<ChunkReaderJob>> = Vec::new();
+        for _ in 0..self.worker_count {
+            let (tx, rx) = mpsc::channel::<ChunkReaderJob>(1);
+            worker_txs.push(tx);
+            worker_rxs.push(rx);
+        }
+
+        // dispatcher: 从中心 channel 读取 job,round-robin 分发到 per-worker channel
+        tokio::spawn(async move {
+            let mut next_worker = 0usize;
+            while let Some(job) = job_rx.recv().await {
+                let worker_id = next_worker % worker_txs.len();
+                if worker_txs[worker_id].send(job).await.is_err() {
+                    tracing::debug!(worker_id, "chunk reader worker 已退出,丢弃 job");
                 }
+                next_worker = worker_id.wrapping_add(1);
+            }
+            // 中心 channel 关闭,通知所有 worker 退出
+            drop(worker_txs);
+        });
+
+        // 启动 N 个 worker,每个持有自己的 receiver
+        for worker_id in 0..self.worker_count {
+            let mut rx = worker_rxs
+                .pop()
+                .expect("worker_rxs 数量应匹配 worker_count");
+            tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    run_chunk_reader(job).await;
+                }
+                tracing::debug!(worker_id, "chunk reader worker 退出:通道已关闭");
             });
         }
     }
@@ -235,12 +255,24 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
             let batch: Vec<u32> = std::mem::take(&mut pending_completed);
             let downloaded = total_downloaded;
             let partial = frag_bytes.clone();
-            if let Err(e) = task_store.update_snapshot(&task_id, |snap| {
-                snap.completed_fragments.extend(batch);
-                snap.partial_fragments = partial;
-                snap.downloaded = downloaded;
-            }) {
-                tracing::warn!(task_id = %task_id, error = %e, "checkpoint 落盘失败");
+            let ts = task_store.clone();
+            let tid = task_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                ts.update_snapshot(&tid, |snap| {
+                    snap.completed_fragments.extend(batch);
+                    snap.partial_fragments = partial;
+                    snap.downloaded = downloaded;
+                })
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "checkpoint 落盘失败");
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "checkpoint spawn_blocking 失败");
+                }
             }
         }
 
@@ -251,11 +283,23 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
             partial_checkpoint_counter = 0;
             let downloaded = total_downloaded;
             let partial = frag_bytes.clone();
-            if let Err(e) = task_store.update_snapshot(&task_id, |snap| {
-                snap.partial_fragments = partial;
-                snap.downloaded = downloaded;
-            }) {
-                tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint 落盘失败");
+            let ts = task_store.clone();
+            let tid = task_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                ts.update_snapshot(&tid, |snap| {
+                    snap.partial_fragments = partial;
+                    snap.downloaded = downloaded;
+                })
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint 落盘失败");
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint spawn_blocking 失败");
+                }
             }
         }
     }
@@ -264,12 +308,24 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
         let batch: Vec<u32> = pending_completed;
         let downloaded = total_downloaded;
         let partial = frag_bytes;
-        if let Err(e) = task_store.update_snapshot(&task_id, |snap| {
-            snap.completed_fragments.extend(batch);
-            snap.partial_fragments = partial;
-            snap.downloaded = downloaded;
-        }) {
-            tracing::warn!(task_id = %task_id, error = %e, "最终 checkpoint 落盘失败");
+        let ts = task_store.clone();
+        let tid = task_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            ts.update_snapshot(&tid, |snap| {
+                snap.completed_fragments.extend(batch);
+                snap.partial_fragments = partial;
+                snap.downloaded = downloaded;
+            })
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(task_id = %task_id, error = %e, "最终 checkpoint 落盘失败");
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "最终 checkpoint spawn_blocking 失败");
+            }
         }
     }
 

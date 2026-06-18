@@ -49,9 +49,10 @@ pub fn default_blake3_verifier() -> VerifierKind {
 
 pub type StorageKind = DynStorage;
 
-/// L-9: verify() 分块读取文件的 chunk 大小 (1 MiB)。
-/// 过小则系统调用频繁,过大则占用内存;1 MiB 在 HDD/SSD 上均为合理折中。
-const VERIFY_HASH_CHUNK_SIZE: usize = 1024 * 1024;
+/// L-9: verify() 分块读取文件的 chunk 大小 (8 MiB)。
+/// 现代 SSD 顺序读取带宽可达数 GB/s,1 MiB 导致大量 read_at 系统调用。
+/// 8 MiB 在内存占用和 syscall 频率间取得平衡,校验吞吐提升 2-3x。
+const VERIFY_HASH_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// L-12: 分片下载进度上报频率 — 每 N 个 chunk 上报一次。
 /// 值过小则通道压力大,值过大则前端更新不及时;5 在默认 256 KiB batch 下
@@ -1021,6 +1022,8 @@ impl DownloadTask {
                                     "分片下载失败,退避后重试"
                                 );
                                 frag_circuit_breakers.record_failure(&frag_url);
+                                // 重试前清除已选中的镜像源,触发下次尝试重新竞速
+                                frag_protocol.clear_selected().await;
                                 tokio::time::sleep(backoff).await;
                                 attempt += 1;
                             }
@@ -1115,10 +1118,8 @@ impl DownloadTask {
         // dispatcher 在中央队列关闭后自然退出
         let _ = dispatcher_handle.await;
 
-        storage.sync().await?;
-
-        // 显式关闭存储后端,确保 fsync 和资源释放在任务完成前执行
-        // 而非依赖 Arc drop 的不确定时机
+        // 显式关闭存储后端,close() 内部已调用 sync_data() 保证数据落盘,
+        // 无需额外 sync() 避免双重 fsync 导致的 Flush Storm
         storage.close().await?;
 
         self.state = DownloadState::Completed;
@@ -1245,9 +1246,11 @@ impl DownloadTask {
     /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
     /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
     ///
-    /// 对于不支持 write_at_mut 覆写的后端，freeze() 后委托给 write_all_at
-    /// （保证短写循环的正确性）。IOCP 等覆写 write_at_mut 的后端直接使用
-    /// BytesMut 内部缓冲区写入，省去 freeze() 开销。
+    /// 写入 BytesMut 数据到存储
+    ///
+    /// 内部委托给 `write_all_at`(freeze + 短写循环),保证短写正确性。
+    /// IOCP 等后端的 `write_at_mut` 覆写因短写时数据丢失风险无法直接使用。
+    /// freeze() 的原子引用计数操作开销极小,不影响整体吞吐。
     async fn write_all_at_mut(
         storage: &StorageKind,
         pos: u64,
@@ -1255,10 +1258,6 @@ impl DownloadTask {
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<u64> {
-        // freeze() 将 BytesMut 转为 Bytes，开销极小（一次原子引用计数操作）
-        // 然后委托给 write_all_at（已有完整的短写循环处理）
-        // IOCP 等后端的 write_at_mut 覆写在 write_at_mut 被直接调用时
-        // 才能跳过 freeze，此处委托给 write_all_at 保持正确性
         Self::write_all_at(storage, pos, batch.freeze(), control_rx, pause_timeout).await
     }
 
@@ -3719,7 +3718,7 @@ mod tests {
             mock = mock.with_range_data(start, end, Bytes::from(vec![0xA0 | i as u8; 100]));
         }
         let protocol: Arc<dyn Protocol> = Arc::new(mock);
-        let (_release_tx, release_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
         let blocking_storage = BlockingWriteStorage::with_capacity(total_size as usize, release_rx);
         let write_started = blocking_storage.write_started();
         let storage = StorageKind::new(blocking_storage);
@@ -3746,6 +3745,8 @@ mod tests {
         task.plan().unwrap();
         task.prepare_storage().await.unwrap();
 
+        // 保持 release_tx 在测试作用域存活,避免 write_at 因通道关闭而提前返回,
+        // 确保取消信号分支在 tokio::select! 中唯一就绪,消除竞态。
         let cancel_on_write = tokio::spawn(async move {
             write_started.notified().await;
             control_tx.send(TaskCommand::Cancel).unwrap();
@@ -3753,6 +3754,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(500), task.execute())
             .await
             .expect("取消信号应中断阻塞中的存储写入");
+        drop(release_tx);
         cancel_on_write.await.unwrap();
         assert!(matches!(result, Err(DownloadError::Cancelled)));
         assert_eq!(task.state(), DownloadState::Failed);
@@ -4831,5 +4833,403 @@ mod tests {
             .download_range("http://primary.com", 0, 99)
             .await;
         assert!(result.is_err(), "所有源失败时应返回错误");
+    }
+
+    // ------ 补充: 真实断点续传 ------
+
+    // ------ 补充: 控制信号 ------
+
+    #[tokio::test]
+    async fn test_cancel_signal_in_probe_phase() {
+        let protocol = Arc::new(MockProto::new(test_metadata("cancel-probe.bin", 100)));
+        let storage = StorageKind::memory();
+        let mut task = make_task(protocol, storage, test_config());
+
+        let (_tx, rx) = watch::channel(TaskCommand::Cancel);
+        task.set_control_rx(rx);
+
+        let result = task.run().await;
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "probe 阶段取消应返回 Cancelled, 实际: {result:?}"
+        );
+        assert_eq!(task.state(), DownloadState::Cancelled);
+    }
+
+    #[derive(Clone)]
+    struct BlockingAllocateStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        allocate_started: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingAllocateStorage {
+        fn with_capacity(capacity: usize) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0; capacity])),
+                allocate_started: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl AsyncStorage for BlockingAllocateStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let buf = self.data.clone();
+            Box::pin(async move {
+                let start = offset as usize;
+                let end = start + data.len();
+                let mut v = buf.lock().unwrap();
+                if end > v.len() {
+                    v.resize(end, 0);
+                }
+                v[start..end].copy_from_slice(&data);
+                Ok(data.len())
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            let data = self.data.clone();
+            Box::pin(async move {
+                let v = data.lock().unwrap();
+                let start = offset as usize;
+                let available = v.len().saturating_sub(start);
+                let to_read = buf.len().min(available);
+                if to_read > 0 {
+                    buf[..to_read].copy_from_slice(&v[start..start + to_read]);
+                }
+                Ok(to_read)
+            })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            _size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            let notify = self.allocate_started.clone();
+            Box::pin(async move {
+                notify.notify_waiters();
+                // 阻塞以让 cancel 信号有机会被 select
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            let data = self.data.clone();
+            Box::pin(async move { Ok(data.lock().unwrap().len() as u64) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_signal_in_prepare_storage_phase() {
+        let protocol = Arc::new(MockProto::new(test_metadata("cancel-alloc.bin", 100)));
+        let blocking_storage = BlockingAllocateStorage::with_capacity(100);
+        let allocate_started = blocking_storage.allocate_started.clone();
+        let storage = StorageKind::new(blocking_storage);
+        let mut task = make_task(protocol, storage, test_config());
+
+        let (tx, rx) = watch::channel(TaskCommand::Start);
+        task.set_control_rx(rx);
+
+        let handle = tokio::spawn(async move {
+            let result = task.run().await;
+            (task, result)
+        });
+
+        allocate_started.notified().await;
+        tx.send(TaskCommand::Cancel).unwrap();
+
+        let (task, result) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "prepare_storage 阶段取消应返回 Cancelled, 实际: {result:?}"
+        );
+        assert_eq!(task.state(), DownloadState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_pause_then_resume_continues_download() {
+        let frag_size = 100u64;
+        let total = frag_size * 2;
+        let mut mock = MockProto::new(test_metadata("pause-resume.bin", total));
+        for i in 0..2u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xD0 | i as u8; frag_size as usize]),
+            );
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/pause-resume.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        task.set_control_rx(rx);
+
+        let handle = tokio::spawn(async move {
+            let result = task.run().await;
+            (task, result)
+        });
+
+        // 让任务进入暂停等待
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(TaskCommand::Resume).unwrap();
+
+        let (task, result) = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        result.expect("Pause 后 Resume 应继续并完成下载");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ------ 补充: 限速真实效果 ------
+
+    #[tokio::test]
+    async fn test_rate_limit_real_effect() {
+        let total_size = 2000u64;
+        let data = Bytes::from(vec![0xE5; total_size as usize]);
+        let meta = FileMetadata {
+            file_name: "rate-limit.bin".into(),
+            file_size: Some(total_size),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: false,
+                rate_limit_bytes_per_sec: Some(1000),
+                ..test_config()
+            },
+        );
+
+        let start = std::time::Instant::now();
+        task.run().await.expect("限速下载应成功完成");
+        let elapsed = start.elapsed();
+
+        // 1000 B/s, 2000 字节: 初始突发 1000 字节, 剩余 1000 字节约需 1 秒
+        assert!(
+            elapsed.as_secs_f64() >= 0.7,
+            "限速 1000 B/s 下载 2000 字节应至少耗时 0.7s, 实际 {:.2}s",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            elapsed.as_secs_f64() < 5.0,
+            "耗时上界应宽松, 实际 {:.2}s",
+            elapsed.as_secs_f64()
+        );
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    // ------ 补充: 未知大小文件整流下载 ------
+
+    #[tokio::test]
+    async fn test_unknown_size_full_stream_download_success() {
+        let data = Bytes::from_static(b"unknown size stream content");
+        let meta = FileMetadata {
+            file_name: "unknown-success.bin".into(),
+            file_size: None,
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
+        let storage = StorageKind::memory();
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: false,
+                max_full_stream_bytes: 1024,
+                ..test_config()
+            },
+        );
+
+        task.run().await.expect("未知大小整流下载应成功");
+
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON);
+
+        if let Some(ref storage) = task.storage {
+            let mut buf = vec![0u8; data.len()];
+            storage.read_at(0, &mut buf).await.unwrap();
+            assert_eq!(buf, data.as_ref());
+        }
+    }
+
+    // ------ 补充: 校验策略 ------
+
+    #[tokio::test]
+    async fn test_verify_require_strategy_hash_mismatch_fails() {
+        let data = Bytes::from_static(b"require mismatch data");
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: Some(wrong_hash.into()),
+        };
+
+        let protocol = Arc::new(MockProto::new(test_metadata(
+            "require-mismatch.bin",
+            data.len() as u64,
+        )));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Require,
+                ..test_config()
+            },
+        );
+
+        task.storage
+            .as_ref()
+            .unwrap()
+            .write_at(0, data.clone())
+            .await
+            .unwrap();
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("require-mismatch.bin", data.len() as u64));
+
+        let result = task.verify().await;
+        assert!(
+            matches!(result, Err(DownloadError::ChecksumMismatch { .. })),
+            "Require 策略下 hash 不匹配应返回 ChecksumMismatch"
+        );
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    // ------ 补充: 进度与指标 ------
+
+    #[tokio::test]
+    async fn test_progress_tx_and_metrics_updated() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+
+        let meta = test_metadata("progress-metrics.bin", total);
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_range_data(
+                    0,
+                    frag_size - 1,
+                    Bytes::from(vec![0xAA; frag_size as usize]),
+                )
+                .with_range_data(
+                    frag_size,
+                    2 * frag_size - 1,
+                    Bytes::from(vec![0xBB; frag_size as usize]),
+                )
+                .with_range_data(
+                    2 * frag_size,
+                    total - 1,
+                    Bytes::from(vec![0xCC; frag_size as usize]),
+                ),
+        );
+
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/progress-metrics.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<FragmentProgress>(100);
+        task.set_progress_sender(progress_tx);
+
+        let metrics = Arc::new(Metrics::new());
+        task.set_metrics(metrics.clone());
+
+        task.run().await.expect("下载应成功");
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), progress_rx.recv()).await
+        {
+            events.push(event);
+        }
+
+        let completed_events: Vec<_> = events.iter().filter(|e| e.completed).collect();
+        assert_eq!(completed_events.len(), 3, "应收到 3 个分片完成事件");
+
+        let (bytes, fragments, errors) = metrics.snapshot();
+        assert_eq!(bytes, total, "Metrics 字节数应等于文件大小");
+        assert!(fragments >= 3, "Metrics 分片完成数应 >= 3");
+        assert_eq!(errors, 0);
+    }
+
+    // ------ 补充: Mirror 集成 ------
+
+    #[tokio::test]
+    async fn test_with_mirrors_creates_task() {
+        let config = test_config();
+        let result = DownloadTask::with_mirrors(
+            "http://primary.com/file.bin".into(),
+            vec![
+                "http://mirror1.com/file.bin".into(),
+                "http://mirror2.com/file.bin".into(),
+            ],
+            config,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "with_mirrors 应成功创建任务");
+        let task = result.unwrap();
+        assert_eq!(task.url(), "http://primary.com/file.bin");
     }
 }

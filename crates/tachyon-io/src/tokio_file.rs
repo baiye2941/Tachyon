@@ -18,6 +18,11 @@ mod win_share {
 pub struct TokioFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
+    /// Windows: seek_write 由 SetFilePointerEx + WriteFile 构成,非原子操作。
+    /// 多线程并发 seek_write 可能导致写入位置错乱。Mutex 串行化保护。
+    /// 非 Windows: seek_write 是原子的(基于 pread/pwrite),无需锁。
+    #[cfg(target_os = "windows")]
+    write_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl TokioFile {
@@ -37,6 +42,8 @@ impl TokioFile {
         Ok(Self {
             path,
             file: Arc::new(file),
+            #[cfg(target_os = "windows")]
+            write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -78,7 +85,9 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
             let file = self.file.clone();
+            let write_lock = self.write_lock.clone();
             tokio::task::spawn_blocking(move || {
+                let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
                 file.seek_write(&data, offset).map_err(DownloadError::Io)
             })
             .await
@@ -94,17 +103,18 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
             let file = self.file.clone();
+            // 通过 usize 中转指针,满足 Send + 'static 约束
+            // Safety: buf 指针在 spawn_blocking .await 返回前保持有效,
+            // seek_read 只写入 buf[..buf_len],不会越界。
+            let buf_addr = buf.as_mut_ptr() as usize;
             let buf_len = buf.len();
-            let mut owned_buf = vec![0u8; buf_len];
-            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = file.seek_read(&mut owned_buf, offset)?;
-                Ok::<_, std::io::Error>((n, owned_buf))
+            tokio::task::spawn_blocking(move || {
+                let ptr = buf_addr as *mut u8;
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
+                file.seek_read(slice, offset).map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-            .map_err(DownloadError::Io)?;
-            buf[..n].copy_from_slice(&owned_buf[..n]);
-            Ok(n)
         })
     }
 
@@ -120,9 +130,35 @@ impl AsyncStorage for TokioFile {
     fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
-            tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+            tokio::task::spawn_blocking(move || {
+                file.set_len(size).map_err(DownloadError::Io)?;
+                // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
+                // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
+                // 但下载数据会立即覆盖,安全风险极低。
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                    // Safety:
+                    // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
+                    // - size 由调用方传入,来自文件元数据的合法大小值
+                    // - 内核保证:失败时不影响文件现有状态
+                    let result = unsafe {
+                        windows_sys::Win32::Storage::FileSystem::SetFileValidData(
+                            handle,
+                            size as i64,
+                        )
+                    };
+                    if result == 0 {
+                        tracing::debug!(
+                            size,
+                            "SetFileValidData 失败(需 SE_MANAGE_VOLUME_NAME),回退到零填充模式"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
         })
     }
 
@@ -173,17 +209,15 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
+            let buf_addr = buf.as_mut_ptr() as usize;
             let buf_len = buf.len();
-            let mut owned_buf = vec![0u8; buf_len];
-            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = file.read_at(&mut owned_buf, offset)?;
-                Ok::<_, std::io::Error>((n, owned_buf))
+            tokio::task::spawn_blocking(move || {
+                let ptr = buf_addr as *mut u8;
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
+                file.read_at(slice, offset).map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-            .map_err(DownloadError::Io)?;
-            buf[..n].copy_from_slice(&owned_buf[..n]);
-            Ok(n)
         })
     }
 
@@ -263,17 +297,15 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
+            let buf_addr = buf.as_mut_ptr() as usize;
             let buf_len = buf.len();
-            let mut owned_buf = vec![0u8; buf_len];
-            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = file.read_at(&mut owned_buf, offset)?;
-                Ok::<_, std::io::Error>((n, owned_buf))
+            tokio::task::spawn_blocking(move || {
+                let ptr = buf_addr as *mut u8;
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
+                file.read_at(slice, offset).map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-            .map_err(DownloadError::Io)?;
-            buf[..n].copy_from_slice(&owned_buf[..n]);
-            Ok(n)
         })
     }
 
@@ -509,6 +541,66 @@ mod tests {
             assert!(
                 buf.iter().all(|&b| b == i + 100),
                 "写入区域 {offset} 数据不一致"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_path_returns_correct_path() {
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        assert_eq!(storage.path(), tmp.path());
+    }
+
+    #[tokio::test]
+    async fn test_close_calls_sync_data() {
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+
+        // 关闭后重新打开，验证数据已通过 sync_data 落盘
+        let storage2 = TokioFile::open(tmp.path()).await.unwrap();
+        let mut buf = [0u8; 5];
+        let read = storage2.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    /// Windows 路径下 write_at 使用 write_lock 串行化 seek_write，
+    /// 并发写入同一文件不同偏移不应出现数据交错。
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_windows_concurrent_write_at_no_interleave() {
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        storage.allocate(4096).await.unwrap();
+        let storage = std::sync::Arc::new(storage);
+
+        let mut handles = Vec::new();
+        for i in 0u8..16 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let offset = (i as u64) * 256;
+                let data = Bytes::from(vec![i; 256]);
+                s.write_at(offset, data).await.unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        for i in 0u8..16 {
+            let offset = (i as u64) * 256;
+            let mut buf = [0u8; 256];
+            let read = storage.read_at(offset, &mut buf).await.unwrap();
+            assert_eq!(read, 256);
+            assert!(
+                buf.iter().all(|&b| b == i),
+                "区域 {offset} 数据不一致，期望全部为 {i}"
             );
         }
     }

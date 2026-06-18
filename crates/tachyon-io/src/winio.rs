@@ -139,9 +139,33 @@ impl WinFile {
 
     pub async fn preallocate(&self, size: u64) -> DownloadResult<()> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
-            .await
-            .map_err(|e| DownloadError::Io(e.into()))?
+        tokio::task::spawn_blocking(move || {
+            file.set_len(size).map_err(DownloadError::Io)?;
+            // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
+            // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
+            // 但下载数据会立即覆盖,安全风险极低。
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::io::AsRawHandle;
+                let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                // Safety:
+                // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
+                // - size 由调用方传入,来自文件元数据的合法大小值
+                // - 内核保证:失败时不影响文件现有状态
+                let result = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::SetFileValidData(handle, size as i64)
+                };
+                if result == 0 {
+                    tracing::debug!(
+                        size,
+                        "SetFileValidData 失败(需 SE_MANAGE_VOLUME_NAME),回退到零填充模式"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(e.into()))?
     }
 
     pub fn path(&self) -> &Path {

@@ -63,8 +63,15 @@ impl ProgressBroker {
         let task_repository_ref = self.task_repository.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
+            let mut last_version: u64 = 0;
             loop {
                 interval.tick().await;
+                // 仅在任务仓库有变更时才构建进度事件,避免无变化时的全量扫描
+                let current_version = task_repository_ref.version();
+                if current_version == last_version {
+                    continue;
+                }
+                last_version = current_version;
                 let event = build_progress_event(&task_repository_ref);
                 let _ = tx.send(event);
             }

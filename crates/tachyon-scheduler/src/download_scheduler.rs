@@ -69,13 +69,29 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
         };
 
         // 根据带宽和文件大小计算建议并发度
-        // 经验公式:并发度 = min(带宽 / 单分片带宽需求, 文件分片数, 最大并发)
+        // 公式:并发度 = predicted_bw * target_secs / frag_size
+        //   即"需要多少个并行分片才能占满预测带宽"
+        //   当 frag_size 被 clamp 到 max_fragment_size 时,并发度 > 1;
+        //   当 frag_size = predicted_bw * target_secs (未 clamp) 时,并发度 = 1 (单分片即可占满)。
+        //
+        // 旧公式 `predicted_bw / (frag_size / target_secs)` 在 frag_size 未 clamp 时
+        // 简化为 `predicted_bw / predicted_bw = 1`,数学上正确但语义不清且易误读。
+        // 新公式等价但更直观,并增加 BDP 约束确保高延迟链路下并发度足够。
         let suggested_concurrency = if predicted_bw > 0.0 && suggested_frag_size > 0 {
-            // 估算可同时下载的分片数
             let fragments_for_file = file_size.div_ceil(suggested_frag_size);
             let bandwidth_based =
-                (predicted_bw / (suggested_frag_size as f64 / target_download_secs)) as u32;
+                (predicted_bw * target_download_secs / suggested_frag_size as f64) as u32;
+            // BDP 约束:高延迟链路下确保至少 ceil(BDP / frag_size) 个并发
+            // 以充分利用 TCP 窗口(假设 RTT ≈ 50ms 作为典型值)
+            let estimated_rtt = 0.050; // 50ms 典型 RTT
+            let bdp = (predicted_bw * estimated_rtt) as u64;
+            let bdp_concurrency = if bdp > suggested_frag_size {
+                (bdp / suggested_frag_size).max(1) as u32
+            } else {
+                1
+            };
             bandwidth_based
+                .max(bdp_concurrency)
                 .min(fragments_for_file as u32)
                 .min(max_concurrency)
                 .max(1) // 至少 1 个并发
@@ -249,6 +265,72 @@ mod tests {
 
         for handle in handles {
             handle.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // 随机带宽与文件大小下,recommend 返回的并发度与分片大小均满足约束
+    proptest! {
+        #[test]
+        fn test_recommend_invariants(
+            file_size in 0u64..2 * 1024 * 1024 * 1024u64,
+            max_concurrency in 0u32..64,
+            bandwidths in prop::collection::vec(1u64..200 * 1024 * 1024u64, 0..30),
+        ) {
+            let config = SchedulerConfig::default();
+            let sched = AdaptiveDownloadScheduler::new(config.clone());
+
+            for bw in bandwidths {
+                sched.observe_bandwidth(bw);
+            }
+
+            let rec = sched.recommend(file_size, max_concurrency);
+
+            // 并发度至少为 1,不超过 max_concurrency(若 max_concurrency=0 仍应 >=1)
+            prop_assert!(rec.concurrency >= 1);
+            prop_assert!(
+                rec.concurrency <= max_concurrency.max(1),
+                "并发度 {} 超过 max_concurrency {}",
+                rec.concurrency,
+                max_concurrency
+            );
+
+            // 分片大小在配置边界内
+            prop_assert!(
+                rec.fragment_size >= config.min_fragment_size,
+                "分片大小 {} 小于最小值 {}",
+                rec.fragment_size,
+                config.min_fragment_size
+            );
+            prop_assert!(
+                rec.fragment_size <= config.max_fragment_size,
+                "分片大小 {} 超过最大值 {}",
+                rec.fragment_size,
+                config.max_fragment_size
+            );
+
+            // 置信度在 [0.0, 1.0] 内
+            prop_assert!(rec.confidence >= 0.0 && rec.confidence <= 1.0);
+        }
+
+        // 冷启动(无带宽样本)时,分片大小为最小值,并发度为 max_concurrency
+        #[test]
+        fn test_cold_start_recommend(
+            file_size in 1u64..2 * 1024 * 1024 * 1024u64,
+            max_concurrency in 1u32..64,
+        ) {
+            let config = SchedulerConfig::default();
+            let sched = AdaptiveDownloadScheduler::new(config);
+            let rec = sched.recommend(file_size, max_concurrency);
+
+            prop_assert_eq!(rec.concurrency, max_concurrency);
+            prop_assert_eq!(rec.fragment_size, SchedulerConfig::default().min_fragment_size);
+            prop_assert!((rec.confidence - 0.0).abs() < f64::EPSILON);
         }
     }
 }

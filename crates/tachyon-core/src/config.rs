@@ -46,10 +46,35 @@ impl Default for IoStrategy {
 }
 
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::derivable_impls)]
 impl Default for IoStrategy {
     fn default() -> Self {
+        // Linux 5.4+ 自动检测 io_uring 可用性,可用时默认使用 io_uring 后端
+        #[cfg(target_os = "linux")]
+        {
+            if is_io_uring_available() {
+                return IoStrategy::IoUring;
+            }
+        }
         IoStrategy::Standard
+    }
+}
+
+/// 检测当前内核是否支持 io_uring
+///
+/// 通过尝试创建最小 io_uring 实例来检测,失败则说明不可用。
+/// 检测结果不缓存(仅在进程启动时调用一次)。
+#[cfg(target_os = "linux")]
+fn is_io_uring_available() -> bool {
+    // io_uring 需要 Linux 5.1+,完整 fixed buffer 支持需要 5.4+
+    // 最简检测:尝试 io_uring_setup 系统调用
+    unsafe {
+        let mut params: libc::io_uring_params = std::mem::zeroed();
+        let ring_fd = libc::io_uring_setup(1, &mut params);
+        if ring_fd >= 0 {
+            libc::close(ring_fd);
+            return true;
+        }
+        false
     }
 }
 
@@ -639,6 +664,7 @@ impl Default for AppConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -877,10 +903,19 @@ mod tests {
 
     #[test]
     fn test_io_strategy_default_is_standard() {
-        // Windows 默认为 IOCP,非 Windows 默认为 Standard
+        // Windows 默认为 IOCP
         #[cfg(target_os = "windows")]
         assert_eq!(IoStrategy::default(), IoStrategy::Iocp);
-        #[cfg(not(target_os = "windows"))]
+        // Linux 5.4+ 默认为 IoUring(运行时检测),其他非 Windows 平台默认为 Standard
+        #[cfg(target_os = "linux")]
+        {
+            let default = IoStrategy::default();
+            assert!(
+                default == IoStrategy::IoUring || default == IoStrategy::Standard,
+                "Linux 默认应为 IoUring 或 Standard,实际: {default:?}"
+            );
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         assert_eq!(IoStrategy::default(), IoStrategy::Standard);
     }
 
@@ -967,11 +1002,413 @@ mod tests {
         let default = IoStrategy::default();
         #[cfg(target_os = "windows")]
         assert_eq!(default, IoStrategy::Iocp, "Windows 默认应为 IOCP");
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        assert!(
+            default == IoStrategy::IoUring || default == IoStrategy::Standard,
+            "Linux 默认应为 IoUring 或 Standard,实际: {default:?}"
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         assert_eq!(
             default,
             IoStrategy::Standard,
-            "非 Windows 默认应为 Standard"
+            "非 Windows/Linux 默认应为 Standard"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P0: 配置校验边界测试
+    // -----------------------------------------------------------------------
+
+    fn assert_config_error<T: std::fmt::Debug>(result: crate::DownloadResult<T>, expected: &str) {
+        match result.unwrap_err() {
+            crate::DownloadError::Config(msg) => {
+                assert!(
+                    msg.contains(expected),
+                    "错误消息应包含 {expected:?},实际: {msg:?}"
+                )
+            }
+            other => panic!("预期 Config 错误,实际: {other:?}"),
+        }
+    }
+
+    fn valid_download_config() -> DownloadConfig {
+        let mut cfg = DownloadConfig::default();
+        cfg.download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        cfg.authorized_dirs = vec![cfg.download_dir.clone()];
+        cfg
+    }
+
+    #[test]
+    fn test_download_config_validate_max_concurrent_fragments_zero() {
+        let mut cfg = valid_download_config();
+        cfg.max_concurrent_fragments = 0;
+        assert_config_error(cfg.validate(), "max_concurrent_fragments 必须 >= 1");
+    }
+
+    #[test]
+    fn test_download_config_validate_max_concurrent_fragments_over_limit() {
+        let mut cfg = valid_download_config();
+        cfg.max_concurrent_fragments = MAX_CONCURRENT_FRAGMENTS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "max_concurrent_fragments 不能超过");
+    }
+
+    #[test]
+    fn test_download_config_validate_max_retries_over_limit() {
+        let mut cfg = valid_download_config();
+        cfg.max_retries = MAX_RETRIES_LIMIT + 1;
+        assert_config_error(cfg.validate(), "max_retries 不能超过");
+    }
+
+    #[test]
+    fn test_download_config_validate_request_timeout_zero() {
+        let mut cfg = valid_download_config();
+        cfg.request_timeout_secs = 0;
+        assert_config_error(cfg.validate(), "request_timeout_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_download_config_validate_request_timeout_over_limit() {
+        let mut cfg = valid_download_config();
+        cfg.request_timeout_secs = REQUEST_TIMEOUT_SECS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "request_timeout_secs 不能超过");
+    }
+
+    #[test]
+    fn test_download_config_validate_connect_timeout_zero() {
+        let mut cfg = valid_download_config();
+        cfg.connect_timeout_secs = 0;
+        assert_config_error(cfg.validate(), "connect_timeout_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_download_config_validate_connect_timeout_over_limit() {
+        let mut cfg = valid_download_config();
+        cfg.connect_timeout_secs = CONNECT_TIMEOUT_SECS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "connect_timeout_secs 不能超过");
+    }
+
+    #[test]
+    fn test_download_config_validate_empty_download_dir() {
+        let mut cfg = valid_download_config();
+        cfg.download_dir = String::new();
+        assert_config_error(cfg.validate(), "download_dir 不能为空");
+    }
+
+    #[test]
+    fn test_download_config_validate_pause_timeout_zero() {
+        let mut cfg = valid_download_config();
+        cfg.pause_timeout_secs = 0;
+        assert_config_error(cfg.validate(), "pause_timeout_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_download_config_validate_pause_timeout_over_limit() {
+        let mut cfg = valid_download_config();
+        cfg.pause_timeout_secs = PAUSE_TIMEOUT_SECS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "pause_timeout_secs 不能超过");
+    }
+
+    #[test]
+    fn test_download_config_validate_rate_limit_zero() {
+        let mut cfg = valid_download_config();
+        cfg.rate_limit_bytes_per_sec = Some(0);
+        assert_config_error(cfg.validate(), "rate_limit_bytes_per_sec 不能为 0");
+    }
+
+    #[test]
+    fn test_download_config_validate_max_full_stream_bytes_zero() {
+        let mut cfg = valid_download_config();
+        cfg.max_full_stream_bytes = 0;
+        assert_config_error(cfg.validate(), "max_full_stream_bytes 必须 >= 1");
+    }
+
+    #[test]
+    fn test_download_config_validate_empty_user_agent() {
+        let mut cfg = valid_download_config();
+        cfg.user_agent = String::new();
+        assert_config_error(cfg.validate(), "user_agent 不能为空");
+    }
+
+    #[test]
+    fn test_download_config_validate_empty_authorized_dirs() {
+        let mut cfg = valid_download_config();
+        cfg.authorized_dirs = vec![];
+        assert_config_error(cfg.validate(), "authorized_dirs 不能为空");
+    }
+
+    #[test]
+    fn test_download_config_validate_valid() {
+        let cfg = valid_download_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_connection_config_validate_max_connections_per_host_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_connections_per_host = 0;
+        assert_config_error(cfg.validate(), "max_connections_per_host 必须 >= 1");
+    }
+
+    #[test]
+    fn test_connection_config_validate_max_connections_per_host_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_connections_per_host = MAX_CONNECTIONS_PER_HOST_LIMIT + 1;
+        assert_config_error(cfg.validate(), "max_connections_per_host 不能超过");
+    }
+
+    #[test]
+    fn test_connection_config_validate_max_global_connections_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_global_connections = 0;
+        assert_config_error(cfg.validate(), "max_global_connections 必须 >= 1");
+    }
+
+    #[test]
+    fn test_connection_config_validate_max_global_connections_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_global_connections = MAX_GLOBAL_CONNECTIONS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "max_global_connections 不能超过");
+    }
+
+    #[test]
+    fn test_connection_config_validate_valid() {
+        assert!(ConnectionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_min_fragment_size_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.min_fragment_size = 0;
+        assert_config_error(cfg.validate(), "min_fragment_size 必须 >= 1");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_max_fragment_size_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.max_fragment_size = 0;
+        assert_config_error(cfg.validate(), "max_fragment_size 必须 >= 1");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_min_greater_than_max() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.min_fragment_size = 1024;
+        cfg.max_fragment_size = 512;
+        assert_config_error(
+            cfg.validate(),
+            "min_fragment_size 不能大于 max_fragment_size",
+        );
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_ewma_alpha_negative() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.ewma_alpha = -0.1;
+        assert_config_error(cfg.validate(), "ewma_alpha 必须在 0.0 ~ 1.0 之间");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_ewma_alpha_over_one() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.ewma_alpha = 1.1;
+        assert_config_error(cfg.validate(), "ewma_alpha 必须在 0.0 ~ 1.0 之间");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_ewma_beta_out_of_range() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.ewma_beta = -0.01;
+        assert_config_error(cfg.validate(), "ewma_beta 必须在 0.0 ~ 1.0 之间");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_default_target_fragments_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.default_target_fragments = 0;
+        assert_config_error(cfg.validate(), "default_target_fragments 必须 >= 1");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_sampling_interval_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.sampling_interval_secs = 0;
+        assert_config_error(cfg.validate(), "sampling_interval_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_scheduler_config_validate_valid() {
+        assert!(SchedulerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_app_config_validate_max_concurrent_tasks_zero() {
+        let mut cfg = AppConfig::default();
+        cfg.max_concurrent_tasks = 0;
+        assert_config_error(cfg.validate(), "max_concurrent_tasks 必须 >= 1");
+    }
+
+    #[test]
+    fn test_app_config_validate_max_concurrent_tasks_over_limit() {
+        let mut cfg = AppConfig::default();
+        cfg.max_concurrent_tasks = MAX_CONCURRENT_TASKS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "max_concurrent_tasks 不能超过");
+    }
+
+    #[test]
+    fn test_app_config_validate_propagates_download_error() {
+        let mut cfg = AppConfig::default();
+        cfg.download.max_concurrent_fragments = 0;
+        assert_config_error(cfg.validate(), "max_concurrent_fragments 必须 >= 1");
+    }
+
+    #[test]
+    fn test_app_config_validate_propagates_connection_error() {
+        let mut cfg = AppConfig::default();
+        cfg.connection.max_connections_per_host = 0;
+        assert_config_error(cfg.validate(), "max_connections_per_host 必须 >= 1");
+    }
+
+    #[test]
+    fn test_app_config_validate_propagates_scheduler_error() {
+        let mut cfg = AppConfig::default();
+        cfg.scheduler.min_fragment_size = 0;
+        assert_config_error(cfg.validate(), "min_fragment_size 必须 >= 1");
+    }
+
+    #[test]
+    fn test_app_config_validate_valid() {
+        assert!(AppConfig::default().validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::manual_range_contains)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // 随机 DownloadConfig 字段边界:validate 拒绝非法值,接受合法值
+    proptest! {
+        #[test]
+        fn test_download_config_validate_random_boundaries(
+            max_concurrent_fragments in 0u32..MAX_CONCURRENT_FRAGMENTS_LIMIT + 10,
+            max_retries in 0u32..MAX_RETRIES_LIMIT + 10,
+            request_timeout_secs in 0u64..REQUEST_TIMEOUT_SECS_LIMIT + 10,
+            connect_timeout_secs in 0u64..CONNECT_TIMEOUT_SECS_LIMIT + 10,
+            pause_timeout_secs in 0u64..PAUSE_TIMEOUT_SECS_LIMIT + 10,
+            max_full_stream_bytes in 0u64..1024u64,
+            rate_limit in prop::option::of(0u64..2u64),
+        ) {
+            let mut cfg = DownloadConfig::default();
+            cfg.download_dir = std::env::temp_dir().to_string_lossy().to_string();
+            cfg.authorized_dirs = vec![cfg.download_dir.clone()];
+            cfg.max_concurrent_fragments = max_concurrent_fragments;
+            cfg.max_retries = max_retries;
+            cfg.request_timeout_secs = request_timeout_secs;
+            cfg.connect_timeout_secs = connect_timeout_secs;
+            cfg.pause_timeout_secs = pause_timeout_secs;
+            cfg.max_full_stream_bytes = max_full_stream_bytes;
+            cfg.rate_limit_bytes_per_sec = rate_limit;
+
+            let result = cfg.validate();
+
+            let valid = max_concurrent_fragments >= 1
+                && max_concurrent_fragments <= MAX_CONCURRENT_FRAGMENTS_LIMIT
+                && max_retries <= MAX_RETRIES_LIMIT
+                && request_timeout_secs >= 1
+                && request_timeout_secs <= REQUEST_TIMEOUT_SECS_LIMIT
+                && connect_timeout_secs >= 1
+                && connect_timeout_secs <= CONNECT_TIMEOUT_SECS_LIMIT
+                && pause_timeout_secs >= 1
+                && pause_timeout_secs <= PAUSE_TIMEOUT_SECS_LIMIT
+                && max_full_stream_bytes >= 1
+                && rate_limit != Some(0);
+
+            prop_assert_eq!(result.is_ok(), valid, "{}", format!("validate 结果与预期不一致: {result:?}"));
+        }
+
+        // 随机 ConnectionConfig 边界
+        #[test]
+        fn test_connection_config_validate_random_boundaries(
+            max_connections_per_host in 0u32..MAX_CONNECTIONS_PER_HOST_LIMIT + 10,
+            max_global_connections in 0u32..MAX_GLOBAL_CONNECTIONS_LIMIT + 10,
+        ) {
+            let mut cfg = ConnectionConfig::default();
+            cfg.max_connections_per_host = max_connections_per_host;
+            cfg.max_global_connections = max_global_connections;
+
+            let result = cfg.validate();
+            let valid = max_connections_per_host >= 1
+                && max_connections_per_host <= MAX_CONNECTIONS_PER_HOST_LIMIT
+                && max_global_connections >= 1
+                && max_global_connections <= MAX_GLOBAL_CONNECTIONS_LIMIT;
+
+            prop_assert_eq!(result.is_ok(), valid, "{}", format!("ConnectionConfig validate 不一致: {result:?}"));
+        }
+
+        // 随机 SchedulerConfig 边界
+        #[test]
+        fn test_scheduler_config_validate_random_boundaries(
+            min_fragment_size in 0u64..2 * 1024 * 1024u64,
+            max_fragment_size in 0u64..2 * 1024 * 1024u64,
+            ewma_alpha in -0.5f64..1.5f64,
+            ewma_beta in -0.5f64..1.5f64,
+            default_target_fragments in 0u32..20,
+            sampling_interval_secs in 0u64..120,
+        ) {
+            let mut cfg = SchedulerConfig::default();
+            cfg.min_fragment_size = min_fragment_size;
+            cfg.max_fragment_size = max_fragment_size;
+            cfg.ewma_alpha = ewma_alpha;
+            cfg.ewma_beta = ewma_beta;
+            cfg.default_target_fragments = default_target_fragments;
+            cfg.sampling_interval_secs = sampling_interval_secs;
+
+            let result = cfg.validate();
+            let valid = min_fragment_size >= 1
+                && max_fragment_size >= 1
+                && min_fragment_size <= max_fragment_size
+                && (0.0..=1.0).contains(&ewma_alpha)
+                && (0.0..=1.0).contains(&ewma_beta)
+                && default_target_fragments >= 1
+                && sampling_interval_secs >= 1;
+
+            prop_assert_eq!(result.is_ok(), valid, "{}", format!("SchedulerConfig validate 不一致: {result:?}"));
+        }
+
+        // AppConfig 随机补丁:应用补丁后再 validate 不应 panic
+        #[test]
+        fn test_app_config_patch_and_validate_no_panic(
+            max_concurrent_tasks in 0u32..MAX_CONCURRENT_TASKS_LIMIT + 10,
+            download_dir in "[a-zA-Z0-9_\\-/]{0,30}",
+        ) {
+            let mut base = AppConfig::default();
+            base.download.download_dir = std::env::temp_dir().to_string_lossy().to_string();
+            base.download.authorized_dirs = vec![base.download.download_dir.clone()];
+
+            let patch = ConfigPatch {
+                max_concurrent_tasks: Some(max_concurrent_tasks),
+                download: Some(DownloadPatch {
+                    download_dir: Some(if download_dir.is_empty() {
+                        std::env::temp_dir().to_string_lossy().to_string()
+                    } else {
+                        download_dir
+                    }),
+                    max_concurrent_fragments: None,
+                    max_retries: None,
+                    request_timeout_secs: None,
+                    connect_timeout_secs: None,
+                    verify_checksum: None,
+                    pause_timeout_secs: None,
+                    rate_limit_bytes_per_sec: None,
+                    io_strategy: None,
+                }),
+                connection: None,
+            };
+
+            let patched = patch.apply_to(&base);
+            // 仅验证不 panic;由于随机 dir 可能含非法字符,不强制 Ok
+            let _ = patched.validate();
+        }
     }
 }

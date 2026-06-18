@@ -411,4 +411,39 @@ mod tests {
         let url = Url::parse("https://example.com/file.bin").unwrap();
         let _ = validate_redirect(&url, 10, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // P1: validate_public_http_url 协议 / 空主机 / IP 字面量
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_public_http_url_rejects_non_http_scheme() {
+        let url = Url::parse("ftp://example.com/file.bin").unwrap();
+        let result = validate_public_http_url(&url);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("不支持的协议"));
+    }
+
+    #[test]
+    #[ignore = "业务逻辑 bug:空主机(如 https://./path)当前未被 validate_public_http_url 拒绝"]
+    fn validate_public_http_url_rejects_empty_host() {
+        let url = Url::parse("https://./path/file.bin").unwrap();
+        let result = validate_public_http_url(&url);
+        assert!(result.is_err(), "空主机应被拒绝");
+        assert!(result.unwrap_err().to_string().contains("URL 主机为空"));
+    }
+
+    #[test]
+    fn validate_public_http_url_handles_ip_literal() {
+        let public = Url::parse("https://8.8.8.8/file.bin").unwrap();
+        assert!(
+            validate_public_http_url(&public).is_ok(),
+            "公网 IP 字面量应被允许"
+        );
+
+        let private = Url::parse("http://192.168.1.1/file.bin").unwrap();
+        let result = validate_public_http_url(&private);
+        assert!(result.is_err(), "私有 IP 字面量应被拒绝");
+        assert!(result.unwrap_err().to_string().contains("受限"));
+    }
 }

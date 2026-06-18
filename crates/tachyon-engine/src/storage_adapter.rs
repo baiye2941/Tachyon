@@ -292,3 +292,127 @@ impl DynStorage {
 
 // FragmentProgress 已移动到 tachyon-core::types,本模块不再定义该类型,
 // 相关实现统一通过 tachyon_core::FragmentProgress 引用。
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Bytes, BytesMut};
+
+    use super::{AsyncMemWrapper, DynStorage};
+    use tachyon_core::config::IoStrategy;
+    use tachyon_core::test_harness::harness::MemoryStorage as MemStorage;
+    use tachyon_io::storage::AsyncStorage;
+
+    #[tokio::test]
+    async fn test_dyn_storage_open_with_strategy_standard() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::Standard)
+            .await
+            .unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 5];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 5);
+        assert_eq!(&buf, b"hello");
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_storage_open_with_strategy_win_aligned() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::WinAligned)
+            .await
+            .unwrap();
+        // 基本操作应成功：Windows 上使用 WinFile，其他平台回退到 Standard
+        storage.allocate(1024).await.unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"aligned"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 7];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 7);
+        assert_eq!(&buf, b"aligned");
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_storage_open_with_strategy_iocp() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::Iocp)
+            .await
+            .unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"iocp"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 4);
+        assert_eq!(&buf, b"iocp");
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_storage_open_with_strategy_iouring() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::IoUring)
+            .await
+            .unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"uring"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 5];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 5);
+        assert_eq!(&buf, b"uring");
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dyn_storage_delegation() {
+        let storage = DynStorage::memory();
+        storage
+            .write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        storage
+            .write_at_mut(5, BytesMut::from(&b" world"[..]))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 11];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(&buf, b"hello world");
+        storage.allocate(1024).await.unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), 1024);
+        storage.sync().await.unwrap();
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_mem_wrapper_behavior() {
+        let mem = MemStorage::new();
+        let wrapper = AsyncMemWrapper(mem.clone());
+        let data = Bytes::from_static(b"async wrapper");
+        let written = wrapper.write_at(0, data.clone()).await.unwrap();
+        assert_eq!(written, data.len());
+
+        let mut buf = [0u8; 13];
+        let read = wrapper.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 13);
+        assert_eq!(&buf, b"async wrapper");
+
+        wrapper.allocate(64).await.unwrap();
+        assert_eq!(wrapper.file_size().await.unwrap(), 64);
+        wrapper.sync().await.unwrap();
+        wrapper.close().await.unwrap();
+
+        // 底层 MemoryStorage 与 AsyncMemWrapper 共享同一份数据
+        assert_eq!(mem.get_data().len(), 64);
+        assert_eq!(&mem.get_data()[..13], b"async wrapper");
+    }
+}

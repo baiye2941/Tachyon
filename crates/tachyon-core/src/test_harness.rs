@@ -549,4 +549,218 @@ mod tests {
         let id = Uuid::from_bytes([0u8; 16]);
         assert_eq!(id.as_bytes(), &[0u8; 16]);
     }
+
+    // -----------------------------------------------------------------------
+    // P1: MockProtocol 全量下载 / 流式 / clear_selected / failing 覆盖
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_mock_protocol_with_default_data_success() {
+        let data = Bytes::from_static(b"full content");
+        let protocol =
+            MockProtocol::new(test_metadata("file.bin", 100)).with_default_data(data.clone());
+        let result = protocol.download_full("http://example.com/file.bin").await;
+        assert_eq!(result.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_download_full_failure_when_missing_data() {
+        let protocol = MockProtocol::new(test_metadata("file.bin", 100));
+        let result = protocol.download_full("http://example.com/file.bin").await;
+        assert!(
+            matches!(result.unwrap_err(), DownloadError::Protocol(_)),
+            "未配置 default_data 时应返回 Protocol 错误"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_download_full_stream() {
+        use futures::StreamExt;
+
+        let data = Bytes::from_static(b"streamed data");
+        let protocol =
+            MockProtocol::new(test_metadata("file.bin", 100)).with_default_data(data.clone());
+        let mut stream = protocol
+            .download_full_stream("http://example.com/file.bin")
+            .await
+            .unwrap();
+
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk, data);
+        assert!(stream.next().await.is_none(), "单块流应仅有一个元素");
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_clear_selected() {
+        let protocol = MockProtocol::new(test_metadata("file.bin", 100));
+        // 默认实现为空操作,不应 panic
+        protocol.clear_selected().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::type_complexity)]
+    async fn test_mock_protocol_failing_preserves_cloneable_errors() {
+        let cases: Vec<(DownloadError, Box<dyn Fn(&DownloadError)>)> = vec![
+            (
+                DownloadError::Network("timeout".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::Network(s) if s == "timeout"))),
+            ),
+            (
+                DownloadError::Protocol("bad".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::Protocol(s) if s == "bad"))),
+            ),
+            (
+                DownloadError::Fragment("short".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::Fragment(s) if s == "short"))),
+            ),
+            (
+                DownloadError::ChecksumMismatch {
+                    expected: "abc".into(),
+                    actual: "def".into(),
+                },
+                Box::new(|e| {
+                    assert!(matches!(
+                        e,
+                        DownloadError::ChecksumMismatch { expected, actual }
+                        if expected == "abc" && actual == "def"
+                    ))
+                }),
+            ),
+            (
+                DownloadError::NoExpectedChecksum,
+                Box::new(|e| assert!(matches!(e, DownloadError::NoExpectedChecksum))),
+            ),
+            (
+                DownloadError::Config("bad".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::Config(s) if s == "bad"))),
+            ),
+            (
+                DownloadError::Cancelled,
+                Box::new(|e| assert!(matches!(e, DownloadError::Cancelled))),
+            ),
+            (
+                DownloadError::TaskNotFound("t1".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::TaskNotFound(s) if s == "t1"))),
+            ),
+            (
+                DownloadError::ConnectionPoolExhausted,
+                Box::new(|e| assert!(matches!(e, DownloadError::ConnectionPoolExhausted))),
+            ),
+            (
+                DownloadError::Timeout("30s".into()),
+                Box::new(|e| assert!(matches!(e, DownloadError::Timeout(s) if s == "30s"))),
+            ),
+            (
+                DownloadError::Throttled {
+                    retry_after_secs: Some(60),
+                },
+                Box::new(|e| {
+                    assert!(matches!(
+                        e,
+                        DownloadError::Throttled {
+                            retry_after_secs: Some(60)
+                        }
+                    ))
+                }),
+            ),
+            (
+                DownloadError::Forbidden { status: 403 },
+                Box::new(|e| assert!(matches!(e, DownloadError::Forbidden { status: 403 }))),
+            ),
+            (
+                DownloadError::Http {
+                    status: 500,
+                    reason: "err".into(),
+                },
+                Box::new(|e| {
+                    assert!(matches!(
+                        e,
+                        DownloadError::Http { status: 500, reason }
+                        if reason == "err"
+                    ))
+                }),
+            ),
+        ];
+
+        for (err, check) in cases {
+            let protocol = MockProtocol::failing(err);
+            let result = protocol.probe("http://example.com/file.bin").await;
+            check(&result.unwrap_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_failing_downgrades_non_cloneable_errors() {
+        let io_err = DownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file gone",
+        ));
+        let other_err = DownloadError::Other(Box::new(std::io::Error::other("other")));
+        let url_err = DownloadError::UrlParse(url::ParseError::EmptyHost);
+        let serde_err = DownloadError::Serialization(
+            serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+        );
+
+        for err in [io_err, other_err, url_err, serde_err] {
+            let original_msg = err.to_string();
+            let protocol = MockProtocol::failing(err);
+            let result = protocol.probe("http://example.com/file.bin").await;
+            match result.unwrap_err() {
+                DownloadError::Network(s) => {
+                    assert!(
+                        s.contains(&original_msg),
+                        "降级后的 Network 错误应保留原始描述: {s}"
+                    );
+                }
+                other => panic!("预期降级为 Network 错误,实际: {other:?}"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P1: MemoryStorage 扩展测试
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_memory_storage_with_capacity() {
+        let storage = MemoryStorage::with_capacity(8);
+        assert_eq!(storage.get_data(), vec![0u8; 8]);
+
+        storage
+            .write_at(2, Bytes::from_static(b"ab"))
+            .await
+            .unwrap();
+        let data = storage.get_data();
+        assert_eq!(data, vec![0, 0, b'a', b'b', 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_get_data_isolation() {
+        let storage = MemoryStorage::new();
+        storage.write_at(0, Bytes::from_static(b"x")).await.unwrap();
+        let snapshot = storage.get_data();
+        storage.write_at(1, Bytes::from_static(b"y")).await.unwrap();
+        assert_eq!(snapshot, vec![b'x']);
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_close() {
+        let storage = MemoryStorage::new();
+        assert!(storage.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_large_offset_write() {
+        let storage = MemoryStorage::new();
+        storage
+            .write_at(1024, Bytes::from_static(b"end"))
+            .await
+            .unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), 1027);
+
+        let data = storage.get_data();
+        assert_eq!(&data[1024..], b"end");
+        // 未写入的中间区域应为 0
+        assert!(data[..1024].iter().all(|&b| b == 0));
+    }
 }

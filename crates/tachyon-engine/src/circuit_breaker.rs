@@ -117,15 +117,13 @@ impl SourceCircuitBreakers {
     }
 
     /// 检查指定源是否被放行
+    ///
+    /// 使用单次 DashMap 查找(entry API),避免双重查找 + 双重 String 分配。
     pub fn allow(&self, source: &str) -> bool {
-        // 确保条目存在(首次访问时插入)
         self.breakers
             .entry(source.to_string())
-            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.open_duration));
-        // 获取可变引用并调用 allow
-        self.breakers
-            .get_mut(source)
-            .is_some_and(|mut cb| cb.allow())
+            .or_insert_with(|| CircuitBreaker::new(self.failure_threshold, self.open_duration))
+            .allow()
     }
 
     /// 记录指定源成功
@@ -264,5 +262,88 @@ mod tests {
         thread::sleep(Duration::from_millis(60));
         assert!(scb.allow("http://example.com/a"));
         assert!(!scb.allow("http://example.com/a"));
+    }
+
+    #[tokio::test]
+    async fn test_half_open_after_duration_with_paused_time() {
+        tokio::time::pause();
+        let mut cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // 模拟熔断时长已过(确定性控制,不依赖真实 sleep)
+        cb.opened_at = Some(Instant::now() - Duration::from_secs(6));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[tokio::test]
+    async fn test_half_open_probe_success_closes_with_paused_time() {
+        tokio::time::pause();
+        let mut cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        cb.record_failure();
+        cb.record_failure();
+        cb.opened_at = Some(Instant::now() - Duration::from_secs(6));
+
+        assert!(cb.allow(), "半开状态应允许第一个探测请求");
+        assert!(cb.half_open_probe_sent, "应标记探测已发出");
+
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed, "probe 成功应关闭熔断器");
+        assert_eq!(cb.failure_count, 0);
+        assert!(!cb.half_open_probe_sent);
+    }
+
+    #[tokio::test]
+    async fn test_half_open_probe_failure_reopens_with_paused_time() {
+        tokio::time::pause();
+        let mut cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        cb.record_failure();
+        cb.record_failure();
+        cb.opened_at = Some(Instant::now() - Duration::from_secs(6));
+
+        assert!(cb.allow(), "半开状态应允许第一个探测请求");
+        let old_opened_at = cb.opened_at.unwrap();
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open, "probe 失败应重新熔断");
+        assert!(cb.opened_at.unwrap() > old_opened_at, "应重置熔断开启时间");
+        assert!(!cb.half_open_probe_sent);
+    }
+
+    #[tokio::test]
+    async fn test_half_open_only_allows_one_probe() {
+        tokio::time::pause();
+        let mut cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        cb.record_failure();
+        cb.record_failure();
+        cb.opened_at = Some(Instant::now() - Duration::from_secs(6));
+
+        assert!(cb.allow(), "第一个探测请求应通过");
+        assert!(!cb.allow(), "第二个请求在半开状态应被拒绝");
+    }
+
+    #[tokio::test]
+    async fn test_source_circuit_breakers_half_open_probe_with_paused_time() {
+        tokio::time::pause();
+        let scb = SourceCircuitBreakers::new(2, Duration::from_secs(5));
+        scb.record_failure("http://example.com/a");
+        scb.record_failure("http://example.com/a");
+        assert!(!scb.allow("http://example.com/a"));
+
+        // 通过直接修改内部熔断器时间模拟超时
+        {
+            let mut cb = scb.breakers.get_mut("http://example.com/a").unwrap();
+            cb.opened_at = Some(Instant::now() - Duration::from_secs(6));
+        }
+
+        assert!(
+            scb.allow("http://example.com/a"),
+            "半开后应允许一个探测请求"
+        );
+        assert!(
+            !scb.allow("http://example.com/a"),
+            "同一源第二个请求应被拒绝"
+        );
     }
 }

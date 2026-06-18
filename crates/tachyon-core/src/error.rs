@@ -374,4 +374,76 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // P1: is_retryable 完整真值表
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_retryable_truth_table_retryable_variants() {
+        assert!(DownloadError::Timeout("t".into()).is_retryable());
+        assert!(DownloadError::Network("n".into()).is_retryable());
+        assert!(DownloadError::Protocol("p".into()).is_retryable());
+        assert!(DownloadError::Io(std::io::Error::other("io")).is_retryable());
+        assert!(DownloadError::Fragment("f".into()).is_retryable());
+        assert!(DownloadError::ConnectionPoolExhausted.is_retryable());
+        assert!(
+            DownloadError::Throttled {
+                retry_after_secs: Some(5)
+            }
+            .is_retryable()
+        );
+        assert!(
+            DownloadError::Throttled {
+                retry_after_secs: None
+            }
+            .is_retryable()
+        );
+
+        for status in [500, 502, 503, 504, 429, 408] {
+            assert!(
+                DownloadError::Http {
+                    status,
+                    reason: format!("R {status}")
+                }
+                .is_retryable(),
+                "HTTP {status} 应可重试"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_retryable_truth_table_non_retryable_variants() {
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
+        assert!(
+            !DownloadError::ChecksumMismatch {
+                expected: "a".into(),
+                actual: "b".into()
+            }
+            .is_retryable()
+        );
+        assert!(!DownloadError::NoExpectedChecksum.is_retryable());
+        assert!(!DownloadError::TaskNotFound("x".into()).is_retryable());
+        assert!(!DownloadError::Config("c".into()).is_retryable());
+        assert!(!DownloadError::UrlParse(url::ParseError::EmptyHost).is_retryable());
+        assert!(
+            !DownloadError::Serialization(
+                serde_json::from_str::<serde_json::Value>("bad").unwrap_err()
+            )
+            .is_retryable()
+        );
+        assert!(!DownloadError::Other("o".into()).is_retryable());
+
+        for status in [400, 401, 403, 404, 405, 406, 410] {
+            assert!(
+                !DownloadError::Http {
+                    status,
+                    reason: format!("NR {status}")
+                }
+                .is_retryable(),
+                "HTTP {status} 不应可重试"
+            );
+        }
+    }
 }

@@ -376,6 +376,8 @@ pub struct IoCpStorage {
     /// Windows 内核完成通知原样返回 OVERLAPPED 地址,通过指针算术恢复 slot 索引,
     /// 完全消除原 parking_lot::Mutex 的串行化瓶颈。
     slots: std::sync::Arc<CompletionSlots>,
+    /// NO_BUFFERING 模式下非对齐写入的 buffered fallback 句柄
+    fallback: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 // Safety: IoCpStorage 的所有字段均可安全跨线程共享:
@@ -401,6 +403,7 @@ impl IoCpStorage {
             poller: None,
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slots: std::sync::Arc::new(CompletionSlots::new()),
+            fallback: std::sync::Mutex::new(None),
         }
     }
 
@@ -412,6 +415,43 @@ impl IoCpStorage {
     /// 获取目标文件路径
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// NO_BUFFERING 模式扇区对齐常量
+    const IOCP_SECTOR_SIZE: u64 = 512;
+
+    /// 惰性获取 buffered fallback 句柄,用于非对齐 I/O
+    ///
+    /// NO_BUFFERING 要求所有 I/O 偏移和长度按扇区大小对齐。
+    /// 不满足对齐要求的写入/读取通过此 fallback 句柄走缓冲 I/O 路径。
+    #[cfg(target_os = "windows")]
+    fn get_or_init_fallback(&self) -> DownloadResult<std::fs::File> {
+        // fast path: fallback 已初始化
+        {
+            let guard = self.fallback.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref f) = *guard {
+                return f.try_clone().map_err(DownloadError::Io);
+            }
+        }
+        // slow path: 惰性打开 buffered 句柄
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE: u32 = 0x00000001 | 0x00000002 | 0x00000004; // READ|WRITE|DELETE
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(SHARE)
+            .open(&self.path)
+            .map_err(DownloadError::Io)?;
+        let mut guard = self.fallback.lock().unwrap_or_else(|e| e.into_inner());
+        // 双检:另一线程可能已初始化
+        if let Some(ref existing) = *guard {
+            return existing.try_clone().map_err(DownloadError::Io);
+        }
+        let result = file.try_clone().map_err(DownloadError::Io)?;
+        *guard = Some(file);
+        Ok(result)
     }
 
     fn clone_ready_file(&self) -> DownloadResult<std::fs::File> {
@@ -451,16 +491,22 @@ impl IoCpStorage {
 
         use std::os::windows::fs::OpenOptionsExt;
 
-        // FILE_FLAG_OVERLAPPED(0x40000000) | FILE_FLAG_SEQUENTIAL_SCAN(0x08000000)
-        // Safety: 这两个标志仅改变内核 I/O 调度行为,不涉及内存安全。
-        const OVERLAPPED_SEQUENTIAL: u32 = 0x40000000 | 0x08000000;
+        // FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
+        // Safety:
+        // - OVERLAPPED: 使 WriteFile/ReadFile 变为异步,通过 IOCP 完成端口通知。
+        // - SEQUENTIAL_SCAN: 提示内核使用顺序预读策略。
+        // - NO_BUFFERING: 绕过 Windows Page Cache,写入直接到达磁盘。
+        //   约束:所有通过主句柄的 I/O 操作的偏移和长度必须按扇区大小对齐
+        //   (通常 512 字节,推荐 4096 字节)。非对齐的写入/读取自动路由到
+        //   惰性初始化的 buffered fallback 句柄(见 get_or_init_fallback)。
+        const OVERLAPPED_SEQUENTIAL_NOBUF: u32 = 0x40000000 | 0x08000000 | 0x20000000;
 
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .custom_flags(OVERLAPPED_SEQUENTIAL)
+            .custom_flags(OVERLAPPED_SEQUENTIAL_NOBUF)
             .open(&self.path)
             .map_err(DownloadError::Io)?;
 
@@ -775,6 +821,21 @@ impl crate::storage::AsyncStorage for IoCpStorage {
             use std::os::windows::io::AsRawHandle;
             use std::sync::atomic::Ordering;
 
+            // NO_BUFFERING 非对齐写入路由到 buffered fallback
+            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
+                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE);
+            if needs_fallback {
+                let fallback_file = self.get_or_init_fallback()?;
+                return tokio::task::spawn_blocking(move || {
+                    use std::os::windows::fs::FileExt;
+                    fallback_file
+                        .seek_write(&data, offset)
+                        .map_err(DownloadError::Io)
+                })
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?;
+            }
+
             if self.state != IoCpState::Ready {
                 return Err(DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
@@ -878,6 +939,24 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
 
+            // NO_BUFFERING 非对齐读取路由到 buffered fallback
+            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
+                || !(buf.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE);
+            if needs_fallback {
+                let fallback_file = self.get_or_init_fallback()?;
+                let buf_len = buf.len();
+                let mut owned_buf = vec![0u8; buf_len];
+                let (n, owned_buf) = tokio::task::spawn_blocking(move || {
+                    let n = fallback_file.seek_read(&mut owned_buf, offset)?;
+                    Ok::<_, std::io::Error>((n, owned_buf))
+                })
+                .await
+                .map_err(|e| DownloadError::Io(e.into()))?
+                .map_err(DownloadError::Io)?;
+                buf[..n].copy_from_slice(&owned_buf[..n]);
+                return Ok(n);
+            }
+
             let file = self.clone_ready_file()?;
             let buf_len = buf.len();
             let mut owned_buf = vec![0u8; buf_len];
@@ -898,16 +977,57 @@ impl crate::storage::AsyncStorage for IoCpStorage {
             let file = self.clone_ready_file()?;
             tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
                 .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+                .map_err(|e| DownloadError::Io(e.into()))??;
+            // flush fallback 句柄(若已初始化),保证缓冲数据落盘
+            let fallback_file = {
+                let guard = self.fallback.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().and_then(|f| f.try_clone().ok())
+            };
+            if let Some(f) = fallback_file {
+                tokio::task::spawn_blocking(move || f.sync_data().map_err(DownloadError::Io))
+                    .await
+                    .map_err(|e| DownloadError::Io(e.into()))??;
+            }
+            Ok(())
         })
     }
 
     fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.clone_ready_file()?;
-            tokio::task::spawn_blocking(move || file.set_len(size).map_err(DownloadError::Io))
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+            tokio::task::spawn_blocking(move || {
+                // 先 set_len 扩展文件大小
+                file.set_len(size).map_err(DownloadError::Io)?;
+                // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
+                // 失败时静默回退(文件已通过 set_len 正确扩展,只是较慢)
+                // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
+                // 但下载数据会立即覆盖,安全风险极低。
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                    // Safety:
+                    // - handle 来自合法的 File 句柄(通过 clone_ready_file 获取)
+                    // - size 由调用方传入,来自文件元数据的合法大小值
+                    // - 内核保证:失败时不影响文件现有状态
+                    let result = unsafe {
+                        windows_sys::Win32::Storage::FileSystem::SetFileValidData(
+                            handle,
+                            size as i64,
+                        )
+                    };
+                    if result == 0 {
+                        // SetFileValidData 失败(通常因权限不足),静默回退
+                        tracing::debug!(
+                            size,
+                            "SetFileValidData 失败(需 SE_MANAGE_VOLUME_NAME),回退到零填充模式"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
         })
     }
 

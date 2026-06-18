@@ -15,11 +15,13 @@
 //! - 全量下载
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
+use dashmap::DashMap;
 #[cfg(test)]
 use tachyon_core::safety::{extract_filename_from_url, parse_content_disposition};
 use tachyon_core::traits::Protocol;
@@ -28,6 +30,9 @@ use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 use url::Url;
 
 use crate::http::parse_retry_after;
+
+/// QUIC DNS 缓存 TTL(秒)
+const QUIC_DNS_CACHE_TTL_SECS: u64 = 60;
 
 /// HTTP/3 客户端请求句柄类型(h3 + h3-quinn)
 ///
@@ -54,6 +59,8 @@ pub struct QuicTransport {
     /// 存在条目表示该 host 的 TLS session 已由 rustls 内部缓存,可尝试 0-RTT。
     /// 条目附带 `Instant` 时间戳用于 TTL 过期清理。
     session_tokens: HashMap<String, (Vec<u8>, Instant)>,
+    /// DNS 解析缓存:按 "host:port" 缓存解析结果,避免每次 connect 重新解析
+    dns_cache: DashMap<String, (SocketAddr, Instant)>,
     /// HTTP/3 客户端请求句柄(连接建立后创建, Mutex 保护并发请求发送)
     h3_send: Option<H3SendRequest>,
     /// HTTP/3 连接管理句柄(保持控制流活跃,防止服务端 GOAWAY)
@@ -90,9 +97,14 @@ impl QuicTransport {
             .with_no_client_auth();
         tls_config.resumption = rustls::client::Resumption::in_memory_sessions(256);
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(
-            |e: std::net::AddrParseError| DownloadError::Network(format!("解析本地地址失败: {e}")),
-        )?)
+        // 优先尝试 IPv6 双栈端点([::]:0 在大多数系统上同时支持 IPv4 和 IPv6),
+        // 失败时回退到 IPv4(0.0.0.0:0)
+        let mut endpoint = quinn::Endpoint::client(
+            "[::]:0"
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("IPv4 地址解析不应失败")),
+        )
+        .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().expect("IPv4 地址解析不应失败")))
         .map_err(|e| DownloadError::Network(format!("创建 QUIC 端点失败: {e}")))?;
 
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -107,6 +119,7 @@ impl QuicTransport {
             connection: None,
             stored_crypto: Some(stored_crypto),
             session_tokens: HashMap::new(),
+            dns_cache: DashMap::new(),
             h3_send: None,
             h3_conn: None,
         })
@@ -122,6 +135,7 @@ impl QuicTransport {
             connection: None,
             stored_crypto: None,
             session_tokens: HashMap::new(),
+            dns_cache: DashMap::new(),
             h3_send: None,
             h3_conn: None,
         }
@@ -149,9 +163,13 @@ impl QuicTransport {
             .map_err(|e| DownloadError::Network(format!("构建 TLS 配置失败: {e}")))?;
         crypto.resumption = rustls::client::Resumption::in_memory_sessions(64);
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(
-            |e: std::net::AddrParseError| DownloadError::Network(format!("解析本地地址失败: {e}")),
-        )?)
+        // 优先尝试 IPv6 双栈端点,失败时回退到 IPv4
+        let mut endpoint = quinn::Endpoint::client(
+            "[::]:0"
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("IPv4 地址解析不应失败")),
+        )
+        .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().expect("IPv4 地址解析不应失败")))
         .map_err(|e| DownloadError::Network(format!("创建 QUIC 端点失败: {e}")))?;
 
         let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
@@ -165,9 +183,27 @@ impl QuicTransport {
             connection: None,
             stored_crypto: Some(stored_crypto),
             session_tokens: HashMap::new(),
+            dns_cache: DashMap::new(),
             h3_send: None,
             h3_conn: None,
         })
+    }
+
+    /// DNS 解析并缓存结果
+    async fn resolve_and_cache(
+        cache: &DashMap<String, (SocketAddr, Instant)>,
+        cache_key: &str,
+        host: &str,
+        port: u16,
+    ) -> DownloadResult<SocketAddr> {
+        let addr_str = format!("{host}:{port}");
+        let addr: SocketAddr = tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(|e| DownloadError::Network(format!("DNS 解析失败: {e}")))?
+            .next()
+            .ok_or_else(|| DownloadError::Network("DNS 解析无结果".into()))?;
+        cache.insert(cache_key.to_string(), (addr, Instant::now()));
+        Ok(addr)
     }
 
     /// 连接到远程 QUIC 服务器
@@ -183,13 +219,20 @@ impl QuicTransport {
             .host_str()
             .ok_or_else(|| DownloadError::Network("URL 缺少主机名".into()))?;
         let port = parsed.port().unwrap_or(443);
-        let addr = format!("{host}:{port}");
+        let cache_key = format!("{host}:{port}");
 
-        let addr: std::net::SocketAddr = tokio::net::lookup_host(addr)
-            .await
-            .map_err(|e| DownloadError::Network(format!("DNS 解析失败: {e}")))?
-            .next()
-            .ok_or_else(|| DownloadError::Network("DNS 解析无结果".into()))?;
+        // DNS 缓存:避免每次 connect 重新解析
+        let addr = if let Some(entry) = self.dns_cache.get(&cache_key) {
+            if entry.value().1.elapsed() < Duration::from_secs(QUIC_DNS_CACHE_TTL_SECS) {
+                entry.value().0
+            } else {
+                drop(entry);
+                self.dns_cache.remove(&cache_key);
+                Self::resolve_and_cache(&self.dns_cache, &cache_key, host, port).await?
+            }
+        } else {
+            Self::resolve_and_cache(&self.dns_cache, &cache_key, host, port).await?
+        };
 
         tachyon_core::reject_forbidden_ip(addr.ip())?;
 
@@ -594,8 +637,12 @@ impl Protocol for QuicTransport {
 
             let request = build_h3_request(http::Method::HEAD, &url, &[])?;
 
-            let mut send = h3_send.lock().await;
-            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            // 仅在发送请求时持锁,收到 stream 后立即释放,
+            // recv_response() 通过独立的 RequestStream 进行,不阻塞其他请求。
+            let mut stream = {
+                let mut send = h3_send.lock().await;
+                send.send_request(request).await.map_err(h3_error)?
+            };
             let response = stream.recv_response().await.map_err(h3_error)?;
 
             parse_h3_metadata(&response, &url)
@@ -625,8 +672,11 @@ impl Protocol for QuicTransport {
             let range_value = format!("bytes={start}-{end}");
             let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
 
-            let mut send = h3_send.lock().await;
-            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            // 仅在发送请求时持锁,收到 stream 后立即释放
+            let mut stream = {
+                let mut send = h3_send.lock().await;
+                send.send_request(request).await.map_err(h3_error)?
+            };
             let response = stream.recv_response().await.map_err(h3_error)?;
 
             // 严格验证 Range 请求必须返回 206
@@ -634,7 +684,6 @@ impl Protocol for QuicTransport {
             if status.as_u16() != 206 {
                 return Err(classify_h3_error(status, response.headers()));
             }
-            drop(send); // 释放 Mutex 以便并发请求
 
             // 读取响应体 DATA 帧
             use futures::StreamExt;
@@ -675,8 +724,11 @@ impl Protocol for QuicTransport {
             let range_value = format!("bytes={start}-{end}");
             let request = build_h3_request(http::Method::GET, &url, &[("range", &range_value)])?;
 
-            let mut send = h3_send.lock().await;
-            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            // 仅在发送请求时持锁,收到 stream 后立即释放
+            let mut stream = {
+                let mut send = h3_send.lock().await;
+                send.send_request(request).await.map_err(h3_error)?
+            };
             let response = stream.recv_response().await.map_err(h3_error)?;
 
             // 严格验证 Range 请求必须返回 206
@@ -684,7 +736,6 @@ impl Protocol for QuicTransport {
             if status.as_u16() != 206 {
                 return Err(classify_h3_error(status, response.headers()));
             }
-            drop(send); // 释放 Mutex
 
             Ok(h3_recv_streaming(stream))
         })
@@ -710,10 +761,12 @@ impl Protocol for QuicTransport {
 
             let request = build_h3_request(http::Method::GET, &url, &[])?;
 
-            let mut send = h3_send.lock().await;
-            let mut stream = send.send_request(request).await.map_err(h3_error)?;
+            // 仅在发送请求时持锁,收到 stream 后立即释放
+            let mut stream = {
+                let mut send = h3_send.lock().await;
+                send.send_request(request).await.map_err(h3_error)?
+            };
             let response = stream.recv_response().await.map_err(h3_error)?;
-            drop(send); // 释放 Mutex
 
             // 校验全量下载响应状态码,避免将 4xx/5xx 错误体当作目标文件
             let status = response.status();

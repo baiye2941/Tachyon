@@ -471,6 +471,120 @@ mod tests {
     }
 
     #[test]
+    fn test_fragment_record_illegal_state_transitions() {
+        let info = make_frag(0, 1024);
+        let mut record = FragmentRecord::new(info, 3);
+
+        // Pending 状态不允许直接校验/写入/完成
+        assert!(
+            record
+                .complete_download(100, Duration::from_millis(10))
+                .is_err(),
+            "Pending -> Verifying 应为非法转换"
+        );
+        assert!(
+            record.verify_ok().is_err(),
+            "Pending -> Writing 应为非法转换"
+        );
+        assert!(record.write_done().is_err(), "Pending -> Done 应为非法转换");
+        assert!(
+            record.mark_failed().is_err(),
+            "Pending -> Failed 应为非法转换"
+        );
+
+        // 完成到任意状态均为非法
+        record.start_download().unwrap();
+        record
+            .complete_download_fast(1024, Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(record.state, FragmentState::Done);
+        assert!(
+            record.start_download().is_err(),
+            "Done -> Downloading 应为非法转换"
+        );
+        assert!(
+            record
+                .complete_download(100, Duration::from_millis(10))
+                .is_err(),
+            "Done -> Verifying 应为非法转换"
+        );
+        assert!(record.mark_failed().is_err(), "Done -> Failed 应为非法转换");
+
+        // Failed 状态不允许重新开始或再次失败
+        let mut record2 = FragmentRecord::new(make_frag(1, 1024), 3);
+        record2.force_fail();
+        assert!(
+            record2.start_download().is_err(),
+            "Failed -> Downloading 应为非法转换"
+        );
+        assert!(
+            record2.mark_failed().is_err(),
+            "Failed -> Failed 应为非法转换"
+        );
+    }
+
+    #[test]
+    fn test_force_fail_vs_mark_failed_boundary() {
+        let info = make_frag(0, 1024);
+
+        // force_fail 从任意状态直接转入 Failed,不增加 retry_count
+        let mut record = FragmentRecord::new(info.clone(), 2);
+        record.force_fail();
+        assert_eq!(record.state, FragmentState::Failed);
+        assert!(record.is_failed());
+        assert_eq!(record.retry_count, 0, "force_fail 不应增加 retry_count");
+
+        // mark_failed 仅在 Downloading/Verifying/Writing 时有效,并受 max_retries 约束
+        let mut record = FragmentRecord::new(info.clone(), 2);
+        record.start_download().unwrap();
+        assert!(record.mark_failed().unwrap()); // retry 1, 回到 Pending
+        assert_eq!(record.retry_count, 1);
+        assert_eq!(record.state, FragmentState::Pending);
+
+        record.start_download().unwrap();
+        assert!(record.mark_failed().unwrap()); // retry 2, 回到 Pending
+        record.start_download().unwrap();
+        assert!(!record.mark_failed().unwrap()); // retry 3 > max, Failed
+        assert_eq!(record.state, FragmentState::Failed);
+        assert_eq!(record.retry_count, 3);
+    }
+
+    #[test]
+    fn test_complete_download_fast_sets_last_duration() {
+        let info = make_frag(0, 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+
+        let duration = Duration::from_millis(250);
+        record.complete_download_fast(1024, duration).unwrap();
+
+        assert_eq!(record.state, FragmentState::Done);
+        assert_eq!(record.info.downloaded, 1024);
+        assert_eq!(
+            record.last_duration,
+            Some(duration),
+            "complete_download_fast 应正确设置 last_duration"
+        );
+        assert!(record.is_done());
+    }
+
+    #[test]
+    fn test_bandwidth_tracker_default_and_zero_samples() {
+        let tracker = BandwidthTracker::default();
+        assert_eq!(tracker.estimate(), 0, "零样本时估计值应为 0");
+        assert_eq!(tracker.sample_count(), 0);
+
+        let mut tracker = BandwidthTracker::default();
+        tracker.record(0);
+        assert_eq!(
+            tracker.sample_count(),
+            0,
+            "零值样本不应被记录,避免污染 EWMA"
+        );
+        assert_eq!(tracker.estimate(), 0);
+    }
+
+    #[test]
     fn test_compute_fragment_size_normal() {
         let size = compute_fragment_size(
             100 * 1024 * 1024,

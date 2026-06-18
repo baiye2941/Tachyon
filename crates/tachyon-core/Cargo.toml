@@ -18,6 +18,10 @@ url.workspace = true
 bytes.workspace = true
 futures.workspace = true
 strum.workspace = true
+crossbeam-utils.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true

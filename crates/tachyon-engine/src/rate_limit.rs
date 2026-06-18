@@ -319,3 +319,48 @@ mod tests {
         assert!(limiter.bytes_per_sec() > 0);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // 随机创建速率并在零/非零之间切换,限速器不应 panic 且 bytes_per_sec 保持一致
+    proptest! {
+        #[test]
+        fn test_rate_limiter_update_rate_invariant(
+            initial_rate in 0u64..1024 * 1024u64,
+            updates in prop::collection::vec(0u64..1024 * 1024u64, 1..20),
+        ) {
+            let limiter = RateLimiter::new(initial_rate);
+            prop_assert_eq!(limiter.bytes_per_sec(), initial_rate);
+
+            for rate in updates {
+                limiter.update_rate(rate);
+                prop_assert_eq!(limiter.bytes_per_sec(), rate);
+            }
+        }
+
+        // rate=0 或 bytes=0 时 acquire 应立即返回且不 panic
+        #[test]
+        fn test_rate_limiter_acquire_zero_or_rate_zero_no_panic(
+            zero_rate in prop::bool::ANY,
+            value in 0u64..1024u64,
+        ) {
+            let (rate, bytes) = if zero_rate {
+                (0, value)
+            } else {
+                (value, 0)
+            };
+            let limiter = RateLimiter::new(rate);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                limiter.acquire(bytes).await;
+            });
+            prop_assert_eq!(limiter.bytes_per_sec(), rate);
+        }
+    }
+}

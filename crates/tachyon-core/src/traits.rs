@@ -58,6 +58,14 @@ pub trait Protocol: Send + Sync {
         url: &str,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>>;
 
+    /// 清除已选中的源(用于重试时触发镜像轮换)
+    ///
+    /// 默认实现为空操作。`MirrorProtocol` 覆盖此方法以清除 probe 选中的源,
+    /// 使下次下载尝试重新竞速所有镜像,避免重复使用已失败的源。
+    fn clear_selected(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     /// 流式下载整个文件(不支持 Range 时使用)
     ///
     /// 与 `download_full` 不同,此方法以流式方式返回数据块,调用方边接收边写入,
@@ -259,4 +267,152 @@ pub trait DownloadScheduler: Send + Sync {
 
     /// 获取当前带宽预测(字节/秒)
     fn predicted_bandwidth(&self) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::error::DownloadError;
+    use crate::types::{FileMetadata, FragmentProgress, TaskCommand};
+
+    /// 最小 Verifier 实现:逐字节 XOR 后转十六进制
+    struct XorVerifier;
+
+    impl Verifier for XorVerifier {
+        fn compute_hash(&self, data: &[u8]) -> DownloadResult<String> {
+            let xor = data.iter().fold(0u8, |acc, &b| acc ^ b);
+            Ok(format!("{xor:02x}"))
+        }
+    }
+
+    #[test]
+    fn test_verifier_compute_hash() {
+        let verifier = XorVerifier;
+        assert_eq!(verifier.compute_hash(b"").unwrap(), "00");
+        assert_eq!(verifier.compute_hash(b"\x01\x01").unwrap(), "00");
+        assert_eq!(verifier.compute_hash(b"\xff").unwrap(), "ff");
+    }
+
+    #[test]
+    fn test_verifier_verify_success_and_failure() {
+        let verifier = XorVerifier;
+        let data = b"abc";
+        let hash = verifier.compute_hash(data).unwrap();
+        assert!(verifier.verify(data, &hash).is_ok());
+
+        let result = verifier.verify(data, "00");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                DownloadError::ChecksumMismatch { expected, actual } if expected == "00" && actual == hash
+            ),
+            "校验失败应返回 ChecksumMismatch"
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq_str() {
+        assert!(constant_time_eq_str(b"abc", b"abc"));
+        assert!(!constant_time_eq_str(b"abc", b"abC"));
+        assert!(!constant_time_eq_str(b"abc", b"ab"));
+        assert!(!constant_time_eq_str(b"ab", b"abc"));
+        assert!(constant_time_eq_str(b"", b""));
+        assert!(!constant_time_eq_str(b"", b"a"));
+        assert!(!constant_time_eq_str(b"a", b""));
+        // 前缀相同但长度不同仍应返回 false
+        assert!(!constant_time_eq_str(b"prefix", b"prefix-longer"));
+        assert!(!constant_time_eq_str(b"prefix-longer", b"prefix"));
+    }
+
+    #[derive(Default)]
+    struct MockTaskRunnerState {
+        control_rx_set: bool,
+        completed_fragments_set: bool,
+        partial_fragments_set: bool,
+        progress_sender_set: bool,
+        probe_called: bool,
+        run_called: bool,
+    }
+
+    struct MockTaskRunner {
+        state: Arc<Mutex<MockTaskRunnerState>>,
+        metadata: FileMetadata,
+    }
+
+    impl TaskRunner for MockTaskRunner {
+        fn set_control_rx(&mut self, _rx: watch::Receiver<TaskCommand>) {
+            self.state.lock().unwrap().control_rx_set = true;
+        }
+
+        fn set_completed_fragments(&mut self, _fragments: Vec<u32>) {
+            self.state.lock().unwrap().completed_fragments_set = true;
+        }
+
+        fn set_partial_fragments(&mut self, _fragments: HashMap<u32, u64>) {
+            self.state.lock().unwrap().partial_fragments_set = true;
+        }
+
+        fn set_progress_sender(&mut self, _tx: mpsc::Sender<FragmentProgress>) {
+            self.state.lock().unwrap().progress_sender_set = true;
+        }
+
+        fn probe(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>> {
+            self.state.lock().unwrap().probe_called = true;
+            Box::pin(async { Ok(&self.metadata) })
+        }
+
+        fn run(&mut self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            self.state.lock().unwrap().run_called = true;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn metadata(&self) -> Option<&FileMetadata> {
+            Some(&self.metadata)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_runner_all_methods_and_box_forwarding() {
+        let state = Arc::new(Mutex::new(MockTaskRunnerState::default()));
+        let metadata = FileMetadata {
+            file_name: "test.bin".into(),
+            file_size: Some(1024),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+        };
+        let mock = MockTaskRunner {
+            state: Arc::clone(&state),
+            metadata,
+        };
+
+        let mut runner: Box<dyn TaskRunner> = Box::new(mock);
+
+        let (_tx, rx) = watch::channel(TaskCommand::Start);
+        runner.set_control_rx(rx);
+        runner.set_completed_fragments(vec![0, 1]);
+        runner.set_partial_fragments(HashMap::from([(2, 100)]));
+        let (progress_tx, _progress_rx) = mpsc::channel::<FragmentProgress>(1);
+        runner.set_progress_sender(progress_tx);
+
+        let meta_ref = runner.probe().await.unwrap();
+        assert_eq!(meta_ref.file_name, "test.bin");
+        runner.run().await.unwrap();
+
+        let s = state.lock().unwrap();
+        assert!(s.control_rx_set);
+        assert!(s.completed_fragments_set);
+        assert!(s.partial_fragments_set);
+        assert!(s.progress_sender_set);
+        assert!(s.probe_called);
+        assert!(s.run_called);
+    }
 }

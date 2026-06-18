@@ -1058,8 +1058,42 @@ impl AsyncStorage for IoUringStorage {
                     // Linux 上:走 io_uring 零拷贝路径
                     #[cfg(target_os = "linux")]
                     {
-                        validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
-                        self.submit_write(_offset, _data).await
+                        // 自动处理 O_DIRECT 对齐:非对齐写入通过填充零字节对齐
+                        let align = O_DIRECT_ALIGN as u64;
+                        let align_mask = align - 1;
+                        let data_len = _data.len() as u64;
+                        let is_aligned =
+                            _offset.is_multiple_of(align) && data_len.is_multiple_of(align);
+
+                        if is_aligned {
+                            // 快速路径:已对齐,直接写入
+                            validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
+                            return self.submit_write(_offset, _data).await;
+                        }
+
+                        // 慢速路径:非对齐写入,自动填充对齐
+                        let aligned_offset = _offset & !align_mask;
+                        let front_pad = (_offset - aligned_offset) as usize;
+                        let total_len = front_pad + _data.len();
+                        let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
+
+                        // 如果填充后超过 fixed buffer 大小,回退到 TokioFile
+                        if padded_len > self.config.buffer_size {
+                            return Err(DownloadError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "io_uring 非对齐写入填充后 {padded_len} 字节超过 fixed buffer 大小 {}",
+                                    self.config.buffer_size
+                                ),
+                            )));
+                        }
+
+                        // 构造对齐缓冲区:前填充零 + 用户数据 + 后填充零
+                        let mut padded = vec![0u8; padded_len];
+                        padded[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
+
+                        validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
+                        self.submit_write(aligned_offset, Bytes::from(padded)).await
                     }
                     #[cfg(not(target_os = "linux"))]
                     {

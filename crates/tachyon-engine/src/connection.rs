@@ -85,7 +85,17 @@ pub struct ConnectionPool {
 
 impl ConnectionPool {
     /// 创建新的连接池
-    pub fn new(config: PoolConfig) -> Self {
+    ///
+    /// HTTP/2 模式下,若 `max_per_host` 保持默认值(16),自动提升到 100:
+    /// 单个 TCP 连接可多路复用 100+ 流,默认 16 的信号量限制会人为制造瓶颈。
+    /// 用户显式设置的值始终被尊重。
+    pub fn new(mut config: PoolConfig) -> Self {
+        const DEFAULT_MAX_PER_HOST: u32 = 16;
+        const HTTP2_RECOMMENDED_PER_HOST: u32 = 100;
+        // 仅当用户未显式修改 max_per_host 时自动提升
+        if config.enable_http2 && config.max_per_host == DEFAULT_MAX_PER_HOST {
+            config.max_per_host = HTTP2_RECOMMENDED_PER_HOST;
+        }
         // 清理阈值 = max_global * 2,避免 host_semaphores 无限增长
         let cleanup_threshold = (config.max_global as usize).saturating_mul(2).max(64);
         Self {
@@ -191,6 +201,8 @@ impl Drop for ConnectionPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_pool_creation() {
@@ -373,5 +385,147 @@ mod tests {
         let pool = ConnectionPool::new(PoolConfig::default());
         let _permit = pool.acquire("example.com").await.unwrap();
         assert_eq!(pool.active_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_global_blocks_new_acquire() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 10,
+            max_global: 2,
+            ..Default::default()
+        }));
+
+        let _p1 = pool.acquire("host1.com").await.unwrap();
+        let _p2 = pool.acquire("host2.com").await.unwrap();
+        assert_eq!(pool.active_connections(), 2);
+
+        let pool2 = Arc::clone(&pool);
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(50), pool2.acquire("host3.com")).await
+        });
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "全局并发满时新请求应被阻塞,不应在 50ms 内获得许可"
+        );
+    }
+
+    #[test]
+    fn test_http2_auto_increases_default_max_per_host() {
+        let pool = ConnectionPool::new(PoolConfig {
+            enable_http2: true,
+            max_per_host: 16,
+            ..Default::default()
+        });
+        assert_eq!(
+            pool.config().max_per_host,
+            100,
+            "HTTP/2 默认值应自动从 16 提升到 100"
+        );
+    }
+
+    #[test]
+    fn test_http2_keeps_explicit_max_per_host() {
+        let pool = ConnectionPool::new(PoolConfig {
+            enable_http2: true,
+            max_per_host: 32,
+            ..Default::default()
+        });
+        assert_eq!(
+            pool.config().max_per_host,
+            32,
+            "用户显式设置的 max_per_host 应被尊重"
+        );
+    }
+
+    #[test]
+    fn test_http2_disabled_keeps_default_max_per_host() {
+        let pool = ConnectionPool::new(PoolConfig {
+            enable_http2: false,
+            max_per_host: 16,
+            ..Default::default()
+        });
+        assert_eq!(
+            pool.config().max_per_host,
+            16,
+            "未启用 HTTP/2 时不应自动提升"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_semaphores_auto_cleanup_at_threshold() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 2, // cleanup_threshold = max(2*2, 64) = 64
+            ..Default::default()
+        }));
+
+        // 创建 65 个主机,在第 65 次 acquire 时触发阈值清理
+        for i in 0..65 {
+            let host = format!("host{i}.com");
+            let _permit = pool.acquire(&host).await.unwrap();
+        }
+
+        // 第 65 次 acquire 触发清理后,仅保留当前活跃主机,
+        // 其余 64 个已释放的空闲主机信号量应被移除
+        assert_eq!(pool.host_count(), 1, "超过阈值时应自动清理空闲主机信号量");
+
+        // 继续增加主机使总数再次超过阈值,验证清理持续生效
+        for i in 65..129 {
+            let host = format!("host{i}.com");
+            let _permit = pool.acquire(&host).await.unwrap();
+        }
+        assert_eq!(pool.host_count(), 1, "再次超过阈值后仍应只保留当前活跃主机");
+    }
+
+    #[tokio::test]
+    async fn test_host_semaphores_no_cleanup_below_threshold() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 100, // cleanup_threshold = 200
+            ..Default::default()
+        }));
+
+        for i in 0..10 {
+            let host = format!("host{i}.com");
+            let _permit = pool.acquire(&host).await.unwrap();
+        }
+
+        assert_eq!(
+            pool.host_count(),
+            10,
+            "低于清理阈值时不应自动清理主机信号量"
+        );
+    }
+
+    #[test]
+    fn test_permit_drop_releases_on_panic() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 1,
+            ..Default::default()
+        }));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let pool = Arc::clone(&pool);
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let _permit = pool.acquire("test.com").await.unwrap();
+                    assert_eq!(pool.active_connections(), 1);
+                    panic!("deliberate panic");
+                });
+            }
+        }));
+
+        assert!(result.is_err(), "应有意触发 panic");
+        assert_eq!(
+            pool.active_connections(),
+            0,
+            "panic 后 permit 应通过 Drop 释放活跃计数"
+        );
     }
 }

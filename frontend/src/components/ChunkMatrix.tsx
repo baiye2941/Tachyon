@@ -209,16 +209,27 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
   const pendingColor = () => resolveToken("--color-bg-tertiary");
 
+  // 缓存上次 Canvas 尺寸,避免每帧重置(width/height 赋值会清空 GPU 上下文)
+  let lastCanvasW = 0;
+  let lastCanvasH = 0;
+
   const drawCanvas = (blockList: ChunkBlock[], phase: number) => {
     if (!canvasRef) return;
     const ctx = canvasRef.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     const { width, height } = canvasLayout();
-    canvasRef.width = Math.floor(width * dpr);
-    canvasRef.height = Math.floor(height * dpr);
-    canvasRef.style.width = `${width}px`;
-    canvasRef.style.height = `${height}px`;
+    const w = Math.floor(width * dpr);
+    const h = Math.floor(height * dpr);
+    // 仅在尺寸变化时重置 Canvas,避免每帧 GPU 上下文重建
+    if (w !== lastCanvasW || h !== lastCanvasH) {
+      canvasRef.width = w;
+      canvasRef.height = h;
+      canvasRef.style.width = `${width}px`;
+      canvasRef.style.height = `${height}px`;
+      lastCanvasW = w;
+      lastCanvasH = h;
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
@@ -262,7 +273,16 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       drawCanvas(blocks(), 0);
       return;
     }
+    // 下载活跃时降级到 30 FPS(每帧间隔 ≥33ms),释放 CPU/GPU 资源给下载线程
+    const MIN_FRAME_MS = 33; // 30 FPS
+    let lastFrameTime = 0;
     const loop = (now: number) => {
+      // 帧率节流:距上次绘制不足 33ms 时跳过本帧
+      if (now - lastFrameTime < MIN_FRAME_MS) {
+        rafId = requestAnimationFrame(loop);
+        return;
+      }
+      lastFrameTime = now;
       currentPulsePhase = (now % 1500) / 1500;
       const blockList = blocks();
       const stillDownloading = blockList.some(

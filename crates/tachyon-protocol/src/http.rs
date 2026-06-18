@@ -127,7 +127,16 @@ impl HttpClient {
             builder = builder.read_timeout(std::time::Duration::from_secs(read_secs));
         }
         if enable_http2 {
-            builder = builder.http2_adaptive_window(true);
+            builder = builder
+                .http2_adaptive_window(true)
+                // 初始流窗口 1MB:高 BDP 网络下避免流级饥饿
+                // (默认 64KB 在 100Mbps×50ms RTT 下成为瓶颈)
+                .http2_initial_stream_window_size(1024 * 1024)
+                // 初始连接窗口 16MB:聚合多流吞吐
+                .http2_initial_connection_window_size(16 * 1024 * 1024)
+                // HTTP/2 PING 保活:检测 NAT/代理超时的死连接
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(10));
         }
 
         let client = builder

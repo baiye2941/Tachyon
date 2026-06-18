@@ -432,6 +432,82 @@ mod tests {
         assert!(Failed.is_terminal());
         assert!(Cancelled.is_terminal());
     }
+
+    // -----------------------------------------------------------------------
+    // P1: TaskCommand / FragmentInfo / PauseInfo 边界测试
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_command_to_download_state_mappings() {
+        assert_eq!(
+            TaskCommand::Start.to_download_state(),
+            DownloadState::Downloading
+        );
+        assert_eq!(
+            TaskCommand::Pause.to_download_state(),
+            DownloadState::Paused
+        );
+        assert_eq!(
+            TaskCommand::Resume.to_download_state(),
+            DownloadState::Downloading
+        );
+        assert_eq!(
+            TaskCommand::Cancel.to_download_state(),
+            DownloadState::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_fragment_info_new_normal() {
+        let frag = FragmentInfo::new(2, 10, 19, 10);
+        assert_eq!(frag.index, 2);
+        assert_eq!(frag.start, 10);
+        assert_eq!(frag.end, 19);
+        assert_eq!(frag.size, 10);
+        assert_eq!(frag.downloaded, 0);
+        assert!(frag.hash.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "end + 1 溢出")]
+    fn test_fragment_info_new_end_overflow_panics() {
+        FragmentInfo::new(0, 0, u64::MAX, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "start + size 溢出")]
+    fn test_fragment_info_new_start_size_overflow_panics() {
+        FragmentInfo::new(0, u64::MAX - 1, 0, 3);
+    }
+
+    #[test]
+    fn test_pause_info_remaining_secs_boundaries() {
+        // max_duration 为 0 时立即无剩余
+        let info = PauseInfo {
+            paused_at_secs: 0,
+            max_duration_secs: 0,
+        };
+        assert_eq!(info.remaining_secs(), 0);
+
+        // 已过期时剩余为 0
+        let expired = PauseInfo {
+            paused_at_secs: 0,
+            max_duration_secs: 1,
+        };
+        assert_eq!(expired.remaining_secs(), 0);
+
+        // 未过期时剩余不超过 max_duration_secs 且大于 0
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let active = PauseInfo {
+            paused_at_secs: now,
+            max_duration_secs: 60,
+        };
+        let remaining = active.remaining_secs();
+        assert!(remaining > 0 && remaining <= 60, "remaining={remaining}");
+    }
 }
 
 #[cfg(test)]

@@ -233,4 +233,88 @@ mod tests {
         let json = serde_json::to_string(&disconnected).unwrap();
         let _: PeerEvent = serde_json::from_str(&json).unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // P1: FragmentEvent::Completed 与 PeerEvent 字段断言
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fragment_completed_event_construction_and_serialization() {
+        let task_id = TaskId::new_v4();
+        let event = FragmentEvent::Completed {
+            task_id,
+            fragment_index: 7,
+        };
+
+        match event {
+            FragmentEvent::Completed {
+                task_id: tid,
+                fragment_index,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(fragment_index, 7);
+            }
+            _ => panic!("应为 Completed 事件"),
+        }
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: FragmentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, event);
+    }
+
+    #[test]
+    fn test_peer_event_fields() {
+        let task_id = TaskId::new_v4();
+        let peer_addr = "10.0.0.1:9000".to_string();
+        let reason = "连接重置".to_string();
+
+        let discovered = PeerEvent::Discovered {
+            task_id,
+            peer_addr: peer_addr.clone(),
+        };
+        let connected = PeerEvent::Connected {
+            task_id,
+            peer_addr: peer_addr.clone(),
+        };
+        let disconnected = PeerEvent::Disconnected {
+            task_id,
+            peer_addr,
+            reason: reason.clone(),
+        };
+
+        match discovered {
+            PeerEvent::Discovered {
+                task_id: tid,
+                peer_addr: addr,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(addr, "10.0.0.1:9000");
+            }
+            _ => panic!("类型不匹配"),
+        }
+
+        match connected {
+            PeerEvent::Connected {
+                task_id: tid,
+                peer_addr: addr,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(addr, "10.0.0.1:9000");
+            }
+            _ => panic!("类型不匹配"),
+        }
+
+        match disconnected {
+            PeerEvent::Disconnected {
+                task_id: tid,
+                peer_addr: addr,
+                reason: r,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(addr, "10.0.0.1:9000");
+                assert_eq!(r, "连接重置");
+            }
+            _ => panic!("类型不匹配"),
+        }
+    }
 }

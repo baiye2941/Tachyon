@@ -798,4 +798,131 @@ mod tests {
             assert!(result.is_ok(), "并发访问不应失败");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // P1: validate_save_path / parse_content_disposition / percent_decode 边界
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_save_path_nonexistent_parent_under_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+        let final_path = base.join("deep").join("nested").join("file.txt");
+
+        assert!(!final_path.parent().unwrap().exists());
+        let result = validate_save_path(&final_path, &base);
+        assert!(result.is_ok(), "基目录内的不存在的父目录应被自动创建");
+        assert!(base.join("deep").join("nested").exists());
+    }
+
+    #[test]
+    fn test_validate_save_path_logical_escape_nonexistent_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+
+        let malicious = base
+            .join("..")
+            .join("outside")
+            .join("nonexistent")
+            .join("file.txt");
+        let result = validate_save_path(&malicious, &base);
+        assert!(result.is_err(), "父目录不在 base 内时应被逻辑逃逸检测阻止");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("逃逸检测") || err_msg.contains("不在预期目录"),
+            "错误信息应说明逃逸检测: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_save_path_no_file_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+        let subdir = base.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        // final_path 以 .. 结尾,没有有意义的 file_name
+        let final_path = subdir.join("..");
+        let result = validate_save_path(&final_path, &base);
+        assert!(result.is_err(), "无 file_name 时应报错");
+        assert!(
+            result.unwrap_err().to_string().contains("无文件名"),
+            "应提示无文件名"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_disposition_non_utf8_charset() {
+        // ISO-8859-1 编码的 é 字节 0xE9,不是合法 UTF-8
+        assert_eq!(
+            parse_content_disposition("attachment; filename*=ISO-8859-1''%E9"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_content_disposition_empty_decoded() {
+        assert_eq!(
+            parse_content_disposition("attachment; filename*=UTF-8''"),
+            None
+        );
+        assert_eq!(parse_content_disposition("attachment; filename=\"\""), None);
+    }
+
+    #[test]
+    fn test_percent_decode_boundaries() {
+        assert_eq!(percent_decode(""), Some(String::new()));
+        assert_eq!(percent_decode("%41%42"), Some("AB".to_string()));
+        assert_eq!(percent_decode("%61%62"), Some("ab".to_string()));
+        // 不完整的 % 序列按字面保留
+        assert_eq!(percent_decode("%"), Some("%".to_string()));
+        assert_eq!(percent_decode("%2"), Some("%2".to_string()));
+        // 非法十六进制字符按字面保留
+        assert_eq!(percent_decode("%GG"), Some("%GG".to_string()));
+        assert_eq!(percent_decode("%G1"), Some("%G1".to_string()));
+        assert_eq!(percent_decode("%1G"), Some("%1G".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // sanitize_filename 对任意字符串不 panic,且结果非空
+    proptest! {
+        #[test]
+        fn test_sanitize_filename_no_panic_and_nonempty(name in ".*") {
+            let sanitized = sanitize_filename(&name);
+            prop_assert!(!sanitized.is_empty(), "sanitize 结果不应为空");
+            prop_assert!(!sanitized.contains('/'), "结果不应含路径分隔符 /");
+            prop_assert!(!sanitized.contains('\\'), "结果不应含路径分隔符 \\");
+        }
+
+        // extract_filename_from_url 对任意字符串不 panic 且返回非空
+        #[test]
+        fn test_extract_filename_from_url_no_panic(url in ".*") {
+            let name = extract_filename_from_url(&url);
+            prop_assert!(!name.is_empty(), "提取的文件名不应为空");
+        }
+
+        // parse_content_disposition 对任意字符串不 panic
+        #[test]
+        fn test_parse_content_disposition_no_panic(value in ".*") {
+            let _ = parse_content_disposition(&value);
+        }
+
+        // validate_save_path 在临时目录下对任意 sanitize 后的文件名不 panic
+        #[test]
+        fn test_validate_save_path_no_panic(name in "[a-zA-Z0-9_.\\-\\/\\\\]{0,50}") {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path();
+            let file_name = sanitize_filename(&name);
+            let final_path = base.join(&file_name);
+            let _ = validate_save_path(&final_path, base);
+        }
+    }
 }
