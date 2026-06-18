@@ -361,14 +361,19 @@ mod tests {
         let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::IoUring)
             .await
             .unwrap();
+        // io_uring 后端使用 O_DIRECT, 要求 offset 与 length 均为 4096 字节对齐
+        // 非 Linux 平台会回退到 Standard, 仍可使用任意长度
+        let payload_size = 4096;
+        let mut payload = vec![0u8; payload_size];
+        payload[..5].copy_from_slice(b"uring");
         storage
-            .write_at(0, Bytes::from_static(b"uring"))
+            .write_at(0, Bytes::from(payload.clone()))
             .await
             .unwrap();
-        let mut buf = [0u8; 5];
+        let mut buf = vec![0u8; payload_size];
         let read = storage.read_at(0, &mut buf).await.unwrap();
-        assert_eq!(read, 5);
-        assert_eq!(&buf, b"uring");
+        assert_eq!(read, payload_size);
+        assert_eq!(&buf[..5], b"uring");
         storage.close().await.unwrap();
     }
 

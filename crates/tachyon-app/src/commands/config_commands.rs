@@ -192,7 +192,25 @@ pub(crate) fn persist_config(config: &AppConfig) -> Result<(), AppError> {
     }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| AppError::Config(format!("序列化配置失败: {e}")))?;
-    let tmp = path.with_extension("tmp");
+    // 使用 进程 ID + 线程 ID + 纳秒时间戳生成唯一 tmp 文件名,
+    // 防止并发 persist_config 调用(例如多个测试并行)抢占同一个 .tmp 路径
+    // 导致 rename 失败 (ENOENT: No such file or directory)。
+    let pid = std::process::id();
+    let tid = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!("config.tmp.{pid}.{tid:x}.{nanos}");
+    let tmp = path
+        .parent()
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
     std::fs::write(&tmp, json)
         .map_err(|e| AppError::Config(format!("写入配置临时文件失败: {e}")))?;
     std::fs::rename(&tmp, &path)
