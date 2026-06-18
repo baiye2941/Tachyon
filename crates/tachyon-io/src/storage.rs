@@ -249,4 +249,15 @@ mod tests {
         assert_eq!(captured[0].0, 10);
         assert_eq!(&captured[0].1[..], b"hello");
     }
+
+    #[tokio::test]
+    async fn test_async_storage_other_methods() {
+        let (storage, _writes) = MockStorage::new();
+        let mut buf = [0u8; 4];
+        assert_eq!(storage.read_at(0, &mut buf).await.unwrap(), 0);
+        assert!(storage.sync().await.is_ok());
+        assert!(storage.allocate(1024).await.is_ok());
+        assert_eq!(storage.file_size().await.unwrap(), 0);
+        assert!(storage.close().await.is_ok());
+    }
 }

@@ -13,6 +13,7 @@ members = [
     "crates/tachyon-hub",
     "crates/tachyon-app",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

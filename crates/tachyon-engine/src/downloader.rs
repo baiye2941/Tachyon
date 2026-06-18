@@ -5229,7 +5229,19 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "with_mirrors 应成功创建任务");
-        let task = result.unwrap();
+        let mut task = result.unwrap();
         assert_eq!(task.url(), "http://primary.com/file.bin");
+
+        // 覆盖未测试的公共 setter / getter
+        task.set_rate_limiter(Arc::new(RateLimiter::new(1024)));
+        task.set_metrics(Arc::new(Metrics::new()));
+        task.set_completed_fragments(vec![0]);
+        let mut partial = HashMap::new();
+        partial.insert(1, 50);
+        task.set_partial_fragments(partial);
+        assert_eq!(task.state(), DownloadState::Pending);
+        assert!((task.progress() - 0.0).abs() < f64::EPSILON);
+        assert!(task.metadata().is_none());
+        assert!(task.fragment_infos().is_empty());
     }
 }

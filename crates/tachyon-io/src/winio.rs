@@ -584,4 +584,20 @@ mod tests {
         // sync 应同时 flush 主句柄和 fallback 句柄
         file.sync().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_winfile_close_flushes_data() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_optimized(tmp.path()).await.unwrap();
+        file.write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        file.close().await.unwrap();
+
+        let file2 = WinFile::open_standard(tmp.path()).await.unwrap();
+        let mut buf = [0u8; 5];
+        let read = file2.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 5);
+        assert_eq!(&buf, b"hello");
+    }
 }
