@@ -64,19 +64,28 @@ impl Default for IoStrategy {
 /// 通过尝试创建最小 io_uring 实例来检测,失败则说明不可用。
 /// 使用 raw syscall 而非 libc 封装(libc 0.2 不导出 io_uring_params/io_uring_setup)。
 /// 检测结果不缓存(仅在进程启动时调用一次)。
+///
+/// Miri 不支持 raw syscall,直接返回 false。
 #[cfg(target_os = "linux")]
 fn is_io_uring_available() -> bool {
-    // io_uring_setup syscall number: 425 (x86_64), 425 (aarch64)
-    const SYS_IO_URING_SETUP: i64 = 425;
-    // io_uring_params 结构体大小约 120 字节,用零初始化即可用于探测
-    let mut params = [0u8; 128];
-    unsafe {
-        let ring_fd = libc::syscall(SYS_IO_URING_SETUP, 1u32, params.as_mut_ptr());
-        if ring_fd >= 0 {
-            libc::close(ring_fd as i32);
-            return true;
-        }
+    #[cfg(miri)]
+    {
         false
+    }
+    #[cfg(not(miri))]
+    {
+        // io_uring_setup syscall number: 425 (x86_64), 425 (aarch64)
+        const SYS_IO_URING_SETUP: i64 = 425;
+        // io_uring_params 结构体大小约 120 字节,用零初始化即可用于探测
+        let mut params = [0u8; 128];
+        unsafe {
+            let ring_fd = libc::syscall(SYS_IO_URING_SETUP, 1u32, params.as_mut_ptr());
+            if ring_fd >= 0 {
+                libc::close(ring_fd as i32);
+                return true;
+            }
+            false
+        }
     }
 }
 

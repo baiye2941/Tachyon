@@ -585,6 +585,7 @@ mod tests {
         file.sync().await.unwrap();
     }
 
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn test_winfile_close_flushes_data() {
         let tmp = NamedTempFile::new().unwrap();
