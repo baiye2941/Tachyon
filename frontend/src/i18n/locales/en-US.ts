@@ -238,8 +238,8 @@ const enUS = {
     'Cause unknown. Click "Retry" to redownload. If it keeps failing, check network, disk space, or use a mirror.',
 
   // —— URL validation ——
-  "url.hint.magnet":
-    "Magnet links are not supported yet. BT protocol will be added in a future version.",
+  "url.hint.magnet.resolving":
+    "Resolving magnet link, fetching torrent info...",
   "url.hint.huggingface": "HuggingFace link detected",
   "url.hint.invalid": "Please enter a link starting with http:// or https://",
 

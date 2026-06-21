@@ -20,7 +20,7 @@ export interface UrlValidation {
   /** 协议类型 */
   protocol: UrlProtocol
   /** 额外提示的 i18n key(调用方用 tr() 翻译) */
-  hintKey?: 'url.hint.magnet' | 'url.hint.huggingface' | 'url.hint.invalid'
+  hintKey?: 'url.hint.magnet.resolving' | 'url.hint.huggingface' | 'url.hint.invalid'
 }
 
 const HTTP_RE = /^https?:\/\/[^\s/$.?#].[^\s]*$/i
@@ -32,7 +32,7 @@ const MAGNET_RE = /^magnet:\?xt=urn:btih:/i
  * 校验单个 URL 字符串。
  *
  * 识别逻辑:
- * - magnet: 磁力链接,当前不支持(标记 invalid + 提示)
+ * - magnet: 磁力链接,有效(通过 BitTorrent 协议下载)
  * - huggingface: HuggingFace 链接,有效(为 Iteration 06 HF Provider 铺路)
  * - http/https/ftp: 标准协议,有效
  * - 其他: invalid
@@ -45,9 +45,8 @@ export function validateUrl(raw: string): UrlValidation {
 
   if (MAGNET_RE.test(trimmed)) {
     return {
-      valid: false,
+      valid: true,
       protocol: 'magnet',
-      hintKey: 'url.hint.magnet',
     }
   }
 

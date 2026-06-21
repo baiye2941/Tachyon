@@ -229,7 +229,7 @@ const zhCN = {
     "原因未知。点击「重试」重新下载,若持续失败请检查网络、磁盘空间或更换镜像源",
 
   // —— URL 校验 ——
-  "url.hint.magnet": "磁力链接暂不支持,将在后续版本接入 BT 协议",
+  "url.hint.magnet.resolving": "正在解析磁力链接，获取种子信息...",
   "url.hint.huggingface": "检测到 HuggingFace 链接",
   "url.hint.invalid": "请输入以 http:// 或 https:// 开头的链接",
 
