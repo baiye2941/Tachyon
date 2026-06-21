@@ -10,6 +10,8 @@ vi.mock('../../api/invoke', () => ({
   api: {
     getConfig: vi.fn(),
     updateConfig: vi.fn(),
+    getSupportedProtocols: vi.fn(),
+    getAppInfo: vi.fn(),
   },
 }))
 
@@ -59,6 +61,8 @@ describe('SettingsPanel', () => {
     setLoading(true)
     vi.mocked(api.getConfig).mockReset()
     vi.mocked(api.updateConfig).mockReset()
+    vi.mocked(api.getSupportedProtocols).mockReset()
+    vi.mocked(api.getAppInfo).mockReset()
     vi.mocked(addToast).mockReset()
   })
 
@@ -178,6 +182,54 @@ describe('SettingsPanel', () => {
     await waitFor(() => {
       expect(addToast).toHaveBeenCalledWith(expect.stringContaining('保存配置失败'), 'error')
     })
+  })
+
+  it('patch 包含新增可编辑字段(requestTimeoutSecs/rateLimit/maxGlobalConnections/keepAlive)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    // 新增可编辑字段应出现在 patch 中
+    expect(calledWith.download!.requestTimeoutSecs).toBe(mockConfig.download.requestTimeoutSecs)
+    expect(calledWith.download!.rateLimitBytesPerSec).toBe(mockConfig.download.rateLimitBytesPerSec)
+    expect(calledWith.connection!.maxGlobalConnections).toBe(mockConfig.connection.maxGlobalConnections)
+    expect(calledWith.connection!.keepAliveTimeoutSecs).toBe(mockConfig.connection.keepAliveTimeoutSecs)
+  })
+
+  it('About 标签展示支持协议 + 只读 User-Agent', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.getSupportedProtocols).mockResolvedValue(['http', 'https', 'ftp'])
+    vi.mocked(api.getAppInfo).mockResolvedValue({ version: '1.2.3', name: 'Tachyon' })
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('关于'))
+
+    await waitFor(() => {
+      // 协议文本经 CSS text-transform:uppercase 视觉大写,但 DOM 文本内容为原始小写
+      expect(screen.getByText('http')).toBeDefined()
+      expect(screen.getByText('https')).toBeDefined()
+    })
+    // 只读 User-Agent 展示后端值
+    expect(screen.getByText('Tachyon/1.0')).toBeDefined()
   })
 })
 
