@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use librqbit::{AddTorrent, ManagedTorrent, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
 use tokio::io::AsyncReadExt;
 
 use tachyon_core::config::MagnetConfig;
@@ -83,12 +83,21 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
 }
 
 /// 通过 Session 添加磁力链接并获取 ManagedTorrent 句柄
+///
+/// `download_dir` 用于设置输出目录，`overwrite` 设为 true 允许覆盖已有文件
+/// （磁力链接可能重复添加同一资源，BT 协议本身支持断点续传）。
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
+    download_dir: &std::path::Path,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
+    let opts = AddTorrentOptions {
+        overwrite: true,
+        output_folder: Some(download_dir.to_string_lossy().into()),
+        ..Default::default()
+    };
     session
-        .add_torrent(AddTorrent::from_url(url), None)
+        .add_torrent(AddTorrent::from_url(url), Some(opts))
         .await
         .map_err(|e| DownloadError::Network(format!("添加磁力链接失败: {e}")))?
         .into_handle()
@@ -108,9 +117,10 @@ impl Protocol for MagnetProtocol {
         let session = self.session.clone();
         let config = self.config.clone();
         let url = url.to_string();
+        let download_dir = self.download_dir.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url).await?;
+            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
 
             // 等待元数据就绪（带超时）
             let timeout = Duration::from_secs(config.metadata_timeout_secs);
@@ -182,7 +192,7 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url).await?;
+            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
 
             // 等待下载完成
             handle
@@ -217,7 +227,7 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url).await?;
+            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
 
             // 等待下载完成
             handle
