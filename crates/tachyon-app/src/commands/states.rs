@@ -40,9 +40,14 @@ pub struct InfraState {
     /// 全局 buffer 池：供下载 worker 复用写盘 buffer,带 Semaphore 反压。
     /// 容量 = max_concurrent_tasks × max_concurrent_fragments,buffer_size = WRITE_BATCH_BYTES。
     pub buffer_pool: Arc<BufferPool>,
-    /// BitTorrent Session 单例（可选，magnet feature 启用时可用）
+    /// BitTorrent Session (magnet:? 链接下载)
+    ///
+    /// 使用 `Arc<Mutex<Option<...>>>` 包装,原因:
+    /// - `BtSession::new()` 是 async,无法在 `AppState::try_new()`(sync) 中初始化
+    /// - 需在 Tauri setup 的异步块中延迟初始化
+    /// - Mutex 保证初始化与读取的互斥安全
     #[cfg(feature = "magnet")]
-    pub bt_session: Option<Arc<tachyon_engine::BtSession>>,
+    pub bt_session: Arc<Mutex<Option<Arc<tachyon_engine::BtSession>>>>,
 }
 
 /// 应用服务状态：业务服务层

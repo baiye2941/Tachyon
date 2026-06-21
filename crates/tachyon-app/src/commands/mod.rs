@@ -318,7 +318,7 @@ impl AppState {
                 chunk_reader_pool,
                 buffer_pool,
                 #[cfg(feature = "magnet")]
-                bt_session: None,
+                bt_session: Arc::new(tokio::sync::Mutex::new(None)),
             },
             service: ServiceState {
                 task_service,
@@ -428,6 +428,18 @@ pub fn request_confirmation(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_download_url(url_str: &str) -> Result<(), AppError> {
+    // 磁力链接走独立校验路径，不经过 HTTP SSRF 防护
+    // （magnet URI 无 host，不适用 validate_public_http_url）
+    #[cfg(feature = "magnet")]
+    if url_str.starts_with("magnet:?") {
+        return tachyon_engine::validate_magnet_uri(url_str)
+            .map_err(|e| AppError::Config(e.to_string()));
+    }
+    #[cfg(not(feature = "magnet"))]
+    if url_str.starts_with("magnet:?") {
+        return Err(AppError::UnsupportedProtocol("magnet".to_string()));
+    }
+
     let url = Url::parse(url_str).map_err(|e| AppError::Network(format!("URL 格式无效: {e}")))?;
     tachyon_core::validate_public_http_url(&url).map_err(|e| AppError::Network(e.to_string()))?;
 
@@ -647,7 +659,7 @@ pub(crate) mod tests {
                 chunk_reader_pool,
                 buffer_pool,
                 #[cfg(feature = "magnet")]
-                bt_session: None,
+                bt_session: Arc::new(tokio::sync::Mutex::new(None)),
             },
             service: ServiceState {
                 task_service,
@@ -1225,5 +1237,33 @@ pub(crate) mod tests {
             capacity - 1,
             "克隆态应看到相同的可用许可数"
         );
+    }
+
+    // ── validate_download_url 磁力链接校验测试 ──────────────────────────
+
+    /// 验证 validate_download_url 接受合法磁力链接
+    ///
+    /// 修复前 BUG:validate_download_url 调用 validate_public_http_url
+    /// 只接受 http/https,磁力链接被拒绝。修复后磁力链接走独立校验路径。
+    #[test]
+    fn test_validate_download_url_accepts_magnet() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test";
+        let result = validate_download_url(uri);
+        assert!(result.is_ok(), "合法磁力链接应被接受: {result:?}");
+    }
+
+    /// 验证 validate_download_url 拒绝无效磁力链接(缺少 xt 参数)
+    #[test]
+    fn test_validate_download_url_rejects_invalid_magnet() {
+        let uri = "magnet:?dn=test";
+        let result = validate_download_url(uri);
+        assert!(result.is_err(), "缺少 xt 参数的磁力链接应被拒绝");
+    }
+
+    /// 验证 validate_download_url 仍然拒绝非 magnet 非 http 的 URL
+    #[test]
+    fn test_validate_download_url_rejects_unsupported_scheme() {
+        let result = validate_download_url("ftp://example.com/file.bin");
+        assert!(result.is_err(), "FTP URL(未启用 ftp feature 时)应被拒绝");
     }
 }

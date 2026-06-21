@@ -25,6 +25,8 @@ pub use tachyon_core::FragmentProgress;
 
 #[cfg(feature = "magnet")]
 pub use bt_session::BtSession;
+#[cfg(feature = "magnet")]
+pub use tachyon_protocol::magnet::validate_magnet_uri;
 
 // 验证测试:放在 crate 根级别,以便 `--exact` 匹配
 

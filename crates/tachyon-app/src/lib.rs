@@ -11,6 +11,8 @@ pub use commands::AppError;
 pub use commands::TaskCommand;
 pub use commands::TaskInfo;
 
+use std::sync::Arc;
+
 use commands::*;
 
 /// 构建并运行 Tauri 应用
@@ -49,6 +51,26 @@ pub fn run() {
                 // 在 reactor 上下文中启动 chunk reader worker
                 // （构造期间不能 spawn,此时 reactor 尚未就绪）
                 state.infra.chunk_reader_pool.spawn_workers();
+
+                // 延迟初始化 BitTorrent Session（BtSession::new 是 async，
+                // 无法在 AppState::try_new 的同步上下文中完成）
+                #[cfg(feature = "magnet")]
+                {
+                    let cfg = state.domain.config.lock().await;
+                    let magnet_config = cfg.magnet.clone();
+                    let download_dir = std::path::PathBuf::from(&cfg.download.download_dir);
+                    drop(cfg);
+                    match tachyon_engine::BtSession::new(download_dir, magnet_config).await {
+                        Ok(bt_session) => {
+                            tracing::info!("BitTorrent Session 初始化成功");
+                            *state.infra.bt_session.lock().await = Some(Arc::new(bt_session));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "BitTorrent Session 初始化失败,磁力链接下载不可用");
+                        }
+                    }
+                }
+
                 match state.load_recovered_tasks().await {
                     Ok(corrupt_keys) => {
                         // 损坏快照非空时向 UI 广播一次性恢复告警
