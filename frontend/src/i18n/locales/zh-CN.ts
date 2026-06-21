@@ -178,6 +178,7 @@ const zhCN = {
   "detail.label.speed": "速度",
   "detail.label.remaining": "剩余",
   "detail.label.fragments": "分片",
+  "detail.label.threads": "线程",
   "detail.label.downloaded": "已下载",
   "detail.label.status": "状态",
   "detail.label.url": "下载链接",

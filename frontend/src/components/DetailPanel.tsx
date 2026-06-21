@@ -609,7 +609,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div
               class="mono"
               style={{
-                "font-size": "24px",
+                "font-size": "28px",
                 "font-weight": 700,
                 color: "var(--color-text-title)",
                 "line-height": "1.2",
@@ -622,7 +622,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div
               class="relative overflow-hidden w-full"
               style={{
-                height: "4px",
+                height: "6px",
                 "margin-top": "8px",
                 "border-radius": "9999px",
                 background: "var(--color-bg-tertiary)",
@@ -801,6 +801,13 @@ export default function DetailPanel(props: DetailPanelProps) {
                     {`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
                   </div>
                 </div>
+                <div class="detail-stat-cell">
+                  <div class="detail-stat-label">{t("detail.label.threads")}</div>
+                  <div class="detail-stat-value">
+                    {/* 后端当前未下发活跃线程数,诚实展示占位 */}
+                    {"—"}
+                  </div>
+                </div>
               </div>
             </div>
           </Show>
@@ -883,10 +890,18 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </Show>
 
-          {/* Action Buttons - at bottom */}
+          {/* Action Buttons - 固定底部(spec 8.2),sticky 不随内容滚动 */}
           <div
             class="flex flex-col"
-            style={{ padding: "0 20px 20px", gap: "8px" }}
+            style={{
+              padding: "12px 20px 20px",
+              gap: "8px",
+              position: "sticky",
+              bottom: "0",
+              "margin-top": "auto",
+              background: "var(--color-bg-elevated)",
+              "border-top": "1px solid var(--color-border-subtle)",
+            }}
           >
             <Show when={!isCompleted()}>
               <Button

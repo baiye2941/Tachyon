@@ -181,6 +181,7 @@ const enUS = {
   "detail.label.speed": "Speed",
   "detail.label.remaining": "Remaining",
   "detail.label.fragments": "Fragments",
+  "detail.label.threads": "Threads",
   "detail.label.downloaded": "Downloaded",
   "detail.label.status": "Status",
   "detail.label.url": "Download URL",

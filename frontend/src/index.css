@@ -1328,7 +1328,7 @@ body {
    ============================================ */
 .detail-stat-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
 }
 
 .detail-stat-cell {
@@ -1338,7 +1338,7 @@ body {
 }
 
 .detail-stat-label {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--color-text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.3px;
@@ -1347,7 +1347,7 @@ body {
 
 .detail-stat-value {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--color-text-primary);
   margin-top: 2px;
   overflow: hidden;
