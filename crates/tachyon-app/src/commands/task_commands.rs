@@ -68,12 +68,17 @@ pub(crate) async fn validate_and_prepare_url(
         }
     };
 
-    let host = match download_url.host_str() {
-        Some(h) => h.to_string(),
-        None => {
-            tracing::error!(task_id = %task_id, "URL 主机为空");
-            mark_task_failed_and_cleanup(state, task_id).await;
-            return None;
+    // 磁力链接没有 host，用占位符代替（仅用于日志）
+    let host = if url.starts_with("magnet:?") {
+        "magnet".to_string()
+    } else {
+        match download_url.host_str() {
+            Some(h) => h.to_string(),
+            None => {
+                tracing::error!(task_id = %task_id, "URL 主机为空");
+                mark_task_failed_and_cleanup(state, task_id).await;
+                return None;
+            }
         }
     };
 

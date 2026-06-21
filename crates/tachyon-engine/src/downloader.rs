@@ -518,6 +518,10 @@ impl DownloadTask {
     }
 
     fn request_host(&self) -> DownloadResult<String> {
+        // 磁力链接没有 host，返回占位符
+        if self.url.starts_with("magnet:?") {
+            return Ok("magnet".to_string());
+        }
         let parsed = url::Url::parse(&self.url)?;
         parsed
             .host_str()
