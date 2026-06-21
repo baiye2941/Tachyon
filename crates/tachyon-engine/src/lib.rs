@@ -14,11 +14,17 @@ mod mirror;
 pub mod rate_limit;
 mod storage_adapter;
 
+#[cfg(feature = "magnet")]
+pub mod bt_session;
+
 pub use connection::{ConnectionPool, PoolConfig};
 pub use downloader::{DownloadTask, StorageKind, VerifierKind, default_blake3_verifier};
 pub use fragment::{BandwidthTracker, FragmentRecord, FragmentState};
 pub use rate_limit::RateLimiter;
 pub use tachyon_core::FragmentProgress;
+
+#[cfg(feature = "magnet")]
+pub use bt_session::BtSession;
 
 // 验证测试:放在 crate 根级别,以便 `--exact` 匹配
 

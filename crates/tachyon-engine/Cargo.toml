@@ -6,9 +6,10 @@ license.workspace = true
 description = "Tachyon 引擎层:分片引擎、连接管理"
 
 [features]
-default = ["tachyon-protocol/ftp", "tachyon-protocol/quic"]
+default = ["tachyon-protocol/ftp", "tachyon-protocol/quic", "tachyon-protocol/magnet"]
 ftp = ["tachyon-protocol/ftp"]
 quic = ["tachyon-protocol/quic"]
+magnet = ["tachyon-protocol/magnet", "dep:librqbit"]
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
@@ -25,6 +26,7 @@ futures.workspace = true
 serde.workspace = true
 url.workspace = true
 dashmap.workspace = true
+librqbit = { workspace = true, optional = true }
 
 [dev-dependencies]
 tachyon-core = { path = "../tachyon-core", features = ["test-harness"] }

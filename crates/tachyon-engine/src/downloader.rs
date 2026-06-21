@@ -132,6 +132,9 @@ pub struct DownloadTask {
     /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
     /// 调用方负责传入已 sanitize 的合法文件名(由 app 层 service 完成)。
     preferred_file_name: Option<String>,
+    /// BitTorrent Session（可选，仅磁力链接任务需要）
+    #[cfg(feature = "magnet")]
+    bt_session: Option<Arc<crate::bt_session::BtSession>>,
 }
 
 /// 跨分片复用的写入缓冲区包装。
@@ -189,7 +192,15 @@ impl DownloadTask {
         config: DownloadConfig,
         scheduler: Arc<dyn DownloadScheduler>,
     ) -> DownloadResult<Self> {
-        Self::with_pool_and_scheduler(url, config, None, scheduler).await
+        Self::with_pool_and_scheduler(
+            url,
+            config,
+            None,
+            scheduler,
+            #[cfg(feature = "magnet")]
+            None,
+        )
+        .await
     }
 
     pub async fn with_pool(
@@ -202,6 +213,8 @@ impl DownloadTask {
             config,
             pool,
             Arc::new(AdaptiveDownloadScheduler::default_config()),
+            #[cfg(feature = "magnet")]
+            None,
         )
         .await
     }
@@ -211,6 +224,7 @@ impl DownloadTask {
         config: DownloadConfig,
         pool: Option<Arc<ConnectionPool>>,
         scheduler: Arc<dyn DownloadScheduler>,
+        #[cfg(feature = "magnet")] bt_session: Option<Arc<crate::bt_session::BtSession>>,
     ) -> DownloadResult<Self> {
         let _parsed = url::Url::parse(&url)?;
 
@@ -233,6 +247,25 @@ impl DownloadTask {
             } else {
                 HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)?
             })
+        } else if url.starts_with("magnet:?") {
+            #[cfg(feature = "magnet")]
+            {
+                use tachyon_protocol::MagnetProtocol;
+                let session = bt_session
+                    .as_ref()
+                    .ok_or_else(|| DownloadError::Config("BitTorrent Session 未初始化".into()))?;
+                Arc::new(MagnetProtocol::new(
+                    session.session(),
+                    session.config().clone(),
+                    session.download_dir().clone(),
+                ))
+            }
+            #[cfg(not(feature = "magnet"))]
+            {
+                return Err(DownloadError::Config(format!(
+                    "磁力链接需要启用 magnet feature: {url}"
+                )));
+            }
         } else {
             return Err(DownloadError::Config(format!("不支持的协议: {url}")));
         };
@@ -260,6 +293,8 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_session,
         })
     }
 
@@ -342,6 +377,8 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_session: None,
         })
     }
 
@@ -374,6 +411,8 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_session: None,
         }
     }
 
