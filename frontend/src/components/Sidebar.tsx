@@ -226,6 +226,7 @@ export default function Sidebar() {
   const fileTypeFilter = () => $taskFilter.fileTypeFilter();
 
   // 展开面板固定宽度,transform 滑入滑出(合成层,零 reflow)
+  // spec 8.3:必须用 translate3d(transform-gpu)而非 translateX,确保 GPU 合成
   const panelWidth = () => Math.max(width(), MIN_EXPANDED_WIDTH);
   const panelTranslateX = () =>
     effectiveCollapsed() ? `-${panelWidth()}px` : "0px";
@@ -345,7 +346,7 @@ export default function Sidebar() {
             width: `${panelWidth()}px`,
             background: "var(--color-bg-secondary)",
             "border-right": "1px solid var(--color-border-subtle)",
-            transform: `translateX(${panelTranslateX()})`,
+            transform: `translate3d(${panelTranslateX()}, 0, 0)`,
             transition: transitionStyle(),
             "will-change": "transform",
             position: "absolute",

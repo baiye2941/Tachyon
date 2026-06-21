@@ -2,10 +2,11 @@ import { createSignal, createRoot, type Accessor } from "solid-js";
 import type { ViewName } from "../types";
 
 // 侧边栏常量(与 Sidebar.tsx 保持一致,单一来源)
-export const SIDEBAR_RAIL_WIDTH = 56;
-export const SIDEBAR_MIN_EXPANDED_WIDTH = 200;
-export const SIDEBAR_MAX_WIDTH = 300;
-export const SIDEBAR_DEFAULT_WIDTH = 220;
+// spec 8.3:轨道 48px,展开默认 240px,可拖拽 180-400px
+export const SIDEBAR_RAIL_WIDTH = 48;
+export const SIDEBAR_MIN_EXPANDED_WIDTH = 180;
+export const SIDEBAR_MAX_WIDTH = 400;
+export const SIDEBAR_DEFAULT_WIDTH = 240;
 const SIDEBAR_STORAGE_KEY = "tachyon-sidebar-state";
 
 type PanelState = {
