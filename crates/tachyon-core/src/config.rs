@@ -288,6 +288,42 @@ impl Default for DownloadConfig {
     }
 }
 
+/// 磁力链接下载配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagnetConfig {
+    /// 元数据获取超时（秒），默认 120
+    #[serde(default = "default_metadata_timeout_secs")]
+    pub metadata_timeout_secs: u64,
+    /// 下载超时（秒），默认 0（不限）
+    #[serde(default)]
+    pub download_timeout_secs: u64,
+}
+
+fn default_metadata_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for MagnetConfig {
+    fn default() -> Self {
+        Self {
+            metadata_timeout_secs: 120,
+            download_timeout_secs: 0,
+        }
+    }
+}
+
+impl MagnetConfig {
+    /// 校验配置值
+    pub fn validate(&self) -> crate::DownloadResult<()> {
+        let e = |msg: &str| crate::DownloadError::Config(msg.into());
+        if self.metadata_timeout_secs == 0 {
+            return Err(e("metadata_timeout_secs 必须 >= 1"));
+        }
+        Ok(())
+    }
+}
+
 /// 连接配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -642,6 +678,7 @@ impl AppConfig {
         self.download.validate()?;
         self.connection.validate()?;
         self.scheduler.validate()?;
+        self.magnet.validate()?;
         Ok(())
     }
 }
@@ -663,6 +700,9 @@ pub struct AppConfig {
     pub connection: ConnectionConfig,
     /// 调度器配置
     pub scheduler: SchedulerConfig,
+    /// 磁力链接配置
+    #[serde(default)]
+    pub magnet: MagnetConfig,
 }
 
 impl AppConfig {
@@ -679,6 +719,7 @@ impl Default for AppConfig {
             download: DownloadConfig::default(),
             connection: ConnectionConfig::default(),
             scheduler: SchedulerConfig::default(),
+            magnet: MagnetConfig::default(),
         }
     }
 }
@@ -1295,6 +1336,34 @@ mod tests {
     #[test]
     fn test_app_config_validate_valid() {
         assert!(AppConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_magnet_config_default() {
+        let config = MagnetConfig::default();
+        assert_eq!(config.metadata_timeout_secs, 120);
+        assert_eq!(config.download_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_magnet_config_validate_valid() {
+        let config = MagnetConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_magnet_config_validate_metadata_timeout_zero() {
+        let mut config = MagnetConfig::default();
+        config.metadata_timeout_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_config_serialization_roundtrip() {
+        let config = MagnetConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: MagnetConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metadata_timeout_secs, config.metadata_timeout_secs);
     }
 }
 
