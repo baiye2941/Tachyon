@@ -14,9 +14,10 @@ name = "tachyon"
 path = "src/main.rs"
 
 [features]
-default = ["tachyon-engine/ftp", "tachyon-engine/quic", "tachyon-hub/ftp", "tachyon-hub/quic"]
+default = ["tachyon-engine/ftp", "tachyon-engine/quic", "tachyon-engine/magnet", "tachyon-hub/ftp", "tachyon-hub/quic"]
 ftp = ["tachyon-engine/ftp", "tachyon-hub/ftp"]
 quic = ["tachyon-engine/quic", "tachyon-hub/quic"]
+magnet = ["tachyon-engine/magnet"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,6 +27,7 @@ tachyon-core = { path = "../tachyon-core" }
 tachyon-engine = { path = "../tachyon-engine", default-features = false }
 tachyon-hub = { path = "../tachyon-hub", default-features = false }
 tachyon-io = { path = "../tachyon-io" }
+tachyon-scheduler = { path = "../tachyon-scheduler" }
 tachyon-sniffer = { path = "../tachyon-sniffer" }
 tachyon-store = { path = "../tachyon-store" }
 tauri.workspace = true

@@ -317,6 +317,8 @@ impl AppState {
                 task_store,
                 chunk_reader_pool,
                 buffer_pool,
+                #[cfg(feature = "magnet")]
+                bt_session: None,
             },
             service: ServiceState {
                 task_service,

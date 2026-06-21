@@ -154,6 +154,7 @@ pub(crate) async fn ensure_download_dir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_download_task(
     task_id: &str,
     url: &str,
@@ -161,6 +162,7 @@ pub(crate) async fn build_download_task(
     connection_pool: Arc<ConnectionPool>,
     buffer_pool: Arc<BufferPool>,
     mirror_urls: Option<Vec<String>>,
+    #[cfg(feature = "magnet")] bt_session: Option<Arc<tachyon_engine::BtSession>>,
 ) -> Result<Box<dyn TaskRunner>, ()> {
     match mirror_urls {
         Some(mirrors) if !mirrors.is_empty() => {
@@ -184,8 +186,17 @@ pub(crate) async fn build_download_task(
             }
         }
         _ => {
-            match DownloadTask::with_pool(url.to_string(), download_config, Some(connection_pool))
-                .await
+            use tachyon_scheduler::AdaptiveDownloadScheduler;
+            let scheduler = Arc::new(AdaptiveDownloadScheduler::default_config());
+            match DownloadTask::with_pool_and_scheduler(
+                url.to_string(),
+                download_config,
+                Some(connection_pool),
+                scheduler,
+                #[cfg(feature = "magnet")]
+                bt_session,
+            )
+            .await
             {
                 Ok(mut t) => {
                     t.set_buffer_pool(buffer_pool.clone());
@@ -2243,6 +2254,8 @@ mod tests {
             download_config,
             state.infra.connection_pool.clone(),
             state.infra.buffer_pool.clone(),
+            None,
+            #[cfg(feature = "magnet")]
             None,
         )
         .await;

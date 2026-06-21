@@ -170,6 +170,8 @@ impl DownloadSession {
             self.connection_pool,
             self.buffer_pool.clone(),
             self.mirror_urls,
+            #[cfg(feature = "magnet")]
+            self.state.infra.bt_session.clone(),
         )
         .await
         {

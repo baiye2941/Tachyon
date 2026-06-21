@@ -27,7 +27,7 @@ impl BtSession {
     pub async fn new(
         download_dir: PathBuf,
         config: MagnetConfig,
-    ) -> crate::DownloadResult<Self> {
+    ) -> tachyon_core::DownloadResult<Self> {
         let session = Session::new(download_dir.clone())
             .await
             .map_err(|e| {
@@ -37,7 +37,7 @@ impl BtSession {
             })?;
 
         Ok(Self {
-            inner: Arc::new(session),
+            inner: session,
             config,
             download_dir,
         })

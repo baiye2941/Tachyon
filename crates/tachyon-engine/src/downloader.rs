@@ -134,6 +134,7 @@ pub struct DownloadTask {
     preferred_file_name: Option<String>,
     /// BitTorrent Session（可选，仅磁力链接任务需要）
     #[cfg(feature = "magnet")]
+    #[allow(dead_code)]
     bt_session: Option<Arc<crate::bt_session::BtSession>>,
 }
 

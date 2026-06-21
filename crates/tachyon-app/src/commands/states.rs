@@ -40,6 +40,9 @@ pub struct InfraState {
     /// 全局 buffer 池：供下载 worker 复用写盘 buffer,带 Semaphore 反压。
     /// 容量 = max_concurrent_tasks × max_concurrent_fragments,buffer_size = WRITE_BATCH_BYTES。
     pub buffer_pool: Arc<BufferPool>,
+    /// BitTorrent Session 单例（可选，magnet feature 启用时可用）
+    #[cfg(feature = "magnet")]
+    pub bt_session: Option<Arc<tachyon_engine::BtSession>>,
 }
 
 /// 应用服务状态：业务服务层
