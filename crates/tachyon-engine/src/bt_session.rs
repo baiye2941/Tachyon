@@ -28,13 +28,9 @@ impl BtSession {
         download_dir: PathBuf,
         config: MagnetConfig,
     ) -> tachyon_core::DownloadResult<Self> {
-        let session = Session::new(download_dir.clone())
-            .await
-            .map_err(|e| {
-                tachyon_core::DownloadError::Config(format!(
-                    "创建 BitTorrent Session 失败: {e}"
-                ))
-            })?;
+        let session = Session::new(download_dir.clone()).await.map_err(|e| {
+            tachyon_core::DownloadError::Config(format!("创建 BitTorrent Session 失败: {e}"))
+        })?;
 
         Ok(Self {
             inner: session,

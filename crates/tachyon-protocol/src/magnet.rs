@@ -10,8 +10,8 @@
 //! - `download_full()` / `download_full_stream()` 等待 librqbit 完成后从磁盘读取
 
 use std::future::Future;
-use std::pin::Pin;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,21 +122,19 @@ impl Protocol for MagnetProtocol {
                         config.metadata_timeout_secs
                     ))
                 })?
-                .map_err(|e| {
-                    DownloadError::Protocol(format!("磁力链接元数据获取失败: {e}"))
-                })?;
+                .map_err(|e| DownloadError::Protocol(format!("磁力链接元数据获取失败: {e}")))?;
 
             // 提取元数据
-            let (file_name, file_size) = handle.with_metadata(|m| {
-                let name = m
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "unknown_torrent".to_string());
-                let size = m.lengths.total_length();
-                (name, size)
-            }).map_err(|e| {
-                DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}"))
-            })?;
+            let (file_name, file_size) = handle
+                .with_metadata(|m| {
+                    let name = m
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "unknown_torrent".to_string());
+                    let size = m.lengths.total_length();
+                    (name, size)
+                })
+                .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
 
             Ok(FileMetadata {
                 file_name,
@@ -156,9 +154,7 @@ impl Protocol for MagnetProtocol {
         _end: u64,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
         Box::pin(async {
-            Err(DownloadError::Protocol(
-                "磁力链接不支持 Range 下载".into(),
-            ))
+            Err(DownloadError::Protocol("磁力链接不支持 Range 下载".into()))
         })
     }
 
@@ -169,9 +165,7 @@ impl Protocol for MagnetProtocol {
         _end: u64,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
         Box::pin(async {
-            Err(DownloadError::Protocol(
-                "磁力链接不支持 Range 下载".into(),
-            ))
+            Err(DownloadError::Protocol("磁力链接不支持 Range 下载".into()))
         })
     }
 
@@ -243,20 +237,17 @@ impl Protocol for MagnetProtocol {
 
             use futures::stream::unfold;
 
-            let stream = unfold(
-                tokio::io::BufReader::new(file),
-                |mut reader| async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match reader.read(&mut buf).await {
-                        Ok(0) => None,
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Some((Ok(Bytes::from(buf)), reader))
-                        }
-                        Err(e) => Some((Err(DownloadError::Io(e)), reader)),
+            let stream = unfold(tokio::io::BufReader::new(file), |mut reader| async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                match reader.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok(Bytes::from(buf)), reader))
                     }
-                },
-            );
+                    Err(e) => Some((Err(DownloadError::Io(e)), reader)),
+                }
+            });
 
             Ok(Box::pin(stream) as ByteStream)
         })
@@ -296,7 +287,12 @@ mod tests {
         let uri = "http://example.com/file.torrent";
         let result = validate_magnet_uri(uri);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("必须以 magnet:? 开头"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("必须以 magnet:? 开头")
+        );
     }
 
     #[test]
@@ -304,7 +300,12 @@ mod tests {
         let uri = "magnet:?dn=test&tr=udp://tracker.example.com:6969";
         let result = validate_magnet_uri(uri);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("缺少有效的 xt=urn:btih:"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("缺少有效的 xt=urn:btih:")
+        );
     }
 
     #[test]
@@ -312,7 +313,12 @@ mod tests {
         let uri = "magnet:?xt=urn:btih:&dn=test";
         let result = validate_magnet_uri(uri);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("缺少有效的 xt=urn:btih:"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("缺少有效的 xt=urn:btih:")
+        );
     }
 
     #[test]
@@ -320,7 +326,12 @@ mod tests {
         let uri = "magnet:?xt=urn:ed2k:abc123&dn=test";
         let result = validate_magnet_uri(uri);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("缺少有效的 xt=urn:btih:"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("缺少有效的 xt=urn:btih:")
+        );
     }
 
     #[test]

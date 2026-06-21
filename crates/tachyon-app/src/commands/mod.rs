@@ -400,6 +400,8 @@ pub fn supported_protocols() -> Vec<&'static str> {
     protocols.push("FTP");
     #[cfg(feature = "quic")]
     protocols.push("QUIC");
+    #[cfg(feature = "magnet")]
+    protocols.push("BitTorrent");
     protocols
 }
 
@@ -644,6 +646,8 @@ pub(crate) mod tests {
                 task_store,
                 chunk_reader_pool,
                 buffer_pool,
+                #[cfg(feature = "magnet")]
+                bt_session: None,
             },
             service: ServiceState {
                 task_service,

@@ -1363,7 +1363,10 @@ mod tests {
         let config = MagnetConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: MagnetConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metadata_timeout_secs, config.metadata_timeout_secs);
+        assert_eq!(
+            deserialized.metadata_timeout_secs,
+            config.metadata_timeout_secs
+        );
     }
 }
 
