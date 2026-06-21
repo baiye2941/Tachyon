@@ -2,7 +2,7 @@ import { createMemo, For, Show } from 'solid-js'
 import type { TaskInfo, ListDensity } from '../types'
 import { CheckboxIcon } from './icons'
 import { COLUMN_WIDTH } from './taskColumns'
-import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel } from '../utils/format'
+import { formatSize, formatSpeed, getFileType, getStatusLabel } from '../utils/format'
 import { tr } from '../i18n'
 
 interface TaskItemProps {
@@ -201,19 +201,18 @@ export default function TaskItem(props: TaskItemProps) {
             </div>
 
             <div
-              class="flex-shrink-0"
+              class="flex-shrink-0 flex justify-end"
               style={{
-                'min-width': '40px',
+                'min-width': '48px',
                 width: COLUMN_WIDTH.status,
-                'text-align': 'right',
-                'font-size': isCompact() ? '11px' : '12px',
-                color: getStatusColor(props.task.status),
-                'overflow': 'hidden',
-                'text-overflow': 'ellipsis',
-                'white-space': 'nowrap',
               }}
             >
-              {getStatusLabel(props.task.status)}
+              <span
+                class={`status-badge status-badge--${props.task.status}`}
+                title={getStatusLabel(props.task.status)}
+              >
+                {getStatusLabel(props.task.status)}
+              </span>
             </div>
           </div>
 
