@@ -24,6 +24,36 @@ export async function resumeSelected(): Promise<void> {
 }
 
 /**
+ * 批量取消选中任务
+ *
+ * cancel = 立即停止下载但保留任务记录(区别于 delete)。cancel_task 是 mutate
+ * 级(非 destructive),后端无需 confirmation token;但批量操作为防误触,前端
+ * 走一次应用内 ConfirmDialog(中性 tone,提示"停止但保留记录")。
+ */
+export async function cancelSelected(): Promise<void> {
+  const ids = Array.from($selectedIds.get())
+  if (ids.length === 0) return
+
+  const result = await requestConfirm({
+    title: tr('confirm.cancelBatch.title'),
+    message: tr('confirm.cancelBatch.message', { count: ids.length }),
+    confirmLabel: tr('confirm.cancelBatch.confirmLabel'),
+  })
+  if (!result.ok) return
+
+  const results = await Promise.allSettled(ids.map(id => api.cancelTask(id)))
+  const failures = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[]
+  if (failures.length > 0) {
+    addToast(tr('toast.cancelBatchPartialFailed', {
+      count: failures.length,
+      error: failures[0]?.reason ?? '',
+    }), 'error')
+  }
+  deselectAll()
+  await refreshTaskList()
+}
+
+/**
  * 批量删除选中任务(Iteration 11)
  *
  * 改造前:Tauri plugin-dialog 弹一次确认 + 每个 deleteTask 内部 window.confirm
@@ -86,5 +116,31 @@ export async function resumeAll(): Promise<void> {
   }
 
   await Promise.allSettled(ids.map(id => api.resumeTask(id)))
+  await refreshTaskList()
+}
+
+/**
+ * 取消所有运行中/暂停中的任务
+ *
+ * cancelAll 走单次应用内确认(中性 tone),避免误触批量取消。
+ */
+export async function cancelAll(): Promise<void> {
+  const ids = $tasks.get()
+    .filter(t => t.status === 'downloading' || t.status === 'connecting' || t.status === 'resuming' || t.status === 'paused')
+    .map(t => t.id)
+
+  if (ids.length === 0) {
+    addToast(tr('toast.noTasksToCancel'), 'info')
+    return
+  }
+
+  const result = await requestConfirm({
+    title: tr('confirm.cancelBatch.title'),
+    message: tr('confirm.cancelBatch.message', { count: ids.length }),
+    confirmLabel: tr('confirm.cancelBatch.confirmLabel'),
+  })
+  if (!result.ok) return
+
+  await Promise.allSettled(ids.map(id => api.cancelTask(id)))
   await refreshTaskList()
 }

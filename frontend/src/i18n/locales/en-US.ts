@@ -89,6 +89,8 @@ const enUS = {
   "toolbar.exit": "Exit",
   "toolbar.pauseAll": "Pause All",
   "toolbar.resumeAll": "Resume All",
+  "toolbar.cancel": "Cancel",
+  "toolbar.cancelAll": "Cancel All",
   "toolbar.settings": "Settings",
   "toolbar.multiSelect": "Multi-Select",
   "toolbar.removeFilter": "Remove filter {filter}",
@@ -99,6 +101,10 @@ const enUS = {
   "confirm.deleteBatch.title": "Delete Selected Tasks",
   "confirm.deleteBatch.message":
     "Delete {count} selected tasks? This action cannot be undone.",
+  "confirm.cancelBatch.title": "Cancel Selected Tasks",
+  "confirm.cancelBatch.message":
+    "Cancel {count} selected tasks? This stops downloads immediately but keeps the task records.",
+  "confirm.cancelBatch.confirmLabel": "Cancel Tasks",
   "confirm.delete.confirmLabel": "Delete",
   "confirm.deleteHistory.title": "Delete History Record",
   "confirm.deleteHistory.message":
@@ -182,6 +188,7 @@ const enUS = {
   "detail.savePathPending": "Download not started, path pending",
   "detail.action.pause": "Pause download",
   "detail.action.resume": "Resume download",
+  "detail.action.cancel": "Cancel task",
   "detail.action.delete": "Delete task",
   "detail.action.open": "Open",
   "detail.copyLink": "Copy link",
@@ -248,6 +255,10 @@ const enUS = {
   "toast.redownloadFailed": "Redownload failed: {error}",
   "toast.pauseFailed": "Failed to pause: {error}",
   "toast.resumeFailed": "Failed to resume: {error}",
+  "toast.cancelFailed": "Failed to cancel: {error}",
+  "toast.cancelSuccess": "Task cancelled",
+  "toast.cancelBatchPartialFailed": "{count} tasks failed to cancel: {error}",
+  "toast.noTasksToCancel": "No tasks to cancel",
   "toast.resumeSuccess": "Download resumed",
   "toast.redownloadSuccess": "New download task created",
   "toast.mirrorRetrySuccess": "Download task created via hf-mirror",

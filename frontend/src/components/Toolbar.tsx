@@ -9,6 +9,7 @@ import {
   CheckboxIcon,
   XIcon,
   TrashIcon,
+  CancelIcon,
 } from "./icons";
 import Button from "../shared/ui/Button";
 import { useI18n } from "../i18n";
@@ -65,6 +66,7 @@ interface ToolbarProps {
   onSelectAll: () => void;
   onPauseSelected: () => void;
   onResumeSelected: () => void;
+  onCancelSelected: () => void;
   onDeleteSelected: () => void;
   onExitMultiSelect: () => void;
   listDensity: "comfortable" | "compact";
@@ -73,6 +75,7 @@ interface ToolbarProps {
   onOpenSettings: () => void;
   onPauseAll: () => void;
   onResumeAll: () => void;
+  onCancelAll: () => void;
 }
 
 export default function Toolbar(props: ToolbarProps) {
@@ -141,6 +144,19 @@ export default function Toolbar(props: ToolbarProps) {
             <PlayIcon />
             <Show when={!isNarrow()}>
               <span>{i18n.t("toolbar.resume")}</span>
+            </Show>
+          </Button>
+
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onCancelSelected}
+            aria-label={i18n.t("toolbar.cancel") as string}
+            title={i18n.t("toolbar.cancel") as string}
+          >
+            <CancelIcon />
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.cancel")}</span>
             </Show>
           </Button>
 
@@ -281,6 +297,16 @@ export default function Toolbar(props: ToolbarProps) {
             onClick={props.onResumeAll}
           >
             <PlayIcon />
+          </Button>
+
+          <Button
+            variant="ghost"
+            shape="icon"
+            title={i18n.t("toolbar.cancelAll") as string}
+            aria-label={i18n.t("toolbar.cancelAll") as string}
+            onClick={props.onCancelAll}
+          >
+            <CancelIcon />
           </Button>
 
           <Button

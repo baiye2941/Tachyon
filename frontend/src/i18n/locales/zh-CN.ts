@@ -88,6 +88,8 @@ const zhCN = {
   "toolbar.exit": "退出",
   "toolbar.pauseAll": "暂停全部",
   "toolbar.resumeAll": "恢复全部",
+  "toolbar.cancel": "取消",
+  "toolbar.cancelAll": "取消全部",
   "toolbar.settings": "设置",
   "toolbar.multiSelect": "多选模式",
   "toolbar.removeFilter": "移除筛选 {filter}",
@@ -98,6 +100,10 @@ const zhCN = {
   "confirm.deleteBatch.title": "删除选中任务",
   "confirm.deleteBatch.message":
     "确定要删除选中的 {count} 个任务吗？此操作不可撤销。",
+  "confirm.cancelBatch.title": "取消选中任务",
+  "confirm.cancelBatch.message":
+    "确定要取消选中的 {count} 个任务吗？将立即停止下载,但保留任务记录。",
+  "confirm.cancelBatch.confirmLabel": "取消任务",
   "confirm.delete.confirmLabel": "删除",
   "confirm.deleteHistory.title": "删除历史记录",
   "confirm.deleteHistory.message":
@@ -179,6 +185,7 @@ const zhCN = {
   "detail.savePathPending": "下载尚未开始,路径待确定",
   "detail.action.pause": "暂停下载",
   "detail.action.resume": "恢复下载",
+  "detail.action.cancel": "取消任务",
   "detail.action.delete": "删除任务",
   "detail.action.open": "打开",
   "detail.copyLink": "复制链接",
@@ -238,6 +245,10 @@ const zhCN = {
   "toast.redownloadFailed": "重新下载失败: {error}",
   "toast.pauseFailed": "暂停失败: {error}",
   "toast.resumeFailed": "恢复失败: {error}",
+  "toast.cancelFailed": "取消失败: {error}",
+  "toast.cancelSuccess": "已取消任务",
+  "toast.cancelBatchPartialFailed": "{count} 个任务取消失败: {error}",
+  "toast.noTasksToCancel": "没有可取消的任务",
   "toast.resumeSuccess": "已恢复下载",
   "toast.redownloadSuccess": "已创建新的下载任务",
   "toast.mirrorRetrySuccess": "已通过 hf-mirror 镜像创建下载任务",

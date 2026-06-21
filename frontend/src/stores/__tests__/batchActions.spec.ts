@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 const mockPauseTask = vi.fn()
 const mockResumeTask = vi.fn()
+const mockCancelTask = vi.fn()
 const mockDeleteTask = vi.fn()
 const mockGetTaskList = vi.fn()
 const mockRequestConfirm = vi.fn()
@@ -13,6 +14,7 @@ vi.mock('../../api/invoke', () => ({
   api: {
     pauseTask: (...args: unknown[]) => mockPauseTask(...args),
     resumeTask: (...args: unknown[]) => mockResumeTask(...args),
+    cancelTask: (...args: unknown[]) => mockCancelTask(...args),
     deleteTask: (...args: unknown[]) => mockDeleteTask(...args),
     getTaskList: (...args: unknown[]) => mockGetTaskList(...args),
   },
@@ -52,6 +54,7 @@ beforeEach(async () => {
   vi.resetModules()
   mockPauseTask.mockReset()
   mockResumeTask.mockReset()
+  mockCancelTask.mockReset()
   mockDeleteTask.mockReset()
   mockGetTaskList.mockReset()
   mockRequestConfirm.mockReset()
@@ -204,5 +207,64 @@ describe('batchActions store', () => {
 
     expect(mockResumeTask).not.toHaveBeenCalled()
     expect(mockAddToast).toHaveBeenCalledWith('没有可恢复的任务', 'info')
+  })
+
+  it('cancelSelected 确认后取消选中任务(中性 tone,保留记录)', async () => {
+    downloadsModule.setTasks([makeTask('t1'), makeTask('t2')])
+    selectionModule.selectAll(['t1'])
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockCancelTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.cancelSelected()
+
+    expect(mockRequestConfirm).toHaveBeenCalledTimes(1)
+    expect(mockRequestConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: '取消选中任务' }),
+    )
+    expect(mockCancelTask).toHaveBeenCalledWith('t1')
+    expect(selectionModule.$selectedIds.get().size).toBe(0)
+  })
+
+  it('cancelSelected 用户取消时不执行', async () => {
+    downloadsModule.setTasks([makeTask('t1')])
+    selectionModule.selectAll(['t1'])
+    mockRequestConfirm.mockResolvedValue({ ok: false, deleteLocalFile: false })
+
+    await batchActionsModule.cancelSelected()
+
+    expect(mockCancelTask).not.toHaveBeenCalled()
+    expect(selectionModule.$selectedIds.get().size).toBe(1)
+  })
+
+  it('cancelAll 取消所有活跃与暂停任务', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'downloading' }),
+      makeTask('t2', { status: 'paused' }),
+      makeTask('t3', { status: 'resuming' }),
+      makeTask('t4', { status: 'completed' }),
+    ])
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockCancelTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.cancelAll()
+
+    expect(mockCancelTask).toHaveBeenCalledWith('t1')
+    expect(mockCancelTask).toHaveBeenCalledWith('t2')
+    expect(mockCancelTask).toHaveBeenCalledWith('t3')
+    expect(mockCancelTask).not.toHaveBeenCalledWith('t4')
+  })
+
+  it('cancelAll 没有可取消任务时提示', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'completed' }),
+      makeTask('t2', { status: 'failed' }),
+    ])
+
+    await batchActionsModule.cancelAll()
+
+    expect(mockCancelTask).not.toHaveBeenCalled()
+    expect(mockAddToast).toHaveBeenCalledWith('没有可取消的任务', 'info')
   })
 })

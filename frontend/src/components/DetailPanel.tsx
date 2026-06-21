@@ -29,6 +29,7 @@ import {
   FolderOpenIcon,
   RefreshIcon,
   ChevronDownIcon,
+  CancelIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
@@ -211,6 +212,16 @@ export default function DetailPanel(props: DetailPanelProps) {
   const isCompleted = () => task()?.status === "completed";
   const isFailed = () => task()?.status === "failed";
   const isDownloading = () => task()?.status === "downloading";
+  // cancel:立即停止但保留记录,对未终止的活跃/暂停任务可用
+  const canCancel = () => {
+    const s = task()?.status;
+    return (
+      s === "downloading" ||
+      s === "connecting" ||
+      s === "resuming" ||
+      s === "paused"
+    );
+  };
 
   // 失败诊断:优先用后端 errorReason,回退到启发式推断(诚实降级)
   const failureInsight = createMemo(() => {
@@ -286,6 +297,19 @@ export default function DetailPanel(props: DetailPanelProps) {
       await refreshTaskList();
     } catch (e) {
       addToast(tr("toast.deleteFailed", { error: e }), "error");
+    }
+  };
+
+  // 取消任务:立即停止下载但保留记录(区别于 delete)。cancel_task 是 mutate
+  // 级,后端无需 confirmation token;详情面板单任务操作,无需二次确认。
+  const handleCancel = async () => {
+    const t2 = currentTask();
+    if (!t2) return;
+    try {
+      await api.cancelTask(t2.id);
+      await refreshTaskList();
+    } catch (e) {
+      addToast(tr("toast.cancelFailed", { error: e }), "error");
     }
   };
 
@@ -875,6 +899,18 @@ export default function DetailPanel(props: DetailPanelProps) {
                 {isDownloading()
                   ? t("detail.action.pause")
                   : t("detail.action.resume")}
+              </Button>
+            </Show>
+            <Show when={canCancel()}>
+              <Button
+                variant="secondary"
+                size="lg"
+                class="detail-action-btn"
+                fullWidth
+                onClick={handleCancel}
+              >
+                <CancelIcon />
+                {t("detail.action.cancel")}
               </Button>
             </Show>
             <Button
