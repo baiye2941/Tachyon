@@ -219,7 +219,7 @@ export default function TaskItem(props: TaskItemProps) {
           <div
             class="relative overflow-hidden"
             style={{
-              height: isCompact() ? '2px' : '3px',
+              height: '4px',
               'margin-top': isCompact() ? '4px' : '8px',
               'border-radius': '9999px',
               background: 'var(--color-bg-tertiary)',
@@ -230,7 +230,7 @@ export default function TaskItem(props: TaskItemProps) {
               style={{
                 width: `${props.task.progress * 100}%`,
                 'border-radius': '9999px',
-                // 完成态用 emerald,失败用 red,下载中由 .progress-bar-active 接管(紫色 shimmer)
+                // spec 8.1:失败=红,完成=翠绿,下载中=accent shimmer,暂停=灰,其他=accent 渐变
                 background:
                   props.task.status === 'failed'
                     ? 'var(--color-status-error)'
@@ -238,7 +238,9 @@ export default function TaskItem(props: TaskItemProps) {
                       ? 'var(--color-status-completed)'
                       : props.task.status === 'downloading'
                         ? undefined
-                        : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
+                        : props.task.status === 'paused'
+                          ? 'var(--color-status-paused)'
+                          : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
                 transition: 'width 300ms ease-out',
               }}
             />

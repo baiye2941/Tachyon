@@ -15,9 +15,10 @@ import { PlusIcon, LinkIcon } from "./icons";
 import Button from "../shared/ui/Button";
 import { useI18n } from "../i18n";
 
-/** Fixed row heights per density mode (px) */
+/** Fixed row heights per density mode (px)
+ * spec 8.1:compact 52px / comfortable 72px */
 const ITEM_HEIGHTS: Record<ListDensity, number> = {
-  comfortable: 80,
+  comfortable: 72,
   compact: 52,
 };
 
