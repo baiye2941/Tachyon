@@ -144,6 +144,7 @@ const enUS = {
   "command.nav.settings.hint": "App configuration and preferences",
   "command.task.new.label": "New Download",
   "command.task.new.hint": "Add a new download task",
+  "command.task.openTask": "Open task",
   "command.act.pauseAll.label": "Pause All",
   "command.act.pauseAll.hint": "Pause all in-progress downloads",
   "command.act.resumeAll.label": "Resume All",

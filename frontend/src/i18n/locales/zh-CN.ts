@@ -142,6 +142,7 @@ const zhCN = {
   "command.nav.settings.hint": "应用配置与偏好",
   "command.task.new.label": "新建下载",
   "command.task.new.hint": "添加新的下载任务",
+  "command.task.openTask": "打开任务",
   "command.act.pauseAll.label": "全部暂停",
   "command.act.pauseAll.hint": "暂停所有进行中的下载",
   "command.act.resumeAll.label": "全部恢复",

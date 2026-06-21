@@ -426,6 +426,8 @@ function AppContent() {
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
             onToggleSidebar={$ui.toggleSidebar}
+            getTasks={() => $tasks.get()}
+            onOpenTask={(taskId) => $selectedId.set(taskId)}
           />
         </Suspense>
       </Show>
