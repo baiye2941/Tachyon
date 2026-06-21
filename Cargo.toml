@@ -67,6 +67,9 @@ wgpu = "24"
 # FTP
 suppaftp = { version = "8", features = ["tokio"] }
 
+# BitTorrent
+librqbit = "8"
+
 # Tauri
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = "2"
