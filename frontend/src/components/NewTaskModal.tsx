@@ -1,5 +1,5 @@
 import { createSignal, createMemo, Show, For } from "solid-js";
-import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon } from "./icons";
+import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon, ChevronDownIcon } from "./icons";
 import { api } from "../api/invoke";
 import { addToast } from "../stores/toast";
 import { refreshTaskList } from "../stores/downloads";
@@ -23,6 +23,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   const [autoStart, setAutoStart] = createSignal(true);
   const [isDragOver, setIsDragOver] = createSignal(false);
   const [creating, setCreating] = createSignal(false);
+  // 高级选项(镜像源/自定义文件名)默认折叠(spec 8.6 渐进披露)
+  const [advancedOpen, setAdvancedOpen] = createSignal(false);
 
   let urlInputRef: HTMLTextAreaElement | undefined;
   let panelRef: HTMLDivElement | undefined;
@@ -302,55 +304,108 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           </Show>
         </div>
 
-        {/* 镜像源(动态行,渐进披露) */}
+        {/* 高级选项(镜像源/自定义文件名)渐进披露,默认收起(spec 8.6) */}
         <div style={{ "margin-bottom": "16px" }}>
-          <Show when={mirrors().length > 0}>
-            <label
-              style={{
-                display: "block",
-                "font-size": "12px",
-                "font-weight": 500,
-                color: "var(--color-text-secondary)",
-                "margin-bottom": "6px",
-              }}
-            >
-              {tr("newTask.mirrorLabel")}
-            </label>
-            <For each={mirrors()}>
-              {(mirror, i) => (
-                <div
-                  class="flex items-center gap-2"
-                  style={{ "margin-bottom": "6px" }}
-                >
+          <button
+            type="button"
+            class="detail-disclosure-row"
+            aria-expanded={advancedOpen()}
+            aria-controls="new-task-advanced"
+            onClick={() => setAdvancedOpen((v) => !v)}
+            style={{ width: "100%", "margin-bottom": advancedOpen() ? "12px" : "0" }}
+          >
+            <span class="detail-disclosure-row-label">
+              {tr("newTask.advanced")}
+            </span>
+            <ChevronDownIcon
+              class={`detail-disclosure-chevron${advancedOpen() ? " detail-disclosure-chevron--open" : ""}`}
+            />
+          </button>
+          <Show when={advancedOpen()}>
+            <div id="new-task-advanced">
+              {/* 镜像源(动态行,渐进披露) */}
+              <div style={{ "margin-bottom": "16px" }}>
+                <Show when={mirrors().length > 0}>
+                  <label
+                    style={{
+                      display: "block",
+                      "font-size": "12px",
+                      "font-weight": 500,
+                      color: "var(--color-text-secondary)",
+                      "margin-bottom": "6px",
+                    }}
+                  >
+                    {tr("newTask.mirrorLabel")}
+                  </label>
+                  <For each={mirrors()}>
+                    {(mirror, i) => (
+                      <div
+                        class="flex items-center gap-2"
+                        style={{ "margin-bottom": "6px" }}
+                      >
+                        <input
+                          data-mirror="true"
+                          type="text"
+                          placeholder={tr("newTask.mirrorPlaceholder")}
+                          value={mirror}
+                          onInput={(e) => updateMirror(i(), e.currentTarget.value)}
+                          class="input"
+                          style={{
+                            flex: 1,
+                            padding: "8px 12px",
+                            "font-size": "13px",
+                          }}
+                        />
+                        <Button
+                          variant="ghost"
+                          shape="icon-sm"
+                          aria-label={tr("newTask.removeMirror", { index: i() + 1 })}
+                          onClick={() => removeMirror(i())}
+                        >
+                          <XIcon />
+                        </Button>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+                <Button variant="ghost" size="sm" onClick={addMirror}>
+                  <PlusIcon />
+                  <span>{tr("newTask.addMirror")}</span>
+                </Button>
+              </div>
+
+              {/* 重命名(仅单 URL 时显示,批量时一个名字套多个文件有歧义) */}
+              <Show when={validCount() === 1}>
+                <div style={{ "margin-bottom": "16px" }}>
+                  <label
+                    for="new-task-filename-input"
+                    style={{
+                      display: "block",
+                      "font-size": "12px",
+                      "font-weight": 500,
+                      color: "var(--color-text-secondary)",
+                      "margin-bottom": "6px",
+                    }}
+                  >
+                    {tr("newTask.fileNameLabel")}
+                  </label>
                   <input
-                    data-mirror="true"
+                    id="new-task-filename-input"
                     type="text"
-                    placeholder={tr("newTask.mirrorPlaceholder")}
-                    value={mirror}
-                    onInput={(e) => updateMirror(i(), e.currentTarget.value)}
+                    placeholder={tr("newTask.fileNamePlaceholder")}
+                    value={fileName()}
+                    onInput={(e) => setFileName(e.currentTarget.value)}
                     class="input"
                     style={{
-                      flex: 1,
-                      padding: "8px 12px",
-                      "font-size": "13px",
+                      width: "100%",
+                      padding: "10px 12px",
+                      "font-size": "14px",
                     }}
                   />
-                  <Button
-                    variant="ghost"
-                    shape="icon-sm"
-                    aria-label={tr("newTask.removeMirror", { index: i() + 1 })}
-                    onClick={() => removeMirror(i())}
-                  >
-                    <XIcon />
-                  </Button>
                 </div>
-              )}
-            </For>
+              </Show>
+            </div>
           </Show>
-          <Button variant="ghost" size="sm" onClick={addMirror}>
-            <PlusIcon />
-            <span>{tr("newTask.addMirror")}</span>
-          </Button>
         </div>
 
         {/* Save Path */}
@@ -388,37 +443,6 @@ export default function NewTaskModal(props: NewTaskModalProps) {
             </Button>
           </div>
         </div>
-
-        {/* 重命名(仅单 URL 时显示,批量时一个名字套多个文件有歧义) */}
-        <Show when={validCount() === 1}>
-          <div style={{ "margin-bottom": "16px" }}>
-            <label
-              for="new-task-filename-input"
-              style={{
-                display: "block",
-                "font-size": "12px",
-                "font-weight": 500,
-                color: "var(--color-text-secondary)",
-                "margin-bottom": "6px",
-              }}
-            >
-              {tr("newTask.fileNameLabel")}
-            </label>
-            <input
-              id="new-task-filename-input"
-              type="text"
-              placeholder={tr("newTask.fileNamePlaceholder")}
-              value={fileName()}
-              onInput={(e) => setFileName(e.currentTarget.value)}
-              class="input"
-              style={{
-                width: "100%",
-                padding: "10px 12px",
-                "font-size": "14px",
-              }}
-            />
-          </div>
-        </Show>
 
         {/* Auto Start */}
         <div

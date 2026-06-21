@@ -301,6 +301,7 @@ const zhCN = {
   "newTask.urlPlaceholder": "粘贴下载链接,每行一个\n支持拖拽 .txt 文件",
   "newTask.validCount": "{count} 个有效链接",
   "newTask.invalidCount": ", {count} 个无效将被忽略",
+  "newTask.advanced": "高级选项",
   "newTask.mirrorLabel": "镜像源(主源失败时自动切换)",
   "newTask.addMirror": "添加镜像源",
   "newTask.mirrorPlaceholder": "https://mirror.example.com/same-file.gguf",

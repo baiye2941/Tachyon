@@ -315,6 +315,7 @@ const enUS = {
   "newTask.invalidCount": ", {count} invalid will be ignored",
   "newTask.mirrorLabel": "Mirrors (auto-switch when primary fails)",
   "newTask.addMirror": "Add mirror",
+  "newTask.advanced": "Advanced options",
   "newTask.mirrorPlaceholder": "https://mirror.example.com/same-file.gguf",
   "newTask.removeMirror": "Remove mirror {index}",
   "newTask.saveTo": "Save to",
