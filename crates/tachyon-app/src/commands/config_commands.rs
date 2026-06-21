@@ -601,6 +601,7 @@ mod tests {
                 enable_quic,
             },
             scheduler: tachyon_core::config::SchedulerConfig::default(),
+            magnet: tachyon_core::config::MagnetConfig::default(),
         }
     }
 
@@ -864,6 +865,7 @@ mod tests {
                 enable_quic: true,
             },
             scheduler: tachyon_core::config::SchedulerConfig::default(),
+            magnet: tachyon_core::config::MagnetConfig::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();

@@ -3,12 +3,7 @@ name = "tachyon-p2sp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tachyon P2SP 混合下载、DHT、Peer 发现"
-
-[features]
-default = ["tachyon-protocol/ftp", "tachyon-protocol/quic"]
-ftp = ["tachyon-protocol/ftp"]
-quic = ["tachyon-protocol/quic"]
+description = "Tachyon P2SP 混合下载、Peer 发现"
 
 [dependencies]
 tachyon-protocol = { path = "../tachyon-protocol", default-features = false }
@@ -16,17 +11,6 @@ tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-postcard.workspace = true
-dashmap.workspace = true
-blake3.workspace = true
-getrandom.workspace = true
-ed25519-dalek.workspace = true
-rand.workspace = true
-
-# tachyon-protocol 通过 [features] default = ["tachyon-protocol/ftp", ...] 隐式使用,
-# cargo-machete 源码文本匹配会误报,此处显式抑制。
-[package.metadata.cargo-machete]
-ignored = ["tachyon-protocol"]
 
 [dev-dependencies]
 tokio-test.workspace = true

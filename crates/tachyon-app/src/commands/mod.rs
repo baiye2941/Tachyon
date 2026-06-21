@@ -605,6 +605,7 @@ pub(crate) mod tests {
             },
             connection: ConnectionConfig::default(),
             scheduler: Default::default(),
+            magnet: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
