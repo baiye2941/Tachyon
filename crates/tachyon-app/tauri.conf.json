@@ -19,7 +19,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Tachyon - 模型下载器",
+        "title": "Tachyon",
         "width": 1200,
         "height": 800,
         "resizable": true,
