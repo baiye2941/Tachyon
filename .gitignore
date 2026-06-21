@@ -53,3 +53,6 @@ Thumbs.db
 
 # Bun
 bun.lockb
+
+# Git worktrees（隔离工作区）
+.worktrees/
