@@ -1,20 +1,25 @@
-//! Tachyon 协议层:HTTP/HTTPS/QUIC/FTP
+//! Tachyon 协议层:HTTP/HTTPS/QUIC/FTP/BitTorrent
 //!
 //! 实现各协议的统一传输抽象:
 //! - HTTP/HTTPS 客户端(基于 reqwest)
 //! - QUIC 传输(基于 quinn)
 //! - FTP 客户端(基于 suppaftp)
+//! - BitTorrent 磁力链接(基于 librqbit)
 //! - 统一 Protocol trait
 
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod http;
+#[cfg(feature = "magnet")]
+pub mod magnet;
 #[cfg(feature = "quic")]
 pub mod quic;
 
 #[cfg(feature = "ftp")]
 pub use ftp::FtpClient;
 pub use http::HttpClient;
+#[cfg(feature = "magnet")]
+pub use magnet::MagnetProtocol;
 #[cfg(feature = "quic")]
 pub use quic::QuicTransport;
 
