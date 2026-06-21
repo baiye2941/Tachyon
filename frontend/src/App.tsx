@@ -400,6 +400,7 @@ function AppContent() {
         >
           <SettingsPanel
             visible={$ui.settingsVisible()}
+            initialTab={$ui.settingsInitialTab() ?? undefined}
             onClose={$ui.closeSettings}
           />
         </Suspense>

@@ -26,6 +26,8 @@ type SettingsTab =
 interface SettingsPanelProps {
   visible: boolean;
   onClose: () => void;
+  /** 初始打开的标签页(由 TitleBar 菜单\"关于\"等入口指定) */
+  initialTab?: SettingsTab;
 }
 
 interface ConfigDraft {
@@ -52,7 +54,9 @@ interface ConfigDraft {
 export default function SettingsPanel(props: SettingsPanelProps) {
   const t = (key: MessageKey, values?: Record<string, string | number>) =>
     tr(key, values as Record<string, string | number | unknown>);
-  const [activeTab, setActiveTab] = createSignal<SettingsTab>("general");
+  const [activeTab, setActiveTab] = createSignal<SettingsTab>(
+    props.initialTab ?? "general",
+  );
   const initialVisible = untrack(() => props.visible);
   const [shouldRender, setShouldRender] = createSignal(initialVisible);
   const [visible, setVisible] = createSignal(initialVisible);
@@ -65,6 +69,13 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       closeTimer = null;
     }
   };
+
+  // 面板打开时,若调用方指定了 initialTab(如 TitleBar\"关于\"入口),切到该标签
+  createEffect(() => {
+    if (props.visible && props.initialTab) {
+      setActiveTab(props.initialTab);
+    }
+  });
 
   createEffect(() => {
     if (props.visible) {

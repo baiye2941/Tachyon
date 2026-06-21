@@ -379,6 +379,11 @@ const zhCN = {
   "titleBar.maximize": "最大化",
   "titleBar.restore": "恢复",
   "titleBar.close": "关闭",
+  "titleBar.menu": "应用菜单",
+  "titleBar.menu.settings": "设置",
+  "titleBar.menu.shortcuts": "快捷键",
+  "titleBar.menu.about": "关于",
+  "titleBar.menu.quit": "退出",
 
   // —— Toast 容器 ——
   "toast.aria.closeToast": "关闭提示",

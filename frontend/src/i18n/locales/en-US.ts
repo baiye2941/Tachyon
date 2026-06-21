@@ -394,6 +394,11 @@ const enUS = {
   "titleBar.maximize": "Maximize",
   "titleBar.restore": "Restore",
   "titleBar.close": "Close",
+  "titleBar.menu": "App menu",
+  "titleBar.menu.settings": "Settings",
+  "titleBar.menu.shortcuts": "Shortcuts",
+  "titleBar.menu.about": "About",
+  "titleBar.menu.quit": "Quit",
 
   // —— Toast container ——
   "toast.aria.closeToast": "Close tip",
