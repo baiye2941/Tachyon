@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tachyon_core::config::DownloadConfig;
-use tachyon_core::traits::TaskRunner;
+use tachyon_core::safety::extract_filename_from_url;
+use tachyon_core::traits::{TaskRunner, Protocol};
 use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::DownloadTask;
 use tachyon_engine::connection::ConnectionPool;
@@ -10,7 +11,7 @@ use tachyon_io::BufferPool;
 use tokio::sync::watch;
 use url::Url;
 
-use super::{AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status};
+use super::{AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status, validate_download_url};
 
 // ---------------------------------------------------------------------------
 // Core download task function
@@ -548,7 +549,7 @@ pub async fn create_task(
     mirror_urls: Option<Vec<String>>,
     file_name: Option<String>,
 ) -> Result<String, AppError> {
-    create_task_inner(&state, url, download_dir, mirror_urls, file_name).await
+    create_task_inner(&state, url, download_dir, mirror_urls, file_name, None).await
 }
 
 #[tauri::command]
@@ -613,6 +614,128 @@ pub async fn get_task_detail(
     get_task_detail_inner(&state, task_id).await
 }
 
+/// 探测文件真实名称(HEAD 请求 / DHT 查询种子元数据)
+///
+/// - HTTP/HTTPS: 发送 HEAD 请求获取 Content-Disposition 等元数据
+/// - 磁力链接: 通过 DHT/Tracker 查询种子 info.name(与迅雷行为一致)
+///
+/// 探测失败时回退到 URL 本地提取(extract_filename_from_url / magnet-{infoHash})。
+#[tauri::command]
+pub async fn probe_filename(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
+    probe_filename_inner(&state, url)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn probe_filename_inner(
+    state: &AppState,
+    url: String,
+) -> Result<String, AppError> {
+    validate_download_url(&url)?;
+
+    // 磁力链接:使用 BtSession 通过 DHT/Tracker 探测真实文件名
+    #[cfg(feature = "magnet")]
+    if url.starts_with("magnet:?") {
+        let bt_session = state.infra.bt_session.lock().await.clone();
+        if let Some(session) = bt_session {
+            let protocol = tachyon_engine::MagnetProtocol::new(
+                session.session(),
+                session.config().clone(),
+                session.download_dir().clone(),
+            );
+            match protocol.probe(&url).await {
+                Ok(meta) => return Ok(meta.file_name),
+                Err(e) => {
+                    tracing::warn!(error = %e, "磁力链接探测失败,回退到本地提取");
+                    return Ok(extract_magnet_fallback_name(&url));
+                }
+            }
+        }
+        // BtSession 未初始化,回退到本地提取
+        tracing::warn!("BitTorrent Session 未初始化,磁力链接探测不可用");
+        return Ok(extract_magnet_fallback_name(&url));
+    }
+
+    // HTTP/FTP:构造 DownloadTask 做 HEAD 探测
+    let download_config = DownloadConfig::default();
+    match DownloadTask::new(url.clone(), download_config).await {
+        Ok(mut task) => match task.probe().await {
+            Ok(meta) => Ok(meta.file_name.clone()),
+            Err(_) => {
+                // 探测失败,回退到 URL 本地提取
+                Ok(extract_filename_from_url(&url))
+            }
+        },
+        Err(_) => Ok(extract_filename_from_url(&url)),
+    }
+}
+
+/// 磁力链接本地回退:优先 dn= 参数,无则用 magnet-{infoHash}
+fn extract_magnet_fallback_name(url: &str) -> String {
+    // 尝试提取 dn= (Display Name),使用 URLSearchParams 风格解析
+    if let Some(query) = url.strip_prefix("magnet:?") {
+        for pair in query.split('&') {
+            if let Some(val) = pair.strip_prefix("dn=") {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return simple_percent_decode(trimmed);
+                }
+            }
+        }
+
+        // 回退到 xt=urn:btih:<hash>
+        for pair in query.split('&') {
+            if let Some(val) = pair.strip_prefix("xt=urn:btih:") {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return format!("magnet-{trimmed}");
+                }
+            }
+        }
+    }
+
+    "unknown".to_string()
+}
+
+/// 简易百分号解码(磁力链接 dn= 值)
+///
+/// 仅处理 %XX 格式,不处理无效编码(原样保留)。
+fn simple_percent_decode(s: &str) -> String {
+    let mut result = Vec::new();
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    if let (Some(hv), Some(lv)) = (hex_val(h), hex_val(l)) {
+                        result.push((hv << 4) | lv);
+                    } else {
+                        result.extend_from_slice(&[b'%', h, l]);
+                    }
+                }
+                _ => result.push(b'%'),
+            }
+        } else {
+            result.push(b);
+        }
+    }
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Inner implementations
 // ---------------------------------------------------------------------------
@@ -623,6 +746,7 @@ pub(crate) async fn create_task_inner(
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
     file_name: Option<String>,
+    hf_meta: Option<super::HfTaskMeta>,
 ) -> Result<String, AppError> {
     let creation = state
         .service
@@ -634,6 +758,13 @@ pub(crate) async fn create_task_inner(
             file_name.as_deref(),
         )
         .await?;
+
+    // 注入 HF 元数据（如果提供）
+    if let Some(meta) = hf_meta
+        && let Some(mut task) = state.domain.task_repository.get_mut(&creation.task_id)
+    {
+        task.hf_meta = Some(meta);
+    }
 
     let state_arc = Arc::new(state.clone_for_task());
     state.runtime.supervisor.start_download(
@@ -762,6 +893,7 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                hf_meta: None,
             },
         );
 
@@ -803,6 +935,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -815,6 +948,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://cdn.example.org/releases/app-v2.0.tar.gz".to_string(),
+            None,
             None,
             None,
             None,
@@ -831,6 +965,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/data.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -863,6 +998,7 @@ mod tests {
             Some(sub_dir.clone()),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -879,12 +1015,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let result = create_task_inner(
             &state,
             "https://dup.example.com/once.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -906,7 +1044,7 @@ mod tests {
         for _ in 0..10 {
             let state = state.clone();
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url.to_string(), None, None, None).await
+                create_task_inner(&state, url.to_string(), None, None, None, None).await
             }));
         }
 
@@ -953,7 +1091,7 @@ mod tests {
             let state = state.clone();
             let url = format!("https://stress.example.com/file-{i}.bin");
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url, None, None, None).await
+                create_task_inner(&state, url, None, None, None, None).await
             }));
         }
 
@@ -1009,6 +1147,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1024,6 +1163,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -1045,6 +1185,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1060,6 +1201,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -1080,6 +1222,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1094,6 +1237,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/file.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -1115,6 +1259,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1129,6 +1274,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/preserve-local-file.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -1186,6 +1332,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/remove-local-file.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -1259,6 +1406,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1310,6 +1458,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1345,6 +1494,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1360,6 +1510,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/paused-delete.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -1381,12 +1532,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let id2 = create_task_inner(
             &state,
             "https://example.com/b.zip".to_string(),
+            None,
             None,
             None,
             None,
@@ -1420,6 +1573,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://example.com/lifecycle.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -1484,6 +1638,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1493,12 +1648,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let result = create_task_inner(
             &state,
             "http://example.com/file3.bin".into(),
+            None,
             None,
             None,
             None,
@@ -1521,6 +1678,7 @@ mod tests {
         let result = create_task_inner(
             &state,
             "http://example.com/zero-sem.bin".into(),
+            None,
             None,
             None,
             None,
@@ -1547,7 +1705,8 @@ mod tests {
                 None,
                 None,
                 None,
-            )
+            None,
+        )
             .await
             .unwrap();
             task_ids.push(id);
@@ -1607,7 +1766,8 @@ mod tests {
                 None,
                 None,
                 None,
-            )
+            None,
+        )
             .await
             .unwrap();
             cancel_task_inner(&state, id.clone()).await.unwrap();
@@ -1622,6 +1782,7 @@ mod tests {
                 create_task_inner(
                     &state_clone,
                     format!("http://example.com/new-task-{i}.bin"),
+                    None,
                     None,
                     None,
                     None,
@@ -1668,6 +1829,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1707,6 +1869,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1736,6 +1899,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1755,6 +1919,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "http://example.com/control-cancel.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -1847,6 +2012,7 @@ mod tests {
             None,
             None,
             Some("my_model.bin".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -1863,6 +2029,7 @@ mod tests {
             None,
             None,
             Some("../../etc/passwd".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -1876,6 +2043,7 @@ mod tests {
         let id = create_task_inner(
             &state,
             "https://cdn.example.org/releases/v2.0.tar.gz".to_string(),
+            None,
             None,
             None,
             None,
@@ -1895,6 +2063,7 @@ mod tests {
             None,
             None,
             Some("   ".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -2002,6 +2171,7 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                hf_meta: None,
             },
         );
         task_id
@@ -2276,5 +2446,80 @@ mod tests {
             capacity,
             "build_download_task 构造失败不应消费 buffer_pool 许可"
         );
+    }
+
+    // ---- probe_filename 测试 ----
+
+    /// 无效 URL 应返回错误
+    #[tokio::test]
+    async fn test_probe_filename_invalid_url_returns_error() {
+        let state = test_state();
+        let result = probe_filename_inner(&state, "not-a-url".to_string()).await;
+        assert!(result.is_err(), "无效 URL 应返回错误");
+    }
+
+    /// 不支持的协议(如 ftp)应返回错误
+    #[tokio::test]
+    async fn test_probe_filename_unsupported_protocol_returns_error() {
+        let state = test_state();
+        let result =
+            probe_filename_inner(&state, "ftp://example.com/file.zip".to_string()).await;
+        assert!(result.is_err(), "不支持的协议应返回错误");
+    }
+
+    /// 网络不可达时 HTTP 探测应回退到本地提取
+    #[tokio::test]
+    async fn test_probe_filename_http_fallback_on_network_error() {
+        let state = test_state();
+        let result = probe_filename_inner(
+            &state,
+            "https://192.0.2.1/nonexistent-file.bin".to_string(),
+        )
+        .await;
+        match result {
+            Ok(name) => assert_eq!(name, "nonexistent-file.bin"),
+            Err(_) => {
+                // 网络超时也可接受,但不能 panic
+            }
+        }
+    }
+
+    /// extract_magnet_fallback_name 应正确提取 dn=
+    #[test]
+    fn test_extract_magnet_fallback_name_with_dn() {
+        assert_eq!(
+            extract_magnet_fallback_name("magnet:?xt=urn:btih:abc&dn=ubuntu.iso&tr=udp://t.example.com"),
+            "ubuntu.iso"
+        );
+    }
+
+    /// extract_magnet_fallback_name 无 dn= 时应回退到 magnet-{infoHash}
+    #[test]
+    fn test_extract_magnet_fallback_name_without_dn() {
+        assert_eq!(
+            extract_magnet_fallback_name("magnet:?xt=urn:btih:ABC123&tr=udp://t.example.com"),
+            "magnet-ABC123"
+        );
+    }
+
+    /// extract_magnet_fallback_name dn= 为空时应回退到 infoHash
+    #[test]
+    fn test_extract_magnet_fallback_name_empty_dn() {
+        assert_eq!(
+            extract_magnet_fallback_name("magnet:?xt=urn:btih:DEF456&dn=&tr=udp://t.example.com"),
+            "magnet-DEF456"
+        );
+    }
+
+    /// simple_percent_decode 应处理 UTF-8 编码
+    #[test]
+    fn test_simple_percent_decode_utf8() {
+        assert_eq!(simple_percent_decode("%E4%B8%AD%E6%96%87"), "中文");
+    }
+
+    /// simple_percent_decode 应原样保留无效编码
+    #[test]
+    fn test_simple_percent_decode_no_encoding() {
+        assert_eq!(simple_percent_decode("filename.zip"), "filename.zip");
     }
 }

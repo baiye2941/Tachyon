@@ -102,6 +102,7 @@ pub fn run() {
             request_confirmation,
             // 任务管理
             create_task,
+            probe_filename,
             pause_task,
             resume_task,
             cancel_task,
@@ -120,6 +121,14 @@ pub fn run() {
             // HuggingFace Hub
             list_repo_files,
             get_hf_download_url,
+            get_model_info,
+            search_models,
+            scan_local_models,
+            verify_model,
+            list_model_favorites,
+            add_model_favorite,
+            remove_model_favorite,
+            batch_create_hf_tasks,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {
@@ -153,6 +162,7 @@ async fn any_fragment() {
         save_path: String::new(),
         error_reason: None,
         retry_count: 0,
+        hf_meta: None,
     };
     state.domain.task_repository.insert(task_id.clone(), task);
 
@@ -201,6 +211,7 @@ async fn max_concurrent() {
                     save_path: String::new(),
                     error_reason: None,
                     retry_count: 0,
+                    hf_meta: None,
                 },
             );
         }

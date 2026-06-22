@@ -1,4 +1,7 @@
-use super::AppError;
+use super::{AppError, AppState, FileVerifyResult, HfTaskMeta, LocalModel, LocalModelFile, ModelFavorite, VerifyStatus};
+use std::path::Path;
+use tauri::State;
+use tachyon_hub::classify_file;
 
 // ---------------------------------------------------------------------------
 // 输入验证 (W-19)
@@ -80,4 +83,305 @@ pub async fn get_hf_download_url(
     let api = tachyon_hub::api::HubApi::from_env()
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     Ok(api.download_url(&repo_id, &rev, &file_path))
+}
+
+/// 获取模型元数据
+#[tauri::command]
+pub async fn get_model_info(
+    repo_id: String,
+    revision: Option<String>,
+) -> Result<tachyon_hub::api::HfModelInfo, AppError> {
+    validate_repo_id(&repo_id)?;
+    let rev = revision.unwrap_or_else(|| "main".to_string());
+    validate_revision(&rev)?;
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
+    api.model_info(&repo_id, &rev).await.map_err(AppError::Core)
+}
+
+/// 搜索模型
+#[tauri::command]
+pub async fn search_models(
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<tachyon_hub::api::HfModelInfo>, AppError> {
+    if query.is_empty() {
+        return Err(AppError::Config("搜索查询不能为空".into()));
+    }
+    let limit = limit.unwrap_or(20).min(50);
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
+    api.search_models(&query, limit).await.map_err(AppError::Core)
+}
+
+/// 扫描本地已下载模型
+///
+/// 从 TaskRepository 筛选有 HfTaskMeta 的 Completed 任务，按 repo_id 聚合。
+#[tauri::command]
+pub async fn scan_local_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<LocalModel>, AppError> {
+    let mut models: std::collections::HashMap<String, LocalModel> = std::collections::HashMap::new();
+
+    for entry in state.domain.task_repository.iter() {
+        let task = entry.value();
+        if task.status != tachyon_core::types::DownloadState::Completed {
+            continue;
+        }
+        let Some(ref meta) = task.hf_meta else {
+            continue;
+        };
+
+        let model = models.entry(meta.repo_id.clone()).or_insert_with(|| LocalModel {
+            repo_id: meta.repo_id.clone(),
+            revision: meta.revision.clone(),
+            local_path: Path::new(&task.save_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            files: Vec::new(),
+            total_size: 0,
+            downloaded_at: Some(task.created_at.clone()),
+            metadata: None,
+        });
+
+        let file_exists = Path::new(&task.save_path).exists();
+        let category = classify_file(&meta.file_path);
+        model.files.push(LocalModelFile {
+            path: meta.file_path.clone(),
+            local_path: task.save_path.clone(),
+            size: task.file_size.unwrap_or(0),
+            category,
+            lfs_oid: meta.lfs_oid.clone(),
+            verify_status: if file_exists {
+                VerifyStatus::Unverified
+            } else {
+                VerifyStatus::Failed("文件不存在".to_string())
+            },
+            exists: file_exists,
+        });
+        model.total_size += task.file_size.unwrap_or(0);
+    }
+
+    Ok(models.into_values().collect())
+}
+
+/// 校验模型文件
+///
+/// LFS 文件使用 sha256 校验，普通文件使用文件大小比对。
+#[tauri::command]
+pub async fn verify_model(
+    state: State<'_, AppState>,
+    repo_id: String,
+    revision: Option<String>,
+) -> Result<Vec<FileVerifyResult>, AppError> {
+    validate_repo_id(&repo_id)?;
+    let rev = revision.unwrap_or_else(|| "main".to_string());
+    validate_revision(&rev)?;
+
+    // 获取远程文件列表用于比对
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
+    let remote_files = api.list_files(&repo_id, &rev).await.map_err(AppError::Core)?;
+    let remote_map: std::collections::HashMap<String, tachyon_hub::api::HfFile> = remote_files
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+
+    let mut results = Vec::new();
+
+    for entry in state.domain.task_repository.iter() {
+        let task = entry.value();
+        let Some(ref meta) = task.hf_meta else { continue; };
+        if meta.repo_id != repo_id {
+            continue;
+        }
+
+        let path = &task.save_path;
+        let start = std::time::Instant::now();
+        let status = if !Path::new(path).exists() {
+            VerifyStatus::Failed("文件不存在".to_string())
+        } else if let Some(remote) = remote_map.get(&meta.file_path) {
+            if let Some(ref lfs) = remote.lfs {
+                // LFS 文件: sha256 校验
+                let verifier = tachyon_crypto::cpu::CpuVerifier::sha256();
+                match verifier
+                    .compute_hash_from_path(std::path::Path::new(path), 8192)
+                    .await
+                {
+                    Ok(hash) => {
+                        let expected = lfs.oid.trim_start_matches("sha256:");
+                        if hash.eq_ignore_ascii_case(expected) {
+                            VerifyStatus::Verified
+                        } else {
+                            VerifyStatus::Failed(format!(
+                                "sha256 不匹配: 期望 {expected}, 实际 {hash}"
+                            ))
+                        }
+                    }
+                    Err(e) => VerifyStatus::Failed(format!("校验计算失败: {e}")),
+                }
+            } else {
+                // 普通文件: 大小比对
+                let actual_size = std::fs::metadata(path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if actual_size == remote.size {
+                    VerifyStatus::Verified
+                } else {
+                    VerifyStatus::Failed(format!(
+                        "大小不匹配: 期望 {}, 实际 {actual_size}",
+                        remote.size
+                    ))
+                }
+            }
+        } else {
+            VerifyStatus::Failed("远程文件信息缺失".to_string())
+        };
+
+        results.push(FileVerifyResult {
+            path: meta.file_path.clone(),
+            status,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+
+    Ok(results)
+}
+
+/// 列出收藏模型
+#[tauri::command]
+pub async fn list_model_favorites(
+    state: State<'_, AppState>,
+) -> Result<Vec<ModelFavorite>, AppError> {
+    let keys = state
+        .infra
+        .favorites_store
+        .list_by_prefix("fav_")
+        .map_err(|e| AppError::Config(format!("读取收藏列表失败: {e}")))?;
+
+    let mut favorites = Vec::new();
+    for key in keys {
+        let repo_id = key.strip_prefix("fav_").unwrap_or(&key).to_string();
+        let cached: Option<tachyon_hub::api::HfModelInfo> = state
+            .infra
+            .favorites_store
+            .get(&key)
+            .map_err(|e| AppError::Config(format!("读取收藏数据失败: {e}")))?;
+
+        let added_at = state
+            .infra
+            .favorites_store
+            .get_raw(&key)
+            .ok()
+            .flatten()
+            .and_then(|json| {
+                serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| {
+                    v.get("addedAt")
+                        .and_then(|a| a.as_str().map(|s| s.to_string()))
+                })
+            })
+            .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
+
+        favorites.push(ModelFavorite {
+            repo_id,
+            added_at,
+            cached_info: cached,
+        });
+    }
+
+    Ok(favorites)
+}
+
+/// 添加收藏模型
+#[tauri::command]
+pub async fn add_model_favorite(
+    state: State<'_, AppState>,
+    repo_id: String,
+) -> Result<(), AppError> {
+    validate_repo_id(&repo_id)?;
+    let key = format!("fav_{repo_id}");
+
+    // 尝试缓存模型元数据
+    let cached_info = match tachyon_hub::api::HubApi::from_env() {
+        Ok(api) => api.model_info(&repo_id, "main").await.ok(),
+        Err(_) => None,
+    };
+
+    let favorite = ModelFavorite {
+        repo_id: repo_id.clone(),
+        added_at: chrono::Local::now().to_rfc3339(),
+        cached_info,
+    };
+
+    state
+        .infra
+        .favorites_store
+        .put(&key, &favorite)
+        .map_err(|e| AppError::Config(format!("保存收藏失败: {e}")))?;
+
+    Ok(())
+}
+
+/// 移除收藏模型
+#[tauri::command]
+pub async fn remove_model_favorite(
+    state: State<'_, AppState>,
+    repo_id: String,
+) -> Result<(), AppError> {
+    validate_repo_id(&repo_id)?;
+    let key = format!("fav_{repo_id}");
+    state
+        .infra
+        .favorites_store
+        .delete(&key)
+        .map_err(|e| AppError::Config(format!("删除收藏失败: {e}")))?;
+    Ok(())
+}
+
+/// 批量创建 HF 下载任务
+///
+/// 为每个文件创建下载任务并注入 HfTaskMeta。
+#[tauri::command]
+pub async fn batch_create_hf_tasks(
+    state: State<'_, AppState>,
+    repo_id: String,
+    revision: Option<String>,
+    file_paths: Vec<String>,
+    download_dir: Option<String>,
+) -> Result<Vec<String>, AppError> {
+    validate_repo_id(&repo_id)?;
+    let rev = revision.unwrap_or_else(|| "main".to_string());
+    validate_revision(&rev)?;
+
+    if file_paths.is_empty() {
+        return Err(AppError::Config("文件列表不能为空".into()));
+    }
+
+    let api = tachyon_hub::api::HubApi::from_env()
+        .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
+
+    let mut task_ids = Vec::new();
+    for file_path in file_paths {
+        validate_file_path(&file_path)?;
+        let url = api.download_url(&repo_id, &rev, &file_path);
+        let hf_meta = HfTaskMeta {
+            repo_id: repo_id.clone(),
+            revision: rev.clone(),
+            file_path: file_path.clone(),
+            lfs_oid: None,
+        };
+        let id = super::task_commands::create_task_inner(
+            &state,
+            url,
+            download_dir.clone(),
+            None,
+            None,
+            Some(hf_meta),
+        )
+        .await?;
+        task_ids.push(id);
+    }
+
+    Ok(task_ids)
 }

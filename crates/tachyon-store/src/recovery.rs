@@ -63,6 +63,8 @@ pub struct TaskSnapshot {
     pub fail_reason: Option<String>,
     #[serde(default)]
     pub retry_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_meta: Option<serde_json::Value>,
 }
 
 /// 下载任务持久化记录（旧接口，保持向后兼容）
@@ -127,6 +129,7 @@ impl From<TaskRecord> for TaskSnapshot {
             updated_at: String::new(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         }
     }
 }
@@ -368,6 +371,7 @@ mod tests {
             updated_at: String::new(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         }
     }
 
@@ -570,6 +574,7 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

@@ -331,6 +331,7 @@ impl TaskService {
             save_path: download_dir_str.clone(),
             error_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性

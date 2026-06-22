@@ -109,6 +109,10 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
         // 从快照恢复时保留失败原因与重试计数,前端诊断面板可直接使用后端原文
         error_reason: snapshot.fail_reason.clone(),
         retry_count: snapshot.retry_count,
+        hf_meta: snapshot
+            .hf_meta
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     }
 }
 
@@ -150,6 +154,11 @@ pub fn task_info_to_snapshot(
         // 保留 TaskInfo 上的失败原因与重试计数,避免持久化时丢失
         fail_reason: task.error_reason.clone(),
         retry_count: task.retry_count,
+        hf_meta: task
+            .hf_meta
+            .as_ref()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .filter(|v| !v.is_null()),
     }
 }
 
@@ -179,6 +188,7 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
 
         let task = snapshot_to_task_info(&snapshot);
@@ -211,6 +221,7 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
 
         store.save_snapshot(&snapshot).unwrap();
@@ -246,6 +257,7 @@ mod tests {
             updated_at: "2026-05-29T00:00:00Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
         store.save_snapshot(&good).unwrap();
 
@@ -314,6 +326,7 @@ mod tests {
             save_path: "/downloads/file.bin".to_string(),
             error_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
 
         let snapshot = task_info_to_snapshot(

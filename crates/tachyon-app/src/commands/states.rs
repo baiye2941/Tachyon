@@ -36,6 +36,8 @@ pub struct DomainState {
 pub struct InfraState {
     pub connection_pool: Arc<ConnectionPool>,
     pub task_store: Arc<TaskStore>,
+    /// 收藏 KV 存储（独立目录，与任务存储分离）
+    pub favorites_store: Arc<tachyon_store::KvStore>,
     pub chunk_reader_pool: Arc<ChunkReaderPool>,
     /// 全局 buffer 池：供下载 worker 复用写盘 buffer,带 Semaphore 反压。
     /// 容量 = max_concurrent_tasks × max_concurrent_fragments,buffer_size = WRITE_BATCH_BYTES。

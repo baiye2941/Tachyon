@@ -180,6 +180,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -230,12 +231,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let id2 = create_task_inner(
             &state,
             "https://example.com/2.bin".to_string(),
+            None,
             None,
             None,
             None,

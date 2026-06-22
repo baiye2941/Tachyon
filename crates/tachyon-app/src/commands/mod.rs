@@ -7,11 +7,14 @@ pub mod task_commands;
 
 // Re-exports: Tauri commands and public types
 pub use self::config_commands::{get_config, update_config};
-pub use self::hub_commands::{get_hf_download_url, list_repo_files};
+pub use self::hub_commands::{
+    add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info, list_model_favorites,
+    list_repo_files, remove_model_favorite, scan_local_models, search_models, verify_model,
+};
 pub use self::progress_commands::{get_download_progress, subscribe_progress};
 pub use self::sniffer_commands::{add_sniffer_filter, add_sniffer_resource, get_sniffer_resources};
 pub use self::task_commands::{
-    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task, resume_task,
+    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task, probe_filename, resume_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,11 +127,82 @@ pub struct TaskInfo {
     /// 任务级重试计数（保留字段，当前恒为 0，为后续重试策略预留接口）。
     #[serde(default)]
     pub retry_count: u32,
+    /// HF 任务元数据（仅 HF 来源的下载任务有值）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_meta: Option<HfTaskMeta>,
 }
 
 /// 序列化 URL 时脱敏，前端只看到不含敏感参数的 URL
 fn serialize_url_for_display<S: serde::Serializer>(url: &str, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&tachyon_core::safety::redact_url_for_log(url))
+}
+
+/// HF 任务元数据（可选，仅 HF 来源的下载任务有值）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HfTaskMeta {
+    pub repo_id: String,
+    pub revision: String,
+    pub file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfs_oid: Option<String>,
+}
+
+/// 本地模型记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModel {
+    pub repo_id: String,
+    pub revision: String,
+    pub local_path: String,
+    pub files: Vec<LocalModelFile>,
+    pub total_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<tachyon_hub::api::HfModelInfo>,
+}
+
+/// 本地模型文件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModelFile {
+    pub path: String,
+    pub local_path: String,
+    pub size: u64,
+    pub category: tachyon_hub::FileCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfs_oid: Option<String>,
+    pub verify_status: VerifyStatus,
+    pub exists: bool,
+}
+
+/// 校验状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerifyStatus {
+    Unverified,
+    Verified,
+    Failed(String),
+}
+
+/// 文件校验结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVerifyResult {
+    pub path: String,
+    pub status: VerifyStatus,
+    pub elapsed_ms: u64,
+}
+
+/// 收藏记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFavorite {
+    pub repo_id: String,
+    pub added_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_info: Option<tachyon_hub::api::HfModelInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +356,12 @@ impl AppState {
             TaskStore::open(&store_dir)
                 .map_err(|e| AppError::Config(format!("任务存储初始化失败: {e}")))?,
         );
+        let favorites_dir = new_dir.join("favorites");
+        let _ = std::fs::create_dir_all(&favorites_dir);
+        let favorites_store = Arc::new(
+            tachyon_store::KvStore::open(&favorites_dir)
+                .map_err(|e| AppError::Config(format!("收藏存储初始化失败: {e}")))?,
+        );
         let task_repository = TaskRepository::new();
         let max_concurrent_tasks = config.max_concurrent_tasks;
         let max_concurrent_fragments = config.download.max_concurrent_fragments;
@@ -315,6 +395,7 @@ impl AppState {
             infra: InfraState {
                 connection_pool: connection_pool_arc,
                 task_store,
+                favorites_store,
                 chunk_reader_pool,
                 buffer_pool,
                 #[cfg(feature = "magnet")]
@@ -624,6 +705,7 @@ pub(crate) mod tests {
             magnet: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
+        let favorites_store = Arc::new(tachyon_store::KvStore::open(tmp_store.path()).unwrap());
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
         let connection_pool = Arc::new(ConnectionPool::new(PoolConfig {
             max_per_host: 16,
@@ -656,6 +738,7 @@ pub(crate) mod tests {
             infra: InfraState {
                 connection_pool,
                 task_store,
+                favorites_store,
                 chunk_reader_pool,
                 buffer_pool,
                 #[cfg(feature = "magnet")]
@@ -754,6 +837,7 @@ pub(crate) mod tests {
             save_path: "/downloads/file.zip".to_string(),
             error_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();
@@ -768,6 +852,7 @@ pub(crate) mod tests {
         let id = task_commands::create_task_inner(
             &state,
             "https://example.com/fail.bin".to_string(),
+            None,
             None,
             None,
             None,
@@ -863,6 +948,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -872,12 +958,14 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         let result = task_commands::create_task_inner(
             &state,
             "http://example.com/gate3.bin".into(),
+            None,
             None,
             None,
             None,
@@ -1050,6 +1138,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1079,6 +1168,7 @@ pub(crate) mod tests {
         let id = task_commands::create_task_inner(
             &state,
             "https://example.com/valid-token.bin".to_string(),
+            None,
             None,
             None,
             None,

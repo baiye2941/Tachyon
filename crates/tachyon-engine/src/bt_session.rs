@@ -33,9 +33,11 @@ impl BtSession {
         download_dir: PathBuf,
         config: MagnetConfig,
     ) -> tachyon_core::DownloadResult<Self> {
-        let mut opts = SessionOptions::default();
-        opts.disable_dht = !config.enable_dht;
-        opts.enable_upnp_port_forwarding = config.enable_upnp;
+        let mut opts = SessionOptions {
+            disable_dht: !config.enable_dht,
+            enable_upnp_port_forwarding: config.enable_upnp,
+            ..Default::default()
+        };
 
         // 全局 tracker: 附加到每个磁力链接的 tracker 列表，
         // 即使磁力链接本身不包含 tracker 也能快速发现 peer。

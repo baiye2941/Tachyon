@@ -836,6 +836,7 @@ mod tests {
             save_path: "/custom/file.bin".to_string(),
             error_reason: None,
             retry_count: 0,
+            hf_meta: None,
         };
         state
             .domain
