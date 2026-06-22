@@ -22,7 +22,13 @@ export default function BatchToolbar(props: BatchToolbarProps) {
         e.preventDefault()
         props.onDeleteAll()
       }
-      if (e.key === 'a' && e.ctrlKey) {
+      // Ctrl+A: 焦点在输入框/textarea 内时不拦截,保留浏览器原生全选
+      if (e.key.toLowerCase() === 'a' && (e.ctrlKey || e.metaKey)) {
+        const target = e.target as HTMLElement
+        const tag = target.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) {
+          return
+        }
         e.preventDefault()
         selectAll(taskIds())
       }

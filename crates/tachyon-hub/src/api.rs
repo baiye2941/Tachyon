@@ -208,7 +208,10 @@ impl HubApi {
     /// GET {endpoint}/api/models?search={query}&limit={limit}
     pub async fn search_models(&self, query: &str, limit: u32) -> DownloadResult<Vec<HfModelInfo>> {
         let encoded = urlencoding::encode(query);
-        let url = format!("{}/api/models?search={encoded}&limit={limit}", self.endpoint);
+        let url = format!(
+            "{}/api/models?search={encoded}&limit={limit}",
+            self.endpoint
+        );
         tracing::info!(url = %url, query = %query, "搜索 HF 模型");
 
         let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
@@ -242,7 +245,10 @@ impl HubApi {
     #[cfg(test)]
     fn search_models_url(&self, query: &str, limit: u32) -> String {
         let encoded = urlencoding::encode(query);
-        format!("{}/api/models?search={encoded}&limit={limit}", self.endpoint)
+        format!(
+            "{}/api/models?search={encoded}&limit={limit}",
+            self.endpoint
+        )
     }
 }
 
@@ -360,7 +366,10 @@ mod tests {
     fn test_search_models_url() {
         let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
         let url = api.search_models_url("bert", 10);
-        assert_eq!(url, "https://huggingface.co/api/models?search=bert&limit=10");
+        assert_eq!(
+            url,
+            "https://huggingface.co/api/models?search=bert&limit=10"
+        );
     }
 
     /// M-17: search_models URL 编码特殊字符
@@ -368,7 +377,10 @@ mod tests {
     fn test_search_models_url_encoding() {
         let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
         let url = api.search_models_url("bert base", 5);
-        assert_eq!(url, "https://huggingface.co/api/models?search=bert%20base&limit=5");
+        assert_eq!(
+            url,
+            "https://huggingface.co/api/models?search=bert%20base&limit=5"
+        );
     }
 
     // ====== HfModelInfo / HfCardData 反序列化测试 ======

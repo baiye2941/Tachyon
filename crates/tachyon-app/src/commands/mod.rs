@@ -8,13 +8,15 @@ pub mod task_commands;
 // Re-exports: Tauri commands and public types
 pub use self::config_commands::{get_config, update_config};
 pub use self::hub_commands::{
-    add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info, list_model_favorites,
-    list_repo_files, remove_model_favorite, scan_local_models, search_models, verify_model,
+    add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info,
+    list_model_favorites, list_repo_files, remove_model_favorite, scan_local_models, search_models,
+    verify_model,
 };
 pub use self::progress_commands::{get_download_progress, subscribe_progress};
 pub use self::sniffer_commands::{add_sniffer_filter, add_sniffer_resource, get_sniffer_resources};
 pub use self::task_commands::{
-    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task, probe_filename, resume_task,
+    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
+    probe_filename, resume_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

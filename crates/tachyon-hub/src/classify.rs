@@ -35,10 +35,7 @@ pub fn classify_file(path: &str) -> FileCategory {
     // 1. 特定文件名完整匹配 — 模型权重
     if matches!(
         file_name,
-        "pytorch_model.bin"
-            | "tf_model.h5"
-            | "model.safetensors"
-            | "rust_model.ot"
+        "pytorch_model.bin" | "tf_model.h5" | "model.safetensors" | "rust_model.ot"
     ) {
         return FileCategory::ModelWeight;
     }
@@ -96,7 +93,10 @@ mod tests {
 
     #[test]
     fn test_model_weight_by_suffix() {
-        assert_eq!(classify_file("model.safetensors"), FileCategory::ModelWeight);
+        assert_eq!(
+            classify_file("model.safetensors"),
+            FileCategory::ModelWeight
+        );
         assert_eq!(classify_file("model.bin"), FileCategory::ModelWeight);
         assert_eq!(classify_file("model.onnx"), FileCategory::ModelWeight);
         assert_eq!(classify_file("model.gguf"), FileCategory::ModelWeight);
@@ -108,22 +108,37 @@ mod tests {
 
     #[test]
     fn test_model_weight_by_exact_name() {
-        assert_eq!(classify_file("pytorch_model.bin"), FileCategory::ModelWeight);
+        assert_eq!(
+            classify_file("pytorch_model.bin"),
+            FileCategory::ModelWeight
+        );
         assert_eq!(classify_file("tf_model.h5"), FileCategory::ModelWeight);
-        assert_eq!(classify_file("model.safetensors"), FileCategory::ModelWeight);
+        assert_eq!(
+            classify_file("model.safetensors"),
+            FileCategory::ModelWeight
+        );
         assert_eq!(classify_file("rust_model.ot"), FileCategory::ModelWeight);
     }
 
     #[test]
     fn test_config_files() {
         assert_eq!(classify_file("config.json"), FileCategory::Config);
-        assert_eq!(classify_file("generation_config.json"), FileCategory::Config);
-        assert_eq!(classify_file("preprocessor_config.json"), FileCategory::Config);
+        assert_eq!(
+            classify_file("generation_config.json"),
+            FileCategory::Config
+        );
+        assert_eq!(
+            classify_file("preprocessor_config.json"),
+            FileCategory::Config
+        );
         assert_eq!(
             classify_file("feature_extractor_config.json"),
             FileCategory::Config
         );
-        assert_eq!(classify_file("processing_config.json"), FileCategory::Config);
+        assert_eq!(
+            classify_file("processing_config.json"),
+            FileCategory::Config
+        );
     }
 
     #[test]
@@ -198,7 +213,10 @@ mod tests {
 
     #[test]
     fn test_case_insensitive() {
-        assert_eq!(classify_file("MODEL.SAFETENSORS"), FileCategory::ModelWeight);
+        assert_eq!(
+            classify_file("MODEL.SAFETENSORS"),
+            FileCategory::ModelWeight
+        );
         assert_eq!(classify_file("Config.JSON"), FileCategory::Config);
         assert_eq!(classify_file("Tokenizer.JSON"), FileCategory::Tokenizer);
         assert_eq!(classify_file("README.MD"), FileCategory::Document);

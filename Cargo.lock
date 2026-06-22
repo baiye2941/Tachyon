@@ -5215,6 +5215,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tachyon-core",
+ "tachyon-crypto",
  "tachyon-engine",
  "tachyon-hub",
  "tachyon-io",
@@ -5304,6 +5305,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "urlencoding",
 ]
 
 [[package]]

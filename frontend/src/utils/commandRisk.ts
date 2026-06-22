@@ -45,6 +45,7 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   cancel_task: 'mutate',
   add_sniffer_filter: 'mutate',
   create_task: 'mutate',
+  probe_filename: 'mutate',
   // 破坏性:数据删除 / 安全策略变更
   delete_task: 'destructive',
   update_config: 'destructive',

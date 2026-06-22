@@ -28,6 +28,50 @@ const FTP_RE = /^ftp:\/\/[^\s/$.?#].[^\s]*$/i
 const HF_RE = /^https?:\/\/(www\.)?huggingface\.co\//i
 const MAGNET_RE = /^magnet:\?xt=urn:btih:/i
 
+function extractMagnetInfoHash(raw: string): string | undefined {
+  const match = raw.match(/(?:^|[?&])xt=urn:btih:([^&]+)/i)
+  return match?.[1]?.trim() || undefined
+}
+
+function extractMagnetDisplayName(raw: string): string | undefined {
+  try {
+    const params = new URLSearchParams(raw.slice('magnet:?'.length))
+    const dn = params.get('dn')?.trim()
+    if (dn) {
+      return dn
+    }
+  } catch {
+    // 磁力链接解析失败时回退到 info hash。
+  }
+
+  const infoHash = extractMagnetInfoHash(raw)
+  return infoHash ? `magnet-${infoHash}` : undefined
+}
+
+/**
+ * 为单个 URL 生成前端展示用的默认文件名。
+ *
+ * 仅用于 UI 提示,不会作为用户显式重命名提交给后端。
+ */
+export function extractSuggestedFileName(raw: string): string | undefined {
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return undefined
+  }
+
+  if (MAGNET_RE.test(trimmed)) {
+    return extractMagnetDisplayName(trimmed)
+  }
+
+  try {
+    const url = new URL(trimmed)
+    const segment = url.pathname.split('/').filter(Boolean).at(-1)
+    return segment ? decodeURIComponent(segment) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 校验单个 URL 字符串。
  *

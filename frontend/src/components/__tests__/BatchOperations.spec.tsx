@@ -178,7 +178,7 @@ describe('键盘快捷键', () => {
       />
     ))
 
-    fireEvent.keyDown(document, { key: 'a', ctrlKey: true })
+    fireEvent.keyDown(document, { key: 'A', ctrlKey: true })
     // store 为空，selectAll 应选中 0 个
     expect(selectionModule.$selectedIds.get().size).toBe(0)
   })

@@ -1,7 +1,10 @@
-use super::{AppError, AppState, FileVerifyResult, HfTaskMeta, LocalModel, LocalModelFile, ModelFavorite, VerifyStatus};
+use super::{
+    AppError, AppState, FileVerifyResult, HfTaskMeta, LocalModel, LocalModelFile, ModelFavorite,
+    VerifyStatus,
+};
 use std::path::Path;
-use tauri::State;
 use tachyon_hub::classify_file;
+use tauri::State;
 
 // ---------------------------------------------------------------------------
 // 输入验证 (W-19)
@@ -111,17 +114,18 @@ pub async fn search_models(
     let limit = limit.unwrap_or(20).min(50);
     let api = tachyon_hub::api::HubApi::from_env()
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
-    api.search_models(&query, limit).await.map_err(AppError::Core)
+    api.search_models(&query, limit)
+        .await
+        .map_err(AppError::Core)
 }
 
 /// 扫描本地已下载模型
 ///
 /// 从 TaskRepository 筛选有 HfTaskMeta 的 Completed 任务，按 repo_id 聚合。
 #[tauri::command]
-pub async fn scan_local_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<LocalModel>, AppError> {
-    let mut models: std::collections::HashMap<String, LocalModel> = std::collections::HashMap::new();
+pub async fn scan_local_models(state: State<'_, AppState>) -> Result<Vec<LocalModel>, AppError> {
+    let mut models: std::collections::HashMap<String, LocalModel> =
+        std::collections::HashMap::new();
 
     for entry in state.domain.task_repository.iter() {
         let task = entry.value();
@@ -132,18 +136,20 @@ pub async fn scan_local_models(
             continue;
         };
 
-        let model = models.entry(meta.repo_id.clone()).or_insert_with(|| LocalModel {
-            repo_id: meta.repo_id.clone(),
-            revision: meta.revision.clone(),
-            local_path: Path::new(&task.save_path)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            files: Vec::new(),
-            total_size: 0,
-            downloaded_at: Some(task.created_at.clone()),
-            metadata: None,
-        });
+        let model = models
+            .entry(meta.repo_id.clone())
+            .or_insert_with(|| LocalModel {
+                repo_id: meta.repo_id.clone(),
+                revision: meta.revision.clone(),
+                local_path: Path::new(&task.save_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                files: Vec::new(),
+                total_size: 0,
+                downloaded_at: Some(task.created_at.clone()),
+                metadata: None,
+            });
 
         let file_exists = Path::new(&task.save_path).exists();
         let category = classify_file(&meta.file_path);
@@ -182,7 +188,10 @@ pub async fn verify_model(
     // 获取远程文件列表用于比对
     let api = tachyon_hub::api::HubApi::from_env()
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
-    let remote_files = api.list_files(&repo_id, &rev).await.map_err(AppError::Core)?;
+    let remote_files = api
+        .list_files(&repo_id, &rev)
+        .await
+        .map_err(AppError::Core)?;
     let remote_map: std::collections::HashMap<String, tachyon_hub::api::HfFile> = remote_files
         .into_iter()
         .map(|f| (f.path.clone(), f))
@@ -192,7 +201,9 @@ pub async fn verify_model(
 
     for entry in state.domain.task_repository.iter() {
         let task = entry.value();
-        let Some(ref meta) = task.hf_meta else { continue; };
+        let Some(ref meta) = task.hf_meta else {
+            continue;
+        };
         if meta.repo_id != repo_id {
             continue;
         }
@@ -223,9 +234,7 @@ pub async fn verify_model(
                 }
             } else {
                 // 普通文件: 大小比对
-                let actual_size = std::fs::metadata(path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let actual_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 if actual_size == remote.size {
                     VerifyStatus::Verified
                 } else {
@@ -263,11 +272,12 @@ pub async fn list_model_favorites(
     let mut favorites = Vec::new();
     for key in keys {
         let repo_id = key.strip_prefix("fav_").unwrap_or(&key).to_string();
-        let cached: Option<tachyon_hub::api::HfModelInfo> = state
-            .infra
-            .favorites_store
-            .get(&key)
-            .map_err(|e| AppError::Config(format!("读取收藏数据失败: {e}")))?;
+        let cached: Option<tachyon_hub::api::HfModelInfo> =
+            state
+                .infra
+                .favorites_store
+                .get(&key)
+                .map_err(|e| AppError::Config(format!("读取收藏数据失败: {e}")))?;
 
         let added_at = state
             .infra
@@ -276,10 +286,12 @@ pub async fn list_model_favorites(
             .ok()
             .flatten()
             .and_then(|json| {
-                serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| {
-                    v.get("addedAt")
-                        .and_then(|a| a.as_str().map(|s| s.to_string()))
-                })
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("addedAt")
+                            .and_then(|a| a.as_str().map(|s| s.to_string()))
+                    })
             })
             .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
 

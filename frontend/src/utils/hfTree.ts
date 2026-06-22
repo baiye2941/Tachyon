@@ -14,6 +14,7 @@
  */
 
 import type { HubFileInfo } from '../types'
+import type { FileCategory } from '../types'
 
 /** 树节点 */
 export interface TreeNode {
@@ -151,4 +152,54 @@ export function countByType(files: HubFileInfo[]): FileCounts {
     if (f.size >= LARGE_FILE_THRESHOLD) large++
   }
   return { all, gguf, safetensors, large }
+}
+
+/** 前端版文件分类（与后端 classify_file 对齐） */
+export function classifyFilePath(path: string): FileCategory {
+  const lower = path.toLowerCase()
+  const filename = lower.split('/').pop() ?? lower
+
+  // 特定文件名优先
+  const configNames = ['config.json', 'generation_config.json', 'preprocessor_config.json', 'feature_extractor_config.json', 'processing_config.json']
+  if (configNames.includes(filename)) return 'config'
+
+  const tokenizerNames = ['tokenizer.json', 'tokenizer_config.json', 'tokenizer.model', 'special_tokens_map.json', 'vocab.txt', 'merges.txt']
+  if (tokenizerNames.includes(filename)) return 'tokenizer'
+
+  const docNames = ['readme.md', 'readme.rst', 'readme.txt', 'license', 'license.md']
+  if (docNames.includes(filename)) return 'document'
+
+  // 后缀匹配
+  const modelWeightExts = ['.safetensors', '.bin', '.onnx', '.gguf', '.pt', '.pth', '.h5', '.msgpack']
+  if (modelWeightExts.some((ext) => filename.endsWith(ext))) return 'modelWeight'
+
+  const codeExts = ['.py', '.cpp', '.c', '.h', '.sh', '.js']
+  if (codeExts.some((ext) => filename.endsWith(ext))) return 'code'
+
+  const dataExts = ['.csv', '.jsonl', '.parquet', '.arrow', '.tsv']
+  if (dataExts.some((ext) => filename.endsWith(ext))) return 'data'
+
+  const docExts = ['.md', '.rst', '.txt']
+  if (docExts.some((ext) => filename.endsWith(ext))) return 'document'
+
+  return 'other'
+}
+
+/** 按分类分组文件 */
+export function groupFilesByCategory(files: HubFileInfo[]): Record<FileCategory, HubFileInfo[]> {
+  const groups: Record<FileCategory, HubFileInfo[]> = {
+    modelWeight: [],
+    config: [],
+    tokenizer: [],
+    code: [],
+    data: [],
+    document: [],
+    other: [],
+  }
+  for (const f of files) {
+    if (f.type === 'directory') continue
+    const category = classifyFilePath(f.path)
+    groups[category].push(f)
+  }
+  return groups
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tachyon_core::config::DownloadConfig;
 use tachyon_core::safety::extract_filename_from_url;
-use tachyon_core::traits::{TaskRunner, Protocol};
+use tachyon_core::traits::{Protocol, TaskRunner};
 use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::DownloadTask;
 use tachyon_engine::connection::ConnectionPool;
@@ -11,7 +11,10 @@ use tachyon_io::BufferPool;
 use tokio::sync::watch;
 use url::Url;
 
-use super::{AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status, validate_download_url};
+use super::{
+    AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status,
+    validate_download_url,
+};
 
 // ---------------------------------------------------------------------------
 // Core download task function
@@ -1705,8 +1708,8 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-        )
+                None,
+            )
             .await
             .unwrap();
             task_ids.push(id);
@@ -1766,8 +1769,8 @@ mod tests {
                 None,
                 None,
                 None,
-            None,
-        )
+                None,
+            )
             .await
             .unwrap();
             cancel_task_inner(&state, id.clone()).await.unwrap();
@@ -2462,8 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_filename_unsupported_protocol_returns_error() {
         let state = test_state();
-        let result =
-            probe_filename_inner(&state, "ftp://example.com/file.zip".to_string()).await;
+        let result = probe_filename_inner(&state, "ftp://example.com/file.zip".to_string()).await;
         assert!(result.is_err(), "不支持的协议应返回错误");
     }
 
@@ -2471,11 +2473,9 @@ mod tests {
     #[tokio::test]
     async fn test_probe_filename_http_fallback_on_network_error() {
         let state = test_state();
-        let result = probe_filename_inner(
-            &state,
-            "https://192.0.2.1/nonexistent-file.bin".to_string(),
-        )
-        .await;
+        let result =
+            probe_filename_inner(&state, "https://192.0.2.1/nonexistent-file.bin".to_string())
+                .await;
         match result {
             Ok(name) => assert_eq!(name, "nonexistent-file.bin"),
             Err(_) => {
@@ -2488,7 +2488,9 @@ mod tests {
     #[test]
     fn test_extract_magnet_fallback_name_with_dn() {
         assert_eq!(
-            extract_magnet_fallback_name("magnet:?xt=urn:btih:abc&dn=ubuntu.iso&tr=udp://t.example.com"),
+            extract_magnet_fallback_name(
+                "magnet:?xt=urn:btih:abc&dn=ubuntu.iso&tr=udp://t.example.com"
+            ),
             "ubuntu.iso"
         );
     }

@@ -453,7 +453,7 @@ mod tests {
                     save_path: "/tmp/file.bin".to_string(),
                     error_reason: None,
                     retry_count: 0,
-                hf_meta: None,
+                    hf_meta: None,
                 },
             );
 

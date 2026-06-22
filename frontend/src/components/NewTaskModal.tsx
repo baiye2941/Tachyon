@@ -1,10 +1,10 @@
-import { createSignal, createMemo, Show, For } from "solid-js";
-import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon, ChevronDownIcon } from "./icons";
+import { createSignal, createMemo, createEffect, Show, For } from "solid-js";
+import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon, ChevronDownIcon, SearchIcon } from "./icons";
 import { api } from "../api/invoke";
 import { addToast } from "../stores/toast";
 import { refreshTaskList } from "../stores/downloads";
 import Button from "../shared/ui/Button";
-import { parseUrlLines, validateUrl } from "../utils/urlValidation";
+import { parseUrlLines, validateUrl, extractSuggestedFileName } from "../utils/urlValidation";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr } from "../i18n";
@@ -26,6 +26,10 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // 高级选项(镜像源/自定义文件名)默认折叠(spec 8.6 渐进披露)
   const [advancedOpen, setAdvancedOpen] = createSignal(false);
 
+  // ── 探测真实文件名 ──────────────────────────────────
+  const [probing, setProbing] = createSignal(false);
+  const [probedFilename, setProbedFilename] = createSignal<string | null>(null);
+
   let urlInputRef: HTMLTextAreaElement | undefined;
   let panelRef: HTMLDivElement | undefined;
 
@@ -38,6 +42,38 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   );
   const validCount = createMemo(() => validUrls().length);
   const invalidCount = createMemo(() => parsedLines().length - validCount());
+  const suggestedFileName = createMemo(() => {
+    const url = validUrls()[0] ?? "";
+    return url ? extractSuggestedFileName(url) ?? "" : "";
+  });
+
+  // URL 变化时清除探测结果(新 URL 需重新探测)
+  createEffect(() => {
+    validUrls();
+    setProbedFilename(null);
+  });
+
+  // 显示的文件名:优先探测结果,回退到本地提取
+  const displayFilename = createMemo(() => {
+    const probed = probedFilename();
+    if (probed) return probed;
+    return suggestedFileName();
+  });
+
+  // 探测按钮处理
+  const handleProbe = async () => {
+    const url = validUrls()[0];
+    if (!url) return;
+    setProbing(true);
+    try {
+      const name = await api.probeFilename(url);
+      setProbedFilename(name);
+    } catch {
+      // 探测失败保持本地提取结果
+    } finally {
+      setProbing(false);
+    }
+  };
 
   // 镜像源校验(每行独立)
   const validMirrors = createMemo(() =>
@@ -52,8 +88,17 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     onEscape: () => props.onClose(),
   });
 
-  // Ctrl+Enter 提交(焦点在面板内时)
   const handleKeyDown = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null;
+    const isTextField =
+      target?.tagName === "INPUT" ||
+      target?.tagName === "TEXTAREA" ||
+      target?.isContentEditable;
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && isTextField) {
+      return;
+    }
+
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       handleSubmit();
@@ -306,6 +351,35 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           </Show>
         </div>
 
+        {/* 默认文件名即时显示 + 探测按钮 */}
+        <Show when={displayFilename()}>
+          <div
+            class="flex items-center gap-2"
+            style={{ "margin-bottom": "12px" }}
+          >
+            <span
+              style={{
+                "font-size": "12px",
+                color: "var(--color-text-secondary)",
+              }}
+            >
+              {validCount() === 1
+                ? tr("newTask.defaultFilename", { name: displayFilename() })
+                : tr("newTask.defaultFilenameBatch", { count: validCount(), name: displayFilename() })}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              loading={probing()}
+              disabled={probing() || validCount() === 0}
+              onClick={handleProbe}
+            >
+              <SearchIcon />
+              <span>{tr("newTask.probeFilename")}</span>
+            </Button>
+          </div>
+        </Show>
+
         {/* 高级选项(镜像源/自定义文件名)渐进披露,默认收起(spec 8.6) */}
         <div style={{ "margin-bottom": "16px" }}>
           <button
@@ -394,7 +468,9 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                   <input
                     id="new-task-filename-input"
                     type="text"
-                    placeholder={tr("newTask.fileNamePlaceholder")}
+                    placeholder={
+                      suggestedFileName() || tr("newTask.fileNamePlaceholder")
+                    }
                     value={fileName()}
                     onInput={(e) => setFileName(e.currentTarget.value)}
                     class="input"
