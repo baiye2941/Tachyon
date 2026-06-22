@@ -454,6 +454,11 @@ impl KvStore {
     pub fn contains(&self, key: &str) -> std::io::Result<bool> {
         self.inner.exists(key)
     }
+
+    /// 列出匹配前缀的所有键
+    pub fn list_by_prefix(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.keys(prefix)
+    }
 }
 
 // ── 测试 ─────────────────────────────────────────────────────────────
@@ -905,6 +910,20 @@ mod tests {
         assert!(!store.contains("x").unwrap());
         store.put("x", &"yes").unwrap();
         assert!(store.contains("x").unwrap());
+    }
+
+    #[test]
+    fn kv_list_by_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        store.put("fav_bert-base-uncased", &"data1").unwrap();
+        store.put("fav_gpt2", &"data2").unwrap();
+        store.put("task_123", &"data3").unwrap();
+        let favs = store.list_by_prefix("fav_").unwrap();
+        assert_eq!(favs.len(), 2);
+        assert!(favs.contains(&"fav_bert-base-uncased".to_string()));
+        assert!(favs.contains(&"fav_gpt2".to_string()));
+        assert!(!favs.contains(&"task_123".to_string()));
     }
 
     #[test]
