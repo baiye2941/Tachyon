@@ -18,10 +18,12 @@
 //! ```
 
 pub mod api;
+pub mod classify;
 pub mod lfs;
 pub mod token;
 
 pub use api::{HfFile, HfLfsInfo, HubApi};
+pub use classify::{classify_file, FileCategory};
 
 /// 便捷入口: 从环境变量创建 Hub 客户端
 pub type HubClient = HubApi;
