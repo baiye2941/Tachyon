@@ -1,5 +1,5 @@
 import { createSignal } from 'solid-js'
-import type { HubFileInfo } from '../types'
+import type { HubFileInfo, HfModelInfo } from '../types'
 import { api } from '../api/invoke'
 import { addToast } from './toast'
 import { tr } from '../i18n'
@@ -34,6 +34,14 @@ export async function listRepoFiles(repoId: string, revision?: string) {
 export function clearRepoFiles() {
   setRepoFiles([])
   setError(null)
+}
+
+export async function getModelInfo(repoId: string, revision?: string): Promise<HfModelInfo | null> {
+  try {
+    return await api.getModelInfo(repoId, revision)
+  } catch {
+    return null
+  }
 }
 
 export async function getHfDownloadUrl(repoId: string, path: string, revision?: string): Promise<string | null> {
