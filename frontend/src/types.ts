@@ -63,11 +63,20 @@ export interface SchedulerConfig {
   ewmaAlpha: number
 }
 
+export interface MagnetConfig {
+  metadataTimeoutSecs: number
+  downloadTimeoutSecs: number
+  enableDht: boolean
+  enableUpnp: boolean
+  trackers: string[]
+}
+
 export interface AppConfig {
   maxConcurrentTasks: number
   download: DownloadConfig
   connection: ConnectionConfig
   scheduler: SchedulerConfig
+  magnet: MagnetConfig
 }
 
 /** 配置白名单补丁 — 仅包含允许前端修改的字段 */
@@ -75,6 +84,7 @@ export interface ConfigPatch {
   maxConcurrentTasks?: number
   download?: DownloadPatch
   connection?: ConnectionPatch
+  magnet?: MagnetPatch
 }
 
 /** 下载配置白名单补丁 */
@@ -98,6 +108,15 @@ export interface ConnectionPatch {
   connectTimeoutSecs?: number
   enableHttp2?: boolean
   enableQuic?: boolean
+}
+
+/** 磁力链接配置白名单补丁 */
+export interface MagnetPatch {
+  metadataTimeoutSecs?: number
+  downloadTimeoutSecs?: number
+  enableDht?: boolean
+  enableUpnp?: boolean
+  trackers?: string[]
 }
 
 export type SnifferResourceType = 'video' | 'audio' | 'document' | 'archive' | 'executable' | 'image' | 'model' | 'other'

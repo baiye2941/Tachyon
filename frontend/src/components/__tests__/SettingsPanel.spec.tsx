@@ -51,6 +51,13 @@ const mockConfig = {
     samplingIntervalSecs: 5,
     ewmaAlpha: 0.3,
   },
+  magnet: {
+    metadataTimeoutSecs: 30,
+    downloadTimeoutSecs: 60,
+    enableDht: true,
+    enableUpnp: true,
+    trackers: [],
+  },
 }
 
 describe('SettingsPanel', () => {
