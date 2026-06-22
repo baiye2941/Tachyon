@@ -10,6 +10,7 @@ import { createStore } from "solid-js/store";
 import { api } from "../api/invoke";
 import { $config, $configLoading } from "../stores/settings";
 import { addToast } from "../stores/toast";
+import { $experimental } from "../stores/experimental";
 import type { AppConfig, ConfigPatch } from "../types";
 import { CloseIcon } from "./icons";
 import ConfirmDialog from "./ConfirmDialog";
@@ -22,6 +23,7 @@ type SettingsTab =
   | "connection"
   | "scheduler"
   | "magnet"
+  | "experimental"
   | "about";
 
 interface SettingsPanelProps {
@@ -117,6 +119,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     { id: "connection", labelKey: "settings.tab.connection" },
     { id: "scheduler", labelKey: "settings.tab.scheduler" },
     { id: "magnet", labelKey: "settings.tab.magnet" },
+    { id: "experimental", labelKey: "settings.tab.experimental" },
     { id: "about", labelKey: "settings.tab.about" },
   ];
 
@@ -652,6 +655,25 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                       setDraft("magnet", "trackers", []);
                     }}
                   />
+                </div>
+              </Show>
+
+              <Show when={activeTab() === "experimental"}>
+                <div class="flex flex-col gap-5">
+                  <ToggleItem
+                    label={t("experimental.huggingface")}
+                    value={$experimental.isEnabled("huggingface")}
+                    onChange={() => $experimental.toggle("huggingface")}
+                  />
+                  <div
+                    style={{
+                      "font-size": "12px",
+                      color: "var(--color-text-tertiary)",
+                      "line-height": "1.5",
+                    }}
+                  >
+                    {t("experimental.huggingfaceDesc")}
+                  </div>
                 </div>
               </Show>
 

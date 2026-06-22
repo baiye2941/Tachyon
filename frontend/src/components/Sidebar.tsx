@@ -26,6 +26,7 @@ import {
   SIDEBAR_MAX_WIDTH as MAX_WIDTH,
 } from "../stores/ui";
 import Button from "../shared/ui/Button";
+import { $experimental } from "../stores/experimental";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { tr, type MessageKey } from "../i18n";
@@ -65,6 +66,7 @@ type NavItemProps = {
   active: boolean;
   expanded: boolean;
   onClick: () => void;
+  badge?: string;
 };
 
 const NavItem = (p: NavItemProps) => {
@@ -114,6 +116,22 @@ const NavItem = (p: NavItemProps) => {
           <span class="truncate" style={{ "font-size": "14px" }}>
             {label()}
           </span>
+          <Show when={p.badge}>
+            <span
+              style={{
+                "font-size": "10px",
+                "font-weight": 700,
+                color: "var(--color-accent-primary)",
+                background: "var(--color-accent-soft)",
+                "border-radius": "4px",
+                padding: "1px 4px",
+                "flex-shrink": 0,
+                "margin-left": "4px",
+              }}
+            >
+              {p.badge}
+            </span>
+          </Show>
         </Show>
       </div>
       <Show when={p.expanded}>
@@ -450,6 +468,17 @@ export default function Sidebar() {
               expanded={true}
               onClick={$ui.openHistory}
             />
+            <Show when={$experimental.isEnabled("huggingface")}>
+              <NavItem
+                icon={HubIcon}
+                labelKey={"sidebar.huggingface"}
+                count={0}
+                active={false}
+                expanded={true}
+                badge="β"
+                onClick={$ui.openHub}
+              />
+            </Show>
           </div>
 
           <div class="flex-1" />

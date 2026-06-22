@@ -356,6 +356,7 @@ const zhCN = {
   "settings.about.versionValue": "版本 {v} · Rust + Tauri",
   "settings.about.tagline": "高性能多线程下载加速器",
   "settings.tab.magnet": "磁力链接",
+  "settings.tab.experimental": "实验性",
   "settings.magnet.enableDht": "启用 DHT 协议",
   "settings.magnet.enableUpnp": "启用 UPnP 端口转发",
   "settings.magnet.trackerList": "Tracker 服务器列表",

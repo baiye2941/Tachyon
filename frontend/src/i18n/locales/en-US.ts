@@ -371,6 +371,7 @@ const enUS = {
   "settings.about.tagline":
     "High-performance multi-threaded download accelerator",
   "settings.tab.magnet": "Magnet",
+  "settings.tab.experimental": "Experimental",
   "settings.magnet.enableDht": "Enable DHT protocol",
   "settings.magnet.enableUpnp": "Enable UPnP port forwarding",
   "settings.magnet.trackerList": "Tracker server list",
