@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tachyon_core::config::{AppConfig, ConfigPatch};
 
 use super::{AppError, AppState};
@@ -58,6 +59,9 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
 
     // 在写入新配置前记录新的 download_dir(避免写后读竞态)
     let new_download_dir = updated.download.download_dir.clone();
+    // 检查 magnet 配置是否有变更,必须在 drop(cfg) 前完成比较
+    let magnet_changed = updated.magnet != cfg.magnet;
+    let magnet_config = updated.magnet.clone();
     *cfg = updated;
     // 将配置变更持久化到磁盘,避免重启后丢失
     let config_to_save = cfg.clone();
@@ -75,6 +79,28 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     .await
     .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
     tracing::info!("应用配置已更新并持久化(白名单补丁模式)");
+
+    // BtSession 热切换:magnet 配置变更时重建 Session
+    #[cfg(feature = "magnet")]
+    if magnet_changed {
+        let download_dir = {
+            let cfg = state.domain.config.lock().await;
+            std::path::PathBuf::from(&cfg.download.download_dir)
+        };
+        match tachyon_engine::BtSession::new(download_dir, magnet_config).await {
+            Ok(new_session) => {
+                let mut bt_session = state.infra.bt_session.lock().await;
+                *bt_session = Some(Arc::new(new_session));
+                tracing::info!("BitTorrent Session 已热切换(磁力链接配置变更)");
+            }
+            Err(e) => {
+                // Session 重建失败:配置已持久化但 Session 未更新
+                // 下次启动会用新配置创建 Session,记录警告而非返回错误
+                tracing::warn!(error = %e, "BtSession 热切换失败,下次启动时生效");
+            }
+        }
+    }
+
     Ok(())
 }
 
