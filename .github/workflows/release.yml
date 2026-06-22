@@ -11,7 +11,7 @@ jobs:
     name: CI 门禁检查
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装系统依赖(Ubuntu)
         run: |
@@ -78,7 +78,7 @@ jobs:
     name: 安全审计门禁
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@v1.12.3
@@ -96,7 +96,7 @@ jobs:
     name: 前端构建门禁
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: 安装前端依赖
         working-directory: frontend
@@ -123,7 +123,7 @@ jobs:
     name: 版本一致性检查
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 检查 tag 与各配置文件版本一致
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
@@ -175,7 +175,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
     continue-on-error: true  # CI 无头环境缺少 display server,GUI 验证可能失败
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 下载构建产物
         uses: actions/download-artifact@v4
@@ -332,7 +332,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装系统依赖(Ubuntu)
         if: runner.os == 'Linux'
@@ -378,7 +378,7 @@ jobs:
     if: success()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 下载所有构建产物
         uses: actions/download-artifact@v4
