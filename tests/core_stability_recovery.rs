@@ -32,6 +32,7 @@ fn make_snapshot(id: &str, url: &str, status: DownloadState) -> TaskSnapshot {
         updated_at: "2026-05-29T00:00:00Z".to_string(),
         fail_reason: None,
         retry_count: 0,
+        hf_meta: None,
     }
 }
 
@@ -198,6 +199,7 @@ fn snapshot_preserves_metadata() {
         updated_at: "2026-05-29T00:00:01Z".to_string(),
         fail_reason: None,
         retry_count: 0,
+        hf_meta: None,
     };
 
     let store_dir = temp_store_dir();
