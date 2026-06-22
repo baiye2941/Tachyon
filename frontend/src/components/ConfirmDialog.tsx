@@ -86,10 +86,13 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
             left: "50%",
             transform: "translate(-50%, -50%)",
             width: "min(400px, calc(100vw - 32px))",
-            background: "var(--color-bg-elevated)",
-            "border-radius": "12px",
-            border: "1px solid var(--color-border-subtle)",
-            "box-shadow": "var(--shadow-xl)",
+            /* 质感:实色 + 顶部极淡向下渐变,模拟环境光从上方照射 */
+            background:
+              "linear-gradient(180deg, rgba(255,255,255,0.022) 0%, transparent 96px), var(--color-bg-elevated)",
+            "border-radius": "14px",
+            border: "1px solid var(--color-border-default)",
+            "box-shadow":
+              "var(--shadow-xl), inset 0 1px 0 rgba(255, 255, 255, 0.06)",
             padding: "24px",
             animation: "fadeIn 150ms ease forwards",
           }}

@@ -89,7 +89,10 @@ export default function Toolbar(props: ToolbarProps) {
         height: "56px",
         padding: isNarrow() ? "0 8px" : "0 16px",
         "border-bottom": "1px solid var(--color-border-subtle)",
+        "box-shadow": "var(--shadow-inset-top)",
         gap: "8px",
+        position: "relative",
+        "z-index": "2",
       }}
     >
       {props.isMultiSelectMode ? (

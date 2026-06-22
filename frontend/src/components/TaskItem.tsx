@@ -84,17 +84,14 @@ export default function TaskItem(props: TaskItemProps) {
       role="button"
       tabindex="0"
       aria-label={ariaLabel()}
-      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter focus:outline-none focus-visible:focus-ring"
+      class="task-row cursor-pointer task-item-enter focus:outline-none focus-visible:focus-ring"
+      classList={{
+        'task-row--selected': props.isSelected && !props.isMultiSelected,
+        'task-row--multi-selected': props.isMultiSelected,
+      }}
       style={{
         padding: isCompact() ? '6px 16px' : '12px 16px',
-        background: props.isMultiSelected
-          ? 'var(--color-accent-soft)'
-          : props.isSelected
-            ? 'var(--color-accent-faint)'
-            : 'transparent',
-        'border-left': props.isMultiSelected
-          ? '2px solid var(--color-accent-primary)'
-          : '2px solid transparent',
+        position: 'relative',
         '--stagger-index': props.staggerIndex ?? 0,
       }}
       onClick={() => props.onClick()}

@@ -344,7 +344,9 @@ export default function Sidebar() {
           class="h-full flex flex-col"
           style={{
             width: `${panelWidth()}px`,
-            background: "var(--color-bg-secondary)",
+            /* 质感:顶部极淡高光向下衰减,inset 上沿 1px 边线 */
+            background:
+              "linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 80px), var(--color-bg-secondary)",
             "border-right": "1px solid var(--color-border-subtle)",
             transform: `translate3d(${panelTranslateX()}, 0, 0)`,
             transition: transitionStyle(),
@@ -355,7 +357,9 @@ export default function Sidebar() {
             bottom: 0,
             "z-index": "2",
             "pointer-events": effectiveCollapsed() ? "none" : "auto",
-            "box-shadow": effectiveCollapsed() ? "none" : "var(--shadow-md)",
+            "box-shadow": effectiveCollapsed()
+              ? "none"
+              : "var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.04)",
           }}
         >
           {/* Pin header */}

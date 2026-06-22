@@ -275,10 +275,12 @@ export default function SettingsPanel(props: SettingsPanelProps) {
             "transform 250ms cubic-bezier(0.32, 0.72, 0, 1), opacity 250ms ease",
           width: "min(640px, calc(100vw - 32px))",
           height: "min(520px, calc(100dvh - 64px))",
-          background: "var(--color-bg-elevated)",
+          /* 质感:顶部极淡向下高光 + 实色底,inset 上沿边线 */
+          background:
+            "linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 120px), var(--color-bg-elevated)",
           "border-radius": "16px",
-          border: "1px solid var(--color-border-subtle)",
-          "box-shadow": "var(--shadow-xl)",
+          border: "1px solid var(--color-border-default)",
+          "box-shadow": "var(--shadow-xl), inset 0 1px 0 rgba(255, 255, 255, 0.06)",
           display: "flex",
           overflow: "hidden",
         }}

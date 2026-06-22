@@ -542,17 +542,28 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* File Info - compact inline layout */}
+          {/* File Info — 质感:扁平容器 + 文件图标加微妙背景,模拟胶囊感 */}
           <div
             class="flex items-center gap-3"
-            style={{ padding: "12px 20px", "max-width": "100%" }}
+            style={{
+              padding: "14px 20px 16px",
+              "max-width": "100%",
+              background:
+                "linear-gradient(180deg, rgba(255,255,255,0.018) 0%, transparent 100%)",
+              "border-bottom": "1px solid var(--color-border-subtle)",
+            }}
           >
             <div
               class="flex items-center justify-center flex-shrink-0"
               style={{
-                width: "36px",
-                height: "36px",
+                width: "40px",
+                height: "40px",
                 color: fileInfo().color,
+                background: "rgba(255, 255, 255, 0.025)",
+                "border-radius": "10px",
+                border: "1px solid var(--color-border-subtle)",
+                "box-shadow":
+                  "inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 1px 2px rgba(0, 0, 0, 0.2)",
               }}
             >
               {(() => {
@@ -609,23 +620,28 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div
               class="mono"
               style={{
-                "font-size": "28px",
+                "font-size": "32px",
                 "font-weight": 700,
                 color: "var(--color-text-title)",
-                "line-height": "1.2",
+                "line-height": "1",
+                "letter-spacing": "-0.03em",
+                /* 质感:数字微下沉投影,做出物理刻度感 */
+                "text-shadow": "0 1px 0 rgba(0, 0, 0, 0.35)",
               }}
             >
               {((task()?.progress || 0) * 100).toFixed(1)}%
             </div>
 
-            {/* Progress bar */}
+            {/* Progress bar — 质感:凹槽感(inset shadow) + 进度条上沿高光 */}
             <div
               class="relative overflow-hidden w-full"
               style={{
                 height: "6px",
-                "margin-top": "8px",
+                "margin-top": "14px",
                 "border-radius": "9999px",
-                background: "var(--color-bg-tertiary)",
+                background: "rgba(0, 0, 0, 0.32)",
+                "box-shadow":
+                  "inset 0 1px 1px rgba(0, 0, 0, 0.4), inset 0 -1px 0 rgba(255, 255, 255, 0.03)",
               }}
             >
               <div
