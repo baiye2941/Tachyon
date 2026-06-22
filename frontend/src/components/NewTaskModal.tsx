@@ -3,11 +3,16 @@ import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon, ChevronDownIcon, SearchIcon
 import { api } from "../api/invoke";
 import { addToast } from "../stores/toast";
 import { refreshTaskList } from "../stores/downloads";
+import { $ui } from "../stores/ui";
 import Button from "../shared/ui/Button";
 import { parseUrlLines, validateUrl, extractSuggestedFileName } from "../utils/urlValidation";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr } from "../i18n";
+import { parseHfUrl } from "../utils/hfUrl";
+import { getModelInfo } from "../stores/hub";
+import { batchDownload } from "../stores/model";
+import type { HfModelInfo } from "../types";
 
 interface NewTaskModalProps {
   onClose: () => void;
@@ -25,6 +30,11 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   const [creating, setCreating] = createSignal(false);
   // 高级选项(镜像源/自定义文件名)默认折叠(spec 8.6 渐进披露)
   const [advancedOpen, setAdvancedOpen] = createSignal(false);
+
+  // ── HuggingFace 预览 ──────────────────────────────────
+  const [hfPreview, setHfPreview] = createSignal<HfModelInfo | null>(null);
+  const [hfLoading, setHfLoading] = createSignal(false);
+  let hfDebounceTimer: number | undefined;
 
   // ── 探测真实文件名 ──────────────────────────────────
   const [probing, setProbing] = createSignal(false);
@@ -51,6 +61,35 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   createEffect(() => {
     validUrls();
     setProbedFilename(null);
+  });
+
+  // ── HF URL 识别与预览 ──────────────────────────────────
+  createEffect(() => {
+    const urls = validUrls();
+    if (urls.length !== 1) {
+      setHfPreview(null);
+      return;
+    }
+    const url = urls[0];
+    const parsed = parseHfUrl(url);
+    if (!parsed) {
+      setHfPreview(null);
+      return;
+    }
+    if (hfDebounceTimer) {
+      window.clearTimeout(hfDebounceTimer);
+    }
+    setHfLoading(true);
+    hfDebounceTimer = window.setTimeout(async () => {
+      try {
+        const info = await getModelInfo(parsed.repoId, parsed.revision ?? undefined);
+        setHfPreview(info);
+      } catch {
+        setHfPreview(null);
+      } finally {
+        setHfLoading(false);
+      }
+    }, 300);
   });
 
   // 显示的文件名:优先探测结果,回退到本地提取
@@ -217,6 +256,29 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     return tr("newTask.submit.startN", { count: n });
   });
 
+  // ── HF 预览辅助函数 ──────────────────────────────────
+  function formatTotalSize(info: HfModelInfo | null): string {
+    if (!info) return "--";
+    const totalBytes = info.siblings.reduce((sum, f) => sum + (f.type !== "directory" ? f.size : 0), 0);
+    if (totalBytes < 1024) return `${totalBytes} B`;
+    if (totalBytes < 1024 * 1024) return `${(totalBytes / 1024).toFixed(1)} KB`;
+    if (totalBytes < 1024 * 1024 * 1024) return `${(totalBytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function handleHfFullDownload() {
+    const preview = hfPreview();
+    if (!preview) return;
+    const files = preview.siblings.filter((f) => f.type !== "directory").map((f) => f.path);
+    batchDownload(preview.id, files, preview.sha ?? "main");
+    $ui.closeNewTaskModal();
+  }
+
+  function handleOpenInModelLibrary() {
+    $ui.closeNewTaskModal();
+    $ui.openHub();
+  }
+
   return (
     <div
       class="fixed inset-0 z-[200] flex items-center justify-center"
@@ -347,6 +409,55 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               <Show when={invalidCount() > 0}>
                 {tr("newTask.invalidCount", { count: invalidCount() })}
               </Show>
+            </div>
+          </Show>
+
+          {/* HF 模型预览卡片 */}
+          <Show when={hfPreview()}>
+            <div
+              style={{
+                padding: "12px",
+                background: "var(--color-accent-soft)",
+                borderRadius: "8px",
+                border: "1px solid var(--color-accent-primary)",
+                marginTop: "8px",
+              }}
+            >
+              <div style={{ fontWeight: 500 }}>
+                {tr("hub.newTask.hfPreview")}: {hfPreview()?.id}
+              </div>
+              <div
+                style={{
+                  fontSize: "13px",
+                  color: "var(--color-text-secondary)",
+                }}
+              >
+                {tr("hub.newTask.hfPreviewInfo", {
+                  files:
+                    hfPreview()?.siblings.filter((f) => f.type !== "directory")
+                      .length ?? 0,
+                  size: formatTotalSize(hfPreview()),
+                  framework: hfPreview()?.libraryName ?? "--",
+                  license: hfPreview()?.license ?? "--",
+                })}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: "8px",
+                  marginTop: "8px",
+                }}
+              >
+                <Button onClick={handleHfFullDownload}>
+                  {tr("hub.action.downloadAll")}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleOpenInModelLibrary}
+                >
+                  {tr("hub.action.openInModelLibrary")} →
+                </Button>
+              </div>
             </div>
           </Show>
         </div>
