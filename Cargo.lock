@@ -5328,8 +5328,6 @@ name = "tachyon-p2sp"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
- "tachyon-protocol",
  "tokio",
  "tokio-test",
  "tracing",
