@@ -21,6 +21,7 @@ type SettingsTab =
   | "download"
   | "connection"
   | "scheduler"
+  | "magnet"
   | "about";
 
 interface SettingsPanelProps {
@@ -46,6 +47,11 @@ interface ConfigDraft {
     minFragmentSize: number;
     maxFragmentSize: number;
     ewmaAlpha: number;
+  };
+  magnet: {
+    enableDht: boolean;
+    enableUpnp: boolean;
+    trackers: string[];
   };
 }
 
@@ -94,6 +100,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     { id: "download", labelKey: "settings.tab.download" },
     { id: "connection", labelKey: "settings.tab.connection" },
     { id: "scheduler", labelKey: "settings.tab.scheduler" },
+    { id: "magnet", labelKey: "settings.tab.magnet" },
     { id: "about", labelKey: "settings.tab.about" },
   ];
 
@@ -115,6 +122,11 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       minFragmentSize: 1048576,
       maxFragmentSize: 67108864,
       ewmaAlpha: 0.3,
+    },
+    magnet: {
+      enableDht: true,
+      enableUpnp: true,
+      trackers: [],
     },
   });
 
@@ -140,6 +152,11 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         minFragmentSize: cfg.scheduler.minFragmentSize,
         maxFragmentSize: cfg.scheduler.maxFragmentSize,
         ewmaAlpha: cfg.scheduler.ewmaAlpha,
+      },
+      magnet: {
+        enableDht: cfg.magnet.enableDht,
+        enableUpnp: cfg.magnet.enableUpnp,
+        trackers: cfg.magnet.trackers,
       },
     });
   };
@@ -171,6 +188,11 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableHttp2: draft.connection.enableHttp2,
         enableQuic: draft.connection.enableQuic,
         connectTimeoutSecs: draft.connection.connectTimeoutSecs,
+      },
+      magnet: {
+        enableDht: draft.magnet.enableDht,
+        enableUpnp: draft.magnet.enableUpnp,
+        trackers: draft.magnet.trackers,
       },
     };
   };
@@ -463,6 +485,43 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                 </div>
               </Show>
 
+              <Show when={activeTab() === "magnet"}>
+                <div class="flex flex-col gap-5">
+                  <ToggleItem
+                    label={t("settings.magnet.enableDht")}
+                    value={draft.magnet.enableDht}
+                    onChange={(v) => setDraft("magnet", "enableDht", v)}
+                  />
+                  <ToggleItem
+                    label={t("settings.magnet.enableUpnp")}
+                    value={draft.magnet.enableUpnp}
+                    onChange={(v) => setDraft("magnet", "enableUpnp", v)}
+                  />
+                  <TrackerList
+                    trackers={draft.magnet.trackers}
+                    onAdd={(url) => {
+                      setDraft("magnet", "trackers", [...draft.magnet.trackers, url]);
+                    }}
+                    onRemove={(index) => {
+                      const updated = draft.magnet.trackers.filter((_, i) => i !== index);
+                      setDraft("magnet", "trackers", updated);
+                    }}
+                    onImportPresets={() => {
+                      const existing = new Set(draft.magnet.trackers);
+                      const newTrackers = PRESET_TRACKERS.filter((t) => !existing.has(t));
+                      setDraft("magnet", "trackers", [...draft.magnet.trackers, ...newTrackers]);
+                      addToast(
+                        tr("settings.magnet.importSuccess", { n: newTrackers.length }),
+                        "success"
+                      );
+                    }}
+                    onClearAll={() => {
+                      setDraft("magnet", "trackers", []);
+                    }}
+                  />
+                </div>
+              </Show>
+
               <Show when={activeTab() === "about"}>
                 <div
                   class="flex flex-col items-center gap-3"
@@ -634,6 +693,202 @@ function SliderItem(props: {
         onInput={(e) => props.onChange(parseInt(e.currentTarget.value))}
         style={{ width: "100%" }}
       />
+    </div>
+  );
+}
+
+/** 精选公共 Tracker 预设列表 */
+const PRESET_TRACKERS: string[] = [
+  "udp://tracker.opentrackr.org:1337/announce",
+  "udp://open.stealth.si:80/announce",
+  "udp://tracker.torrent.eu.org:451/announce",
+  "udp://tracker.bittor.pw:1337/announce",
+  "udp://public.popcorn-tracker.org:6969/announce",
+  "udp://tracker.dler.org:6969/announce",
+  "udp://exodus.desync.com:6969/announce",
+  "udp://open.demonii.com:1337/announce",
+  "https://tracker.tamersunion.org:443/announce",
+  "https://tracker.lilithraws.org:443/announce",
+];
+
+/** 检测 tracker URL 基本格式 */
+function isValidTrackerUrl(url: string): boolean {
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  return /^udp:\/\/.+|^https?:\/\/.+/.test(trimmed);
+}
+
+function TrackerList(props: {
+  trackers: string[];
+  onAdd: (url: string) => void;
+  onRemove: (index: number) => void;
+  onImportPresets: () => void;
+  onClearAll: () => void;
+}) {
+  const i18n = tr;
+  const [newUrl, setNewUrl] = createSignal("");
+  const [urlError, setUrlError] = createSignal<string | null>(null);
+
+  const handleAdd = () => {
+    const trimmed = newUrl().trim();
+    if (!isValidTrackerUrl(trimmed)) {
+      setUrlError(i18n("settings.magnet.invalidUrl"));
+      return;
+    }
+    if (props.trackers.includes(trimmed)) {
+      setUrlError(i18n("settings.magnet.duplicateUrl"));
+      return;
+    }
+    props.onAdd(trimmed);
+    setNewUrl("");
+    setUrlError(null);
+  };
+
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Enter") handleAdd();
+  };
+
+  return (
+    <div>
+      <div class="flex items-center justify-between" style={{ "margin-bottom": "12px" }}>
+        <div class="flex items-center gap-2">
+          <span style={{ "font-size": "13px", color: "var(--color-text-secondary)" }}>
+            {i18n("settings.magnet.trackerList")}
+          </span>
+          <span
+            class="mono"
+            style={{
+              "font-size": "12px",
+              color: "var(--color-text-tertiary)",
+              background: "var(--color-bg-secondary)",
+              padding: "1px 6px",
+              "border-radius": "4px",
+            }}
+          >
+            {i18n("settings.magnet.trackerCount", { n: props.trackers.length })}
+          </span>
+        </div>
+        <div class="flex items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={props.onImportPresets}>
+            {i18n("settings.magnet.importPreset")}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={props.onClearAll}
+            disabled={props.trackers.length === 0}
+          >
+            {i18n("settings.magnet.clearAll")}
+          </Button>
+        </div>
+      </div>
+
+      {/* Tracker 列表 */}
+      <div
+        style={{
+          "max-height": "200px",
+          "overflow-y": "auto",
+          border: "1px solid var(--color-border-subtle)",
+          "border-radius": "8px",
+          "margin-bottom": "8px",
+        }}
+      >
+        <Show
+          when={props.trackers.length > 0}
+          fallback={
+            <div
+              style={{
+                padding: "16px",
+                "text-align": "center",
+                "font-size": "13px",
+                color: "var(--color-text-tertiary)",
+              }}
+            >
+              暂无 Tracker
+            </div>
+          }
+        >
+          <For each={props.trackers}>
+            {(tracker, index) => (
+              <div
+                class="flex items-center justify-between"
+                style={{
+                  padding: "6px 12px",
+                  "border-bottom":
+                    index() < props.trackers.length - 1
+                      ? "1px solid var(--color-border-subtle)"
+                      : "none",
+                }}
+              >
+                <span
+                  class="mono"
+                  style={{
+                    "font-size": "12px",
+                    color: "var(--color-text-secondary)",
+                    overflow: "hidden",
+                    "text-overflow": "ellipsis",
+                    "white-space": "nowrap",
+                    flex: "1",
+                    "margin-right": "8px",
+                  }}
+                >
+                  {tracker}
+                </span>
+                <button
+                  style={{
+                    background: "none",
+                    border: "none",
+                    cursor: "pointer",
+                    color: "var(--color-text-tertiary)",
+                    padding: "2px 4px",
+                    "border-radius": "4px",
+                    "font-size": "14px",
+                  }}
+                  onClick={() => props.onRemove(index())}
+                  aria-label={i18n("settings.magnet.removeTracker")}
+                >
+                  ×
+                </button>
+              </div>
+            )}
+          </For>
+        </Show>
+      </div>
+
+      {/* 添加行 */}
+      <div class="flex items-center gap-2">
+        <input
+          type="text"
+          class="input flex-1"
+          value={newUrl()}
+          onInput={(e) => {
+            setNewUrl(e.currentTarget.value);
+            setUrlError(null);
+          }}
+          onKeyDown={handleKeyDown}
+          placeholder={i18n("settings.magnet.addTrackerPlaceholder")}
+          style={{
+            "font-size": "12px",
+            "font-family": "monospace",
+            "border-color": urlError()
+              ? "var(--color-error)"
+              : undefined,
+          }}
+        />
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={handleAdd}
+          disabled={!newUrl().trim()}
+        >
+          {i18n("settings.magnet.addTracker")}
+        </Button>
+      </div>
+      <Show when={urlError()}>
+        <div style={{ "font-size": "12px", color: "var(--color-error)", "margin-top": "4px" }}>
+          {urlError()}
+        </div>
+      </Show>
     </div>
   );
 }
