@@ -346,6 +346,19 @@ impl MagnetConfig {
         if self.metadata_timeout_secs == 0 {
             return Err(e("metadata_timeout_secs 必须 >= 1"));
         }
+        // 校验 tracker URL 格式
+        for (i, tracker) in self.trackers.iter().enumerate() {
+            if tracker.trim().is_empty() {
+                return Err(e(&format!("trackers[{}] 不能为空字符串", i)));
+            }
+            if url::Url::parse(tracker).is_err() {
+                return Err(e(&format!("trackers[{}] 不是合法的 URL: {}", i, tracker)));
+            }
+            // 防止 CRLF 注入
+            if tracker.contains('\r') || tracker.contains('\n') {
+                return Err(e(&format!("trackers[{}] 不能包含换行符: {}", i, tracker)));
+            }
+        }
         Ok(())
     }
 }
@@ -1423,6 +1436,45 @@ mod tests {
         let mut config = MagnetConfig::default();
         config.metadata_timeout_secs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_config_validate_rejects_empty_tracker_url() {
+        let mut config = MagnetConfig::default();
+        config.trackers = vec!["".to_string()];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("tracker"));
+    }
+
+    #[test]
+    fn test_magnet_config_validate_rejects_invalid_tracker_url() {
+        let mut config = MagnetConfig::default();
+        config.trackers = vec!["not-a-valid-url".to_string()];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("tracker"));
+    }
+
+    #[test]
+    fn test_magnet_config_validate_accepts_valid_tracker_urls() {
+        let mut config = MagnetConfig::default();
+        config.trackers = vec![
+            "udp://tracker.opentrackr.org:1337/announce".to_string(),
+            "http://tracker.example.com:80/announce".to_string(),
+            "https://tracker.example.com:443/announce".to_string(),
+        ];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_magnet_config_validate_rejects_tracker_with_crlf() {
+        let mut config = MagnetConfig::default();
+        config.trackers =
+            vec!["udp://tracker.example.com:1337/announce\r\nX-Injected: true".to_string()];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("tracker"));
     }
 
     #[test]
