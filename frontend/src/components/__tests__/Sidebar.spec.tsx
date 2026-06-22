@@ -51,13 +51,13 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
     $ui.setSidebarCollapsed(true);
   });
 
-  it("默认 collapsed 态占位宽度为 RAIL_WIDTH(56px)", () => {
+  it("默认 collapsed 态占位宽度为 RAIL_WIDTH(48px)", () => {
     const { container } = render(() => <Sidebar />);
     const placeholder = container.querySelector(
       ".relative.flex-shrink-0.h-full.overflow-hidden",
     ) as HTMLElement | null;
     expect(placeholder).not.toBeNull();
-    expect(placeholder!.style.width).toBe("56px");
+    expect(placeholder!.style.width).toBe("48px");
   });
 
   it("pin 后占位宽度从 RAIL 扩展到面板宽度", () => {
@@ -66,12 +66,12 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
       container.querySelector(
         ".relative.flex-shrink-0.h-full.overflow-hidden",
       ) as HTMLElement;
-    expect(placeholder().style.width).toBe("56px");
+    expect(placeholder().style.width).toBe("48px");
 
     $ui.toggleSidebarPin();
 
     const w = parseInt(placeholder().style.width, 10);
-    expect(w).toBeGreaterThanOrEqual(200);
+    expect(w).toBeGreaterThanOrEqual(180);
   });
 
   it("collapsed 态轨道应渲染图标按钮(非空),提供 collapsed 交互", () => {
@@ -86,24 +86,24 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
       container.querySelector(
         ".relative.flex-shrink-0.h-full.overflow-hidden",
       ) as HTMLElement;
-    expect(placeholder().style.width).toBe("56px");
+    expect(placeholder().style.width).toBe("48px");
 
     $ui.setSidebarCollapsed(false);
 
     const w = parseInt(placeholder().style.width, 10);
-    expect(w).toBeGreaterThanOrEqual(200);
+    expect(w).toBeGreaterThanOrEqual(180);
   });
 
   it("展开面板用 transform 定位(collapsed 时藏到轨道后)", () => {
     // 确保 collapsed
     if (!$ui.sidebarCollapsed()) $ui.setSidebarCollapsed(true);
     const { container } = render(() => <Sidebar />);
-    // 展开面板:z-index:2 的绝对定位层
-    const panels = container.querySelectorAll("[style*='translateX']");
+    // 展开面板:z-index:2 的绝对定位层(spec 8.3 用 translate3d GPU 合成)
+    const panels = container.querySelectorAll("[style*='translate3d']");
     expect(panels.length).toBeGreaterThan(0);
-    // collapsed 态面板应有负 translateX(藏到轨道后)
+    // collapsed 态面板应有负 translate3d(藏到轨道后)
     const collapsedPanel = Array.from(panels).find((p) =>
-      (p as HTMLElement).style.transform.includes("translateX(-"),
+      (p as HTMLElement).style.transform.includes("translate3d(-"),
     ) as HTMLElement | undefined;
     expect(collapsedPanel).not.toBeUndefined();
   });

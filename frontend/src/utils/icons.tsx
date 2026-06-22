@@ -17,6 +17,7 @@ import {
   ListIcon,
   ChartBarIcon,
   PauseCircleIcon,
+  CancelIcon,
 } from "../components/icons";
 
 type IconComponent = (props: { class?: string }) => JSX.Element;
@@ -32,6 +33,7 @@ const ICON_MAP: Record<string, IconComponent> = {
   clock: ClockIcon,
   "chart-bar": ChartBarIcon,
   "pause-circle": PauseCircleIcon,
+  cancel: CancelIcon,
 };
 
 export interface IconProps extends JSX.SvgSVGAttributes<SVGSVGElement> {

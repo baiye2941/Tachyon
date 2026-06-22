@@ -29,6 +29,7 @@ import {
   FolderOpenIcon,
   RefreshIcon,
   ChevronDownIcon,
+  CancelIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
@@ -211,6 +212,16 @@ export default function DetailPanel(props: DetailPanelProps) {
   const isCompleted = () => task()?.status === "completed";
   const isFailed = () => task()?.status === "failed";
   const isDownloading = () => task()?.status === "downloading";
+  // cancel:立即停止但保留记录,对未终止的活跃/暂停任务可用
+  const canCancel = () => {
+    const s = task()?.status;
+    return (
+      s === "downloading" ||
+      s === "connecting" ||
+      s === "resuming" ||
+      s === "paused"
+    );
+  };
 
   // 失败诊断:优先用后端 errorReason,回退到启发式推断(诚实降级)
   const failureInsight = createMemo(() => {
@@ -286,6 +297,19 @@ export default function DetailPanel(props: DetailPanelProps) {
       await refreshTaskList();
     } catch (e) {
       addToast(tr("toast.deleteFailed", { error: e }), "error");
+    }
+  };
+
+  // 取消任务:立即停止下载但保留记录(区别于 delete)。cancel_task 是 mutate
+  // 级,后端无需 confirmation token;详情面板单任务操作,无需二次确认。
+  const handleCancel = async () => {
+    const t2 = currentTask();
+    if (!t2) return;
+    try {
+      await api.cancelTask(t2.id);
+      await refreshTaskList();
+    } catch (e) {
+      addToast(tr("toast.cancelFailed", { error: e }), "error");
     }
   };
 
@@ -518,17 +542,28 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* File Info - compact inline layout */}
+          {/* File Info — 质感:扁平容器 + 文件图标加微妙背景,模拟胶囊感 */}
           <div
             class="flex items-center gap-3"
-            style={{ padding: "12px 20px", "max-width": "100%" }}
+            style={{
+              padding: "14px 20px 16px",
+              "max-width": "100%",
+              background:
+                "linear-gradient(180deg, rgba(255,255,255,0.018) 0%, transparent 100%)",
+              "border-bottom": "1px solid var(--color-border-subtle)",
+            }}
           >
             <div
               class="flex items-center justify-center flex-shrink-0"
               style={{
-                width: "36px",
-                height: "36px",
+                width: "40px",
+                height: "40px",
                 color: fileInfo().color,
+                background: "rgba(255, 255, 255, 0.025)",
+                "border-radius": "10px",
+                border: "1px solid var(--color-border-subtle)",
+                "box-shadow":
+                  "inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 1px 2px rgba(0, 0, 0, 0.2)",
               }}
             >
               {(() => {
@@ -585,23 +620,28 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div
               class="mono"
               style={{
-                "font-size": "24px",
+                "font-size": "32px",
                 "font-weight": 700,
                 color: "var(--color-text-title)",
-                "line-height": "1.2",
+                "line-height": "1",
+                "letter-spacing": "-0.03em",
+                /* 质感:数字微下沉投影,做出物理刻度感 */
+                "text-shadow": "0 1px 0 rgba(0, 0, 0, 0.35)",
               }}
             >
               {((task()?.progress || 0) * 100).toFixed(1)}%
             </div>
 
-            {/* Progress bar */}
+            {/* Progress bar — 质感:凹槽感(inset shadow) + 进度条上沿高光 */}
             <div
               class="relative overflow-hidden w-full"
               style={{
-                height: "4px",
-                "margin-top": "8px",
+                height: "6px",
+                "margin-top": "14px",
                 "border-radius": "9999px",
-                background: "var(--color-bg-tertiary)",
+                background: "rgba(0, 0, 0, 0.32)",
+                "box-shadow":
+                  "inset 0 1px 1px rgba(0, 0, 0, 0.4), inset 0 -1px 0 rgba(255, 255, 255, 0.03)",
               }}
             >
               <div
@@ -777,6 +817,13 @@ export default function DetailPanel(props: DetailPanelProps) {
                     {`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
                   </div>
                 </div>
+                <div class="detail-stat-cell">
+                  <div class="detail-stat-label">{t("detail.label.threads")}</div>
+                  <div class="detail-stat-value">
+                    {/* 后端当前未下发活跃线程数,诚实展示占位 */}
+                    {"—"}
+                  </div>
+                </div>
               </div>
             </div>
           </Show>
@@ -859,10 +906,18 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </Show>
 
-          {/* Action Buttons - at bottom */}
+          {/* Action Buttons - 固定底部(spec 8.2),sticky 不随内容滚动 */}
           <div
             class="flex flex-col"
-            style={{ padding: "0 20px 20px", gap: "8px" }}
+            style={{
+              padding: "12px 20px 20px",
+              gap: "8px",
+              position: "sticky",
+              bottom: "0",
+              "margin-top": "auto",
+              background: "var(--color-bg-elevated)",
+              "border-top": "1px solid var(--color-border-subtle)",
+            }}
           >
             <Show when={!isCompleted()}>
               <Button
@@ -875,6 +930,18 @@ export default function DetailPanel(props: DetailPanelProps) {
                 {isDownloading()
                   ? t("detail.action.pause")
                   : t("detail.action.resume")}
+              </Button>
+            </Show>
+            <Show when={canCancel()}>
+              <Button
+                variant="secondary"
+                size="lg"
+                class="detail-action-btn"
+                fullWidth
+                onClick={handleCancel}
+              >
+                <CancelIcon />
+                {t("detail.action.cancel")}
               </Button>
             </Show>
             <Button

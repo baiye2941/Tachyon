@@ -31,8 +31,10 @@ import {
   pauseSelected,
   resumeSelected,
   deleteSelected,
+  cancelSelected,
   pauseAll,
   resumeAll,
+  cancelAll,
 } from "./stores/batchActions";
 import { useAppInit } from "./hooks/useAppInit";
 import { useGlobalKeyboard } from "./hooks/useGlobalKeyboard";
@@ -212,6 +214,7 @@ function AppContent() {
             onSelectAll={handleSelectAll}
             onPauseSelected={pauseSelected}
             onResumeSelected={resumeSelected}
+            onCancelSelected={cancelSelected}
             onDeleteSelected={deleteSelected}
             onExitMultiSelect={() => {
               setIsMultiSelectMode(false);
@@ -227,6 +230,7 @@ function AppContent() {
             onOpenSettings={$ui.openSettings}
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
+            onCancelAll={cancelAll}
           />
 
           <div class="flex flex-1 overflow-hidden">
@@ -304,6 +308,12 @@ function AppContent() {
             .resumeTask(taskId)
             .then(() => refreshTaskList())
             .catch((e) => addToast(tr("toast.resumeFailed", { error: e }), "error"));
+        }}
+        onCancel={(taskId) => {
+          api
+            .cancelTask(taskId)
+            .then(() => refreshTaskList())
+            .catch((e) => addToast(tr("toast.cancelFailed", { error: e }), "error"));
         }}
         onOpenFolder={(taskId) => {
           const task = $tasks.get().find((t) => t.id === taskId);
@@ -390,6 +400,7 @@ function AppContent() {
         >
           <SettingsPanel
             visible={$ui.settingsVisible()}
+            initialTab={$ui.settingsInitialTab() ?? undefined}
             onClose={$ui.closeSettings}
           />
         </Suspense>
@@ -415,6 +426,8 @@ function AppContent() {
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
             onToggleSidebar={$ui.toggleSidebar}
+            getTasks={() => $tasks.get()}
+            onOpenTask={(taskId) => $selectedId.set(taskId)}
           />
         </Suspense>
       </Show>

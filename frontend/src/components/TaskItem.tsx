@@ -2,7 +2,7 @@ import { createMemo, For, Show } from 'solid-js'
 import type { TaskInfo, ListDensity } from '../types'
 import { CheckboxIcon } from './icons'
 import { COLUMN_WIDTH } from './taskColumns'
-import { formatSize, formatSpeed, getFileType, getStatusColor, getStatusLabel } from '../utils/format'
+import { formatSize, formatSpeed, getFileType, getStatusLabel } from '../utils/format'
 import { tr } from '../i18n'
 
 interface TaskItemProps {
@@ -84,17 +84,14 @@ export default function TaskItem(props: TaskItemProps) {
       role="button"
       tabindex="0"
       aria-label={ariaLabel()}
-      class="cursor-pointer transition-all duration-150 hover-lift-sm task-item-enter focus:outline-none focus-visible:focus-ring"
+      class="task-row cursor-pointer task-item-enter focus:outline-none focus-visible:focus-ring"
+      classList={{
+        'task-row--selected': props.isSelected && !props.isMultiSelected,
+        'task-row--multi-selected': props.isMultiSelected,
+      }}
       style={{
         padding: isCompact() ? '6px 16px' : '12px 16px',
-        background: props.isMultiSelected
-          ? 'var(--color-accent-soft)'
-          : props.isSelected
-            ? 'var(--color-accent-faint)'
-            : 'transparent',
-        'border-left': props.isMultiSelected
-          ? '2px solid var(--color-accent-primary)'
-          : '2px solid transparent',
+        position: 'relative',
         '--stagger-index': props.staggerIndex ?? 0,
       }}
       onClick={() => props.onClick()}
@@ -201,26 +198,25 @@ export default function TaskItem(props: TaskItemProps) {
             </div>
 
             <div
-              class="flex-shrink-0"
+              class="flex-shrink-0 flex justify-end"
               style={{
-                'min-width': '40px',
+                'min-width': '48px',
                 width: COLUMN_WIDTH.status,
-                'text-align': 'right',
-                'font-size': isCompact() ? '11px' : '12px',
-                color: getStatusColor(props.task.status),
-                'overflow': 'hidden',
-                'text-overflow': 'ellipsis',
-                'white-space': 'nowrap',
               }}
             >
-              {getStatusLabel(props.task.status)}
+              <span
+                class={`status-badge status-badge--${props.task.status}`}
+                title={getStatusLabel(props.task.status)}
+              >
+                {getStatusLabel(props.task.status)}
+              </span>
             </div>
           </div>
 
           <div
             class="relative overflow-hidden"
             style={{
-              height: isCompact() ? '2px' : '3px',
+              height: '4px',
               'margin-top': isCompact() ? '4px' : '8px',
               'border-radius': '9999px',
               background: 'var(--color-bg-tertiary)',
@@ -231,7 +227,7 @@ export default function TaskItem(props: TaskItemProps) {
               style={{
                 width: `${props.task.progress * 100}%`,
                 'border-radius': '9999px',
-                // 完成态用 emerald,失败用 red,下载中由 .progress-bar-active 接管(紫色 shimmer)
+                // spec 8.1:失败=红,完成=翠绿,下载中=accent shimmer,暂停=灰,其他=accent 渐变
                 background:
                   props.task.status === 'failed'
                     ? 'var(--color-status-error)'
@@ -239,7 +235,9 @@ export default function TaskItem(props: TaskItemProps) {
                       ? 'var(--color-status-completed)'
                       : props.task.status === 'downloading'
                         ? undefined
-                        : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
+                        : props.task.status === 'paused'
+                          ? 'var(--color-status-paused)'
+                          : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
                 transition: 'width 300ms ease-out',
               }}
             />

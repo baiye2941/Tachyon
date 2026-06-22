@@ -19,6 +19,10 @@ interface CommandPaletteProps {
   onPauseAll?: () => void;
   onResumeAll?: () => void;
   onToggleSidebar?: () => void;
+  /** 任务搜索数据源(spec 8.6) */
+  getTasks?: () => { id: string; fileName: string; url: string }[];
+  /** 选中任务后打开详情 */
+  onOpenTask?: (taskId: string) => void;
 }
 
 /** 高亮匹配字符:根据 matchedIndices 在 label 中包裹 <mark> */
@@ -84,29 +88,82 @@ export default function CommandPalette(props: CommandPaletteProps) {
     get onToggleSidebar() {
       return props.onToggleSidebar;
     },
+    get getTasks() {
+      return props.getTasks;
+    },
+    get onOpenTask() {
+      return props.onOpenTask;
+    },
   };
 
   // fuzzy 搜索(子序列匹配 + 评分排序),替换原 includes。
   // 搜索文本用当前语言翻译后的 label/hint,保证用户输入中文可命中。
-  const results = createMemo(() =>
+  // 任务搜索(spec 8.6):将匹配的任务包装为合成 Command(id 前缀 task-open:),
+  // 归入 task 分组,选中后调用 onOpenTask 打开任务详情。
+  const commandResults = createMemo(() =>
     fuzzySearch(
       COMMANDS,
       query(),
       (c) => `${t(c.labelKey)} ${c.hintKey ? t(c.hintKey) : ""}`,
-    ),
+    ).map((r) => ({
+      item: r.item,
+      score: r.score,
+      matchedIndices: r.matchedIndices,
+      taskFileName: undefined as string | undefined,
+    })),
   );
 
+  const taskResults = createMemo(() => {
+    const tasks = ctx.getTasks?.() ?? [];
+    if (tasks.length === 0) return [];
+    return fuzzySearch(tasks, query(), (task) => `${task.fileName} ${task.url}`).map(
+      (r) => {
+        const task = r.item;
+        const synthetic: Command = {
+          id: `task-open:${task.id}`,
+          labelKey: "command.task.openTask" as MessageKey,
+          group: "task",
+          icon: "list-bullet",
+          run: (c) => {
+            c.onOpenTask?.(task.id);
+            c.onClose();
+          },
+        };
+        return {
+          item: synthetic,
+          score: r.score,
+          matchedIndices: r.matchedIndices,
+          taskFileName: task.fileName,
+        };
+      },
+    );
+  });
+
+  // 合并命令 + 任务结果,按 score 降序(分数越高越靠前)
+  const results = createMemo(() => {
+    const merged = [...commandResults(), ...taskResults()];
+    merged.sort((a, b) => b.score - a.score);
+    return merged;
+  });
+
   // 按分组聚合(保持 fuzzy score 排序内的分组)
+  // taskFileName:任务条目用文件名作为可搜索 label(合成 Command 的 labelKey 仅作占位)
   const grouped = createMemo(() => {
     const items = results();
-    const byGroup: Record<CommandGroup, { cmd: Command; indices: number[] }[]> =
-      {
-        navigation: [],
-        action: [],
-        task: [],
-      };
+    const byGroup: Record<
+      CommandGroup,
+      { cmd: Command; indices: number[]; taskFileName?: string }[]
+    > = {
+      navigation: [],
+      action: [],
+      task: [],
+    };
     for (const r of items) {
-      byGroup[r.item.group].push({ cmd: r.item, indices: r.matchedIndices });
+      byGroup[r.item.group].push({
+        cmd: r.item,
+        indices: r.matchedIndices,
+        taskFileName: r.taskFileName,
+      });
     }
     return byGroup;
   });
@@ -297,7 +354,27 @@ export default function CommandPalette(props: CommandPaletteProps) {
                           </span>
                           <div class="flex-1 min-w-0">
                             <span class="block truncate">
-                              {highlight(t(entry.cmd.labelKey), entry.indices)}
+                              {entry.taskFileName
+                                ? (() => {
+                                    // 任务条目:"打开任务" 前缀 + 高亮文件名
+                                    const prefix = t("command.task.openTask");
+                                    return (
+                                      <>
+                                        <span
+                                          style={{
+                                            color: "var(--color-text-tertiary)",
+                                          }}
+                                        >
+                                          {prefix}:{" "}
+                                        </span>
+                                        {highlight(
+                                          entry.taskFileName,
+                                          entry.indices,
+                                        )}
+                                      </>
+                                    );
+                                  })()
+                                : highlight(t(entry.cmd.labelKey), entry.indices)}
                             </span>
                             <Show when={entry.cmd.hintKey}>
                               <span

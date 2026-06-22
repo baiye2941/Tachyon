@@ -101,13 +101,15 @@
   /* 兼容旧引用 */
   --color-text-title: var(--porcelain);
 
-  /* 强调色(严格控制使用频率) */
+  /* 强调色(严格控制使用频率)
+     spec 6.2:max 1 accent,saturation < 80%。primitive violet-500 饱和度 92% 偏高,
+     在交互场景一律走 muted/soft 变体以避免"AI 紫"过度感。 */
   --color-accent-primary: var(--violet-500);
   --color-accent-secondary: var(--violet-400);
   --color-accent-tertiary: var(--violet-600);
-  --color-accent-glow: rgba(139, 92, 246, 0.25);
-  --color-accent-glow-strong: rgba(139, 92, 246, 0.5);
-  --color-accent-soft: rgba(139, 92, 246, 0.12);
+  --color-accent-glow: rgba(139, 92, 246, 0.15);
+  --color-accent-glow-strong: rgba(139, 92, 246, 0.3);
+  --color-accent-soft: rgba(139, 92, 246, 0.1);
 
   /* 速度指示(Neon Cyan,仅实时下载速度数字与 sparkline) */
   --color-speed-active: var(--cyan-500);
@@ -174,11 +176,22 @@
   --radius-xl: 16px;
   --radius-full: 9999px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
-  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
+  /* Shadows - 多层复合(环境散射 + 直接光),模拟物理材质感 */
+  --shadow-sm:
+    0 1px 1px rgba(0, 0, 0, 0.25),
+    0 1px 2px rgba(0, 0, 0, 0.18);
+  --shadow-md:
+    0 2px 4px rgba(0, 0, 0, 0.28),
+    0 8px 16px rgba(0, 0, 0, 0.32);
+  --shadow-lg:
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    0 16px 32px rgba(0, 0, 0, 0.4);
+  --shadow-xl:
+    0 8px 16px rgba(0, 0, 0, 0.35),
+    0 24px 56px rgba(0, 0, 0, 0.5);
+  /* inset 高光:模拟从上方光源照射的边缘高光,关键质感细节 */
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   --shadow-glow: 0 0 20px rgba(139, 92, 246, 0.15);
   --shadow-accent: 0 0 0 1px var(--color-accent-glow);
 
@@ -224,13 +237,24 @@ body {
   color: var(--color-text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 高级感:打开 Geist 专业 OpenType 特性(连字 + 上下文替代 + 风格替代) */
+  font-feature-settings: "cv11", "ss01", "ss03", "calt" on;
+  text-rendering: optimizeLegibility;
   user-select: none;
 }
 
-/* Scrollbar */
+/* 等宽字段全部 tabular-nums + 微距字距,让数字稳如刻度盘 */
+.mono,
+.font-mono {
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: "tnum", "zero", "ss01";
+  letter-spacing: -0.01em;
+}
+
+/* Scrollbar — 极简风格,移动设备 like,hover 才显著 */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
@@ -238,12 +262,21 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  /* 上下加 2px 透明 border,thumb 视觉收窄到 4px,hover 时填满 */
+  background-clip: content-box;
+  border: 2px solid transparent;
+  transition: background-color 150ms ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* ============================================
@@ -297,10 +330,13 @@ body {
   border: 1px solid var(--color-border-subtle);
 }
 
-/* 面板表面(Iteration 07:原 .glass-strong,实际无 backdrop-filter,语义化为 panel-surface) */
+/* 面板表面(质感升级:实色底 + 顶部 1px 高光 + 极淡的顶光渐变) */
 .panel-surface {
-  background: var(--color-bg-elevated);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.015) 0%, transparent 80px),
+    var(--color-bg-elevated);
   border: 1px solid var(--color-border-default);
+  box-shadow: var(--shadow-inset-top);
 }
 
 /* 可排序列头(Iteration 07 DI-3):hover 反馈,提示可点击排序 */
@@ -359,13 +395,14 @@ body {
 @keyframes logo-shimmer {
   0%,
   100% {
-    opacity: 0.6;
+    /* 去 AI 味:0.6→1 + brightness 1→1.3 太活泼,收敛为 0.8→1 + 1→1.15 */
+    opacity: 0.8;
     filter: brightness(1);
   }
 
   50% {
     opacity: 1;
-    filter: brightness(1.3);
+    filter: brightness(1.15);
   }
 }
 
@@ -373,12 +410,11 @@ body {
   0%,
   100% {
     opacity: 1;
-    box-shadow: 0 0 4px var(--color-accent-glow);
   }
 
   50% {
-    opacity: 0.5;
-    box-shadow: 0 0 8px var(--color-accent-glow-strong);
+    /* 去 AI 味:opacity 范围 1→0.5 收窄到 1→0.7,移除 box-shadow 着色脉冲 */
+    opacity: 0.7;
   }
 }
 
@@ -407,14 +443,13 @@ body {
 }
 
 .chunk-cell:hover {
-  transform: scale(2.5);
+  /* 去 AI 味:放大倍率 2.5→1.6,移除白色外发光,改为细边框 + 轻微亮度 */
+  transform: scale(1.6);
   z-index: 10;
-  box-shadow:
-    0 0 16px rgba(255, 255, 255, 0.4),
-    0 0 6px rgba(255, 255, 255, 0.2);
-  outline: 2px solid rgba(255, 255, 255, 0.5);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  outline: 1px solid rgba(255, 255, 255, 0.25);
   outline-offset: 1px;
-  filter: brightness(1.3);
+  filter: brightness(1.15);
 }
 
 /* Chunk tooltip - floating */
@@ -557,7 +592,8 @@ body {
   }
 
   50% {
-    opacity: 0.5;
+    /* 去 AI 味:opacity 0.5 太突兀,改为 0.75 让脉冲更含蓄 */
+    opacity: 0.75;
   }
 }
 
@@ -608,7 +644,7 @@ body {
   transform: translateY(0);
 }
 
-/* 主按钮:纯紫色 + glow shadow,移除渐变(性能:减少合成层) */
+/* 主按钮:质感细节—上沿 inset 高光 + 多层下沉阴影,模拟物理按键 */
 .btn-primary {
   display: inline-flex;
   align-items: center;
@@ -626,13 +662,20 @@ body {
   color: var(--white-pure);
   padding: 8px 16px;
   border-radius: var(--radius-md);
+  letter-spacing: -0.01em;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 .btn-primary:hover {
   background: var(--color-accent-secondary);
   box-shadow:
-    0 0 0 1px var(--color-accent-glow),
-    0 4px 16px rgba(139, 92, 246, 0.25);
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 2px 6px rgba(0, 0, 0, 0.35);
+  transform: translateY(-1px);
 }
 
 .btn-primary:focus-visible {
@@ -659,16 +702,24 @@ body {
   border: 1px solid var(--color-border-default);
   cursor: pointer;
   transition: all 200ms var(--ease-spring);
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--color-text-primary);
   padding: 8px 16px;
   border-radius: var(--radius-md);
+  letter-spacing: -0.01em;
+  /* 质感:上沿 1px 高光,模拟从上方光源的轻微反射 */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 2px rgba(0, 0, 0, 0.2);
 }
 
 .btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.07);
   border-color: var(--color-border-strong);
   transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 6px rgba(0, 0, 0, 0.3);
 }
 
 .btn-secondary:focus-visible {
@@ -756,7 +807,9 @@ body {
 
 .btn-danger:hover {
   background: #f87171;
-  box-shadow: 0 4px 16px rgba(239, 68, 68, 0.3);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 2px 8px rgba(0, 0, 0, 0.35);
 }
 
 .btn-danger:focus-visible {
@@ -764,9 +817,9 @@ body {
   outline-offset: 2px;
 }
 
-/* Input Base */
+/* Input Base — 质感:实色底 + 上沿微高光,focus 时双层光环 */
 .input {
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);
   padding: 10px 12px;
@@ -774,14 +827,27 @@ body {
   font-size: 14px;
   font-family: var(--font-sans);
   width: 100%;
-  transition: all 200ms ease;
+  transition:
+    border-color 200ms ease,
+    box-shadow 200ms ease,
+    background 200ms ease;
   outline: none;
+  letter-spacing: -0.005em;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.15);
+}
+
+.input:hover {
+  border-color: var(--color-border-strong);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .input:focus {
   border-color: var(--color-accent-secondary);
-  box-shadow: 0 0 0 3px var(--color-accent-soft);
-  background: rgba(255, 255, 255, 0.06);
+  /* 焦点环:外层 violet 软光 + 内层细紧贴边线 */
+  box-shadow:
+    0 0 0 3px var(--color-accent-soft),
+    inset 0 1px 1px rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.05);
   outline: 2px solid transparent;
 }
 
@@ -873,8 +939,9 @@ body {
 }
 
 .hover-lift:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 16px rgba(139, 92, 246, 0.2);
+  /* 去 AI 味:translate 从 -2px 减到 -1px,移除 violet 着色阴影 */
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
 }
 
 .hover-lift-sm {
@@ -894,6 +961,55 @@ body {
 
 .hover-row:hover {
   background: rgba(255, 255, 255, 0.03);
+}
+
+/* ============================================
+   Task Row(高级感:hover 横向背景渐变 + 选中态左侧 2px 竹纹 + 微 lift)
+   ============================================ */
+.task-row {
+  background: transparent;
+  box-shadow: inset 2px 0 0 transparent;
+  transition:
+    background 180ms var(--ease-standard),
+    box-shadow 180ms var(--ease-standard);
+}
+
+.task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.025) 0%,
+    rgba(255, 255, 255, 0.012) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--selected {
+  background: linear-gradient(
+    90deg,
+    rgba(139, 92, 246, 0.08) 0%,
+    rgba(139, 92, 246, 0.025) 50%,
+    transparent 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
+}
+
+.task-row--selected:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(139, 92, 246, 0.12) 0%,
+    rgba(139, 92, 246, 0.04) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--multi-selected {
+  background: linear-gradient(
+    90deg,
+    rgba(139, 92, 246, 0.14) 0%,
+    rgba(139, 92, 246, 0.06) 50%,
+    rgba(139, 92, 246, 0.01) 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
 }
 
 .hover-underline:hover {
@@ -1078,7 +1194,8 @@ body {
   position: fixed;
   inset: 0;
   z-index: 200;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--color-overlay-scrim);
+  backdrop-filter: blur(2px);
   animation: fadeIn 200ms ease forwards;
 }
 
@@ -1201,14 +1318,15 @@ body {
 }
 
 .progress-bar-active {
+  /* 去 AI 味:从三色亮 shimmer 改为同色微亮度差,降低视觉骚动 */
   background: linear-gradient(
     90deg,
     var(--violet-500) 0%,
-    var(--violet-600) 50%,
+    var(--violet-400) 50%,
     var(--violet-500) 100%
   ) !important;
   background-size: 200% 100% !important;
-  animation: progress-shimmer 2.5s linear infinite;
+  animation: progress-shimmer 3s linear infinite;
 }
 
 /* ============================================
@@ -1236,17 +1354,71 @@ body {
 @keyframes status-breathe {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4);
+    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.3);
     opacity: 1;
   }
   50% {
-    box-shadow: 0 0 6px 2px rgba(139, 92, 246, 0.2);
-    opacity: 0.8;
+    /* 去 AI 味:6px 模糊降到 3px,opacity 范围 1→0.8 收窄到 1→0.85 */
+    box-shadow: 0 0 3px 1px rgba(139, 92, 246, 0.15);
+    opacity: 0.85;
   }
 }
 
 .status-indicator-active {
   animation: status-breathe 2.5s ease-in-out infinite;
+}
+
+/* Status Badge — 质感:per-status 背景 + 顶部 1px inset 高光 */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  line-height: 1.4;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  font-feature-settings: "ss01", "tnum";
+}
+.status-badge--downloading {
+  color: var(--color-status-downloading);
+  background: var(--color-accent-soft);
+  border-color: rgba(139, 92, 246, 0.18);
+  /* 下载中脉冲(spec 8.1):subtle opacity 呼吸 */
+  animation: status-pulse 1.8s ease-in-out infinite;
+}
+.status-badge--connecting,
+.status-badge--resuming,
+.status-badge--verifying {
+  color: var(--color-status-connecting);
+  background: var(--color-info-soft);
+  border-color: rgba(34, 211, 238, 0.18);
+}
+.status-badge--completed {
+  color: var(--color-status-completed);
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.18);
+}
+.status-badge--paused {
+  color: var(--color-text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--color-border-subtle);
+}
+.status-badge--failed {
+  color: var(--color-status-error);
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.18);
+}
+.status-badge--pending,
+.status-badge--cancelled {
+  color: var(--color-text-tertiary);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--color-border-subtle);
 }
 
 /* ============================================
@@ -1274,7 +1446,7 @@ body {
    ============================================ */
 .detail-stat-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
 }
 
 .detail-stat-cell {
@@ -1284,7 +1456,7 @@ body {
 }
 
 .detail-stat-label {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--color-text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.3px;
@@ -1293,7 +1465,7 @@ body {
 
 .detail-stat-value {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--color-text-primary);
   margin-top: 2px;
   overflow: hidden;

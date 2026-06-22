@@ -148,9 +148,10 @@ describe('ui store', () => {
   })
 
   it('侧边栏常量已导出且符合设计约束', () => {
-    expect(uiModule.SIDEBAR_RAIL_WIDTH).toBe(56)
-    expect(uiModule.SIDEBAR_MIN_EXPANDED_WIDTH).toBe(200)
-    expect(uiModule.SIDEBAR_MAX_WIDTH).toBe(300)
-    expect(uiModule.SIDEBAR_DEFAULT_WIDTH).toBe(220)
+    // spec 8.3:轨道 48px,展开默认 240px,可拖拽 180-400px
+    expect(uiModule.SIDEBAR_RAIL_WIDTH).toBe(48)
+    expect(uiModule.SIDEBAR_MIN_EXPANDED_WIDTH).toBe(180)
+    expect(uiModule.SIDEBAR_MAX_WIDTH).toBe(400)
+    expect(uiModule.SIDEBAR_DEFAULT_WIDTH).toBe(240)
   })
 })

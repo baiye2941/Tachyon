@@ -27,6 +27,8 @@ type SettingsTab =
 interface SettingsPanelProps {
   visible: boolean;
   onClose: () => void;
+  /** 初始打开的标签页(由 TitleBar 菜单\"关于\"等入口指定) */
+  initialTab?: SettingsTab;
 }
 
 interface ConfigDraft {
@@ -35,10 +37,15 @@ interface ConfigDraft {
     downloadDir: string;
     maxConcurrentFragments: number;
     maxRetries: number;
+    requestTimeoutSecs: number;
     verifyChecksum: boolean;
+    /** 限速(bytes/sec);null 表示不限速 */
+    rateLimitBytesPerSec: number | null;
   };
   connection: {
     maxConnectionsPerHost: number;
+    maxGlobalConnections: number;
+    keepAliveTimeoutSecs: number;
     enableHttp2: boolean;
     enableQuic: boolean;
     connectTimeoutSecs: number;
@@ -58,7 +65,9 @@ interface ConfigDraft {
 export default function SettingsPanel(props: SettingsPanelProps) {
   const t = (key: MessageKey, values?: Record<string, string | number>) =>
     tr(key, values as Record<string, string | number | unknown>);
-  const [activeTab, setActiveTab] = createSignal<SettingsTab>("general");
+  const [activeTab, setActiveTab] = createSignal<SettingsTab>(
+    props.initialTab ?? "general",
+  );
   const initialVisible = untrack(() => props.visible);
   const [shouldRender, setShouldRender] = createSignal(initialVisible);
   const [visible, setVisible] = createSignal(initialVisible);
@@ -71,6 +80,13 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       closeTimer = null;
     }
   };
+
+  // 面板打开时,若调用方指定了 initialTab(如 TitleBar\"关于\"入口),切到该标签
+  createEffect(() => {
+    if (props.visible && props.initialTab) {
+      setActiveTab(props.initialTab);
+    }
+  });
 
   createEffect(() => {
     if (props.visible) {
@@ -110,10 +126,14 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       downloadDir: "",
       maxConcurrentFragments: 8,
       maxRetries: 3,
+      requestTimeoutSecs: 60,
       verifyChecksum: true,
+      rateLimitBytesPerSec: null,
     },
     connection: {
       maxConnectionsPerHost: 4,
+      maxGlobalConnections: 256,
+      keepAliveTimeoutSecs: 90,
       enableHttp2: true,
       enableQuic: false,
       connectTimeoutSecs: 30,
@@ -132,6 +152,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
 
   const [saving, setSaving] = createSignal(false);
   const [confirmOpen, setConfirmOpen] = createSignal(false);
+  // About 标签:支持协议列表 + 应用版本(只读,来自后端)
+  const [protocols, setProtocols] = createSignal<string[]>([]);
+  const [appVersion, setAppVersion] = createSignal<string>("");
 
   const applyConfig = (cfg: AppConfig) => {
     setDraft({
@@ -140,10 +163,14 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         downloadDir: cfg.download.downloadDir,
         maxConcurrentFragments: cfg.download.maxConcurrentFragments,
         maxRetries: cfg.download.maxRetries,
+        requestTimeoutSecs: cfg.download.requestTimeoutSecs,
         verifyChecksum: cfg.download.verifyChecksum,
+        rateLimitBytesPerSec: cfg.download.rateLimitBytesPerSec ?? null,
       },
       connection: {
         maxConnectionsPerHost: cfg.connection.maxConnectionsPerHost,
+        maxGlobalConnections: cfg.connection.maxGlobalConnections,
+        keepAliveTimeoutSecs: cfg.connection.keepAliveTimeoutSecs,
         enableHttp2: cfg.connection.enableHttp2,
         enableQuic: cfg.connection.enableQuic,
         connectTimeoutSecs: cfg.connection.connectTimeoutSecs,
@@ -172,6 +199,17 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     } finally {
       $configLoading.set(false);
     }
+    // About 标签:并行拉取支持协议 + 应用信息(失败静默降级,不阻塞面板)
+    try {
+      const [proto, info] = await Promise.all([
+        api.getSupportedProtocols(),
+        api.getAppInfo(),
+      ]);
+      setProtocols(proto);
+      setAppVersion(info.version);
+    } catch {
+      // 浏览器/无 Tauri 环境下静默降级,About 仍展示静态文案
+    }
   });
 
   const buildPatch = (): ConfigPatch => {
@@ -181,10 +219,14 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         downloadDir: draft.download.downloadDir,
         maxConcurrentFragments: draft.download.maxConcurrentFragments,
         maxRetries: draft.download.maxRetries,
+        requestTimeoutSecs: draft.download.requestTimeoutSecs,
         verifyChecksum: draft.download.verifyChecksum,
+        rateLimitBytesPerSec: draft.download.rateLimitBytesPerSec,
       },
       connection: {
         maxConnectionsPerHost: draft.connection.maxConnectionsPerHost,
+        maxGlobalConnections: draft.connection.maxGlobalConnections,
+        keepAliveTimeoutSecs: draft.connection.keepAliveTimeoutSecs,
         enableHttp2: draft.connection.enableHttp2,
         enableQuic: draft.connection.enableQuic,
         connectTimeoutSecs: draft.connection.connectTimeoutSecs,
@@ -255,10 +297,12 @@ export default function SettingsPanel(props: SettingsPanelProps) {
             "transform 250ms cubic-bezier(0.32, 0.72, 0, 1), opacity 250ms ease",
           width: "min(640px, calc(100vw - 32px))",
           height: "min(520px, calc(100dvh - 64px))",
-          background: "var(--color-bg-elevated)",
+          /* 质感:顶部极淡向下高光 + 实色底,inset 上沿边线 */
+          background:
+            "linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 120px), var(--color-bg-elevated)",
           "border-radius": "16px",
-          border: "1px solid var(--color-border-subtle)",
-          "box-shadow": "var(--shadow-xl)",
+          border: "1px solid var(--color-border-default)",
+          "box-shadow": "var(--shadow-xl), inset 0 1px 0 rgba(255, 255, 255, 0.06)",
           display: "flex",
           overflow: "hidden",
         }}
@@ -409,6 +453,73 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     onChange={(v) => setDraft("download", "maxRetries", v)}
                     displayValue={t("settings.download.maxRetriesValue", { n: draft.download.maxRetries })}
                   />
+                  <SliderItem
+                    label={t("settings.download.requestTimeout")}
+                    value={draft.download.requestTimeoutSecs}
+                    min={5}
+                    max={120}
+                    onChange={(v) =>
+                      setDraft("download", "requestTimeoutSecs", v)
+                    }
+                    displayValue={t("settings.download.requestTimeoutValue", {
+                      n: draft.download.requestTimeoutSecs,
+                    })}
+                  />
+                  <div class="flex items-center justify-between">
+                    <span
+                      style={{
+                        "font-size": "13px",
+                        color: "var(--color-text-secondary)",
+                      }}
+                    >
+                      {t("settings.download.rateLimit")}
+                    </span>
+                    <div class="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        step={1048576}
+                        class="input"
+                        style={{ width: "120px", "font-size": "13px" }}
+                        placeholder={t("settings.download.rateLimitPlaceholder")}
+                        value={
+                          draft.download.rateLimitBytesPerSec ?? ""
+                        }
+                        onInput={(e) => {
+                          const raw = e.currentTarget.value.trim();
+                          if (raw === "") {
+                            setDraft("download", "rateLimitBytesPerSec", null);
+                          } else {
+                            const n = Number(raw);
+                            setDraft(
+                              "download",
+                              "rateLimitBytesPerSec",
+                              Number.isFinite(n) && n > 0 ? Math.floor(n) : null,
+                            );
+                          }
+                        }}
+                      />
+                      <span
+                        class="mono"
+                        style={{
+                          "font-size": "11px",
+                          color: "var(--color-text-tertiary)",
+                          "white-space": "nowrap",
+                        }}
+                      >
+                        {t("settings.download.rateLimitUnit")}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      "font-size": "11px",
+                      color: "var(--color-text-tertiary)",
+                      "margin-top": "-12px",
+                    }}
+                  >
+                    {t("settings.download.rateLimitHint")}
+                  </div>
                   <ToggleItem
                     label={t("settings.download.verifyChecksum")}
                     value={draft.download.verifyChecksum}
@@ -438,6 +549,28 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                       setDraft("connection", "connectTimeoutSecs", v)
                     }
                     displayValue={t("settings.connection.connectTimeoutValue", { n: draft.connection.connectTimeoutSecs })}
+                  />
+                  <SliderItem
+                    label={t("settings.connection.maxGlobalConnections")}
+                    value={draft.connection.maxGlobalConnections}
+                    min={1}
+                    max={256}
+                    onChange={(v) =>
+                      setDraft("connection", "maxGlobalConnections", v)
+                    }
+                    displayValue={`${draft.connection.maxGlobalConnections}`}
+                  />
+                  <SliderItem
+                    label={t("settings.connection.keepAliveTimeout")}
+                    value={draft.connection.keepAliveTimeoutSecs}
+                    min={1}
+                    max={120}
+                    onChange={(v) =>
+                      setDraft("connection", "keepAliveTimeoutSecs", v)
+                    }
+                    displayValue={t("settings.connection.keepAliveTimeoutValue", {
+                      n: draft.connection.keepAliveTimeoutSecs,
+                    })}
                   />
                   <ToggleItem
                     label={t("settings.connection.enableHttp2")}
@@ -525,21 +658,24 @@ export default function SettingsPanel(props: SettingsPanelProps) {
               <Show when={activeTab() === "about"}>
                 <div
                   class="flex flex-col items-center gap-3"
-                  style={{ padding: "40px 20px" }}
+                  style={{ padding: "32px 20px 24px" }}
                 >
                   <div
                     style={{
                       width: "48px",
                       height: "48px",
-                      background:
-                        "linear-gradient(135deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)",
+                      /* 去 AI 味:135deg 渐变品牌块替换为实色 + inner highlight */
+                      background: "var(--color-accent-primary)",
                       "border-radius": "12px",
                       display: "flex",
                       "align-items": "center",
                       "justify-content": "center",
                       color: "var(--color-text-inverse)",
-                      "font-size": "24px",
+                      "font-family": "var(--font-mono)",
+                      "font-size": "22px",
                       "font-weight": 700,
+                      "box-shadow":
+                        "inset 0 1px 0 rgba(255,255,255,0.12), 0 1px 2px rgba(0,0,0,0.4)",
                     }}
                   >
                     T
@@ -554,21 +690,141 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     Tachyon
                   </div>
                   <div
+                    class="mono"
                     style={{
-                      "font-size": "13px",
+                      "font-size": "12px",
                       color: "var(--color-text-tertiary)",
                     }}
                   >
-                    {t("settings.about.version")}
+                    {appVersion()
+                      ? t("settings.about.versionValue", { v: appVersion() })
+                      : t("settings.about.version")}
                   </div>
                   <div
                     style={{
                       "font-size": "12px",
                       color: "var(--color-text-tertiary)",
-                      "margin-top": "8px",
+                      "margin-top": "4px",
+                      "text-align": "center",
                     }}
                   >
                     {t("settings.about.tagline")}
+                  </div>
+
+                  {/* 支持的协议(spec 1.6) */}
+                  <div
+                    class="flex flex-wrap items-center justify-center gap-1.5"
+                    style={{ "margin-top": "16px", "max-width": "100%" }}
+                  >
+                    <For each={protocols()}>
+                      {(proto) => (
+                        <span
+                          style={{
+                            "font-size": "11px",
+                            "font-weight": 600,
+                            color: "var(--color-accent-secondary)",
+                            background: "var(--color-accent-soft)",
+                            padding: "2px 8px",
+                            "border-radius": "9999px",
+                            "text-transform": "uppercase",
+                            "letter-spacing": "0.3px",
+                          }}
+                        >
+                          {proto}
+                        </span>
+                      )}
+                    </For>
+                  </div>
+                </div>
+
+                {/* 只读安全字段:user_agent / headers(后端白名单故意排除,
+                    spec 1.2 要求展示但不可编辑,标注受安全策略保护) */}
+                <div
+                  class="flex flex-col gap-3"
+                  style={{ padding: "0 20px 24px" }}
+                >
+                  <div
+                    style={{
+                      "font-size": "11px",
+                      "font-weight": 600,
+                      color: "var(--color-text-tertiary)",
+                      "text-transform": "uppercase",
+                      "letter-spacing": "0.5px",
+                      "margin-bottom": "4px",
+                    }}
+                  >
+                    {t("settings.about.securityFields")}
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: "6px",
+                      padding: "10px 12px",
+                      "border-radius": "8px",
+                      background: "var(--color-bg-hover)",
+                      border: "1px solid var(--color-border-subtle)",
+                    }}
+                  >
+                    <div
+                      class="flex items-center justify-between"
+                      style={{ gap: "12px" }}
+                    >
+                      <span
+                        style={{
+                          "font-size": "12px",
+                          color: "var(--color-text-secondary)",
+                        }}
+                      >
+                        {t("settings.about.userAgent")}
+                      </span>
+                      <span
+                        class="mono"
+                        style={{
+                          "font-size": "12px",
+                          color: "var(--color-text-tertiary)",
+                          "text-align": "right",
+                          "overflow-wrap": "anywhere",
+                        }}
+                      >
+                        {$config.get()?.download.userAgent ?? "---"}
+                      </span>
+                    </div>
+                    <div
+                      class="flex items-center justify-between"
+                      style={{ gap: "12px" }}
+                    >
+                      <span
+                        style={{
+                          "font-size": "12px",
+                          color: "var(--color-text-secondary)",
+                        }}
+                      >
+                        {t("settings.about.customHeaders")}
+                      </span>
+                      <span
+                        class="mono"
+                        style={{
+                          "font-size": "12px",
+                          color: "var(--color-text-tertiary)",
+                        }}
+                      >
+                        {t("settings.about.headersCount", {
+                          n: Object.keys(
+                            $config.get()?.download.headers ?? {},
+                          ).length,
+                        })}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      "font-size": "11px",
+                      color: "var(--color-text-tertiary)",
+                      "line-height": "1.5",
+                    }}
+                  >
+                    {t("settings.about.securityHint")}
                   </div>
                 </div>
               </Show>

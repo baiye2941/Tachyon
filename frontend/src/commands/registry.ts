@@ -24,6 +24,10 @@ export interface CommandContext {
   onPauseAll?: () => void
   onResumeAll?: () => void
   onToggleSidebar?: () => void
+  /** 任务搜索:返回当前任务列表(CommandPalette 任务搜索用) */
+  getTasks?: () => { id: string; fileName: string; url: string }[]
+  /** 打开指定任务详情(选中任务) */
+  onOpenTask?: (taskId: string) => void
 }
 
 export interface Command {

@@ -36,6 +36,7 @@ describe("ContextMenu 可访问性", () => {
         onClose={() => {}}
         onPause={vi.fn()}
         onResume={vi.fn()}
+        onCancel={vi.fn()}
         onOpenFolder={vi.fn()}
         onCopyLink={vi.fn()}
         onRedownload={vi.fn()}
@@ -59,6 +60,7 @@ describe("ContextMenu 可访问性", () => {
           onClose={() => {}}
           onPause={vi.fn()}
           onResume={vi.fn()}
+          onCancel={vi.fn()}
           onOpenFolder={vi.fn()}
           onCopyLink={vi.fn()}
           onRedownload={vi.fn()}
@@ -85,6 +87,7 @@ describe("ContextMenu 可访问性", () => {
           onClose={() => {}}
           onPause={vi.fn()}
           onResume={vi.fn()}
+          onCancel={vi.fn()}
           onOpenFolder={vi.fn()}
           onCopyLink={vi.fn()}
           onRedownload={vi.fn()}
@@ -112,6 +115,7 @@ describe("ContextMenu 可访问性", () => {
           onClose={() => {}}
           onPause={vi.fn()}
           onResume={vi.fn()}
+          onCancel={vi.fn()}
           onOpenFolder={vi.fn()}
           onCopyLink={vi.fn()}
           onRedownload={vi.fn()}
@@ -140,6 +144,7 @@ describe("ContextMenu 可访问性", () => {
           onClose={onClose}
           onPause={vi.fn()}
           onResume={vi.fn()}
+          onCancel={vi.fn()}
           onOpenFolder={vi.fn()}
           onCopyLink={vi.fn()}
           onRedownload={vi.fn()}
@@ -166,6 +171,7 @@ describe("ContextMenu 可访问性", () => {
           onClose={() => {}}
           onPause={onPause}
           onResume={vi.fn()}
+          onCancel={vi.fn()}
           onOpenFolder={vi.fn()}
           onCopyLink={vi.fn()}
           onRedownload={vi.fn()}
@@ -190,6 +196,7 @@ describe("ContextMenu 可访问性", () => {
         onClose={() => {}}
         onPause={vi.fn()}
         onResume={vi.fn()}
+        onCancel={vi.fn()}
         onOpenFolder={vi.fn()}
         onCopyLink={vi.fn()}
         onRedownload={vi.fn()}
@@ -210,6 +217,7 @@ describe("ContextMenu 可访问性", () => {
         onClose={() => {}}
         onPause={vi.fn()}
         onResume={vi.fn()}
+        onCancel={vi.fn()}
         onOpenFolder={vi.fn()}
         onCopyLink={vi.fn()}
         onRedownload={vi.fn()}
@@ -219,5 +227,54 @@ describe("ContextMenu 可访问性", () => {
 
     expect(container.textContent).toContain("恢复");
     expect(container.textContent).not.toContain("暂停");
+  });
+
+  it('下载中任务应显示"取消任务"且点击触发 onCancel', () => {
+    const onCancel = vi.fn();
+    const { container } = render(() => (
+      <ContextMenu
+        x={100}
+        y={100}
+        visible={true}
+        task={mockTask}
+        onClose={() => {}}
+        onPause={vi.fn()}
+        onResume={vi.fn()}
+        onCancel={onCancel}
+        onOpenFolder={vi.fn()}
+        onCopyLink={vi.fn()}
+        onRedownload={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    ));
+
+    expect(container.textContent).toContain("取消任务");
+    // 点击取消菜单项应触发 onCancel(taskId)
+    const items = container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+    const cancelBtn = Array.from(items).find((b) => b.textContent?.includes("取消任务"));
+    expect(cancelBtn).toBeTruthy();
+    fireEvent.click(cancelBtn!);
+    expect(onCancel).toHaveBeenCalledWith("task-1");
+  });
+
+  it('已完成任务不显示"取消任务"', () => {
+    const { container } = render(() => (
+      <ContextMenu
+        x={100}
+        y={100}
+        visible={true}
+        task={completedTask}
+        onClose={() => {}}
+        onPause={vi.fn()}
+        onResume={vi.fn()}
+        onCancel={vi.fn()}
+        onOpenFolder={vi.fn()}
+        onCopyLink={vi.fn()}
+        onRedownload={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    ));
+
+    expect(container.textContent).not.toContain("取消任务");
   });
 });

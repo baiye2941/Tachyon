@@ -15,6 +15,7 @@ import {
   LinkIcon,
   RefreshIcon,
   TrashIcon,
+  CancelIcon,
 } from "./icons";
 import { tr, type MessageKey } from "../i18n";
 
@@ -35,6 +36,7 @@ interface ContextMenuProps {
   onClose: () => void;
   onPause: (taskId: string) => void;
   onResume: (taskId: string) => void;
+  onCancel: (taskId: string) => void;
   onOpenFolder: (taskId: string) => void;
   onCopyLink: (taskId: string) => void;
   onRedownload: (taskId: string) => void;
@@ -57,6 +59,12 @@ export default function ContextMenu(props: ContextMenuProps) {
   const canPause = () =>
     props.task?.status === "downloading" || props.task?.status === "connecting";
   const canResume = () => props.task?.status === "paused";
+  // cancel:立即停止但保留记录,对任何未终止任务可用
+  const canCancel = () =>
+    props.task?.status === "downloading" ||
+    props.task?.status === "connecting" ||
+    props.task?.status === "paused" ||
+    props.task?.status === "resuming";
   const isCompleted = () => props.task?.status === "completed";
 
   const menuItems = createMemo<MenuItem[]>(() => {
@@ -77,6 +85,15 @@ export default function ContextMenu(props: ContextMenuProps) {
         label: t("common.resume"),
         icon: () => <PlayIcon />,
         action: () => props.onResume(props.task!.id),
+      });
+    }
+
+    if (canCancel()) {
+      items.push({
+        id: "cancel",
+        label: t("detail.action.cancel"),
+        icon: () => <CancelIcon />,
+        action: () => props.onCancel(props.task!.id),
       });
     }
 

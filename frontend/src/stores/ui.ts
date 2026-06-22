@@ -2,10 +2,11 @@ import { createSignal, createRoot, type Accessor } from "solid-js";
 import type { ViewName } from "../types";
 
 // 侧边栏常量(与 Sidebar.tsx 保持一致,单一来源)
-export const SIDEBAR_RAIL_WIDTH = 56;
-export const SIDEBAR_MIN_EXPANDED_WIDTH = 200;
-export const SIDEBAR_MAX_WIDTH = 300;
-export const SIDEBAR_DEFAULT_WIDTH = 220;
+// spec 8.3:轨道 48px,展开默认 240px,可拖拽 180-400px
+export const SIDEBAR_RAIL_WIDTH = 48;
+export const SIDEBAR_MIN_EXPANDED_WIDTH = 180;
+export const SIDEBAR_MAX_WIDTH = 400;
+export const SIDEBAR_DEFAULT_WIDTH = 240;
 const SIDEBAR_STORAGE_KEY = "tachyon-sidebar-state";
 
 type PanelState = {
@@ -25,6 +26,12 @@ const [hubVisible, setHubVisible] = createSignal(false);
 const [newTaskModalOpen, setNewTaskModalOpen] = createSignal(false);
 const [commandPaletteOpen, setCommandPaletteOpen] = createSignal(false);
 const [shortcutHelpOpen, setShortcutHelpOpen] = createSignal(false);
+// Settings 面板初始标签页(由 TitleBar\"关于\"等入口指定,openSettings 时消费)
+// 与 SettingsPanel 的 SettingsTab 保持一致(未导出,此处内联)
+type SettingsTab = "general" | "download" | "connection" | "scheduler" | "about";
+const [settingsInitialTab, setSettingsInitialTab] = createSignal<SettingsTab | null>(
+  null,
+);
 
 // —— 侧边栏状态(Iteration 13 从 Sidebar.tsx 本地信号迁移到全局 store)——
 // 迁移动机:使命令面板/快捷键能控制侧边栏伸缩,消除"状态散落在组件内"的技术债。
@@ -140,6 +147,14 @@ export function toggleHistory(): void {
 
 export function openSettings(): void {
   closeAllPanels();
+  setSettingsInitialTab(null);
+  setSettingsVisible(true);
+}
+
+/** 打开设置面板并定位到指定标签页(如 TitleBar\"关于\"入口) */
+export function openSettingsTab(tab: SettingsTab): void {
+  closeAllPanels();
+  setSettingsInitialTab(tab);
   setSettingsVisible(true);
 }
 
@@ -247,6 +262,9 @@ export const $ui = {
   get shortcutHelpOpen(): Accessor<boolean> {
     return shortcutHelpOpen;
   },
+  get settingsInitialTab(): Accessor<SettingsTab | null> {
+    return settingsInitialTab;
+  },
   // —— 侧边栏(Iteration 13)——
   get sidebarWidth(): Accessor<number> {
     return sidebarWidth;
@@ -270,6 +288,7 @@ export const $ui = {
   openSettings,
   closeSettings,
   toggleSettings,
+  openSettingsTab,
   openHub,
   closeHub,
   toggleHub,

@@ -20,7 +20,8 @@ interface ChunkMatrixProps {
 
 const AGGREGATE_THRESHOLD = 200;
 const AGGREGATE_BLOCKS = 100;
-const BLOCKS_PER_ROW = 25;
+const MAX_BLOCKS_PER_ROW = 25;
+const MIN_BLOCKS_PER_ROW = 8;
 const BLOCK_SIZE = 14;
 const BLOCK_GAP = 3;
 
@@ -105,15 +106,24 @@ function statusLabelForBlock(status: ChunkBlock["status"]): string {
 }
 
 export default function ChunkMatrix(props: ChunkMatrixProps) {
-  const chunksPerRow = 25;
   const [tooltipIndex, setTooltipIndex] = createSignal<number | null>(null);
   const [cursorPos, setCursorPos] = createSignal({ x: 0, y: 0 });
+  // 自适应列数:根据 wrapper 实际宽度计算,避免固定 25 列在窄面板溢出
+  const [blocksPerRow, setBlocksPerRow] = createSignal(MAX_BLOCKS_PER_ROW);
   let currentPulsePhase = 0;
   let tooltipTimer: number | null = null;
   let rafId: number | null = null;
+  let resizeObs: ResizeObserver | null = null;
   let gridRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
   let wrapperRef: HTMLDivElement | undefined;
+
+  const computeBlocksPerRow = (containerWidth: number): number => {
+    // 容器内边距 16*2 = 32px;每格占用 BLOCK_SIZE+BLOCK_GAP,最后一格不算 gap
+    const available = Math.max(0, containerWidth - 32);
+    const perRow = Math.floor((available + BLOCK_GAP) / (BLOCK_SIZE + BLOCK_GAP));
+    return Math.max(MIN_BLOCKS_PER_ROW, Math.min(MAX_BLOCKS_PER_ROW, perRow));
+  };
 
   // 检测用户是否偏好减少动画
   const prefersReducedMotion = useReducedMotion();
@@ -146,13 +156,14 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     setCursorPos({ x, y });
+    const perRow = blocksPerRow();
     const col = Math.floor(x / (BLOCK_SIZE + BLOCK_GAP));
     const row = Math.floor(y / (BLOCK_SIZE + BLOCK_GAP));
-    const idx = row * BLOCKS_PER_ROW + col;
+    const idx = row * perRow + col;
     const blockList = blocks();
     if (
       col >= 0 &&
-      col < BLOCKS_PER_ROW &&
+      col < perRow &&
       idx >= 0 &&
       idx < blockList.length
     ) {
@@ -169,6 +180,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   onCleanup(() => {
     if (tooltipTimer !== null) clearTimeout(tooltipTimer);
     if (rafId !== null) cancelAnimationFrame(rafId);
+    if (resizeObs !== null) resizeObs.disconnect();
   });
 
   const shouldAggregate = createMemo(
@@ -201,8 +213,9 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
   const canvasLayout = createMemo(() => {
     const blockList = blocks();
-    const rows = Math.ceil(blockList.length / BLOCKS_PER_ROW);
-    const width = BLOCKS_PER_ROW * (BLOCK_SIZE + BLOCK_GAP) - BLOCK_GAP;
+    const perRow = blocksPerRow();
+    const rows = Math.ceil(blockList.length / perRow);
+    const width = perRow * (BLOCK_SIZE + BLOCK_GAP) - BLOCK_GAP;
     const height = rows * (BLOCK_SIZE + BLOCK_GAP) - BLOCK_GAP;
     return { rows, width, height };
   });
@@ -236,10 +249,11 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const pulse = Math.sin(phase * Math.PI * 2);
     const pending = pendingColor();
     const radius = 3;
+    const perRow = blocksPerRow();
 
     blockList.forEach((block, i) => {
-      const row = Math.floor(i / BLOCKS_PER_ROW);
-      const col = i % BLOCKS_PER_ROW;
+      const row = Math.floor(i / perRow);
+      const col = i % perRow;
       const x = col * (BLOCK_SIZE + BLOCK_GAP);
       const y = row * (BLOCK_SIZE + BLOCK_GAP);
 
@@ -259,7 +273,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
       if (block.status === "done") {
         ctx.shadowColor = `${block.color}66`;
-        ctx.shadowBlur = 4;
+        ctx.shadowBlur = 2;
         ctx.stroke();
         ctx.shadowBlur = 0;
       }
@@ -301,6 +315,18 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   };
 
   onMount(() => {
+    if (wrapperRef) {
+      setBlocksPerRow(computeBlocksPerRow(wrapperRef.clientWidth));
+      // jsdom 测试环境无 ResizeObserver,守护避免 ReferenceError
+      if (typeof ResizeObserver !== "undefined") {
+        resizeObs = new ResizeObserver((entries) => {
+          for (const entry of entries) {
+            setBlocksPerRow(computeBlocksPerRow(entry.contentRect.width));
+          }
+        });
+        resizeObs.observe(wrapperRef);
+      }
+    }
     if (shouldAggregate()) {
       drawCanvas(blocks(), currentPulsePhase);
     }
@@ -385,13 +411,13 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                           ? chunk.color
                           : "var(--color-bg-tertiary)",
                       "box-shadow": chunk.isDone
-                        ? `0 0 4px ${chunk.color}66`
+                        ? `inset 0 0 0 1px ${chunk.color}40`
                         : "none",
                       animation: chunk.isDownloading
                         ? `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards, chunk-pulse 1.5s ease-in-out infinite`
                         : `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards`,
                       "animation-delay": chunk.isDownloading
-                        ? `${chunk.index * 5}ms, ${(chunk.index % chunksPerRow) * 0.05 + Math.floor(chunk.index / chunksPerRow) * 0.1}s`
+                        ? `${chunk.index * 5}ms, ${(chunk.index % blocksPerRow()) * 0.05 + Math.floor(chunk.index / blocksPerRow()) * 0.1}s`
                         : `${chunk.index * 5}ms`,
                       opacity: 0,
                     }}

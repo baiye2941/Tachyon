@@ -1,4 +1,4 @@
-import { For, Show, createSignal } from "solid-js";
+import { For, Show } from "solid-js";
 import {
   PlusIcon,
   SearchIcon,
@@ -9,6 +9,7 @@ import {
   CheckboxIcon,
   XIcon,
   TrashIcon,
+  CancelIcon,
 } from "./icons";
 import Button from "../shared/ui/Button";
 import { useI18n } from "../i18n";
@@ -65,6 +66,7 @@ interface ToolbarProps {
   onSelectAll: () => void;
   onPauseSelected: () => void;
   onResumeSelected: () => void;
+  onCancelSelected: () => void;
   onDeleteSelected: () => void;
   onExitMultiSelect: () => void;
   listDensity: "comfortable" | "compact";
@@ -73,12 +75,12 @@ interface ToolbarProps {
   onOpenSettings: () => void;
   onPauseAll: () => void;
   onResumeAll: () => void;
+  onCancelAll: () => void;
 }
 
 export default function Toolbar(props: ToolbarProps) {
   const i18n = useI18n();
   const isNarrow = useIsNarrowScreen();
-  const [searchExpanded, setSearchExpanded] = createSignal(false);
 
   return (
     <div
@@ -87,7 +89,10 @@ export default function Toolbar(props: ToolbarProps) {
         height: "56px",
         padding: isNarrow() ? "0 8px" : "0 16px",
         "border-bottom": "1px solid var(--color-border-subtle)",
+        "box-shadow": "var(--shadow-inset-top)",
         gap: "8px",
+        position: "relative",
+        "z-index": "2",
       }}
     >
       {props.isMultiSelectMode ? (
@@ -145,6 +150,19 @@ export default function Toolbar(props: ToolbarProps) {
           </Button>
 
           <Button
+            variant="ghost"
+            size="md"
+            onClick={props.onCancelSelected}
+            aria-label={i18n.t("toolbar.cancel") as string}
+            title={i18n.t("toolbar.cancel") as string}
+          >
+            <CancelIcon />
+            <Show when={!isNarrow()}>
+              <span>{i18n.t("toolbar.cancel")}</span>
+            </Show>
+          </Button>
+
+          <Button
             variant="danger"
             size="md"
             onClick={props.onDeleteSelected}
@@ -186,11 +204,18 @@ export default function Toolbar(props: ToolbarProps) {
             </Show>
           </Button>
 
-          <div class="relative flex flex-col gap-2 min-w-0 flex-1 max-w-[360px]">
-            <div class="relative">
+          <div class="relative flex items-center gap-2 min-w-0 flex-1">
+            <div class="relative flex-1 min-w-0" style={{ "max-width": "420px" }}>
               <div
-                class="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                style={{ color: "var(--color-text-tertiary)" }}
+                class="absolute pointer-events-none flex items-center justify-center"
+                style={{
+                  left: "10px",
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  width: "16px",
+                  height: "16px",
+                  color: "var(--color-text-tertiary)",
+                }}
               >
                 <SearchIcon />
               </div>
@@ -201,49 +226,55 @@ export default function Toolbar(props: ToolbarProps) {
                 onInput={(e) => props.onSearchChange(e.currentTarget.value)}
                 class="input"
                 style={{
-                  "padding-left": "36px",
-                  width: isNarrow() ? "100%" : searchExpanded() ? "320px" : "280px",
-                  "font-size": "14px",
-                  transition:
-                    "width var(--duration-normal) var(--ease-standard)",
-                }}
-                onFocus={() => {
-                  setSearchExpanded(true);
-                }}
-                onBlur={() => {
-                  if (!props.searchQuery) {
-                    setSearchExpanded(false);
-                  }
+                  width: "100%",
+                  height: "34px",
+                  "padding-left": "34px",
+                  "padding-right": "12px",
+                  "padding-top": "0",
+                  "padding-bottom": "0",
+                  "font-size": "13px",
+                  "line-height": "34px",
                 }}
               />
             </div>
 
             <Show when={props.filters.length > 0}>
-              <div class="flex items-center gap-2 flex-wrap">
+              <div class="flex items-center gap-1.5 flex-shrink min-w-0 overflow-hidden">
                 <For each={props.filters}>
                   {(filter) => (
                     <div
-                      class="flex items-center gap-1"
+                      class="flex items-center gap-1 flex-shrink-0"
                       style={{
                         padding: "2px 8px",
-                        "border-radius": "4px",
-                        "font-size": "12px",
+                        height: "22px",
+                        "border-radius": "11px",
+                        "font-size": "11px",
+                        "font-weight": 500,
                         background: "var(--color-bg-hover)",
                         border: `1px solid ${getFilterBorderColor(filter.type)}`,
                         color: getFilterColor(filter.type),
+                        "white-space": "nowrap",
                       }}
                     >
-                      <span>{filter.raw}</span>
+                      <span
+                        style={{
+                          "max-width": "120px",
+                          overflow: "hidden",
+                          "text-overflow": "ellipsis",
+                        }}
+                      >
+                        {filter.raw}
+                      </span>
                       <button
                         class="flex items-center justify-center"
                         style={{
-                          width: "14px",
-                          height: "14px",
+                          width: "12px",
+                          height: "12px",
                           background: "none",
                           border: "none",
                           cursor: "pointer",
                           color: "inherit",
-                          opacity: 0.7,
+                          opacity: 0.6,
                         }}
                         onClick={() => props.onRemoveFilter(filter.raw)}
                         aria-label={
@@ -281,6 +312,16 @@ export default function Toolbar(props: ToolbarProps) {
             onClick={props.onResumeAll}
           >
             <PlayIcon />
+          </Button>
+
+          <Button
+            variant="ghost"
+            shape="icon"
+            title={i18n.t("toolbar.cancelAll") as string}
+            aria-label={i18n.t("toolbar.cancelAll") as string}
+            onClick={props.onCancelAll}
+          >
+            <CancelIcon />
           </Button>
 
           <Button
