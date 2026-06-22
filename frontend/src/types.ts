@@ -26,6 +26,8 @@ export interface TaskInfo {
   errorReason?: string
   /** 任务级重试计数(保留字段,当前恒为 0) */
   retryCount?: number
+  /** HF 任务元数据(HuggingFace 模型下载任务特有) */
+  hfMeta?: HfTaskMeta
 }
 
 export interface DownloadConfig {
@@ -198,3 +200,79 @@ export interface AppInfo {
   version: string
   name: string
 }
+
+/** HF 模型元数据 — 与后端 HfModelInfo 对齐 */
+export interface HfModelInfo {
+  id: string
+  author?: string
+  sha: string
+  lastModified: string
+  tags: string[]
+  pipelineTag?: string
+  libraryName?: string
+  license?: string
+  downloads: number
+  likes: number
+  siblings: HubFileInfo[]
+  cardData?: HfCardData
+}
+
+/** Model card 摘要 — 与后端 HfCardData 对齐 */
+export interface HfCardData {
+  description?: string
+  language: string[]
+  datasets: string[]
+}
+
+/** 文件类型分类 — 与后端 FileCategory 对齐 */
+export type FileCategory = 'modelWeight' | 'config' | 'tokenizer' | 'code' | 'data' | 'document' | 'other'
+
+/** HF 任务元数据 — 与后端 HfTaskMeta 对齐 */
+export interface HfTaskMeta {
+  repoId: string
+  revision: string
+  filePath: string
+  lfsOid?: string
+}
+
+/** 本地模型记录 — 与后端 LocalModel 对齐 */
+export interface LocalModel {
+  repoId: string
+  revision: string
+  localPath: string
+  files: LocalModelFile[]
+  totalSize: number
+  downloadedAt?: string
+  metadata?: HfModelInfo
+}
+
+/** 本地模型文件 — 与后端 LocalModelFile 对齐 */
+export interface LocalModelFile {
+  path: string
+  localPath: string
+  size: number
+  category: FileCategory
+  lfsOid?: string
+  verifyStatus: VerifyStatus
+  exists: boolean
+}
+
+/** 校验状态 — 与后端 VerifyStatus 对齐 */
+export type VerifyStatus = 'unverified' | 'verified' | { failed: string }
+
+/** 文件校验结果 — 与后端 FileVerifyResult 对齐 */
+export interface FileVerifyResult {
+  path: string
+  status: VerifyStatus
+  elapsedMs: number
+}
+
+/** 收藏记录 — 与后端 ModelFavorite 对齐 */
+export interface ModelFavorite {
+  repoId: string
+  addedAt: string
+  cachedInfo?: HfModelInfo
+}
+
+/** 模型来源过滤器 */
+export type ModelSourceFilter = 'local' | 'remote' | 'favorite'

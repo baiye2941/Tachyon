@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 
@@ -73,6 +73,8 @@ export const api = {
   /** 创建下载任务 */
   createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string) =>
     invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName }),
+  /** 探测真实文件名(HEAD 请求获取 Content-Disposition / DHT 查询种子元数据) */
+  probeFilename: (url: string) => invoke<string>('probe_filename', { url }),
   /** 获取任务列表 */
   getTaskList: () => invoke<TaskInfo[]>('get_task_list'),
   /** 获取任务详情 */
@@ -110,4 +112,21 @@ export const api = {
   listRepoFiles: (repoId: string, revision?: string) => invoke<HubFileInfo[]>('list_repo_files', { repoId, revision }),
   /** 获取 HuggingFace 文件下载 URL */
   getHfDownloadUrl: (repoId: string, path: string, revision?: string) => invoke<string>('get_hf_download_url', { repoId, filePath: path, revision }),
+  /** 获取 HF 模型元数据 */
+  getModelInfo: (repoId: string, revision?: string) => invoke<HfModelInfo>('get_model_info', { repoId, revision }),
+  /** 搜索 HF 模型 */
+  searchModels: (query: string, limit?: number) => invoke<HfModelInfo[]>('search_models', { query, limit }),
+  /** 扫描本地模型 */
+  scanLocalModels: () => invoke<LocalModel[]>('scan_local_models'),
+  /** 校验模型文件完整性 */
+  verifyModel: (repoId: string, revision?: string) => invoke<FileVerifyResult[]>('verify_model', { repoId, revision }),
+  /** 列出收藏 */
+  listModelFavorites: () => invoke<ModelFavorite[]>('list_model_favorites'),
+  /** 添加收藏 */
+  addModelFavorite: (repoId: string) => invoke<void>('add_model_favorite', { repoId }),
+  /** 移除收藏 */
+  removeModelFavorite: (repoId: string) => invoke<void>('remove_model_favorite', { repoId }),
+  /** 批量创建 HF 下载任务 */
+  batchCreateHfTasks: (repoId: string, filePaths: string[], revision?: string, downloadDir?: string) =>
+    invoke<string[]>('batch_create_hf_tasks', { repoId, revision, filePaths, downloadDir }),
 }
