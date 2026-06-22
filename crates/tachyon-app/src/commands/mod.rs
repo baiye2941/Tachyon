@@ -707,7 +707,11 @@ pub(crate) mod tests {
             magnet: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
-        let favorites_store = Arc::new(tachyon_store::KvStore::open(tmp_store.path()).unwrap());
+        // favorites_store 必须使用独立临时目录,不能与 task_store 共用同一目录:
+        // KvStore::open 对每个目录加 OS 级排他锁(fs2::try_lock_exclusive),
+        // 同目录上第二次 open 会因锁冲突返回 WouldBlock。
+        let tmp_favorites = tempfile::tempdir().unwrap();
+        let favorites_store = Arc::new(tachyon_store::KvStore::open(tmp_favorites.path()).unwrap());
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
         let connection_pool = Arc::new(ConnectionPool::new(PoolConfig {
             max_per_host: 16,
