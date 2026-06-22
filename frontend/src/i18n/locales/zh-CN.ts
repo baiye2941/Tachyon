@@ -37,7 +37,7 @@ const zhCN = {
   "taskList.aria.selectTask": "选择任务：{name}",
   "taskList.unknownSize": "未知大小",
 
-  // —— 状态标签(共享:format.ts/getStatusLabel、stateMachine、History) ——
+  // —— 状态标签(共享:format.ts/getStatusLabel、History) ——
   "status.label.downloading": "下载中",
   "status.label.pending": "等待中",
   "status.label.paused": "已暂停",

@@ -151,7 +151,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
                 "border-radius": "10px",
                 border: "1px solid var(--color-border-subtle)",
                 background: "var(--color-bg-secondary)",
-                "box-shadow": "inset 0 1px 0 rgba(255,255,255,0.04)",
+                "box-shadow": "inset 0 1px 0 var(--color-bg-hover)",
                 "margin-bottom": "20px",
                 cursor: props.loading ? "not-allowed" : "pointer",
               }}

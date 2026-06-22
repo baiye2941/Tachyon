@@ -225,15 +225,7 @@ export default function TitleBar() {
         </button>
       </div>
 
-      {/* Bottom glow line */}
-      <div
-        class="absolute bottom-0 left-0 right-0 pointer-events-none"
-        style={{
-          height: '1px',
-          background: 'linear-gradient(90deg, transparent 0%, var(--color-accent-soft) 20%, var(--color-speed-soft) 80%, transparent 100%)',
-          opacity: 0.6,
-        }}
-      />
+      {/* 去 AI 味:原 violet→cyan 渐变 glow 线删除,subtle border 已足够分隔 */}
     </div>
   )
 }

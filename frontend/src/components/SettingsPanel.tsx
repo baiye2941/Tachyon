@@ -603,15 +603,18 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     style={{
                       width: "48px",
                       height: "48px",
-                      background:
-                        "linear-gradient(135deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)",
+                      /* 去 AI 味:135deg 渐变品牌块替换为实色 + inner highlight */
+                      background: "var(--color-accent-primary)",
                       "border-radius": "12px",
                       display: "flex",
                       "align-items": "center",
                       "justify-content": "center",
                       color: "var(--color-text-inverse)",
-                      "font-size": "24px",
+                      "font-family": "var(--font-mono)",
+                      "font-size": "22px",
                       "font-weight": 700,
+                      "box-shadow":
+                        "inset 0 1px 0 rgba(255,255,255,0.12), 0 1px 2px rgba(0,0,0,0.4)",
                     }}
                   >
                     T
