@@ -221,4 +221,8 @@ describe('Accessibility Tests', () => {
       const { container } = render(() => (
         <TaskItem task={mockTask} isSelected={false} isMultiSelected={false} isMultiSelectMode={false} onClick={() => {}} density="comfortable" />
       ))
-      const taskElement
+      const taskElement = container.querySelector('[role="button"]')!
+      expect(taskElement).toBeTruthy()
+    })
+  })
+})

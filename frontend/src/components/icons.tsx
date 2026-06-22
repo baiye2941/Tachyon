@@ -934,4 +934,21 @@ export const HubIcon = (props: { class?: string }) => (
     <path d="M2 17l10 5 10-5" />
     <path d="M2 12l10 5 10-5" />
   </svg>
+)
+
+/** 星形图标(收藏标记) */
+export const StarIcon = (props: { class?: string }) => (
+  <svg
+    class={props.class}
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+  </svg>
 );
