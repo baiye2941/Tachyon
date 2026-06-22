@@ -289,7 +289,7 @@ impl Default for DownloadConfig {
 }
 
 /// 磁力链接下载配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MagnetConfig {
     /// 元数据获取超时（秒），默认 120
@@ -583,6 +583,9 @@ pub struct ConfigPatch {
     pub max_concurrent_tasks: Option<u32>,
     pub download: Option<DownloadPatch>,
     pub connection: Option<ConnectionPatch>,
+    /// 磁力链接配置补丁
+    #[serde(default)]
+    pub magnet: Option<MagnetPatch>,
 }
 
 /// 下载配置白名单补丁
@@ -612,6 +615,38 @@ pub struct ConnectionPatch {
     pub enable_quic: Option<bool>,
 }
 
+/// 磁力链接配置白名单补丁
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagnetPatch {
+    pub metadata_timeout_secs: Option<u64>,
+    pub download_timeout_secs: Option<u64>,
+    pub enable_dht: Option<bool>,
+    pub enable_upnp: Option<bool>,
+    pub trackers: Option<Vec<String>>,
+}
+
+impl MagnetPatch {
+    /// 将磁力链接补丁应用到现有 MagnetConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut MagnetConfig) {
+        if let Some(v) = self.metadata_timeout_secs {
+            base.metadata_timeout_secs = v;
+        }
+        if let Some(v) = self.download_timeout_secs {
+            base.download_timeout_secs = v;
+        }
+        if let Some(v) = self.enable_dht {
+            base.enable_dht = v;
+        }
+        if let Some(v) = self.enable_upnp {
+            base.enable_upnp = v;
+        }
+        if let Some(v) = &self.trackers {
+            base.trackers = v.clone();
+        }
+    }
+}
+
 impl ConfigPatch {
     /// 将补丁应用到现有 AppConfig,仅更新 Some 字段,保留其余不变
     ///
@@ -626,6 +661,9 @@ impl ConfigPatch {
         }
         if let Some(patch) = &self.connection {
             patch.apply_to(&mut result.connection);
+        }
+        if let Some(patch) = &self.magnet {
+            patch.apply_to(&mut result.magnet);
         }
         result
     }
@@ -1408,6 +1446,100 @@ mod tests {
             config.metadata_timeout_secs
         );
     }
+
+    #[test]
+    fn test_magnet_patch_apply_to_overwrites_some_fields() {
+        let mut base = MagnetConfig::default();
+        base.enable_dht = true;
+        base.trackers = vec!["udp://old.example.com:1337/announce".to_string()];
+
+        let patch = MagnetPatch {
+            metadata_timeout_secs: Some(60),
+            download_timeout_secs: None,
+            enable_dht: Some(false),
+            enable_upnp: None,
+            trackers: Some(vec!["udp://new.example.com:1337/announce".to_string()]),
+        };
+        patch.apply_to(&mut base);
+
+        assert_eq!(base.metadata_timeout_secs, 60);
+        assert_eq!(base.download_timeout_secs, 0); // None -> 保留原值
+        assert!(!base.enable_dht);
+        assert!(base.enable_upnp); // None -> 保留原值
+        assert_eq!(base.trackers.len(), 1);
+        assert_eq!(base.trackers[0], "udp://new.example.com:1337/announce");
+    }
+
+    #[test]
+    fn test_magnet_patch_apply_to_preserves_all_on_none() {
+        let mut base = MagnetConfig::default();
+        base.metadata_timeout_secs = 200;
+        base.enable_dht = false;
+        base.trackers = vec!["udp://kept.example.com:1337/announce".to_string()];
+
+        let patch = MagnetPatch {
+            metadata_timeout_secs: None,
+            download_timeout_secs: None,
+            enable_dht: None,
+            enable_upnp: None,
+            trackers: None,
+        };
+        patch.apply_to(&mut base);
+
+        assert_eq!(base.metadata_timeout_secs, 200);
+        assert!(!base.enable_dht);
+        assert_eq!(base.trackers.len(), 1);
+    }
+
+    #[test]
+    fn test_config_patch_with_magnet_patch() {
+        let base = AppConfig::default();
+        assert!(base.magnet.trackers.is_empty());
+
+        let patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: None,
+            connection: None,
+            magnet: Some(MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: Some(false),
+                enable_upnp: None,
+                trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
+            }),
+        };
+        let result = patch.apply_to(&base);
+
+        assert!(!result.magnet.enable_dht);
+        assert_eq!(result.magnet.trackers.len(), 1);
+        // 其余字段不变
+        assert_eq!(result.max_concurrent_tasks, base.max_concurrent_tasks);
+        assert_eq!(result.download.download_dir, base.download.download_dir);
+    }
+
+    #[test]
+    fn test_magnet_patch_serialization_roundtrip() {
+        let patch = MagnetPatch {
+            metadata_timeout_secs: Some(60),
+            download_timeout_secs: Some(300),
+            enable_dht: Some(false),
+            enable_upnp: Some(true),
+            trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        let deserialized: MagnetPatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metadata_timeout_secs, Some(60));
+        assert_eq!(deserialized.enable_dht, Some(false));
+        assert_eq!(deserialized.trackers.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_magnet_patch_deserializes_partial() {
+        let json = r#"{"enableDht":false}"#;
+        let patch: MagnetPatch = serde_json::from_str(json).unwrap();
+        assert_eq!(patch.enable_dht, Some(false));
+        assert!(patch.trackers.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1533,6 +1665,7 @@ mod proptests {
                     io_strategy: None,
                 }),
                 connection: None,
+                magnet: None,
             };
 
             let patched = patch.apply_to(&base);

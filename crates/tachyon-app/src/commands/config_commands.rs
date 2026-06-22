@@ -635,6 +635,7 @@ mod tests {
                 enable_http2: None,
                 enable_quic,
             }),
+            magnet: None,
         }
     }
 
@@ -681,6 +682,7 @@ mod tests {
                 enable_http2: None,
                 enable_quic: Some(true),
             }),
+            magnet: None,
         };
         update_config_inner(&state, patch).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
@@ -711,6 +713,7 @@ mod tests {
                 io_strategy: None,
             }),
             connection: None,
+            magnet: None,
         };
         update_config_inner(&state, setup_patch).await.unwrap();
 
@@ -726,6 +729,7 @@ mod tests {
                 enable_http2: None,
                 enable_quic: Some(true),
             }),
+            magnet: None,
         };
         update_config_inner(&state, partial_patch).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
@@ -996,6 +1000,7 @@ mod tests {
             max_concurrent_tasks: None,
             download: None,
             connection: None,
+            magnet: None,
         };
         update_config_inner(&state, empty_patch).await.unwrap();
         let after = get_config_inner(&state).await.unwrap();
@@ -1036,6 +1041,7 @@ mod tests {
                 enable_http2: Some(false),
                 enable_quic: Some(true),
             }),
+            magnet: None,
         };
         let json = serde_json::to_string(&patch).unwrap();
         let deserialized: ConfigPatch = serde_json::from_str(&json).unwrap();
