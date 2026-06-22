@@ -23,6 +23,59 @@ pub struct HfFile {
     pub lfs: Option<HfLfsInfo>,
 }
 
+/// 模型卡片摘要数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HfCardData {
+    /// 模型描述
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 支持语言
+    #[serde(default)]
+    pub language: Vec<String>,
+    /// 关联数据集
+    #[serde(default)]
+    pub datasets: Vec<String>,
+}
+
+/// HuggingFace 模型元数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HfModelInfo {
+    /// 仓库 ID, 格式 "owner/repo"
+    pub id: String,
+    /// 作者
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// 当前 commit hash
+    pub sha: String,
+    /// 最后修改时间 (ISO 8601)
+    #[serde(default)]
+    pub last_modified: String,
+    /// 标签列表
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Pipeline 标签, 如 "text-classification"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_tag: Option<String>,
+    /// 框架名称, 如 "pytorch"/"transformers"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_name: Option<String>,
+    /// 许可证
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// 下载次数
+    #[serde(default)]
+    pub downloads: u64,
+    /// 点赞数
+    #[serde(default)]
+    pub likes: u64,
+    /// 文件列表
+    #[serde(default)]
+    pub siblings: Vec<HfFile>,
+    /// 模型卡片摘要
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_data: Option<HfCardData>,
+}
+
 /// LFS 对象信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfLfsInfo {
@@ -124,6 +177,73 @@ impl HubApi {
     pub fn download_url(&self, repo_id: &str, revision: &str, file_path: &str) -> String {
         lfs::build_resolve_url(&self.endpoint, repo_id, revision, file_path)
     }
+
+    /// 获取模型元数据
+    ///
+    /// GET {endpoint}/api/models/{repo_id}
+    pub async fn model_info(&self, repo_id: &str, revision: &str) -> DownloadResult<HfModelInfo> {
+        let mut url = format!("{}/api/models/{repo_id}", self.endpoint);
+        if revision != "main" {
+            url = format!("{url}?revision={revision}");
+        }
+        tracing::info!(url = %url, repo_id = %repo_id, "获取 HF 模型元数据");
+
+        let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
+        let auth;
+        if let Some(ref token) = self.token {
+            auth = format!("Bearer {token}");
+            headers.push(("Authorization", &auth));
+        }
+
+        let body = self.http.get_text(&url, &headers).await?;
+        let info: HfModelInfo =
+            serde_json::from_str(&body).map_err(tachyon_core::DownloadError::Serialization)?;
+
+        tracing::info!(repo_id = %repo_id, "获取模型元数据成功");
+        Ok(info)
+    }
+
+    /// 搜索模型
+    ///
+    /// GET {endpoint}/api/models?search={query}&limit={limit}
+    pub async fn search_models(&self, query: &str, limit: u32) -> DownloadResult<Vec<HfModelInfo>> {
+        let encoded = urlencoding::encode(query);
+        let url = format!("{}/api/models?search={encoded}&limit={limit}", self.endpoint);
+        tracing::info!(url = %url, query = %query, "搜索 HF 模型");
+
+        let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
+        let auth;
+        if let Some(ref token) = self.token {
+            auth = format!("Bearer {token}");
+            headers.push(("Authorization", &auth));
+        }
+
+        let body = self.http.get_text(&url, &headers).await?;
+        let models: Vec<HfModelInfo> =
+            serde_json::from_str(&body).map_err(tachyon_core::DownloadError::Serialization)?;
+
+        tracing::info!(count = models.len(), query = %query, "搜索模型成功");
+        Ok(models)
+    }
+
+    // 以下辅助方法仅供测试使用,用于验证 URL 构建逻辑
+
+    /// 构建 model_info URL (测试用)
+    #[cfg(test)]
+    fn model_info_url(&self, repo_id: &str, revision: &str) -> String {
+        let mut url = format!("{}/api/models/{repo_id}", self.endpoint);
+        if revision != "main" {
+            url = format!("{url}?revision={revision}");
+        }
+        url
+    }
+
+    /// 构建 search_models URL (测试用)
+    #[cfg(test)]
+    fn search_models_url(&self, query: &str, limit: u32) -> String {
+        let encoded = urlencoding::encode(query);
+        format!("{}/api/models?search={encoded}&limit={limit}", self.endpoint)
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +335,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ====== model_info / search_models URL 构建测试 ======
+
+    /// M-17: model_info URL 构建 (main revision)
+    #[test]
+    fn test_model_info_url_main() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
+        let url = api.model_info_url("bert-base-uncased", "main");
+        assert_eq!(url, "https://huggingface.co/api/models/bert-base-uncased");
+    }
+
+    /// M-17: model_info URL 构建 (非 main revision)
+    #[test]
+    fn test_model_info_url_revision() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
+        let url = api.model_info_url("gpt2", "v1.0");
+        assert_eq!(url, "https://huggingface.co/api/models/gpt2?revision=v1.0");
+    }
+
+    /// M-17: search_models URL 构建
+    #[test]
+    fn test_search_models_url() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
+        let url = api.search_models_url("bert", 10);
+        assert_eq!(url, "https://huggingface.co/api/models?search=bert&limit=10");
+    }
+
+    /// M-17: search_models URL 编码特殊字符
+    #[test]
+    fn test_search_models_url_encoding() {
+        let api = HubApi::with_endpoint("https://huggingface.co".to_string()).unwrap();
+        let url = api.search_models_url("bert base", 5);
+        assert_eq!(url, "https://huggingface.co/api/models?search=bert%20base&limit=5");
+    }
+
+    // ====== HfModelInfo / HfCardData 反序列化测试 ======
+
+    /// M-17: HfModelInfo 完整字段反序列化
+    #[test]
+    fn test_model_info_deserialization_full() {
+        let json = r#"{
+            "id": "org/model",
+            "author": "test-author",
+            "sha": "abc123def456",
+            "last_modified": "2024-01-15T08:30:00Z",
+            "tags": ["transformers", "pytorch"],
+            "pipeline_tag": "text-classification",
+            "library_name": "transformers",
+            "license": "apache-2.0",
+            "downloads": 12345,
+            "likes": 678,
+            "siblings": [
+                {"type": "file", "path": "config.json", "size": 1234, "lfs": null}
+            ],
+            "card_data": {
+                "description": "A test model",
+                "language": ["en"],
+                "datasets": ["dataset1"]
+            }
+        }"#;
+
+        let info: HfModelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "org/model");
+        assert_eq!(info.author.as_deref(), Some("test-author"));
+        assert_eq!(info.sha, "abc123def456");
+        assert_eq!(info.last_modified, "2024-01-15T08:30:00Z");
+        assert_eq!(info.tags, vec!["transformers", "pytorch"]);
+        assert_eq!(info.pipeline_tag.as_deref(), Some("text-classification"));
+        assert_eq!(info.library_name.as_deref(), Some("transformers"));
+        assert_eq!(info.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(info.downloads, 12345);
+        assert_eq!(info.likes, 678);
+        assert_eq!(info.siblings.len(), 1);
+        assert_eq!(info.siblings[0].path, "config.json");
+        assert!(info.card_data.is_some());
+        let card = info.card_data.unwrap();
+        assert_eq!(card.description.as_deref(), Some("A test model"));
+        assert_eq!(card.language, vec!["en"]);
+        assert_eq!(card.datasets, vec!["dataset1"]);
+    }
+
+    /// M-17: HfModelInfo 最小字段反序列化 (缺失可选字段)
+    #[test]
+    fn test_model_info_deserialization_minimal() {
+        let json = r#"{"id": "minimal/model", "sha": "abc123"}"#;
+        let info: HfModelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "minimal/model");
+        assert_eq!(info.sha, "abc123");
+        assert!(info.author.is_none());
+        assert!(info.last_modified.is_empty());
+        assert!(info.tags.is_empty());
+        assert!(info.pipeline_tag.is_none());
+        assert!(info.library_name.is_none());
+        assert!(info.license.is_none());
+        assert_eq!(info.downloads, 0);
+        assert_eq!(info.likes, 0);
+        assert!(info.siblings.is_empty());
+        assert!(info.card_data.is_none());
+    }
+
+    /// M-17: HfModelInfo 数组反序列化 (搜索接口返回)
+    #[test]
+    fn test_model_info_array_deserialization() {
+        let json = r#"[
+            {"id": "model/1", "sha": "sha1"},
+            {"id": "model/2", "sha": "sha2", "downloads": 100}
+        ]"#;
+        let models: Vec<HfModelInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "model/1");
+        assert_eq!(models[1].id, "model/2");
+        assert_eq!(models[1].downloads, 100);
+    }
+
+    /// M-17: HfCardData 反序列化 (空对象)
+    #[test]
+    fn test_card_data_deserialization_empty() {
+        let json = r#"{}"#;
+        let card: HfCardData = serde_json::from_str(json).unwrap();
+        assert!(card.description.is_none());
+        assert!(card.language.is_empty());
+        assert!(card.datasets.is_empty());
     }
 }
