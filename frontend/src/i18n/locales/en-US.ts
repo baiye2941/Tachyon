@@ -343,6 +343,21 @@ const enUS = {
   "settings.about.version": "Version 0.1.0 · Rust + Tauri",
   "settings.about.tagline":
     "High-performance multi-threaded download accelerator",
+  "settings.tab.magnet": "Magnet",
+  "settings.magnet.enableDht": "Enable DHT protocol",
+  "settings.magnet.enableUpnp": "Enable UPnP port forwarding",
+  "settings.magnet.trackerList": "Tracker server list",
+  "settings.magnet.trackerCount": "{n} trackers",
+  "settings.magnet.addTracker": "Add",
+  "settings.magnet.addTrackerPlaceholder": "udp://tracker.example.com:port/announce",
+  "settings.magnet.removeTracker": "Remove",
+  "settings.magnet.importPreset": "Import presets",
+  "settings.magnet.clearAll": "Clear all",
+  "settings.magnet.invalidUrl": "Invalid URL format",
+  "settings.magnet.duplicateUrl": "Tracker already exists",
+  "settings.magnet.importSuccess": "Imported {n} trackers",
+  "settings.magnet.clearConfirm": "Clear all trackers?",
+  "toast.magnetSessionSwapFailed": "BtSession hot-swap failed, changes will apply after restart",
   "settings.save": "Save",
 
   // —— History panel ——
