@@ -298,10 +298,33 @@ pub struct MagnetConfig {
     /// 下载超时（秒），默认 0（不限）
     #[serde(default)]
     pub download_timeout_secs: u64,
+    /// 是否启用 DHT 协议（默认启用）
+    ///
+    /// DHT（分布式哈希表）是 BitTorrent 的去中心化节点发现协议，
+    /// 启用后可脱离 tracker 发现 peer，显著提升磁力链接解析速度。
+    #[serde(default = "default_true")]
+    pub enable_dht: bool,
+    /// 是否启用 UPnP 端口转发（默认启用）
+    ///
+    /// UPnP 可自动在路由器上开放监听端口，允许入站 peer 连接，加速下载。
+    #[serde(default = "default_true")]
+    pub enable_upnp: bool,
+    /// 全局 tracker 服务器列表
+    ///
+    /// 这些 tracker 会附加到每个磁力链接的 tracker 列表中，
+    /// 即使磁力链接本身不包含 tracker 也能快速发现 peer。
+    /// 格式：`udp://host:port/announce` 或 `http://host:port/announce`
+    #[serde(default)]
+    pub trackers: Vec<String>,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
     120
+}
+
+/// 布尔默认值 true 的辅助函数（serde default 不支持直接写 true）
+fn default_true() -> bool {
+    true
 }
 
 impl Default for MagnetConfig {
@@ -309,6 +332,9 @@ impl Default for MagnetConfig {
         Self {
             metadata_timeout_secs: 120,
             download_timeout_secs: 0,
+            enable_dht: true,
+            enable_upnp: true,
+            trackers: Vec::new(),
         }
     }
 }
@@ -1343,6 +1369,9 @@ mod tests {
         let config = MagnetConfig::default();
         assert_eq!(config.metadata_timeout_secs, 120);
         assert_eq!(config.download_timeout_secs, 0);
+        assert!(config.enable_dht, "DHT 应默认启用");
+        assert!(config.enable_upnp, "UPnP 应默认启用");
+        assert!(config.trackers.is_empty(), "默认 tracker 列表应为空");
     }
 
     #[test]
@@ -1356,6 +1385,17 @@ mod tests {
         let mut config = MagnetConfig::default();
         config.metadata_timeout_secs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_config_with_trackers() {
+        let mut config = MagnetConfig::default();
+        config.trackers = vec![
+            "udp://tracker.opentrackr.org:1337/announce".to_string(),
+            "https://tracker.lilithraws.org:443/announce".to_string(),
+        ];
+        assert!(config.validate().is_ok());
+        assert_eq!(config.trackers.len(), 2);
     }
 
     #[test]

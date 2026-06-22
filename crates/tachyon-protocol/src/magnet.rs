@@ -59,12 +59,12 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
         )));
     }
 
-    // 查找 xt=urn:btih: 参数
-    let xt_prefix = "xt=urn:btih:";
+    // 查找 xt=urn:btih: 参数（大小写不敏感）
     let has_valid_xt = uri[8..] // 跳过 "magnet:?"
         .split('&')
         .any(|param| {
-            if let Some(hash) = param.strip_prefix(xt_prefix) {
+            let lower = param.to_ascii_lowercase();
+            if let Some(hash) = lower.strip_prefix("xt=urn:btih:") {
                 // info_hash 必须非空
                 // 合法格式: 40 位十六进制(SHA1) 或 32 位 Base32
                 !hash.is_empty()
@@ -348,5 +348,39 @@ mod tests {
     fn test_magnet_protocol_new() {
         // 仅验证构造函数，不启动真实 Session
         // 真实 Session 创建需要异步环境和网络，在 e2e 测试中验证
+    }
+
+    /// 验证磁力链接中 urn:btih 大小写不敏感
+    ///
+    /// 实际磁力链接可能使用大写 BTIH（如 xt=urn:BTIH:...），
+    /// validate_magnet_uri 应接受任意大小写组合。
+    #[test]
+    fn test_validate_magnet_uri_btih_case_insensitive() {
+        let uri_upper = "magnet:?xt=urn:BTIH:0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            validate_magnet_uri(uri_upper).is_ok(),
+            "大写 BTIH 应被接受: {:?}",
+            validate_magnet_uri(uri_upper)
+        );
+
+        let uri_mixed = "magnet:?xt=urn:BtIh:0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            validate_magnet_uri(uri_mixed).is_ok(),
+            "混合大小写 BtIh 应被接受: {:?}",
+            validate_magnet_uri(uri_mixed)
+        );
+    }
+
+    /// 验证磁力链接中 info hash 大小写不敏感
+    ///
+    /// info hash 可能是大写十六进制（如 ABCDEF...），应被接受。
+    #[test]
+    fn test_validate_magnet_uri_hash_uppercase() {
+        let uri = "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        assert!(
+            validate_magnet_uri(uri).is_ok(),
+            "大写 info hash 应被接受: {:?}",
+            validate_magnet_uri(uri)
+        );
     }
 }

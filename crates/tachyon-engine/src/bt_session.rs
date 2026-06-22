@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use librqbit::Session;
+use librqbit::{Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
 
 /// BitTorrent Session 单例
@@ -23,14 +23,33 @@ impl BtSession {
     /// 创建 BitTorrent Session
     ///
     /// `download_dir` 为默认下载输出目录。
-    /// Session 内部管理 DHT、Peer 连接、Piece 下载等生命周期。
+    /// 根据 MagnetConfig 配置 DHT、UPnP、全局 tracker 等选项。
+    ///
+    /// # DHT 持久化
+    ///
+    /// librqbit 默认启用 DHT 持久化（`disable_dht_persistence: false`），
+    /// 会自动在默认位置存储 DHT 节点信息，重启时复用已知节点加速 bootstrap。
     pub async fn new(
         download_dir: PathBuf,
         config: MagnetConfig,
     ) -> tachyon_core::DownloadResult<Self> {
-        let session = Session::new(download_dir.clone()).await.map_err(|e| {
-            tachyon_core::DownloadError::Config(format!("创建 BitTorrent Session 失败: {e}"))
-        })?;
+        let mut opts = SessionOptions::default();
+        opts.disable_dht = !config.enable_dht;
+        opts.enable_upnp_port_forwarding = config.enable_upnp;
+
+        // 全局 tracker: 附加到每个磁力链接的 tracker 列表，
+        // 即使磁力链接本身不包含 tracker 也能快速发现 peer。
+        for tracker_url in &config.trackers {
+            if let Ok(url) = url::Url::parse(tracker_url) {
+                opts.trackers.insert(url);
+            }
+        }
+
+        let session = Session::new_with_opts(download_dir.clone(), opts)
+            .await
+            .map_err(|e| {
+                tachyon_core::DownloadError::Config(format!("创建 BitTorrent Session 失败: {e}"))
+            })?;
 
         Ok(Self {
             inner: session,
