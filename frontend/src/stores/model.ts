@@ -66,7 +66,7 @@ export async function searchRemoteModels(query: string) {
   try {
     if (isRepoId(query)) {
       const info = await api.getModelInfo(query)
-      setRemoteModels([info])
+      setRemoteModels(info ? [info] : [])
     } else {
       const results = await api.searchModels(query)
       setRemoteModels(results)
@@ -152,5 +152,5 @@ export function toggleFileSelection(filePath: string) {
 }
 
 export function clearFileSelection() {
-  setSelectedFilePaths(new Set())
+  setSelectedFilePaths(new Set<string>())
 }

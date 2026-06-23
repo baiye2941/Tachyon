@@ -27,7 +27,7 @@ export function parseHfUrl(url: string): HfUrlParseResult | null {
     let revision: string | null = null
 
     if (pathParts.length >= 4 && (pathParts[2] === 'tree' || pathParts[2] === 'resolve')) {
-      revision = pathParts[3]
+      revision = pathParts[3] ?? null
     }
 
     return { repoId, revision }
@@ -42,5 +42,5 @@ export function parseHfUrl(url: string): HfUrlParseResult | null {
  */
 export function isRepoId(input: string): boolean {
   const parts = input.split('/')
-  return parts.length === 2 && parts[0].length > 0 && parts[1].length > 0
+  return parts.length === 2 && (parts[0]?.length ?? 0) > 0 && (parts[1]?.length ?? 0) > 0
 }

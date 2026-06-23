@@ -70,7 +70,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       setHfPreview(null);
       return;
     }
-    const url = urls[0];
+    const url = urls[0]!;
     const parsed = parseHfUrl(url);
     if (!parsed) {
       setHfPreview(null);
@@ -419,17 +419,17 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               style={{
                 padding: "12px",
                 background: "var(--color-accent-soft)",
-                borderRadius: "8px",
+                "border-radius": "8px",
                 border: "1px solid var(--color-accent-primary)",
-                marginTop: "8px",
+                "margin-top": "8px",
               }}
             >
-              <div style={{ fontWeight: 500 }}>
+              <div style={{ "font-weight": 500 }}>
                 {tr("hub.newTask.hfPreview")}: {hfPreview()?.id}
               </div>
               <div
                 style={{
-                  fontSize: "13px",
+                  "font-size": "13px",
                   color: "var(--color-text-secondary)",
                 }}
               >
@@ -446,14 +446,14 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                 style={{
                   display: "flex",
                   gap: "8px",
-                  marginTop: "8px",
+                  "margin-top": "8px",
                 }}
               >
                 <Button onClick={handleHfFullDownload}>
                   {tr("hub.action.downloadAll")}
                 </Button>
                 <Button
-                  variant="outline"
+                  variant="secondary"
                   onClick={handleOpenInModelLibrary}
                 >
                   {tr("hub.action.openInModelLibrary")} →
