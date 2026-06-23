@@ -4,8 +4,6 @@ import {
   Show,
   createMemo,
   createEffect,
-  Switch,
-  Match,
 } from 'solid-js'
 import type {
   HfModelInfo,
@@ -25,9 +23,6 @@ import { formatSize } from '../utils/format'
 import { SearchIcon } from './icons'
 import Button from '../shared/ui/Button'
 import ModelDetail from './ModelDetail'
-import { addToast } from '../stores/toast'
-import { api } from '../api/invoke'
-import { refreshTaskList } from '../stores/downloads'
 
 interface ModelCard {
   id: string
@@ -83,7 +78,6 @@ function buildModelCard(
 
 export default function ModelLibrary() {
   // Local state
-  const [searchQuery, setSearchQuery] = createSignal('')
   const [searchInput, setSearchInput] = createSignal('')
   const [debouncedQuery, setDebouncedQuery] = createSignal('')
   let searchTimer: ReturnType<typeof setTimeout> | undefined
@@ -164,28 +158,6 @@ export default function ModelLibrary() {
   const handleSearch = () => {
     if (sourceFilter() === 'remote') {
       void searchRemoteModels(debouncedQuery() || '')
-    }
-  }
-
-  // Quick download all files for a model
-  const handleQuickDownload = async (repoId: string) => {
-    try {
-      const info = await api.getModelInfo(repoId)
-      if (!info || !info.siblings || info.siblings.length === 0) {
-        addToast(tr('toast.hubNoWeights'), 'error')
-        return
-      }
-      const weightExts = ['.safetensors', '.gguf', '.bin', '.pt', '.pth']
-      const weights = info.siblings.filter((f) =>
-        weightExts.some((ext) => f.path.toLowerCase().endsWith(ext)),
-      )
-      const toDownload = weights.length > 0 ? weights : info.siblings.slice(0, 5)
-      const paths = toDownload.map((f) => f.path)
-      await api.batchCreateHfTasks(repoId, paths)
-      addToast(tr('hub.batch.created', { count: paths.length }), 'success')
-      refreshTaskList()
-    } catch (e) {
-      addToast(tr('hub.batch.failed', { error: String(e) }), 'error')
     }
   }
 
@@ -424,7 +396,7 @@ export default function ModelLibrary() {
         {/* Right panel: ModelDetail */}
         <div style={{ width: '40%', 'min-width': 0, overflow: 'hidden' }}>
           <ModelDetail
-            model={selectedModel() as any}
+            model={selectedModel()}
             source={sourceFilter()}
             onClose={() => {
               setSelectedModelId(null)

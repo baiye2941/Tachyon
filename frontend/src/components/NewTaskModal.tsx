@@ -33,7 +33,6 @@ export default function NewTaskModal(props: NewTaskModalProps) {
 
   // ── HuggingFace 预览 ──────────────────────────────────
   const [hfPreview, setHfPreview] = createSignal<HfModelInfo | null>(null);
-  const [hfLoading, setHfLoading] = createSignal(false);
   let hfDebounceTimer: number | undefined;
 
   // ── 探测真实文件名 ──────────────────────────────────
@@ -79,15 +78,12 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     if (hfDebounceTimer) {
       window.clearTimeout(hfDebounceTimer);
     }
-    setHfLoading(true);
     hfDebounceTimer = window.setTimeout(async () => {
       try {
         const info = await getModelInfo(parsed.repoId, parsed.revision ?? undefined);
         setHfPreview(info);
       } catch {
         setHfPreview(null);
-      } finally {
-        setHfLoading(false);
       }
     }, 300);
   });

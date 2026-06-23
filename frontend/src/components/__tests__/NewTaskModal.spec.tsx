@@ -41,8 +41,7 @@ describe("NewTaskModal", () => {
     fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
 
     const fileNameInput = await screen.findByLabelText("重命名(可选)");
-    expect(fileNameInput).toHaveAttribute(
-      "placeholder",
+    expect((fileNameInput as HTMLInputElement).placeholder).toBe(
       "magnet-WFL25E2HOBS656ZRTF7JX3HWFWVCURZ5",
     );
   });

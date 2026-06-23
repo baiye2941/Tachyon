@@ -86,7 +86,7 @@ export async function loadFavorites() {
     const favs = await api.listModelFavorites()
     setFavorites(favs)
     return favs
-  } catch (e) {
+  } catch {
     return []
   }
 }
@@ -121,7 +121,7 @@ export async function verifyModel(repoId: string, revision?: string) {
     }
     setVerifyResults(map)
     return results
-  } catch (e) {
+  } catch {
     return []
   } finally {
     setVerifying(false)

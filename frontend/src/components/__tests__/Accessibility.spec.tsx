@@ -34,30 +34,6 @@ const expectElement = <T extends Element>(element: T | null): T => {
   return element as T
 }
 
-const readCssToken = (name: string) => {
-  const match = indexCss.match(new RegExp(`${name}:\s*([^;]+);`))
-  expect(match, `missing CSS token ${name}`).not.toBeNull()
-  return match![1].trim()
-}
-
-const relativeLuminance = (hex: string) => {
-  const value = hex.replace('#', '')
-  expect(value).toMatch(/^[0-9a-fA-F]{6}$/)
-  const channels = [0, 2, 4].map((start) => parseInt(value.slice(start, start + 2), 16) / 255)
-  const linear = channels.map((channel) =>
-    channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
-  )
-  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-}
-
-const contrastRatio = (foreground: string, background: string) => {
-  const fg = relativeLuminance(foreground)
-  const bg = relativeLuminance(background)
-  const lighter = Math.max(fg, bg)
-  const darker = Math.min(fg, bg)
-  return (lighter + 0.05) / (darker + 0.05)
-}
-
 describe('Accessibility Tests', () => {
   const mockTask: TaskInfo = {
     id: 'test-1',

@@ -299,7 +299,7 @@ export default function ModelDetail(props: ModelDetailProps) {
                 style={{
                   'font-size': '12px',
                   color: 'var(--color-text-secondary)',
-                  'line-height': 1.5,
+                  'line-height': '1.5',
                   'margin-bottom': '12px',
                 }}
               >
