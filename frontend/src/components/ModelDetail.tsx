@@ -68,7 +68,7 @@ function extractFiles(model: unknown) {
 
   // HfModelInfo: siblings 是 HubFileInfo[]
   if ('siblings' in model) {
-    return (model as HfModelInfo).siblings.map((f) => ({
+    return ((model as HfModelInfo).siblings ?? []).map((f) => ({
       type: f.type,
       path: f.path,
       size: f.size,
@@ -80,7 +80,7 @@ function extractFiles(model: unknown) {
   if ('cachedInfo' in model && (model as ModelFavorite).cachedInfo) {
     const info = (model as ModelFavorite).cachedInfo
     if (info) {
-      return info.siblings.map((f) => ({
+      return (info.siblings ?? []).map((f) => ({
         type: f.type,
         path: f.path,
         size: f.size,

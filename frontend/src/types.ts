@@ -213,7 +213,7 @@ export interface HfModelInfo {
   license?: string
   downloads: number
   likes: number
-  siblings: HubFileInfo[]
+  siblings?: HubFileInfo[]
   cardData?: HfCardData
 }
 

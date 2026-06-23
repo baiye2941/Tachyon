@@ -259,7 +259,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // ── HF 预览辅助函数 ──────────────────────────────────
   function formatTotalSize(info: HfModelInfo | null): string {
     if (!info) return "--";
-    const totalBytes = info.siblings.reduce((sum, f) => sum + (f.type !== "directory" ? f.size : 0), 0);
+    const files = info.siblings ?? []
+    const totalBytes = files.reduce((sum, f) => sum + (f.type !== "directory" ? f.size : 0), 0);
     if (totalBytes < 1024) return `${totalBytes} B`;
     if (totalBytes < 1024 * 1024) return `${(totalBytes / 1024).toFixed(1)} KB`;
     if (totalBytes < 1024 * 1024 * 1024) return `${(totalBytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -269,7 +270,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   function handleHfFullDownload() {
     const preview = hfPreview();
     if (!preview) return;
-    const files = preview.siblings.filter((f) => f.type !== "directory").map((f) => f.path);
+    const files = (preview.siblings ?? []).filter((f) => f.type !== "directory").map((f) => f.path);
     batchDownload(preview.id, files, preview.sha ?? "main");
     $ui.closeNewTaskModal();
   }
@@ -434,8 +435,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               >
                 {tr("hub.newTask.hfPreviewInfo", {
                   files:
-                    hfPreview()?.siblings.filter((f) => f.type !== "directory")
-                      .length ?? 0,
+                    (hfPreview()?.siblings ?? []).filter((f) => f.type !== "directory")
+                      .length,
                   size: formatTotalSize(hfPreview()),
                   framework: hfPreview()?.libraryName ?? "--",
                   license: hfPreview()?.license ?? "--",
