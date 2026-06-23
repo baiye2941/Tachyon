@@ -21,6 +21,10 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: "127.0.0.1",
+    watch: {
+      usePolling: true,
+      interval: 300,
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

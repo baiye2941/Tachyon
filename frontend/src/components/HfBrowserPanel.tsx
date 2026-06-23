@@ -272,7 +272,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
   /** 智能选择:GGUF 优先 Q4_K_M,safetensors 全选 */
   const smartSelect = () => {
-    const modelFiles = repoFiles().filter(
+    const modelFiles = (repoFiles() ?? []).filter(
       (f: HubFileInfo) => f.type !== 'directory' && isModelWeight(f.path),
     )
     if (modelFiles.length === 0) {
@@ -299,10 +299,10 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   }
 
   const selectedFiles = createMemo(() =>
-    repoFiles().filter((f: HubFileInfo) => selectedPaths().has(f.path)),
+    (repoFiles() ?? []).filter((f: HubFileInfo) => selectedPaths().has(f.path)),
   )
   const selectedSize = createMemo(() =>
-    selectedFiles().reduce((s: number, f: HubFileInfo) => s + f.size, 0),
+    (selectedFiles() ?? []).reduce((s: number, f: HubFileInfo) => s + f.size, 0),
   )
 
   /**
@@ -350,15 +350,15 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     }
   }
 
-  const repoFiles = () => $hub.repoFiles()
+  const repoFiles = () => $hub.repoFiles() ?? []
   const loading = () => $hub.loading()
   const error = () => $hub.error()
   // DI-2:tree memo 化,仅 repoFiles 变化时重建(勾选/筛选不触发树重算)
-  const tree = createMemo(() => buildTree(repoFiles()))
-  const fileCount = () => repoFiles().filter((f: HubFileInfo) => f.type !== 'directory').length
+  const tree = createMemo(() => buildTree(repoFiles() ?? []))
+  const fileCount = () => (repoFiles() ?? []).filter((f: HubFileInfo) => f.type !== 'directory').length
 
   // DI-5:筛选 + 类型计数
-  const counts = createMemo(() => countByType(repoFiles()))
+  const counts = createMemo(() => countByType(repoFiles() ?? []))
   // 搜索 debounce 150ms(实时筛选响应)
   const [search, setSearch] = createSignal('')
   let searchTimer: ReturnType<typeof setTimeout> | undefined
@@ -372,7 +372,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     const f = filter()
     if (f === 'all' && !q) return null // null 表示无筛选,全部匹配
     const set = new Set<string>()
-    for (const file of repoFiles()) {
+    for (const file of (repoFiles() ?? [])) {
       if (matchesFilter(file, f, q)) set.add(file.path)
     }
     return set
@@ -501,7 +501,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           </Show>
 
           {/* 文件树 */}
-          <Show when={!loading() && !error() && browsed() && repoFiles().length > 0}>
+          <Show when={!loading() && !error() && browsed() && (repoFiles() ?? []).length > 0}>
             {/* DI-5:筛选条 + 类型计数(radiogroup 语义) */}
             <div role="radiogroup" aria-label={tr("hub.aria.filterType")} class="flex items-center gap-1 flex-wrap" style={{ 'margin-bottom': '8px', padding: '4px 8px' }}>
               <For each={filterTabs}>
@@ -571,7 +571,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           </Show>
 
           {/* 空仓库 */}
-          <Show when={!loading() && !error() && browsed() && repoFiles().length === 0}>
+          <Show when={!loading() && !error() && browsed() && (repoFiles() ?? []).length === 0}>
             <div class="flex flex-col items-center justify-center gap-3" style={{ padding: '60px 20px' }}>
               <div style={{ 'font-size': '14px', color: 'var(--color-text-tertiary)' }}>
                 {tr("hub.emptyRepo")}

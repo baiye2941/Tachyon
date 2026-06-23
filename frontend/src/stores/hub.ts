@@ -18,7 +18,7 @@ export async function listRepoFiles(repoId: string, revision?: string) {
   setLoading(true)
   setError(null)
   try {
-    const files = await api.listRepoFiles(repoId, revision)
+    const files = (await api.listRepoFiles(repoId, revision)) ?? []
     setRepoFiles(files)
     return files
   } catch (e) {
