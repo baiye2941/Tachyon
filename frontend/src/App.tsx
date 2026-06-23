@@ -484,9 +484,10 @@ export default function App() {
                 "font-size": "13px",
                 color: "var(--color-text-secondary)",
                 "word-break": "break-all",
+                "white-space": "pre-wrap",
               }}
             >
-              {String(err)}
+              {String(err) + (err instanceof Error && err.stack ? "\n\n" + err.stack : "")}
             </div>
           </div>
         </div>
