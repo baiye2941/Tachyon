@@ -6604,6 +6604,72 @@ mod tests {
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
+    /// 慢存储 + 多 chunk 回归护栏:写盘延迟放大时,流式哈希仍按网络序(=字节序)
+    /// update,最终 computed_hash == blake3(分片)。验证 hash 顺序与写入时序解耦。
+    #[tokio::test]
+    async fn test_slow_storage_multi_chunk_hash_integrity() {
+        let total_size = 100_000u64;
+        let frag_size = total_size / 2; // 50_000,强制 2 分片进入分片下载路径
+        let chunk_size = 1000usize;
+
+        let data = Bytes::from(vec![0xABu8; total_size as usize]);
+        let verifier = CpuVerifier::blake3();
+        let expected_hash_frag0 = verifier.compute_hash(&data[0..frag_size as usize]).unwrap();
+        let expected_hash_frag1 = verifier
+            .compute_hash(&data[frag_size as usize..total_size as usize])
+            .unwrap();
+
+        let protocol: Arc<dyn Protocol> = Arc::new(SmallChunkProtocol {
+            meta: test_metadata("slow-multi-chunk.bin", total_size),
+            chunk_size,
+            total_data: data.clone(),
+        });
+        // 慢存储:每次写延迟 5ms,放大读写时序差异
+        let slow = SlowStorage::with_capacity(total_size as usize, Duration::from_millis(5));
+        let storage = StorageKind::new(slow);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/slow-multi-chunk.bin".into(),
+            DownloadConfig {
+                verify_checksum: true,
+                max_concurrent_fragments: 1,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        // 分步执行:expected hash 必须在 plan 之后、execute 之前注入
+        task.probe().await.expect("probe 应成功");
+        task.init_storage().await.expect("init_storage 应成功");
+        task.plan().expect("plan 应成功");
+        assert_eq!(task.fragments.len(), 2, "应规划为 2 个分片");
+        task.fragments[0].info.hash = Some(expected_hash_frag0.clone());
+        task.fragments[1].info.hash = Some(expected_hash_frag1.clone());
+        task.prepare_storage()
+            .await
+            .expect("prepare_storage 应成功");
+        task.execute().await.expect("execute 应成功");
+        task.verify().await.expect("verify 应通过(哈希匹配)");
+        task.state = DownloadState::Completed;
+
+        assert_eq!(
+            task.fragments[0].computed_hash,
+            Some(expected_hash_frag0),
+            "分片 0 慢存储下流式哈希应等于 blake3(分片 0)"
+        );
+        assert_eq!(
+            task.fragments[1].computed_hash,
+            Some(expected_hash_frag1),
+            "分片 1 慢存储下流式哈希应等于 blake3(分片 1)"
+        );
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
     // F-12 回归测试:带宽自适应不得降低限速器配置上限(负反馈回路)。
     //
     // 限速器的职责是强制用户配置的速率上限,而带宽自适应(分片大小调整)
