@@ -590,6 +590,8 @@ pub(crate) async fn persist_task_snapshot(
             .map(|r| r.value().clone())
     };
     if let Some(task) = task {
+        // load 仅 read_to_string(无 fsync),阻塞远小于 save 的 fsync,
+        // 保持同步调用以维持原有控制流时序(与 task_service.rs:persist_snapshot 一致)。
         let existing = state.infra.task_store.load_snapshot(task_id).ok().flatten();
         let save_path = if let Some(snapshot) = existing.as_ref() {
             snapshot.save_path.clone()
@@ -625,9 +627,15 @@ pub(crate) async fn persist_task_snapshot(
             snapshot.retry_count = existing.retry_count;
         }
         snapshot.fail_reason = fail_reason;
-        if let Err(e) = state.infra.task_store.save_snapshot(&snapshot) {
-            tracing::warn!(task_id = %task_id, error = %e, "保存任务状态快照失败");
-        }
+        // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
+        // spawn_blocking 包裹避免阻塞 tokio worker,错误仅记录警告。
+        let task_store = state.infra.task_store.clone();
+        let task_id_for_log = task_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = task_store.save_snapshot(&snapshot) {
+                tracing::warn!(task_id = %task_id_for_log, error = %e, "保存任务状态快照失败");
+            }
+        });
     }
 }
 

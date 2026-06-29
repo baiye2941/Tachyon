@@ -83,7 +83,8 @@ fn resume_download() {
                 frag_size,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .expect("测试分片应构造成功");
 
     // 已完成分片索引
     let completed: Vec<u32> = vec![0, 1];

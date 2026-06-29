@@ -259,6 +259,15 @@ export default function CommandPalette(props: CommandPaletteProps) {
             <input
               ref={inputRef}
               type="text"
+              role="combobox"
+              aria-expanded="true"
+              aria-controls="cmd-palette-listbox"
+              aria-autocomplete="list"
+              aria-activedescendant={
+                results().length > 0
+                  ? `cmd-opt-${activeIndex()}`
+                  : undefined
+              }
               class="flex-1 bg-transparent focus:outline-none focus-visible"
               style={{
                 "font-size": "14px",
@@ -288,6 +297,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
           {/* 结果列表 */}
           <div
             ref={listRef}
+            id="cmd-palette-listbox"
             class="overflow-y-auto py-1.5"
             role="listbox"
             aria-label={t("commandPalette.listAria")}
@@ -324,6 +334,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                       const isActive = () => activeIndex() === flatIndex();
                       return (
                         <button
+                          id={`cmd-opt-${flatIndex()}`}
                           data-cmd-index={flatIndex()}
                           class="w-full flex items-center gap-3 px-3 py-2 text-left"
                           style={{
@@ -418,6 +429,13 @@ export default function CommandPalette(props: CommandPaletteProps) {
             </For>
           </div>
 
+          {/* a11y:屏幕阅读器播报结果计数,视觉隐藏 */}
+          <div aria-live="polite" role="status" class="sr-only">
+            {results().length > 0
+              ? `${results().length} ${t("commandPalette.listAria")}`
+              : t("commandPalette.noResults")}
+          </div>
+
           {/* 底部提示 */}
           <div
             class="flex items-center gap-4 px-4 py-2"
@@ -446,7 +464,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
               >
                 ↓
               </kbd>
-              导航
+              {t("commandPalette.hintNav")}
             </span>
             <span class="flex items-center gap-1">
               <kbd
@@ -458,7 +476,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
               >
                 Enter
               </kbd>
-              执行
+              {t("commandPalette.hintExecute")}
             </span>
             <span class="flex items-center gap-1 ml-auto">
               <kbd
@@ -470,7 +488,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
               >
                 Ctrl+/
               </kbd>
-              全部快捷键
+              {t("commandPalette.hintAllShortcuts")}
             </span>
           </div>
         </div>

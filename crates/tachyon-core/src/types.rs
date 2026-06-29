@@ -55,6 +55,7 @@ impl DownloadState {
                 | (Downloading, Failed)
                 | (Downloading, Cancelled)
                 | (Paused, Resuming)
+                | (Paused, Failed)
                 | (Paused, Cancelled)
                 | (Resuming, Downloading)
                 | (Resuming, Failed)
@@ -197,24 +198,29 @@ pub struct FragmentInfo {
 }
 
 impl FragmentInfo {
-    pub fn new(index: u32, start: u64, end: u64, size: u64) -> Self {
-        // 使用 checked_add 防止 u64 溢出, assert_eq! 在 release 模式下也执行
-        let end_plus_1 = end.checked_add(1).expect("FragmentInfo: end + 1 溢出");
+    pub fn new(index: u32, start: u64, end: u64, size: u64) -> Result<Self, DownloadError> {
+        // 使用 checked_add 防止 u64 溢出,并以错误传播代替 panic。
+        // end/start/size 可能来自服务器响应(如 Content-Range),为服务器可控值,
+        // 不应在服务器返回极端值(如 end=u64::MAX)时 panic 导致整个进程崩溃。
+        let end_plus_1 = end
+            .checked_add(1)
+            .ok_or_else(|| DownloadError::Fragment("FragmentInfo: end + 1 溢出".into()))?;
         let start_plus_size = start
             .checked_add(size)
-            .expect("FragmentInfo: start + size 溢出");
-        assert_eq!(
-            end_plus_1, start_plus_size,
-            "FragmentInfo invariant: end + 1 == start + size, got end={end}, start={start}, size={size}"
-        );
-        Self {
+            .ok_or_else(|| DownloadError::Fragment("FragmentInfo: start + size 溢出".into()))?;
+        if end_plus_1 != start_plus_size {
+            return Err(DownloadError::Fragment(format!(
+                "FragmentInfo invariant 违反: end + 1 == start + size 不成立, got end={end}, start={start}, size={size}"
+            )));
+        }
+        Ok(Self {
             index,
             start,
             end,
             size,
             downloaded: 0,
             hash: None,
-        }
+        })
     }
 }
 
@@ -381,6 +387,7 @@ mod tests {
             (Downloading, Failed),
             (Downloading, Cancelled),
             (Paused, Resuming),
+            (Paused, Failed),
             (Paused, Cancelled),
             (Resuming, Downloading),
             (Resuming, Failed),
@@ -459,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_fragment_info_new_normal() {
-        let frag = FragmentInfo::new(2, 10, 19, 10);
+        let frag = FragmentInfo::new(2, 10, 19, 10).expect("合法分片应构造成功");
         assert_eq!(frag.index, 2);
         assert_eq!(frag.start, 10);
         assert_eq!(frag.end, 19);
@@ -469,15 +476,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "end + 1 溢出")]
-    fn test_fragment_info_new_end_overflow_panics() {
-        FragmentInfo::new(0, 0, u64::MAX, 0);
+    fn test_fragment_info_new_end_overflow_returns_err() {
+        // F-10:服务器可控的 end=u64::MAX 不应 panic,而应返回错误。
+        let result = FragmentInfo::new(0, 0, u64::MAX, 0);
+        assert!(result.is_err(), "end + 1 溢出应返回错误而非 panic");
+        assert!(result.unwrap_err().to_string().contains("end + 1 溢出"));
     }
 
     #[test]
-    #[should_panic(expected = "start + size 溢出")]
-    fn test_fragment_info_new_start_size_overflow_panics() {
-        FragmentInfo::new(0, u64::MAX - 1, 0, 3);
+    fn test_fragment_info_new_start_size_overflow_returns_err() {
+        // F-10:start + size 溢出应返回错误而非 panic。
+        let result = FragmentInfo::new(0, u64::MAX - 1, 0, 3);
+        assert!(result.is_err(), "start + size 溢出应返回错误而非 panic");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("start + size 溢出")
+        );
     }
 
     #[test]

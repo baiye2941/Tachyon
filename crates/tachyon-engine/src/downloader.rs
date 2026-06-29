@@ -639,7 +639,7 @@ impl DownloadTask {
             metadata.supports_range,
             suggested_frag_size,
             &self.scheduler_config,
-        );
+        )?;
 
         info!(count = fragments.len(), "分片规划完成");
 
@@ -1309,14 +1309,14 @@ impl DownloadTask {
             };
             if bytes_per_sec > 0 {
                 self.scheduler.observe_bandwidth(bytes_per_sec);
-                // 带宽自适应:将观测带宽反馈给限速器动态调整速率
-                if let Some(ref limiter) = self.rate_limiter {
-                    limiter.update_rate(bytes_per_sec);
-                }
+                // 限速器职责是强制用户配置的速率上限,不随实测带宽变化。
+                // 带宽自适应(分片大小调整)由 scheduler.observe_bandwidth() 负责;
+                // 若把实测速率喂给限速器会形成负反馈回路:一次抖动即把上限
+                // 永久拉低,后续分片越跑越慢直至趋近 0。
                 debug!(
                     index = index,
                     bytes_per_sec = bytes_per_sec,
-                    "带宽数据已反馈给调度器和限速器"
+                    "带宽数据已反馈给调度器"
                 );
             }
         }
@@ -2003,7 +2003,6 @@ impl tachyon_core::traits::TaskRunner for DownloadTask {
 mod tests {
     use super::*;
     use crate::fragment::FragmentState;
-    use crate::storage_adapter::AsyncMemWrapper;
     use bytes::Bytes;
     use std::future::Future;
     use std::pin::Pin;
@@ -2303,7 +2302,7 @@ mod tests {
         let protocol: Arc<dyn Protocol> =
             Arc::new(MockProto::new(meta).with_range_data(0, frag_size - 1, overlong_frag_a));
         let memory = MemStorage::with_capacity(total_size as usize + 1);
-        let storage = StorageKind::new(AsyncMemWrapper(memory.clone()));
+        let storage = StorageKind::new(memory.clone());
         let sched_config = tachyon_core::config::SchedulerConfig {
             min_fragment_size: frag_size,
             max_fragment_size: frag_size,
@@ -2359,7 +2358,7 @@ mod tests {
         let protocol: Arc<dyn Protocol> =
             Arc::new(MockProto::new(meta).with_range_data(0, frag_size - 1, overlong_frag_a));
         let memory = MemStorage::with_capacity(total_size as usize + 1);
-        let storage = StorageKind::new(AsyncMemWrapper(memory.clone()));
+        let storage = StorageKind::new(memory.clone());
         let sched_config = tachyon_core::config::SchedulerConfig {
             min_fragment_size: frag_size,
             max_fragment_size: frag_size,
@@ -6239,5 +6238,48 @@ mod tests {
         // 旧代码会 panic,修复后应正常完成
         task.run().await.expect("小 chunk 流式下载不应 panic");
         assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    // F-12 回归测试:带宽自适应不得降低限速器配置上限(负反馈回路)。
+    //
+    // 限速器的职责是强制用户配置的速率上限,而带宽自适应(分片大小调整)
+    // 由 scheduler.observe_bandwidth() 负责。若把实测速率喂给限速器,
+    // 一次网络抖动会导致限速阈值被永久拉低,后续分片越跑越慢直至趋近 0。
+    #[tokio::test]
+    async fn test_rate_limiter_not_lowered_by_observed_bandwidth() {
+        use crate::rate_limit::RateLimiter;
+
+        const CAP: u64 = 10 * 1024 * 1024; // 10 MB/s 用户配置上限
+        let limiter = Arc::new(RateLimiter::new(CAP));
+
+        let data = Bytes::from_static(b"0123456789abcdef"); // 16 字节
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: data.len() as u64 - 1,
+            size: data.len() as u64,
+            downloaded: 0,
+            hash: None,
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("f12.bin", data.len() as u64)));
+        let storage = StorageKind::memory_with_capacity(data.len());
+        let mut task = make_task(protocol, storage, test_config());
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("f12.bin", data.len() as u64));
+        task.set_rate_limiter(limiter.clone());
+
+        // 分片须先进入 Downloading 状态才能完成
+        task.fragments[0].start_download().unwrap();
+
+        // 模拟一次慢分片:1 秒下载 2 字节 => 实测 2 bytes/sec(远低于 CAP)。
+        // 旧实现会调用 limiter.update_rate(2),把上限拉低到 2 bytes/sec。
+        task.record_completed_fragment(0, 2, Duration::from_secs(1), None)
+            .expect("记录完成分片不应失败");
+
+        assert_eq!(
+            limiter.bytes_per_sec(),
+            CAP,
+            "限速器上限必须保持用户配置值,不得被实测带宽降低(负反馈 bug)"
+        );
     }
 }

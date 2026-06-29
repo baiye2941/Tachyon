@@ -13,7 +13,7 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use crate::storage::AsyncStorage;
-use tachyon_core::DownloadResult;
+use tachyon_core::{DownloadError, DownloadResult};
 
 /// 写入管道,将数据从网络写入存储
 ///
@@ -59,11 +59,17 @@ impl<S: AsyncStorage> WritePipeline<S> {
     /// 内部使用 `Bytes::copy_from_slice()` 创建独立缓冲区,
     /// 与 `spawn_blocking` + `FileExt` 的 ownership 模型兼容性最佳。
     pub async fn write(&self, offset: u64, data: &[u8]) -> DownloadResult<usize> {
+        // F-11:信号量 acquire 失败仅在 close 后发生(未来 graceful shutdown 场景),
+        // 用错误传播代替 expect() panic。clamp 到 u32::MAX 防 usize→u32 截断。
+        let permits = data
+            .len()
+            .min(self.semaphore_capacity)
+            .min(u32::MAX as usize) as u32;
         let _permit = self
             .semaphore
-            .acquire_many(data.len().min(self.semaphore_capacity) as u32)
+            .acquire_many(permits)
             .await
-            .expect("WritePipeline 信号量不应被关闭");
+            .map_err(|e| DownloadError::Other(Box::new(e)))?;
         self.storage
             .write_at(offset, Bytes::copy_from_slice(data))
             .await
@@ -76,11 +82,15 @@ impl<S: AsyncStorage> WritePipeline<S> {
     /// 注意:在 `spawn_blocking` + `FileExt` 后端下,此路径可能比 `write()` 略慢,
     /// 因为共享引用的 Arc 开销。在零拷贝后端(io_uring)下收益更明显。
     pub async fn write_bytes(&self, offset: u64, data: &Bytes) -> DownloadResult<usize> {
+        let permits = data
+            .len()
+            .min(self.semaphore_capacity)
+            .min(u32::MAX as usize) as u32;
         let _permit = self
             .semaphore
-            .acquire_many(data.len().min(self.semaphore_capacity) as u32)
+            .acquire_many(permits)
             .await
-            .expect("WritePipeline 信号量不应被关闭");
+            .map_err(|e| DownloadError::Other(Box::new(e)))?;
         self.storage.write_at(offset, data.clone()).await
     }
 
@@ -138,13 +148,16 @@ impl<S: AsyncStorage> WritePipeline<S> {
         // M-6 修复: permit 按字节粒度计算,1B 与 256KB 不再等价。
         // clamp 到信号量总容量,防止超大 payload 导致 acquire_many 永久阻塞。
         let total_bytes: usize = segments.iter().map(|(_, data)| data.len()).sum();
-        let write_permits = total_bytes.min(self.semaphore_capacity).max(1) as u32;
+        let write_permits = total_bytes
+            .min(self.semaphore_capacity)
+            .max(1)
+            .min(u32::MAX as usize) as u32;
 
         let _permit = self
             .semaphore
             .acquire_many(write_permits)
             .await
-            .expect("WritePipeline 信号量不应被关闭");
+            .map_err(|e| DownloadError::Other(Box::new(e)))?;
 
         // 按合并计划执行写入
         let mut total_written: usize = 0;

@@ -56,7 +56,28 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>, skipConfir
   return fn(cmd, args) as Promise<T>
 }
 
+/**
+ * 判断路径是否为合法本地文件系统路径(非带 scheme 的 URL)。
+ *
+ * F-02 防御:shell.open 仅用于打开本地下载文件夹。拒绝任何带 scheme 的路径
+ * (如 javascript:/http:/https:),防止 task.savePath 被污染后触发任意 URL 打开。
+ * 合法本地路径无 "://" 前缀;Windows 盘符(如 C:\)与 UNC(\\)均不含 "://"。
+ */
+export function isLocalPath(path: string): boolean {
+  // 拒绝任何 scheme 前缀(如 javascript:/http:/https:/file:/ftp:)。
+  // 规则:形如 `scheme:` 且冒号后非反斜杠则视为 scheme 而拒绝。
+  // Windows 盘符 `C:\` 冒号后是反斜杠,不匹配此规则,故放行。
+  // Unix 绝对路径 `/home/x`、UNC `\\server`、相对路径均无 `scheme:` 前缀,放行。
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:(?!\\)/.test(path)) {
+    return false
+  }
+  return true
+}
+
 async function openPath(path: string): Promise<void> {
+  if (!isLocalPath(path)) {
+    return
+  }
   try {
     const { open } = await import('@tauri-apps/plugin-shell')
     await open(path)

@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::Stream;
 
-use crate::error::DownloadResult;
+use crate::error::{DownloadError, DownloadResult};
 use crate::types::{FileMetadata, FragmentInfo, TaskId};
 
 /// 字节流类型别名
@@ -85,12 +85,43 @@ pub trait Protocol: Send + Sync {
     }
 }
 
-pub trait Storage: Send + Sync {
+/// 异步存储后端抽象
+///
+/// 统一所有存储后端(TokioFile/WinFile/IoCp/IoUring/Memory)的读写接口,
+/// 由 `tachyon-engine::DynStorage` 通过类型擦除(`ErasedStorage`)动态分发。
+/// 添加新存储后端只需实现本 trait,无需修改引擎层枚举。
+///
+/// 本 trait 定义在 `tachyon-core` 而非 `tachyon-io`,因为它是跨 crate 共享的
+/// 公共抽象(与 `Protocol`/`Verifier` 同层),且 `tachyon-core` 的测试 harness
+/// `MemoryStorage` 需直接实现它,避免 `tachyon-io` 向 `tachyon-core` 反向依赖。
+/// `tachyon-io` 通过 `pub use` 重导出本 trait 以保持 `tachyon_io::AsyncStorage`
+/// 路径向后兼容。
+pub trait AsyncStorage: Send + Sync {
+    /// 写入 `Bytes` 数据,返回实际写入字节数
     fn write_at(
         &self,
         offset: u64,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>>;
+
+    /// 写入 BytesMut 数据(避免 freeze() 产生额外复制)
+    ///
+    /// 默认实现复制一份 `Bytes` 后调用 `write_at`,后端应覆盖此方法
+    /// 以直接从 `BytesMut` 内部缓冲区写入,避免复制/原子引用计数开销。
+    ///
+    /// 语义约定:
+    /// - 方法返回实际写入的字节数 `n`,`data` 本身不会被修改。
+    /// - 调用方需根据返回值自行 `data.advance(n)`,以处理短写循环。
+    fn write_at_mut<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a mut BytesMut,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        // 默认实现通过复制构造 Bytes,避免将 &mut BytesMut 的借用带入 async 块。
+        // 后端覆盖时应直接读取 data 的连续内存,且不消费 data。
+        let frozen = Bytes::copy_from_slice(data);
+        Box::pin(async move { self.write_at(offset, frozen).await })
+    }
 
     fn read_at<'a>(
         &'a self,
@@ -105,6 +136,54 @@ pub trait Storage: Send + Sync {
     fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>>;
 
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>>;
+
+    /// 对齐写入:自动处理 offset 和 data 的对齐填充。
+    ///
+    /// 为 WinFile NO_BUFFERING 和 IoUringStorage O_DIRECT 等需要对齐的后端
+    /// 提供统一的对齐写入 API。默认实现通过填充零字节将 offset 向下对齐、
+    /// data 向上对齐到 `alignment` 边界,然后委托给 `write_at`。
+    ///
+    /// - `alignment` 必须为 2 的幂(典型值:512 扇区 / 4096 页)
+    /// - 返回实际写入的用户数据字节数(等于 `data.len()`)
+    fn write_at_aligned<'a>(
+        &'a self,
+        offset: u64,
+        data: &'a [u8],
+        alignment: u64,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(DownloadError::Config(format!(
+                    "alignment 必须为 2 的正整数幂, 实际值: {alignment}"
+                )));
+            }
+
+            if data.is_empty() {
+                return Ok(0);
+            }
+
+            let align_mask = alignment - 1;
+
+            // 1. 将 offset 向下对齐到 alignment 边界
+            let aligned_offset = offset & !align_mask;
+            let front_pad = (offset - aligned_offset) as usize;
+
+            // 2. 计算总填充大小(前端 + 数据 + 后端对齐)
+            let total_len = front_pad + data.len();
+            let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
+
+            // 3. 构造对齐的写入缓冲区
+            let mut padded = vec![0u8; padded_len];
+            padded[front_pad..front_pad + data.len()].copy_from_slice(data);
+
+            // 4. 委托给 write_at
+            let written = self.write_at(aligned_offset, Bytes::from(padded)).await?;
+
+            // 5. 返回用户数据的实际长度(而非填充后的长度)
+            let user_written = written.saturating_sub(front_pad).min(data.len());
+            Ok(user_written)
+        })
+    }
 }
 
 /// 校验层 trait:负责数据完整性校验

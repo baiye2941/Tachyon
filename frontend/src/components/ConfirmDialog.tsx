@@ -55,7 +55,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
 
   useFocusTrap({
     active: () => props.open,
-    container: dialogRef,
+    container: () => dialogRef,
     onEscape: () => props.onCancel(),
   });
 
@@ -64,6 +64,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
       <Show when={props.open}>
         {/* 遮罩层 */}
         <div
+          data-testid="dialog-overlay"
           class="fixed inset-0 z-[300]"
           style={{
             background: "var(--color-overlay-scrim)",
@@ -76,7 +77,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
         {/* 对话框 */}
         <div
           ref={dialogRef}
-          role="dialog"
+          role="alertdialog"
           aria-modal="true"
           aria-labelledby="confirm-dialog-title"
           aria-describedby="confirm-dialog-desc"
@@ -199,6 +200,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
           {/* 按钮行 */}
           <div class="flex items-center justify-end gap-2">
             <button
+              class="btn-secondary"
               style={{
                 padding: "6px 16px",
                 "font-size": "13px",
@@ -216,6 +218,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
             </button>
             <button
               ref={confirmBtnRef}
+              class={props.tone === "danger" ? "btn-danger" : "btn-primary"}
               data-autofocus
               style={{
                 padding: "6px 16px",
@@ -236,6 +239,9 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
               onClick={() => props.onConfirm({ deleteLocalFile: deleteLocalFile() })}
               disabled={props.loading}
             >
+              {props.tone === "danger" && (
+                <span class="confirm-dialog-icon--danger" aria-hidden="true" />
+              )}
               {props.loading ? tr("common.processing") : (props.confirmLabel ?? tr("common.confirm"))}
             </button>
           </div>

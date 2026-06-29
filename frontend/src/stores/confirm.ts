@@ -7,7 +7,7 @@
 // 统一走 requestConfirm → Promise<boolean>,确认 UI 控制权交还应用层。
 //
 // 后端 confirmation token 机制(requestConfirmation)不受影响,安全边界完整。
-import { createSignal } from 'solid-js'
+import { createSignal, untrack } from 'solid-js'
 
 /** 确认按钮视觉调性 */
 export type ConfirmTone = 'primary' | 'danger'
@@ -59,6 +59,15 @@ export function requestConfirm(
   opts: Omit<ConfirmRequest, 'resolve'>,
 ): Promise<ConfirmResult> {
   return new Promise<ConfirmResult>((resolve) => {
+    // F-23:覆盖前先 resolve 旧的 pending 请求为 {ok:false}。
+    // 旧实现直接 setPending 覆盖,旧 resolve 闭包被丢弃,旧 Promise 永久 pending(内存泄漏)。
+    // 现在确保旧请求以"取消"语义收尾,避免泄漏并符合用户预期(被新请求取代即视为取消)。
+    // untrack:仅读取当前 pending 快照用于清理,不建立响应式订阅(此处非跟踪作用域)。
+    const prev = untrack(() => pending())
+    if (prev) {
+      setPending(null)
+      prev.resolve({ ok: false, deleteLocalFile: false })
+    }
     setPending({ ...opts, resolve })
   })
 }

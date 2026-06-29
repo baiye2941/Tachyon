@@ -476,7 +476,7 @@ export default function App() {
                 "margin-bottom": "8px",
               }}
             >
-              应用发生错误
+              {tr("common.appError")}
             </div>
             <div
               class="mono"

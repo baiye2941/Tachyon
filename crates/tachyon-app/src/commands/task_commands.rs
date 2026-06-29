@@ -297,7 +297,16 @@ pub(crate) async fn inject_resume_snapshot(
     state: &AppState,
     task_id: &str,
 ) {
-    if let Ok(Some(snapshot)) = state.infra.task_store.load_snapshot(task_id) {
+    // load_snapshot 读磁盘,用 spawn_blocking 包裹避免阻塞 tokio worker。
+    // 原 `if let Ok(Some(snapshot))` 在 Err/None 时跳过,此处用 .ok().ok().flatten() 等价。
+    let task_store = state.infra.task_store.clone();
+    let task_id_owned = task_id.to_string();
+    let snapshot = tokio::task::spawn_blocking(move || task_store.load_snapshot(&task_id_owned))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+    if let Some(snapshot) = snapshot {
         if !snapshot.completed_fragments.is_empty() {
             tracing::info!(
                 task_id = %task_id,
@@ -392,9 +401,15 @@ pub(crate) async fn probe_and_save_metadata(
                     meta.etag.clone(),
                     meta.last_modified.clone(),
                 );
-                if let Err(e) = state.infra.task_store.save_snapshot(&snapshot) {
-                    tracing::warn!(task_id = %task_id, error = %e, "保存元数据快照失败");
-                }
+                // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
+                // spawn_blocking 包裹避免阻塞 tokio worker,错误仅记录警告。
+                let task_store = state.infra.task_store.clone();
+                let task_id_for_log = task_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = task_store.save_snapshot(&snapshot) {
+                        tracing::warn!(task_id = %task_id_for_log, error = %e, "保存元数据快照失败");
+                    }
+                });
             }
 
             Some(meta.clone())

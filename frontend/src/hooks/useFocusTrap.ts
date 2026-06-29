@@ -3,8 +3,8 @@ import { createEffect, onCleanup } from "solid-js";
 export interface FocusTrapOptions {
   /** 是否激活焦点陷阱(支持 getter,避免 solid/reactivity 警告) */
   active: boolean | (() => boolean);
-  /** 容器元素(含可聚焦子元素) */
-  container: HTMLElement | undefined;
+  /** 容器元素(含可聚焦子元素);支持 getter 以追踪 ref 解析时机 */
+  container: HTMLElement | undefined | (() => HTMLElement | undefined);
   /** 打开时是否自动聚焦第一个可聚焦元素,默认 true */
   autoFocus?: boolean;
   /** 按 Escape 时回调 */
@@ -28,6 +28,12 @@ function resolveActive(active: boolean | (() => boolean)): boolean {
   return typeof active === "function" ? active() : active;
 }
 
+function resolveContainer(
+  container: HTMLElement | undefined | (() => HTMLElement | undefined),
+): HTMLElement | undefined {
+  return typeof container === "function" ? container() : container;
+}
+
 /**
  * 焦点陷阱 hook(Iteration 08)。
  *
@@ -45,7 +51,8 @@ export function useFocusTrap(options: FocusTrapOptions) {
 
   createEffect(() => {
     const active = resolveActive(options.active);
-    const { container, autoFocus = true, onEscape, restoreFocus } = options;
+    const container = resolveContainer(options.container);
+    const { autoFocus = true, onEscape, restoreFocus } = options;
 
     if (!active || !container) return;
 

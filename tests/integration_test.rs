@@ -9,7 +9,7 @@ use tachyon_core::DownloadError;
 use tachyon_core::test_harness::harness::{
     MemoryStorage, MockProtocol, test_config, test_fragments, test_metadata,
 };
-use tachyon_core::traits::{Protocol, Storage, Verifier};
+use tachyon_core::traits::{Protocol, Verifier};
 use tachyon_core::types::{DownloadState, FragmentInfo};
 use tachyon_crypto::CpuVerifier;
 use tachyon_engine::fragment::compute_fragment_size;

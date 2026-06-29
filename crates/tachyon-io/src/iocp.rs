@@ -72,6 +72,12 @@ struct CompletionSlot {
     state: std::sync::atomic::AtomicU8,
     /// pending 写入上下文(仅 state==Submitted 时有效)
     pending: UnsafeCell<Option<PendingWrite>>,
+    /// F-15:分配代际计数器。每次 alloc() 复用此 slot 时 fetch_add(1),
+    /// 用于消除 CancelGuard 的 TOCTOU 窗口:guard 持有提交时的 expected_generation,
+    /// drop 时若 generation 已变,说明 slot 被回收并提交了新 I/O,此时 CancelIoEx
+    /// 会误取消无关 I/O,故跳过。state 检查无法覆盖此场景(检查后另一线程 alloc
+    /// 并重新置 SUBMITTED,CancelIoEx 仍用旧 overlapped 地址但内核已绑定新 I/O)。
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_os = "windows")]
@@ -114,6 +120,7 @@ impl CompletionSlots {
                 overlapped: UnsafeCell::new(KernelOverlapped::new_for_offset(0)),
                 state: std::sync::atomic::AtomicU8::new(CompletionSlot::FREE),
                 pending: UnsafeCell::new(None),
+                generation: std::sync::atomic::AtomicU64::new(0),
             })
             .collect();
         let bitmap_words = IOCP_SLOT_CAPACITY.div_ceil(64);
@@ -140,7 +147,7 @@ impl CompletionSlots {
         }
     }
 
-    fn alloc(&self) -> Option<usize> {
+    fn alloc(&self) -> Option<(usize, u64)> {
         use std::sync::atomic::Ordering;
         for (word_idx, word) in self.free_bitmap.iter().enumerate() {
             let mut current = word.load(Ordering::Relaxed);
@@ -164,7 +171,11 @@ impl CompletionSlots {
                         self.slots[global_slot]
                             .state
                             .store(CompletionSlot::SUBMITTED, Ordering::Release);
-                        return Some(global_slot);
+                        // F-15:递增代际计数器,返回新 generation 供 CancelGuard 比对。
+                        let generation = self.slots[global_slot]
+                            .generation
+                            .fetch_add(1, Ordering::AcqRel);
+                        return Some((global_slot, generation.wrapping_add(1)));
                     }
                     Err(actual) => current = actual,
                 }
@@ -230,6 +241,8 @@ struct PendingWriteCancelGuard {
     file_handle: usize,
     slot_index: usize,
     slots: std::sync::Arc<CompletionSlots>,
+    /// 提交 I/O 时捕获的 slot generation,用于 drop 时检测 slot 是否已被回收重用。
+    expected_generation: u64,
     armed: bool,
 }
 
@@ -239,11 +252,13 @@ impl PendingWriteCancelGuard {
         file_handle: windows_sys::Win32::Foundation::HANDLE,
         slot_index: usize,
         slots: std::sync::Arc<CompletionSlots>,
+        expected_generation: u64,
     ) -> Self {
         Self {
             file_handle: file_handle as usize,
             slot_index,
             slots,
+            expected_generation,
             armed: true,
         }
     }
@@ -259,10 +274,27 @@ impl Drop for PendingWriteCancelGuard {
         if !self.armed {
             return;
         }
-        // 防御性检查:如果 poller 已完成该 slot(state != SUBMITTED),
-        // 则 OVERLAPPED 可能已被 alloc() 分配给新的 I/O 操作,
-        // 此时调用 CancelIoEx 会错误取消无关的 I/O。
-        // Acquire 序保证看到 poller 的 Release 写入(state→FREE)。
+        // F-15:双重检查消除 TOCTOU 窗口。
+        //
+        // 1) generation 检查:若 slot generation 已变,说明 poller 完成后另一线程
+        //    已 alloc 复用此 slot 并提交新 I/O,此时 overlapped 地址已绑定新 I/O,
+        //    CancelIoEx 会误取消无关操作,故必须跳过。state 检查无法覆盖此场景
+        //    (检查后另一线程 alloc 并重新置 SUBMITTED,此时 state 恢复但 I/O 已换)。
+        //
+        // 2) state 检查:generation 未变但 state 已转 Free,说明 poller 刚完成,
+        //    overlapped 内核侧已释放,CancelIoEx 将返回 ERROR_NOT_FOUND(无害)。
+        let current_gen = self.slots.slots[self.slot_index]
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if current_gen != self.expected_generation {
+            tracing::debug!(
+                slot = self.slot_index,
+                expected_gen = self.expected_generation,
+                actual_gen = current_gen,
+                "CancelGuard: slot 已被回收重用(generation 不匹配),跳过 CancelIoEx 避免误取消"
+            );
+            return;
+        }
         let current_state = self.slots.slots[self.slot_index]
             .state
             .load(std::sync::atomic::Ordering::Acquire);
@@ -278,12 +310,13 @@ impl Drop for PendingWriteCancelGuard {
         let overlapped_ptr = self.slots.slots[self.slot_index].overlapped.get()
             as *mut windows_sys::Win32::System::IO::OVERLAPPED;
         // Safety: file_handle 来自仍存活的 IoCpStorage 文件句柄;overlapped_ptr 指向 slot_index
-        // 对应的 slot.overlapped,且上方 Acquire 检查确认 state 仍为 Submitted,
-        // 即该 slot 仍持有我们提交的 I/O 操作(overlapped 地址有效)。
-        // CancelIoEx 只请求取消该 pending I/O,不释放 OVERLAPPED 或缓冲区,内核保证线程安全。
-        // 注意:CancelIoEx 调用与 state 检查之间存在微小窗口,poller 可能在此期间完成 I/O
-        // 并将 state 设为 FREE——但此时 CancelIoEx 会返回 ERROR_NOT_FOUND,
-        // 下方的错误过滤会正确忽略此错误码。
+        // 对应的 slot.overlapped。上方 generation + state 双重检查已确认:
+        // (1) slot 仍属于本次提交(generation 未变);
+        // (2) state 仍为 Submitted(poller 未完成回收)。
+        // 即 overlapped 仍绑定我们提交的 I/O。CancelIoEx 只请求取消该 pending I/O,
+        // 不释放 OVERLAPPED 或缓冲区,内核保证线程安全。
+        // 残留窗口:generation/state 检查通过到 CancelIoEx 之间,poller 可能完成并回收、
+        // 另一线程 alloc 复用——但此时 CancelIoEx 返回 ERROR_NOT_FOUND,下方过滤忽略。
         let ok = unsafe { windows_sys::Win32::System::IO::CancelIoEx(file_handle, overlapped_ptr) };
         if ok == 0 {
             let err = std::io::Error::last_os_error();
@@ -505,7 +538,7 @@ impl IoCpStorage {
             )));
         }
 
-        let slot_index = self.slots.alloc().ok_or_else(|| {
+        let (slot_index, generation) = self.slots.alloc().ok_or_else(|| {
             DownloadError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "IOCP slot 容量耗尽(256 并发 pending 写入上限)",
@@ -578,7 +611,7 @@ impl IoCpStorage {
         }
 
         let mut cancel_guard =
-            PendingWriteCancelGuard::new(file_handle, slot_index, self.slots.clone());
+            PendingWriteCancelGuard::new(file_handle, slot_index, self.slots.clone(), generation);
         let completion = rx.await.map_err(|_| {
             DownloadError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -1361,7 +1394,7 @@ mod tests {
     fn test_iocp_registered_completion_resolves_pending_write() {
         let slots = std::sync::Arc::new(CompletionSlots::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let (slot_index, _) = slots.alloc().expect("应有空闲 slot");
         let slot = &slots.slots[slot_index];
         // SAFETY: slot 已由 alloc() 分配(state=Submitted),此线程是唯一持有者,
         // UnsafeCell.get() 返回内部指针,写入 Some(PendingWrite) 不会与
@@ -1395,7 +1428,7 @@ mod tests {
     fn test_iocp_cancel_guard_preserves_pending_slot_entry() {
         let slots = std::sync::Arc::new(CompletionSlots::new());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let (slot_index, generation) = slots.alloc().expect("应有空闲 slot");
         let slot = &slots.slots[slot_index];
         // SAFETY: 同上,test_iocp_registered_completion_resolves_pending_write。
         unsafe {
@@ -1405,8 +1438,12 @@ mod tests {
             });
         }
         {
-            let _guard =
-                PendingWriteCancelGuard::new(std::ptr::null_mut(), slot_index, slots.clone());
+            let _guard = PendingWriteCancelGuard::new(
+                std::ptr::null_mut(),
+                slot_index,
+                slots.clone(),
+                generation,
+            );
         }
         assert_eq!(
             slot.state.load(std::sync::atomic::Ordering::Acquire),
@@ -1425,7 +1462,7 @@ mod tests {
     fn test_cancel_guard_skips_when_slot_already_free() {
         let slots = std::sync::Arc::new(CompletionSlots::new());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let slot_index = slots.alloc().expect("应有空闲 slot");
+        let (slot_index, generation) = slots.alloc().expect("应有空闲 slot");
         let slot = &slots.slots[slot_index];
         // SAFETY: slot 已由 alloc() 分配(state=Submitted),此线程是唯一持有者。
         unsafe {
@@ -1445,12 +1482,16 @@ mod tests {
 
         // 此时 CancelGuard::drop 应检测到 state=FREE 并跳过 CancelIoEx
         {
-            let _guard =
-                PendingWriteCancelGuard::new(std::ptr::null_mut(), slot_index, slots.clone());
+            let _guard = PendingWriteCancelGuard::new(
+                std::ptr::null_mut(),
+                slot_index,
+                slots.clone(),
+                generation,
+            );
         }
 
         // slot 应仍可重新分配(验证 bitmap 未被破坏)
-        let reused = slots.alloc().expect("回收后的 slot 应可重新分配");
+        let (reused, _) = slots.alloc().expect("回收后的 slot 应可重新分配");
         // 注意:reused 不一定等于 slot_index(其他线程可能分配了其他 slot),
         // 但 pending_count 应从 0 恢复到 1
         assert_eq!(slots.pending_count(), 1);
@@ -1460,6 +1501,65 @@ mod tests {
             .state
             .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
         slots.release(reused);
+    }
+
+    /// F-15:验证 generation 计数器能在 slot 被回收重用后阻止 CancelIoEx 误取消。
+    ///
+    /// 场景:线程 A 提交 I/O(捕获 generation=G);poller 完成并 release slot;
+    /// 线程 B alloc 复用同一 slot(generation→G+1)提交新 I/O;此时 A 的 CancelGuard
+    /// drop 时 generation 不匹配,必须跳过 CancelIoEx(否则会误取消 B 的新 I/O)。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_cancel_guard_skips_when_slot_generation_changed() {
+        let slots = std::sync::Arc::new(CompletionSlots::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        // 线程 A:提交 I/O,捕获 generation
+        let (slot_index, gen_a) = slots.alloc().expect("应有空闲 slot");
+        let slot = &slots.slots[slot_index];
+        unsafe {
+            *slot.pending.get() = Some(PendingWrite {
+                completion: tx,
+                data: Some(Bytes::from_static(b"first")),
+            });
+        }
+
+        // poller 完成:state→FREE,release bitmap
+        unsafe {
+            let _ = (*slot.pending.get()).take();
+        }
+        slot.state
+            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+        slots.release(slot_index);
+
+        // 线程 B:复用同一 slot,generation 递增
+        let (reused, _gen_b) = slots.alloc().expect("回收后应有空闲 slot");
+        assert_eq!(
+            reused, slot_index,
+            "回收后应复用同一 slot 以验证 generation"
+        );
+        let new_gen = slots.slots[slot_index]
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(
+            new_gen, gen_a,
+            "复用后 generation 必须已递增,否则 generation 检查无效"
+        );
+
+        // A 的 CancelGuard drop:generation 不匹配,应跳过 CancelIoEx(不 panic、不误取消)
+        {
+            let _guard = PendingWriteCancelGuard::new(
+                std::ptr::null_mut(),
+                slot_index,
+                slots.clone(),
+                gen_a,
+            );
+        }
+
+        // 清理
+        slots.slots[slot_index]
+            .state
+            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+        slots.release(slot_index);
     }
 
     /// 验证 complete_pending_write 对未知指针不泄漏 bitmap 位。
@@ -1495,7 +1595,7 @@ mod tests {
         assert_eq!(slots.pending_count(), 0);
         let mut allocated = Vec::new();
         for _ in 0..IOCP_SLOT_CAPACITY {
-            let idx = slots.alloc().expect("应有空闲 slot");
+            let (idx, _) = slots.alloc().expect("应有空闲 slot");
             allocated.push(idx);
         }
         assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY);
@@ -1507,7 +1607,7 @@ mod tests {
             slots.release(idx);
         }
         assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY / 2);
-        let reused = slots.alloc().expect("回收后应有空闲 slot");
+        let (reused, _) = slots.alloc().expect("回收后应有空闲 slot");
         assert!(allocated[..IOCP_SLOT_CAPACITY / 2].contains(&reused));
     }
 
@@ -1539,7 +1639,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut local = Vec::new();
                     for _ in 0..allocs_per_thread {
-                        if let Some(idx) = slots.alloc() {
+                        if let Some((idx, _)) = slots.alloc() {
                             local.push(idx);
                         }
                     }

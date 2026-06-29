@@ -3,7 +3,15 @@ import { render, fireEvent } from '@solidjs/testing-library'
 import TaskItem from '../TaskItem'
 import TitleBar from '../TitleBar'
 import type { TaskInfo } from '../../types'
-import indexCss from '../../index.css?raw'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+// 直接读取 CSS 源文件而非 `?raw` 导入:Tailwind v4 的 Vite 插件会拦截并转换
+// CSS 导入,导致 `?raw` 返回空字符串。fs.readFileSync 绕过转换管线,拿到原始源码。
+const indexCss = readFileSync(
+  resolve(__dirname, '../../index.css'),
+  'utf-8',
+)
 
 vi.mock('@tauri-apps/api/webviewWindow', () => ({
   getCurrentWebviewWindow: () => ({

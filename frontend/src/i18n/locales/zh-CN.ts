@@ -11,6 +11,7 @@ const zhCN = {
 
   // —— 通用 ——
   "common.loading": "加载中...",
+  "common.appError": "应用发生错误",
   "common.confirm": "确认",
   "common.cancel": "取消",
   "common.close": "关闭",
@@ -123,6 +124,9 @@ const zhCN = {
   "commandPalette.searchPlaceholder": "搜索命令或导航...",
   "commandPalette.noResults": "未找到匹配的命令",
   "commandPalette.listAria": "命令列表",
+  "commandPalette.hintNav": "导航",
+  "commandPalette.hintExecute": "执行",
+  "commandPalette.hintAllShortcuts": "全部快捷键",
 
   // —— 命令分组 ——
   "commandGroup.navigation": "导航",

@@ -88,4 +88,19 @@ describe('confirm store', () => {
     expect(req?.cancelLabel).toBe('No')
     confirmModule.resolveConfirm(false)
   })
+
+  it('新请求覆盖未 resolve 的旧请求时,旧 Promise 以 ok=false resolve(不泄漏)', async () => {
+    // F-23:旧实现 setPending 直接覆盖,旧 resolve 闭包被丢弃,
+    // 旧 Promise 永久 pending(内存泄漏)。修复后应先 resolve 旧请求为 {ok:false}。
+    const first = confirmModule.requestConfirm({ title: '旧', message: 'm' })
+    const second = confirmModule.requestConfirm({ title: '新', message: 'm' })
+
+    // 旧请求应被自动 resolve 为 ok:false,而非永久挂起
+    await expect(first).resolves.toMatchObject({ ok: false, deleteLocalFile: false })
+    // 新请求成为当前 pending
+    expect(confirmModule.$confirm.pending()?.title).toBe('新')
+    // 清理:resolve 新请求
+    confirmModule.resolveConfirm(false)
+    await expect(second).resolves.toMatchObject({ ok: false })
+  })
 })

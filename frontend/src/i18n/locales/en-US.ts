@@ -11,6 +11,7 @@ const enUS = {
 
   // —— Common ——
   "common.loading": "Loading...",
+  "common.appError": "An error occurred",
   "common.confirm": "Confirm",
   "common.cancel": "Cancel",
   "common.close": "Close",
@@ -125,6 +126,9 @@ const enUS = {
   "commandPalette.searchPlaceholder": "Search commands or navigation...",
   "commandPalette.noResults": "No matching commands found",
   "commandPalette.listAria": "Command list",
+  "commandPalette.hintNav": "Navigate",
+  "commandPalette.hintExecute": "Execute",
+  "commandPalette.hintAllShortcuts": "All shortcuts",
 
   // —— Command groups ——
   "commandGroup.navigation": "Navigation",

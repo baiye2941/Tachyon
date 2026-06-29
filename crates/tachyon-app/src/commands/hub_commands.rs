@@ -263,46 +263,46 @@ pub async fn verify_model(
 pub async fn list_model_favorites(
     state: State<'_, AppState>,
 ) -> Result<Vec<ModelFavorite>, AppError> {
-    let keys = state
-        .infra
-        .favorites_store
-        .list_by_prefix("fav_")
-        .map_err(|e| AppError::Config(format!("读取收藏列表失败: {e}")))?;
+    // favorites_store 底层为 FileStore,使用 std::fs 同步 I/O(含 fsync),
+    // 直接在 async 上下文调用会阻塞 tokio worker 线程,故包裹 spawn_blocking。
+    let store = state.infra.favorites_store.clone();
+    tokio::task::spawn_blocking(move || -> Result<Vec<ModelFavorite>, AppError> {
+        let keys = store
+            .list_by_prefix("fav_")
+            .map_err(|e| AppError::Config(format!("读取收藏列表失败: {e}")))?;
 
-    let mut favorites = Vec::new();
-    for key in keys {
-        let repo_id = key.strip_prefix("fav_").unwrap_or(&key).to_string();
-        let cached: Option<tachyon_hub::api::HfModelInfo> =
-            state
-                .infra
-                .favorites_store
+        let mut favorites = Vec::new();
+        for key in keys {
+            let repo_id = key.strip_prefix("fav_").unwrap_or(&key).to_string();
+            let cached: Option<tachyon_hub::api::HfModelInfo> = store
                 .get(&key)
                 .map_err(|e| AppError::Config(format!("读取收藏数据失败: {e}")))?;
 
-        let added_at = state
-            .infra
-            .favorites_store
-            .get_raw(&key)
-            .ok()
-            .flatten()
-            .and_then(|json| {
-                serde_json::from_str::<serde_json::Value>(&json)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("addedAt")
-                            .and_then(|a| a.as_str().map(|s| s.to_string()))
-                    })
-            })
-            .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
+            let added_at = store
+                .get_raw(&key)
+                .ok()
+                .flatten()
+                .and_then(|json| {
+                    serde_json::from_str::<serde_json::Value>(&json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("addedAt")
+                                .and_then(|a| a.as_str().map(|s| s.to_string()))
+                        })
+                })
+                .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
 
-        favorites.push(ModelFavorite {
-            repo_id,
-            added_at,
-            cached_info: cached,
-        });
-    }
+            favorites.push(ModelFavorite {
+                repo_id,
+                added_at,
+                cached_info: cached,
+            });
+        }
 
-    Ok(favorites)
+        Ok(favorites)
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("收藏列表读取任务失败: {e}")))?
 }
 
 /// 添加收藏模型
@@ -326,11 +326,15 @@ pub async fn add_model_favorite(
         cached_info,
     };
 
-    state
-        .infra
-        .favorites_store
-        .put(&key, &favorite)
-        .map_err(|e| AppError::Config(format!("保存收藏失败: {e}")))?;
+    // favorites_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。
+    let store = state.infra.favorites_store.clone();
+    tokio::task::spawn_blocking(move || {
+        store
+            .put(&key, &favorite)
+            .map_err(|e| AppError::Config(format!("保存收藏失败: {e}")))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("保存收藏任务失败: {e}")))??;
 
     Ok(())
 }
@@ -343,11 +347,15 @@ pub async fn remove_model_favorite(
 ) -> Result<(), AppError> {
     validate_repo_id(&repo_id)?;
     let key = format!("fav_{repo_id}");
-    state
-        .infra
-        .favorites_store
-        .delete(&key)
-        .map_err(|e| AppError::Config(format!("删除收藏失败: {e}")))?;
+    // favorites_store 底层为 FileStore 同步 I/O,包裹 spawn_blocking 避免阻塞 tokio。
+    let store = state.infra.favorites_store.clone();
+    tokio::task::spawn_blocking(move || {
+        store
+            .delete(&key)
+            .map_err(|e| AppError::Config(format!("删除收藏失败: {e}")))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("删除收藏任务失败: {e}")))??;
     Ok(())
 }
 

@@ -13,7 +13,7 @@ pub mod harness {
 
     use crate::config::{DownloadConfig, IoStrategy};
     use crate::error::{DownloadError, DownloadResult};
-    use crate::traits::{Protocol, Storage};
+    use crate::traits::{AsyncStorage, Protocol};
     use crate::types::{FileMetadata, FragmentInfo, TaskId};
 
     /// Mock 协议实现,用于测试
@@ -268,7 +268,7 @@ pub mod harness {
         }
     }
 
-    impl Storage for MemoryStorage {
+    impl AsyncStorage for MemoryStorage {
         fn write_at(
             &self,
             offset: u64,
@@ -404,8 +404,7 @@ mod tests {
 
     use super::harness::*;
     use crate::error::DownloadError;
-    use crate::traits::Protocol;
-    use crate::traits::Storage;
+    use crate::traits::{AsyncStorage, Protocol};
 
     #[test]
     fn test_metadata_creation() {

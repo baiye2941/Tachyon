@@ -29,8 +29,14 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
 
     let host = url
         .host_str()
+        .filter(|h| !h.is_empty())
         .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))?;
+    // 去除尾部点后若为空(如 host 为 "." 或 ".."),视为退化主机并拒绝。
+    // 此类 URL 可绕过 host_str() 为 None/"" 的检查,是 SSRF 防护的盲点。
     let normalized_host = host.trim_end_matches('.');
+    if normalized_host.is_empty() {
+        return Err(DownloadError::Config("URL 主机为空".into()));
+    }
     if normalized_host.eq_ignore_ascii_case("localhost") {
         return Err(DownloadError::Config("不允许访问 localhost".into()));
     }
@@ -64,6 +70,7 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
 pub fn validate_resolved_ip(url: &Url) -> DownloadResult<Vec<IpAddr>> {
     let host = url
         .host_str()
+        .filter(|h| !h.is_empty())
         .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))?;
 
     // 如果 host 已经是 IP 地址,直接校验即可(无需 DNS 解析)
@@ -425,7 +432,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "业务逻辑 bug:空主机(如 https://./path)当前未被 validate_public_http_url 拒绝"]
     fn validate_public_http_url_rejects_empty_host() {
         let url = Url::parse("https://./path/file.bin").unwrap();
         let result = validate_public_http_url(&url);

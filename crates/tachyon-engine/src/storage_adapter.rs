@@ -235,58 +235,17 @@ impl DynStorage {
 // 测试辅助
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-pub(crate) struct AsyncMemWrapper(pub(crate) MemStorage);
-
-#[cfg(test)]
-impl AsyncStorage for AsyncMemWrapper {
-    fn write_at(
-        &self,
-        offset: u64,
-        data: Bytes,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.write_at(offset, data))
-    }
-
-    fn read_at<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.read_at(offset, buf))
-    }
-
-    fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.sync())
-    }
-
-    fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.allocate(size))
-    }
-
-    fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.file_size())
-    }
-
-    fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        use tachyon_core::traits::Storage;
-        Box::pin(self.0.close())
-    }
-}
+// F-26:AsyncMemWrapper 已删除。MemoryStorage 现在直接实现 AsyncStorage
+// (trait 已上移到 tachyon-core),无需适配器桥接 core::Storage -> io::AsyncStorage。
 
 #[cfg(test)]
 impl DynStorage {
     pub(crate) fn memory() -> Self {
-        Self::new(AsyncMemWrapper(MemStorage::new()))
+        Self::new(MemStorage::new())
     }
 
     pub(crate) fn memory_with_capacity(cap: usize) -> Self {
-        Self::new(AsyncMemWrapper(MemStorage::with_capacity(cap)))
+        Self::new(MemStorage::with_capacity(cap))
     }
 }
 
@@ -297,10 +256,8 @@ impl DynStorage {
 mod tests {
     use bytes::{Bytes, BytesMut};
 
-    use super::{AsyncMemWrapper, DynStorage};
+    use super::DynStorage;
     use tachyon_core::config::IoStrategy;
-    use tachyon_core::test_harness::harness::MemoryStorage as MemStorage;
-    use tachyon_io::storage::AsyncStorage;
 
     #[tokio::test]
     async fn test_dyn_storage_open_with_strategy_standard() {
@@ -394,28 +351,5 @@ mod tests {
         assert_eq!(storage.file_size().await.unwrap(), 1024);
         storage.sync().await.unwrap();
         storage.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_async_mem_wrapper_behavior() {
-        let mem = MemStorage::new();
-        let wrapper = AsyncMemWrapper(mem.clone());
-        let data = Bytes::from_static(b"async wrapper");
-        let written = wrapper.write_at(0, data.clone()).await.unwrap();
-        assert_eq!(written, data.len());
-
-        let mut buf = [0u8; 13];
-        let read = wrapper.read_at(0, &mut buf).await.unwrap();
-        assert_eq!(read, 13);
-        assert_eq!(&buf, b"async wrapper");
-
-        wrapper.allocate(64).await.unwrap();
-        assert_eq!(wrapper.file_size().await.unwrap(), 64);
-        wrapper.sync().await.unwrap();
-        wrapper.close().await.unwrap();
-
-        // 底层 MemoryStorage 与 AsyncMemWrapper 共享同一份数据
-        assert_eq!(mem.get_data().len(), 64);
-        assert_eq!(&mem.get_data()[..13], b"async wrapper");
     }
 }

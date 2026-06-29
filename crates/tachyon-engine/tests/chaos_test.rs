@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use tachyon_core::config::SchedulerConfig;
 use tachyon_core::test_harness::harness::{MemoryStorage, MockProtocol};
-use tachyon_core::traits::{ByteStream, Protocol, Storage};
+use tachyon_core::traits::{AsyncStorage, ByteStream, Protocol};
 use tachyon_core::types::{FileMetadata, FragmentInfo, TaskCommand};
 use tachyon_core::{DownloadError, DownloadResult};
 use tachyon_engine::fragment::plan_fragments;
@@ -205,7 +205,7 @@ impl ChaoticStorage {
     }
 }
 
-impl Storage for ChaoticStorage {
+impl AsyncStorage for ChaoticStorage {
     fn write_at(
         &self,
         offset: u64,
@@ -262,7 +262,8 @@ fn build_mock_protocol(total_size: u64) -> (MockProtocol, Vec<u8>, Vec<FragmentI
     };
 
     let scheduler_config = SchedulerConfig::default();
-    let fragments = plan_fragments(total_size, meta.supports_range, None, &scheduler_config);
+    let fragments = plan_fragments(total_size, meta.supports_range, None, &scheduler_config)
+        .expect("plan_fragments 不应失败");
 
     let mut protocol = MockProtocol::new(meta);
     for frag in &fragments {
@@ -278,7 +279,7 @@ fn build_mock_protocol(total_size: u64) -> (MockProtocol, Vec<u8>, Vec<FragmentI
 /// 单分片下载任务(带重试与取消检查)
 async fn download_fragment_with_chaos(
     protocol: Arc<dyn Protocol>,
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn AsyncStorage>,
     frag: FragmentInfo,
     max_retries: u32,
     cancel_flag: Arc<AtomicBool>,

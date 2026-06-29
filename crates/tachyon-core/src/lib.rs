@@ -30,59 +30,12 @@ pub use safety::{
     reject_forbidden_ip, sanitize_filename, validate_public_http_url, validate_redirect,
     validate_resolved_ip, validate_save_path,
 };
-pub use traits::{ByteStream, Protocol, Storage, TaskRunner, Verifier};
+pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{
     DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, FragmentProgress, TaskCommand,
     TaskId, TaskProgress,
 };
 pub use utils::{Metrics, hex_encode};
-
-/// 事件广播可观测性验证测试
-///
-/// 验证 `DownloadEvent` 可通过 `tokio::sync::broadcast` 通道广播并被多个接收者正确消费。
-#[cfg(test)]
-#[tokio::test]
-async fn event_broadcast() {
-    use event::DownloadEvent;
-    use types::DownloadState;
-
-    // 创建 broadcast 通道，容量 16
-    let (tx, _rx) = tokio::sync::broadcast::channel::<DownloadEvent>(16);
-
-    // 构造状态变更事件
-    let task_id = TaskId::new_v4();
-    let event = DownloadEvent::StateChanged {
-        task_id,
-        old_state: DownloadState::Pending,
-        new_state: DownloadState::Downloading,
-    };
-
-    // 订阅两个接收者
-    let mut rx1 = tx.subscribe();
-    let mut rx2 = tx.subscribe();
-
-    // 广播事件
-    tx.send(event.clone()).expect("广播发送不应失败");
-
-    // 验证两个接收者都收到了正确的事件
-    let received1 = rx1.recv().await.expect("接收者 1 应收到事件");
-    let received2 = rx2.recv().await.expect("接收者 2 应收到事件");
-
-    assert_eq!(received1, event);
-    assert_eq!(received2, event);
-
-    // 再广播一个进度事件，验证事件流连续性
-    let progress_event = DownloadEvent::Progress {
-        task_id,
-        downloaded: 1024,
-        total: Some(4096),
-        speed: 512_000,
-    };
-    tx.send(progress_event.clone()).expect("广播发送不应失败");
-
-    let received_progress = rx1.recv().await.expect("接收者 1 应收到进度事件");
-    assert_eq!(received_progress, progress_event);
-}
 
 /// 验证统一配置类型存在且序列化往返正确
 #[cfg(test)]

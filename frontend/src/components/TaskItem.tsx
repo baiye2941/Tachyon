@@ -223,7 +223,7 @@ export default function TaskItem(props: TaskItemProps) {
             }}
           >
             <div
-              class={`absolute left-0 top-0 bottom-0${props.task.status === 'downloading' ? ' progress-bar-active' : ''}`}
+              class={`absolute left-0 top-0 bottom-0 linear-progress-fill linear-progress-fill--${props.task.status}${props.task.status === 'downloading' ? ' progress-bar-active' : ''}`}
               style={{
                 width: `${props.task.progress * 100}%`,
                 'border-radius': '9999px',

@@ -78,8 +78,9 @@ const MAX_SESSION_TOKENS: usize = 256;
 impl QuicTransport {
     /// 创建新的 QUIC 传输实例
     ///
-    /// 使用自签名证书生成 TLS 配置,仅适用于测试环境。
-    /// 生产环境应使用系统信任根或自定义 CA。
+    /// 加载系统信任的根证书(通过 rustls-native-certs)用于 TLS 验证,
+    /// 适用于生产环境。如需在测试中跳过证书校验,请使用 `new_insecure()`
+    /// (该方法已限制为 `#[cfg(test)]`)。
     ///
     /// 需要在异步上下文中调用(需要 tokio 运行时)。
     pub async fn new() -> DownloadResult<Self> {
@@ -114,7 +115,21 @@ impl QuicTransport {
 
         // 保存加密配置的 Arc 引用,用于后续构造支持 0-RTT 的自定义 ClientConfig
         let stored_crypto: Arc<dyn quinn::crypto::ClientConfig> = Arc::new(crypto);
-        endpoint.set_default_client_config(quinn::ClientConfig::new(stored_crypto.clone()));
+        let mut client_config = quinn::ClientConfig::new(stored_crypto.clone());
+
+        // F-13:QUIC 应用层保活探测。与 HTTP/2 PING(http.rs:139)对齐,
+        // 定期发送 PING 帧检测 NAT/代理超时的死连接,避免连接静默断开后
+        // 首次 I/O 才发现错误。max_idle_timeout 设 30s,keep_alive 间隔 10s,
+        // 确保在 idle 超时前发出保活探测。
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
+                .expect("30s 在 IdleTimeout 有效范围内"),
+        ));
+        client_config.transport_config(Arc::new(transport));
+
+        endpoint.set_default_client_config(client_config);
 
         Ok(Self {
             endpoint,

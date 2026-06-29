@@ -389,8 +389,16 @@ impl TaskService {
                 None,
                 None,
             );
-            if let Err(e) = self.task_store.save_snapshot(&snapshot) {
-                tracing::warn!(task_id = %task_id, error = %e, "保存初始快照失败");
+            // task_store 底层为 FileStore 同步 I/O(含 fsync),用 spawn_blocking 包裹避免
+            // 阻塞 tokio worker。此处 await 以保证 create_task 返回前快照已落盘
+            // (调用方如断点续传/删除测试依赖快照已存在),错误仅记录警告。
+            let task_store = self.task_store.clone();
+            let task_id_for_log = task_id.to_string();
+            if let Err(e) = tokio::task::spawn_blocking(move || task_store.save_snapshot(&snapshot))
+                .await
+                .map_err(|e| AppError::Config(format!("保存初始快照任务失败: {e}")))?
+            {
+                tracing::warn!(task_id = %task_id_for_log, error = %e, "保存初始快照失败");
             }
         }
 
@@ -502,7 +510,14 @@ impl TaskService {
         }
 
         if delete_local_file {
-            let snapshot = self.task_store.load_snapshot(task_id)?;
+            // load_snapshot 读磁盘(read_to_string),用 spawn_blocking 包裹避免阻塞 tokio,
+            // 错误经 ? 传播以保持原有错误处理语义。
+            let task_store = self.task_store.clone();
+            let task_id_owned = task_id.to_string();
+            let snapshot =
+                tokio::task::spawn_blocking(move || task_store.load_snapshot(&task_id_owned))
+                    .await
+                    .map_err(|e| AppError::Config(format!("加载任务快照任务失败: {e}")))??;
             if let Some(save_path) = resolve_delete_save_path(&task, snapshot.as_ref()) {
                 let config = self.config.lock().await.clone();
                 delete_local_file_candidates(&config, task_id, &save_path)?;
@@ -511,8 +526,14 @@ impl TaskService {
 
         self.task_repository.remove(task_id);
 
-        // 清理断点续传快照
-        match self.task_store.remove_snapshot(task_id) {
+        // 清理断点续传快照:remove_snapshot 删文件,用 spawn_blocking 包裹,
+        // await 拿到 Result<bool> 后 match 三分支以保持原有清理日志语义。
+        let task_store = self.task_store.clone();
+        let task_id_owned = task_id.to_string();
+        match tokio::task::spawn_blocking(move || task_store.remove_snapshot(&task_id_owned))
+            .await
+            .map_err(|e| AppError::Config(format!("删除任务快照任务失败: {e}")))?
+        {
             Ok(true) => {
                 tracing::debug!(task_id = %task_id, "已删除任务快照");
             }
@@ -566,6 +587,8 @@ impl TaskService {
 
         let task = { self.task_repository.get(task_id).map(|r| r.value().clone()) };
         if let Some(task) = task {
+            // 读取已存在快照用于字段合并。load 仅 read_to_string(无 fsync),
+            // 阻塞远小于 save 的 fsync,保持同步调用以维持原有控制流时序。
             let existing = self.task_store.load_snapshot(task_id).ok().flatten();
             let save_path = if let Some(snapshot) = existing.as_ref() {
                 snapshot.save_path.clone()
@@ -595,9 +618,16 @@ impl TaskService {
                 snapshot.retry_count = existing.retry_count;
             }
             snapshot.fail_reason = fail_reason;
-            if let Err(e) = self.task_store.save_snapshot(&snapshot) {
-                tracing::warn!(task_id = %task_id, error = %e, "保存任务状态快照失败");
-            }
+            // task_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。
+            // 此处采用 fire-and-forget:快照保存错误仅记录警告,无需阻塞调用方(如取消/暂停路径),
+            // 避免在 fsync 期间拖延任务控制信号的发送。
+            let task_store = self.task_store.clone();
+            let task_id_for_log = task_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = task_store.save_snapshot(&snapshot) {
+                    tracing::warn!(task_id = %task_id_for_log, error = %e, "保存任务状态快照失败");
+                }
+            });
         }
     }
 }

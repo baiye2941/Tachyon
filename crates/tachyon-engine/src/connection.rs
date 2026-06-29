@@ -1,7 +1,13 @@
-//! 连接池管理
+//! 并发限制器(命名沿用 ConnectionPool,实为 per-host + global 信号量许可管理)
 //!
-//! 每个主机维护独立连接池,支持连接复用和并发控制。
+//! 本类型不持有/复用 TCP 连接 —— 真正的连接池由底层 reqwest 客户端管理。
+//! 其职责是按主机 + 全局两级的并发许可限制:每个主机维护独立信号量,
+//! 配合全局信号量控制总并发,避免单主机打满或全局过载。
 //! 使用 DashMap 实现无锁主机信号量索引,避免高并发下的锁竞争。
+//!
+//! 命名说明:历史命名为 ConnectionPool,虽语义实为 ConcurrencyLimiter,
+//! 但因已作为公共 API 广泛导出(tachyon-app/runtime 等多处引用),
+//! 重命名成本与回归风险高于收益,故保留名称但在此澄清真实职责。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -174,11 +180,16 @@ impl ConnectionPool {
     ///
     /// 返回 `max_per_host - available_permits`,即当前正在使用的连接数。
     /// 用于监控和诊断连接池状态。
+    ///
+    /// 使用 `saturating_sub` 防御性地避免下溢:即使出现 `available_permits`
+    /// 超过 `max_per_host` 的异常(如未来配置热更新与信号量重建之间的竞态),
+    /// 也会返回 0 而非 panic(debug)或 wrap 到 `usize::MAX`(release)。
     pub fn host_active_connections(&self, host: &str) -> u32 {
         self.host_semaphores
             .get(host)
             .map(|sem| {
-                let used = self.config.max_per_host as usize - sem.available_permits();
+                let used =
+                    (self.config.max_per_host as usize).saturating_sub(sem.available_permits());
                 used as u32
             })
             .unwrap_or(0)
@@ -526,6 +537,37 @@ mod tests {
             pool.active_connections(),
             0,
             "panic 后 permit 应通过 Drop 释放活跃计数"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_active_connections_tracks_permits() {
+        // 回归测试 F-08:host_active_connections 必须返回有界、正确的值,
+        // 不得因 available_permits 与 max_per_host 失配而下溢 panic 或 wrap。
+        let pool = ConnectionPool::new(PoolConfig {
+            max_per_host: 3,
+            max_global: 10,
+            ..Default::default()
+        });
+
+        // 未知主机返回 0
+        assert_eq!(pool.host_active_connections("unknown.com"), 0);
+
+        // 持有两个 permit 时,活跃数 = max_per_host - available_permits = 3 - 1 = 2
+        let _p1 = pool.acquire("example.com").await.unwrap();
+        let _p2 = pool.acquire("example.com").await.unwrap();
+        assert_eq!(pool.host_active_connections("example.com"), 2);
+
+        // 释放一个后回到 1
+        drop(_p2);
+        assert_eq!(pool.host_active_connections("example.com"), 1);
+
+        // 全部释放后回到 0,且不超过 max_per_host
+        drop(_p1);
+        let active = pool.host_active_connections("example.com");
+        assert!(
+            active <= 3,
+            "活跃连接数不应超过 max_per_host,实际: {active}"
         );
     }
 }

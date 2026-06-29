@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use tachyon_core::error::DownloadResult;
+use tachyon_core::hex_encode;
 use tachyon_core::traits::Verifier;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -144,17 +145,6 @@ impl Verifier for CpuVerifier {
             }
         }
     }
-}
-
-/// 十六进制编码
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
 }
 
 /// 根据数据大小自动选择最优校验算法

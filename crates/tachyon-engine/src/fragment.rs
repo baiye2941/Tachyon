@@ -289,13 +289,13 @@ pub fn plan_fragments(
     supports_range: bool,
     suggested_frag_size: Option<u64>,
     scheduler_config: &SchedulerConfig,
-) -> Vec<FragmentInfo> {
+) -> DownloadResult<Vec<FragmentInfo>> {
     if file_size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     if !supports_range {
-        return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
+        return Ok(vec![FragmentInfo::new(0, 0, file_size - 1, file_size)?]);
     }
 
     let frag_size = match suggested_frag_size {
@@ -313,7 +313,7 @@ pub fn plan_fragments(
 
     // frag_size 为 0 的防御(理论上 file_size > 0 时不会发生)
     if frag_size == 0 {
-        return vec![FragmentInfo::new(0, 0, file_size - 1, file_size)];
+        return Ok(vec![FragmentInfo::new(0, 0, file_size - 1, file_size)?]);
     }
 
     // 防止超大文件导致分片数溢出: 硬上限 1,000,000 个分片
@@ -334,13 +334,15 @@ pub fn plan_fragments(
         let size = remaining.min(effective_frag_size);
         let end = offset + size - 1;
 
-        fragments.push(FragmentInfo::new(index, offset, end, size));
+        fragments.push(FragmentInfo::new(index, offset, end, size)?);
 
         offset += size;
-        index = index.checked_add(1).expect("分片数超过 u32::MAX,文件过大");
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| DownloadError::Fragment("分片数超过 u32::MAX,文件过大".into()))?;
     }
 
-    fragments
+    Ok(fragments)
 }
 
 #[cfg(test)]
@@ -355,6 +357,7 @@ mod tests {
             (index as u64 + 1) * size - 1,
             size,
         )
+        .expect("测试分片应构造成功")
     }
 
     #[test]
@@ -651,7 +654,8 @@ mod tests {
         fn test_plan_fragments_normal_range_supported() {
             let config = SchedulerConfig::default();
             // 100MB 文件,支持 Range
-            let frags = plan_fragments(100 * 1024 * 1024, true, None, &config);
+            let frags = plan_fragments(100 * 1024 * 1024, true, None, &config)
+                .expect("plan_fragments 不应失败");
             assert!(!frags.is_empty(), "应至少生成一个分片");
 
             // 验证连续性和完整性
@@ -680,7 +684,7 @@ mod tests {
         fn test_plan_fragments_small_file() {
             let config = SchedulerConfig::default();
             // 500 字节文件,支持 Range —— 小于 min_fragment_size
-            let frags = plan_fragments(500, true, None, &config);
+            let frags = plan_fragments(500, true, None, &config).expect("plan_fragments 不应失败");
             assert_eq!(frags.len(), 1, "小于最小分片的文件应只产生一个分片");
             assert_eq!(frags[0].start, 0);
             assert_eq!(frags[0].end, 499);
@@ -692,7 +696,7 @@ mod tests {
             let config = SchedulerConfig::default();
             // 恰好等于 min_fragment_size (1MB)
             let size = 1024 * 1024u64;
-            let frags = plan_fragments(size, true, None, &config);
+            let frags = plan_fragments(size, true, None, &config).expect("plan_fragments 不应失败");
             let total: u64 = frags.iter().map(|f| f.size).sum();
             assert_eq!(total, size);
         }
@@ -702,21 +706,21 @@ mod tests {
         #[test]
         fn test_plan_fragments_empty_file() {
             let config = SchedulerConfig::default();
-            let frags = plan_fragments(0, true, None, &config);
+            let frags = plan_fragments(0, true, None, &config).expect("plan_fragments 不应失败");
             assert!(frags.is_empty(), "空文件不应产生任何分片");
         }
 
         #[test]
         fn test_plan_fragments_empty_file_no_range() {
             let config = SchedulerConfig::default();
-            let frags = plan_fragments(0, false, None, &config);
+            let frags = plan_fragments(0, false, None, &config).expect("plan_fragments 不应失败");
             assert!(frags.is_empty(), "空文件无论是否支持 Range 都不应产生分片");
         }
 
         #[test]
         fn test_plan_fragments_single_byte() {
             let config = SchedulerConfig::default();
-            let frags = plan_fragments(1, true, None, &config);
+            let frags = plan_fragments(1, true, None, &config).expect("plan_fragments 不应失败");
             assert_eq!(frags.len(), 1);
             assert_eq!(frags[0].size, 1);
             assert_eq!(frags[0].start, 0);
@@ -729,7 +733,8 @@ mod tests {
         fn test_plan_fragments_no_range_support() {
             let config = SchedulerConfig::default();
             let file_size = 50 * 1024 * 1024u64; // 50MB
-            let frags = plan_fragments(file_size, false, None, &config);
+            let frags =
+                plan_fragments(file_size, false, None, &config).expect("plan_fragments 不应失败");
             assert_eq!(frags.len(), 1, "不支持 Range 时应只产生单个分片");
             assert_eq!(frags[0].index, 0);
             assert_eq!(frags[0].start, 0);
@@ -750,7 +755,8 @@ mod tests {
             };
 
             // 验证配置被正确传入(通过检查分片大小约束)
-            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config);
+            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config)
+                .expect("plan_fragments 不应失败");
             for frag in &frags {
                 assert!(frag.size >= config.min_fragment_size || frag.size == 10 * 1024 * 1024);
             }
@@ -762,7 +768,8 @@ mod tests {
         fn test_plan_fragments_large_file_total_coverage() {
             let config = SchedulerConfig::default();
             let file_size = 1024 * 1024 * 1024u64; // 1GB
-            let frags = plan_fragments(file_size, true, None, &config);
+            let frags =
+                plan_fragments(file_size, true, None, &config).expect("plan_fragments 不应失败");
             let total: u64 = frags.iter().map(|f| f.size).sum();
             assert_eq!(total, file_size, "所有分片大小之和必须等于文件大小");
 
@@ -780,7 +787,8 @@ mod tests {
             let file_size = 10 * 1024 * 1024u64;
             let suggested = 2 * 1024 * 1024u64;
 
-            let frags = plan_fragments(file_size, true, Some(suggested), &config);
+            let frags = plan_fragments(file_size, true, Some(suggested), &config)
+                .expect("plan_fragments 不应失败");
             assert!(!frags.is_empty());
 
             // 每个分片(除最后一个)大小应为 suggested
@@ -798,8 +806,10 @@ mod tests {
             let file_size = 10 * 1024 * 1024u64;
 
             // suggested=0 应回退到内部计算
-            let frags_zero = plan_fragments(file_size, true, Some(0), &config);
-            let frags_none = plan_fragments(file_size, true, None, &config);
+            let frags_zero =
+                plan_fragments(file_size, true, Some(0), &config).expect("plan_fragments 不应失败");
+            let frags_none =
+                plan_fragments(file_size, true, None, &config).expect("plan_fragments 不应失败");
             assert_eq!(
                 frags_zero.len(),
                 frags_none.len(),
@@ -818,7 +828,8 @@ mod tests {
 
             // 10MB file, 100 target fragments -> 102KB per fragment -> clamped to min 1MB -> 10 fragments
             // If max_global=4 was used as target_fragments: 10MB/4 = 2.5MB -> still clamped -> 4 fragments
-            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config);
+            let frags = plan_fragments(10 * 1024 * 1024, true, None, &config)
+                .expect("plan_fragments 不应失败");
             assert_eq!(
                 frags.len(),
                 10,
