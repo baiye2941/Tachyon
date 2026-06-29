@@ -1699,27 +1699,43 @@ impl DownloadTask {
         let storage = self
             .storage
             .as_ref()
-            .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
+            .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?
+            .clone();
 
+        // 收集需要校验的分片(有 expected hash 的),并行计算/比对。
+        // 流式哈希分片(有 computed_hash)无需读盘,直接比对;断点续传分片读盘计算。
+        // 用 JoinSet + Semaphore(available_parallelism) 并发,任一失败短路 abort。
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut has_expected_hash = false;
-        for frag in &self.fragments {
-            if let Some(ref expected_hash) = frag.info.hash {
-                has_expected_hash = true;
+        let mut join_set: tokio::task::JoinSet<DownloadResult<(u32, String, String)>> =
+            tokio::task::JoinSet::new();
 
+        for frag in &self.fragments {
+            let Some(expected_hash) = frag.info.hash.clone() else {
+                continue;
+            };
+            has_expected_hash = true;
+            let index = frag.info.index;
+            let computed = frag.computed_hash.clone();
+            let start = frag.info.start;
+            let size = frag.info.size;
+            let storage = storage.clone();
+            let permit_sem = semaphore.clone();
+            join_set.spawn(async move {
+                let _permit = permit_sem.acquire().await;
                 // 流式哈希优先:下载阶段已边写边算,直接比对,消除 I/O 放大。
-                // 仅断点续传恢复的分片(未经过本次 download_single_fragment)无此字段,
-                // 回退到读盘计算。
-                let computed = if let Some(ref h) = frag.computed_hash {
-                    debug!(index = frag.info.index, "使用流式哈希校验(无需重读文件)");
-                    h.clone()
+                let computed = if let Some(h) = computed {
+                    debug!(index, "使用流式哈希校验(无需重读文件)");
+                    h
                 } else {
-                    debug!(
-                        index = frag.info.index,
-                        "无流式哈希,回退读盘计算(断点续传分片)"
-                    );
+                    debug!(index, "无流式哈希,回退读盘计算(断点续传分片)");
                     let chunk_size = VERIFY_HASH_CHUNK_SIZE;
-                    let mut offset = frag.info.start;
-                    let end = frag.info.start + frag.info.size;
+                    let mut offset = start;
+                    let end = start + size;
                     let mut buf = vec![0u8; chunk_size];
                     let mut hasher = blake3::Hasher::new();
                     while offset < end {
@@ -1730,22 +1746,24 @@ impl DownloadTask {
                     }
                     hasher.finalize().to_hex().to_string()
                 };
+                Ok((index, expected_hash, computed))
+            });
+        }
 
-                if computed != *expected_hash {
-                    warn!(
-                        index = frag.info.index,
-                        expected = %expected_hash,
-                        actual = %computed,
-                        "分片校验失败"
-                    );
-                    self.state = DownloadState::Failed;
-                    return Err(DownloadError::ChecksumMismatch {
-                        expected: expected_hash.clone(),
-                        actual: computed,
-                    });
-                }
-                debug!(index = frag.info.index, "分片校验通过");
+        // 收集结果:任一分片校验失败即 abort 其余并短路返回
+        while let Some(res) = join_set.join_next().await {
+            let (index, expected_hash, computed) =
+                res.map_err(|e| DownloadError::Io(e.into()))??;
+            if computed != expected_hash {
+                warn!(index, expected = %expected_hash, actual = %computed, "分片校验失败");
+                join_set.abort_all();
+                self.state = DownloadState::Failed;
+                return Err(DownloadError::ChecksumMismatch {
+                    expected: expected_hash,
+                    actual: computed,
+                });
             }
+            debug!(index, "分片校验通过");
         }
 
         // Require 策略:必须有 expected hash
@@ -2962,6 +2980,273 @@ mod tests {
 
         let result = task.verify().await;
         assert!(result.is_ok(), "Skip 策略下应完全跳过校验");
+    }
+
+    // ------ 9b. 分片并行校验回归护栏 ------
+
+    /// 并发读盘计数存储:内部委托 `MemStorage`,在 `read_at` 进入/退出时用
+    /// `Arc<AtomicU32>` 统计并发活跃数,并更新峰值;读盘内 `sleep` 一小段,
+    /// 使多个分片的读盘在时间上重叠,从而让并行 verify 的并发度可观测。
+    ///
+    /// 仅供 `test_verify_parallel_concurrent_reads` 用于验证 verify 分片并行化
+    /// (JoinSet + Semaphore) 后读盘并发度 > 1。
+    #[derive(Clone)]
+    struct ConcurrentCountStorage {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        active: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+        read_delay: Duration,
+    }
+
+    impl ConcurrentCountStorage {
+        fn with_capacity(capacity: usize, read_delay: Duration) -> Self {
+            Self {
+                data: Arc::new(std::sync::Mutex::new(vec![0u8; capacity])),
+                active: Arc::new(AtomicU32::new(0)),
+                peak: Arc::new(AtomicU32::new(0)),
+                read_delay,
+            }
+        }
+
+        /// 读取观测到的读盘并发峰值
+        fn peak(&self) -> u32 {
+            self.peak.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl AsyncStorage for ConcurrentCountStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move {
+                let len = data.len();
+                let start = offset as usize;
+                let end = start + len;
+                let mut buf = data_inner.lock().unwrap();
+                if end > buf.len() {
+                    buf.resize(end, 0);
+                }
+                buf[start..end].copy_from_slice(&data);
+                Ok(len)
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            let data_inner = self.data.clone();
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            let delay = self.read_delay;
+            Box::pin(async move {
+                // 进入读盘:active +1,更新峰值
+                let cur = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak.fetch_max(cur, AtomicOrdering::SeqCst);
+                // 人为延迟,使多个分片的读盘时间重叠,并行度可见
+                tokio::time::sleep(delay).await;
+                // 退出读盘:active -1
+                active.fetch_sub(1, AtomicOrdering::SeqCst);
+
+                let data = data_inner.lock().unwrap();
+                let start = offset as usize;
+                let available = data.len().saturating_sub(start);
+                let to_read = buf.len().min(available);
+                if to_read > 0 {
+                    buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+                }
+                Ok(to_read)
+            })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move {
+                let mut data = data_inner.lock().unwrap();
+                data.resize(size as usize, 0);
+                Ok(())
+            })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            let data_inner = self.data.clone();
+            Box::pin(async move { Ok(data_inner.lock().unwrap().len() as u64) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// 并行校验回归护栏 1:多分片中单个分片哈希错误,verify 应检出并短路失败。
+    ///
+    /// 构造 4 个连续分片(各 1KB),分片 0/1/3 数据正确且 hash 正确,
+    /// 分片 2 用全 0 错误 hash。手动写盘 4 个分片的正确数据。
+    /// 断言 verify 返回 `ChecksumMismatch` 且状态为 `Failed`。
+    ///
+    /// 该测试在串行 verify 下也应通过(串行同样能检出损坏分片),
+    /// 用于保证 JoinSet 并行化后短路 abort 逻辑不破坏错误检出语义。
+    #[tokio::test]
+    async fn test_verify_parallel_multi_fragment_one_corrupt_fails() {
+        let frag_size: u64 = 1024;
+        let total_size = frag_size * 4;
+        // 4 个分片各自的内容(便于区分)
+        let frag_data: Vec<Bytes> = (0..4u8)
+            .map(|i| Bytes::from(vec![0xA0 | i; frag_size as usize]))
+            .collect();
+        // 计算每个分片的正确 blake3 hash
+        let frag_hashes: Vec<String> = frag_data
+            .iter()
+            .map(|d| CpuVerifier::blake3().compute_hash(d).unwrap())
+            .collect();
+        // 分片 2 使用全 0 错误 hash 触发 ChecksumMismatch
+        let wrong_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        let protocol = Arc::new(MockProto::new(test_metadata("par-corrupt.bin", total_size)));
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                ..test_config()
+            },
+        );
+
+        // 手动写盘 4 个分片的正确数据(连续 offset 0/1024/2048/3072)
+        for (i, data) in frag_data.iter().enumerate() {
+            let offset = (i as u64) * frag_size;
+            task.storage
+                .as_ref()
+                .unwrap()
+                .write_at(offset, data.clone())
+                .await
+                .unwrap();
+        }
+
+        // 构造 4 个分片记录:0/1/3 用正确 hash,2 用错误 hash
+        let frags: Vec<FragmentRecord> = (0..4u32)
+            .map(|i| {
+                let start = (i as u64) * frag_size;
+                let info = FragmentInfo {
+                    index: i,
+                    start,
+                    end: start + frag_size - 1,
+                    size: frag_size,
+                    downloaded: 0,
+                    hash: Some(if i == 2 {
+                        wrong_hash.clone()
+                    } else {
+                        frag_hashes[i as usize].clone()
+                    }),
+                };
+                FragmentRecord::new(info, 3)
+            })
+            .collect();
+        task.fragments = frags;
+        task.metadata = Some(test_metadata("par-corrupt.bin", total_size));
+
+        let result = task.verify().await;
+        assert!(result.is_err(), "存在损坏分片时校验应失败");
+        assert!(
+            matches!(result.unwrap_err(), DownloadError::ChecksumMismatch { .. }),
+            "损坏分片应触发 ChecksumMismatch"
+        );
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    /// 并行校验回归护栏 2:验证 verify 分片并行化后读盘并发度 > 1。
+    ///
+    /// 用 `ConcurrentCountStorage` 观测 `read_at` 并发峰值:4 个分片均不设
+    /// `computed_hash`,强制走读盘计算路径;每个分片读盘时 sleep 5ms,使并发可见。
+    /// 断言并发峰值 >= 2(证明至少 2 个分片读盘并行)。
+    ///
+    /// 该测试在当前串行 verify 下为 **RED**(peak=1 < 2),用于驱动 JoinSet +
+    /// Semaphore 并行化改造;并行化实现后应转为 GREEN。
+    #[tokio::test]
+    async fn test_verify_parallel_concurrent_reads() {
+        let frag_size: u64 = 1024;
+        let total_size = frag_size * 4;
+        let read_delay = Duration::from_millis(5);
+
+        // 4 个分片各自的内容
+        let frag_data: Vec<Bytes> = (0..4u8)
+            .map(|i| Bytes::from(vec![0xB0 | i; frag_size as usize]))
+            .collect();
+        // 计算每个分片的正确 blake3 hash(强制走读盘路径:不设 computed_hash)
+        let frag_hashes: Vec<String> = frag_data
+            .iter()
+            .map(|d| CpuVerifier::blake3().compute_hash(d).unwrap())
+            .collect();
+
+        let protocol = Arc::new(MockProto::new(test_metadata(
+            "par-concurrent.bin",
+            total_size,
+        )));
+        let counting = ConcurrentCountStorage::with_capacity(total_size as usize, read_delay);
+        let storage = StorageKind::new(counting.clone());
+        let mut task = make_task(
+            protocol,
+            storage,
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                ..test_config()
+            },
+        );
+
+        // 手动写盘 4 个分片的正确数据
+        for (i, data) in frag_data.iter().enumerate() {
+            let offset = (i as u64) * frag_size;
+            task.storage
+                .as_ref()
+                .unwrap()
+                .write_at(offset, data.clone())
+                .await
+                .unwrap();
+        }
+
+        // 构造 4 个分片记录:均设正确 expected hash,不设 computed_hash,
+        // 迫使 verify 走读盘计算路径,从而触发 ConcurrentCountStorage 的计数。
+        let frags: Vec<FragmentRecord> = (0..4u32)
+            .map(|i| {
+                let start = (i as u64) * frag_size;
+                let info = FragmentInfo {
+                    index: i,
+                    start,
+                    end: start + frag_size - 1,
+                    size: frag_size,
+                    downloaded: 0,
+                    hash: Some(frag_hashes[i as usize].clone()),
+                };
+                FragmentRecord::new(info, 3)
+            })
+            .collect();
+        task.fragments = frags;
+        task.metadata = Some(test_metadata("par-concurrent.bin", total_size));
+
+        // 全部分片数据正确,verify 应成功
+        task.verify().await.expect("数据正确时校验应通过");
+
+        // 断言读盘并发峰值 >= 2(串行 verify 下为 RED:peak=1)
+        let peak = counting.peak();
+        assert!(
+            peak >= 2,
+            "verify 分片并行化后读盘并发峰值应 >= 2,实际: {peak}(串行 verify 为 1)"
+        );
     }
 
     // ------ 10. 空文件处理 -----
