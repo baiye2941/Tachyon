@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -1351,25 +1351,8 @@ impl DownloadTask {
         }
     }
 
-    /// 将 `Bytes` 批量写入存储，内部转换为 `BytesMut` 后复用 `write_all_at_mut` 循环。
+    /// 使用 BytesMut 写入存储，避免 freeze() 复制
     ///
-    /// P1-05: 通过 `BytesMut::from(batch)` 避免 `batch.clone()` 的引用计数递增，
-    /// 在 batch 独占所有权时可直接接管其内存；否则回退到复制，语义与 clone 等价。
-    async fn write_all_at(
-        storage: &StorageKind,
-        pos: u64,
-        batch: Bytes,
-        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
-        pause_timeout: Duration,
-    ) -> DownloadResult<u64> {
-        let batch_mut = bytes::BytesMut::from(batch);
-        Self::write_all_at_mut(storage, pos, batch_mut, control_rx, pause_timeout).await
-    }
-
-    /// P1-05: 使用 BytesMut 写入存储，避免 freeze() 复制
-    ///
-    /// 与 `write_all_at` 的区别：
-    /// - 接受 `BytesMut` 而非 `Bytes`，跳过 freeze() 的原子操作
     /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
     /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
     ///
@@ -1416,6 +1399,75 @@ impl DownloadTask {
             batch.advance(written);
         }
         Ok(total_written)
+    }
+
+    /// 刷写一个 batch 到存储,统一处理「流式哈希 update + 越界检查 + 写入 + 偏移推进 + 限速」。
+    ///
+    /// 消除 `download_single_fragment` 中大 chunk 直写 / 批量刷写 / 尾刷三段重复逻辑。
+    /// 调用方负责进度上报(各路径的进度计数位置不同,留在调用点保持原有语义)。
+    ///
+    /// 返回 `(新偏移, 本次写入字节数)`。hash update 在写入前按字节序执行,
+    /// 保证流式哈希顺序与文件字节顺序一致(双缓冲乱序落盘亦安全)。
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_batch(
+        storage: &StorageKind,
+        pos: u64,
+        batch: bytes::BytesMut,
+        hasher: &mut Option<blake3::Hasher>,
+        frag_index: u32,
+        total_written: u64,
+        expected_len: u64,
+        rate_limiter: &Option<Arc<RateLimiter>>,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
+        pause_timeout: Duration,
+    ) -> DownloadResult<(u64, u64)> {
+        // 流式哈希:在写入前按字节序更新(batch 内容此后不再变化)
+        if let Some(h) = hasher {
+            h.update(&batch);
+        }
+        let batch_len = u64::try_from(batch.len())
+            .map_err(|_| DownloadError::Fragment("分片写入长度溢出".into()))?;
+        let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
+            DownloadError::Fragment(format!(
+                "分片写入长度溢出: index={frag_index}, written={total_written}, len={batch_len}"
+            ))
+        })?;
+        if attempted_written > expected_len {
+            return Err(DownloadError::Fragment(format!(
+                "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
+            )));
+        }
+        let w = Self::write_all_at_mut(storage, pos, batch, control_rx, pause_timeout).await?;
+        let new_pos = pos.checked_add(w).ok_or_else(|| {
+            DownloadError::Fragment(format!(
+                "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
+            ))
+        })?;
+        // 实时令牌桶限速
+        if let Some(limiter) = rate_limiter {
+            limiter.acquire(w).await;
+        }
+        Ok((new_pos, w))
+    }
+
+    /// 发送增量进度事件(通道满或关闭时丢弃并记录,不阻塞下载)。
+    fn report_progress(
+        frag_index: u32,
+        total_written: u64,
+        progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
+    ) {
+        if let Some(tx) = progress_tx {
+            let _ = tx
+                .try_send(FragmentProgress {
+                    fragment_index: frag_index,
+                    completed: false,
+                    fragment_downloaded: total_written,
+                })
+                .map_err(|e| {
+                    tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
+                });
+        }
+        tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
     }
 
     /// 下载单个分片(一次尝试)
@@ -1509,46 +1561,25 @@ impl DownloadTask {
             let chunk = chunk_result?;
             // 零拷贝优化: 大 chunk 直接写入,跳过 BytesMut 聚合
             if chunk.len() >= WRITE_BATCH_BYTES && write_buf.is_empty() {
-                // 流式哈希: 直接在写入前更新
-                if let Some(ref mut h) = hasher {
-                    h.update(&chunk);
-                }
-                let chunk_len = u64::try_from(chunk.len())
-                    .map_err(|_| DownloadError::Fragment("chunk 长度溢出".into()))?;
-                let attempted_written = total_written.checked_add(chunk_len).ok_or_else(|| {
-                    DownloadError::Fragment(format!(
-                        "分片写入长度溢出: index={frag_index}, written={total_written}, len={chunk_len}"
-                    ))
-                })?;
-                if attempted_written > expected_len {
-                    return Err(DownloadError::Fragment(format!(
-                        "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
-                    )));
-                }
-                let w =
-                    Self::write_all_at(storage, pos, chunk, &mut control_rx, pause_timeout).await?;
-                pos = pos.checked_add(w).ok_or_else(|| {
-                    DownloadError::Fragment(format!(
-                        "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
-                    ))
-                })?;
+                // BytesMut::from(chunk) 接管网络 chunk,等价于直接持有所有权后写入
+                let (new_pos, w) = Self::flush_batch(
+                    storage,
+                    pos,
+                    bytes::BytesMut::from(chunk),
+                    &mut hasher,
+                    frag_index,
+                    total_written,
+                    expected_len,
+                    &rate_limiter,
+                    &mut control_rx,
+                    pause_timeout,
+                )
+                .await?;
+                pos = new_pos;
                 total_written += w;
                 progress_report_countdown = progress_report_countdown.saturating_sub(1);
-                // 实时令牌桶限速
-                if let Some(ref limiter) = rate_limiter {
-                    limiter.acquire(w).await;
-                }
                 if progress_report_countdown == 0 {
-                    if let Some(tx) = progress_tx {
-                        let _ = tx.try_send(FragmentProgress {
-                            fragment_index: frag_index,
-                            completed: false,
-                            fragment_downloaded: total_written,
-                        }).map_err(|e| {
-                            tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
-                        });
-                    }
-                    tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                    Self::report_progress(frag_index, total_written, progress_tx);
                     progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
                 }
                 continue;
@@ -1559,48 +1590,26 @@ impl DownloadTask {
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
                 let batch = write_buf.split();
-                // 流式哈希:在写入前更新(batch 即将写入,内容不再变化)
-                if let Some(ref mut h) = hasher {
-                    h.update(&batch);
-                }
-                let batch_len = u64::try_from(batch.len())
-                    .map_err(|_| DownloadError::Fragment("分片批量写入长度溢出".into()))?;
-                let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
-                    DownloadError::Fragment(format!(
-                        "分片写入长度溢出: index={frag_index}, written={total_written}, len={batch_len}"
-                    ))
-                })?;
-                if attempted_written > expected_len {
-                    return Err(DownloadError::Fragment(format!(
-                        "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
-                    )));
-                }
-                let w = Self::write_all_at_mut(storage, pos, batch, &mut control_rx, pause_timeout)
-                    .await?;
-                pos = pos.checked_add(w).ok_or_else(|| {
-                    DownloadError::Fragment(format!(
-                        "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
-                    ))
-                })?;
+                let (new_pos, w) = Self::flush_batch(
+                    storage,
+                    pos,
+                    batch,
+                    &mut hasher,
+                    frag_index,
+                    total_written,
+                    expected_len,
+                    &rate_limiter,
+                    &mut control_rx,
+                    pause_timeout,
+                )
+                .await?;
+                pos = new_pos;
                 total_written += w;
-                // 实时令牌桶限速
-                if let Some(ref limiter) = rate_limiter {
-                    limiter.acquire(w).await;
-                }
             }
             // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
             // countdown 也能正常重置,避免 u64 下溢 panic
             if progress_report_countdown == 0 {
-                if let Some(tx) = progress_tx {
-                    let _ = tx.try_send(FragmentProgress {
-                        fragment_index: frag_index,
-                        completed: false,
-                        fragment_downloaded: total_written,
-                    }).map_err(|e| {
-                        tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
-                    });
-                }
-                tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                Self::report_progress(frag_index, total_written, progress_tx);
                 progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
             }
         }
@@ -1609,43 +1618,25 @@ impl DownloadTask {
             // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
             // split() 抽取当前全部内容并清空 self,语义等价且适配借用。
             let batch = write_buf.split();
-            // 流式哈希:尾块也需更新
-            if let Some(ref mut h) = hasher {
-                h.update(&batch);
-            }
-            let batch_len = u64::try_from(batch.len())
-                .map_err(|_| DownloadError::Fragment("分片剩余写入长度溢出".into()))?;
-            let attempted_written = total_written.checked_add(batch_len).ok_or_else(|| {
-                DownloadError::Fragment(format!(
-                    "分片写入长度溢出: index={frag_index}, written={total_written}, len={batch_len}"
-                ))
-            })?;
-            if attempted_written > expected_len {
-                return Err(DownloadError::Fragment(format!(
-                    "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
-                )));
-            }
-            let w =
-                Self::write_all_at_mut(storage, pos, batch, &mut control_rx, pause_timeout).await?;
+            let (_new_pos, w) = Self::flush_batch(
+                storage,
+                pos,
+                batch,
+                &mut hasher,
+                frag_index,
+                total_written,
+                expected_len,
+                &rate_limiter,
+                &mut control_rx,
+                pause_timeout,
+            )
+            .await?;
             total_written += w;
-            // 实时令牌桶限速(最终刷写)
-            if let Some(ref limiter) = rate_limiter {
-                limiter.acquire(w).await;
-            }
         }
         // 与原始 is_multiple_of 行为对齐:当 chunk 总数为 PROGRESS_REPORT_CHUNK_INTERVAL
         // 整数倍时,尾刷再发送一次进度事件(可能重复)。
         if progress_report_countdown == PROGRESS_REPORT_CHUNK_INTERVAL {
-            if let Some(tx) = progress_tx {
-                let _ = tx.try_send(FragmentProgress {
-                    fragment_index: frag_index,
-                    completed: false,
-                    fragment_downloaded: total_written,
-                }).map_err(|e| {
-                    tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
-                });
-            }
-            tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
+            Self::report_progress(frag_index, total_written, progress_tx);
         }
 
         let actual_written = total_written.saturating_sub(resume_offset);
@@ -6237,6 +6228,94 @@ mod tests {
 
         // 旧代码会 panic,修复后应正常完成
         task.run().await.expect("小 chunk 流式下载不应 panic");
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    /// 验证:多 chunk 分片流式下载后,download_single_fragment 内部按网络到达顺序
+    /// (=字节序)流式 update 的 blake3 哈希,最终 computed_hash 等于 blake3(该分片完整字节)。
+    ///
+    /// 这是 flush_batch 重构(提取 download_single_fragment 中四段重复的
+    /// hash-update/越界检查/写/限速代码)的回归护栏:重构后多 chunk 到达时,
+    /// 哈希仍必须按顺序累积,computed_hash 不得错位或丢失。
+    ///
+    /// 关键约束:execute() 在 fragments.len() <= 1 时会路由到 execute_full_download
+    /// (该路径不计算 computed_hash)。为真正覆盖 download_single_fragment 的流式哈希,
+    /// 这里强制 2 个分片,使执行进入 execute_fragmented_download → download_single_fragment。
+    #[tokio::test]
+    async fn test_multi_chunk_fragment_computed_hash_matches() {
+        // 100_000 字节,chunk_size=1000(远小于 WRITE_BATCH_BYTES=256KB,走批量聚合分支),
+        // 每个分片 50_000 字节 → 每分片 50 个小 chunk,验证多 chunk 累积哈希正确性。
+        let total_size = 100_000u64;
+        let frag_size = total_size / 2; // 50_000,强制 2 个分片
+        let chunk_size = 1000usize;
+
+        let data = Bytes::from(vec![0xABu8; total_size as usize]);
+
+        // 每个分片的 expected hash = blake3(该分片字节范围)
+        let verifier = CpuVerifier::blake3();
+        let expected_hash_frag0 = verifier.compute_hash(&data[0..frag_size as usize]).unwrap();
+        let expected_hash_frag1 = verifier
+            .compute_hash(&data[frag_size as usize..total_size as usize])
+            .unwrap();
+
+        let protocol: Arc<dyn Protocol> = Arc::new(SmallChunkProtocol {
+            meta: test_metadata("multi-chunk-hash.bin", total_size),
+            chunk_size,
+            total_data: data.clone(),
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/multi-chunk-hash.bin".into(),
+            DownloadConfig {
+                verify_checksum: true,
+                max_concurrent_fragments: 1,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        // min==max==frag_size,配合 default_target_fragments=16 使 base=6250 被 clamp
+        // 到 50_000,从而规划出恰好 2 个分片(进入分片下载路径)。
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        // 分步执行:run() 内部会调 plan(),而 expected hash 必须在 plan 之后、execute 之前
+        // 设置到 frag.info.hash(否则 compute_hash 为 false,不会计算流式哈希)。
+        // control_rx 为 None(测试构造),各步骤直接执行无需 select 竞速。
+        task.probe().await.expect("probe 应成功");
+        task.init_storage().await.expect("init_storage 应成功");
+        task.plan().expect("plan 应成功");
+        assert_eq!(
+            task.fragments.len(),
+            2,
+            "应规划为 2 个分片以覆盖分片下载路径"
+        );
+        // 关键:为每个分片注入 expected hash,触发 compute_hash = true 的流式哈希计算
+        task.fragments[0].info.hash = Some(expected_hash_frag0.clone());
+        task.fragments[1].info.hash = Some(expected_hash_frag1.clone());
+        task.prepare_storage()
+            .await
+            .expect("prepare_storage 应成功");
+        task.execute().await.expect("execute 应成功");
+        task.verify().await.expect("verify 应通过(哈希匹配)");
+        // 分步执行复刻 run_inner 的流程:verify 成功后由调用方置为 Completed
+        // (run_inner 在第 1887 行做同样的事),以断言终态。
+        task.state = DownloadState::Completed;
+
+        // 断言:每个分片流式计算的 computed_hash 等于 blake3(该分片完整字节)
+        assert_eq!(
+            task.fragments[0].computed_hash,
+            Some(expected_hash_frag0),
+            "分片 0 多 chunk 流式哈希应等于 blake3(分片 0 字节范围)"
+        );
+        assert_eq!(
+            task.fragments[1].computed_hash,
+            Some(expected_hash_frag1),
+            "分片 1 多 chunk 流式哈希应等于 blake3(分片 1 字节范围)"
+        );
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
