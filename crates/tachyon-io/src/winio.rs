@@ -37,6 +37,12 @@ pub struct WinFile {
     /// 惰性初始化的 buffered fallback 句柄(仅 no_buffering=true 时使用)
     #[allow(dead_code)]
     fallback: FallbackHandle,
+    /// Windows: seek_write 由 SetFilePointerEx + WriteFile 构成,非原子操作。
+    /// 多任务并发 seek_write 同一 per-handle 文件指针会互相覆盖写入位置。
+    /// 双缓冲(网络读与落盘重叠)会使并发写成为常态,故用 Mutex 串行化保护。
+    /// 非 Windows: seek_write 原子(基于 pread/pwrite),此字段不使用。
+    #[allow(dead_code)]
+    write_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl WinFile {
@@ -59,6 +65,7 @@ impl WinFile {
             file: Arc::new(file),
             no_buffering: true,
             fallback: Mutex::new(None),
+            write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -80,6 +87,7 @@ impl WinFile {
             file: Arc::new(file),
             no_buffering: false,
             fallback: Mutex::new(None),
+            write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -98,6 +106,7 @@ impl WinFile {
             file: Arc::new(file),
             no_buffering: false,
             fallback: Mutex::new(None),
+            write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -254,7 +263,10 @@ impl AsyncStorage for WinFile {
                 self.file.clone()
             };
 
+            let write_lock = self.write_lock.clone();
             tokio::task::spawn_blocking(move || {
+                // seek_write 非原子,串行化保证并发写不交错文件指针
+                let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
                 target_file
                     .seek_write(&data, offset)
                     .map_err(DownloadError::Io)
@@ -299,7 +311,10 @@ impl AsyncStorage for WinFile {
 
             let data_ptr = data.as_mut_ptr() as usize;
             let data_len = data.len();
+            let write_lock = self.write_lock.clone();
             tokio::task::spawn_blocking(move || {
+                // seek_write 非原子,串行化保证并发写不交错文件指针
+                let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
                 // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
                 let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 target_file
@@ -755,5 +770,56 @@ mod tests {
         let read = file2.read_at(0, &mut buf).await.unwrap();
         assert_eq!(read, 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    /// WinFile 的 write_at 经 spawn_blocking 调用 seek_write
+    /// (SetFilePointerEx + WriteFile 两步,非原子),且无 write_lock 保护。
+    /// 同一 per-handle 文件指针是多任务共享状态,并发 seek_write 不同 offset
+    /// 会互相覆盖文件指针位置,导致写入错位。此测试验证并发写不交错。
+    /// 参考实现 tokio_file.rs::test_windows_concurrent_write_at_no_interleave
+    /// 因有 write_lock 而通过;WinFile 缺 write_lock,当前预期失败(RED)。
+    ///
+    /// 用 open_standard(no_buffering=false)使所有写都走主句柄的 seek_write
+    /// (无 fallback 分流),并多轮迭代以提高竞态检出概率。
+    #[cfg(target_os = "windows")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_write_at_no_interleave() {
+        const ROUNDS: usize = 20;
+        const CONCURRENCY: u8 = 32;
+        const REGION: usize = 256;
+        let total = (CONCURRENCY as usize) * REGION;
+
+        for round in 0..ROUNDS {
+            let tmp = NamedTempFile::new().unwrap();
+            let storage = WinFile::open_standard(tmp.path()).await.unwrap();
+            storage.allocate(total as u64).await.unwrap();
+            let storage = std::sync::Arc::new(storage);
+
+            // 并发写:每个 i 写到 offset=i*REGION,内容全部为 i(REGION 字节)
+            let mut handles = Vec::new();
+            for i in 0u8..CONCURRENCY {
+                let s = storage.clone();
+                handles.push(tokio::spawn(async move {
+                    let offset = (i as u64) * REGION as u64;
+                    let data = Bytes::from(vec![i; REGION]);
+                    s.write_at(offset, data).await.unwrap();
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            // 逐区域回读,断言全部等于 i(不应出现交错)
+            for i in 0u8..CONCURRENCY {
+                let offset = (i as u64) * REGION as u64;
+                let mut buf = [0u8; REGION];
+                let read = storage.read_at(offset, &mut buf).await.unwrap();
+                assert_eq!(read, REGION);
+                assert!(
+                    buf.iter().all(|&b| b == i),
+                    "round {round} 区域 {offset} 数据不一致,期望全部为 {i}"
+                );
+            }
+        }
     }
 }
