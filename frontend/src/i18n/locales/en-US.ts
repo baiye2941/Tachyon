@@ -3,11 +3,9 @@ const enUS = {
   "status.idle": "Idle",
   "status.downloading": "Downloading",
   "status.countSummary": "{active} active · {paused} paused · {total} total",
-  "status.unlimited": "Unlimited",
-  "status.speedLimit": "Speed Limit",
-  "status.speedLimitTooltip": "Speed limit settings coming soon",
-  "status.feedback": "Feedback",
-  "status.feedbackTooltip": "Feedback feature coming soon",
+  "status.theme.toggle": "Toggle light/dark theme",
+  "status.theme.light": "Light theme",
+  "status.theme.dark": "Dark theme",
 
   // —— Common ——
   "common.loading": "Loading...",

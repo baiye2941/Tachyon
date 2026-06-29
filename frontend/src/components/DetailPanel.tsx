@@ -40,6 +40,7 @@ import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr, type MessageKey } from "../i18n";
 import SpeedChart from "./SpeedChart";
+import InfoRow from "./DetailInfoRow";
 import Button from "../shared/ui/Button";
 import { inferFailure, parseHfUrl, type FailureInsight } from "../utils/errorReason";
 import { buildHfMirrorUrl } from "../utils/hfMirror";
@@ -542,14 +543,13 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* File Info — 质感:扁平容器 + 文件图标加微妙背景,模拟胶囊感 */}
+          {/* File Info — 去 AI 味:实色容器 + 边框分层,移除装饰性高光渐变 */}
           <div
             class="flex items-center gap-3"
             style={{
               padding: "14px 20px 16px",
               "max-width": "100%",
-              background:
-                "linear-gradient(180deg, rgba(255,255,255,0.018) 0%, transparent 100%)",
+              background: "transparent",
               "border-bottom": "1px solid var(--color-border-subtle)",
             }}
           >
@@ -559,11 +559,10 @@ export default function DetailPanel(props: DetailPanelProps) {
                 width: "40px",
                 height: "40px",
                 color: fileInfo().color,
-                background: "rgba(255, 255, 255, 0.025)",
+                background: "var(--color-bg-tertiary)",
                 "border-radius": "10px",
                 border: "1px solid var(--color-border-subtle)",
-                "box-shadow":
-                  "inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 1px 2px rgba(0, 0, 0, 0.2)",
+                "box-shadow": "var(--shadow-sm)",
               }}
             >
               {(() => {
@@ -625,23 +624,19 @@ export default function DetailPanel(props: DetailPanelProps) {
                 color: "var(--color-text-title)",
                 "line-height": "1",
                 "letter-spacing": "-0.03em",
-                /* 质感:数字微下沉投影,做出物理刻度感 */
-                "text-shadow": "0 1px 0 rgba(0, 0, 0, 0.35)",
               }}
             >
               {((task()?.progress || 0) * 100).toFixed(1)}%
             </div>
 
-            {/* Progress bar — 质感:凹槽感(inset shadow) + 进度条上沿高光 */}
+            {/* Progress bar — 去 AI 味:实色凹槽,移除多层 inset 阴影 */}
             <div
               class="relative overflow-hidden w-full"
               style={{
                 height: "6px",
                 "margin-top": "14px",
                 "border-radius": "9999px",
-                background: "rgba(0, 0, 0, 0.32)",
-                "box-shadow":
-                  "inset 0 1px 1px rgba(0, 0, 0, 0.4), inset 0 -1px 0 rgba(255, 255, 255, 0.03)",
+                background: "var(--color-bg-tertiary)",
               }}
             >
               <div
@@ -960,40 +955,3 @@ export default function DetailPanel(props: DetailPanelProps) {
   );
 }
 
-function InfoRow(props: {
-  label: string;
-  value: string;
-  copyable?: boolean;
-  copied?: boolean;
-  onCopy?: () => void;
-}) {
-  return (
-    <div class="detail-info-row">
-      <div class="min-w-0 flex-1 overflow-hidden">
-        <div class="detail-info-label">{props.label}</div>
-        <div class="detail-info-value">{props.value}</div>
-      </div>
-      <Show when={props.copyable}>
-        <button
-          class="icon-btn-sm"
-          style={{ "flex-shrink": 0, width: "24px", height: "24px" }}
-          onClick={() => props.onCopy?.()}
-          aria-label={props.copied ? tr("detail.copied.aria") : tr("detail.copy.aria")}
-          title={props.copied ? tr("detail.copied.aria") : tr("detail.copy.aria")}
-        >
-          <Show when={props.copied} fallback={<CopyIcon />}>
-            <span
-              style={{
-                color: "var(--color-accent-primary)",
-                "font-size": "12px",
-                "font-weight": 700,
-              }}
-            >
-              &#10003;
-            </span>
-          </Show>
-        </button>
-      </Show>
-    </div>
-  );
-}

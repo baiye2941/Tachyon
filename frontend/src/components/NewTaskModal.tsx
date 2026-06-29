@@ -296,9 +296,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           width: "var(--panel-modal-width, 480px)",
           "border-radius": "16px",
           padding: "24px",
-          /* 质感:多层阴影 + 顶部 1px inset 高光,移除旧 glow */
-          "box-shadow":
-            "var(--shadow-xl), inset 0 1px 0 rgba(255, 255, 255, 0.06)",
+          /* 去 AI 味:实色 + shadow,移除 inset 装饰高光 */
+          "box-shadow": "var(--shadow-xl)",
           animation: "toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1)",
         }}
         onClick={(e) => e.stopPropagation()}
@@ -695,7 +694,6 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           <Button
             variant="primary"
             size="md"
-            class="hover-lift"
             disabled={validCount() === 0 || creating()}
             loading={creating()}
             onClick={handleSubmit}

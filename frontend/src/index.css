@@ -1,6 +1,7 @@
 /* Tachyon Design System - Global Styles */
 /* Tailwind CSS v4 - Vite Plugin Mode */
-/* Brand: Agnes Tachyon - 实验室仪表盘,深黑操作台 / 紫色试剂反应 / 青色电子读数 */
+/* Brand: Tachyon - 深空操作台 / 赛马娘青绿速度轴 / 电青读数 / 粉星光点缀
+   设计取向:Linear 克制留白 + FluxDown 分片密度,去 AI 味(去饱和/去辉光/去玻璃拟态) */
 
 @import "tailwindcss";
 
@@ -8,38 +9,54 @@
     第一层:Primitive Tokens(原始色板,不直接使用)
    ============================================ */
 @theme {
-  /* ===== Near Black 基底(实验室暗室,纯灰阶无色偏)===== */
-  --black-0: #050505;
-  --black-1: #080808;
-  --black-2: #0a0a0a;
-  --black-3: #0d0d0d;
-  --black-4: #111111;
-  --black-5: #161618;
+  /* ===== Near Black 基底(深空冷蓝灰阶,Linear #08090A 系,纯灰阶无暖偏)===== */
+  --black-0: #050608;
+  --black-1: #08090c;
+  --black-2: #0a0b0f;
+  --black-3: #0d0e13;
+  --black-4: #111319;
+  --black-5: #16181f;
 
-  /* ===== Graphite / Gunmetal / Charcoal 中性阶 ===== */
-  --graphite-1: #1c1c1f;
-  --graphite-2: #232327;
-  --graphite-3: #2c2c31;
-  --gunmetal: #3a3a40;
-  --charcoal: #4a4a50;
-  --ash: #6b6b72;
-  --silver: #9a9aa2;
-  --platinum: #c9c9d0;
-  --porcelain: #ededf0;
-  --white-pure: #f7f7fa;
+  /* ===== Graphite / Gunmetal / Charcoal 中性阶(冷灰蓝调)===== */
+  --graphite-1: #1a1d24;
+  --graphite-2: #23262e;
+  --graphite-3: #2c3038;
+  --gunmetal: #3a3f48;
+  --charcoal: #4a4f59;
+  --ash: #6b7280;
+  --silver: #9aa0ac;
+  --platinum: #c9cdd6;
+  --porcelain: #edeff3;
+  --white-pure: #f7f8fa;
 
-  /* ===== Tachyon Violet(主强调,Agnes Tachyon 标志色)===== */
+  /* ===== Tachyon Teal(主强调,赛马娘赛道青绿,去饱和档)
+     原始赛马娘 #00C7B1 饱和度过高,降一档到 teal-500 #14b8a6,
+     对应 LCH 饱和约 38%(去 AI 味:避免荧光绿感),冷调贴合"快子"速度语义。 ===== */
+  --teal-300: #5eead4;
+  --teal-400: #2dd4bf;
+  --teal-500: #14b8a6;
+  --teal-600: #0d9488;
+  --teal-700: #0f766e;
+
+  /* ===== Rose Sparkle(完成态静态点缀,赛马娘星光粉,去饱和档)
+     仅用于完成态的静态星点/图例,禁动画。原 #ff79d0 降到 #f472b6。 ===== */
+  --rose-300: #f9a8d4;
+  --rose-400: #f472b6;
+  --rose-500: #ec4899;
+
+  /* ===== Violet(历史主强调,降权保留:primitive 仍定义但 semantic 不再绑定主强调)
+     保留是为避免破坏性引用,后续渐进迁移清理。仅 file-audio 等次要分类色沿用。 ===== */
   --violet-300: #c4b5fd;
   --violet-400: #a78bfa;
   --violet-500: #8b5cf6;
   --violet-600: #7c3aed;
   --violet-700: #6d28d9;
 
-  /* ===== Electric Purple(次强调,关键操作高亮)===== */
+  /* ===== Electric Purple(次强调,关键操作高亮,降权)===== */
   --purple-400: #c084fc;
   --purple-500: #a855f7;
 
-  /* ===== Neon Cyan(点缀,仅实时下载速度指示)===== */
+  /* ===== Neon Cyan(实时下载速度专用,能量隐喻,严格限制使用范围)===== */
   --cyan-400: #22d3ee;
   --cyan-500: #00e5ff;
 
@@ -79,10 +96,13 @@
   --color-bg-raised: var(--graphite-2);
   --color-bg-overlay: var(--graphite-1);
   --color-bg-hover: rgba(255, 255, 255, 0.04);
+  /* 滚动条拇指色(light 主题覆盖为黑色 rgba,保证浅底可见) */
+  --color-scrollbar-thumb: rgba(255, 255, 255, 0.08);
+  --color-scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
   /* Modal/弹窗遮罩 scrim(Iteration 06:统一原散落的 rgba(0,0,0,0.4~0.6)) */
   --color-overlay-scrim: rgba(0, 0, 0, 0.55);
   /* 比 accent-soft 更淡的强调底色(细微 hover 高亮) */
-  --color-accent-faint: rgba(139, 92, 246, 0.04);
+  --color-accent-faint: rgba(20, 184, 166, 0.04);
 
   /* 兼容旧引用:bg-secondary 在 DetailPanel 中仍被引用 */
   --color-bg-card: var(--graphite-1);
@@ -101,30 +121,33 @@
   /* 兼容旧引用 */
   --color-text-title: var(--porcelain);
 
-  /* 强调色(严格控制使用频率)
-     spec 6.2:max 1 accent,saturation < 80%。primitive violet-500 饱和度 92% 偏高,
-     在交互场景一律走 muted/soft 变体以避免"AI 紫"过度感。 */
-  --color-accent-primary: var(--violet-500);
-  --color-accent-secondary: var(--violet-400);
-  --color-accent-tertiary: var(--violet-600);
-  --color-accent-glow: rgba(139, 92, 246, 0.15);
-  --color-accent-glow-strong: rgba(139, 92, 246, 0.3);
-  --color-accent-soft: rgba(139, 92, 246, 0.1);
+  /* 强调色(严格控制使用频率,去 AI 味:辉光 alpha 大幅降低)
+     spec 6.2:max 1 accent。主强调切到赛马娘青绿 teal-500,饱和度比 violet 低,
+     冷调中性,避免"AI 紫"荧光感。辉光/软底 alpha 统一压到 0.04-0.10。 */
+  --color-accent-primary: var(--teal-500);
+  --color-accent-secondary: var(--teal-400);
+  --color-accent-tertiary: var(--teal-600);
+  --color-accent-glow: rgba(20, 184, 166, 0.10);
+  --color-accent-glow-strong: rgba(20, 184, 166, 0.20);
+  --color-accent-soft: rgba(20, 184, 166, 0.08);
+  /* 粉星光:完成态静态点缀专用,不参与交互态 */
+  --color-sparkle: var(--rose-400);
+  --color-sparkle-soft: rgba(244, 114, 182, 0.10);
 
   /* 速度指示(Neon Cyan,仅实时下载速度数字与 sparkline) */
   --color-speed-active: var(--cyan-500);
-  --color-speed-soft: rgba(0, 229, 255, 0.12);
-  /* 信息/警告的柔和底色(筛选激活态,Iteration 06) */
-  --color-info-soft: rgba(34, 211, 238, 0.3);
-  --color-warning-soft: rgba(245, 158, 11, 0.3);
+  --color-speed-soft: rgba(0, 229, 255, 0.10);
+  /* 信息/警告的柔和底色(筛选激活态) */
+  --color-info-soft: rgba(34, 211, 238, 0.24);
+  --color-warning-soft: rgba(245, 158, 11, 0.24);
 
-  /* 状态语义:紫(下载中)/ 灰(暂停)/ 翠绿(完成)/ 琥珀(警告)/ 红(错误) */
+  /* 状态语义:青绿(下载中,品牌绑定活跃态)/ 灰(暂停)/ 翠绿(完成)/ 琥珀(警告)/ 红(错误) */
   --color-success: var(--emerald-500);
   --color-warning: var(--amber-500);
   --color-error: var(--red-500);
   --color-info: var(--cyan-400);
 
-  --color-status-downloading: var(--violet-500);
+  --color-status-downloading: var(--teal-500);
   --color-status-paused: var(--ash);
   --color-status-completed: var(--emerald-500);
   --color-status-warning: var(--amber-500);
@@ -132,21 +155,21 @@
   --color-status-pending: var(--charcoal);
   --color-status-connecting: var(--cyan-400);
   --color-status-verifying: var(--cyan-400);
-  --color-status-resuming: var(--violet-400);
+  --color-status-resuming: var(--teal-400);
 
-  /* Thread 颜色精简:12 色彩虹 → 5 阶单色 */
-  --color-thread-0: var(--violet-500);
-  --color-thread-1: var(--violet-400);
-  --color-thread-2: var(--violet-600);
+  /* Thread 颜色:青绿 3 阶主轴 + 电紫区分 + cyan 点缀(去彩虹,冷调单色系) */
+  --color-thread-0: var(--teal-500);
+  --color-thread-1: var(--teal-400);
+  --color-thread-2: var(--teal-600);
   --color-thread-3: var(--purple-500);
   --color-thread-4: var(--cyan-500);
-  --color-thread-5: var(--violet-500);
-  --color-thread-6: var(--violet-400);
+  --color-thread-5: var(--teal-500);
+  --color-thread-6: var(--teal-400);
   --color-thread-7: var(--purple-500);
-  --color-thread-8: var(--violet-600);
+  --color-thread-8: var(--teal-600);
   --color-thread-9: var(--cyan-500);
-  --color-thread-10: var(--violet-500);
-  --color-thread-11: var(--violet-400);
+  --color-thread-10: var(--teal-500);
+  --color-thread-11: var(--teal-400);
 
   /* File Type Colors(保留功能性分类色,降低饱和度) */
   --color-file-video: var(--amber-500);
@@ -192,7 +215,7 @@
   /* inset 高光:模拟从上方光源照射的边缘高光,关键质感细节 */
   --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.1);
-  --shadow-glow: 0 0 20px rgba(139, 92, 246, 0.15);
+  --shadow-glow: 0 0 20px rgba(20, 184, 166, 0.10);
   --shadow-accent: 0 0 0 1px var(--color-accent-glow);
 
   /* Typography */
@@ -262,7 +285,7 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--color-scrollbar-thumb);
   border-radius: 4px;
   /* 上下加 2px 透明 border,thumb 视觉收窄到 4px,hover 时填满 */
   background-clip: content-box;
@@ -271,7 +294,7 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--color-scrollbar-thumb-hover);
   background-clip: content-box;
 }
 
@@ -296,18 +319,16 @@ body {
   border-width: 0;
 }
 
-/* Global focus-visible utility for keyboard navigation - 双层增强(紫 + 白光晕) */
+/* Global focus-visible utility for keyboard navigation - 单层青绿焦点环(去 AI 味:移除双层白光晕) */
 .focus-visible:focus-visible {
   outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
 }
 
 /* 焦点环工具类:供 Tailwind focus-visible: 覆盖不到的自定义元素使用(如 TaskItem) */
 .focus-ring:focus-visible {
   outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
 }
 
 /* 搜索高亮:供 TaskItem HighlightedText 的 <mark> 使用 */
@@ -318,15 +339,16 @@ body {
   padding: 0 2px;
 }
 
+/* 去 AI 呟:移除玻璃拟态 backdrop-filter,改实色 + 边框分层(Linear "felt not seen") */
 .glass {
-  background: rgba(16, 16, 20, 0.85);
+  background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-subtle);
 }
 
+/* glass-blur 仅保留给真正脱离文档流的浮层(tooltip/命令面板等),此处与 glass 同义,
+   具体 backdrop-filter 由使用方内联指定,避免全局默认开启 */
 .glass-blur {
-  background: rgba(16, 16, 20, 0.85);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-subtle);
 }
 
@@ -457,14 +479,13 @@ body {
   position: absolute;
   z-index: 20;
   padding: 8px 12px;
-  background: rgba(16, 16, 20, 0.92);
+  background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-default);
   border-radius: 8px;
   display: flex;
   align-items: center;
   gap: 10px;
   pointer-events: none;
-  backdrop-filter: blur(12px);
   animation: tooltip-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
   white-space: nowrap;
   box-shadow:
@@ -567,11 +588,11 @@ body {
 @keyframes drag-glow {
   0%,
   100% {
-    box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.4);
+    box-shadow: inset 0 0 0 2px rgba(20, 184, 166, 0.3);
   }
 
   50% {
-    box-shadow: inset 0 0 0 2px rgba(139, 92, 246, 0.8);
+    box-shadow: inset 0 0 0 2px rgba(20, 184, 166, 0.6);
   }
 }
 
@@ -636,14 +657,6 @@ body {
   transition: all 200ms var(--ease-spring);
 }
 
-.btn:hover {
-  transform: translateY(-2px);
-}
-
-.btn:active {
-  transform: translateY(0);
-}
-
 /* 主按钮:质感细节—上沿 inset 高光 + 多层下沉阴影,模拟物理按键 */
 .btn-primary {
   display: inline-flex;
@@ -669,19 +682,18 @@ body {
     0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
+/* 去 AI 味:hover 移除 translateY 上浮,改纯背景提亮 */
 .btn-primary:hover {
   background: var(--color-accent-secondary);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.18),
     inset 0 -1px 0 rgba(0, 0, 0, 0.12),
     0 2px 6px rgba(0, 0, 0, 0.35);
-  transform: translateY(-1px);
 }
 
 .btn-primary:focus-visible {
   outline: 2px solid var(--color-accent-primary);
   outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgba(247, 247, 250, 0.12);
 }
 
 .btn-primary:disabled {
@@ -702,21 +714,20 @@ body {
   border: 1px solid var(--color-border-default);
   cursor: pointer;
   transition: all 200ms var(--ease-spring);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--color-bg-hover);
   color: var(--color-text-primary);
   padding: 8px 16px;
   border-radius: var(--radius-md);
   letter-spacing: -0.01em;
-  /* 质感:上沿 1px 高光,模拟从上方光源的轻微反射 */
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.04),
     0 1px 2px rgba(0, 0, 0, 0.2);
 }
 
+/* 去 AI 味:hover 移除 translateY 上浮,纯背景/边框色变 */
 .btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--color-border-subtle);
   border-color: var(--color-border-strong);
-  transform: translateY(-1px);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.06),
     0 2px 6px rgba(0, 0, 0, 0.3);
@@ -751,11 +762,11 @@ body {
 }
 .btn-ghost:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 .btn-ghost:active {
   transform: scale(0.97);
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--color-border-strong);
 }
 .btn-ghost:focus-visible {
   outline: 2px solid var(--color-accent-primary);
@@ -819,7 +830,7 @@ body {
 
 /* Input Base — 质感:实色底 + 上沿微高光,focus 时双层光环 */
 .input {
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--color-bg-hover);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);
   padding: 10px 12px;
@@ -838,16 +849,16 @@ body {
 
 .input:hover {
   border-color: var(--color-border-strong);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--color-border-subtle);
 }
 
 .input:focus {
   border-color: var(--color-accent-secondary);
-  /* 焦点环:外层 violet 软光 + 内层细紧贴边线 */
+  /* 焦点环:单层青绿软光(去 AI 味:移除双层叠加) */
   box-shadow:
     0 0 0 3px var(--color-accent-soft),
     inset 0 1px 1px rgba(0, 0, 0, 0.12);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--color-border-subtle);
   outline: 2px solid transparent;
 }
 
@@ -898,7 +909,7 @@ body {
 
 .hover-light:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 
 .hover-accent {
@@ -934,24 +945,22 @@ body {
 
 .hover-lift {
   transition:
-    transform 200ms var(--ease-spring),
-    box-shadow 200ms var(--ease-spring);
+    box-shadow 200ms var(--ease-spring),
+    background 200ms var(--ease-spring);
 }
 
+/* 去 AI 味:移除 translateY 上浮,改纯阴影层级变化(Linear 克制) */
 .hover-lift:hover {
-  /* 去 AI 味:translate 从 -2px 减到 -1px,移除 violet 着色阴影 */
-  transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
 }
 
 .hover-lift-sm {
   transition:
-    transform 150ms ease,
-    box-shadow 150ms ease;
+    box-shadow 150ms ease,
+    background 150ms ease;
 }
 
 .hover-lift-sm:hover {
-  transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
@@ -960,7 +969,7 @@ body {
 }
 
 .hover-row:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--color-bg-hover);
 }
 
 /* ============================================
@@ -986,8 +995,8 @@ body {
 .task-row--selected {
   background: linear-gradient(
     90deg,
-    rgba(139, 92, 246, 0.08) 0%,
-    rgba(139, 92, 246, 0.025) 50%,
+    rgba(20, 184, 166, 0.07) 0%,
+    rgba(20, 184, 166, 0.02) 50%,
     transparent 100%
   );
   box-shadow: inset 2px 0 0 var(--color-accent-primary);
@@ -996,8 +1005,8 @@ body {
 .task-row--selected:hover {
   background: linear-gradient(
     90deg,
-    rgba(139, 92, 246, 0.12) 0%,
-    rgba(139, 92, 246, 0.04) 50%,
+    rgba(20, 184, 166, 0.11) 0%,
+    rgba(20, 184, 166, 0.04) 50%,
     transparent 100%
   );
 }
@@ -1005,9 +1014,9 @@ body {
 .task-row--multi-selected {
   background: linear-gradient(
     90deg,
-    rgba(139, 92, 246, 0.14) 0%,
-    rgba(139, 92, 246, 0.06) 50%,
-    rgba(139, 92, 246, 0.01) 100%
+    rgba(20, 184, 166, 0.13) 0%,
+    rgba(20, 184, 166, 0.05) 50%,
+    rgba(20, 184, 166, 0.01) 100%
   );
   box-shadow: inset 2px 0 0 var(--color-accent-primary);
 }
@@ -1039,7 +1048,7 @@ body {
 
 .icon-btn:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 
 .icon-btn:focus-visible {
@@ -1074,7 +1083,7 @@ body {
 
 .icon-btn-sm:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 
 .icon-btn-sm:focus-visible {
@@ -1100,7 +1109,7 @@ body {
 
 .win-btn:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 
 .win-btn-close:hover {
@@ -1125,11 +1134,11 @@ body {
 
 .pill-btn-default {
   color: var(--color-text-tertiary);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--color-bg-hover);
 }
 
 .pill-btn-default:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--color-border-subtle);
   color: var(--color-text-primary);
 }
 
@@ -1208,7 +1217,7 @@ body {
   z-index: 90;
   display: flex;
   flex-direction: column;
-  background: rgba(16, 16, 20, 0.95);
+  background: var(--color-bg-elevated);
   border-left: 1px solid var(--color-border-subtle);
   box-shadow: -8px 0 32px rgba(0, 0, 0, 0.3);
   transition: transform 300ms cubic-bezier(0.32, 0.72, 0, 1);
@@ -1276,12 +1285,12 @@ body {
 }
 
 .hover-light:active {
-  background: rgba(255, 255, 255, 0.1) !important;
+  background: var(--color-border-strong) !important;
   transform: scale(0.98);
 }
 
 .hover-accent:active {
-  background: rgba(139, 92, 246, 0.15) !important;
+  background: rgba(20, 184, 166, 0.15) !important;
   transform: scale(0.98);
 }
 
@@ -1301,45 +1310,27 @@ body {
 }
 
 .hover-row:active {
-  background: rgba(255, 255, 255, 0.06) !important;
+  background: var(--color-border-strong) !important;
 }
 
 /* ============================================
-   Progress Bar Shimmer
-   紫→深紫微动,仅在真正写入数据时启用
+   Progress Bar Active
+   去 AI 味:移除 shimmer 动画,改为静态 teal 填充,仅靠颜色区分活跃态
    ============================================ */
-@keyframes progress-shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
-}
-
 .progress-bar-active {
-  /* 去 AI 味:从三色亮 shimmer 改为同色微亮度差,降低视觉骚动 */
-  background: linear-gradient(
-    90deg,
-    var(--violet-500) 0%,
-    var(--violet-400) 50%,
-    var(--violet-500) 100%
-  ) !important;
-  background-size: 200% 100% !important;
-  animation: progress-shimmer 3s linear infinite;
+  background: var(--color-status-downloading) !important;
 }
 
 /* ============================================
    Task Item Stagger Entry
+   去 AI 味:移除 translateY 位移,改为纯 opacity 淡入,降低视觉骚动
    ============================================ */
 @keyframes task-enter {
   0% {
     opacity: 0;
-    transform: translateY(8px);
   }
   100% {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 
@@ -1354,13 +1345,13 @@ body {
 @keyframes status-breathe {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.3);
+    box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.25);
     opacity: 1;
   }
   50% {
-    /* 去 AI 味:6px 模糊降到 3px,opacity 范围 1→0.8 收窄到 1→0.85 */
-    box-shadow: 0 0 3px 1px rgba(139, 92, 246, 0.15);
-    opacity: 0.85;
+    /* 去 AI 味:6px→3px,opacity 范围 1→0.85 再收到 1→0.9 */
+    box-shadow: 0 0 3px 1px rgba(20, 184, 166, 0.12);
+    opacity: 0.9;
   }
 }
 
@@ -1388,7 +1379,7 @@ body {
 .status-badge--downloading {
   color: var(--color-status-downloading);
   background: var(--color-accent-soft);
-  border-color: rgba(139, 92, 246, 0.18);
+  border-color: rgba(20, 184, 166, 0.18);
   /* 下载中脉冲(spec 8.1):subtle opacity 呼吸 */
   animation: status-pulse 1.8s ease-in-out infinite;
 }
@@ -1406,7 +1397,7 @@ body {
 }
 .status-badge--paused {
   color: var(--color-text-secondary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
   border-color: var(--color-border-subtle);
 }
 .status-badge--failed {
@@ -1417,7 +1408,7 @@ body {
 .status-badge--pending,
 .status-badge--cancelled {
   color: var(--color-text-tertiary);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--color-bg-hover);
   border-color: var(--color-border-subtle);
 }
 
@@ -1427,17 +1418,17 @@ body {
 @keyframes input-drag-glow {
   0%,
   100% {
-    border-color: rgba(139, 92, 246, 0.4);
-    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
+    border-color: rgba(20, 184, 166, 0.3);
+    box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.06);
   }
   50% {
-    border-color: rgba(139, 92, 246, 0.7);
-    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15);
+    border-color: rgba(20, 184, 166, 0.6);
+    box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.12);
   }
 }
 
 .input-drag-over {
-  border-color: rgba(139, 92, 246, 0.5) !important;
+  border-color: rgba(20, 184, 166, 0.5) !important;
   animation: input-drag-glow 1.2s ease-in-out infinite;
 }
 
@@ -1509,7 +1500,7 @@ body {
   top: 100%;
   margin-top: 4px;
   min-width: 160px;
-  background: rgba(28, 28, 31, 0.98);
+  background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);
   padding: 4px;
@@ -1537,7 +1528,7 @@ body {
 
 .detail-menu-item:hover {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--color-bg-hover);
 }
 
 .detail-error-box {
@@ -1585,8 +1576,8 @@ body {
 }
 .detail-category-badge--auth {
   color: var(--color-accent-primary);
-  background: rgba(139, 92, 246, 0.1);
-  border-color: rgba(139, 92, 246, 0.2);
+  background: rgba(20, 184, 166, 0.1);
+  border-color: rgba(20, 184, 166, 0.2);
 }
 .detail-category-badge--network,
 .detail-category-badge--ssl {
@@ -1777,11 +1768,11 @@ body {
 /* Custom scrollbar for detail panel */
 .overflow-y-auto {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  scrollbar-color: var(--color-scrollbar-thumb) transparent;
 }
 
 .overflow-y-auto:hover {
-  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  scrollbar-color: var(--color-scrollbar-thumb-hover) transparent;
 }
 
 .overflow-y-auto::-webkit-scrollbar {
@@ -1793,12 +1784,12 @@ body {
 }
 
 .overflow-y-auto::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--color-scrollbar-thumb);
   border-radius: 3px;
 }
 
 .overflow-y-auto:hover::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.22);
+  background: var(--color-scrollbar-thumb-hover);
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -1931,3 +1922,132 @@ body {
 .hf-filter-search::placeholder {
   color: var(--color-text-tertiary);
 }
+
+/* ============================================
+   Light Theme(明亮主题,data-theme="light" 覆盖)
+   设计原则:暗色 token 体系完整镜像,禁纯白 #fff / 禁纯黑 #000,
+   背景用浅冷灰白,文字用深灰,主强调青绿在浅底提亮一档保证 WCAG AA(正文≥4.5:1)。
+   辉光在浅底下 alpha 进一步压低(浅底对透明色叠加效果弱)。
+   ============================================ */
+[data-theme="light"] {
+  /* 背景层级:反转为浅冷灰白(Linear 浅底系,非纯白) */
+  --black-0: #f4f5f7;
+  --black-1: #eceef1;
+  --black-2: #fafafa;
+  --black-3: #f4f5f7;
+  --black-4: #eceef1;
+  --black-5: #ffffff;
+  --graphite-1: #e4e7eb;
+  --graphite-2: #d8dce2;
+  --graphite-3: #c8cdd5;
+  --gunmetal: #9ca3af;
+  --charcoal: #6b7280;
+  --ash: #9ca3af;
+  --silver: #6b7280;
+  --platinum: #3a3f48;
+  --porcelain: #1a1d24;
+  --white-pure: #0a0b0f;
+
+  /* 边框:反转为深色 rgba(浅底下用黑色低透明度) */
+  --color-bg-hover: rgba(0, 0, 0, 0.04);
+  --color-scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --color-scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+
+  /* 文本:反转为深灰(非纯黑) */
+  --color-text-primary: var(--platinum);
+  --color-text-secondary: var(--silver);
+  --color-text-tertiary: var(--ash);
+  --color-text-disabled: var(--gunmetal);
+  --color-text-inverse: var(--black-2);
+  --color-text-title: var(--porcelain);
+
+  /* 强调色:浅底提亮一档(teal-600 作 primary,对比度≥4.5:1) */
+  --color-accent-primary: var(--teal-600);
+  --color-accent-secondary: var(--teal-500);
+  --color-accent-tertiary: var(--teal-700);
+  --color-accent-glow: rgba(13, 148, 136, 0.08);
+  --color-accent-glow-strong: rgba(13, 148, 136, 0.16);
+  --color-accent-soft: rgba(13, 148, 136, 0.06);
+  --color-accent-faint: rgba(13, 148, 136, 0.03);
+
+  /* 速度色:浅底下用 cyan-600 提亮 */
+  --color-speed-active: #0891b2;
+  --color-speed-soft: rgba(8, 145, 178, 0.08);
+  --color-info-soft: rgba(8, 145, 178, 0.16);
+  --color-warning-soft: rgba(217, 119, 6, 0.16);
+
+  /* 状态色:浅底提亮一档保证对比 */
+  --color-success: #059669;
+  --color-error: #dc2626;
+  --color-info: #0891b2;
+  --color-status-downloading: var(--teal-600);
+  --color-status-paused: var(--ash);
+  --color-status-completed: #059669;
+  --color-status-warning: #d97706;
+  --color-status-error: #dc2626;
+  --color-status-pending: var(--gunmetal);
+  --color-status-connecting: #0891b2;
+  --color-status-verifying: #0891b2;
+  --color-status-resuming: var(--teal-500);
+
+  /* Thread 色:浅底同步提亮 */
+  --color-thread-0: var(--teal-600);
+  --color-thread-1: var(--teal-500);
+  --color-thread-2: var(--teal-700);
+  --color-thread-5: var(--teal-600);
+  --color-thread-6: var(--teal-500);
+  --color-thread-8: var(--teal-700);
+  --color-thread-10: var(--teal-600);
+
+  /* 遮罩:浅底下用深色 scrim */
+  --color-overlay-scrim: rgba(15, 23, 42, 0.4);
+
+  /* 阴影:浅底下阴影更柔和但可见 */
+  --shadow-sm:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-md:
+    0 2px 4px rgba(15, 23, 42, 0.08),
+    0 8px 16px rgba(15, 23, 42, 0.10);
+  --shadow-lg:
+    0 4px 8px rgba(15, 23, 42, 0.10),
+    0 16px 32px rgba(15, 23, 42, 0.14);
+  --shadow-xl:
+    0 8px 16px rgba(15, 23, 42, 0.12),
+    0 24px 56px rgba(15, 23, 42, 0.18);
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --shadow-glow: 0 0 20px rgba(13, 148, 136, 0.08);
+}
+
+/* Light 主题下的组件微调:边框/玻璃类跟随浅底 */
+[data-theme="light"] .glass,
+[data-theme="light"] .glass-blur {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+}
+
+[data-theme="light"] .task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.02) 0%,
+    rgba(0, 0, 0, 0.01) 50%,
+    transparent 100%
+  );
+}
+
+/* Light 主题:基础组件类已改用 --color-bg-hover / --color-border-* token,
+   这些 token 在本块已覆盖为黑色 rgba,故无需组件级镜像。仅保留少量特殊处理。 */
+
+/* toggle 关态:浅底下白拇指浮浅灰轨道对比不足,改深色拇指 + 轨道边框 */
+[data-theme="light"] .toggle {
+  background: var(--graphite-3);
+  border: 1px solid var(--color-border-default);
+}
+
+[data-theme="light"] .toggle-thumb {
+  background: var(--color-bg-elevated);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2);
+}
+
+/* 滚动条已通过 --color-scrollbar-thumb token 自动覆盖,无需组件级镜像 */

@@ -1,6 +1,11 @@
 /* Tachyon Icon System - SVG Icons */
 /* All icons are 24x24 viewBox, stroke-based, 1.5px stroke width */
 
+/**
+ * Tachyon Logo:快子(超光速粒子)几何标识。
+ * 去 AI 味:菱形主体 + 中心点保留速度意象,十字辅助线 opacity 0.5→0.35 收敛,
+ * 避免过度装饰。赛马娘"速度"主题的克制表达。
+ */
 export const LogoIcon = (props: { class?: string }) => (
   <svg
     class={props.class}
@@ -23,7 +28,7 @@ export const LogoIcon = (props: { class?: string }) => (
       stroke="currentColor"
       stroke-width="1"
       stroke-linecap="round"
-      opacity="0.5"
+      opacity="0.35"
     />
   </svg>
 );
@@ -950,5 +955,40 @@ export const StarIcon = (props: { class?: string }) => (
     stroke-linejoin="round"
   >
     <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+  </svg>
+);
+
+/** 太阳图标(明亮主题切换,浅色模式标识) */
+export const SunIcon = (props: { class?: string }) => (
+  <svg
+    class={props.class}
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+  </svg>
+);
+
+/** 月亮图标(暗黑主题切换,深色模式标识) */
+export const MoonIcon = (props: { class?: string }) => (
+  <svg
+    class={props.class}
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
   </svg>
 );

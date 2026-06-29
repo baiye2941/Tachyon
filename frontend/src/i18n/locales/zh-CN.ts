@@ -3,11 +3,9 @@ const zhCN = {
   "status.idle": "空闲",
   "status.downloading": "下载中",
   "status.countSummary": "{active} 活跃 · {paused} 暂停 · {total} 总计",
-  "status.unlimited": "无限制",
-  "status.speedLimit": "限速设置",
-  "status.speedLimitTooltip": "限速设置暂未开放",
-  "status.feedback": "反馈",
-  "status.feedbackTooltip": "反馈功能暂未开放",
+  "status.theme.toggle": "切换明暗主题",
+  "status.theme.light": "明亮主题",
+  "status.theme.dark": "暗黑主题",
 
   // —— 通用 ——
   "common.loading": "加载中...",

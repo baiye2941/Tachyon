@@ -1,11 +1,12 @@
 import { createMemo } from "solid-js";
-import { ArrowDownIcon, ChevronDownIcon } from "./icons";
+import { ArrowDownIcon, SunIcon, MoonIcon } from "./icons";
 import Sparkline from "./Sparkline";
 import Button from "../shared/ui/Button";
 import LanguageSwitcher from "../shared/ui/LanguageSwitcher";
 import { formatSpeed } from "../utils/format";
 import { getHistory } from "../stores/speedHistory";
 import { useI18n } from "../i18n";
+import { useTheme } from "../hooks/useTheme";
 
 interface StatusBarProps {
   isIdle: boolean;
@@ -17,6 +18,7 @@ interface StatusBarProps {
 
 export default function StatusBar(props: StatusBarProps) {
   const i18n = useI18n();
+  const { theme, toggleTheme } = useTheme();
 
   // 真实速度历史:取最近 30 个采样点,删除 Math.random 伪造数据
   const speedHistory = createMemo(() => {
@@ -89,25 +91,19 @@ export default function StatusBar(props: StatusBarProps) {
 
       {/* Right */}
       <div class="flex items-center gap-3">
+        {/* 明暗主题切换:读写 localStorage + data-theme,去 AI 味的实色图标无辉光 */}
         <Button
           variant="ghost"
-          size="sm"
-          class="flex items-center gap-1"
-          aria-label={i18n.t("status.speedLimit") as string}
-          disabled
-          title={i18n.t("status.speedLimitTooltip") as string}
+          shape="icon-sm"
+          aria-label={i18n.t("status.theme.toggle") as string}
+          title={
+            (theme() === "dark"
+              ? i18n.t("status.theme.light")
+              : i18n.t("status.theme.dark")) as string
+          }
+          onClick={toggleTheme}
         >
-          <span>{i18n.t("status.unlimited")}</span>
-          <ChevronDownIcon />
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label={i18n.t("status.feedback") as string}
-          disabled
-          title={i18n.t("status.feedbackTooltip") as string}
-        >
-          {i18n.t("status.feedback")}
+          {theme() === "dark" ? <SunIcon /> : <MoonIcon />}
         </Button>
         <LanguageSwitcher />
       </div>

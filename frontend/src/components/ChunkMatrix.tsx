@@ -23,7 +23,8 @@ const AGGREGATE_BLOCKS = 100;
 const MAX_BLOCKS_PER_ROW = 25;
 const MIN_BLOCKS_PER_ROW = 8;
 const BLOCK_SIZE = 14;
-const BLOCK_GAP = 3;
+/* 去 AI 味:缝隙 3→2,对齐 FluxDown gap-[1.5px] 紧凑密度 */
+const BLOCK_GAP = 2;
 
 interface ChunkData {
   index: number;
@@ -248,7 +249,8 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
     const pulse = Math.sin(phase * Math.PI * 2);
     const pending = pendingColor();
-    const radius = 3;
+    /* 去 AI 味:圆角 3→2,对齐 DOM 模式 */
+    const radius = 2;
     const perRow = blocksPerRow();
 
     blockList.forEach((block, i) => {
@@ -272,8 +274,9 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       ctx.globalAlpha = 1;
 
       if (block.status === "done") {
+        /* 去 AI 味:完成态阴影 2→1,降低辉光 */
         ctx.shadowColor = `${block.color}66`;
-        ctx.shadowBlur = 2;
+        ctx.shadowBlur = 1;
         ctx.stroke();
         ctx.shadowBlur = 0;
       }
@@ -396,7 +399,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
         <Show
           when={shouldAggregate()}
           fallback={
-            <div class="flex flex-wrap" style={{ gap: "3px" }} ref={gridRef}>
+            <div class="flex flex-wrap" style={{ gap: "2px" }} ref={gridRef}>
               <For each={chunks()}>
                 {(chunk) => (
                   <div
@@ -404,15 +407,14 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                     style={{
                       width: "14px",
                       height: "14px",
-                      "border-radius": "3px",
+                      "border-radius": "2px",
                       background: chunk.isDone
                         ? chunk.color
                         : chunk.isDownloading
                           ? chunk.color
                           : "var(--color-bg-tertiary)",
-                      "box-shadow": chunk.isDone
-                        ? `inset 0 0 0 1px ${chunk.color}40`
-                        : "none",
+                      /* 去 AI 味:移除完成格 inset 描边,改纯填充 */
+                      "box-shadow": "none",
                       animation: chunk.isDownloading
                         ? `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards, chunk-pulse 1.5s ease-in-out infinite`
                         : `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards`,

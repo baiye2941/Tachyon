@@ -173,7 +173,7 @@ function CategorySection(props: {
                       'font-size': '10px',
                       'font-weight': 600,
                       color: 'var(--color-accent-primary)',
-                      background: 'rgba(139, 92, 246, 0.1)',
+                      background: 'var(--color-accent-soft)',
                       padding: '1px 4px',
                       'border-radius': '3px',
                       'margin-right': '8px',

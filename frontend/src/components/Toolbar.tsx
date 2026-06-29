@@ -208,7 +208,6 @@ export default function Toolbar(props: ToolbarProps) {
               <Button
                 variant="primary"
                 size="md"
-                class="hover-lift"
                 onClick={props.onNewTask}
                 aria-label={i18n.t("toolbar.newDownload") as string}
                 title={i18n.t("toolbar.newDownload") as string}
