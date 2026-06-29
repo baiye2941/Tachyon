@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, it, expect, vi } from 'vitest'
 import { render, fireEvent } from '@solidjs/testing-library'
 import TaskItem from '../TaskItem'
