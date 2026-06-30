@@ -3,6 +3,7 @@ use super::{
     VerifyStatus,
 };
 use std::path::Path;
+use tachyon_core::config::HfSourceMode;
 use tachyon_hub::classify_file;
 use tauri::State;
 
@@ -58,16 +59,25 @@ fn validate_file_path(path: &str) -> Result<(), AppError> {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+/// 读取当前 HF 源模式(从 AppConfig,配置驱动)
+///
+/// 锁失败视为配置损坏,降级为默认 Mirror。
+async fn current_hf_source_mode(state: &AppState) -> HfSourceMode {
+    state.domain.config.lock().await.hub.source_mode
+}
+
 /// 列出 HuggingFace 仓库文件
 #[tauri::command]
 pub async fn list_repo_files(
+    state: State<'_, AppState>,
     repo_id: String,
     revision: Option<String>,
 ) -> Result<Vec<tachyon_hub::api::HfFile>, AppError> {
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.list_files(&repo_id, &rev).await.map_err(AppError::Core)
 }
@@ -75,6 +85,7 @@ pub async fn list_repo_files(
 /// 获取 HuggingFace 文件下载 URL
 #[tauri::command]
 pub async fn get_hf_download_url(
+    state: State<'_, AppState>,
     repo_id: String,
     revision: Option<String>,
     file_path: String,
@@ -83,7 +94,8 @@ pub async fn get_hf_download_url(
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
     validate_file_path(&file_path)?;
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     Ok(api.download_url(&repo_id, &rev, &file_path))
 }
@@ -91,13 +103,15 @@ pub async fn get_hf_download_url(
 /// 获取模型元数据
 #[tauri::command]
 pub async fn get_model_info(
+    state: State<'_, AppState>,
     repo_id: String,
     revision: Option<String>,
 ) -> Result<tachyon_hub::api::HfModelInfo, AppError> {
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.model_info(&repo_id, &rev).await.map_err(AppError::Core)
 }
@@ -105,6 +119,7 @@ pub async fn get_model_info(
 /// 搜索模型
 #[tauri::command]
 pub async fn search_models(
+    state: State<'_, AppState>,
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<tachyon_hub::api::HfModelInfo>, AppError> {
@@ -112,7 +127,8 @@ pub async fn search_models(
         return Err(AppError::Config("搜索查询不能为空".into()));
     }
     let limit = limit.unwrap_or(20).min(50);
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.search_models(&query, limit)
         .await
@@ -186,7 +202,8 @@ pub async fn verify_model(
     validate_revision(&rev)?;
 
     // 获取远程文件列表用于比对
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     let remote_files = api
         .list_files(&repo_id, &rev)
@@ -315,7 +332,8 @@ pub async fn add_model_favorite(
     let key = format!("fav_{repo_id}");
 
     // 尝试缓存模型元数据
-    let cached_info = match tachyon_hub::api::HubApi::from_env() {
+    let mode = current_hf_source_mode(&state).await;
+    let cached_info = match tachyon_hub::api::HubApi::from_mode(mode) {
         Ok(api) => api.model_info(&repo_id, "main").await.ok(),
         Err(_) => None,
     };
@@ -378,7 +396,8 @@ pub async fn batch_create_hf_tasks(
         return Err(AppError::Config("文件列表不能为空".into()));
     }
 
-    let api = tachyon_hub::api::HubApi::from_env()
+    let mode = current_hf_source_mode(&state).await;
+    let api = tachyon_hub::api::HubApi::from_mode(mode)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
 
     let mut task_ids = Vec::new();

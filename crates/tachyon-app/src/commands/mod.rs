@@ -645,42 +645,45 @@ pub(crate) fn build_download_config(app_config: &AppConfig, download_dir: &str) 
     download
 }
 
-/// 自动将 huggingface.co 替换为 HF_ENDPOINT 镜像地址
+/// 按配置的源模式处理 HuggingFace 下载 URL
 ///
-/// 检测逻辑:
-/// 1. 如果设置了 HF_ENDPOINT 环境变量,替换 URL 中的 huggingface.co → HF_ENDPOINT
-/// 2. 如果未设置,检查是否能连接 huggingface.co,不能则自动使用 hf-mirror.com
+/// 行为随 `HfSourceMode` 变化:
+/// - `Official`: 不改写,直连 huggingface.co
+/// - `Mirror`/`Race`: 将 huggingface.co 替换为 hf-mirror.com(国内可达)
+///   Race 模式下官方源由调用方作为 mirror_urls 竞速源注入(见 hf_race_counterpart_url)
 ///
-/// 安全约束: HF_ENDPOINT 必须通过 validate_public_http_url 校验(与全局 SSRF 防护一致),
-/// 否则忽略环境变量以防止 SSRF。
-pub(crate) fn rewrite_hf_url(url: &str) -> String {
+/// 安全约束: 仅当 URL 含 `huggingface.co` 时才考虑改写;目标
+/// 固定为 hf-mirror.com(硬编码常量,不读环境变量,与 SSRF 全局策略一致)。
+pub(crate) fn rewrite_hf_url(url: &str, mode: tachyon_core::config::HfSourceMode) -> String {
     if !url.contains("huggingface.co") {
         return url.to_string();
     }
-
-    let mirror = std::env::var("HF_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        // 安全校验: 多层防护,与全局 SSRF 体系一致
-        // 1. 强制 HTTPS(HuggingFace 下载不应使用 HTTP 明文传输)
-        // 2. 无路径穿越(不允许 .. 绕过 URL 路径)
-        // 3. validate_public_http_url: 拒绝内网 IP/localhost(核心 SSRF 防护)
-        .filter(|s| {
-            if !s.starts_with("https://") || s.contains("..") {
-                return false;
+    match mode {
+        tachyon_core::config::HfSourceMode::Official => url.to_string(),
+        tachyon_core::config::HfSourceMode::Mirror | tachyon_core::config::HfSourceMode::Race => {
+            let rewritten = url.replace("https://huggingface.co", "https://hf-mirror.com");
+            if rewritten != url {
+                tracing::info!(original = %url, rewritten = %rewritten, mode = ?mode, "HF 下载切换至镜像源");
             }
-            let Ok(parsed) = url::Url::parse(s) else {
-                return false;
-            };
-            tachyon_core::safety::validate_public_http_url(&parsed).is_ok()
-        })
-        .unwrap_or_else(|| "https://hf-mirror.com".to_string());
-
-    let rewritten = url.replace("https://huggingface.co", &mirror);
-    if rewritten != url {
-        tracing::info!(original = %url, rewritten = %rewritten, "HF 下载自动切换至镜像源");
+            rewritten
+        }
     }
-    rewritten
+}
+
+/// 构造 HF 竞速的对立源 URL(Race 模式注入用)
+///
+/// 主源是官方(`huggingface.co`)则返回镜像(`hf-mirror.com`),反之亦然,
+/// 保证 Race 模式下官方与镜像同时参与竞速。仅对 resolve URL(含 huggingface.co
+/// 或 hf-mirror.com)生效,CDN 子域不匹配但注入点用的是 download_url() 构造的
+/// resolve URL,替换安全。
+pub(crate) fn hf_race_counterpart_url(url: &str) -> Option<String> {
+    if url.contains("huggingface.co") {
+        Some(url.replace("huggingface.co", "hf-mirror.com"))
+    } else if url.contains("hf-mirror.com") {
+        Some(url.replace("hf-mirror.com", "huggingface.co"))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +716,7 @@ pub(crate) mod tests {
             connection: ConnectionConfig::default(),
             scheduler: Default::default(),
             magnet: Default::default(),
+            hub: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
         // favorites_store 必须使用独立临时目录,不能与 task_store 共用同一目录:
@@ -994,54 +998,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_rewrite_hf_url_rejects_non_https_endpoint() {
-        // HF_ENDPOINT 设置为 http:// (非 https) 应被忽略,回退到默认镜像
-        // Safety: 测试代码,仅修改当前进程环境变量,无跨线程风险
-        unsafe { std::env::set_var("HF_ENDPOINT", "http://evil.com") };
-        let result = rewrite_hf_url("https://huggingface.co/model.bin");
-        assert!(
-            result.contains("hf-mirror.com"),
-            "非 HTTPS HF_ENDPOINT 应被忽略: {result}"
+    fn test_rewrite_hf_url_official_no_rewrite() {
+        // Official 模式:不改写,直连官方
+        let result = rewrite_hf_url(
+            "https://huggingface.co/owner/repo/resolve/main/model.bin",
+            tachyon_core::config::HfSourceMode::Official,
         );
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        assert_eq!(
+            result, "https://huggingface.co/owner/repo/resolve/main/model.bin",
+            "Official 模式应保持官方 URL: {result}"
+        );
     }
 
     #[test]
-    fn test_rewrite_hf_url_rejects_path_traversal() {
-        // HF_ENDPOINT 包含 .. 应被忽略
-        // Safety: 测试代码,仅修改当前进程环境变量,无跨线程风险
-        unsafe { std::env::set_var("HF_ENDPOINT", "https://evil.com/../huggingface.co") };
-        let result = rewrite_hf_url("https://huggingface.co/model.bin");
+    fn test_rewrite_hf_url_mirror_rewrites() {
+        // Mirror 模式:替换为 hf-mirror.com
+        let result = rewrite_hf_url(
+            "https://huggingface.co/owner/repo/resolve/main/model.bin",
+            tachyon_core::config::HfSourceMode::Mirror,
+        );
         assert!(
             result.contains("hf-mirror.com"),
-            "含路径穿越的 HF_ENDPOINT 应被忽略: {result}"
+            "Mirror 模式应替换为镜像: {result}"
         );
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        assert!(
+            !result.contains("huggingface.co"),
+            "Mirror 模式替换后不应残留官方域名: {result}"
+        );
     }
 
     #[test]
-    fn test_rewrite_hf_url_rejects_private_ip() {
-        // HF_ENDPOINT 指向内网 IP 应被 SSRF 防护拦截
-        // Safety: 测试代码,仅修改当前进程环境变量,无跨线程风险
-        unsafe { std::env::set_var("HF_ENDPOINT", "https://192.168.1.1") };
-        let result = rewrite_hf_url("https://huggingface.co/model.bin");
+    fn test_rewrite_hf_url_race_rewrites_to_mirror() {
+        // Race 模式:主源改写为镜像(国内可达),官方由 hf_race_counterpart_url 注入竞速
+        let result = rewrite_hf_url(
+            "https://huggingface.co/owner/repo/resolve/main/model.bin",
+            tachyon_core::config::HfSourceMode::Race,
+        );
         assert!(
             result.contains("hf-mirror.com"),
-            "内网 IP HF_ENDPOINT 应被 SSRF 防护拦截: {result}"
+            "Race 模式主源应改写为镜像: {result}"
         );
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        assert!(
+            !result.contains("huggingface.co"),
+            "Race 模式主源不应残留官方域名: {result}"
+        );
     }
 
     #[test]
-    fn test_rewrite_hf_url_accepts_valid_https() {
-        // Safety: 测试代码,仅修改当前进程环境变量,无跨线程风险
-        unsafe { std::env::set_var("HF_ENDPOINT", "https://my-mirror.example.com") };
-        let result = rewrite_hf_url("https://huggingface.co/model.bin");
-        assert!(
-            result.contains("my-mirror.example.com"),
-            "合法 HTTPS HF_ENDPOINT 应被使用: {result}"
+    fn test_rewrite_hf_url_non_hf_untouched() {
+        // 非 HF URL 任何模式都不改写
+        let result = rewrite_hf_url(
+            "https://example.com/file.bin",
+            tachyon_core::config::HfSourceMode::Mirror,
         );
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
+        assert_eq!(result, "https://example.com/file.bin");
+    }
+
+    #[test]
+    fn test_hf_race_counterpart_url() {
+        // 主源官方 → 对立源镜像
+        let mirror =
+            hf_race_counterpart_url("https://huggingface.co/owner/repo/resolve/main/f.bin");
+        assert_eq!(
+            mirror.as_deref(),
+            Some("https://hf-mirror.com/owner/repo/resolve/main/f.bin")
+        );
+        // 主源镜像 → 对立源官方
+        let official =
+            hf_race_counterpart_url("https://hf-mirror.com/owner/repo/resolve/main/f.bin");
+        assert_eq!(
+            official.as_deref(),
+            Some("https://huggingface.co/owner/repo/resolve/main/f.bin")
+        );
+        // 非 HF URL 无对立源
+        assert!(hf_race_counterpart_url("https://example.com/f.bin").is_none());
     }
 
     // ── ConfirmationStore 测试(P1-11b) ──────────────────────────────

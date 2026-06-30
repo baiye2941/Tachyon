@@ -628,6 +628,7 @@ mod tests {
             },
             scheduler: tachyon_core::config::SchedulerConfig::default(),
             magnet: tachyon_core::config::MagnetConfig::default(),
+            hub: tachyon_core::config::HubConfig::default(),
         }
     }
 
@@ -662,6 +663,7 @@ mod tests {
                 enable_quic,
             }),
             magnet: None,
+            ..Default::default()
         }
     }
 
@@ -709,6 +711,7 @@ mod tests {
                 enable_quic: Some(true),
             }),
             magnet: None,
+            ..Default::default()
         };
         update_config_inner(&state, patch).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
@@ -740,6 +743,7 @@ mod tests {
             }),
             connection: None,
             magnet: None,
+            ..Default::default()
         };
         update_config_inner(&state, setup_patch).await.unwrap();
 
@@ -756,6 +760,7 @@ mod tests {
                 enable_quic: Some(true),
             }),
             magnet: None,
+            ..Default::default()
         };
         update_config_inner(&state, partial_patch).await.unwrap();
         let cfg = get_config_inner(&state).await.unwrap();
@@ -897,6 +902,7 @@ mod tests {
             },
             scheduler: tachyon_core::config::SchedulerConfig::default(),
             magnet: tachyon_core::config::MagnetConfig::default(),
+            hub: tachyon_core::config::HubConfig::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
@@ -1028,6 +1034,7 @@ mod tests {
             download: None,
             connection: None,
             magnet: None,
+            ..Default::default()
         };
         update_config_inner(&state, empty_patch).await.unwrap();
         let after = get_config_inner(&state).await.unwrap();
@@ -1069,6 +1076,7 @@ mod tests {
                 enable_quic: Some(true),
             }),
             magnet: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&patch).unwrap();
         let deserialized: ConfigPatch = serde_json::from_str(&json).unwrap();

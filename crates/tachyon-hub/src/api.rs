@@ -123,6 +123,25 @@ impl HubApi {
         })
     }
 
+    /// 按配置的源模式创建客户端
+    ///
+    /// endpoint 由 `HfSourceMode::list_endpoint()` 决定(配置驱动,取代纯环境变量)。
+    /// Race 模式浏览走官方端点保证元数据最新;下载时镜像由 mirror_urls 竞速注入。
+    /// endpoint 仍过 validate_public_http_url 校验,SSRF 防护与 from_env 一致。
+    pub fn from_mode(
+        mode: tachyon_core::config::HfSourceMode,
+    ) -> Result<Self, tachyon_core::DownloadError> {
+        let endpoint = mode.list_endpoint().to_string();
+        let url: url::Url =
+            url::Url::parse(&endpoint).map_err(tachyon_core::DownloadError::UrlParse)?;
+        tachyon_core::validate_public_http_url(&url)?;
+        Ok(Self {
+            endpoint,
+            token: token::load_token(),
+            http: new_http_client()?,
+        })
+    }
+
     /// 使用自定义 endpoint 创建
     ///
     /// 可能因 HTTP 客户端初始化失败返回错误。

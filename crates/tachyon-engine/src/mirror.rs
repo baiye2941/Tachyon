@@ -27,13 +27,27 @@ use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 ///   失败后并行竞速所有镜像源
 ///
 /// 显著减少镜像切换时的等待时间,避免顺序 fallback 的串行延迟累积。
+/// probe 选中的源(协议 + 对应 URL)
+type SelectedSource = (Arc<dyn Protocol>, String);
+
+/// 多镜像源 Protocol 适配器
+///
+/// 包装主源和备用源列表,采用 Happy Eyeballs v2 (RFC 8305) 并行竞速策略:
+/// - **probe**: 同时向所有源发起 HEAD 探测,选择最先响应的源
+/// - **download**: 使用 probe 选中的源;若 probe 未执行,则优先尝试主源(500ms 超时),
+///   失败后并行竞速所有镜像源
+///
+/// 显著减少镜像切换时的等待时间,避免顺序 fallback 的串行延迟累积。
 pub(crate) struct MirrorProtocol {
     /// 主下载源
     primary: Arc<dyn Protocol>,
     /// 备用镜像源列表 (url, protocol)
     mirrors: Vec<(String, Arc<dyn Protocol>)>,
     /// probe 选中的源(由 probe 竞速设置,后续 download 方法优先使用)
-    selected: Arc<Mutex<Option<Arc<dyn Protocol>>>>,
+    ///
+    /// 同时记录选中源对应的 URL。probe 选中镜像后,后续 download 必须用该镜像 URL
+    /// 而非主源 URL,否则镜像协议会拿着主源 URL 请求镜像服务器导致失败。
+    selected: Arc<Mutex<Option<SelectedSource>>>,
 }
 
 /// 主源快速尝试超时 (Happy Eyeballs 核心参数)
@@ -61,7 +75,7 @@ impl MirrorProtocol {
     /// 执行流程: selected 快径 -> 主源 500ms 快速尝试 -> 镜像并行竞速
     /// `download_fn` 抽象具体下载操作(范围/流式/全量),接收 Protocol 和 URL 返回异步结果
     async fn race_download<T: Send + 'static>(
-        selected: &Arc<Mutex<Option<Arc<dyn Protocol>>>>,
+        selected: &Arc<Mutex<Option<SelectedSource>>>,
         primary: Arc<dyn Protocol>,
         mirrors: &[(String, Arc<dyn Protocol>)],
         url: &str,
@@ -74,9 +88,23 @@ impl MirrorProtocol {
         + 'static,
         error_label: &str,
     ) -> DownloadResult<T> {
-        // 1. 优先使用 probe 选中的源
-        if let Some(sel) = selected.lock().await.clone() {
-            return download_fn(sel, url.to_string()).await;
+        // 1. 优先使用 probe 选中的源及其对应 URL;失败则清空选中,落到全源竞速
+        //
+        // 不能在 selected 命中时直接 return:probe 阶段某源可能"伪成功"(如 DNS 污染下
+        // 官方源返回 200/302),被选中后实际下载却失败。若不回退,镜像永远不被尝试,
+        // 表现为"竞速模式仍只走主源"。故 selected 仅作优先提示,失败必须回退竞速。
+        //
+        // 注意:必须显式 drop guard 后再清空,否则若在持锁期间再次 lock 会死锁
+        // (tokio::sync::Mutex 不可重入)。
+        let selected_clone = selected.lock().await.clone();
+        if let Some((sel, sel_url)) = selected_clone {
+            match download_fn(sel, sel_url).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::info!(error = %e, "probe 选中源下载失败,回退全源竞速");
+                    *selected.lock().await = None;
+                }
+            }
         }
 
         // 2. 快速尝试主源(500ms 超时)
@@ -148,34 +176,34 @@ impl Protocol for MirrorProtocol {
             if mirrors.is_empty() {
                 let result = primary.probe(&url).await;
                 if result.is_ok() {
-                    *selected.lock().await = Some(primary);
+                    *selected.lock().await = Some((primary, url.clone()));
                 }
                 return result;
             }
 
             // Happy Eyeballs: 并行竞速所有源的 probe
-            // 用 (index, protocol) 标记每个源,以便获胜时记录选中项
+            // 用 (index, protocol, url) 标记每个源,以便获胜时记录选中项及对应 URL
             let mut set = JoinSet::new();
             set.spawn({
                 let p = primary.clone();
                 let u = url.clone();
-                async move { (0usize, p.clone(), p.probe(&u).await) }
+                async move { (0usize, p.clone(), u.clone(), p.probe(&u).await) }
             });
             for (i, (mirror_url, proto)) in mirrors.iter().enumerate() {
                 let p = proto.clone();
                 let u = mirror_url.clone();
-                set.spawn(async move { (i + 1, p.clone(), p.probe(&u).await) });
+                set.spawn(async move { (i + 1, p.clone(), u.clone(), p.probe(&u).await) });
             }
 
             let mut last_err = None;
             while let Some(result) = set.join_next().await {
                 match result {
-                    Ok((_idx, proto, Ok(meta))) => {
+                    Ok((_idx, proto, sel_url, Ok(meta))) => {
                         set.abort_all();
-                        *selected.lock().await = Some(proto);
+                        *selected.lock().await = Some((proto, sel_url));
                         return Ok(meta);
                     }
-                    Ok((_idx, _proto, Err(e))) => last_err = Some(e),
+                    Ok((_idx, _proto, _url, Err(e))) => last_err = Some(e),
                     Err(e) => {
                         last_err = Some(DownloadError::Io(std::io::Error::other(e.to_string())));
                     }
@@ -274,6 +302,8 @@ mod tests {
         probe_delay: Duration,
         probe_meta: Result<FileMetadata, String>,
         download_data: Result<Bytes, String>,
+        /// 若设置,download_* 收到不匹配此 URL 的请求则失败(用于验证竞速选中后用对 URL)
+        expected_url: Option<String>,
     }
 
     impl MockProtocol {
@@ -289,11 +319,17 @@ mod tests {
                     last_modified: None,
                 }),
                 download_data: Ok(Bytes::from_static(b"mock")),
+                expected_url: None,
             }
         }
 
         fn with_probe_delay(mut self, delay: Duration) -> Self {
             self.probe_delay = delay;
+            self
+        }
+
+        fn with_expected_url(mut self, url: impl Into<String>) -> Self {
+            self.expected_url = Some(url.into());
             self
         }
 
@@ -325,12 +361,23 @@ mod tests {
 
         fn download_range(
             &self,
-            _url: &str,
+            url: &str,
             _start: u64,
             _end: u64,
         ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
             let result = self.download_data.clone();
-            Box::pin(async move { result.map_err(DownloadError::Protocol) })
+            let expected = self.expected_url.clone();
+            let url = url.to_string();
+            Box::pin(async move {
+                if let Some(exp) = expected
+                    && exp != url
+                {
+                    return Err(DownloadError::Protocol(format!(
+                        "URL 不匹配: 期望 {exp}, 实际 {url}"
+                    )));
+                }
+                result.map_err(DownloadError::Protocol)
+            })
         }
 
         fn download_range_stream(
@@ -349,10 +396,21 @@ mod tests {
 
         fn download_full(
             &self,
-            _url: &str,
+            url: &str,
         ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
             let result = self.download_data.clone();
-            Box::pin(async move { result.map_err(DownloadError::Protocol) })
+            let expected = self.expected_url.clone();
+            let url = url.to_string();
+            Box::pin(async move {
+                if let Some(exp) = expected
+                    && exp != url
+                {
+                    return Err(DownloadError::Protocol(format!(
+                        "URL 不匹配: 期望 {exp}, 实际 {url}"
+                    )));
+                }
+                result.map_err(DownloadError::Protocol)
+            })
         }
     }
 
@@ -510,5 +568,107 @@ mod tests {
         let mut stream = result.unwrap();
         let chunk = stream.next().await.unwrap().unwrap();
         assert_eq!(chunk, Bytes::from_static(b"mirror stream"));
+    }
+
+    /// 验证 probe 选中镜像后,后续 download 用选中源对应的 URL 而非主源 URL。
+    ///
+    /// 回归测试:曾因 selected 只存协议不存 URL,导致 probe 选中镜像后 download_range
+    /// 仍传主源 URL,镜像协议拿着主源 URL 请求镜像服务器而失败(HF Race 模式失效)。
+    #[tokio::test]
+    async fn test_download_uses_selected_mirror_url_not_primary_url() {
+        // 主源 probe 失败(模拟官方源国内探测不通),下载也失败
+        let primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Err("primary probe failed".into()))
+                .with_download_data(Err("primary download failed".into())),
+        );
+
+        // 镜像 probe 成功,且只接受镜像 URL(expected_url),收到主源 URL 则失败
+        let mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "model.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                }))
+                .with_download_data(Ok(Bytes::from_static(b"from mirror")))
+                .with_expected_url("http://mirror.com/file"),
+        );
+
+        let mirror_protocol =
+            MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+
+        // probe 竞速:仅镜像成功,选中镜像并记录镜像 URL
+        let meta = mirror_protocol.probe("http://primary.com/file").await;
+        assert!(meta.is_ok(), "probe 应选中镜像成功");
+
+        // 下载:必须用镜像 URL 才能成功。若错误地用主源 URL,镜像会因 expected_url 不匹配而失败
+        let result = mirror_protocol
+            .download_range("http://primary.com/file", 0, 99)
+            .await;
+        assert!(
+            result.is_ok(),
+            "probe 选中镜像后下载应使用镜像 URL,实际错误: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), Bytes::from_static(b"from mirror"));
+    }
+
+    /// 验证 probe 选中源下载失败时,回退到全源竞速(而非锁死在选中源)。
+    ///
+    /// 回归测试:Race 模式下 probe 阶段官方源可能"伪成功"(DNS 污染返回 200/302)被选中,
+    /// 但实际下载失败。若 selected 命中后直接 return 错误,镜像永远不被尝试,
+    /// 表现为"竞速仍只走官方"。修复:selected 失败后清空并落到全源竞速。
+    #[tokio::test]
+    async fn test_download_falls_back_to_race_when_selected_source_fails() {
+        // 官方源 probe 成功(伪成功)但下载失败
+        let primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "model.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                }))
+                .with_download_data(Err("primary download blocked".into())),
+        );
+
+        // 镜像 probe 成功,下载也成功(只接受镜像 URL)
+        let mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "model.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                }))
+                .with_download_data(Ok(Bytes::from_static(b"from mirror")))
+                .with_expected_url("http://mirror.com/file"),
+        );
+
+        let mirror_protocol =
+            MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+
+        // probe:官方先返回成功被选中(selected = 官方源)
+        let meta = mirror_protocol.probe("http://primary.com/file").await;
+        assert!(meta.is_ok(), "probe 应成功(官方伪成功)");
+
+        // 下载:官方(选中源)失败后,必须回退到镜像竞速,而非直接报错
+        let result = mirror_protocol
+            .download_range("http://primary.com/file", 0, 99)
+            .await;
+        assert!(
+            result.is_ok(),
+            "选中源下载失败应回退全源竞速,实际错误: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), Bytes::from_static(b"from mirror"));
     }
 }

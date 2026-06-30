@@ -21,8 +21,8 @@ use crate::commands::task_commands::{
     wait_chunk_reader_done, wait_for_resume_or_cancel,
 };
 use crate::commands::{
-    AppState, TaskCommand, cleanup_runtime, persist_task_snapshot, rewrite_hf_url,
-    update_task_status,
+    AppState, TaskCommand, cleanup_runtime, hf_race_counterpart_url, persist_task_snapshot,
+    rewrite_hf_url, update_task_status,
 };
 use crate::runtime::ChunkReaderJob;
 
@@ -117,8 +117,24 @@ impl DownloadSession {
 
     /// 执行完整下载生命周期
     pub async fn run(mut self) {
-        // HF 镜像: 自动将 huggingface.co 替换为 HF_ENDPOINT 或 hf-mirror.com
-        self.url = rewrite_hf_url(&self.url);
+        // 读取 HF 源模式(配置驱动)。锁失败降级为默认 Mirror。
+        let hf_mode = self.state.domain.config.lock().await.hub.source_mode;
+
+        // 按模式改写 URL:Official 不改写,Mirror/Race 替换为 hf-mirror.com
+        // (Race 浏览与主源均走镜像保证国内可达,官方作为竞速源在下方注入)
+        self.url = rewrite_hf_url(&self.url, hf_mode);
+
+        // Race 模式:注入对立源做竞速(主源镜像则注入官方,主源官方则注入镜像)
+        if matches!(hf_mode, tachyon_core::config::HfSourceMode::Race)
+            && let Some(counterpart) = hf_race_counterpart_url(&self.url)
+        {
+            let mut urls = self.mirror_urls.take().unwrap_or_default();
+            if !urls.iter().any(|u| u == &counterpart) {
+                urls.push(counterpart);
+            }
+            tracing::info!(task_id = %self.task_id, mirrors = urls.len(), "Race 模式注入 HF 竞速源");
+            self.mirror_urls = Some(urls);
+        }
 
         // 1. URL 校验与启动前状态守卫
         let pause_timeout_secs = self.download_config.pause_timeout_secs;

@@ -339,6 +339,43 @@ impl Default for MagnetConfig {
     }
 }
 
+/// HuggingFace 源模式
+///
+/// 控制 HF 仓库浏览与下载时使用的源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum HfSourceMode {
+    /// 直连 huggingface.co 官方源
+    Official,
+    /// 国内镜像 hf-mirror.com(默认,国内加速)
+    #[default]
+    Mirror,
+    /// 官方 + 镜像多源竞速(浏览走镜像保证国内可达,下载时官方+镜像竞速)
+    Race,
+}
+
+impl HfSourceMode {
+    /// 该模式下浏览/列表(list_files)使用的 endpoint
+    ///
+    /// Mirror 与 Race 均走 hf-mirror.com:hf-mirror 提供完整 Hub API,国内可达;
+    /// Official 走官方。Race 的下载阶段才注入官方+镜像竞速,浏览无需走官方。
+    pub fn list_endpoint(self) -> &'static str {
+        match self {
+            HfSourceMode::Official => "https://huggingface.co",
+            HfSourceMode::Mirror | HfSourceMode::Race => "https://hf-mirror.com",
+        }
+    }
+}
+
+/// HuggingFace Hub 配置
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubConfig {
+    /// HF 源模式,默认 Mirror(国内加速)
+    #[serde(default)]
+    pub source_mode: HfSourceMode,
+}
+
 impl MagnetConfig {
     /// 校验配置值
     pub fn validate(&self) -> crate::DownloadResult<()> {
@@ -590,7 +627,7 @@ impl SchedulerConfig {
 /// - `authorized_dirs`: 路径安全敏感,需独立授权流程
 /// - `user_agent`: 不应被前端覆盖
 /// - `max_full_stream_bytes`: OOM 防护上限,不应暴露给前端
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
     pub max_concurrent_tasks: Option<u32>,
@@ -599,6 +636,12 @@ pub struct ConfigPatch {
     /// 磁力链接配置补丁
     #[serde(default)]
     pub magnet: Option<MagnetPatch>,
+    /// 调度器配置补丁
+    #[serde(default)]
+    pub scheduler: Option<SchedulerPatch>,
+    /// HuggingFace Hub 配置补丁
+    #[serde(default)]
+    pub hub: Option<HubPatch>,
 }
 
 /// 下载配置白名单补丁
@@ -639,6 +682,26 @@ pub struct MagnetPatch {
     pub trackers: Option<Vec<String>>,
 }
 
+/// 调度器配置白名单补丁
+///
+/// 仅暴露 UI 可编辑字段。`sampling_interval_secs`(当前未生效)、
+/// `default_target_fragments`、`high/medium_bandwidth_threshold` 为内部调参字段,
+/// 不暴露给前端(与 `headers`/`authorized_dirs` 排除理由一致)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerPatch {
+    pub min_fragment_size: Option<u64>,
+    pub max_fragment_size: Option<u64>,
+    pub ewma_alpha: Option<f64>,
+}
+
+/// HuggingFace Hub 配置白名单补丁
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubPatch {
+    pub source_mode: Option<HfSourceMode>,
+}
+
 impl MagnetPatch {
     /// 将磁力链接补丁应用到现有 MagnetConfig,仅更新 Some 字段
     pub fn apply_to(&self, base: &mut MagnetConfig) {
@@ -660,6 +723,30 @@ impl MagnetPatch {
     }
 }
 
+impl SchedulerPatch {
+    /// 将调度器补丁应用到现有 SchedulerConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut SchedulerConfig) {
+        if let Some(v) = self.min_fragment_size {
+            base.min_fragment_size = v;
+        }
+        if let Some(v) = self.max_fragment_size {
+            base.max_fragment_size = v;
+        }
+        if let Some(v) = self.ewma_alpha {
+            base.ewma_alpha = v;
+        }
+    }
+}
+
+impl HubPatch {
+    /// 将 Hub 补丁应用到现有 HubConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut HubConfig) {
+        if let Some(v) = self.source_mode {
+            base.source_mode = v;
+        }
+    }
+}
+
 impl ConfigPatch {
     /// 将补丁应用到现有 AppConfig,仅更新 Some 字段,保留其余不变
     ///
@@ -677,6 +764,12 @@ impl ConfigPatch {
         }
         if let Some(patch) = &self.magnet {
             patch.apply_to(&mut result.magnet);
+        }
+        if let Some(patch) = &self.scheduler {
+            patch.apply_to(&mut result.scheduler);
+        }
+        if let Some(patch) = &self.hub {
+            patch.apply_to(&mut result.hub);
         }
         result
     }
@@ -780,6 +873,9 @@ pub struct AppConfig {
     /// 磁力链接配置
     #[serde(default)]
     pub magnet: MagnetConfig,
+    /// HuggingFace Hub 配置
+    #[serde(default)]
+    pub hub: HubConfig,
 }
 
 impl AppConfig {
@@ -797,6 +893,7 @@ impl Default for AppConfig {
             connection: ConnectionConfig::default(),
             scheduler: SchedulerConfig::default(),
             magnet: MagnetConfig::default(),
+            hub: HubConfig::default(),
         }
     }
 }
@@ -1559,6 +1656,8 @@ mod tests {
                 enable_upnp: None,
                 trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
             }),
+            scheduler: None,
+            hub: None,
         };
         let result = patch.apply_to(&base);
 
@@ -1718,6 +1817,8 @@ mod proptests {
                 }),
                 connection: None,
                 magnet: None,
+                scheduler: None,
+                hub: None,
             };
 
             let patched = patch.apply_to(&base);
