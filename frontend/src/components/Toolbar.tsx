@@ -208,14 +208,19 @@ export default function Toolbar(props: ToolbarProps) {
               <Button
                 variant="primary"
                 size="md"
+                class="new-download-btn"
                 onClick={props.onNewTask}
                 aria-label={i18n.t("toolbar.newDownload") as string}
                 title={i18n.t("toolbar.newDownload") as string}
               >
                 <PlusIcon />
-                <Show when={!isNarrow()}>
-                  <span>{i18n.t("toolbar.newDownload")}</span>
-                </Show>
+                <span>
+                  {i18n.t(
+                    isNarrow()
+                      ? "toolbar.newDownloadShort"
+                      : "toolbar.newDownload",
+                  )}
+                </span>
               </Button>
 
               <div class="relative flex items-center gap-2 min-w-0 flex-1">

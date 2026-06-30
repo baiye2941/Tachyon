@@ -11,7 +11,7 @@ import { api } from "../api/invoke";
 import { $config, $configLoading } from "../stores/settings";
 import { addToast } from "../stores/toast";
 import { $experimental } from "../stores/experimental";
-import type { AppConfig, ConfigPatch } from "../types";
+import type { AppConfig, ConfigPatch, HfSourceMode } from "../types";
 import { CloseIcon } from "./icons";
 import ConfirmDialog from "./ConfirmDialog";
 import Button from "../shared/ui/Button";
@@ -61,6 +61,9 @@ interface ConfigDraft {
     enableDht: boolean;
     enableUpnp: boolean;
     trackers: string[];
+  };
+  hub: {
+    sourceMode: HfSourceMode;
   };
 }
 
@@ -151,6 +154,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       enableUpnp: true,
       trackers: [],
     },
+    hub: {
+      sourceMode: "mirror",
+    },
   });
 
   const [saving, setSaving] = createSignal(false);
@@ -187,6 +193,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: cfg.magnet.enableDht,
         enableUpnp: cfg.magnet.enableUpnp,
         trackers: cfg.magnet.trackers,
+      },
+      hub: {
+        sourceMode: cfg.hub?.sourceMode ?? "mirror",
       },
     });
   };
@@ -238,6 +247,14 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: draft.magnet.enableDht,
         enableUpnp: draft.magnet.enableUpnp,
         trackers: draft.magnet.trackers,
+      },
+      scheduler: {
+        minFragmentSize: draft.scheduler.minFragmentSize,
+        maxFragmentSize: draft.scheduler.maxFragmentSize,
+        ewmaAlpha: draft.scheduler.ewmaAlpha,
+      },
+      hub: {
+        sourceMode: draft.hub.sourceMode,
       },
     };
   };
@@ -614,6 +631,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     value={draft.scheduler.ewmaAlpha}
                     min={0.1}
                     max={0.9}
+                    step={0.05}
                     onChange={(v) => setDraft("scheduler", "ewmaAlpha", v)}
                     displayValue={draft.scheduler.ewmaAlpha.toFixed(2)}
                   />
@@ -673,6 +691,27 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                   >
                     {t("experimental.huggingfaceDesc")}
                   </div>
+                  <Show when={$experimental.isEnabled("huggingface")}>
+                    <SegmentedItem<HfSourceMode>
+                      label={t("settings.hub.sourceMode")}
+                      value={draft.hub.sourceMode}
+                      options={[
+                        { value: "official", label: t("settings.hub.sourceOfficial") },
+                        { value: "mirror", label: t("settings.hub.sourceMirror") },
+                        { value: "race", label: t("settings.hub.sourceRace") },
+                      ]}
+                      onChange={(v) => setDraft("hub", "sourceMode", v)}
+                    />
+                    <div
+                      style={{
+                        "font-size": "12px",
+                        color: "var(--color-text-tertiary)",
+                        "line-height": "1.5",
+                      }}
+                    >
+                      {t("settings.hub.sourceModeDesc")}
+                    </div>
+                  </Show>
                 </div>
               </Show>
 
@@ -939,9 +978,12 @@ function SliderItem(props: {
   value: number;
   min: number;
   max: number;
+  step?: number;
   onChange: (v: number) => void;
   displayValue: string;
 }) {
+  // step<1 视为浮点滑块(如 EWMA alpha),用 parseFloat 解析;否则整数滑块用 parseInt
+  const isFloat = props.step !== undefined && props.step < 1;
   return (
     <div>
       <div
@@ -965,10 +1007,74 @@ function SliderItem(props: {
         aria-label={props.label}
         min={props.min}
         max={props.max}
+        step={props.step ?? 1}
         value={props.value}
-        onInput={(e) => props.onChange(parseInt(e.currentTarget.value))}
+        onInput={(e) =>
+          props.onChange(
+            isFloat
+              ? parseFloat(e.currentTarget.value)
+              : parseInt(e.currentTarget.value),
+          )
+        }
         style={{ width: "100%" }}
       />
+    </div>
+  );
+}
+
+/** 分段选择项(多选一,如 HF 源模式) */
+function SegmentedItem<T extends string>(props: {
+  label: string;
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div>
+      <div style={{ "margin-bottom": "8px" }}>
+        <span
+          style={{ "font-size": "13px", color: "var(--color-text-title)" }}
+        >
+          {props.label}
+        </span>
+      </div>
+      <div
+        class="flex"
+        style={{
+          "border-radius": "8px",
+          background: "var(--graphite-2)",
+          padding: "2px",
+          gap: "2px",
+        }}
+      >
+        <For each={props.options}>
+          {(opt) => (
+            <button
+              style={{
+                flex: "1",
+                padding: "6px 8px",
+                "font-size": "12px",
+                "border-radius": "6px",
+                border: "none",
+                cursor: "pointer",
+                background:
+                  props.value === opt.value
+                    ? "var(--color-bg-primary)"
+                    : "transparent",
+                color:
+                  props.value === opt.value
+                    ? "var(--color-text-title)"
+                    : "var(--color-text-secondary)",
+                "font-weight": props.value === opt.value ? 600 : 400,
+                transition: "all 150ms ease",
+              }}
+              onClick={() => props.onChange(opt.value)}
+            >
+              {opt.label}
+            </button>
+          )}
+        </For>
+      </div>
     </div>
   );
 }

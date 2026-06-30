@@ -8,6 +8,7 @@ import {
 } from "../stores/downloads";
 import { addToast } from "../stores/toast";
 import * as speedHistory from "../stores/speedHistory";
+import { isBrowserDev, startMockData } from "../stores/mockData";
 import type { SnifferResource } from "../types";
 import { tr } from "../i18n";
 import { useProgressListener } from "./useTauriEvent";
@@ -16,14 +17,27 @@ import { useRafThrottle } from "./useRafThrottle";
 /**
  * 应用级初始化：任务列表刷新、进度订阅、恢复告警、嗅探资源加载、
  * 以及 500ms 节流的速度历史记录。
+ *
+ * 浏览器 dev 环境(无 Tauri 后端)激活 mock 数据源,让 UI 效果可被查看;
+ * Tauri 生产环境走真实 api。判断见 isBrowserDev()。
  */
 export function useAppInit(
   setSnifferResources: (resources: SnifferResource[]) => void,
 ) {
-  // 真实数据订阅
+  // 浏览器 dev:注入 mock 种子任务 + 模拟进度 tick,跳过真实 api
+  if (isBrowserDev()) {
+    startMockData();
+  }
+
+  // 真实数据订阅(Tauri 环境生效)
   useProgressListener();
 
   onMount(() => {
+    if (isBrowserDev()) {
+      // 浏览器 dev:mock 已注入,无需真实订阅
+      return;
+    }
+
     refreshTaskList();
 
     api

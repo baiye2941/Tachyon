@@ -1,6 +1,7 @@
 import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
+import { isBrowserDev, removeMockTask } from '../stores/mockData'
 
 async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
   try {
@@ -113,8 +114,13 @@ export const api = {
    *   跳过 invoke 内置的 window.confirm。后端 confirmation token 仍会请求,
    *   安全边界不受影响。
    */
-  deleteTask: (taskId: string, opts?: { skipConfirm?: boolean; deleteLocalFile?: boolean }) =>
-    invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm),
+  deleteTask: (taskId: string, opts?: { skipConfirm?: boolean; deleteLocalFile?: boolean }) => {
+    if (isBrowserDev()) {
+      removeMockTask(taskId)
+      return Promise.resolve()
+    }
+    return invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm)
+  },
   /** 打开文件夹 */
   openFolder: (path: string) => openPath(path),
   /** 获取下载进度详情 */

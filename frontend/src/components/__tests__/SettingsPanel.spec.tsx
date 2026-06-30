@@ -60,6 +60,9 @@ const mockConfig = {
     enableUpnp: true,
     trackers: [],
   },
+  hub: {
+    sourceMode: 'mirror' as const,
+  },
 }
 
 describe('SettingsPanel', () => {

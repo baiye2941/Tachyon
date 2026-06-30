@@ -60,7 +60,7 @@ function TreeNodeItem(props: {
   revision: string
   onDownload: (path: string) => void
   depth: number
-  isSelected: () => boolean
+  isSelected: (path: string) => boolean
   onToggleSelect: (path: string) => void
   /** 当前节点 path 是否匹配筛选(非匹配降透明度) */
   isMatched: () => boolean
@@ -112,7 +112,7 @@ function TreeNodeItem(props: {
         role="treeitem"
         aria-level={props.depth + 1}
         aria-expanded={props.node.isDirectory ? expanded() : undefined}
-        aria-selected={props.isSelected()}
+        aria-selected={props.isSelected(props.node.path)}
         tabindex={props.node.isDirectory ? 0 : 0}
         style={{
           padding: '4px 8px',
@@ -132,14 +132,14 @@ function TreeNodeItem(props: {
             style={{
               width: '16px',
               height: '16px',
-              color: props.isSelected() ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+              color: props.isSelected(props.node.path) ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
             }}
             onClick={(e) => {
               e.stopPropagation()
               props.onToggleSelect(props.node.path)
             }}
           >
-            <CheckboxIcon checked={props.isSelected()} />
+            <CheckboxIcon checked={props.isSelected(props.node.path)} />
           </div>
         </Show>
         {/* 展开/折叠图标 */}
@@ -239,6 +239,9 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   const [batchDownloading, setBatchDownloading] = createSignal(false)
   const [filter, setFilter] = createSignal<FilterKey>('all')
   const [searchInput, setSearchInput] = createSignal('')
+  const repoFiles = () => $hub.repoFiles() ?? []
+  const loading = () => $hub.loading()
+  const error = () => $hub.error()
   let inputRef: HTMLInputElement | undefined
 
   const handleBrowse = async () => {
@@ -307,8 +310,8 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
   /**
    * 批量下载选中文件。
-   * useMirror=true 时用 hf-mirror.com 作为主源(基于 repoId 构造,绕过 CDN 域名差异),
-   * 原始 HF 链接作为容灾镜像。
+   * useMirror=true 时用 hf-mirror.com 作为单源下载(基于 repoId 构造,绕过 CDN 域名差异)。
+   * 后端默认按 HubConfig.source_mode 处理源(镜像/竞速),此处仅保留显式镜像覆盖入口。
    */
   const handleBatchDownload = async (useMirror: boolean) => {
     const paths = Array.from(selectedPaths())
@@ -327,7 +330,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
           if (useMirror) {
             // 镜像主源:基于 repoId 构造 hf-mirror resolve URL(鲁棒,绕过 CDN 域名)
             const mirrorUrl = buildHfMirrorUrl(id, rev, path)
-            return api.createTask(mirrorUrl, undefined, [originalUrl])
+            return api.createTask(mirrorUrl)
           }
           return api.createTask(originalUrl)
         }),
@@ -350,9 +353,6 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     }
   }
 
-  const repoFiles = () => $hub.repoFiles() ?? []
-  const loading = () => $hub.loading()
-  const error = () => $hub.error()
   // DI-2:tree memo 化,仅 repoFiles 变化时重建(勾选/筛选不触发树重算)
   const tree = createMemo(() => buildTree(repoFiles() ?? []))
   const fileCount = () => (repoFiles() ?? []).filter((f: HubFileInfo) => f.type !== 'directory').length
@@ -555,7 +555,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                     revision={revision()}
                     onDownload={() => {}}
                     depth={0}
-                    isSelected={() => selectedPaths().has(node.path)}
+                    isSelected={(path) => selectedPaths().has(path)}
                     onToggleSelect={toggleSelect}
                     isMatched={() => {
                       const matched = matchedPaths()

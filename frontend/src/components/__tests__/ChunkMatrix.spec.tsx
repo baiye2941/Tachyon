@@ -101,7 +101,7 @@ describe("ChunkMatrix 分片矩阵", () => {
   });
 
   describe("组件渲染", () => {
-    it("分片数 <= 500 时渲染 DOM 分片", () => {
+    it("分片数 <= 200 时渲染 DOM 分片", () => {
       render(() => (
         <ChunkMatrix fragmentsTotal={100} fragmentsDone={50} progress={0.5} />
       ));
@@ -110,7 +110,7 @@ describe("ChunkMatrix 分片矩阵", () => {
       expect(document.querySelector("canvas")).toBeNull();
     });
 
-    it("分片数 > 500 时渲染 canvas", () => {
+    it("分片数 > 200 时渲染 canvas", () => {
       render(() => (
         <ChunkMatrix fragmentsTotal={1000} fragmentsDone={500} progress={0.5} />
       ));
@@ -125,6 +125,31 @@ describe("ChunkMatrix 分片矩阵", () => {
         ));
       }).not.toThrow();
       expect(screen.getByText("分片分布")).toBeDefined();
+    });
+
+    it("DOM 分片不再为完成格重复挂载出现/闪光动画", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
+      ));
+      const cells = Array.from(document.querySelectorAll<HTMLElement>(".chunk-cell"));
+      expect(cells.length).toBe(20);
+      expect(cells.some((cell) => cell.classList.contains("chunk-flash"))).toBe(false);
+      expect(cells[0]!.style.animation).toBe("none");
+      expect(cells[0]!.style.opacity).toBe("1");
+    });
+
+    it("DOM 下载中分片保留稳定低调脉冲且无级联延迟", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
+      ));
+      const downloading = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-status="downloading"]'),
+      );
+      expect(downloading.length).toBeGreaterThan(0);
+      for (const cell of downloading) {
+        expect(cell.style.animation).toContain("chunk-pulse");
+        expect(cell.style.animationDelay).toBe("");
+      }
     });
 
     it("prefers-reduced-motion 时不启动动画循环", () => {

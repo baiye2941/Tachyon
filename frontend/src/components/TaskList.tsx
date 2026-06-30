@@ -11,7 +11,7 @@ import type { TaskInfo, ListDensity } from "../types";
 import TaskItem from "./TaskItem";
 import { COLUMNS } from "./taskColumns";
 import { $taskSort, toggleSort, sortTasks } from "../stores/taskSort";
-import { PlusIcon, LinkIcon } from "./icons";
+import { PlusIcon } from "./icons";
 import Button from "../shared/ui/Button";
 import { useI18n } from "../i18n";
 
@@ -292,15 +292,21 @@ export default function TaskList(props: TaskListProps) {
                 </Show>
               </div>
               <div
-                class="flex items-center gap-2"
+                class="flex items-center gap-2 flex-wrap justify-center"
                 style={{
                   "font-size": "12px",
                   color: "var(--color-text-tertiary)",
-                  opacity: 0.8,
+                  "margin-top": "4px",
                 }}
               >
-                <LinkIcon />
-                <span>也支持粘贴 URL 与拖拽 .txt 链接文件</span>
+                <span class="kbd">N</span>
+                <span>新建任务</span>
+                <span style={{ color: "var(--color-border-strong)" }}>·</span>
+                <span class="kbd">⌘</span>
+                <span class="kbd">V</span>
+                <span>粘贴链接</span>
+                <span style={{ color: "var(--color-border-strong)" }}>·</span>
+                <span>拖拽 .txt 链接文件</span>
               </div>
             </div>
           }

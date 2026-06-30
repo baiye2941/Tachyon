@@ -10,6 +10,8 @@ const zhCN = {
   // —— 通用 ——
   "common.loading": "加载中...",
   "common.appError": "应用发生错误",
+  "common.appErrorHint": "应用遇到未预期的错误。可尝试重试,若反复出现请反馈以下信息。",
+  "common.errorStack": "错误堆栈",
   "common.confirm": "确认",
   "common.cancel": "取消",
   "common.close": "关闭",
@@ -77,8 +79,9 @@ const zhCN = {
 
   // —— 工具栏 ——
   "toolbar.newDownload": "新建下载",
+  "toolbar.newDownloadShort": "新建",
   "toolbar.searchPlaceholder":
-    "搜索任务或设置 (例: status:downloading size:>1gb)",
+    "搜索任务或设置",
   "toolbar.selectAll": "全选",
   "toolbar.selectedCount": "已选 {count} 项",
   "toolbar.pause": "暂停",
@@ -198,7 +201,7 @@ const zhCN = {
   "detail.retry": "重试",
   "detail.retryWithMirror": "镜像重试",
   "detail.retryWithMirrorHint":
-    "通过 hf-mirror.com 镜像重新下载,原始链接作为容灾",
+    "通过 hf-mirror.com 镜像重新下载",
   "detail.copy.aria": "复制",
   "detail.copied.aria": "已复制",
   "detail.section.diagnostics": "失败诊断",
@@ -473,7 +476,7 @@ const zhCN = {
   "hub.downloadTitle": "直接从 HuggingFace 下载",
   "hub.mirrorDownload": "镜像下载",
   "hub.mirrorDownloadTitle":
-    "通过 hf-mirror.com 镜像下载(国内加速),原始链接作为容灾",
+    "通过 hf-mirror.com 镜像下载(国内加速)",
   "hub.aria.downloadFile": "下载 {name}",
   "hub.largeTag": "大",
 
@@ -548,6 +551,11 @@ const zhCN = {
   "experimental.huggingfaceDesc": "浏览、搜索和下载 HuggingFace 模型权重，管理本地模型库",
   "sidebar.huggingface": "Hugging Face",
   "settings.section.experimental": "实验性功能",
+  "settings.hub.sourceMode": "HuggingFace 源模式",
+  "settings.hub.sourceModeDesc": "镜像模式经 hf-mirror.com 国内加速;竞速模式官方与镜像同时连接取快者;官方模式直连,需可访问 huggingface.co",
+  "settings.hub.sourceOfficial": "官方",
+  "settings.hub.sourceMirror": "镜像",
+  "settings.hub.sourceRace": "竞速",
 } as const;
 
 export default zhCN;

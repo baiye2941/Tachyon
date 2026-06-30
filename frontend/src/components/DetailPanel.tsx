@@ -20,8 +20,6 @@ import {
 } from "../utils/format";
 import {
   CloseIcon,
-  PauseIcon,
-  PlayIcon,
   FileIcon,
   OpenFileIcon,
   MoreIcon,
@@ -30,6 +28,7 @@ import {
   RefreshIcon,
   ChevronDownIcon,
   CancelIcon,
+  ArrowLeftIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
@@ -172,16 +171,16 @@ export default function DetailPanel(props: DetailPanelProps) {
     });
   });
 
-  // 窄屏 sheet:focus trap + Esc 关闭(Iteration 13 遗留,Iteration 15 补齐)
+  // 详情覆盖式:focus trap 在 visible 时统一激活(宽屏也 trap,因列表被遮罩盖住)
   useFocusTrap({
-    active: () => isNarrow() && visible(),
+    active: () => visible(),
     container: panelContentRef,
     onEscape: () => handleClose(),
   });
 
-  // 宽屏侧栏:Esc 关闭(非 trap,侧栏与列表共存,仅关面板)
+  // 兜底 Esc 关闭(focus trap 未拦截时的键盘兜底)
   createEffect(() => {
-    if (isNarrow() || !visible()) return;
+    if (!visible()) return;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !menuOpen()) {
         e.preventDefault();
@@ -333,9 +332,8 @@ export default function DetailPanel(props: DetailPanelProps) {
   /**
    * 通过 hf-mirror 镜像重试 HuggingFace 失败任务(Iteration 16)。
    *
-   * 策略:
-   * - 主源:hf-mirror.com 镜像 URL(基于 repoId 构造,绕过 CDN 域名差异)
-   * - 容灾:原始 HF 链接(传给 mirrorUrls,主源失败时后端自动切换)
+   * 策略:以 hf-mirror.com 镜像 URL 作为单源重新下载。
+   * 后端默认按 HubConfig.source_mode 处理源(镜像/竞速),此处仅保留显式镜像重试入口。
    *
    * 仅对可解析的 HuggingFace URL 显示此按钮(parseHfUrl 返回非 null)。
    */
@@ -351,8 +349,8 @@ export default function DetailPanel(props: DetailPanelProps) {
     setMirrorRetrying(true);
     try {
       const mirrorUrl = buildHfMirrorUrl(parsed.repoId, parsed.revision, parsed.filePath);
-      // 镜像主源 + 原始链接容灾:与 HfBrowserPanel 镜像下载策略一致
-      await api.createTask(mirrorUrl, undefined, [t2.url]);
+      // 镜像单源重试:与 HfBrowserPanel 镜像下载策略一致
+      await api.createTask(mirrorUrl);
       await refreshTaskList();
       addToast(tr("toast.mirrorRetrySuccess"), "success");
       // 镜像重试创建新任务后,关闭当前失败任务的详情面板
@@ -388,12 +386,11 @@ export default function DetailPanel(props: DetailPanelProps) {
 
   return (
     <Show when={shouldRender()}>
-      {/* 外层容器:窄屏 fixed 全屏 sheet + 遮罩;宽屏 grid 列宽过渡。
-          内容树只写一份,通过动态 style 切换布局模式(Iteration 13)。
-          窄屏用 fixed 定位天然脱离文档流,z-index 覆盖主内容,无需 Portal。 */}
-      <Show when={isNarrow() && visible()}>
+      {/* 覆盖式遮罩:半透明 + 模糊,列表隐约可见但不可点(参考稿风格 + 保留下载器信息密度)
+          z-70:高于 Toolbar z-2 / BatchToolbar z-50,低于 CommandPalette z-100 与模态遮罩 z-200+ */}
+      <Show when={visible()}>
         <div
-          class="fixed inset-0 z-[280]"
+          class="absolute inset-0 z-[70]"
           style={{
             background: "var(--color-overlay-scrim)",
             "backdrop-filter": "blur(4px)",
@@ -402,39 +399,27 @@ export default function DetailPanel(props: DetailPanelProps) {
           onClick={() => props.onClose()}
         />
       </Show>
+      {/* 详情面板:覆盖 main 区,从右滑入。z-80:高于遮罩 z-70。
+          统一 absolute inset-0(废弃宽屏 grid 列模式),窄屏宽屏同为覆盖式,
+          宽屏居中限宽,窄屏全宽。 */}
       <div
-        style={isNarrow()
-          ? {
-              position: "fixed",
-              top: 0,
-              right: 0,
-              bottom: 0,
-              width: "min(420px, 100vw)",
-              "max-width": "100vw",
-              background: "var(--color-bg-secondary)",
-              "border-left": "1px solid var(--color-border-subtle)",
-              "box-shadow": "var(--shadow-xl)",
-              transform: visible() ? "translateX(0)" : "translateX(100%)",
-              transition: reducedMotion()
-                ? "none"
-                : "transform 260ms cubic-bezier(0.32, 0.72, 0, 1)",
-              "z-index": "290",
-              overflow: "hidden",
-            }
-          : {
-              display: "grid",
-              "grid-template-columns": visible() ? "var(--panel-detail-width, 400px)" : "0px",
-              "grid-template-rows": "1fr",
-              transition: reducedMotion()
-                ? "none"
-                : "grid-template-columns 280ms cubic-bezier(0.32, 0.72, 0, 1)",
-              overflow: "hidden",
-              "min-height": 0,
-              height: "100%",
-              opacity: visible() ? 1 : 0,
-              "pointer-events": visible() ? "auto" : "none",
-            }
-        }
+        style={{
+          position: "absolute",
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: isNarrow() ? "100%" : "min(560px, 50vw)",
+          "max-width": "100%",
+          background: "var(--color-bg-secondary)",
+          "border-left": "1px solid var(--color-border-subtle)",
+          "box-shadow": "var(--shadow-xl)",
+          transform: visible() ? "translateX(0)" : "translateX(100%)",
+          transition: reducedMotion()
+            ? "none"
+            : "transform 260ms cubic-bezier(0.32, 0.72, 0, 1)",
+          "z-index": "80",
+          overflow: "hidden",
+        }}
       >
           <div
             ref={panelContentRef}
@@ -442,17 +427,26 @@ export default function DetailPanel(props: DetailPanelProps) {
             aria-label={t("detail.aria")}
           tabIndex={isNarrow() ? -1 : undefined}
           style={{
-            width: isNarrow() ? "100%" : "var(--panel-detail-width, 400px)",
+            width: "100%",
             "max-width": "100%",
             height: "100%",
             background: "var(--color-bg-secondary)",
-            "border-left": "1px solid var(--color-border-subtle)",
             transition: reducedMotion() ? "none" : "opacity 220ms ease",
           }}
           class="flex flex-col h-full overflow-y-auto overflow-x-hidden"
         >
           <div class="panel-header">
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+              {/* 覆盖式:返回箭头(关闭详情回列表) */}
+              <Button
+                variant="ghost"
+                shape="icon-sm"
+                aria-label={t("detail.closeAria")}
+                title={t("detail.closeAria")}
+                onClick={handleClose}
+              >
+                <ArrowLeftIcon />
+              </Button>
               <Show when={isCompleted()}>
                 <Button
                   variant="secondary"
@@ -461,26 +455,6 @@ export default function DetailPanel(props: DetailPanelProps) {
                 >
                   <OpenFileIcon />
                   <span>{t("detail.action.open")}</span>
-                </Button>
-              </Show>
-              <Show when={!isCompleted()}>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  class="hover-lift-sm"
-                  onClick={handlePrimaryAction}
-                >
-                  {isDownloading() ? (
-                    <>
-                      <PauseIcon />
-                      <span>{t("common.pause")}</span>
-                    </>
-                  ) : (
-                    <>
-                      <PlayIcon />
-                      <span>{t("common.resume")}</span>
-                    </>
-                  )}
                 </Button>
               </Show>
             </div>
@@ -553,16 +527,14 @@ export default function DetailPanel(props: DetailPanelProps) {
               "border-bottom": "1px solid var(--color-border-subtle)",
             }}
           >
+            {/* 文件图标材质板(参考稿 file-icon:材质 plate + 顶光 + hue 着色) */}
             <div
-              class="flex items-center justify-center flex-shrink-0"
+              class="flex items-center justify-center flex-shrink-0 file-icon-plate"
               style={{
-                width: "40px",
-                height: "40px",
+                width: "44px",
+                height: "44px",
+                "border-radius": "9px",
                 color: fileInfo().color,
-                background: "var(--color-bg-tertiary)",
-                "border-radius": "10px",
-                border: "1px solid var(--color-border-subtle)",
-                "box-shadow": "var(--shadow-sm)",
               }}
             >
               {(() => {
@@ -611,49 +583,65 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* Progress Section - compact */}
+          {/* Progress Section - compact,进度大字电青高亮(下载中呼吸) */}
           <div
             class="flex flex-col items-center"
             style={{ padding: "0 20px 12px" }}
           >
             <div
-              class="mono"
+              class={`mono ${isDownloading() ? "speed-breathe" : ""}`}
               style={{
-                "font-size": "32px",
+                "font-size": "36px",
                 "font-weight": 700,
-                color: "var(--color-text-title)",
+                color: isFailed()
+                  ? "var(--color-status-error)"
+                  : isCompleted()
+                    ? "var(--color-status-completed)"
+                    : "var(--color-accent-primary)",
                 "line-height": "1",
                 "letter-spacing": "-0.03em",
+                transition: "color 300ms ease",
               }}
             >
               {((task()?.progress || 0) * 100).toFixed(1)}%
             </div>
 
-            {/* Progress bar — 去 AI 味:实色凹槽,移除多层 inset 阴影 */}
+            {/* Progress bar — 参考稿材质:凹槽 inset + 填充 sheen + 下载中斜纹前缘 */}
             <div
-              class="relative overflow-hidden w-full"
+              class="relative overflow-hidden progress-track-inset"
               style={{
-                height: "6px",
+                height: "8px",
                 "margin-top": "14px",
                 "border-radius": "9999px",
                 background: "var(--color-bg-tertiary)",
               }}
             >
               <div
-                class={`absolute left-0 top-0 bottom-0${isDownloading() ? " progress-bar-active" : ""}`}
+                class={`absolute left-0 top-0 bottom-0 progress-fill-sheen${isDownloading() ? " progress-bar-active" : ""}`}
                 style={{
-                  width: `${(task()?.progress || 0) * 100}%`,
+                  position: "relative",
+                  width: `${Math.max((task()?.progress || 0) * 100, (task()?.progress || 0) > 0 ? 2 : 0)}%`,
                   "border-radius": "9999px",
                   background: isFailed()
                     ? "var(--color-status-error)"
                     : isCompleted()
                       ? "var(--color-status-completed)"
                       : isDownloading()
-                        ? undefined
+                        ? "var(--color-status-downloading)"
                         : "linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)",
                   transition: "width 300ms ease-out",
+                  "min-width": (task()?.progress || 0) > 0 ? "8px" : "0",
                 }}
-              />
+              >
+                <Show when={isDownloading() && (task()?.progress || 0) > 0 && (task()?.progress || 0) < 1}>
+                  <span class="progress-stripes absolute inset-0 rounded-full" aria-hidden="true" />
+                  <span
+                    class="progress-edge-glow absolute right-0 top-0 bottom-0 rounded-full"
+                    style={{ width: "2px", background: "var(--color-text-primary)" }}
+                    aria-hidden="true"
+                  />
+                </Show>
+              </div>
             </div>
 
             {/* Progress stats row */}

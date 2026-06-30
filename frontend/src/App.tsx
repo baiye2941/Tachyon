@@ -50,6 +50,7 @@ import ToastContainer from "./components/ToastContainer";
 import ContextMenu from "./components/ContextMenu";
 import BatchToolbar from "./components/BatchToolbar";
 import ConfirmDialog from "./components/ConfirmDialog";
+import ErrorPage from "./components/ErrorPage";
 import { $confirm, requestConfirm, resolveConfirm } from "./stores/confirm";
 import { tr } from "./i18n";
 
@@ -209,6 +210,8 @@ function AppContent() {
             onToggleMultiSelect={() => {
               setIsMultiSelectMode((v) => !v);
               deselectAll();
+              // 覆盖式详情:进入多选时清详情,否则详情遮罩盖住选中态(R1 回归修复)
+              $selectedId.set(null);
             }}
             selectedCount={$selectedIds.get().size}
             onSelectAll={handleSelectAll}
@@ -219,6 +222,7 @@ function AppContent() {
             onExitMultiSelect={() => {
               setIsMultiSelectMode(false);
               deselectAll();
+              $selectedId.set(null);
             }}
             listDensity={listDensity()}
             onToggleDensity={() =>
@@ -233,7 +237,7 @@ function AppContent() {
             onCancelAll={cancelAll}
           />
 
-          <div class="flex flex-1 overflow-hidden">
+          <div class="flex flex-1 overflow-hidden relative">
             <TaskList
               tasks={$taskFilter.filteredTasks()}
               selectedTaskId={$selectedId.get()}
@@ -454,45 +458,7 @@ function AppContent() {
 
 export default function App() {
   return (
-    <ErrorBoundary
-      fallback={(err) => (
-        <div
-          class="flex items-center justify-center p-8"
-          style={{
-            "min-height": "100dvh",
-            background: "var(--color-bg-primary)",
-            color: "var(--color-text-primary)",
-          }}
-        >
-          <div
-            class="panel-surface rounded-lg p-6 max-w-md"
-            style={{ "box-shadow": "var(--shadow-lg)" }}
-          >
-            <div
-              style={{
-                "font-size": "16px",
-                "font-weight": 600,
-                color: "var(--color-error)",
-                "margin-bottom": "8px",
-              }}
-            >
-              {tr("common.appError")}
-            </div>
-            <div
-              class="mono"
-              style={{
-                "font-size": "13px",
-                color: "var(--color-text-secondary)",
-                "word-break": "break-all",
-                "white-space": "pre-wrap",
-              }}
-            >
-              {String(err) + (err instanceof Error && err.stack ? "\n\n" + err.stack : "")}
-            </div>
-          </div>
-        </div>
-      )}
-    >
+    <ErrorBoundary fallback={(err) => <ErrorPage error={err} />}>
       <AppContent />
     </ErrorBoundary>
   );

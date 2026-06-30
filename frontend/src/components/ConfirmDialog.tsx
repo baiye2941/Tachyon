@@ -1,6 +1,6 @@
 import { createEffect, createSignal, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import { CloseIcon } from "./icons";
+import { CloseIcon, WarningCircleIcon } from "./icons";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr } from "../i18n";
 
@@ -100,19 +100,35 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
           {/* 标题行 */}
           <div
             class="flex items-start justify-between"
-            style={{ "margin-bottom": "12px" }}
+            style={{ "margin-bottom": "12px", gap: "12px" }}
           >
-            <h3
-              id="confirm-dialog-title"
-              style={{
-                "font-size": "15px",
-                "font-weight": 600,
-                color: "var(--color-text-title)",
-                "line-height": "1.4",
-              }}
-            >
-              {props.title}
-            </h3>
+            <div class="flex items-start" style={{ gap: "12px", "min-width": "0", "flex": "1" }}>
+              <Show when={props.tone === "danger"}>
+                <div
+                  class="flex items-center justify-center flex-shrink-0"
+                  style={{
+                    width: "32px",
+                    height: "32px",
+                    "border-radius": "8px",
+                    background: "var(--color-danger-soft)",
+                    color: "var(--color-error)",
+                  }}
+                >
+                  <WarningCircleIcon />
+                </div>
+              </Show>
+              <h3
+                id="confirm-dialog-title"
+                style={{
+                  "font-size": "15px",
+                  "font-weight": 600,
+                  color: "var(--color-text-title)",
+                  "line-height": "1.4",
+                }}
+              >
+                {props.title}
+              </h3>
+            </div>
             <button
               aria-label={tr("confirmDialog.aria.close")}
               style={{
@@ -121,8 +137,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
                 cursor: "pointer",
                 color: "var(--color-text-tertiary)",
                 padding: "2px",
-                "flex-shrink": 0,
-                "margin-left": "8px",
+                "flex-shrink": "0",
               }}
               onClick={() => props.onCancel()}
             >

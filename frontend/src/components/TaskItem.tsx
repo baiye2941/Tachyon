@@ -117,12 +117,16 @@ export default function TaskItem(props: TaskItemProps) {
           </div>
         </Show>
 
+        {/* 文件图标材质板(参考稿 file-icon:160deg 渐变 + 顶光 inset + drop-shadow)
+            hue 由 --color-file-* token 驱动,图标本身已 duotone */}
         <div
-          class="flex items-center justify-center flex-shrink-0"
+          class="flex items-center justify-center flex-shrink-0 file-icon-plate"
           style={{
-            width: isCompact() ? '28px' : '40px',
-            height: isCompact() ? '28px' : '40px',
+            width: isCompact() ? '28px' : '36px',
+            height: isCompact() ? '28px' : '36px',
+            'border-radius': isCompact() ? '6px' : '8px',
             color: fileInfo().color,
+            '--file-hue': fileInfo().color,
           }}
         >
           {(() => {
@@ -214,33 +218,45 @@ export default function TaskItem(props: TaskItemProps) {
           </div>
 
           <div
-            class="relative overflow-hidden"
+            class="relative overflow-hidden progress-track-inset"
             style={{
-              height: '4px',
+              height: '6px',
               'margin-top': isCompact() ? '4px' : '8px',
               'border-radius': '9999px',
               background: 'var(--color-bg-tertiary)',
             }}
           >
             <div
-              class={`absolute left-0 top-0 bottom-0 linear-progress-fill linear-progress-fill--${props.task.status}${props.task.status === 'downloading' ? ' progress-bar-active' : ''}`}
+              class={`absolute left-0 top-0 bottom-0 progress-fill-sheen linear-progress-fill linear-progress-fill--${props.task.status}${props.task.status === 'downloading' ? ' progress-bar-active' : ''}`}
               style={{
-                width: `${props.task.progress * 100}%`,
+                position: 'relative',
+                width: `${Math.max(props.task.progress * 100, props.task.progress > 0 ? 2 : 0)}%`,
                 'border-radius': '9999px',
-                // spec 8.1:失败=红,完成=翠绿,下载中=accent shimmer,暂停=灰,其他=accent 渐变
+                // spec 8.1:失败=红,完成=翠绿,下载中=电青,暂停=灰,其他=电青渐变
                 background:
                   props.task.status === 'failed'
                     ? 'var(--color-status-error)'
                     : props.task.status === 'completed'
                       ? 'var(--color-status-completed)'
                       : props.task.status === 'downloading'
-                        ? undefined
+                        ? 'var(--color-status-downloading)'
                         : props.task.status === 'paused'
                           ? 'var(--color-status-paused)'
                           : 'linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)',
                 transition: 'width 300ms ease-out',
+                'min-width': props.task.progress > 0 ? '8px' : '0',
               }}
-            />
+            >
+              {/* 下载中:叠斜纹 + 前缘发光(参考稿进度条材质) */}
+              <Show when={props.task.status === 'downloading' && props.task.progress > 0 && props.task.progress < 1}>
+                <span class="progress-stripes absolute inset-0 rounded-full" aria-hidden="true" />
+                <span
+                  class="progress-edge-glow absolute right-0 top-0 bottom-0 rounded-full"
+                  style={{ width: '2px', background: 'var(--color-text-primary)' }}
+                  aria-hidden="true"
+                />
+              </Show>
+            </div>
           </div>
         </div>
       </div>

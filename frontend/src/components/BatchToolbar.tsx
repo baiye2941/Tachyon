@@ -49,10 +49,26 @@ export default function BatchToolbar(props: BatchToolbarProps) {
         }}
       >
         <span
-          class="mr-1 mono"
+          class="mono flex items-center justify-center"
           style={{
-            'font-size': '11px',
-            color: 'var(--color-text-secondary)',
+            "min-width": "20px",
+            height: "20px",
+            padding: "0 6px",
+            "border-radius": "5px",
+            "font-size": "12px",
+            "font-weight": 600,
+            color: "var(--color-accent-foreground)",
+            background: "var(--color-accent-primary)",
+            "margin-right": "4px",
+          }}
+        >
+          {count()}
+        </span>
+        <span
+          style={{
+            "font-size": "13px",
+            color: "var(--color-text-secondary)",
+            "margin-right": "8px",
           }}
         >
           {tr('batch.selectedCount', { count: count() })}

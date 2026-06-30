@@ -1,5 +1,5 @@
 import {
-  For,
+  Index,
   Show,
   createMemo,
   createSignal,
@@ -52,6 +52,8 @@ export function buildBlocks(
 ): ChunkBlock[] {
   if (total <= 0) return [];
   const blockCount = Math.min(total, AGGREGATE_BLOCKS);
+  // 活跃带宽度(连续下载中分片,对齐 DOM 模式,避免单格乱跳)
+  const band = Math.max(2, Math.round(total / 8));
   const blocks: ChunkBlock[] = [];
   for (let i = 0; i < blockCount; i++) {
     const start = Math.floor((i * total) / blockCount);
@@ -62,7 +64,8 @@ export function buildBlocks(
     for (let f = start; f < end; f++) {
       if (f < done) {
         blockDone++;
-      } else if (f === done && progress < 1) {
+      } else if (f >= done && f < done + band && progress < 1) {
+        // 连续活跃带:done <= f < done+band
         blockDownloading++;
       }
     }
@@ -193,9 +196,14 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const total = props.fragmentsTotal;
     const done = props.fragmentsDone;
     const progress = props.progress;
+    // 活跃带:连续的下载中分片(对齐参考稿 activeBand)。
+    // 宽度 ≈ total/8(至少 2),位置紧跟已完成段之后,避免单格乱跳。
+    const band = Math.max(2, Math.round(total / 8));
     return Array.from({ length: total }, (_, i) => {
       const isDone = i < done;
-      const isDownloading = i === done && progress < 1;
+      // 连续活跃带:done <= i < done+band 且未完成
+      const isDownloading =
+        !isDone && i >= done && i < done + band && progress < 1;
       const threadId = i % THREAD_COLORS.length;
       const color = THREAD_COLORS[threadId];
       return {
@@ -400,34 +408,37 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
           when={shouldAggregate()}
           fallback={
             <div class="flex flex-wrap" style={{ gap: "2px" }} ref={gridRef}>
-              <For each={chunks()}>
+              <Index each={chunks()}>
                 {(chunk) => (
                   <div
                     class="chunk-cell"
+                    data-status={
+                      chunk().isDone
+                        ? "done"
+                        : chunk().isDownloading
+                          ? "downloading"
+                          : "pending"
+                    }
                     style={{
                       width: "14px",
                       height: "14px",
                       "border-radius": "2px",
-                      background: chunk.isDone
-                        ? chunk.color
-                        : chunk.isDownloading
-                          ? chunk.color
+                      background: chunk().isDone
+                        ? chunk().color
+                        : chunk().isDownloading
+                          ? chunk().color
                           : "var(--color-bg-tertiary)",
-                      /* 去 AI 味:移除完成格 inset 描边,改纯填充 */
                       "box-shadow": "none",
-                      animation: chunk.isDownloading
-                        ? `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards, chunk-pulse 1.5s ease-in-out infinite`
-                        : `chunk-appear 200ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards`,
-                      "animation-delay": chunk.isDownloading
-                        ? `${chunk.index * 5}ms, ${(chunk.index % blocksPerRow()) * 0.05 + Math.floor(chunk.index / blocksPerRow()) * 0.1}s`
-                        : `${chunk.index * 5}ms`,
-                      opacity: 0,
+                      animation: chunk().isDownloading
+                        ? "chunk-pulse 1.5s ease-in-out infinite"
+                        : "none",
+                      opacity: 1,
                     }}
-                    onMouseEnter={() => showTooltip(chunk.index)}
+                    onMouseEnter={() => showTooltip(chunk().index)}
                     onMouseLeave={() => hideTooltip()}
                   />
                 )}
-              </For>
+              </Index>
             </div>
           }
         >

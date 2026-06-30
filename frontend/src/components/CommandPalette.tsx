@@ -223,13 +223,13 @@ export default function CommandPalette(props: CommandPaletteProps) {
   return (
     <Show when={props.open}>
       <div
-        class="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh]"
+        class="fixed inset-0 z-[100] flex items-start justify-center pt-[12vh] px-4"
         role="dialog"
         aria-modal="true"
         aria-label={t("commandPalette.aria")}
         style={{
           background: "var(--color-overlay-scrim)",
-          "backdrop-filter": "blur(4px)",
+          "backdrop-filter": "blur(6px)",
         }}
         onClick={handleOverlayClick}
         onKeyDown={handleKeyDown}
@@ -238,23 +238,29 @@ export default function CommandPalette(props: CommandPaletteProps) {
         }}
       >
         <div
-          class="panel-surface rounded-lg w-full max-w-lg flex flex-col max-h-[60vh]"
+          class="cmd-panel rounded-lg w-full max-w-xl flex flex-col max-h-[64vh] overflow-hidden"
           style={{
-            "box-shadow": "var(--shadow-xl)",
-            animation: "card-fade-in 200ms var(--ease-emphasized) forwards",
+            background: "var(--color-bg-elevated)",
+            border: "1px solid var(--color-border-default)",
+            "box-shadow": "var(--shadow-xl), 0 0 0 1px var(--color-inset-light) inset",
+            animation: "card-fade-in 180ms var(--ease-emphasized) forwards",
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          {/* 搜索输入框 */}
+          {/* 搜索输入区:放大镜 + 输入框 + Esc 键帽 */}
           <div
-            class="flex items-center gap-2.5 px-4 py-3"
+            class="flex items-center gap-3 px-4 py-3.5"
             style={{ "border-bottom": "1px solid var(--color-border-subtle)" }}
           >
             <span
-              style={{ color: "var(--color-text-tertiary)" }}
-              class="shrink-0"
+              class="shrink-0 flex items-center justify-center"
+              style={{
+                width: "20px",
+                height: "20px",
+                color: "var(--color-text-tertiary)",
+              }}
             >
-              <Icon name="magnifying-glass" class="w-4 h-4" />
+              <Icon name="magnifying-glass" class="w-5 h-5" />
             </span>
             <input
               ref={inputRef}
@@ -268,10 +274,11 @@ export default function CommandPalette(props: CommandPaletteProps) {
                   ? `cmd-opt-${activeIndex()}`
                   : undefined
               }
-              class="flex-1 bg-transparent focus:outline-none focus-visible"
+              class="flex-1 bg-transparent focus:outline-none"
               style={{
-                "font-size": "14px",
+                "font-size": "15px",
                 color: "var(--color-text-primary)",
+                "letter-spacing": "-0.01em",
               }}
               placeholder={t("commandPalette.searchPlaceholder")}
               value={query()}
@@ -281,36 +288,26 @@ export default function CommandPalette(props: CommandPaletteProps) {
               }}
               autofocus
             />
-            <kbd
-              class="shrink-0 mono rounded px-1.5 py-0.5"
-              style={{
-                "font-size": "10px",
-                color: "var(--color-text-tertiary)",
-                background: "var(--color-bg-raised)",
-                border: "1px solid var(--color-border-default)",
-              }}
-            >
-              Esc
-            </kbd>
+            <kbd class="kbd shrink-0">Esc</kbd>
           </div>
 
           {/* 结果列表 */}
           <div
             ref={listRef}
             id="cmd-palette-listbox"
-            class="overflow-y-auto py-1.5"
+            class="overflow-y-auto py-2"
             role="listbox"
             aria-label={t("commandPalette.listAria")}
           >
             <Show when={results().length === 0}>
               <div
-                class="px-4 py-6 text-center"
-                style={{
-                  "font-size": "13px",
-                  color: "var(--color-text-tertiary)",
-                }}
+                class="px-4 py-8 text-center flex flex-col items-center gap-2"
+                style={{ color: "var(--color-text-tertiary)" }}
               >
-                {t("commandPalette.noResults")}
+                <Icon name="magnifying-glass" class="w-6 h-6 opacity-40" />
+                <span style={{ "font-size": "13px" }}>
+                  {t("commandPalette.noResults")}
+                </span>
               </div>
             </Show>
 
@@ -318,11 +315,12 @@ export default function CommandPalette(props: CommandPaletteProps) {
               {(gkey) => (
                 <Show when={grouped()[gkey].length > 0}>
                   <div
-                    class="px-3 py-1.5 uppercase tracking-wider select-none"
+                    class="px-4 pt-2 pb-1 uppercase tracking-wider select-none"
                     style={{
                       "font-size": "10px",
                       "font-weight": 600,
                       color: "var(--color-text-tertiary)",
+                      "letter-spacing": "0.08em",
                     }}
                   >
                     {t(GROUP_LABEL_KEYS[gkey])}
@@ -336,11 +334,10 @@ export default function CommandPalette(props: CommandPaletteProps) {
                         <button
                           id={`cmd-opt-${flatIndex()}`}
                           data-cmd-index={flatIndex()}
-                          class="w-full flex items-center gap-3 px-3 py-2 text-left"
+                          class="cmd-item w-full flex items-center gap-3 px-3 py-2.5 text-left relative"
                           style={{
                             "font-size": "13px",
-                            transition:
-                              "background var(--duration-fast) var(--ease-standard)",
+                            transition: "background var(--duration-fast) var(--ease-standard)",
                             background: isActive()
                               ? "var(--color-accent-soft)"
                               : "transparent",
@@ -353,35 +350,48 @@ export default function CommandPalette(props: CommandPaletteProps) {
                           role="option"
                           aria-selected={isActive()}
                         >
+                          {/* active 左竖条(电青) */}
+                          <Show when={isActive()}>
+                            <span
+                              aria-hidden="true"
+                              style={{
+                                position: "absolute",
+                                left: "0",
+                                top: "50%",
+                                transform: "translateY(-50%)",
+                                width: "2px",
+                                height: "60%",
+                                "border-radius": "0 2px 2px 0",
+                                background: "var(--color-accent-primary)",
+                              }}
+                            />
+                          </Show>
+                          {/* 图标:固定列宽对齐 */}
                           <span
-                            class="shrink-0"
+                            class="shrink-0 flex items-center justify-center"
                             style={{
+                              width: "20px",
+                              height: "20px",
                               color: isActive()
                                 ? "var(--color-accent-primary)"
                                 : "var(--color-text-tertiary)",
                             }}
                           >
-                            <Icon name={entry.cmd.icon} class="w-4 h-4" />
+                            <Icon name={entry.cmd.icon} class="w-5 h-5" />
                           </span>
                           <div class="flex-1 min-w-0">
-                            <span class="block truncate">
+                            <span class="block truncate cmd-palette-mark">
                               {entry.taskFileName
                                 ? (() => {
-                                    // 任务条目:"打开任务" 前缀 + 高亮文件名
                                     const prefix = t("command.task.openTask");
                                     return (
                                       <>
                                         <span
-                                          style={{
-                                            color: "var(--color-text-tertiary)",
-                                          }}
+                                          style={{ color: "var(--color-text-tertiary)" }}
                                         >
                                           {prefix}:{" "}
                                         </span>
-                                        {highlight(
-                                          entry.taskFileName,
-                                          entry.indices,
-                                        )}
+                                        {highlight(entry.taskFileName, entry.indices)}
                                       </>
                                     );
                                   })()
@@ -393,6 +403,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                                 style={{
                                   "font-size": "11px",
                                   color: "var(--color-text-tertiary)",
+                                  "margin-top": "1px",
                                 }}
                               >
                                 {t(entry.cmd.hintKey!)}
@@ -403,20 +414,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                           <Show when={entry.cmd.shortcut}>
                             <span class="flex items-center gap-0.5 shrink-0">
                               <For each={entry.cmd.shortcut}>
-                                {(key) => (
-                                  <kbd
-                                    class="mono rounded px-1 py-0.5"
-                                    style={{
-                                      "font-size": "10px",
-                                      color: "var(--color-text-tertiary)",
-                                      background: "var(--color-bg-raised)",
-                                      border:
-                                        "1px solid var(--color-border-default)",
-                                    }}
-                                  >
-                                    {key}
-                                  </kbd>
-                                )}
+                                {(key) => <kbd class="kbd">{key}</kbd>}
                               </For>
                             </span>
                           </Show>
@@ -436,58 +434,27 @@ export default function CommandPalette(props: CommandPaletteProps) {
               : t("commandPalette.noResults")}
           </div>
 
-          {/* 底部提示 */}
+          {/* 底部提示栏:分隔 + 导航/执行/全部快捷键 */}
           <div
-            class="flex items-center gap-4 px-4 py-2"
+            class="flex items-center gap-4 px-4 py-2.5"
             style={{
               "border-top": "1px solid var(--color-border-subtle)",
-              "font-size": "10px",
+              "font-size": "11px",
               color: "var(--color-text-tertiary)",
+              background: "var(--color-bg-secondary)",
             }}
           >
-            <span class="flex items-center gap-1">
-              <kbd
-                class="rounded px-1 py-0.5 mono"
-                style={{
-                  background: "var(--color-bg-raised)",
-                  border: "1px solid var(--color-border-default)",
-                }}
-              >
-                ↑
-              </kbd>
-              <kbd
-                class="rounded px-1 py-0.5 mono"
-                style={{
-                  background: "var(--color-bg-raised)",
-                  border: "1px solid var(--color-border-default)",
-                }}
-              >
-                ↓
-              </kbd>
+            <span class="flex items-center gap-1.5">
+              <kbd class="kbd">↑</kbd>
+              <kbd class="kbd">↓</kbd>
               {t("commandPalette.hintNav")}
             </span>
-            <span class="flex items-center gap-1">
-              <kbd
-                class="rounded px-1 py-0.5 mono"
-                style={{
-                  background: "var(--color-bg-raised)",
-                  border: "1px solid var(--color-border-default)",
-                }}
-              >
-                Enter
-              </kbd>
+            <span class="flex items-center gap-1.5">
+              <kbd class="kbd">Enter</kbd>
               {t("commandPalette.hintExecute")}
             </span>
-            <span class="flex items-center gap-1 ml-auto">
-              <kbd
-                class="rounded px-1 py-0.5 mono"
-                style={{
-                  background: "var(--color-bg-raised)",
-                  border: "1px solid var(--color-border-default)",
-                }}
-              >
-                Ctrl+/
-              </kbd>
+            <span class="flex items-center gap-1.5 ml-auto">
+              <kbd class="kbd">Ctrl+/</kbd>
               {t("commandPalette.hintAllShortcuts")}
             </span>
           </div>

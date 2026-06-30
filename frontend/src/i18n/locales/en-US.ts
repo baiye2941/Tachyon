@@ -10,6 +10,8 @@ const enUS = {
   // —— Common ——
   "common.loading": "Loading...",
   "common.appError": "An error occurred",
+  "common.appErrorHint": "The app hit an unexpected error. You can retry; if it persists, please report the details below.",
+  "common.errorStack": "Error stack",
   "common.confirm": "Confirm",
   "common.cancel": "Cancel",
   "common.close": "Close",
@@ -78,8 +80,9 @@ const enUS = {
 
   // —— Toolbar ——
   "toolbar.newDownload": "New Download",
+  "toolbar.newDownloadShort": "New",
   "toolbar.searchPlaceholder":
-    "Search tasks or settings (e.g. status:downloading size:>1gb)",
+    "Search tasks or settings",
   "toolbar.selectAll": "Select All",
   "toolbar.selectedCount": "{count} selected",
   "toolbar.pause": "Pause",
@@ -201,7 +204,7 @@ const enUS = {
   "detail.retry": "Retry",
   "detail.retryWithMirror": "Mirror retry",
   "detail.retryWithMirrorHint":
-    "Redownload via hf-mirror.com, original link as fallback",
+    "Redownload via hf-mirror.com",
   "detail.copy.aria": "Copy",
   "detail.copied.aria": "Copied",
   "detail.section.diagnostics": "Failure diagnostics",
@@ -488,7 +491,7 @@ const enUS = {
   "hub.downloadTitle": "Download directly from HuggingFace",
   "hub.mirrorDownload": "Mirror download",
   "hub.mirrorDownloadTitle":
-    "Download via hf-mirror.com (accelerated in CN), original link as fallback",
+    "Download via hf-mirror.com (accelerated in CN)",
   "hub.aria.downloadFile": "Download {name}",
   "hub.largeTag": "L",
 
@@ -563,6 +566,11 @@ const enUS = {
   "experimental.huggingfaceDesc": "Browse, search and download HuggingFace model weights, manage local model library",
   "sidebar.huggingface": "Hugging Face",
   "settings.section.experimental": "Experimental Features",
+  "settings.hub.sourceMode": "HuggingFace source mode",
+  "settings.hub.sourceModeDesc": "Mirror routes through hf-mirror.com for CN acceleration; Race connects official and mirror concurrently and picks the faster; Official connects directly, requires huggingface.co reachability",
+  "settings.hub.sourceOfficial": "Official",
+  "settings.hub.sourceMirror": "Mirror",
+  "settings.hub.sourceRace": "Race",
 } as const;
 
 export default enUS;

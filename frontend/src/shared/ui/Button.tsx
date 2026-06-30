@@ -85,6 +85,24 @@ const Button: Component<ButtonProps> = (rawProps) => {
     return parts.filter(Boolean).join(' ')
   }
 
+  // 点击 ripple:在点击位置生成涟漪 span,600ms 后自清。
+  // 仅对支持 ripple 的变体(primary/secondary/danger/ghost/icon)生效,
+  // disabled/loading 不触发。容器需 position:relative + overflow:hidden。
+  const handleRipple = (e: MouseEvent) => {
+    if (props.disabled || props.loading) return
+    const target = e.currentTarget as HTMLElement
+    const rect = target.getBoundingClientRect()
+    const size = Math.max(rect.width, rect.height)
+    const wave = document.createElement('span')
+    wave.className = 'ripple-wave'
+    wave.style.width = `${size}px`
+    wave.style.height = `${size}px`
+    wave.style.left = `${e.clientX - rect.left - size / 2}px`
+    wave.style.top = `${e.clientY - rect.top - size / 2}px`
+    target.appendChild(wave)
+    window.setTimeout(() => wave.remove(), 650)
+  }
+
   return (
     <Dynamic
       component={props.as}
@@ -95,6 +113,7 @@ const Button: Component<ButtonProps> = (rawProps) => {
       title={props.title}
       type={props.as === 'button' ? props.type : undefined}
       onClick={(e: MouseEvent) => {
+        handleRipple(e)
         if (props.disabled || props.loading) return
         props.onClick?.(e)
       }}

@@ -2,7 +2,6 @@ import { Show, For, untrack, createMemo } from "solid-js";
 import type { JSX } from "solid-js";
 import type { SidebarFilter, FileTypeFilter } from "../types";
 import {
-  FileIcon,
   VideoIcon,
   AudioIcon,
   DocumentIcon,
@@ -12,12 +11,18 @@ import {
   PinIcon,
   PinOffIcon,
   HistoryIcon,
+  RadarIcon,
   HubIcon,
+  StackIcon,
+  DownloadSimpleIcon,
+  CheckCircleIcon,
+  PauseIcon,
+  WarningCircleIcon,
 } from "./icons";
 import {
   $taskFilter,
-  setSidebarFilter,
-  setFileTypeFilter,
+  toggleSidebarFilter,
+  toggleFileTypeFilter,
 } from "../stores/taskFilter";
 import {
   $ui,
@@ -42,11 +47,11 @@ interface NavEntry {
 }
 
 const statusItems: NavEntry[] = [
-  { key: "all", labelKey: "sidebar.filter.all", icon: FileIcon },
-  { key: "downloading", labelKey: "status.label.downloading", icon: FileIcon },
-  { key: "completed", labelKey: "status.label.completed", icon: FileIcon },
-  { key: "paused", labelKey: "status.label.paused", icon: FileIcon },
-  { key: "failed", labelKey: "sidebar.filter.failed", icon: FileIcon },
+  { key: "all", labelKey: "sidebar.filter.all", icon: StackIcon },
+  { key: "downloading", labelKey: "status.label.downloading", icon: DownloadSimpleIcon },
+  { key: "completed", labelKey: "status.label.completed", icon: CheckCircleIcon },
+  { key: "paused", labelKey: "status.label.paused", icon: PauseIcon },
+  { key: "failed", labelKey: "sidebar.filter.failed", icon: WarningCircleIcon },
 ];
 
 const typeItems: { key: FileTypeFilter; labelKey: MessageKey; icon: IconComponent }[] =
@@ -74,28 +79,45 @@ const NavItem = (p: NavItemProps) => {
   const label = () => tr(p.labelKey);
   return (
     <button
-      class={`sidebar-nav-item flex items-center cursor-pointer select-none focus:outline-none focus-visible:focus-ring ${p.active ? "" : "hover-light"}`}
+      class={`sidebar-nav-item flex items-center cursor-pointer select-none focus:outline-none focus-visible:focus-ring relative ${p.active ? "is-active" : "hover-light"}`}
       style={{
         height: "34px",
         padding: p.expanded ? "0 12px" : "0",
-        "border-radius": "8px",
-        background: p.active ? "var(--color-accent-soft)" : "transparent",
-        "border-left": p.active
-          ? "2px solid var(--color-accent-primary)"
-          : "2px solid transparent",
+        "border-radius": "7px",
+        background: p.active ? "var(--color-surface-2, var(--color-bg-tertiary))" : "transparent",
         color: p.active
-          ? "var(--color-accent-primary)"
+          ? "var(--color-text-primary)"
           : "var(--color-text-secondary)",
         transition: "background 150ms ease, color 150ms ease",
         "justify-content": p.expanded ? "space-between" : "center",
         border: "none",
         width: "100%",
+        /* active 态:顶光 inset + 微下沉阴影(参考稿 raised active) */
+        "box-shadow": p.active
+          ? "inset 0 1px 0 var(--color-inset-dark), inset 0 0 0 0.5px var(--color-inset-light)"
+          : "none",
       }}
       onClick={() => p.onClick()}
       aria-current={p.active ? "page" : undefined}
       aria-label={label()}
       title={label()}
     >
+      {/* active 左竖条(参考稿:2px 电青 bar) */}
+      <Show when={p.active}>
+        <span
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            left: p.expanded ? "-2px" : "0",
+            top: "50%",
+            transform: "translateY(-50%)",
+            width: "2px",
+            height: "20px",
+            "border-radius": "0 2px 2px 0",
+            background: "var(--color-accent-primary)",
+          }}
+        />
+      </Show>
       <div
         class="flex items-center min-w-0"
         style={{ gap: p.expanded ? "12px" : "0" }}
@@ -262,21 +284,21 @@ export default function Sidebar() {
       labelKey: it.labelKey,
       icon: it.icon,
       active: sidebarFilter() === it.key,
-      onClick: () => setSidebarFilter(it.key),
+      onClick: () => toggleSidebarFilter(it.key),
     })),
     ...typeItems.map((it) => ({
       key: `t-${it.key}`,
       labelKey: it.labelKey,
       icon: it.icon,
       active: fileTypeFilter() === it.key,
-      onClick: () => setFileTypeFilter(it.key),
+      onClick: () => toggleFileTypeFilter(it.key),
     })),
     {
-      key: "hub",
+      key: "sniffer",
       labelKey: "command.nav.sniffer.label" as MessageKey,
-      icon: HubIcon,
+      icon: RadarIcon,
       active: false,
-      onClick: $ui.openHub,
+      onClick: $ui.openSniffer,
     },
     {
       key: "history",
@@ -419,7 +441,7 @@ export default function Sidebar() {
                   count={taskCounts()[item.key]}
                   active={sidebarFilter() === item.key}
                   expanded={true}
-                  onClick={() => setSidebarFilter(item.key)}
+                  onClick={() => toggleSidebarFilter(item.key)}
                 />
               )}
             </For>
@@ -438,7 +460,7 @@ export default function Sidebar() {
                   count={fileTypeCounts()[item.key]}
                   active={fileTypeFilter() === item.key}
                   expanded={true}
-                  onClick={() => setFileTypeFilter(item.key)}
+                  onClick={() => toggleFileTypeFilter(item.key)}
                 />
               )}
             </For>
@@ -450,12 +472,12 @@ export default function Sidebar() {
           <div class="flex flex-col gap-1" style={{ padding: "8px 6px" }}>
             <SectionLabel>{tr("sidebar.section.lab")}</SectionLabel>
             <NavItem
-              icon={HubIcon}
+              icon={RadarIcon}
               labelKey={"command.nav.sniffer.label"}
               count={0}
               active={false}
               expanded={true}
-              onClick={$ui.openHub}
+              onClick={$ui.openSniffer}
             />
             <NavItem
               icon={HistoryIcon}

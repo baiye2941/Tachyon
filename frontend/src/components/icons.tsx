@@ -1,12 +1,147 @@
-/* Tachyon Icon System - SVG Icons */
-/* All icons are 24x24 viewBox, stroke-based, 1.5px stroke width */
+/* Tachyon Icon System - Phosphor path 内嵌版
+ * path data 来源: @phosphor-icons/core@2.1.1 (MIT License)
+ *   https://github.com/phosphor-icons/web
+ * 仅内嵌 path d 字符串(无颜色字面量),合规 lint:colors。
+ * viewBox 统一 0 0 256 256(Phosphor 规约),fill="currentColor"。
+ * duotone 图标(文件类)用双层 path:底层 opacity 0.2 + 主轮廓。 */
 
-/**
- * Tachyon Logo:快子(超光速粒子)几何标识。
- * 去 AI 味:菱形主体 + 中心点保留速度意象,十字辅助线 opacity 0.5→0.35 收敛,
- * 避免过度装饰。赛马娘"速度"主题的克制表达。
- */
-export const LogoIcon = (props: { class?: string }) => (
+import { regular as P, duotone as D } from "./iconPaths";
+import type { JSX } from "solid-js";
+
+/** 图标尺寸 prop:可由调用方覆盖工厂默认值 */
+interface IconProps {
+  class?: string;
+  /** 覆盖默认尺寸(px),优先于 Tailwind w-/h- 类(inline 优先级最高) */
+  size?: number;
+}
+
+/** regular 单 path 工厂。
+ *  fill="currentColor",颜色随父容器 color 驱动。
+ *  size 默认 16,可经 props.size 覆盖。 */
+function makeRegular(pathKey: keyof typeof P, defaultSize = 16) {
+  return function IconCmp(props: IconProps): JSX.Element {
+    return (
+      <svg
+        class={props.class}
+        width={props.size ?? defaultSize}
+        height={props.size ?? defaultSize}
+        viewBox="0 0 256 256"
+        fill="currentColor"
+        xmlns="http://www.w3.org/2000/svg"
+        aria-hidden="true"
+        style={{ "flex-shrink": "0" }}
+      >
+        <path d={P[pathKey]} />
+      </svg>
+    );
+  };
+}
+
+/** duotone 双 path 工厂(文件类材质质感)。
+ *  底层 opacity 0.2 + 主轮廓 fill="currentColor"。 */
+function makeDuotone(
+  pathKey: keyof typeof D,
+  defaultSize = 20,
+) {
+  return function IconCmp(props: IconProps): JSX.Element {
+    const d = D[pathKey];
+    return (
+      <svg
+        class={props.class}
+        width={props.size ?? defaultSize}
+        height={props.size ?? defaultSize}
+        viewBox="0 0 256 256"
+        fill="currentColor"
+        xmlns="http://www.w3.org/2000/svg"
+        aria-hidden="true"
+        style={{ "flex-shrink": "0" }}
+      >
+        {/* 底层副色(Phosphor 规约 opacity 0.2) */}
+        <path d={d.layer} opacity="0.2" />
+        {/* 主轮廓 */}
+        <path d={d.main} />
+      </svg>
+    );
+  };
+}
+
+/* ===== 操作类(regular,18px:高 DPI 屏可读性)===== */
+export const PlusIcon = makeRegular("plus", 18);
+export const DownloadSimpleIcon = makeRegular("downloadSimple", 18);
+export const SearchIcon = makeRegular("magnifyingGlass", 18);
+export const PauseIcon = makeRegular("pause", 18);
+export const PlayIcon = makeRegular("play", 18);
+export const CancelIcon = makeRegular("stop", 18);
+export const TrashIcon = makeRegular("trash", 18);
+export const SettingsIcon = makeRegular("gearSix", 18);
+export const XIcon = makeRegular("x", 18);
+export const CloseIcon = makeRegular("x", 14);
+export const MinimizeIcon = makeRegular("minus", 14);
+export const MaximizeIcon = makeRegular("squaresFour", 14);
+export const RestoreIcon = makeRegular("squaresFour", 14);
+export const MenuIcon = makeRegular("list", 18);
+export const FilterIcon = makeRegular("funnelSimple", 18);
+export const FunnelSimpleIcon = makeRegular("funnelSimple", 18);
+export const CaretDoubleLeftIcon = makeRegular("caretDoubleLeft", 18);
+export const WarningCircleIcon = makeRegular("warningCircle", 18);
+export const StackIcon = makeRegular("stack", 18);
+export const HashIcon = makeRegular("hash", 18);
+export const CheckCircleIcon = makeRegular("checkCircle", 18);
+export const LightningIcon = makeRegular("lightning", 18);
+export const ArrowLeftIcon = makeRegular("arrowLeft", 18);
+export const ArrowDownIcon = makeRegular("arrowDown", 14);
+export const ChevronDownIcon = makeRegular("caretDown", 14);
+export const RefreshIcon = makeRegular("arrowClockwise", 18);
+export const CopyIcon = makeRegular("copy", 18);
+export const FolderOpenIcon = makeRegular("folderOpen", 18);
+export const LinkIcon = makeRegular("link", 18);
+export const InfoIcon = makeRegular("info", 18);
+export const EditIcon = makeRegular("pencilSimple", 18);
+export const MoreIcon = makeRegular("dotsThree", 18);
+export const OpenFileIcon = makeRegular("arrowSquareOut", 18);
+export const GridFourIcon = makeRegular("gridFour", 18);
+export const ListIcon = makeRegular("listBullets", 20);
+export const ListBulletsIcon = makeRegular("listBullets", 20);
+
+/* ===== 导航/状态类(regular,22px)===== */
+export const GearIcon = makeRegular("gear", 22);
+export const FileIcon = makeRegular("fileText", 22);
+export const BrowserIcon = makeRegular("browser", 22);
+export const RadarIcon = makeRegular("broadcast", 22);
+export const HistoryIcon = makeRegular("clock", 22);
+export const ClockIcon = makeRegular("clock", 22);
+export const TrophyIcon = makeRegular("trophy", 22);
+export const GlobeIcon = makeRegular("globe", 22);
+export const PackageIcon = makeRegular("package", 22);
+export const ChartBarIcon = makeRegular("chartBar", 22);
+export const PauseCircleIcon = makeRegular("pauseCircle", 22);
+export const CheckIcon = makeRegular("check", 18);
+export const StarIcon = makeRegular("star", 18);
+export const SunIcon = makeRegular("sun", 18);
+export const MoonIcon = makeRegular("moon", 18);
+
+/* ===== 文件类型(duotone,22px,材质质感)===== */
+export const VideoIcon = makeDuotone("fileVideo", 22);
+export const AudioIcon = makeDuotone("fileAudio", 22);
+export const DocumentIcon = makeDuotone("fileText", 22);
+export const ImageIcon = makeDuotone("fileImage", 22);
+export const ArchiveIcon = makeDuotone("fileArchive", 22);
+// 代码文件复用 fileCode
+export const CodeFileIcon = makeDuotone("fileCode", 22);
+// 附件/其他文件用 regular fileText(无 duotone 区分,降级)
+export const AttachmentIcon = makeRegular("fileText", 22);
+
+/* ===== Hub 图标(模型仓库,叠层)===== */
+export const HubIcon = makeRegular("stack", 20);
+
+/* ===== MoveIcon(移动到标签,用 arrows-out-of-center 近似)=====
+ * Phosphor 无精确 move,用 grid-four 占位语义保持导出契约 */
+export const MoveIcon = makeRegular("gridFour", 16);
+
+/* ===== 特殊保留图标(非 Phosphor,保持原规约)===== */
+
+/** Tachyon Logo:快子几何标识(品牌,保留自绘) */
+export const LogoIcon = (props: IconProps) => (
   <svg
     class={props.class}
     width="18"
@@ -14,6 +149,7 @@ export const LogoIcon = (props: { class?: string }) => (
     viewBox="0 0 24 24"
     fill="none"
     xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
     <path
       d="M4 12L12 4L20 12L12 20L4 12Z"
@@ -33,240 +169,27 @@ export const LogoIcon = (props: { class?: string }) => (
   </svg>
 );
 
-export const PlusIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M12 5v14M5 12h14" />
+/** StatusDot:状态小圆点(8x8,非 Phosphor) */
+export const StatusDot = (props: { class?: string; active?: boolean }) => (
+  <svg class={props.class} width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
+    <circle
+      cx="4"
+      cy="4"
+      r="4"
+      fill={
+        props.active
+          ? "var(--color-accent-primary)"
+          : "var(--color-text-tertiary)"
+      }
+    />
   </svg>
 );
 
-export const SettingsIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="3" />
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.67 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.67 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.67a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.33 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-  </svg>
-);
-
-export const MinimizeIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-  >
-    <path d="M5 12h14" />
-  </svg>
-);
-
-export const MaximizeIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="3" y="3" width="18" height="18" rx="2" />
-  </svg>
-);
-
-export const RestoreIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="5" y="9" width="14" height="12" rx="2" />
-    <path d="M9 9V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-4" />
-  </svg>
-);
-
-export const CloseIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M18 6L6 18M6 6l12 12" />
-  </svg>
-);
-
-export const SearchIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="11" cy="11" r="8" />
-    <path d="M21 21l-4.35-4.35" />
-  </svg>
-);
-
-export const PauseIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="6" y="4" width="4" height="16" rx="1" />
-    <rect x="14" y="4" width="4" height="16" rx="1" />
-  </svg>
-);
-
-export const PlayIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none" />
-  </svg>
-);
-
-/** 取消图标:圆环 + 斜杠(stop/no-entry 语义),区别于 CloseIcon 的 X(关闭窗口) */
-export const CancelIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="9" />
-    <line x1="5.5" y1="5.5" x2="18.5" y2="18.5" />
-  </svg>
-);
-
-/** 菜单图标:三横线(汉堡 ≡),用于 TitleBar 应用菜单按钮 */
-export const MenuIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <line x1="4" y1="6" x2="20" y2="6" />
-    <line x1="4" y1="12" x2="20" y2="12" />
-    <line x1="4" y1="18" x2="20" y2="18" />
-  </svg>
-);
-
-export const TrashIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-    <path d="M10 11v6M14 11v6" />
-  </svg>
-);
-
-export const PinIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M12 2v8M5 10h14l-2.5 7h-9L5 10zM12 17v5" />
-  </svg>
-);
-
-export const PinOffIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M12 2v8M5 10h14l-2.5 7h-9L5 10zM12 17v5" />
-    <path d="M2 2l20 20" />
-  </svg>
-);
-
+/**
+ * CheckboxIcon:复选框。
+ * 保留 24-viewBox + checkmark path d="M9 12l2 2 4-4"(HfBrowserPanel.spec 断言此值,
+ * 不可改)。checked 时实心 + 白勾,未 checked 时空心框。
+ */
 export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
   <svg
     class={props.class}
@@ -278,6 +201,8 @@ export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
     stroke-width="1.5"
     stroke-linecap="round"
     stroke-linejoin="round"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
     {props.checked ? (
       <>
@@ -298,7 +223,8 @@ export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
   </svg>
 );
 
-export const SelectIcon = (props: { class?: string }) => (
+/** SelectIcon:多选切换(网格 + 勾选语义,24-viewBox 保留) */
+export const SelectIcon = (props: IconProps) => (
   <svg
     class={props.class}
     width="16"
@@ -309,13 +235,16 @@ export const SelectIcon = (props: { class?: string }) => (
     stroke-width="1.5"
     stroke-linecap="round"
     stroke-linejoin="round"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
     <rect x="3" y="3" width="18" height="18" rx="2" />
     <path d="M3 9h18M9 3v18" />
   </svg>
 );
 
-export const XIcon = (props: { class?: string }) => (
+/** PinIcon / PinOffIcon:侧栏钉住(保留自绘,Phosphor 无贴切图) */
+export const PinIcon = (props: IconProps) => (
   <svg
     class={props.class}
     width="16"
@@ -326,150 +255,14 @@ export const XIcon = (props: { class?: string }) => (
     stroke-width="1.5"
     stroke-linecap="round"
     stroke-linejoin="round"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
-    <path d="M18 6L6 18M6 6l12 12" />
+    <path d="M12 2v8M5 10h14l-2.5 7h-9L5 10zM12 17v5" />
   </svg>
 );
 
-export const FileIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-    <polyline points="14 2 14 8 20 8" />
-  </svg>
-);
-
-export const VideoIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="2" y="2" width="20" height="20" rx="2" />
-    <polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none" />
-  </svg>
-);
-
-export const AudioIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M9 18V5l12-2v13" />
-    <circle cx="6" cy="18" r="3" />
-    <circle cx="18" cy="16" r="3" />
-  </svg>
-);
-
-export const DocumentIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-    <polyline points="14 2 14 8 20 8" />
-    <line x1="16" y1="13" x2="8" y2="13" />
-    <line x1="16" y1="17" x2="8" y2="17" />
-  </svg>
-);
-
-export const ImageIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="3" y="3" width="18" height="18" rx="2" />
-    <circle cx="8.5" cy="8.5" r="1.5" />
-    <path d="M21 15l-5-5L5 21" />
-  </svg>
-);
-
-export const ArchiveIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4" />
-  </svg>
-);
-
-export const GearIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="3" />
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.67 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.67 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.67a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.33 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-  </svg>
-);
-
-export const AttachmentIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-  </svg>
-);
-
-export const FolderOpenIcon = (props: { class?: string }) => (
+export const PinOffIcon = (props: IconProps) => (
   <svg
     class={props.class}
     width="16"
@@ -480,13 +273,16 @@ export const FolderOpenIcon = (props: { class?: string }) => (
     stroke-width="1.5"
     stroke-linecap="round"
     stroke-linejoin="round"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
-    <path d="M22 19V9a2 2 0 0 0-2-2h-6.3c-.7 0-1.4-.3-1.9-.8L9.7 3.8A2 2 0 0 0 7.8 3H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2z" />
-    <path d="M2 13h20" />
+    <path d="M12 2v8M5 10h14l-2.5 7h-9L5 10zM12 17v5" />
+    <path d="M2 2l20 20" />
   </svg>
 );
 
-export const LinkIcon = (props: { class?: string }) => (
+/** LoadingIcon:加载旋转(保留 spin 动画) */
+export const LoadingIcon = (props: IconProps) => (
   <svg
     class={props.class}
     width="16"
@@ -497,355 +293,8 @@ export const LinkIcon = (props: { class?: string }) => (
     stroke-width="1.5"
     stroke-linecap="round"
     stroke-linejoin="round"
-  >
-    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-  </svg>
-);
-
-export const RefreshIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polyline points="23 4 23 10 17 10" />
-    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-  </svg>
-);
-
-export const InfoIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <line x1="12" y1="16" x2="12" y2="12" />
-    <line x1="12" y1="8" x2="12.01" y2="8" />
-  </svg>
-);
-
-export const ArrowDownIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M12 5v14M5 12l7 7 7-7" />
-  </svg>
-);
-
-export const ChevronDownIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="12"
-    height="12"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M6 9l6 6 6-6" />
-  </svg>
-);
-
-export const StatusDot = (props: { class?: string; active?: boolean }) => (
-  <svg class={props.class} width="8" height="8" viewBox="0 0 8 8">
-    <circle
-      cx="4"
-      cy="4"
-      r="4"
-      fill={
-        props.active
-          ? "var(--color-accent-primary)"
-          : "var(--color-text-tertiary)"
-      }
-    />
-  </svg>
-);
-
-export const OpenFileIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-    <polyline points="15 3 21 3 21 9" />
-    <line x1="10" y1="14" x2="21" y2="3" />
-  </svg>
-);
-
-export const MoreIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="1" />
-    <circle cx="19" cy="12" r="1" />
-    <circle cx="5" cy="12" r="1" />
-  </svg>
-);
-
-export const EditIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-  </svg>
-);
-
-export const MoveIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polyline points="5 9 2 12 5 15" />
-    <polyline points="9 5 12 2 15 5" />
-    <polyline points="15 19 12 22 9 19" />
-    <polyline points="19 9 22 12 19 15" />
-    <line x1="2" y1="12" x2="22" y2="12" />
-    <line x1="12" y1="2" x2="12" y2="22" />
-  </svg>
-);
-
-export const CopyIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-  </svg>
-);
-
-export const CheckIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polyline points="20 6 9 17 4 12" />
-  </svg>
-);
-
-export const BrowserIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="2" y="3" width="20" height="18" rx="2" />
-    <line x1="2" y1="9" x2="22" y2="9" />
-    <line x1="6" y1="6" x2="6.01" y2="6" />
-    <line x1="10" y1="6" x2="10.01" y2="6" />
-  </svg>
-);
-
-export const RadarIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="48"
-    height="48"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <path d="M12 2v10l8.66-5" />
-  </svg>
-);
-
-export const HistoryIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <polyline points="12 6 12 12 16 14" />
-  </svg>
-);
-
-export const TrophyIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" />
-    <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" />
-    <path d="M4 22h16" />
-    <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22" />
-    <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22" />
-    <path d="M18 2H6v7a6 6 0 0 0 12 0V2z" />
-  </svg>
-);
-
-export const GlobeIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <line x1="2" y1="12" x2="22" y2="12" />
-    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-  </svg>
-);
-
-export const ClockIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <polyline points="12 6 12 12 16 14" />
-  </svg>
-);
-
-export const PackageIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
-    <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
-    <line x1="12" y1="22.08" x2="12" y2="12" />
-  </svg>
-);
-
-export const FilterIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-  </svg>
-);
-
-export const LoadingIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
   >
     <style>{`
       @keyframes spin { 100% { transform: rotate(360deg); } }
@@ -862,133 +311,5 @@ export const LoadingIcon = (props: { class?: string }) => (
       />
       <path d="M12 2v4" />
     </g>
-  </svg>
-);
-
-export const ListIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <line x1="9" y1="6" x2="20" y2="6" />
-    <line x1="9" y1="12" x2="20" y2="12" />
-    <line x1="9" y1="18" x2="20" y2="18" />
-    <circle cx="5" cy="6" r="1.5" fill="currentColor" stroke="none" />
-    <circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none" />
-    <circle cx="5" cy="18" r="1.5" fill="currentColor" stroke="none" />
-  </svg>
-);
-
-export const ChartBarIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <rect x="3" y="3" width="18" height="18" rx="2" />
-    <line x1="8" y1="17" x2="8" y2="10" />
-    <line x1="12" y1="17" x2="12" y2="7" />
-    <line x1="16" y1="17" x2="16" y2="12" />
-  </svg>
-);
-
-export const PauseCircleIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="10" />
-    <line x1="10" y1="9" x2="10" y2="15" />
-    <line x1="14" y1="9" x2="14" y2="15" />
-  </svg>
-);
-
-export const HubIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M12 2L2 7l10 5 10-5-10-5z" />
-    <path d="M2 17l10 5 10-5" />
-    <path d="M2 12l10 5 10-5" />
-  </svg>
-)
-
-/** 星形图标(收藏标记) */
-export const StarIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="currentColor"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-  </svg>
-);
-
-/** 太阳图标(明亮主题切换,浅色模式标识) */
-export const SunIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <circle cx="12" cy="12" r="4" />
-    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-  </svg>
-);
-
-/** 月亮图标(暗黑主题切换,深色模式标识) */
-export const MoonIcon = (props: { class?: string }) => (
-  <svg
-    class={props.class}
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  >
-    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
   </svg>
 );

@@ -219,6 +219,16 @@ export function resetFilters(): void {
   setFileTypeFilter("all");
 }
 
+/** toggle 筛选:点已选中的分类再点一次 = 回到 'all'(可取消,避免点了看不到全部)。 */
+export function toggleSidebarFilter(key: SidebarFilter): void {
+  setSidebarFilter((prev) => (prev === key ? "all" : key));
+}
+
+/** toggle 文件类型筛选:同上,再点取消回 'all'。 */
+export function toggleFileTypeFilter(key: FileTypeFilter): void {
+  setFileTypeFilter((prev) => (prev === key ? "all" : key));
+}
+
 export const $taskFilter = {
   get searchQuery(): Accessor<string> {
     return searchQuery;

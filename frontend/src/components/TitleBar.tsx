@@ -1,5 +1,5 @@
 import { createSignal, onCleanup, onMount, Show, For } from 'solid-js'
-import { LogoIcon, MinimizeIcon, MaximizeIcon, RestoreIcon, CloseIcon, MenuIcon } from './icons'
+import { LightningIcon, MinimizeIcon, MaximizeIcon, RestoreIcon, CloseIcon, MenuIcon } from './icons'
 import { tr, type MessageKey } from '../i18n'
 import { $ui, openSettingsTab } from '../stores/ui'
 
@@ -124,26 +124,30 @@ export default function TitleBar() {
       <div class="flex items-center" style={{ height: '100%' }}>
         <div
           class="flex items-center gap-2"
-          style={{ padding: '0 12px', height: '100%' }}
+          style={{ padding: "0 12px", height: "100%" }}
         >
+          {/* brand 材质方块:深底 + 电青闪电(对齐参考稿 sidebar brand)。
+              深底 surface-2 + 闪电 fill accent,暗色下高对比可辨。 */}
           <div
             class="flex items-center justify-center"
             style={{
-              width: '18px',
-              height: '18px',
-              color: 'var(--color-accent-primary)',
-              animation: 'logo-shimmer 3s ease-in-out infinite',
+              width: "22px",
+              height: "22px",
+              "border-radius": "6px",
+              background: "var(--color-bg-raised)",
+              color: "var(--color-accent-primary)",
+              "box-shadow": "var(--shadow-inset-bevel)",
             }}
           >
-            <LogoIcon />
+            <LightningIcon />
           </div>
           <span
             style={{
-              'font-family': "'Geist', sans-serif",
-              'font-size': '13px',
-              'font-weight': 500,
-              color: 'var(--color-text-title)',
-              'letter-spacing': '0.5px',
+              "font-family": "'Geist', sans-serif",
+              "font-size": "13px",
+              "font-weight": 600,
+              color: "var(--color-text-title)",
+              "letter-spacing": "-0.01em",
             }}
           >
             Tachyon

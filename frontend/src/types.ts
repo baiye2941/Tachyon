@@ -65,6 +65,13 @@ export interface SchedulerConfig {
   ewmaAlpha: number
 }
 
+/** HuggingFace 源模式 — 与后端 tachyon_core::config::HfSourceMode 对齐 */
+export type HfSourceMode = 'official' | 'mirror' | 'race'
+
+export interface HubConfig {
+  sourceMode: HfSourceMode
+}
+
 export interface MagnetConfig {
   metadataTimeoutSecs: number
   downloadTimeoutSecs: number
@@ -79,6 +86,7 @@ export interface AppConfig {
   connection: ConnectionConfig
   scheduler: SchedulerConfig
   magnet: MagnetConfig
+  hub: HubConfig
 }
 
 /** 配置白名单补丁 — 仅包含允许前端修改的字段 */
@@ -87,6 +95,8 @@ export interface ConfigPatch {
   download?: DownloadPatch
   connection?: ConnectionPatch
   magnet?: MagnetPatch
+  scheduler?: SchedulerPatch
+  hub?: HubPatch
 }
 
 /** 下载配置白名单补丁 */
@@ -119,6 +129,18 @@ export interface MagnetPatch {
   enableDht?: boolean
   enableUpnp?: boolean
   trackers?: string[]
+}
+
+/** 调度器配置白名单补丁 */
+export interface SchedulerPatch {
+  minFragmentSize?: number
+  maxFragmentSize?: number
+  ewmaAlpha?: number
+}
+
+/** HuggingFace Hub 配置白名单补丁 */
+export interface HubPatch {
+  sourceMode?: HfSourceMode
 }
 
 export type SnifferResourceType = 'video' | 'audio' | 'document' | 'archive' | 'executable' | 'image' | 'model' | 'other'

@@ -74,7 +74,9 @@ export default function StatusBar(props: StatusBarProps) {
           }}
         >
           <ArrowDownIcon aria-hidden="true" />
-          {formatSpeed(props.totalSpeed)}
+          <span class={props.isIdle ? "" : "speed-breathe"}>
+            {formatSpeed(props.totalSpeed)}
+          </span>
         </span>
         <span aria-hidden="true">
           <Sparkline data={speedHistory()} width={80} height={16} />

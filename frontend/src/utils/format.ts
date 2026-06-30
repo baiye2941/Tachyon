@@ -14,24 +14,24 @@ import { tr, type MessageKey } from "../i18n";
  * 分片线程/批次着色色板(仅 Canvas 场景使用)。
  *
  * 设计原则:禁止彩虹色,90%+ 界面深色,强调色少量使用。
- * 赛马娘青绿 3 阶覆盖 1-3 批次(主轴),电紫区分 4 批次,仅 5+ 批次点缀青色。
+ * 冷电青 3 阶覆盖 1-3 批次(主轴,= --accent-vel-*),电紫区分 4 批次,仅 5+ 批次点缀青色。
  *
  * 重要:以下十六进制必须与 index.css @theme primitive token 保持同步,
  * 改一处改两处。映射关系见右侧注释。Canvas 无法使用 var(),故保留字面值。
  */
 export const THREAD_COLORS = [
-  "#14B8A6", // = --teal-500 (主强调,赛马娘青绿)
-  "#2DD4BF", // = --teal-400
-  "#0D9488", // = --teal-600
+  "#35DDE2", // = --accent-vel-400 (主强调,冷电青)
+  "#00E5FF", // = --accent-vel-500
+  "#40B1B7", // = --accent-vel-600
   "#A855F7", // = --purple-500 (电紫,区分批次)
   "#00E5FF", // = --cyan-500  (Neon Cyan,仅 5+ 批次点缀)
-  "#14B8A6",
-  "#2DD4BF",
-  "#A855F7",
-  "#0D9488",
+  "#35DDE2",
   "#00E5FF",
-  "#14B8A6",
-  "#2DD4BF",
+  "#A855F7",
+  "#40B1B7",
+  "#00E5FF",
+  "#35DDE2",
+  "#00E5FF",
 ];
 
 export function formatSize(bytes: number | null | undefined): string {
@@ -61,6 +61,7 @@ export function formatSpeed(bytesPerSec: number): string {
  *
  * color 返回 CSS 变量字符串(var(--color-file-*)),供 DOM 内联样式使用。
  * 与 index.css @theme 的 --color-file-* token 同源。
+ * 颜色降饱和度,各类型用独立 hue 区分(video 橙/audio 紫/document 蓝/image 绿/archive 橙/model 紫)。
  */
 const FILE_TYPE_MAP: Record<string, { icon: typeof FileIcon; color: string }> =
   {
@@ -133,10 +134,10 @@ export function getFileTypeColor(type: string): string {
  * 返回状态语义色(DOM 用,值为 CSS 变量字符串)。
  *
  * 状态色语义:
- * - 下载中 = Tachyon Teal(赛马娘青绿,品牌色绑定核心动态状态)
- * - 完成   = emerald(与下载中青绿对立,色盲可区分)
+ * - 下载中 = 冷电青(品牌色绑定核心动态状态)
+ * - 完成   = 青绿 emerald(与下载中电青对立,色盲可区分)
  * - 暂停   = ash(中性灰,警示但不紧急)
- * - 连接/校验/恢复 = cyan/teal 过渡态
+ * - 连接/校验/恢复 = cyan/电青 过渡态
  */
 export function getStatusColor(status: string): string {
   switch (status) {
