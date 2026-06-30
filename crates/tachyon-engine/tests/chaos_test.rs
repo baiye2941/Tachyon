@@ -109,11 +109,11 @@ impl ChaoticProtocol {
     async fn maybe_inject_network_chaos(&self) -> DownloadResult<()> {
         let mut rng = self.rng.lock().await;
 
-        if rng.r#gen::<f64>() < self.config.network_failure_prob {
+        if rng.random::<f64>() < self.config.network_failure_prob {
             return Err(DownloadError::Network("chaos: 网络故障注入".into()));
         }
 
-        if rng.r#gen::<f64>() < self.config.network_delay_prob {
+        if rng.random::<f64>() < self.config.network_delay_prob {
             let delay_ms = rng.gen_range(0..=self.config.max_network_delay_ms);
             drop(rng);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -197,7 +197,7 @@ impl ChaoticStorage {
 
     async fn maybe_inject_storage_delay(&self) {
         let mut rng = self.rng.lock().await;
-        if rng.r#gen::<f64>() < self.config.storage_delay_prob {
+        if rng.random::<f64>() < self.config.storage_delay_prob {
             let delay_ms = rng.gen_range(0..=self.config.max_storage_delay_ms);
             drop(rng);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -338,7 +338,7 @@ async fn run_chaos_download(
             let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(0x12345678));
             loop {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                if rng.r#gen::<f64>() < config.cancel_prob {
+                if rng.random::<f64>() < config.cancel_prob {
                     let _ = cancel_tx.send(TaskCommand::Cancel);
                     cancel_flag_clone.store(true, Ordering::Relaxed);
                     break;

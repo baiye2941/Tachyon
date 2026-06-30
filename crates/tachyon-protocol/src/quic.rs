@@ -170,7 +170,7 @@ impl QuicTransport {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
             .map_err(|e| DownloadError::Network(format!("生成自签名证书失败: {e}")))?;
 
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
 
         let mut crypto = rustls::ClientConfig::builder()
