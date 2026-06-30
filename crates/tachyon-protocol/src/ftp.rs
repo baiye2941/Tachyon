@@ -187,9 +187,23 @@ impl FtpClient {
             }
         };
 
-        let stream = AsyncFtpStream::connect(&addr)
-            .await
-            .map_err(|e| DownloadError::Network(format!("FTP 连接失败: {e}")))?;
+        // 连接超时:不可达地址(如防火墙丢包)会让 TCP 连接等到 OS 默认超时
+        // (Linux ~75-130s),拖慢测试与生产。5s 足以区分慢速合法连接与不可达
+        // (合法 FTP 握手通常 <2s;被静默丢弃的连接 5s 必然超时)。
+        let connect_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AsyncFtpStream::connect(&addr),
+        )
+        .await;
+        let stream = match connect_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(DownloadError::Network(format!("FTP 连接失败: {e}"))),
+            Err(_) => {
+                return Err(DownloadError::Network(format!(
+                    "FTP 连接失败: 连接超时(5s): {addr}"
+                )));
+            }
+        };
 
         let mut guard = self.inner.write().await;
         guard.stream = Some(stream);
