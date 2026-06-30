@@ -6604,6 +6604,110 @@ mod tests {
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
+    /// 覆盖大 chunk 直写分支(chunk.len() >= WRITE_BATCH_BYTES=256KB):
+    /// 单 chunk 超过刷写阈值时跳过 BytesMut 聚合直接写入,流式哈希仍须正确。
+    #[tokio::test]
+    async fn test_large_chunk_direct_write_hash() {
+        let frag_size = 512 * 1024u64; // 512KB 分片
+        let total_size = frag_size * 2; // 2 分片,进入分片下载路径
+        let chunk_size = 512 * 1024usize; // 单 chunk = 512KB > 256KB,走大 chunk 直写
+
+        let data = Bytes::from(vec![0xCDu8; total_size as usize]);
+        let verifier = CpuVerifier::blake3();
+        let expected_hash_frag0 = verifier.compute_hash(&data[0..frag_size as usize]).unwrap();
+        let expected_hash_frag1 = verifier
+            .compute_hash(&data[frag_size as usize..total_size as usize])
+            .unwrap();
+
+        let protocol: Arc<dyn Protocol> = Arc::new(SmallChunkProtocol {
+            meta: test_metadata("large-chunk.bin", total_size),
+            chunk_size,
+            total_data: data.clone(),
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/large-chunk.bin".into(),
+            DownloadConfig {
+                verify_checksum: true,
+                max_concurrent_fragments: 1,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        task.probe().await.unwrap();
+        task.init_storage().await.unwrap();
+        task.plan().unwrap();
+        assert_eq!(task.fragments.len(), 2);
+        task.fragments[0].info.hash = Some(expected_hash_frag0.clone());
+        task.fragments[1].info.hash = Some(expected_hash_frag1.clone());
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("execute 应成功");
+        task.verify().await.expect("verify 应通过");
+        task.state = DownloadState::Completed;
+
+        assert_eq!(task.fragments[0].computed_hash, Some(expected_hash_frag0));
+        assert_eq!(task.fragments[1].computed_hash, Some(expected_hash_frag1));
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    /// 覆盖批量刷写分支(write_buf 累积 >= WRITE_BATCH_BYTES=256KB):
+    /// 多个小 chunk 累积到阈值后 split 批量写入,流式哈希仍须正确。
+    #[tokio::test]
+    async fn test_batch_flush_threshold_hash() {
+        let frag_size = 512 * 1024u64; // 512KB 分片
+        let total_size = frag_size * 2; // 2 分片
+        let chunk_size = 128 * 1024usize; // 128KB chunk,2 个累积 256KB 触发批量刷写
+
+        let data = Bytes::from(vec![0xEFu8; total_size as usize]);
+        let verifier = CpuVerifier::blake3();
+        let expected_hash_frag0 = verifier.compute_hash(&data[0..frag_size as usize]).unwrap();
+        let expected_hash_frag1 = verifier
+            .compute_hash(&data[frag_size as usize..total_size as usize])
+            .unwrap();
+
+        let protocol: Arc<dyn Protocol> = Arc::new(SmallChunkProtocol {
+            meta: test_metadata("batch-flush.bin", total_size),
+            chunk_size,
+            total_data: data.clone(),
+        });
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/batch-flush.bin".into(),
+            DownloadConfig {
+                verify_checksum: true,
+                max_concurrent_fragments: 1,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        task.probe().await.unwrap();
+        task.init_storage().await.unwrap();
+        task.plan().unwrap();
+        assert_eq!(task.fragments.len(), 2);
+        task.fragments[0].info.hash = Some(expected_hash_frag0.clone());
+        task.fragments[1].info.hash = Some(expected_hash_frag1.clone());
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("execute 应成功");
+        task.verify().await.expect("verify 应通过");
+        task.state = DownloadState::Completed;
+
+        assert_eq!(task.fragments[0].computed_hash, Some(expected_hash_frag0));
+        assert_eq!(task.fragments[1].computed_hash, Some(expected_hash_frag1));
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
     /// 慢存储 + 多 chunk 回归护栏:写盘延迟放大时,流式哈希仍按网络序(=字节序)
     /// update,最终 computed_hash == blake3(分片)。验证 hash 顺序与写入时序解耦。
     #[tokio::test]
