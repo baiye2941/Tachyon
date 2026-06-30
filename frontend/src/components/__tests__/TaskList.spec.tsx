@@ -9,13 +9,17 @@ const renderWithI18n = (ui: () => JSX.Element) =>
 
 describe("TaskList 空状态与交互", () => {
   beforeEach(() => {
+    // vitest 4: mockImplementation 返回普通对象时 `new` 失败(not a constructor)。
+    // 用 class 形式确保 `new ResizeObserver(...)` 返回带 observe/disconnect 的实例。
     vi.stubGlobal(
       "ResizeObserver",
-      vi.fn().mockImplementation(() => ({
-        observe: vi.fn(),
-        disconnect: vi.fn(),
-        unobserve: vi.fn(),
-      })),
+      vi.fn().mockImplementation(function () {
+        return {
+          observe: vi.fn(),
+          disconnect: vi.fn(),
+          unobserve: vi.fn(),
+        };
+      }),
     );
   });
 

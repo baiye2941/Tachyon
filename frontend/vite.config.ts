@@ -5,6 +5,22 @@ import { visualizer } from "rollup-plugin-visualizer";
 
 export default defineConfig({
   plugins: [
+    // vitest 4 + vite-plugin-solid 2.11.12 兼容修复:
+    // solid-refresh babel 插件注入 import "/@solid-refresh" 虚拟模块,
+    // vite-plugin-solid 的 resolveId/load 钩子本应处理它,但 vitest 4 的
+    // deps optimizer 在插件钩子前用 new URL 把 /@solid-refresh 转成
+    // file:///@solid-refresh 触发 TypeError。此插件在 solidPlugin 之前
+    // 把虚拟 id 重定向到真实文件,绕过 vitest 的错误转换。
+    {
+      name: "solid-refresh-virtual-fix",
+      enforce: "pre",
+      resolveId(id) {
+        if (id === "/@solid-refresh") {
+          return require.resolve("solid-refresh/dist/solid-refresh.mjs");
+        }
+        return null;
+      },
+    },
     solidPlugin(),
     tailwindcss(),
     process.env.ANALYZE === "true"
