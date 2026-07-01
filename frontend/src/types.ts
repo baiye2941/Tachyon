@@ -81,6 +81,18 @@ export interface MagnetConfig {
   disableDhtPersistence: boolean
   peerWaitTimeoutSecs: number
   socksProxyUrl: string | null
+  /** peer 连接超时(秒),1-300,后端默认 8 */
+  peerConnectTimeoutSecs: number
+  /** peer 读写超时(秒),1-600,后端默认 10 */
+  peerReadWriteTimeoutSecs: number
+  /** 强制 tracker 重新 announce 间隔(秒),0=禁用 或 30-3600,后端默认 120 */
+  forceTrackerIntervalSecs: number
+  /** 延迟写入缓冲上限(MB),0=禁用(同步写入) 或 1-256,后端默认 16 */
+  deferWritesUpToMb: number
+  /** SOCKS5 启用时是否禁用 DHT(UDP 不可经 SOCKS5),后端默认 true */
+  disableDhtWhenSocks: boolean
+  /** 预置 peer 地址列表(host:port),从磁力链接 &pe= 解析 + 用户配置合并 */
+  peerAddrs: string[]
 }
 
 export interface AppConfig {
@@ -135,6 +147,12 @@ export interface MagnetPatch {
   disableDhtPersistence?: boolean
   peerWaitTimeoutSecs?: number
   socksProxyUrl?: string | null
+  peerConnectTimeoutSecs?: number
+  peerReadWriteTimeoutSecs?: number
+  forceTrackerIntervalSecs?: number
+  deferWritesUpToMb?: number
+  disableDhtWhenSocks?: boolean
+  peerAddrs?: string[]
 }
 
 /** 调度器配置白名单补丁 */

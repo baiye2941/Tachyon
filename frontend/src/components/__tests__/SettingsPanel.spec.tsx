@@ -62,6 +62,12 @@ const mockConfig = {
     disableDhtPersistence: false,
     peerWaitTimeoutSecs: 300,
     socksProxyUrl: null,
+    peerConnectTimeoutSecs: 8,
+    peerReadWriteTimeoutSecs: 10,
+    forceTrackerIntervalSecs: 120,
+    deferWritesUpToMb: 16,
+    disableDhtWhenSocks: true,
+    peerAddrs: [],
   },
   hub: {
     sourceMode: 'mirror' as const,
@@ -178,7 +184,8 @@ describe('SettingsPanel', () => {
 
     // 找到"禁用 DHT 持久化"开关的 toggle 按钮并点击翻转
     const toggleLabel = screen.getByText('禁用 DHT 持久化(仅内存)')
-    const toggleBtn = toggleLabel.parentElement!.querySelector('button')!
+    // label 被包在左侧分组 div 内,需向上找到 .justify-between 容器再取 button
+    const toggleBtn = toggleLabel.closest('.flex.items-center.justify-between')!.querySelector('button')!
     fireEvent.click(toggleBtn)
 
     // 保存
@@ -294,6 +301,124 @@ describe('SettingsPanel', () => {
     expect(calledWith.download!.rateLimitBytesPerSec).toBe(mockConfig.download.rateLimitBytesPerSec)
     expect(calledWith.connection!.maxGlobalConnections).toBe(mockConfig.connection.maxGlobalConnections)
     expect(calledWith.connection!.keepAliveTimeoutSecs).toBe(mockConfig.connection.keepAliveTimeoutSecs)
+  })
+
+  // --- Task 9: Peer 优化新增配置项 ---
+  it('加载配置后 magnet tab 渲染新增 peer 配置项(NumberInput + toggle)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+
+    // 四个 NumberInput 应以 aria-label 可达
+    expect((screen.getByLabelText('Peer 连接超时') as HTMLInputElement).value).toBe('8')
+    expect((screen.getByLabelText('Peer 读写超时') as HTMLInputElement).value).toBe('10')
+    expect((screen.getByLabelText('强制 Tracker 间隔') as HTMLInputElement).value).toBe('120')
+    expect((screen.getByLabelText('延迟写入缓冲') as HTMLInputElement).value).toBe('16')
+    // 新增 toggle "SOCKS5 时禁用 DHT" 应可见
+    expect(screen.getByText('SOCKS5 时禁用 DHT')).toBeDefined()
+    // 需重启生效 / 对新任务生效 标记应可见
+    expect(screen.getAllByText('需重启生效').length).toBeGreaterThan(0)
+    expect(screen.getByText('对新任务生效')).toBeDefined()
+  })
+
+  it('修改 Peer 连接超时后保存,patch 携带新值', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+    await waitFor(() => {
+      expect(screen.getByLabelText('Peer 连接超时')).toBeDefined()
+    })
+
+    const input = screen.getByLabelText('Peer 连接超时') as HTMLInputElement
+    fireEvent.input(input, { target: { value: '15' } })
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.peerConnectTimeoutSecs).toBe(15)
+  })
+
+  it('切换 SOCKS5 禁用 DHT 开关后保存,patch 携带翻转值', async () => {
+    // mockConfig 中 disableDhtWhenSocks=true,翻转后应为 false
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+    await waitFor(() => {
+      expect(screen.getByText('SOCKS5 时禁用 DHT')).toBeDefined()
+    })
+
+    const toggleLabel = screen.getByText('SOCKS5 时禁用 DHT')
+    // label 被包在左侧分组 div 内,需向上找到 .justify-between 容器再取 button
+    const toggleBtn = toggleLabel.closest('.flex.items-center.justify-between')!.querySelector('button')!
+    fireEvent.click(toggleBtn)
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.disableDhtWhenSocks).toBe(false)
+  })
+
+  it('未修改时保存,patch 仍携带全部新增字段(全量回传,与现有模式一致)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.peerConnectTimeoutSecs).toBe(mockConfig.magnet.peerConnectTimeoutSecs)
+    expect(calledWith.magnet!.peerReadWriteTimeoutSecs).toBe(mockConfig.magnet.peerReadWriteTimeoutSecs)
+    expect(calledWith.magnet!.forceTrackerIntervalSecs).toBe(mockConfig.magnet.forceTrackerIntervalSecs)
+    expect(calledWith.magnet!.deferWritesUpToMb).toBe(mockConfig.magnet.deferWritesUpToMb)
+    expect(calledWith.magnet!.disableDhtWhenSocks).toBe(mockConfig.magnet.disableDhtWhenSocks)
   })
 
   it('About 标签展示支持协议 + 只读 User-Agent', async () => {

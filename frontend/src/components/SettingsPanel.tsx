@@ -63,6 +63,11 @@ interface ConfigDraft {
     trackers: string[];
     disableDhtPersistence: boolean;
     socksProxyUrl: string | null;
+    peerConnectTimeoutSecs: number;
+    peerReadWriteTimeoutSecs: number;
+    forceTrackerIntervalSecs: number;
+    deferWritesUpToMb: number;
+    disableDhtWhenSocks: boolean;
   };
   hub: {
     sourceMode: HfSourceMode;
@@ -157,6 +162,11 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       trackers: [],
       disableDhtPersistence: false,
       socksProxyUrl: null,
+      peerConnectTimeoutSecs: 8,
+      peerReadWriteTimeoutSecs: 10,
+      forceTrackerIntervalSecs: 120,
+      deferWritesUpToMb: 16,
+      disableDhtWhenSocks: true,
     },
     hub: {
       sourceMode: "mirror",
@@ -199,6 +209,12 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         trackers: cfg.magnet.trackers,
         disableDhtPersistence: cfg.magnet.disableDhtPersistence,
         socksProxyUrl: cfg.magnet.socksProxyUrl,
+        // 新增字段:向后兼容旧版后端快照(字段可能缺失),缺失时回退后端默认值
+        peerConnectTimeoutSecs: cfg.magnet.peerConnectTimeoutSecs ?? 8,
+        peerReadWriteTimeoutSecs: cfg.magnet.peerReadWriteTimeoutSecs ?? 10,
+        forceTrackerIntervalSecs: cfg.magnet.forceTrackerIntervalSecs ?? 120,
+        deferWritesUpToMb: cfg.magnet.deferWritesUpToMb ?? 16,
+        disableDhtWhenSocks: cfg.magnet.disableDhtWhenSocks ?? true,
       },
       hub: {
         sourceMode: cfg.hub?.sourceMode ?? "mirror",
@@ -255,6 +271,11 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         trackers: draft.magnet.trackers,
         disableDhtPersistence: draft.magnet.disableDhtPersistence,
         socksProxyUrl: draft.magnet.socksProxyUrl || null,
+        peerConnectTimeoutSecs: draft.magnet.peerConnectTimeoutSecs,
+        peerReadWriteTimeoutSecs: draft.magnet.peerReadWriteTimeoutSecs,
+        forceTrackerIntervalSecs: draft.magnet.forceTrackerIntervalSecs,
+        deferWritesUpToMb: draft.magnet.deferWritesUpToMb,
+        disableDhtWhenSocks: draft.magnet.disableDhtWhenSocks,
       },
       scheduler: {
         minFragmentSize: draft.scheduler.minFragmentSize,
@@ -698,6 +719,69 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                       {t("settings.magnet.socksProxyUrlHint")}
                     </span>
                   </div>
+
+                  {/* —— Task 9: Peer 超时配置(需重启生效) —— */}
+                  <SectionLabel text={t("settings.magnet.sectionPeer")} />
+                  <NumberInput
+                    label={t("settings.magnet.peerConnectTimeout")}
+                    value={draft.magnet.peerConnectTimeoutSecs}
+                    min={1}
+                    max={300}
+                    unit={t("time.seconds", { n: draft.magnet.peerConnectTimeoutSecs })}
+                    badge="restart"
+                    hint={t("settings.magnet.peerConnectTimeoutHint")}
+                    onChange={(v) => setDraft("magnet", "peerConnectTimeoutSecs", v)}
+                  />
+                  <NumberInput
+                    label={t("settings.magnet.peerReadWriteTimeout")}
+                    value={draft.magnet.peerReadWriteTimeoutSecs}
+                    min={1}
+                    max={600}
+                    unit={t("time.seconds", { n: draft.magnet.peerReadWriteTimeoutSecs })}
+                    badge="restart"
+                    hint={t("settings.magnet.peerReadWriteTimeoutHint")}
+                    onChange={(v) => setDraft("magnet", "peerReadWriteTimeoutSecs", v)}
+                  />
+
+                  {/* —— Task 9: 高级配置(tracker / defer_writes / socks-DHT) —— */}
+                  <SectionLabel text={t("settings.magnet.sectionAdvanced")} />
+                  <NumberInput
+                    label={t("settings.magnet.forceTrackerInterval")}
+                    value={draft.magnet.forceTrackerIntervalSecs}
+                    min={0}
+                    max={3600}
+                    unit={t("time.seconds", { n: draft.magnet.forceTrackerIntervalSecs })}
+                    badge="newTask"
+                    hint={t("settings.magnet.forceTrackerIntervalHint")}
+                    onChange={(v) => setDraft("magnet", "forceTrackerIntervalSecs", v)}
+                  />
+                  <NumberInput
+                    label={t("settings.magnet.deferWritesUpToMb")}
+                    value={draft.magnet.deferWritesUpToMb}
+                    min={0}
+                    max={256}
+                    unit="MB"
+                    badge="restart"
+                    hint={t("settings.magnet.deferWritesUpToMbHint")}
+                    onChange={(v) => setDraft("magnet", "deferWritesUpToMb", v)}
+                  />
+                  <ToggleItem
+                    label={t("settings.magnet.disableDhtWhenSocks")}
+                    value={draft.magnet.disableDhtWhenSocks}
+                    badge="restart"
+                    onChange={(v) => setDraft("magnet", "disableDhtWhenSocks", v)}
+                  />
+                  <div
+                    style={{
+                      "font-size": "11px",
+                      color: "var(--color-text-tertiary)",
+                      "margin-top": "-12px",
+                      "line-height": "1.5",
+                    }}
+                  >
+                    {t("settings.magnet.disableDhtWhenSocksHint")}
+                  </div>
+
                   <TrackerList
                     trackers={draft.magnet.trackers}
                     onAdd={(url) => {
@@ -982,12 +1066,32 @@ function ToggleItem(props: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  /** 副标记:"restart"=需重启生效(如 SOCKS5 禁 DHT 等需重建 Session 的项) */
+  badge?: "restart";
 }) {
+  const badgeText = () =>
+    props.badge === "restart" ? tr("settings.magnet.restartRequired") : null;
   return (
     <div class="flex items-center justify-between">
-      <span style={{ "font-size": "13px", color: "var(--color-text-title)" }}>
-        {props.label}
-      </span>
+      <div class="flex items-center" style={{ gap: "8px" }}>
+        <span style={{ "font-size": "13px", color: "var(--color-text-title)" }}>
+          {props.label}
+        </span>
+        <Show when={badgeText()}>
+          <span
+            style={{
+              "font-size": "11px",
+              color: "var(--color-text-tertiary)",
+              background: "var(--color-bg-secondary)",
+              padding: "1px 6px",
+              "border-radius": "4px",
+              "white-space": "nowrap",
+            }}
+          >
+            {badgeText()}
+          </span>
+        </Show>
+      </div>
       <button
         class="relative"
         style={{
@@ -1125,6 +1229,134 @@ function SegmentedItem<T extends string>(props: {
           )}
         </For>
       </div>
+    </div>
+  );
+}
+
+/** 分区小标题(magnet tab 分组:Peer 超时 / 高级) */
+function SectionLabel(props: { text: string }) {
+  return (
+    <div
+      style={{
+        "font-size": "11px",
+        "font-weight": 600,
+        color: "var(--color-text-tertiary)",
+        "text-transform": "uppercase",
+        "letter-spacing": "0.5px",
+        "margin-top": "4px",
+        "margin-bottom": "-4px",
+      }}
+    >
+      {props.text}
+    </div>
+  );
+}
+
+/**
+ * 数值输入项(Task 9 Peer 优化)。
+ *
+ * 设计沿用 SliderItem / 下载限速的视觉模式:label + 副标记(badge)在上,
+ * 数字输入框在下,可选 hint 文案。与 SliderItem 不同的是采用 type=number
+ * 输入框(而非 range 滑块),因为 peer 超时等字段范围跨度大(1-3600),
+ * 滑块精度不足且占横向空间过多。
+ *
+ * 副标记:
+ *  - "restart"(需重启生效):peer 超时 / defer_writes / disable_dht_when_socks
+ *  - "newTask"(对新任务生效):force_tracker_interval
+ */
+function NumberInput(props: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  unit?: string;
+  /** 副标记类型:restart=需重启生效,newTask=对新任务生效 */
+  badge?: "restart" | "newTask";
+  hint?: string;
+  onChange: (v: number) => void;
+}) {
+  const badgeText = () => {
+    if (props.badge === "restart") return tr("settings.magnet.restartRequired");
+    if (props.badge === "newTask") return tr("settings.magnet.newTaskOnly");
+    return null;
+  };
+  const badgeColor = () =>
+    props.badge === "restart"
+      ? "var(--color-text-tertiary)"
+      : "var(--color-accent-secondary)";
+  return (
+    <div>
+      <div
+        class="flex items-center justify-between"
+        style={{ "margin-bottom": "6px", gap: "8px" }}
+      >
+        <span
+          style={{
+            "font-size": "13px",
+            color: "var(--color-text-title)",
+          }}
+        >
+          {props.label}
+        </span>
+        <Show when={badgeText()}>
+          <span
+            style={{
+              "font-size": "11px",
+              color: badgeColor(),
+              background: "var(--color-bg-secondary)",
+              padding: "1px 6px",
+              "border-radius": "4px",
+              "white-space": "nowrap",
+            }}
+          >
+            {badgeText()}
+          </span>
+        </Show>
+      </div>
+      <div class="flex items-center gap-2">
+        <input
+          type="number"
+          aria-label={props.label}
+          min={props.min}
+          max={props.max}
+          step={1}
+          class="input"
+          style={{ width: "120px", "font-size": "13px" }}
+          value={props.value}
+          onInput={(e) => {
+            const raw = e.currentTarget.value.trim();
+            if (raw === "") return;
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n)) {
+              props.onChange(n);
+            }
+          }}
+        />
+        <Show when={props.unit}>
+          <span
+            class="mono"
+            style={{
+              "font-size": "11px",
+              color: "var(--color-text-tertiary)",
+              "white-space": "nowrap",
+            }}
+          >
+            {props.unit}
+          </span>
+        </Show>
+      </div>
+      <Show when={props.hint}>
+        <div
+          style={{
+            "font-size": "11px",
+            color: "var(--color-text-tertiary)",
+            "margin-top": "4px",
+            "line-height": "1.5",
+          }}
+        >
+          {props.hint}
+        </div>
+      </Show>
     </div>
   );
 }
