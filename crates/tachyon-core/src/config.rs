@@ -124,6 +124,12 @@ pub const CONNECT_TIMEOUT_SECS_LIMIT: u64 = 300;
 /// 24 小时防止任务永久暂停占用资源。
 pub const PAUSE_TIMEOUT_SECS_LIMIT: u64 = 86400;
 
+/// 磁力链接读取 stall 超时上限(秒)
+///
+/// 24 小时,与 pause_timeout 对齐。0 表示禁用看门狗(向后兼容),
+/// 但禁用后磁力死 swarm 会永久卡死且取消信号无法穿透。
+pub const STALL_TIMEOUT_SECS_LIMIT: u64 = 86400;
+
 /// 单主机最大连接数上限
 ///
 /// 128 路连接在常规多线程 HTTP 客户端中已属较高水平,
@@ -311,15 +317,33 @@ pub struct MagnetConfig {
     pub enable_upnp: bool,
     /// 全局 tracker 服务器列表
     ///
-    /// 这些 tracker 会附加到每个磁力链接的 tracker 列表中，
+    /// 这些 tracker 会附加到每个磁力链接的 tracker 列表中,
     /// 即使磁力链接本身不包含 tracker 也能快速发现 peer。
     /// 格式：`udp://host:port/announce` 或 `http://host:port/announce`
     #[serde(default)]
     pub trackers: Vec<String>,
+    /// 单次读取无数据 stall 超时(秒),默认 60
+    ///
+    /// 磁力链接的 `FileStream` 读取在找不到 peer 时会永久挂起,
+    /// 导致引擎 32 worker 全部卡死且取消信号无法穿透(协作式取消依赖
+    /// chunk 循环到达检查点)。本字段为单次 `read` 间隔设置上限:
+    /// 两次数据到达间隔超过此值则流产出 `Err(Timeout)`,触发引擎重试/失败。
+    /// 0 表示禁用(`Duration::MAX` 零开销跳过,向后兼容)。
+    #[serde(default = "default_stall_timeout_secs")]
+    pub stall_timeout_secs: u64,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
     120
+}
+
+/// stall 超时默认值(秒)
+///
+/// 60s 给足 BT 的 DHT bootstrap + tracker 查询 + peer 握手时间(通常 20-40s),
+/// 死 swarm 在 60s 内失败触发重试,避免 32 worker 永久挂起。
+/// HTTP 不经此路径,不受影响。
+fn default_stall_timeout_secs() -> u64 {
+    60
 }
 
 /// 布尔默认值 true 的辅助函数（serde default 不支持直接写 true）
@@ -335,6 +359,7 @@ impl Default for MagnetConfig {
             enable_dht: true,
             enable_upnp: true,
             trackers: Vec::new(),
+            stall_timeout_secs: default_stall_timeout_secs(),
         }
     }
 }
@@ -382,6 +407,12 @@ impl MagnetConfig {
         let e = |msg: &str| crate::DownloadError::Config(msg.into());
         if self.metadata_timeout_secs == 0 {
             return Err(e("metadata_timeout_secs 必须 >= 1"));
+        }
+        // stall_timeout_secs == 0 合法(禁用看门狗,向后兼容)
+        if self.stall_timeout_secs > STALL_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "stall_timeout_secs 不能超过 {STALL_TIMEOUT_SECS_LIMIT} (24h)"
+            )));
         }
         // 校验 tracker URL 格式
         for (i, tracker) in self.trackers.iter().enumerate() {
@@ -680,6 +711,7 @@ pub struct MagnetPatch {
     pub enable_dht: Option<bool>,
     pub enable_upnp: Option<bool>,
     pub trackers: Option<Vec<String>>,
+    pub stall_timeout_secs: Option<u64>,
 }
 
 /// 调度器配置白名单补丁
@@ -719,6 +751,9 @@ impl MagnetPatch {
         }
         if let Some(v) = &self.trackers {
             base.trackers = v.clone();
+        }
+        if let Some(v) = self.stall_timeout_secs {
+            base.stall_timeout_secs = v;
         }
     }
 }
@@ -1520,6 +1555,7 @@ mod tests {
         assert!(config.enable_dht, "DHT 应默认启用");
         assert!(config.enable_upnp, "UPnP 应默认启用");
         assert!(config.trackers.is_empty(), "默认 tracker 列表应为空");
+        assert_eq!(config.stall_timeout_secs, 60, "stall 超时默认 60 秒");
     }
 
     #[test]
@@ -1533,6 +1569,35 @@ mod tests {
         let mut config = MagnetConfig::default();
         config.metadata_timeout_secs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_config_validate_stall_timeout_zero_allowed() {
+        // 0 合法:禁用看门狗(向后兼容)
+        let mut config = MagnetConfig::default();
+        config.stall_timeout_secs = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_magnet_config_validate_stall_timeout_over_limit() {
+        let mut config = MagnetConfig::default();
+        config.stall_timeout_secs = STALL_TIMEOUT_SECS_LIMIT + 1;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("stall_timeout_secs")
+        );
+    }
+
+    #[test]
+    fn test_magnet_config_validate_stall_timeout_at_limit() {
+        let mut config = MagnetConfig::default();
+        config.stall_timeout_secs = STALL_TIMEOUT_SECS_LIMIT;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1608,6 +1673,7 @@ mod tests {
             enable_dht: Some(false),
             enable_upnp: None,
             trackers: Some(vec!["udp://new.example.com:1337/announce".to_string()]),
+            stall_timeout_secs: None,
         };
         patch.apply_to(&mut base);
 
@@ -1632,6 +1698,7 @@ mod tests {
             enable_dht: None,
             enable_upnp: None,
             trackers: None,
+            stall_timeout_secs: None,
         };
         patch.apply_to(&mut base);
 
@@ -1655,6 +1722,7 @@ mod tests {
                 enable_dht: Some(false),
                 enable_upnp: None,
                 trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
+                stall_timeout_secs: None,
             }),
             scheduler: None,
             hub: None,
@@ -1676,6 +1744,7 @@ mod tests {
             enable_dht: Some(false),
             enable_upnp: Some(true),
             trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
+            stall_timeout_secs: None,
         };
         let json = serde_json::to_string(&patch).unwrap();
         let deserialized: MagnetPatch = serde_json::from_str(&json).unwrap();
@@ -1690,6 +1759,41 @@ mod tests {
         let patch: MagnetPatch = serde_json::from_str(json).unwrap();
         assert_eq!(patch.enable_dht, Some(false));
         assert!(patch.trackers.is_none());
+    }
+
+    #[test]
+    fn test_magnet_patch_stall_timeout_applies() {
+        let mut base = MagnetConfig::default();
+        assert_eq!(base.stall_timeout_secs, 60);
+        let patch = MagnetPatch {
+            stall_timeout_secs: Some(120),
+            ..MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: None,
+                enable_upnp: None,
+                trackers: None,
+                stall_timeout_secs: None,
+            }
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(base.stall_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_magnet_patch_stall_timeout_none_preserves() {
+        let mut base = MagnetConfig::default();
+        base.stall_timeout_secs = 90;
+        let patch = MagnetPatch {
+            metadata_timeout_secs: None,
+            download_timeout_secs: None,
+            enable_dht: None,
+            enable_upnp: None,
+            trackers: None,
+            stall_timeout_secs: None,
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(base.stall_timeout_secs, 90, "None 应保留原值");
     }
 }
 

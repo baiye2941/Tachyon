@@ -176,20 +176,40 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
 ///
 /// 读取到 EOF 返回 None 结束流,遇错误产出 Err 项。
 /// 单文件单段与多文件多段共用此 helper 把 FileStream 包装成统一的 ByteStream。
-fn make_chunk_stream<R>(reader: R) -> impl futures::Stream<Item = DownloadResult<Bytes>>
+///
+/// `stall_timeout` 为单次 `read` 间隔设置上限。磁力链接的 `FileStream` 在找不到
+/// peer 时 `read()` 会永久挂起,导致引擎 32 worker 全卡死且取消信号无法穿透
+/// (协作式取消依赖 chunk 循环到达检查点)。本超时让流在 `stall_timeout` 内
+/// 无数据时产出 `Err(Timeout)`,触发引擎重试/失败。
+/// `Duration::MAX` 表示禁用:`tokio::time::timeout` 遇超大 deadline 直接 poll
+/// 内部 future,不注册定时器,零开销。
+fn make_chunk_stream<R>(
+    reader: R,
+    stall_timeout: Duration,
+) -> impl futures::Stream<Item = DownloadResult<Bytes>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use futures::stream::unfold;
-    unfold(reader, |mut reader| async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        match reader.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok(Bytes::from(buf)), reader))
+    unfold(reader, move |mut reader| {
+        let stall = stall_timeout;
+        async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            match tokio::time::timeout(stall, reader.read(&mut buf)).await {
+                Ok(Ok(0)) => None, // EOF
+                Ok(Ok(n)) => {
+                    buf.truncate(n);
+                    Some((Ok(Bytes::from(buf)), reader))
+                }
+                Ok(Err(e)) => Some((Err(DownloadError::Io(e)), reader)),
+                Err(_) => Some((
+                    Err(DownloadError::Timeout(format!(
+                        "磁力链接读取 stall 超时({}秒),可能无可用 peer",
+                        stall.as_secs()
+                    ))),
+                    reader,
+                )),
             }
-            Err(e) => Some((Err(DownloadError::Io(e)), reader)),
         }
     })
 }
@@ -348,6 +368,14 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let url = url.to_string();
+        // stall 超时:0 禁用(Duration::MAX 零开销),否则按配置秒数。
+        // 解决磁力链接死 swarm 下 FileStream.read() 永久挂起导致 32 worker 卡死
+        // 且取消信号无法穿透的问题。
+        let stall_timeout = if self.config.stall_timeout_secs == 0 {
+            Duration::MAX
+        } else {
+            Duration::from_secs(self.config.stall_timeout_secs)
+        };
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
@@ -395,7 +423,8 @@ impl Protocol for MagnetProtocol {
                                     Ok(_) => {
                                         let reader =
                                             tokio::io::BufReader::new(stream.take(local_len));
-                                        Box::pin(make_chunk_stream(reader)) as ByteStream
+                                        Box::pin(make_chunk_stream(reader, stall_timeout))
+                                            as ByteStream
                                     }
                                     Err(e) => Box::pin(futures::stream::once(async move {
                                         Err(DownloadError::Io(e))
@@ -526,7 +555,7 @@ impl Protocol for MagnetProtocol {
                 .await
                 .map_err(DownloadError::Io)?;
 
-            let stream = make_chunk_stream(tokio::io::BufReader::new(file));
+            let stream = make_chunk_stream(tokio::io::BufReader::new(file), Duration::MAX);
             Ok(Box::pin(stream) as ByteStream)
         })
     }
@@ -1130,5 +1159,61 @@ mod tests {
             multi_per_byte_ns < single_per_byte_ns * 10,
             "多段 per-byte {multi_per_byte_ns} ns 不应比单段 {single_per_byte_ns} 差 10x"
         );
+    }
+
+    // ── make_chunk_stream stall 超时测试 ──────────────────────────────
+
+    /// 永不产出数据的 AsyncRead mock,模拟 BT 死 swarm 下 FileStream 永久挂起
+    struct PendingReader;
+
+    impl tokio::io::AsyncRead for PendingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // 永远 Pending,模拟无 peer 产出数据的死 swarm
+            std::task::Poll::Pending
+        }
+    }
+
+    /// 验证:stall_timeout 到期时,make_chunk_stream 产出 Err(Timeout) 而非永久挂起
+    ///
+    /// 复现磁力卡死根因:死 swarm 下 reader.read() 永久 Pending。
+    /// 修复后应在 stall_timeout 内失败,使引擎能重试/取消。
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_stall_timeout_triggers() {
+        use futures::StreamExt;
+        let stream = make_chunk_stream(PendingReader, Duration::from_secs(2));
+        let mut s = Box::pin(stream);
+        // 用 tokio::time::timeout 双保险:若修复回归(永久挂起),测试本身不卡死
+        let result = tokio::time::timeout(Duration::from_secs(10), s.next()).await;
+        assert!(result.is_ok(), "应在 stall_timeout 内产出项,而非永久挂起");
+        let item = result.unwrap().expect("流应产出错误项");
+        assert!(
+            matches!(item, Err(DownloadError::Timeout(_))),
+            "应产出 Timeout 错误,实际: {item:?}"
+        );
+    }
+
+    /// 验证:Duration::MAX 禁用 stall 看门狗时,正常数据可被读出(零开销路径)
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_stall_disabled_reads_data() {
+        let data = Bytes::from(vec![0xABu8; 200]);
+        let reader = std::io::Cursor::new(data.clone());
+        let stream = make_chunk_stream(reader, Duration::MAX);
+        let collected = collect_stream(Box::pin(stream)).await;
+        assert_eq!(collected, data.to_vec());
+    }
+
+    /// 验证:有数据的 reader 在 stall_timeout 内正常完成(stall 不误触发)
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_stall_does_not_fire_on_active_stream() {
+        let data = Bytes::from(vec![0xCDu8; 100_000]);
+        let reader = std::io::Cursor::new(data.clone());
+        // 设一个很短的 stall,但 reader 立即产出数据,不应触发
+        let stream = make_chunk_stream(reader, Duration::from_millis(100));
+        let collected = collect_stream(Box::pin(stream)).await;
+        assert_eq!(collected, data.to_vec());
     }
 }
