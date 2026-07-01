@@ -399,6 +399,12 @@ pub struct HubConfig {
     /// HF 源模式,默认 Mirror(国内加速)
     #[serde(default)]
     pub source_mode: HfSourceMode,
+    /// HF 访问令牌(匿名访问时为 None)
+    ///
+    /// 由配置加载层从环境变量/文件填充(AGENTS.md:92 禁止各 crate 自行解析 env),
+    /// `skip_serializing` 保证令牌不写入磁盘配置文件(避免明文落盘)。
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
 }
 
 impl MagnetConfig {

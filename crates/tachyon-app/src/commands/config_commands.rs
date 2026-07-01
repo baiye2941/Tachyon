@@ -249,13 +249,17 @@ pub(crate) fn persist_config(config: &AppConfig) -> Result<(), AppError> {
 /// 若配置文件不存在则返回默认配置;若解析失败则返回错误,由调用方决定是否回退。
 pub(crate) fn load_persisted_config() -> Result<AppConfig, AppError> {
     let path = config_file_path();
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-    let json = std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Config(format!("读取配置文件失败: {e}")))?;
-    let config: AppConfig = serde_json::from_str(&json)
-        .map_err(|e| AppError::Config(format!("解析配置文件失败: {e}")))?;
+    let mut config = if !path.exists() {
+        AppConfig::default()
+    } else {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| AppError::Config(format!("读取配置文件失败: {e}")))?;
+        serde_json::from_str::<AppConfig>(&json)
+            .map_err(|e| AppError::Config(format!("解析配置文件失败: {e}")))?
+    };
+    // AGENTS.md:92 禁止各 crate 自行解析 env。HF token 集中在此填充:
+    // 从环境变量/文件加载后注入 HubConfig.token(skip_serializing,不落盘)。
+    config.hub.token = tachyon_hub::token::load_token();
     Ok(config)
 }
 

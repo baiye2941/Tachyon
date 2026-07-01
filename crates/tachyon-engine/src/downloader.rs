@@ -19,7 +19,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Buf;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -117,7 +116,6 @@ pub struct DownloadTask {
     metadata: Option<FileMetadata>,
     fragments: Vec<FragmentRecord>,
     progress_tx: Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
-    #[allow(dead_code)]
     verifier: VerifierKind,
     completed_fragments: Vec<u32>,
     /// 未完整下载的分片及其已持久化的字节数(字节级断点续传)
@@ -1112,6 +1110,7 @@ impl DownloadTask {
             let frag_progress_tx = progress_tx.clone();
             let frag_metrics = metrics.clone();
             let frag_circuit_breakers = circuit_breakers.clone();
+            let frag_verifier = self.verifier.clone();
             let completed_tx = completed_tx.clone();
 
             handles.spawn(async move {
@@ -1185,6 +1184,7 @@ impl DownloadTask {
                             frag_limiter.clone(),
                             &frag_control_rx,
                             &frag_progress_tx,
+                            &frag_verifier,
                             compute_hash,
                             write_buf.as_mut(),
                         )
@@ -1423,22 +1423,25 @@ impl DownloadTask {
         }
     }
 
-    /// 使用 BytesMut 写入存储，避免 freeze() 复制
+    /// 把一个 batch 完整写入存储(含短写重试 + 控制信号中断)
     ///
-    /// - 使用 `storage.write_at_mut()` 覆盖方法，后端可优化
-    /// - `BytesMut` 由跨分片复用缓冲区分配，减少分配开销
-    ///
-    /// 通过 `batch.advance(written)` 处理后端短写，保证数据完整落盘。
+    /// 入口处 `batch.freeze()` 转为 `Bytes`(零拷贝,Arc 引用计数 +1),循环内用
+    /// `storage.write_at(pos, remaining.clone())` 写入。相比旧 `write_at_mut` 路径:
+    /// - 消除后端 `Bytes::copy_from_slice` 的 256KiB 全量 memcpy(write_at 后端直接
+    ///   move owned `Bytes` 进 `spawn_blocking`,Arc refcount 保证 select! 取消安全)
+    /// - 消除 `advance(written.min(batch.len()))` 的 min hack(Bytes::slice 天然处理剩余)
+    /// - `Bytes::clone()`/`slice()` 均为零拷贝指针调整,无内存复制
     async fn write_all_at_mut(
         storage: &StorageSet,
         mut pos: u64,
-        mut batch: bytes::BytesMut,
+        batch: bytes::BytesMut,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<u64> {
+        let mut remaining = batch.freeze();
         let mut total_written = 0u64;
-        while !batch.is_empty() {
-            let write = storage.write_at_mut(pos, &mut batch);
+        while !remaining.is_empty() {
+            let write = storage.write_at(pos, remaining.clone());
             let written = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
                     result = write => result?,
@@ -1453,7 +1456,7 @@ impl DownloadTask {
             if written == 0 {
                 return Err(DownloadError::Fragment(format!(
                     "存储短写未前进: offset={pos}, remaining={}",
-                    batch.len()
+                    remaining.len()
                 )));
             }
             let written_u64 = u64::try_from(written)
@@ -1468,10 +1471,9 @@ impl DownloadTask {
                     "存储写入总长度溢出: written={total_written}, len={written_u64}"
                 ))
             })?;
-            // advance 兼容 Multi 零拷贝路径:Multi::write_at_mut 用 split_to 消费 data,
-            // 成功时 batch 已空,written=原 len > batch.len()=0,直接 advance 会 panic。
-            // min 限制为剩余长度:Single 路径不消费,退化为 advance(written),行为不变。
-            batch.advance(written.min(batch.len()));
+            // 零拷贝推进:Bytes::slice 仅调整指针/长度,不复制数据。
+            // 与 StorageSet::Multi::write_at 的段内短写处理(storage_adapter.rs)一致。
+            remaining = remaining.slice(written..);
         }
         Ok(total_written)
     }
@@ -1488,7 +1490,7 @@ impl DownloadTask {
         storage: &StorageSet,
         pos: u64,
         batch: bytes::BytesMut,
-        hasher: &mut Option<blake3::Hasher>,
+        hasher: &mut Option<Box<dyn tachyon_core::traits::StreamingHasher>>,
         frag_index: u32,
         total_written: u64,
         expected_len: u64,
@@ -1532,17 +1534,19 @@ impl DownloadTask {
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) {
         if let Some(tx) = progress_tx {
-            let _ = tx
-                .try_send(FragmentProgress {
-                    fragment_index: frag_index,
-                    completed: false,
-                    fragment_downloaded: total_written,
-                })
-                .map_err(|e| {
+            match tx.try_send(FragmentProgress {
+                fragment_index: frag_index,
+                completed: false,
+                fragment_downloaded: total_written,
+            }) {
+                Ok(()) => {
+                    tracing::trace!(idx = frag_index, bytes = total_written, "进度事件已发送");
+                }
+                Err(e) => {
                     tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
-                });
+                }
+            }
         }
-        tracing::debug!(idx = frag_index, bytes = total_written, "进度事件已发送");
     }
 
     /// 下载单个分片(一次尝试)
@@ -1565,6 +1569,7 @@ impl DownloadTask {
         rate_limiter: Option<Arc<RateLimiter>>,
         control_rx: &Option<watch::Receiver<TaskCommand>>,
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
+        verifier: &VerifierKind,
         compute_hash: bool,
         write_buf: &mut bytes::BytesMut,
     ) -> DownloadResult<(u64, Duration, Option<String>)> {
@@ -1621,8 +1626,10 @@ impl DownloadTask {
         let mut control_check_countdown = 0u64; // 0 保证第一个 chunk 先检查一次
         let mut progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
         // write_buf 由调用方传入(跨分片复用),此处不再新建
-        // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件
-        let mut hasher = compute_hash.then(blake3::Hasher::new);
+        // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件。
+        // 通过 Verifier trait 创建 StreamingHasher,支持 blake3/sha256/GPU 等后端切换。
+        let mut hasher: Option<Box<dyn tachyon_core::traits::StreamingHasher>> =
+            compute_hash.then(|| verifier.new_hasher());
         tokio::pin!(stream);
         while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
             // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销
@@ -1742,8 +1749,8 @@ impl DownloadTask {
             elapsed_ms = elapsed.as_millis(),
             "分片下载完成"
         );
-        // 流式哈希结果:若启用了 compute_hash,finalize 为十六进制字符串
-        let computed_hash = hasher.map(|h| h.finalize().to_hex().to_string());
+        // 流式哈希结果:StreamingHasher::finalize 消耗 self 返回十六进制字符串
+        let computed_hash = hasher.map(|h| h.finalize());
         Ok((total_written, elapsed, computed_hash))
     }
 
@@ -1800,6 +1807,7 @@ impl DownloadTask {
             let size = frag.info.size;
             let storage = storage.clone();
             let permit_sem = semaphore.clone();
+            let verifier = self.verifier.clone();
             join_set.spawn(async move {
                 let _permit = permit_sem.acquire().await;
                 // 流式哈希优先:下载阶段已边写边算,直接比对,消除 I/O 放大。
@@ -1812,14 +1820,14 @@ impl DownloadTask {
                     let mut offset = start;
                     let end = start + size;
                     let mut buf = vec![0u8; chunk_size];
-                    let mut hasher = blake3::Hasher::new();
+                    let mut hasher = verifier.new_hasher();
                     while offset < end {
                         let read_len = ((end - offset).min(chunk_size as u64)) as usize;
                         let read = storage.read_at(offset, &mut buf[..read_len]).await?;
                         hasher.update(&buf[..read]);
                         offset += read as u64;
                     }
-                    hasher.finalize().to_hex().to_string()
+                    hasher.finalize()
                 };
                 Ok((index, expected_hash, computed))
             });
@@ -2707,6 +2715,57 @@ mod tests {
         let data = short_storage.data();
         assert_eq!(&data[..frag_size as usize], &first[..]);
         assert_eq!(&data[frag_size as usize..], &second[..]);
+    }
+
+    /// 验证 write_all_at_mut 短写循环正确性 + 计时(AGENTS.md:44/97)
+    ///
+    /// 用 ShortWriteStorage(max_write_len=17)强制短写,验证:
+    /// - 循环正确推进(remaining.slice(written..)),数据完整落盘
+    /// - 零拷贝路径(freeze+write_at)不引入额外开销
+    #[tokio::test]
+    async fn test_write_all_at_mut_short_write_loop_correctness() {
+        let total = 4096usize;
+        let storage = ShortWriteStorage::with_capacity(total, 17);
+        let ss = StorageSet::single(StorageKind::new(storage.clone()));
+        let batch = bytes::BytesMut::from(&vec![0xA5u8; total][..]);
+        let written = DownloadTask::write_all_at_mut(&ss, 0, batch, &mut None, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(written, total as u64, "短写循环应累计写入全部字节");
+        assert_eq!(storage.data(), vec![0xA5u8; total], "数据应完整落盘");
+    }
+
+    /// write_all_at_mut 计时基准:256KiB batch(对齐 WRITE_BATCH_BYTES),NoopStorage
+    ///
+    /// NoopStorage.write_at 零拷贝返回 len,隔离出 freeze/clone/slice 的纯逻辑开销。
+    /// 用于同会话对比改前(advance+write_at_mut)与改后(freeze+write_at)的绝对耗时。
+    #[tokio::test]
+    async fn test_write_all_at_mut_256k_noop_timing() {
+        use std::time::Instant;
+        let ss = StorageSet::single(StorageKind::new(
+            tachyon_core::test_harness::harness::NoopStorage,
+        ));
+        let batch = bytes::BytesMut::from(&vec![0u8; WRITE_BATCH_BYTES][..]);
+        let iterations = 1000u32;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            // clone batch 供每轮消费(write_all_at_mut 入口 freeze 消费所有权)
+            let _ =
+                DownloadTask::write_all_at_mut(&ss, 0, batch.clone(), &mut None, Duration::ZERO)
+                    .await
+                    .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!(
+            "write_all_at_mut 256KiB NoopStorage: {per_op_ns} ns/op ({} iters, {elapsed:?} total)",
+            iterations
+        );
+        // 回归护栏:单次零拷贝逻辑开销应 < 50µs(NoopStorage 无 I/O)
+        assert!(
+            per_op_ns < 50_000,
+            "write_all_at_mut 单次开销 {per_op_ns} ns 过高,可能引入了拷贝"
+        );
     }
 
     /// 不支持 Range 请求时使用整块下载

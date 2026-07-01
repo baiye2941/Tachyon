@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use futures::Stream;
 
 use crate::error::{DownloadError, DownloadResult};
-use crate::types::{FileMetadata, FragmentInfo, TaskId};
+use crate::types::FileMetadata;
 
 /// 字节流类型别名
 ///
@@ -186,6 +186,21 @@ pub trait AsyncStorage: Send + Sync {
     }
 }
 
+/// 流式哈希句柄,支持分块 update + finalize
+///
+/// 由 [`Verifier::new_hasher`] 创建,供下载/校验管线的流式哈希计算使用。
+/// 生命周期:创建 → 多次 `update`(分块) → `finalize`(消耗 self 返回十六进制哈希)。
+///
+/// 与 `Verifier::compute_hash(&[u8])` 的一次性 API 互补:大文件无法整体加载进内存,
+/// 下载管线需"边下边 update、写完再 finalize"的交错生命周期,由本 trait 承载。
+pub trait StreamingHasher: Send {
+    /// 追加数据块到哈希状态
+    fn update(&mut self, data: &[u8]);
+
+    /// 完成哈希计算,返回十六进制字符串(消耗 self)
+    fn finalize(self: Box<Self>) -> String;
+}
+
 /// 校验层 trait:负责数据完整性校验
 pub trait Verifier: Send + Sync {
     /// 计算数据的哈希值
@@ -207,6 +222,12 @@ pub trait Verifier: Send + Sync {
             })
         }
     }
+
+    /// 创建流式哈希句柄(供下载/校验管线分块计算)
+    ///
+    /// 后端应覆盖以返回原生流式实现(如 `blake3::Hasher`),
+    /// 避免默认实现的缓冲全量数据再一次性 `compute_hash` 的内存放大。
+    fn new_hasher(&self) -> Box<dyn StreamingHasher>;
 }
 
 /// 常量时间字符串比较,防止时序侧信道攻击
@@ -298,23 +319,6 @@ impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
     }
 }
 
-/// 分片下载 trait:单个分片的下载操作
-///
-/// 使用 `Pin<Box<dyn Future>>` 返回类型以满足 object-safe 条件,
-/// 与 `Protocol` / `Storage` 等 trait 的设计风格保持一致,
-/// 支持 `Arc<dyn FragmentDownloader>` 动态分发。
-pub trait FragmentDownloader: Send + Sync {
-    /// 下载单个分片
-    fn download(
-        &self,
-        task_id: TaskId,
-        fragment: FragmentInfo,
-    ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send + '_>>;
-
-    /// 取消分片下载
-    fn cancel(&self, task_id: TaskId, fragment_index: u32) -> DownloadResult<()>;
-}
-
 /// 下载调度建议
 ///
 /// 调度器根据带宽预测和文件特征返回的动态配置建议。
@@ -371,10 +375,26 @@ mod tests {
     /// 最小 Verifier 实现:逐字节 XOR 后转十六进制
     struct XorVerifier;
 
+    /// XorVerifier 的流式句柄:缓冲所有数据后一次性 XOR(测试用,非生产)
+    struct XorStreamingHasher(Vec<u8>);
+
+    impl StreamingHasher for XorStreamingHasher {
+        fn update(&mut self, data: &[u8]) {
+            self.0.extend_from_slice(data);
+        }
+        fn finalize(self: Box<Self>) -> String {
+            let xor = self.0.iter().fold(0u8, |acc, &b| acc ^ b);
+            format!("{xor:02x}")
+        }
+    }
+
     impl Verifier for XorVerifier {
         fn compute_hash(&self, data: &[u8]) -> DownloadResult<String> {
             let xor = data.iter().fold(0u8, |acc, &b| acc ^ b);
             Ok(format!("{xor:02x}"))
+        }
+        fn new_hasher(&self) -> Box<dyn StreamingHasher> {
+            Box::new(XorStreamingHasher(Vec::new()))
         }
     }
 

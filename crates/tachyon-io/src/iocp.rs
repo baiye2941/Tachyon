@@ -1017,21 +1017,28 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 )));
             }
             // NO_BUFFERING 主句柄要求 offset/length/缓冲区指针 三者均按扇区对齐。
-            // 内部 owned_buf 是 Vec<u8>(堆分配,通常仅 16B 对齐),无法保证扇区对齐;
+            // 调用方传入的 buf 是栈/堆分配(通常仅 16B 对齐),无法保证扇区对齐;
             // 因此 IOCP 主句柄不适合通用读取,统一路由到 buffered fallback 句柄,
             // 它无对齐限制且能正确读到最新数据(主句柄写入已 flush 到文件系统)。
             let fallback_file = self.get_or_init_fallback()?;
+
+            // 通过 usize 中转指针,满足 Send + 'static 约束(与 TokioFile::read_at 一致)。
+            // Safety: buf 指针在 spawn_blocking .await 返回前保持有效。
+            // read_at 的唯一生产调用点是 verify 阶段(downloader.rs:1821),
+            // 该路径为纯 .await(不在 tokio::select! 中),future 不会被取消,
+            // buf 生命周期覆盖整个 spawn_blocking 执行期,无 UAF 风险。
+            // seek_read 只写入 buf[..buf_len],不会越界。
+            let buf_addr = buf.as_mut_ptr() as usize;
             let buf_len = buf.len();
-            let mut owned_buf = vec![0u8; buf_len];
-            let (n, owned_buf) = tokio::task::spawn_blocking(move || {
-                let n = fallback_file.seek_read(&mut owned_buf, offset)?;
-                Ok::<_, std::io::Error>((n, owned_buf))
+            tokio::task::spawn_blocking(move || {
+                let ptr = buf_addr as *mut u8;
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
+                fallback_file
+                    .seek_read(slice, offset)
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
-            .map_err(DownloadError::Io)?;
-            buf[..n].copy_from_slice(&owned_buf[..n]);
-            Ok(n)
         })
     }
 

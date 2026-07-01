@@ -479,10 +479,6 @@ pub fn get_app_info() -> AppInfo {
 #[allow(unused_mut)]
 pub fn supported_protocols() -> Vec<&'static str> {
     let mut protocols = vec!["HTTP", "HTTPS"];
-    #[cfg(feature = "ftp")]
-    protocols.push("FTP");
-    #[cfg(feature = "quic")]
-    protocols.push("QUIC");
     #[cfg(feature = "magnet")]
     protocols.push("BitTorrent");
     protocols

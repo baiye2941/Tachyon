@@ -98,11 +98,6 @@ impl Default for HoltLinearPredictor {
     }
 }
 
-/// 向后兼容的类型别名:完整 Holt-Winters 应包含季节性分量,
-/// 本实现仅有双指数平滑,使用 `HoltLinearPredictor` 更准确。
-#[deprecated(note = "使用 HoltLinearPredictor (双指数平滑,非完整 Holt-Winters)")]
-pub type HoltWintersPredictor = HoltLinearPredictor;
-
 #[cfg(test)]
 mod tests {
     use super::*;

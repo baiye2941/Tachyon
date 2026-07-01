@@ -115,6 +115,7 @@ pub fn run() {
             // 嗅探
             get_sniffer_resources,
             add_sniffer_filter,
+            add_sniffer_resource,
             // 配置管理
             get_config,
             update_config,

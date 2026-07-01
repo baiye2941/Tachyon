@@ -10,7 +10,7 @@ pub mod cpu;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
-pub use cpu::{CpuVerifier, HashAlgorithm, auto_select_verifier};
+pub use cpu::{CpuVerifier, HashAlgorithm};
 
 #[cfg(feature = "gpu")]
 pub use gpu::GpuVerifier;

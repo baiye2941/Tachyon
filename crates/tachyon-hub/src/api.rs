@@ -7,7 +7,6 @@ use tachyon_core::DownloadResult;
 use tachyon_protocol::HttpClient;
 
 use crate::lfs;
-use crate::token;
 
 /// HF Hub 文件信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,44 +106,28 @@ fn new_http_client() -> Result<HttpClient, tachyon_core::DownloadError> {
 }
 
 impl HubApi {
-    /// 从环境变量创建客户端
+    /// 从 HubConfig 创建客户端(配置驱动,符合 AGENTS.md:92)
     ///
-    /// 可能因 HTTP 客户端初始化失败(如 TLS 后端不可用)返回错误。
-    /// endpoint 会通过 validate_public_http_url 校验,防止指向内网的 SSRF。
-    pub fn from_env() -> Result<Self, tachyon_core::DownloadError> {
-        let endpoint = token::hf_endpoint();
-        let url: url::Url =
-            url::Url::parse(&endpoint).map_err(tachyon_core::DownloadError::UrlParse)?;
-        tachyon_core::validate_public_http_url(&url)?;
-        Ok(Self {
-            endpoint,
-            token: token::load_token(),
-            http: new_http_client()?,
-        })
-    }
-
-    /// 按配置的源模式创建客户端
-    ///
-    /// endpoint 由 `HfSourceMode::list_endpoint()` 决定(配置驱动,取代纯环境变量)。
+    /// endpoint 由 `HfSourceMode::list_endpoint()` 决定,token 由配置加载层填充。
     /// Race 模式浏览走官方端点保证元数据最新;下载时镜像由 mirror_urls 竞速注入。
-    /// endpoint 仍过 validate_public_http_url 校验,SSRF 防护与 from_env 一致。
-    pub fn from_mode(
-        mode: tachyon_core::config::HfSourceMode,
+    /// endpoint 仍过 validate_public_http_url 校验,SSRF 防护一致。
+    pub fn from_config(
+        hub: &tachyon_core::config::HubConfig,
     ) -> Result<Self, tachyon_core::DownloadError> {
-        let endpoint = mode.list_endpoint().to_string();
+        let endpoint = hub.source_mode.list_endpoint().to_string();
         let url: url::Url =
             url::Url::parse(&endpoint).map_err(tachyon_core::DownloadError::UrlParse)?;
         tachyon_core::validate_public_http_url(&url)?;
         Ok(Self {
             endpoint,
-            token: token::load_token(),
+            token: hub.token.clone(),
             http: new_http_client()?,
         })
     }
 
-    /// 使用自定义 endpoint 创建
+    /// 使用自定义 endpoint 创建(测试/特殊用途)
     ///
-    /// 可能因 HTTP 客户端初始化失败返回错误。
+    /// 不携带 token(匿名访问)。可能因 HTTP 客户端初始化失败返回错误。
     /// endpoint 会通过 validate_public_http_url 校验,防止指向内网的 SSRF。
     pub fn with_endpoint(endpoint: String) -> Result<Self, tachyon_core::DownloadError> {
         let url: url::Url =
@@ -152,7 +135,7 @@ impl HubApi {
         tachyon_core::validate_public_http_url(&url)?;
         Ok(Self {
             endpoint,
-            token: token::load_token(),
+            token: None,
             http: new_http_client()?,
         })
     }

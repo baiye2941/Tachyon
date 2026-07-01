@@ -21,7 +21,17 @@ pub async fn add_sniffer_filter(
     state.service.sniffer_service.add_filter(filter).await
 }
 
-pub async fn add_sniffer_resource(state: &AppState, url: String) {
+#[tauri::command]
+pub async fn add_sniffer_resource(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<(), AppError> {
+    state.service.sniffer_service.add_resource(url).await;
+    Ok(())
+}
+
+/// 内部辅助:直接向嗅探器添加资源(供其他模块/测试调用,不经 Tauri 命令分发)
+pub async fn add_sniffer_resource_inner(state: &AppState, url: String) {
     state.service.sniffer_service.add_resource(url).await
 }
 
@@ -105,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_sniffer_resource() {
         let state = test_state();
-        add_sniffer_resource(&state, "http://example.com/video.mp4".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://example.com/video.mp4".to_string()).await;
         let resources = state.service.sniffer_service.get_resources().await;
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].url, "http://example.com/video.mp4");
@@ -116,8 +126,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_sniffer_resource_duplicate_ignored() {
         let state = test_state();
-        add_sniffer_resource(&state, "http://example.com/file.zip".to_string()).await;
-        add_sniffer_resource(&state, "http://example.com/file.zip".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://example.com/file.zip".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://example.com/file.zip".to_string()).await;
         let resources = state.service.sniffer_service.get_resources().await;
         assert_eq!(resources.len(), 1, "重复 URL 应被忽略");
     }
@@ -131,9 +141,9 @@ mod tests {
             .add_filter("cdn.example.com".to_string())
             .await
             .unwrap();
-        add_sniffer_resource(&state, "http://other.com/video.mp4".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://other.com/video.mp4".to_string()).await;
         assert_eq!(state.service.sniffer_service.get_resources().await.len(), 0);
-        add_sniffer_resource(&state, "http://cdn.example.com/video.mp4".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://cdn.example.com/video.mp4".to_string()).await;
         assert_eq!(state.service.sniffer_service.get_resources().await.len(), 1);
     }
 

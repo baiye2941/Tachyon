@@ -40,14 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2"] }
 
-# QUIC
-quinn = "0.11"
-rustls = "0.23"
-rustls-native-certs = "0.8"
+# TLS 测试证书
 rcgen = "0.14"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-http = "1"
 
 # 哈希
 blake3 = "1"
@@ -62,9 +56,6 @@ rand = "0.9"
 
 # GPU
 wgpu = "29"
-
-# FTP
-suppaftp = { version = "10", features = ["tokio"] }
 
 # BitTorrent
 librqbit = "8"

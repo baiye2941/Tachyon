@@ -3,7 +3,6 @@ use super::{
     VerifyStatus,
 };
 use std::path::Path;
-use tachyon_core::config::HfSourceMode;
 use tachyon_hub::classify_file;
 use tauri::State;
 
@@ -62,8 +61,11 @@ fn validate_file_path(path: &str) -> Result<(), AppError> {
 /// 读取当前 HF 源模式(从 AppConfig,配置驱动)
 ///
 /// 锁失败视为配置损坏,降级为默认 Mirror。
-async fn current_hf_source_mode(state: &AppState) -> HfSourceMode {
-    state.domain.config.lock().await.hub.source_mode
+/// 获取当前 HubConfig(source_mode + token)
+///
+/// 锁失败视为配置损坏,降级为默认 Mirror。
+async fn current_hub_config(state: &AppState) -> tachyon_core::config::HubConfig {
+    state.domain.config.lock().await.hub.clone()
 }
 
 /// 列出 HuggingFace 仓库文件
@@ -76,8 +78,8 @@ pub async fn list_repo_files(
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.list_files(&repo_id, &rev).await.map_err(AppError::Core)
 }
@@ -94,8 +96,8 @@ pub async fn get_hf_download_url(
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
     validate_file_path(&file_path)?;
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     Ok(api.download_url(&repo_id, &rev, &file_path))
 }
@@ -110,8 +112,8 @@ pub async fn get_model_info(
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
     validate_revision(&rev)?;
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.model_info(&repo_id, &rev).await.map_err(AppError::Core)
 }
@@ -127,8 +129,8 @@ pub async fn search_models(
         return Err(AppError::Config("搜索查询不能为空".into()));
     }
     let limit = limit.unwrap_or(20).min(50);
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     api.search_models(&query, limit)
         .await
@@ -202,8 +204,8 @@ pub async fn verify_model(
     validate_revision(&rev)?;
 
     // 获取远程文件列表用于比对
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
     let remote_files = api
         .list_files(&repo_id, &rev)
@@ -332,8 +334,8 @@ pub async fn add_model_favorite(
     let key = format!("fav_{repo_id}");
 
     // 尝试缓存模型元数据
-    let mode = current_hf_source_mode(&state).await;
-    let cached_info = match tachyon_hub::api::HubApi::from_mode(mode) {
+    let hub = current_hub_config(&state).await;
+    let cached_info = match tachyon_hub::api::HubApi::from_config(&hub) {
         Ok(api) => api.model_info(&repo_id, "main").await.ok(),
         Err(_) => None,
     };
@@ -396,8 +398,8 @@ pub async fn batch_create_hf_tasks(
         return Err(AppError::Config("文件列表不能为空".into()));
     }
 
-    let mode = current_hf_source_mode(&state).await;
-    let api = tachyon_hub::api::HubApi::from_mode(mode)
+    let hub = current_hub_config(&state).await;
+    let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
 
     let mut task_ids = Vec::new();

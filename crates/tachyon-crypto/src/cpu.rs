@@ -6,7 +6,7 @@ use std::path::Path;
 
 use tachyon_core::error::DownloadResult;
 use tachyon_core::hex_encode;
-use tachyon_core::traits::Verifier;
+use tachyon_core::traits::{StreamingHasher, Verifier};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// 哈希算法类型
@@ -129,6 +129,58 @@ impl CpuVerifier {
     }
 }
 
+/// CPU 流式哈希句柄,包装 blake3::Hasher 或 sha2::Sha256
+///
+/// 由 `CpuVerifier::new_hasher()` 创建,供下载管线"边下边 update、写完再 finalize"。
+/// 避免一次性 `compute_hash(&[u8])` 将整个分片加载进内存。
+pub struct CpuStreamingHasher {
+    algorithm: HashAlgorithm,
+    blake3: Option<blake3::Hasher>,
+    sha256: Option<sha2::Sha256>,
+}
+
+impl CpuStreamingHasher {
+    pub fn new(algorithm: HashAlgorithm) -> Self {
+        use sha2::Digest;
+        match algorithm {
+            HashAlgorithm::Blake3 => Self {
+                algorithm,
+                blake3: Some(blake3::Hasher::new()),
+                sha256: None,
+            },
+            HashAlgorithm::Sha256 => Self {
+                algorithm,
+                blake3: None,
+                sha256: Some(sha2::Sha256::new()),
+            },
+        }
+    }
+}
+
+impl StreamingHasher for CpuStreamingHasher {
+    fn update(&mut self, data: &[u8]) {
+        match self.algorithm {
+            HashAlgorithm::Blake3 => {
+                self.blake3.as_mut().unwrap().update(data);
+            }
+            HashAlgorithm::Sha256 => {
+                use sha2::Digest;
+                self.sha256.as_mut().unwrap().update(data);
+            }
+        }
+    }
+
+    fn finalize(mut self: Box<Self>) -> String {
+        match self.algorithm {
+            HashAlgorithm::Blake3 => self.blake3.take().unwrap().finalize().to_hex().to_string(),
+            HashAlgorithm::Sha256 => {
+                use sha2::Digest;
+                hex_encode(&self.sha256.take().unwrap().finalize())
+            }
+        }
+    }
+}
+
 impl Verifier for CpuVerifier {
     fn compute_hash(&self, data: &[u8]) -> DownloadResult<String> {
         match self.algorithm {
@@ -145,13 +197,10 @@ impl Verifier for CpuVerifier {
             }
         }
     }
-}
 
-/// 根据数据大小自动选择最优校验算法
-///
-/// Blake3 在所有大小下都优于 SHA-256,因此默认使用 Blake3。
-pub fn auto_select_verifier(_data_size: u64) -> CpuVerifier {
-    CpuVerifier::blake3()
+    fn new_hasher(&self) -> Box<dyn StreamingHasher> {
+        Box::new(CpuStreamingHasher::new(self.algorithm))
+    }
 }
 
 #[cfg(test)]
@@ -239,18 +288,6 @@ mod tests {
     #[test]
     fn test_default_is_blake3() {
         let verifier = CpuVerifier::default();
-        assert_eq!(verifier.algorithm(), HashAlgorithm::Blake3);
-    }
-
-    #[test]
-    fn test_auto_select_small() {
-        let verifier = auto_select_verifier(1024);
-        assert_eq!(verifier.algorithm(), HashAlgorithm::Blake3);
-    }
-
-    #[test]
-    fn test_auto_select_large() {
-        let verifier = auto_select_verifier(128 * 1024 * 1024);
         assert_eq!(verifier.algorithm(), HashAlgorithm::Blake3);
     }
 
@@ -389,5 +426,64 @@ mod tests {
             .unwrap();
 
         assert_ne!(hash1, hash2);
+    }
+
+    // ── StreamingHasher 正确性测试 ──────────────────────────────────
+
+    #[test]
+    fn test_streaming_hasher_blake3_matches_oneshot() {
+        use tachyon_core::traits::StreamingHasher;
+        let data = b"streaming hasher blake3 consistency test payload";
+        let verifier = CpuVerifier::blake3();
+
+        // 一次性计算
+        let oneshot = verifier.compute_hash(data).unwrap();
+
+        // 流式分块计算(模拟下载管线:多段 update + finalize)
+        let mut hasher = verifier.new_hasher();
+        hasher.update(&data[..10]);
+        hasher.update(&data[10..25]);
+        hasher.update(&data[25..]);
+        let streaming = hasher.finalize();
+
+        assert_eq!(oneshot, streaming, "流式哈希应与一次性哈希一致");
+    }
+
+    #[test]
+    fn test_streaming_hasher_sha256_matches_oneshot() {
+        use tachyon_core::traits::StreamingHasher;
+        let data = b"streaming hasher sha256 consistency test payload";
+        let verifier = CpuVerifier::sha256();
+
+        let oneshot = verifier.compute_hash(data).unwrap();
+
+        let mut hasher = verifier.new_hasher();
+        hasher.update(&data[..8]);
+        hasher.update(&data[8..20]);
+        hasher.update(&data[20..]);
+        let streaming = hasher.finalize();
+
+        assert_eq!(oneshot, streaming, "sha256 流式哈希应与一次性一致");
+    }
+
+    #[test]
+    fn test_streaming_hasher_empty_input() {
+        use tachyon_core::traits::StreamingHasher;
+        let verifier = CpuVerifier::blake3();
+        let oneshot = verifier.compute_hash(b"").unwrap();
+        let streaming = verifier.new_hasher().finalize();
+        assert_eq!(oneshot, streaming, "空输入流式哈希应与一次性一致");
+    }
+
+    #[test]
+    fn test_streaming_hasher_single_chunk() {
+        use tachyon_core::traits::StreamingHasher;
+        let data = b"single chunk no split";
+        let verifier = CpuVerifier::blake3();
+        let oneshot = verifier.compute_hash(data).unwrap();
+        let mut hasher = verifier.new_hasher();
+        hasher.update(data);
+        let streaming = hasher.finalize();
+        assert_eq!(oneshot, streaming);
     }
 }

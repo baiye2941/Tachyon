@@ -14,9 +14,7 @@ name = "tachyon"
 path = "src/main.rs"
 
 [features]
-default = ["ftp", "quic", "magnet"]
-ftp = ["tachyon-engine/ftp", "tachyon-hub/ftp"]
-quic = ["tachyon-engine/quic", "tachyon-hub/quic"]
+default = ["magnet"]
 magnet = ["tachyon-engine/magnet"]
 
 [build-dependencies]

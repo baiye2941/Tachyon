@@ -393,6 +393,14 @@ impl Verifier for GpuVerifier {
         let hash = blake3::hash(data);
         Ok(hash.to_hex().to_string())
     }
+
+    fn new_hasher(&self) -> Box<dyn tachyon_core::traits::StreamingHasher> {
+        // GPU 是批处理加速,流式 update 阶段回退到 CPU blake3。
+        // 大数据 GPU 加速请用 compute_blake3() 异步方法(一次性批处理)。
+        Box::new(crate::cpu::CpuStreamingHasher::new(
+            crate::cpu::HashAlgorithm::Blake3,
+        ))
+    }
 }
 
 /// 自动选择并计算 blake3 哈希

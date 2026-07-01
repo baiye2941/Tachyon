@@ -1,6 +1,10 @@
-//! HF Token 管理
+//! HF Token 加载
 //!
 //! 加载顺序: HF_TOKEN 环境变量 > ~/.huggingface/token 文件
+//!
+//! 本模块仅供配置加载层(tachyon-app 的 load_persisted_config)调用,
+//! 在构造 AppConfig 时填充 hub.token 字段。
+//! HubApi 及其他 crate 不得直接调用(AGENTS.md:92 禁止各自解析 env)。
 
 /// 从环境变量或文件加载 HuggingFace Token
 ///
@@ -31,14 +35,6 @@ pub fn load_token() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// HF_ENDPOINT 镜像地址 (默认为 https://huggingface.co)
-pub fn hf_endpoint() -> String {
-    std::env::var("HF_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 
 #[cfg(test)]
@@ -122,25 +118,5 @@ mod tests {
         // Safety: 同上,清理测试设置的环境变量。
         unsafe { std::env::remove_var("HF_TOKEN") };
         assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_hf_endpoint_default() {
-        let _guard = env_lock();
-        let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
-        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,EnvSnapshot::drop 恢复原值。
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
-        assert_eq!(hf_endpoint(), "https://huggingface.co");
-    }
-
-    #[test]
-    fn test_hf_endpoint_custom() {
-        let _guard = env_lock();
-        let _endpoint = EnvSnapshot::capture("HF_ENDPOINT");
-        // Safety: 测试隔离 — ENV_LOCK 保证线程安全,EnvSnapshot::drop 恢复原值。
-        unsafe { std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com") };
-        assert_eq!(hf_endpoint(), "https://hf-mirror.com");
-        // Safety: 同上,清理测试设置的环境变量。
-        unsafe { std::env::remove_var("HF_ENDPOINT") };
     }
 }

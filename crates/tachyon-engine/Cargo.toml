@@ -6,9 +6,7 @@ license.workspace = true
 description = "Tachyon 引擎层:分片引擎、连接管理"
 
 [features]
-default = ["tachyon-protocol/ftp", "tachyon-protocol/quic", "tachyon-protocol/magnet"]
-ftp = ["tachyon-protocol/ftp"]
-quic = ["tachyon-protocol/quic"]
+default = ["tachyon-protocol/magnet"]
 magnet = ["tachyon-protocol/magnet", "dep:librqbit"]
 
 [dependencies]
