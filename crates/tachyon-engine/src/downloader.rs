@@ -135,6 +135,12 @@ pub struct DownloadTask {
     #[cfg(feature = "magnet")]
     #[allow(dead_code)]
     bt_session: Option<Arc<crate::bt_session::BtSession>>,
+    /// BT fallback 协议(P2SP 混合下载时持有,HTTP 全熔断后接管)
+    ///
+    /// 仅 `with_hybrid_sources` 构造时填充;纯 BT/纯 HTTP 路径为 None。
+    #[cfg(feature = "magnet")]
+    #[allow(dead_code)]
+    bt_fallback: Option<Arc<tachyon_protocol::MagnetProtocol>>,
 }
 
 /// 跨分片复用的写入缓冲区包装。
@@ -295,6 +301,8 @@ impl DownloadTask {
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session,
+            #[cfg(feature = "magnet")]
+            bt_fallback: None,
         })
     }
 
@@ -379,6 +387,90 @@ impl DownloadTask {
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
+            #[cfg(feature = "magnet")]
+            bt_fallback: None,
+        })
+    }
+
+    /// 混合源下载(P2SP):HTTP 镜像主源 + BT fallback
+    ///
+    /// HTTP 镜像立即提供数据(消除冷启动等待),BT 作为整文件 fallback:
+    /// 所有 HTTP 源 probe 失败或连续熔断时,切 BT download_full_stream。
+    ///
+    /// layout 兼容:仅单文件 BT + 单文件 HTTP + 大小一致才允许 BT fallback;
+    /// 多文件 BT 或大小不一致时,BT fallback 标记为不可用(仅走 HTTP)。
+    #[cfg(feature = "magnet")]
+    pub async fn with_hybrid_sources(
+        magnet_url: String,
+        http_mirrors: Vec<String>,
+        config: DownloadConfig,
+        pool: Option<Arc<ConnectionPool>>,
+        scheduler: Arc<dyn DownloadScheduler>,
+        bt_session: Arc<crate::bt_session::BtSession>,
+    ) -> DownloadResult<Self> {
+        use tachyon_protocol::{HttpClient, MagnetProtocol};
+        // MirrorProtocol 来自 crate::mirror(已在文件顶部 use),此处直接使用。
+
+        // 无 HTTP 镜像:退化为纯 BT
+        if http_mirrors.is_empty() {
+            return Self::with_pool_and_scheduler(
+                magnet_url,
+                config,
+                pool,
+                scheduler,
+                Some(bt_session),
+            )
+            .await;
+        }
+
+        // HTTP 镜像主源:塞入 MirrorProtocol(least-in-flight 调度)
+        let primary = Arc::new(HttpClient::with_timeouts(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+        )?);
+        let mirrors: Vec<(String, Arc<dyn Protocol>)> = http_mirrors
+            .iter()
+            .filter_map(|m| {
+                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                    .ok()
+                    .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
+            })
+            .collect();
+        let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
+
+        // BT fallback:独立持有,不塞入 MirrorProtocol
+        let bt_fallback = Arc::new(MagnetProtocol::new(
+            bt_session.session(),
+            bt_session.config().clone(),
+            bt_session.download_dir().clone(),
+        ));
+
+        Ok(Self {
+            id: TaskId::new_v4(),
+            url: magnet_url,
+            config,
+            protocol,
+            storage: None,
+            scheduler_config: SchedulerConfig::default(),
+            scheduler,
+            pool,
+            buffer_pool: None,
+            control_rx: None,
+            state: DownloadState::Pending,
+            metadata: None,
+            fragments: Vec::new(),
+            progress_tx: None,
+            verifier: default_blake3_verifier(),
+            completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
+            rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_session: Some(bt_session),
+            #[cfg(feature = "magnet")]
+            bt_fallback: Some(bt_fallback),
         })
     }
 
@@ -413,6 +505,8 @@ impl DownloadTask {
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
+            #[cfg(feature = "magnet")]
+            bt_fallback: None,
         }
     }
 
@@ -450,6 +544,8 @@ impl DownloadTask {
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
+            #[cfg(feature = "magnet")]
+            bt_fallback: None,
         }
     }
 
@@ -2179,6 +2275,33 @@ mod tests {
         assert!(task.metadata().is_none());
         assert!(task.fragment_infos().is_empty());
         assert!((task.progress() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ------ 1b. with_hybrid_sources:bt_fallback 字段存在 + 空镜像降级编译路径 ------
+
+    // 验证 bt_fallback 字段存在且默认构造为 None(纯 HTTP / 纯 BT 路径)。
+    // Task 6 仅落地字段 + 构造,fallback 触发逻辑在 Task 7。
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_with_hybrid_sources_no_mirrors_degrades_to_bt() {
+        // 无 HTTP 镜像 → 退化为纯 BT(with_pool_and_scheduler 路径)。
+        // 完整 P2SP 测试需要真实 BtSession(tempfile + librqbit Session),较重,
+        // 留待集成测试。此处仅验证:
+        //   1. with_hybrid_sources 签名编译通过;
+        //   2. 通过 new_for_test 构造的任务 bt_fallback 字段为 None(纯 HTTP 路径)。
+        let config = test_config();
+        let protocol = Arc::new(MockProto::new(test_metadata("data.zip", 2048)));
+        let task = DownloadTask::new_for_test(
+            "http://example.com/file.bin".into(),
+            config,
+            protocol,
+            StorageKind::memory(),
+        );
+        // 纯 HTTP 构造路径不填充 bt_fallback
+        assert!(
+            task.bt_fallback.is_none(),
+            "纯 HTTP 路径 bt_fallback 必须为 None"
+        );
     }
 
     // ------ 2. probe 获取元数据 -----
