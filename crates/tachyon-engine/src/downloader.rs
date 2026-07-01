@@ -1472,8 +1472,11 @@ impl DownloadTask {
                 ))
             })?;
             // 零拷贝推进:Bytes::slice 仅调整指针/长度,不复制数据。
-            // 与 StorageSet::Multi::write_at 的段内短写处理(storage_adapter.rs)一致。
-            remaining = remaining.slice(written..);
+            // clamp written 到剩余长度:StorageSet::Multi::write_at 内部 split_to 消费
+            // 全部数据后返回的 total 可能 > 单次 clone 的 len(跨段聚合),需防止 slice 越界。
+            // 与旧 advance(written.min(batch.len())) 的防御逻辑等价。
+            let advance = written.min(remaining.len());
+            remaining = remaining.slice(advance..);
         }
         Ok(total_written)
     }
