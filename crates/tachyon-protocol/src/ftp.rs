@@ -627,6 +627,7 @@ impl Protocol for FtpClient {
                 supports_range: false,
                 etag: None,
                 last_modified: None,
+                file_layout: None,
             })
         })
     }

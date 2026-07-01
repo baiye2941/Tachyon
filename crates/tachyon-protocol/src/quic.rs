@@ -542,6 +542,7 @@ fn parse_h3_metadata(response: &http::Response<()>, url: &str) -> DownloadResult
         supports_range,
         etag,
         last_modified,
+        file_layout: None,
     })
 }
 

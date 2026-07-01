@@ -623,6 +623,7 @@ fn metadata_from_headers(
         supports_range,
         etag,
         last_modified,
+        file_layout: None,
     }
 }
 

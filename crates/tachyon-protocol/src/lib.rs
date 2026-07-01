@@ -142,6 +142,7 @@ async fn download_range_stream() {
                     supports_range: true,
                     etag: None,
                     last_modified: None,
+                    file_layout: None,
                 })
             })
         }

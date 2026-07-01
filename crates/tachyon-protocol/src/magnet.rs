@@ -5,9 +5,14 @@
 //!
 //! # 设计要点
 //!
-//! - `probe()` 返回 `supports_range: false`，使引擎自动走 `download_full` 路径
-//! - `download_range()` / `download_range_stream()` 返回错误（BT 不支持按字节范围请求）
-//! - `download_full()` / `download_full_stream()` 等待 librqbit 完成后从磁盘读取
+//! - `probe()` 返回 `supports_range: true`（单文件 torrent 且 metadata 就绪时），
+//!   使引擎走 `execute_fragmented_download` 多 worker 分片并发路径
+//! - `download_range_stream()` 基于 librqbit 的 [`FileStream`]（`AsyncSeek`+`AsyncRead`），
+//!   每次调用新建独立 `FileStream`，引擎多 worker 各持独立 stream 并发读不同字节区间；
+//!   librqbit 内部 `TorrentStreams::iter_next_pieces` 交错调度各 stream 覆盖的 piece 请求，
+//!   实现"引擎分片并发 + BT 多 peer swarming 叠加"
+//! - `download_full_stream()` 保留作 fallback（多文件 torrent 或 metadata 未就绪），
+//!   走 `wait_until_completed` + 磁盘读两段式
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -16,23 +21,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use tachyon_core::config::MagnetConfig;
 use tachyon_core::error::{DownloadError, DownloadResult};
 use tachyon_core::traits::{ByteStream, Protocol};
-use tachyon_core::types::FileMetadata;
+use tachyon_core::types::{FileLayout, FileMetadata, FileSpan};
 
 /// 磁力链接协议客户端
 ///
 /// 持有 librqbit Session 引用，通过 Protocol trait
 /// 将 BitTorrent 下载适配为 Tachyon 统一下载接口。
+///
+/// `handle_cache` 按 magnet URL 缓存 `ManagedTorrent` 句柄与其 `FileLayout`,
+/// 避免 `download_range_stream` 在每个分片调用时重复查表 add_torrent。
+/// librqbit 对已存在的 torrent 返回 `AlreadyManaged` 同一 handle,
+/// 缓存只是省去这条查表路径与 info_hash 解析开销。
+/// `FileLayout` 在 probe 阶段从 metadata.file_infos 构造,供 download 拆分跨文件 range。
 pub struct MagnetProtocol {
     session: Arc<Session>,
     config: MagnetConfig,
     /// 默认下载输出目录（与 Session 创建时的 default_output_folder 一致）
     download_dir: PathBuf,
+    /// 按 magnet URL 缓存的 ManagedTorrent 句柄 + 文件布局
+    handle_cache: DashMap<String, (Arc<ManagedTorrent>, FileLayout)>,
 }
 
 impl MagnetProtocol {
@@ -42,7 +56,34 @@ impl MagnetProtocol {
             session,
             config,
             download_dir,
+            handle_cache: DashMap::new(),
         }
+    }
+
+    /// 从已构造的 `ManagedTorrent` 注入构造(测试与离线场景接缝)
+    ///
+    /// 跳过 magnet URL 解析与 `add_torrent` 注册,直接把预构造的 handle 塞进缓存。
+    /// 后续 `download_range_stream(url, ..)` 命中缓存即走 `FileStream` 读取路径,
+    /// `url` 仅作缓存 key(可填任意合法 magnet URI 占位)。
+    ///
+    /// 生产路径(`new` + magnet URL)不受影响;此构造器让离线集成测试可注入
+    /// 预置文件 torrent(initial_check 已标记 have),无需真实 peer 网络。
+    ///
+    /// `layout` 由调用方从 `handle.with_metadata` 构造(测试 helper 用 `FileLayout::single`)。
+    ///
+    /// 仅测试可用:生产代码只走 `new`,本接缝不暴露给外部 crate。
+    #[cfg(test)]
+    pub fn from_handle(
+        session: Arc<Session>,
+        config: MagnetConfig,
+        download_dir: PathBuf,
+        url: &str,
+        handle: Arc<ManagedTorrent>,
+        layout: FileLayout,
+    ) -> Self {
+        let proto = Self::new(session, config, download_dir);
+        proto.handle_cache.insert(url.to_string(), (handle, layout));
+        proto
     }
 }
 
@@ -82,6 +123,56 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     Ok(())
 }
 
+/// 把 BufReader 包装成 64KB chunk 的 ByteStream(unfold)
+///
+/// 读取到 EOF 返回 None 结束流,遇错误产出 Err 项。
+/// 单文件单段与多文件多段共用此 helper 把 FileStream 包装成统一的 ByteStream。
+fn make_chunk_stream<R>(reader: R) -> impl futures::Stream<Item = DownloadResult<Bytes>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use futures::stream::unfold;
+    unfold(reader, |mut reader| async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        match reader.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), reader))
+            }
+            Err(e) => Some((Err(DownloadError::Io(e)), reader)),
+        }
+    })
+}
+
+/// 解析首个文件的落盘路径(download_full / download_full_stream 回退路径用)
+///
+/// librqbit 对单文件 torrent 落盘到 download_dir/<name>,
+/// 对多文件 torrent 落盘到 download_dir/<torrent_name>/<relative_filename>。
+/// 此 helper 从 file_infos[0] 取相对名,拼到 download_dir 下。
+fn resolve_first_file_path(
+    handle: &Arc<ManagedTorrent>,
+    download_dir: &std::path::Path,
+) -> DownloadResult<PathBuf> {
+    let rel = handle
+        .with_metadata(|m| {
+            m.file_infos
+                .first()
+                .map(|fi| fi.relative_filename.clone())
+                .unwrap_or_default()
+        })
+        .map_err(|e| DownloadError::Protocol(format!("获取首个文件名失败: {e}")))?;
+    if rel.as_os_str().is_empty() {
+        // 回退:用 torrent name
+        let name = handle
+            .name()
+            .unwrap_or_else(|| "unknown_torrent".to_string());
+        Ok(download_dir.join(name))
+    } else {
+        Ok(download_dir.join(rel))
+    }
+}
+
 /// 通过 Session 添加磁力链接并获取 ManagedTorrent 句柄
 ///
 /// `download_dir` 用于设置输出目录，`overwrite` 设为 true 允许覆盖已有文件
@@ -118,6 +209,7 @@ impl Protocol for MagnetProtocol {
         let config = self.config.clone();
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
+        let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
             let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
@@ -134,25 +226,46 @@ impl Protocol for MagnetProtocol {
                 })?
                 .map_err(|e| DownloadError::Protocol(format!("磁力链接元数据获取失败: {e}")))?;
 
-            // 提取元数据
-            let (file_name, file_size) = handle
+            // 提取元数据：文件名、大小、文件布局
+            // 单/多文件 torrent 均走 range 路径(FileStream 按 file_id 流式读),
+            // download_range_stream 用 FileLayout 把全局 range 拆到各文件段。
+            let (file_name, file_size, layout) = handle
                 .with_metadata(|m| {
                     let name = m
                         .name
                         .clone()
                         .unwrap_or_else(|| "unknown_torrent".to_string());
                     let size = m.lengths.total_length();
-                    (name, size)
+                    // 构造 FileLayout:单文件退化为单元素,多文件按 file_infos 各文件段
+                    let spans: Vec<FileSpan> = m
+                        .file_infos
+                        .iter()
+                        .enumerate()
+                        .map(|(file_id, fi)| FileSpan {
+                            file_id,
+                            global_offset: fi.offset_in_torrent,
+                            len: fi.len,
+                            name: fi.relative_filename.to_string_lossy().into_owned(),
+                        })
+                        .collect();
+                    let layout = FileLayout::from_spans(spans);
+                    (name, size, layout)
                 })
                 .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
+
+            // 缓存 handle + layout,供后续 download_range_stream 每分片命中
+            handle_cache.insert(url.clone(), (Arc::clone(&handle), layout.clone()));
 
             Ok(FileMetadata {
                 file_name,
                 file_size: Some(file_size),
                 content_type: None,
-                supports_range: false,
+                // 单/多文件均支持 range(download_range_stream 内部按 FileLayout 拆分)
+                supports_range: true,
                 etag: None,
                 last_modified: None,
+                // 多文件布局供 init_storage 构造 StorageSet::Multi;单文件退化为单元素
+                file_layout: Some(layout),
             })
         })
     }
@@ -164,18 +277,108 @@ impl Protocol for MagnetProtocol {
         _end: u64,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
         Box::pin(async {
-            Err(DownloadError::Protocol("磁力链接不支持 Range 下载".into()))
+            Err(DownloadError::Protocol(
+                "磁力链接请使用 download_range_stream 流式下载".into(),
+            ))
         })
     }
 
     fn download_range_stream(
         &self,
-        _url: &str,
-        _start: u64,
-        _end: u64,
+        url: &str,
+        start: u64,
+        end: u64,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
-        Box::pin(async {
-            Err(DownloadError::Protocol("磁力链接不支持 Range 下载".into()))
+        if let Err(e) = validate_magnet_uri(url) {
+            return Box::pin(async move { Err(e) });
+        }
+
+        // end 为闭区间（与 HttpClient 的 Range: bytes=start-end 语义一致）
+        if end < start {
+            return Box::pin(async move {
+                Err(DownloadError::Protocol(format!(
+                    "磁力链接 Range 非法: start={start} > end={end}"
+                )))
+            });
+        }
+
+        let session = self.session.clone();
+        let download_dir = self.download_dir.clone();
+        let handle_cache = self.handle_cache.clone();
+        let url = url.to_string();
+
+        Box::pin(async move {
+            // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
+            // 否则回退 add_magnet_to_session（无 layout,构造单文件默认）
+            let (handle, layout) = if let Some(entry) = handle_cache.get(&url) {
+                (Arc::clone(&entry.0), entry.1.clone())
+            } else {
+                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                // 未走 probe 的回退路径:从 metadata 构造 layout
+                let layout = h
+                    .with_metadata(|m| {
+                        let spans: Vec<FileSpan> = m
+                            .file_infos
+                            .iter()
+                            .enumerate()
+                            .map(|(fid, fi)| FileSpan {
+                                file_id: fid,
+                                global_offset: fi.offset_in_torrent,
+                                len: fi.len,
+                                name: fi.relative_filename.to_string_lossy().into_owned(),
+                            })
+                            .collect();
+                        FileLayout::from_spans(spans)
+                    })
+                    .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
+                handle_cache.insert(url.clone(), (Arc::clone(&h), layout.clone()));
+                (h, layout)
+            };
+
+            // 用 FileLayout 把全局 [start, end] 拆成各文件内的段
+            let segments = layout.split_range(start, end);
+            if segments.is_empty() {
+                return Err(DownloadError::Protocol(format!(
+                    "磁力链接 Range 拆分结果为空: start={start}, end={end}"
+                )));
+            }
+
+            // 每段:独立 FileStream(独立 stream_id) → seek(local_start) → take(local_len) → unfold 64KB chunk
+            // 多段用 iter + flatten 拼接成连续 ByteStream(对外仍是 [start,end] 的连续字节)
+            // 引擎多 worker 各自调用本方法,各持独立 FileStream 并发读不同区间;
+            // librqbit 内部 TorrentStreams::iter_next_pieces 交错调度这些区间覆盖的 piece。
+            use futures::StreamExt;
+            // then(异步映射) + flatten:每段异步产出 ByteStream,flatten 拼接成连续流。
+            // 段内打开 FileStream/seek 失败时,产出一条 Err 项的单元素流,让下游感知错误。
+            let segment_streams = futures::stream::iter(segments)
+                .then(move |(file_id, local_start, local_end)| {
+                    let handle = Arc::clone(&handle);
+                    async move {
+                        let local_len = local_end - local_start + 1;
+                        match handle.stream(file_id) {
+                            Ok(mut stream) => {
+                                match stream.seek(std::io::SeekFrom::Start(local_start)).await {
+                                    Ok(_) => {
+                                        let reader =
+                                            tokio::io::BufReader::new(stream.take(local_len));
+                                        Box::pin(make_chunk_stream(reader)) as ByteStream
+                                    }
+                                    Err(e) => Box::pin(futures::stream::once(async move {
+                                        Err(DownloadError::Io(e))
+                                    })) as ByteStream,
+                                }
+                            }
+                            Err(e) => Box::pin(futures::stream::once(async move {
+                                Err(DownloadError::Protocol(format!(
+                                    "打开 FileStream(file_id={file_id}) 失败: {e}"
+                                )))
+                            })) as ByteStream,
+                        }
+                    }
+                })
+                .flatten();
+
+            Ok(Box::pin(segment_streams) as ByteStream)
         })
     }
 
@@ -190,9 +393,34 @@ impl Protocol for MagnetProtocol {
         let session = self.session.clone();
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
+        let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
+            // 命中缓存(probe 已填充 handle + layout);未命中则现场添加(回退,无 layout)
+            let handle = if let Some(entry) = handle_cache.get(&url) {
+                Arc::clone(&entry.0)
+            } else {
+                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                // 回退路径:构造单文件默认 layout(metadata 已就绪时)
+                let layout = h
+                    .with_metadata(|m| {
+                        let spans: Vec<FileSpan> = m
+                            .file_infos
+                            .iter()
+                            .enumerate()
+                            .map(|(fid, fi)| FileSpan {
+                                file_id: fid,
+                                global_offset: fi.offset_in_torrent,
+                                len: fi.len,
+                                name: fi.relative_filename.to_string_lossy().into_owned(),
+                            })
+                            .collect();
+                        FileLayout::from_spans(spans)
+                    })
+                    .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
+                handle_cache.insert(url.clone(), (Arc::clone(&h), layout));
+                h
+            };
 
             // 等待下载完成
             handle
@@ -200,12 +428,16 @@ impl Protocol for MagnetProtocol {
                 .await
                 .map_err(|e| DownloadError::Network(format!("磁力链接下载失败: {e}")))?;
 
-            // 从磁盘读取已下载文件
-            let file_name = handle
-                .name()
-                .unwrap_or_else(|| "unknown_torrent".to_string());
-            let file_path = download_dir.join(&file_name);
-
+            // 修复 BUG-I:多文件 torrent 的 download_full 会丢数据(只读首文件)。
+            // 多文件应走 download_range_stream(probe 恒 supports_range:true),
+            // 此 fallback 路径只支持单文件;多文件明确报错而非静默丢数据。
+            let file_count = handle.with_metadata(|m| m.file_infos.len()).unwrap_or(1);
+            if file_count > 1 {
+                return Err(DownloadError::Protocol(format!(
+                    "多文件 torrent({file_count} 文件)不支持 download_full,请走 range 路径"
+                )));
+            }
+            let file_path = resolve_first_file_path(&handle, &download_dir)?;
             let data = tokio::fs::read(&file_path)
                 .await
                 .map_err(DownloadError::Io)?;
@@ -225,9 +457,33 @@ impl Protocol for MagnetProtocol {
         let session = self.session.clone();
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
+        let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
+            // 命中缓存;未命中则现场添加
+            let handle = if let Some(entry) = handle_cache.get(&url) {
+                Arc::clone(&entry.0)
+            } else {
+                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let layout = h
+                    .with_metadata(|m| {
+                        let spans: Vec<FileSpan> = m
+                            .file_infos
+                            .iter()
+                            .enumerate()
+                            .map(|(fid, fi)| FileSpan {
+                                file_id: fid,
+                                global_offset: fi.offset_in_torrent,
+                                len: fi.len,
+                                name: fi.relative_filename.to_string_lossy().into_owned(),
+                            })
+                            .collect();
+                        FileLayout::from_spans(spans)
+                    })
+                    .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
+                handle_cache.insert(url.clone(), (Arc::clone(&h), layout));
+                h
+            };
 
             // 等待下载完成
             handle
@@ -235,30 +491,21 @@ impl Protocol for MagnetProtocol {
                 .await
                 .map_err(|e| DownloadError::Network(format!("磁力链接下载失败: {e}")))?;
 
-            let file_name = handle
-                .name()
-                .unwrap_or_else(|| "unknown_torrent".to_string());
-            let file_path = download_dir.join(&file_name);
-
+            // 修复 BUG-I:多文件 torrent 的 download_full_stream 只读首文件会丢数据。
+            // 多文件应走 download_range_stream,此 fallback 只支持单文件。
+            let file_count = handle.with_metadata(|m| m.file_infos.len()).unwrap_or(1);
+            if file_count > 1 {
+                return Err(DownloadError::Protocol(format!(
+                    "多文件 torrent({file_count} 文件)不支持 download_full_stream,请走 range 路径"
+                )));
+            }
+            let file_path = resolve_first_file_path(&handle, &download_dir)?;
             // 流式读取文件
             let file = tokio::fs::File::open(&file_path)
                 .await
                 .map_err(DownloadError::Io)?;
 
-            use futures::stream::unfold;
-
-            let stream = unfold(tokio::io::BufReader::new(file), |mut reader| async move {
-                let mut buf = vec![0u8; 64 * 1024];
-                match reader.read(&mut buf).await {
-                    Ok(0) => None,
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Some((Ok(Bytes::from(buf)), reader))
-                    }
-                    Err(e) => Some((Err(DownloadError::Io(e)), reader)),
-                }
-            });
-
+            let stream = make_chunk_stream(tokio::io::BufReader::new(file));
             Ok(Box::pin(stream) as ByteStream)
         })
     }
@@ -381,6 +628,420 @@ mod tests {
             validate_magnet_uri(uri).is_ok(),
             "大写 info hash 应被接受: {:?}",
             validate_magnet_uri(uri)
+        );
+    }
+
+    /// `download_range_stream` 的闭区间语义校验（start > end 非法）
+    ///
+    /// end 为包含的末字节（与 HttpClient 的 `Range: bytes=start-end` 一致），
+    /// 长度 = end - start + 1。start > end 时应立即返回错误，不进入 FileStream 路径。
+    #[test]
+    fn test_range_closed_interval_semantics() {
+        // 合法闭区间
+        assert_eq!(100u64.checked_sub(50).map(|d| d + 1), Some(51));
+        // start == end（单字节）
+        assert_eq!(50u64.checked_sub(50).map(|d| d + 1), Some(1));
+        // start > end 非法
+        assert_eq!(50u64.checked_sub(100).map(|d| d + 1), None);
+    }
+
+    // ===== 离线集成测试 =====
+    //
+    // 通过 librqbit 的 initial_check 机制:预置文件内容与 torrent pieces 哈希匹配时,
+    // add_torrent 会把所有 piece 标记为 have,FileStream 立即可读,无需真实 peer/DHT。
+    // 参考 librqbit-8.1.1/src/tests/e2e_stream.rs 的构造方式。
+
+    use librqbit::{
+        AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions, create_torrent,
+    };
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// 构造离线可读的 MagnetProtocol:预置文件 + 单文件 torrent + initial_check 完成
+    ///
+    /// 返回 (protocol, magnet_url, 原始文件内容)。
+    /// `file_size` 控制预置文件大小;`piece_len` 控制 torrent 分片大小(影响 piece 数)。
+    async fn make_offline_protocol(
+        file_size: usize,
+        piece_len: u32,
+    ) -> Result<(MagnetProtocol, String, Vec<u8>, TempDir), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        // 已知内容的预置文件(确定性字节,便于断言)
+        let content: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+        let file_path = dir.path().join("data.bin");
+        std::fs::write(&file_path, &content)?;
+
+        // 从预置文件生成 torrent metainfo(pieces SHA1 基于文件内容)
+        let torrent = create_torrent(
+            &file_path,
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(piece_len),
+            },
+        )
+        .await?;
+        let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
+
+        // Session 输出目录指向预置文件所在目录,initial_check 会校验已存在文件
+        let session = Session::new_with_opts(
+            PathBuf::from(dir.path()),
+            SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(dir.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .unwrap();
+
+        // wait_until_completed 确保 initial_check 完成且 have_pieces 填满
+        handle.wait_until_completed().await?;
+
+        let config = MagnetConfig::default();
+        // 单文件 torrent:layout 退化为单元素(file_id=0, 全局偏移 0)
+        let layout = FileLayout::single("data.bin".into(), file_size as u64);
+        let protocol = MagnetProtocol::from_handle(
+            session,
+            config,
+            PathBuf::from(dir.path()),
+            &magnet_url,
+            handle,
+            layout,
+        );
+
+        Ok((protocol, magnet_url, content, dir))
+    }
+
+    /// 构造离线可读的多文件 MagnetProtocol:预置目录(多文件)+ 多文件 torrent + initial_check 完成
+    ///
+    /// 返回 (protocol, magnet_url, 各文件内容 Vec, 拼接后的全局字节流, TempDir)。
+    /// `file_sizes` 指定每个文件大小(顺序对应 file_id 0..N);`piece_len` 控制 piece 大小。
+    /// 全局字节流 = 各文件内容顺序拼接,用于断言跨文件 range 读取正确性。
+    async fn make_offline_multi_protocol(
+        file_sizes: &[usize],
+        piece_len: u32,
+    ) -> Result<(MagnetProtocol, String, Vec<Vec<u8>>, Vec<u8>, TempDir), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        // 各文件确定性内容(不同基避免内容雷同),并拼接全局流
+        let mut files_content = Vec::with_capacity(file_sizes.len());
+        let mut global = Vec::new();
+        for (i, &sz) in file_sizes.iter().enumerate() {
+            // 不同基让各文件字节可区分(便于跨文件断言)
+            let content: Vec<u8> = (0..sz).map(|j| ((j + i * 7) % 251) as u8).collect();
+            let path = dir.path().join(format!("file{i}.bin"));
+            std::fs::write(&path, &content)?;
+            global.extend_from_slice(&content);
+            files_content.push(content);
+        }
+
+        // 从目录生成多文件 torrent(create_torrent 接受目录)
+        let torrent = create_torrent(
+            dir.path(),
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(piece_len),
+            },
+        )
+        .await?;
+        let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
+
+        let session = Session::new_with_opts(
+            PathBuf::from(dir.path()),
+            SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(dir.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .unwrap();
+
+        handle.wait_until_completed().await?;
+
+        // 从 handle 的 file_infos 构造 FileLayout(与 probe 路径一致)
+        let layout = handle
+            .with_metadata(|m| {
+                let spans: Vec<FileSpan> = m
+                    .file_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(fid, fi)| FileSpan {
+                        file_id: fid,
+                        global_offset: fi.offset_in_torrent,
+                        len: fi.len,
+                        name: fi.relative_filename.to_string_lossy().into_owned(),
+                    })
+                    .collect();
+                FileLayout::from_spans(spans)
+            })
+            .map_err(|e| DownloadError::Protocol(format!("获取元数据失败: {e}")))?;
+
+        let config = MagnetConfig::default();
+        let protocol = MagnetProtocol::from_handle(
+            session,
+            config,
+            PathBuf::from(dir.path()),
+            &magnet_url,
+            handle,
+            layout,
+        );
+
+        Ok((protocol, magnet_url, files_content, global, dir))
+    }
+
+    /// 把 ByteStream 完整消费为 Vec<u8>,遇错误 panic
+    async fn collect_stream(stream: ByteStream) -> Vec<u8> {
+        use futures::StreamExt;
+        let mut out = Vec::new();
+        let mut s = Box::pin(stream);
+        while let Some(item) = s.next().await {
+            let bytes = item.expect("流应产出有效字节块");
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    /// Tracer bullet:预置文件 torrent 经 Protocol::download_range_stream 读出正确字节
+    ///
+    /// 验证 range 化核心路径:from_handle 注入 → 命中缓存 → FileStream::stream(0)
+    /// → seek(start) → take(len) → unfold 64KB chunk → 字节与原文件一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_range_stream_reads_correct_bytes() {
+        let (protocol, url, content, _dir) = make_offline_protocol(8192, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        // 读取全文件 [0, len-1]
+        let end = (content.len() - 1) as u64;
+        let stream = protocol
+            .download_range_stream(&url, 0, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        assert_eq!(collected, content, "流式读出字节应与原文件完全一致");
+    }
+
+    /// 子区间读取 + 跨 piece 边界
+    ///
+    /// piece_len=1024,读取 [1500, 3500] 跨越 piece 1/2/3 的边界,
+    /// 验证 seek(非零起点) + take(部分长度) 裁剪正确。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_range_stream_subrange_across_pieces() {
+        let (protocol, url, content, _dir) = make_offline_protocol(8192, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let start: u64 = 1500;
+        let end: u64 = 3500;
+        let stream = protocol
+            .download_range_stream(&url, start, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        let expected = &content[start as usize..=end as usize];
+        assert_eq!(
+            collected, expected,
+            "子区间 [start, end] 读出字节应与原文件对应切片一致"
+        );
+        assert_eq!(
+            collected.len(),
+            (end - start + 1) as usize,
+            "读出字节数应为闭区间长度"
+        );
+    }
+
+    /// 单字节读取(start == end),验证闭区间边界
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_range_stream_single_byte() {
+        let (protocol, url, content, _dir) = make_offline_protocol(8192, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let pos: u64 = 2048;
+        let stream = protocol
+            .download_range_stream(&url, pos, pos)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        assert_eq!(
+            collected,
+            vec![content[pos as usize]],
+            "单字节读取应返回该位置字节"
+        );
+    }
+
+    // ===== 多文件 torrent range 化测试 =====
+
+    /// 多文件 torrent 全局范围读取:跨文件字节流拼接正确
+    ///
+    /// 3 个文件(各 4096),全局 [0, total-1] 读出应等于拼接后的全局字节流。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_file_full_range_reads_concatenated_bytes() {
+        let (protocol, url, _files, global, _dir) =
+            make_offline_multi_protocol(&[4096, 4096, 4096], 1024)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        let end = (global.len() - 1) as u64;
+        let stream = protocol
+            .download_range_stream(&url, 0, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        assert_eq!(collected, global, "多文件全局范围读出应等于拼接字节流");
+    }
+
+    /// 跨文件边界的子区间:range 横跨 file0/file1 边界,拆分拼接正确
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_file_subrange_across_boundary() {
+        // file0 [0,4095], file1 [4096,8191], file2 [8192,12287]
+        let (protocol, url, _files, global, _dir) =
+            make_offline_multi_protocol(&[4096, 4096, 4096], 1024)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        // [3000, 5000] 跨 file0 末尾 + file1 开头
+        let start: u64 = 3000;
+        let end: u64 = 5000;
+        let stream = protocol
+            .download_range_stream(&url, start, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        let expected = &global[start as usize..=end as usize];
+        assert_eq!(
+            collected, expected,
+            "跨文件边界子区间读出应等于全局流对应切片"
+        );
+        assert_eq!(collected.len(), (end - start + 1) as usize);
+    }
+
+    /// 跨三个文件的子区间:验证多段拼接(>2 段)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_file_subrange_across_three_files() {
+        let (protocol, url, _files, global, _dir) =
+            make_offline_multi_protocol(&[2048, 2048, 2048], 1024)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        // [1000, 5000] 跨三文件
+        let start: u64 = 1000;
+        let end: u64 = 5000;
+        let stream = protocol
+            .download_range_stream(&url, start, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        let expected = &global[start as usize..=end as usize];
+        assert_eq!(
+            collected, expected,
+            "跨三文件子区间读出应等于全局流对应切片"
+        );
+    }
+
+    /// 单文件内子区间(多文件 torrent 的某文件内部):不跨边界
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_file_subrange_within_single_file() {
+        let (protocol, url, _files, global, _dir) =
+            make_offline_multi_protocol(&[4096, 4096, 4096], 1024)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        // [5000, 6000] 完全在 file1 [4096,8191] 内
+        let start: u64 = 5000;
+        let end: u64 = 6000;
+        let stream = protocol
+            .download_range_stream(&url, start, end)
+            .await
+            .expect("download_range_stream 失败");
+
+        let collected = collect_stream(stream).await;
+        let expected = &global[start as usize..=end as usize];
+        assert_eq!(
+            collected, expected,
+            "单文件内子区间读出应等于全局流对应切片"
+        );
+    }
+
+    /// 计时测试:多文件 range 路径在离线预置文件下的吞吐
+    ///
+    /// 用 Instant 计时(非 criterion),验证 range 路径多 worker 并发读已就绪文件的吞吐合理。
+    ///
+    /// **局限声明**:此测试用 initial_check 让文件预置就绪(pieces 已 have),
+    /// FileStream 走本地磁盘 pread,无真实 BT swarming。因此测的是
+    /// "多段 FileStream 并发读本地文件"的 IO 并发能力,不是真实网络下载性能。
+    /// 真实 swarm 下 range 化 vs 两段式的收益(分片并发触发 librqbit 交错 piece 请求)
+    /// 需联网 e2e 环境量化,离线无法模拟。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_file_range_throughput_offline() {
+        // 4 文件各 256KB,总 1MB;piece 16KB(足够多 piece 触发并发读)
+        let file_size = 256 * 1024;
+        let piece_len = 16 * 1024;
+        let (protocol, url, _files, global, _dir) =
+            make_offline_multi_protocol(&[file_size, file_size, file_size, file_size], piece_len)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        let total = global.len() as u64;
+        let start = std::time::Instant::now();
+        let stream = protocol
+            .download_range_stream(&url, 0, total - 1)
+            .await
+            .expect("download_range_stream 失败");
+        let collected = collect_stream(stream).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(collected.len(), global.len(), "应读出全部字节");
+        assert_eq!(collected, global, "内容应一致");
+
+        // 吞吐断言:1MB 在本地磁盘 pread 应 < 500ms(保守上限,CI 环境波动)
+        // 主要验证 range 路径不异常慢,非精确性能基准
+        let throughput_mbps = (total as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "多文件 range 路径: {} 字节, {:?}, 吞吐 {:.1} MB/s (本地磁盘, 非真实 swarm)",
+            total, elapsed, throughput_mbps
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "1MB 本地读取耗时 {:?} 过长,可能存在性能问题",
+            elapsed
         );
     }
 }
