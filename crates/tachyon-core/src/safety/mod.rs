@@ -10,7 +10,7 @@ pub mod url_safety;
 // 重新导出公开 API,保持与旧 `pub mod safety` 一致的调用路径
 pub use filename::{
     extract_filename, extract_filename_from_url, parse_content_disposition, sanitize_filename,
-    validate_save_path,
+    validate_multi_save_paths, validate_save_path,
 };
 pub use url_safety::{
     redact_url_for_log, reject_forbidden_ip, validate_public_http_url, validate_redirect,

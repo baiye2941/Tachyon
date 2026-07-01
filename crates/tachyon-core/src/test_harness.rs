@@ -4,7 +4,7 @@
 
 #[cfg(any(test, feature = "test-harness"))]
 pub mod harness {
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -331,6 +331,61 @@ pub mod harness {
         }
     }
 
+    /// 无操作存储实现,用于隔离测量存储适配层(如 `StorageSet::Multi`)开销
+    ///
+    /// `write_at`/`write_at_mut` 立即返回成功,不拷贝数据也不做真实 I/O,
+    /// 因此计时测试可隔离出 `StorageSet::Multi::write_at_mut` 的分段拷贝/拆分成本
+    /// (而非被底层后端 I/O 或全量拷贝掩盖)。
+    #[derive(Clone, Default)]
+    pub struct NoopStorage;
+
+    impl AsyncStorage for NoopStorage {
+        fn write_at(
+            &self,
+            _offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            Box::pin(async move { Ok(data.len()) })
+        }
+
+        // write_at_mut 不覆盖:默认实现会 Bytes::copy_from_slice 全量拷贝,
+        // 这正是我们想隔离测量 Multi 分段拷贝时不想被干扰的因素,故覆盖为零拷贝直读。
+        fn write_at_mut<'a>(
+            &'a self,
+            _offset: u64,
+            data: &'a mut BytesMut,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move { Ok(data.len()) })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            _offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            _size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async move { Ok(u64::MAX) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
     /// 创建测试用的文件元数据
     pub fn test_metadata(file_name: &str, file_size: u64) -> FileMetadata {
         FileMetadata {
@@ -340,6 +395,7 @@ pub mod harness {
             supports_range: true,
             etag: Some("\"abc123\"".into()),
             last_modified: None,
+            file_layout: None,
         }
     }
 

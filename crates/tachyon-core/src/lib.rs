@@ -27,13 +27,13 @@ pub use config::USER_AGENT;
 pub use error::{DownloadError, DownloadResult};
 pub use safety::{
     extract_filename, extract_filename_from_url, parse_content_disposition, redact_url_for_log,
-    reject_forbidden_ip, sanitize_filename, validate_public_http_url, validate_redirect,
-    validate_resolved_ip, validate_save_path,
+    reject_forbidden_ip, sanitize_filename, validate_multi_save_paths, validate_public_http_url,
+    validate_redirect, validate_resolved_ip, validate_save_path,
 };
 pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{
-    DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, FragmentProgress, TaskCommand,
-    TaskId, TaskProgress,
+    DownloadState, DownloadStateChange, FileLayout, FileMetadata, FileSpan, FragmentInfo,
+    FragmentProgress, TaskCommand, TaskId, TaskProgress,
 };
 pub use utils::{Metrics, hex_encode};
 

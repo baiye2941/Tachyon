@@ -481,6 +481,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let mock = MockTaskRunner {
             state: Arc::clone(&state),

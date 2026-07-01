@@ -243,6 +243,58 @@ pub fn validate_save_path(
     }
 }
 
+/// 多文件落盘路径校验
+///
+/// `file_names` 为各文件的相对路径(可能含子目录,如 "subdir/a.bin"),
+/// 顺序对应 file_id。每个文件路径拼到 `base/torrent_name/` 下,
+/// 经 `validate_save_path` 做 TOCTOU 防护和逃逸检测,返回各 canonical 路径。
+///
+/// 安全策略(分组件 sanitize,保留子目录结构):
+/// - 按路径分隔符(`/`/`\`)把相对路径拆成组件,逐段 `sanitize_filename`;
+///   组件级 sanitize 移除单段内的危险字符,但不再把分隔符压成空格
+///   (分隔符在此处用于分割,而非压平),从而保留 "subdir/a.bin" 的目录层级。
+/// - 任一组件为 `..` 或 `.` 视为逃逸攻击,直接报错(不接受相对路径穿越)。
+/// - 最后 `validate_save_path` 做最终的 canonical 逃逸检测与父目录自动创建,
+///   形成纵深防御。
+pub fn validate_multi_save_paths(
+    base: &std::path::Path,
+    torrent_name: &str,
+    file_names: &[String],
+) -> crate::DownloadResult<Vec<std::path::PathBuf>> {
+    let safe_torrent_dir = sanitize_filename(torrent_name);
+    let torrent_base = base.join(&safe_torrent_dir);
+    let mut paths = Vec::with_capacity(file_names.len());
+    for rel in file_names {
+        // 按路径分隔符拆成组件,逐段 sanitize,保留子目录结构。
+        // OPT-2:旧实现对整条 rel 调 sanitize_filename,把 '/' 压成空格,
+        // 导致 "subdir/a.bin" 被扁平化为 "subdir a.bin",丢失目录层级。
+        let mut safe_path = torrent_base.clone();
+        for raw_component in rel.split(['/', '\\']) {
+            // 跳过空组件(连续分隔符 / 首尾分隔符产生的空段)
+            if raw_component.is_empty() {
+                continue;
+            }
+            // '.' 与 '..' 在相对路径中是逃逸/无意义段,直接拒绝
+            if raw_component == "." || raw_component == ".." {
+                return Err(crate::DownloadError::Config(format!(
+                    "多文件相对路径含非法组件 '{raw_component}'(逃逸检测): {rel}"
+                )));
+            }
+            // 单组件 sanitize:移除组件内的危险字符(组件内不应再含分隔符,
+            // sanitize_filename 会把残留分隔符压成空格,这是期望行为)
+            let safe_comp = sanitize_filename(raw_component);
+            safe_path.push(safe_comp);
+        }
+        // 若拆分后无任何有效组件(如 rel 全是分隔符),回退到 unknown 兜底
+        if safe_path == torrent_base {
+            safe_path.push(sanitize_filename(rel));
+        }
+        let canonical = validate_save_path(&safe_path, base)?;
+        paths.push(canonical);
+    }
+    Ok(paths)
+}
+
 /// 解析 Content-Disposition 头中的文件名
 ///
 /// 支持两种格式:
@@ -894,6 +946,71 @@ mod tests {
         assert_eq!(percent_decode("%GG"), Some("%GG".to_string()));
         assert_eq!(percent_decode("%G1"), Some("%G1".to_string()));
         assert_eq!(percent_decode("%1G"), Some("%1G".to_string()));
+    }
+
+    // ===== validate_multi_save_paths:多文件 torrent 子目录结构保留 =====
+    //
+    // OPT-2:多文件 torrent 的 file_names 可能含子目录(如 "subdir/a.bin"),
+    // validate_multi_save_paths 必须把子目录段当作目录保留,而非 sanitize 成空格。
+    // 否则多文件 torrent 的嵌套目录结构在落盘时丢失。
+
+    #[test]
+    fn test_validate_multi_save_paths_preserves_subdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+
+        let paths = validate_multi_save_paths(
+            &base,
+            "mytorrent",
+            &["subdir/a.bin".to_string(), "subdir/b.bin".to_string()],
+        )
+        .expect("合法子目录路径应通过校验");
+
+        // 两个文件应落到 mytorrent/subdir/ 下,而非被扁平化成 "subdir a.bin"
+        // validate_save_path 返回 canonical 路径(Windows 上带 \\?\ 前缀),
+        // 故比较 file_name 与 parent 末段而非整路径字符串。
+        let p0 = &paths[0];
+        assert_eq!(p0.file_name().unwrap(), "a.bin", "文件名应保留");
+        assert_eq!(
+            p0.parent().unwrap().file_name().unwrap(),
+            "subdir",
+            "子目录应被保留,而非扁平化成空格"
+        );
+        assert_eq!(paths[1].file_name().unwrap(), "b.bin", "第二个文件也应保留");
+        assert_eq!(
+            paths[1].parent().unwrap().file_name().unwrap(),
+            "subdir",
+            "第二个文件的子目录也应保留"
+        );
+    }
+
+    #[test]
+    fn test_validate_multi_save_paths_blocks_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+
+        // 含 .. 的相对路径应被阻止(无法逃逸出 torrent 基目录)
+        let result =
+            validate_multi_save_paths(&base, "mytorrent", &["../../../etc/passwd".to_string()]);
+        assert!(
+            result.is_err(),
+            "含 .. 的逃逸路径应被阻止,实际返回: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_multi_save_paths_flat_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+
+        // 无子目录的简单文件名应直接落到 torrent 基目录下
+        let paths = validate_multi_save_paths(&base, "mytorrent", &["data.bin".to_string()])
+            .expect("简单文件名应通过校验");
+        assert_eq!(paths[0].file_name().unwrap(), "data.bin");
     }
 }
 

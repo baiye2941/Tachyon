@@ -178,6 +178,114 @@ pub struct FileMetadata {
     pub etag: Option<String>,
     /// 最后修改时间
     pub last_modified: Option<String>,
+    /// 多文件布局(BitTorrent 多文件 torrent 用)
+    ///
+    /// None 表示单文件(HTTP/FTP/单文件 torrent),init_storage 走单文件路径。
+    /// Some 表示多文件,file_layout 描述各文件的 (file_id, offset, len, name),
+    /// init_storage 据此构造 StorageSet::Multi,download_range_stream 据此拆分跨文件 range。
+    #[serde(default)]
+    pub file_layout: Option<FileLayout>,
+}
+
+/// 多文件布局:全局偏移 ↔ (file_id, 文件内偏移) 的双向折算
+///
+/// 用于 BitTorrent 多文件 torrent:引擎按 torrent 全局字节流切分片
+/// (`plan_fragments` 按总长切),而 `FileStream`/存储后端都绑定单个 file_id。
+/// `FileLayout` 把全局 `[start, end]` 拆成各文件内的段,供读取侧
+/// (`download_range_stream`)和写入侧(`storage.write_at`)共享同一映射。
+///
+/// 单文件 torrent 退化为单元素列表,行为等价于现有单文件路径。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileLayout {
+    /// 按 global_offset 升序排列的文件段
+    files: Vec<FileSpan>,
+}
+
+/// FileLayout 中的一个文件段
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSpan {
+    /// 文件在 torrent 内的索引(librqbit file_infos 下标)
+    pub file_id: usize,
+    /// 文件在 torrent 全局字节流的起点
+    pub global_offset: u64,
+    /// 文件长度
+    pub len: u64,
+    /// 文件相对名(用于落盘路径)
+    pub name: String,
+}
+
+impl FileLayout {
+    /// 单文件快捷构造
+    pub fn single(name: String, len: u64) -> Self {
+        Self {
+            files: vec![FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len,
+                name,
+            }],
+        }
+    }
+
+    /// 从文件段列表构造(会按 global_offset 排序,确保升序不变量)
+    pub fn from_spans(mut spans: Vec<FileSpan>) -> Self {
+        spans.sort_by_key(|s| s.global_offset);
+        Self { files: spans }
+    }
+
+    /// 全局总长
+    pub fn total_len(&self) -> u64 {
+        self.files
+            .last()
+            .map(|f| f.global_offset + f.len)
+            .unwrap_or(0)
+    }
+
+    /// 文件段数量
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// 各文件的相对名列表(按 file_id 升序)
+    ///
+    /// 供 `validate_multi_save_paths` 取各文件 relative_filename 做落盘路径校验。
+    pub fn file_names(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// 把全局闭区间 `[start, end]` 拆成各文件内的段
+    ///
+    /// 返回 `Vec<(file_id, file_local_start, file_local_end)>`,按文件顺序排列,
+    /// 各段的 file_local 坐标是该文件内偏移(从 0 开始)。
+    /// 跨文件边界的 range 会被拆成多段;完全在单文件内的返回单段。
+    /// start > end 返回空 Vec(非法 range)。
+    pub fn split_range(&self, start: u64, end: u64) -> Vec<(usize, u64, u64)> {
+        if start > end {
+            return Vec::new();
+        }
+        // 修复 BUG-E:end+1 在 end=u64::MAX 时溢出。用 saturating_add,饱和到 MAX
+        // (语义:exclusive 上界,饱和到 MAX 等价于"到末尾")
+        let end_exclusive = end.saturating_add(1);
+        let mut out = Vec::new();
+        for span in &self.files {
+            let span_start = span.global_offset;
+            let span_end = span.global_offset + span.len; // exclusive
+            // 该文件区间 [span_start, span_end) 与 [start, end_exclusive) 的交集
+            let lo = start.max(span_start);
+            let hi = end_exclusive.min(span_end);
+            if lo < hi {
+                // 有交集,折算到文件内偏移
+                let local_start = lo - span_start;
+                let local_end = hi - 1 - span_start; // 闭区间末字节
+                out.push((span.file_id, local_start, local_end));
+            }
+            // 文件已在 end 之前结束,后续无需再查
+            if span_end > end_exclusive {
+                break;
+            }
+        }
+        out
+    }
 }
 
 /// 分片信息
@@ -308,6 +416,7 @@ mod tests {
             supports_range: true,
             etag: Some("\"abc\"".into()),
             last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            file_layout: None,
         };
         assert_eq!(meta.file_size, Some(1024));
         assert!(meta.supports_range);
@@ -322,6 +431,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         assert!(meta.file_size.is_none());
         assert!(!meta.supports_range);
@@ -358,6 +468,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();
@@ -521,6 +632,119 @@ mod tests {
         let remaining = active.remaining_secs();
         assert!(remaining > 0 && remaining <= 60, "remaining={remaining}");
     }
+
+    // ===== FileLayout 折算测试 =====
+
+    #[test]
+    fn test_file_layout_single_file_degenerates_to_one_span() {
+        let layout = FileLayout::single("data.bin".into(), 8192);
+        assert_eq!(layout.file_count(), 1);
+        assert_eq!(layout.total_len(), 8192);
+
+        // 全文件 [0, 8191] → 单段 (file_id=0, local 0..8191)
+        let segs = layout.split_range(0, 8191);
+        assert_eq!(segs, vec![(0, 0, 8191)]);
+    }
+
+    #[test]
+    fn test_file_layout_split_range_within_single_file() {
+        let layout = FileLayout::single("data.bin".into(), 8192);
+        // 子区间完全在单文件内
+        let segs = layout.split_range(1500, 3500);
+        assert_eq!(segs, vec![(0, 1500, 3500)]);
+    }
+
+    #[test]
+    fn test_file_layout_split_range_across_file_boundary() {
+        // 两文件:file0 [0, 4095], file1 [4096, 8191]
+        let layout = FileLayout::from_spans(vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 4096,
+                name: "a.bin".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 4096,
+                len: 4096,
+                name: "b.bin".into(),
+            },
+        ]);
+        assert_eq!(layout.total_len(), 8192);
+
+        // 跨边界 [3000, 5000] → file0 [3000,4095] + file1 [0,904]
+        // file1 全局 [4096, 5000],文件内偏移 5000-4096=904
+        let segs = layout.split_range(3000, 5000);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], (0, 3000, 4095), "file0 段");
+        assert_eq!(segs[1], (1, 0, 904), "file1 段: 5000-4096=904");
+    }
+
+    #[test]
+    fn test_file_layout_split_range_exactly_at_boundary() {
+        let layout = FileLayout::from_spans(vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 4096,
+                name: "a.bin".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 4096,
+                len: 4096,
+                name: "b.bin".into(),
+            },
+        ]);
+        // range 恰好落在 file0 末字节 4095
+        let segs = layout.split_range(4095, 4095);
+        assert_eq!(segs, vec![(0, 4095, 4095)]);
+
+        // range 恰好落在 file1 首字节 4096
+        let segs = layout.split_range(4096, 4096);
+        assert_eq!(segs, vec![(1, 0, 0)]);
+    }
+
+    #[test]
+    fn test_file_layout_split_range_across_three_files() {
+        // 三文件各 1024
+        let layout = FileLayout::from_spans(vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1024,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 1024,
+                len: 1024,
+                name: "b".into(),
+            },
+            FileSpan {
+                file_id: 2,
+                global_offset: 2048,
+                len: 1024,
+                name: "c".into(),
+            },
+        ]);
+        // 全局 [500, 2500] 跨三文件
+        let segs = layout.split_range(500, 2500);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0], (0, 500, 1023)); // a: [500, 1023]
+        assert_eq!(segs[1], (1, 0, 1023)); // b: 全部
+        assert_eq!(segs[2], (2, 0, 452)); // c: [0, 2500-2048=452]
+    }
+
+    #[test]
+    fn test_file_layout_split_range_illegal_returns_empty() {
+        let layout = FileLayout::single("x".into(), 100);
+        assert!(
+            layout.split_range(50, 49).is_empty(),
+            "start > end 应返回空"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +809,7 @@ mod proptests {
                 supports_range,
                 etag: None,
                 last_modified: None,
+                file_layout: None,
             };
             let json = serde_json::to_string(&meta).unwrap();
             let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();
