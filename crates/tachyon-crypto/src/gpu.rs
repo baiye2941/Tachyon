@@ -94,7 +94,7 @@ impl GpuVerifier {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| DownloadError::Other("未找到可用 GPU 适配器".into()))?;
+            .map_err(|_| DownloadError::Other("未找到可用 GPU 适配器".into()))?;
 
         tracing::info!(
             "GPU 适配器: {} ({:?})",
@@ -103,15 +103,12 @@ impl GpuVerifier {
         );
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tachyon_crypto_device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    ..Default::default()
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tachyon_crypto_device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| DownloadError::Other(format!("GPU 设备初始化失败: {e}").into()))?;
 
@@ -149,7 +146,7 @@ impl GpuVerifier {
                 force_fallback_adapter: false,
             })
             .await
-            .is_some()
+            .is_ok()
     }
 
     /// 获取 GPU 设备调试描述
@@ -332,7 +329,9 @@ impl GpuVerifier {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| DownloadError::Other(format!("GPU 设备 poll 失败: {e}").into()))?;
         rx.recv()
             .map_err(|e| DownloadError::Other(format!("GPU buffer 映射通道关闭: {e}").into()))?
             .map_err(|e| DownloadError::Other(format!("GPU buffer 映射失败: {e}").into()))?;
