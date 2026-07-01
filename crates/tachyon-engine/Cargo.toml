@@ -27,6 +27,7 @@ librqbit = { workspace = true, optional = true }
 
 [dev-dependencies]
 tachyon-core = { path = "../tachyon-core", features = ["test-harness"] }
+tachyon-protocol = { path = "../tachyon-protocol", default-features = false, features = ["test-harness"] }
 tempfile.workspace = true
 tokio-test.workspace = true
 proptest.workspace = true

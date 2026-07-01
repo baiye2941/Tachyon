@@ -8,6 +8,9 @@ description = "Tachyon 协议层:HTTP/HTTPS/BitTorrent"
 [features]
 default = ["magnet"]
 magnet = ["dep:librqbit"]
+# 测试接缝:暴露 from_handle 等仅供离线集成测试使用的构造器。
+# 由下游 crate(tachyon-engine)在 dev-dependencies 中开启,不影响生产编译。
+test-harness = []
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }

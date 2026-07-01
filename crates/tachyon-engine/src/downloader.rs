@@ -2497,6 +2497,268 @@ mod tests {
         );
     }
 
+    // ------ 1c. should_try_bt_fallback:Cancelled 排除 + bt_fallback 缺失时不触发 ------
+
+    /// I-1 回归测试:`should_try_bt_fallback` 在 `bt_fallback` 存在时,
+    /// 对 `DownloadError::Cancelled` 必须返回 false(用户主动取消是确定终态,
+    /// 不应再启动 BT 整文件下载,也不应掩盖取消语义);对其他可重试错误
+    /// (如 Timeout)返回 true。
+    ///
+    /// 另校验 `bt_fallback` 为 None(纯 HTTP / 纯 BT 路径)时,任何错误均返回
+    /// false —— 失败直接向上传播,不触发 fallback。
+    ///
+    /// 仅需一个真实 `librqbit::Session`(构造 `MagnetProtocol` 占位),无需
+    /// 预置 torrent / 真实 peer 网络:本测试只覆盖 `should_try_bt_fallback`
+    /// 的判定逻辑(字段存在性 + 错误变体),不触及 `execute_bt_fallback` 的
+    /// probe/download_full_stream 路径。
+    #[cfg(feature = "magnet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_should_try_bt_fallback_excludes_cancelled() {
+        use tachyon_protocol::MagnetProtocol;
+
+        // 构造占位 MagnetProtocol(只需合法 Session,无需添加 torrent):
+        // should_try_bt_fallback 只读 bt_fallback.is_some(),不调用其任何方法。
+        let dir = tempfile::TempDir::new().unwrap();
+        // Session::new_with_opts 已返回 Arc<Session>(见 magnet.rs:968 用法),
+        // 无需再 Arc::new 包裹。
+        let session = librqbit::Session::new_with_opts(
+            dir.path().to_path_buf(),
+            librqbit::SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("创建 BT Session 失败");
+        let bt_proto = std::sync::Arc::new(MagnetProtocol::new(
+            session,
+            tachyon_core::config::MagnetConfig::default(),
+            dir.path().to_path_buf(),
+        ));
+
+        // 1) bt_fallback = Some:Cancelled 必须排除,其他错误(Timeout/Network)触发 fallback
+        let meta = test_metadata("hybrid.bin", 2048);
+        let protocol = Arc::new(MockProto::new(meta));
+        let mut task = DownloadTask::new_for_test(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            test_config(),
+            protocol,
+            StorageKind::memory(),
+        );
+        task.bt_fallback = Some(bt_proto);
+
+        assert!(
+            !task.should_try_bt_fallback(&DownloadError::Cancelled),
+            "Cancelled 是确定终态,必须排除 BT fallback(不得掩盖取消语义)"
+        );
+        assert!(
+            task.should_try_bt_fallback(&DownloadError::Timeout("30s".into())),
+            "Timeout 在 bt_fallback 存在时应触发 BT fallback"
+        );
+        assert!(
+            task.should_try_bt_fallback(&DownloadError::Network("主源熔断".into())),
+            "Network 错误在 bt_fallback 存在时应触发 BT fallback"
+        );
+        assert!(
+            task.should_try_bt_fallback(&DownloadError::Http {
+                status: 503,
+                reason: "unavailable".into()
+            }),
+            "Http 5xx 在 bt_fallback 存在时应触发 BT fallback"
+        );
+
+        // 2) bt_fallback = None(纯 HTTP / 纯 BT 路径):任何错误均不触发 fallback
+        let plain_task = DownloadTask::new_for_test(
+            "http://example.com/plain.bin".into(),
+            test_config(),
+            Arc::new(MockProto::new(test_metadata("plain.bin", 1024))),
+            StorageKind::memory(),
+        );
+        assert!(
+            plain_task.bt_fallback.is_none(),
+            "纯 HTTP 路径 bt_fallback 必须为 None"
+        );
+        assert!(
+            !plain_task.should_try_bt_fallback(&DownloadError::Network("失败".into())),
+            "bt_fallback 为 None 时不得触发 fallback,失败直接向上传播"
+        );
+        assert!(
+            !plain_task.should_try_bt_fallback(&DownloadError::Cancelled),
+            "bt_fallback 为 None 时 Cancelled 也不触发 fallback"
+        );
+    }
+
+    // ------ 1d. BT fallback 集成:HTTP 主源全熔断 → BT 整文件下载接管 (spec 5.4) ------
+
+    /// 构造离线可读的 `MagnetProtocol`(预置文件 + 单文件 torrent + initial_check 完成),
+    /// 复刻 `tachyon-protocol::magnet` 测试模块的 `make_offline_protocol` 模式。
+    ///
+    /// 通过 librqbit 的 `initial_check` 机制:预置文件内容与 torrent pieces 哈希匹配时,
+    /// `add_torrent` 把所有 piece 标记为 have,`FileStream` / `download_full_stream` 立即可读,
+    /// 无需真实 peer / DHT 网络。返回 `(protocol, magnet_url, 文件内容, TempDir)`。
+    ///
+    /// `file_size` 控制预置文件大小;`piece_len` 控制 torrent 分片大小(影响 piece 数)。
+    /// `TempDir` 必须由调用方持有(预置文件 + Session 输出目录在其下)。
+    #[cfg(feature = "magnet")]
+    async fn make_offline_bt_fallback(
+        file_size: usize,
+        piece_len: u32,
+    ) -> Result<
+        (
+            tachyon_protocol::MagnetProtocol,
+            String,
+            Vec<u8>,
+            tempfile::TempDir,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use librqbit::{
+            AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
+            create_torrent,
+        };
+        use tachyon_core::FileLayout;
+
+        let dir = tempfile::TempDir::new()?;
+        // 已知内容的预置文件(确定性字节,便于断言)
+        let content: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+        let file_path = dir.path().join("data.bin");
+        std::fs::write(&file_path, &content)?;
+
+        // 从预置文件生成 torrent metainfo(pieces SHA1 基于文件内容)
+        let torrent = create_torrent(
+            &file_path,
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(piece_len),
+            },
+        )
+        .await?;
+        let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
+
+        // Session 输出目录指向预置文件所在目录,initial_check 会校验已存在文件
+        let session = Session::new_with_opts(
+            std::path::PathBuf::from(dir.path()),
+            SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(dir.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .unwrap();
+
+        // wait_until_completed 确保 initial_check 完成且 have_pieces 填满
+        handle.wait_until_completed().await?;
+        let config = tachyon_core::config::MagnetConfig::default();
+        // 用 from_handle 直接预缓存 handle + layout 到 MagnetProtocol.handle_cache,
+        // 使后续 bt_proto.probe(&magnet_url) 命中缓存短路(见 magnet.rs probe 的
+        // handle_cache 命中分支),不再走 add_magnet_to_session —— 后者在「无 DHT/无 peer」
+        // 离线场景会硬失败(librqbit 需 DHT/peer 发现元数据)。
+        //
+        // `from_handle` 由 tachyon-protocol 的 test-harness feature 暴露(下游测试构建
+        // 可达),与生产构造路径(with_hybrid_sources 用 new + 真实磁力 probe)的区别仅在于
+        // 跳过 magnet URL 解析 + add_torrent 注册 —— 这正是离线测试需要的接缝。
+        // 单文件 torrent:layout 退化为单元素(file_id=0, 全局偏移 0)。
+        let layout = FileLayout::single("data.bin".into(), file_size as u64);
+        let protocol = tachyon_protocol::MagnetProtocol::from_handle(
+            session,
+            config,
+            std::path::PathBuf::from(dir.path()),
+            &magnet_url,
+            handle,
+            layout,
+        );
+
+        Ok((protocol, magnet_url, content, dir))
+    }
+
+    /// I-2 集成测试:spec 5.4「HTTP 失败 BT 接管」场景。
+    ///
+    /// 构造 P2SP 混合任务:主协议为 `MockProto`(模拟 HTTP 主源全熔断 —— probe 成功
+    /// 返回 metadata,但 `download_range` 因无 range_data 失败),`bt_fallback` 为离线
+    /// 预置的 `MagnetProtocol`(tempfile + initial_check,无真实 peer)。
+    ///
+    /// `run()` 流程:probe(MockProto 成功)→ init_storage → plan → prepare_storage →
+    /// execute(MockProto 失败,`max_retries=0` 立即失败,无退避)→
+    /// `should_try_bt_fallback(Network 错误)=true` → `execute_bt_fallback`:
+    ///   - `bt_proto.probe(magnet_url)` 命中 from_handle 预缓存,layout 校验通过
+    ///     (单文件 + 大小一致);
+    ///   - `download_full_stream` 读预置文件字节流;
+    ///   - `write_stream_to_storage_with_fallback` 写入 storage;
+    /// → verify(校验关闭,直接通过)→ Completed。
+    ///
+    /// 断言:任务最终 Completed,storage 中数据 == BT 预置文件内容(证明 BT 接管写入)。
+    #[cfg(feature = "magnet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt_fallback_triggered_on_http_failure() {
+        let file_size = 4096usize;
+        let (bt_protocol, magnet_url, bt_content, _dir) = make_offline_bt_fallback(file_size, 1024)
+            .await
+            .expect("构造离线 BT fallback 失败");
+
+        // 主协议(MockProto):probe 成功(返回与 BT 一致大小,使 execute_bt_fallback 的
+        // layout 兼容校验通过),但 download_range 无 range_data → 失败,模拟 HTTP 全熔断。
+        let http_meta = test_metadata("data.bin", file_size as u64);
+        let http_protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(http_meta));
+
+        // max_retries=0:execute 首次失败立即向上返回,避免重试退避拖慢测试。
+        let mut config = test_config();
+        config.max_retries = 0;
+
+        let mut task = DownloadTask::new_for_test(
+            // url 必须为 magnet_url:execute_bt_fallback 内 bt_proto.probe(&self.url)
+            // 用此 url 命中 from_handle 预缓存。
+            magnet_url,
+            config,
+            http_protocol,
+            StorageKind::memory_with_capacity(file_size),
+        );
+        // 手动注入 bt_fallback(模拟 with_hybrid_sources 的填充结果)。
+        task.bt_fallback = Some(Arc::new(bt_protocol));
+
+        task.run().await.expect("BT fallback 后下载应成功完成");
+
+        assert_eq!(
+            task.state(),
+            DownloadState::Completed,
+            "HTTP 熔断 + BT 接管后任务应 Completed"
+        );
+        assert!(
+            (task.progress() - 1.0).abs() < f64::EPSILON,
+            "进度应为 1.0"
+        );
+
+        // 验证 storage 数据 == BT 预置文件内容(证明数据由 BT fallback 写入,非 HTTP)
+        let mut buf = vec![0u8; file_size];
+        task.storage
+            .as_ref()
+            .expect("storage 应已初始化")
+            .read_at(0, &mut buf)
+            .await
+            .expect("读 storage 失败");
+        assert_eq!(
+            buf, bt_content,
+            "storage 数据应与 BT 预置文件完全一致(BT 接管写入)"
+        );
+    }
+
     // ------ 2. probe 获取元数据 -----
 
     #[tokio::test]

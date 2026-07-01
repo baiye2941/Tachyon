@@ -142,7 +142,7 @@ impl MagnetProtocol {
     /// `layout` 由调用方从 `handle.with_metadata` 构造(测试 helper 用 `FileLayout::single`)。
     ///
     /// 仅测试可用:生产代码只走 `new`,本接缝不暴露给外部 crate。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn from_handle(
         session: Arc<Session>,
         config: MagnetConfig,
@@ -449,6 +449,41 @@ impl Protocol for MagnetProtocol {
         let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
+            // 缓存命中短路:若 handle_cache 已有该 url 的 handle + layout(此前 probe /
+            // from_handle / download_range_stream 已填充),直接从缓存 handle 派生
+            // FileMetadata,跳过 add_magnet_to_session 的重新添加。
+            //
+            // 动机:probe 可能被多次调用(run 内 + UI 刷新),重复 add_torrent(from_url)
+            // 既浪费开销,又会在「离线预置 torrent + 无 DHT/无 peer」场景下硬失败
+            // (librqbit 需 DHT/peer 发现元数据,无源时报 "no way to discover torrent
+            // metainfo")。缓存命中意味着元数据已就绪,无需再走发现路径。
+            //
+            // 安全性:缓存 handle 的 with_metadata 是权威元数据来源,与重新 add 后拿到的
+            // 是同一 handle(librqbit 对已存在 torrent 返回 AlreadyManaged),结果等价;
+            // layout 同样取自缓存(由先前 probe 从 file_infos 构造),一致。生产首次 probe
+            // 缓存为空,走原路径不受影响。
+            if let Some(entry) = handle_cache.get(&url) {
+                let (handle, layout) = (Arc::clone(&entry.0), entry.1.clone());
+                let (file_name, file_size) = handle
+                    .with_metadata(|m| {
+                        let name = m
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "unknown_torrent".to_string());
+                        (name, m.lengths.total_length())
+                    })
+                    .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
+                return Ok(FileMetadata {
+                    file_name,
+                    file_size: Some(file_size),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                    file_layout: Some(layout),
+                });
+            }
+
             // force_tracker_interval: 0 禁用(None),否则按配置秒数强制 tracker 回连间隔
             let force_tracker_interval = if config.force_tracker_interval_secs == 0 {
                 None
