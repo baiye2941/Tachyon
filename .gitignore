@@ -19,7 +19,7 @@ AGENTS.md
 
 
 # 文档（不跟踪）
-docs/
+Document/
 RTK.md
 
 # 编译泄漏文件（Windows NUL 设备 bug）
