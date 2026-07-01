@@ -305,12 +305,6 @@ impl StorageSet {
                                 "多文件存储短写未前进(file_id={file_id}, offset={local_pos})"
                             )));
                         }
-                        // 诊断:后端 write_at 不应返回 > 传入 data.len() 的值
-                        debug_assert!(
-                            written <= remaining.len(),
-                            "Multi 段内 write_at 返回 {written} > remaining.len() {} (file_id={file_id}, local_pos={local_pos})",
-                            remaining.len()
-                        );
                         local_pos += written as u64;
                         remaining = remaining.slice(written..);
                         total_written += written;

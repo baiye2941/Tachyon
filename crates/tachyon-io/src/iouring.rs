@@ -1110,7 +1110,13 @@ impl AsyncStorage for IoUringStorage {
                         padded[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
-                        self.submit_write(aligned_offset, &padded).await
+                        let written = self.submit_write(aligned_offset, &padded).await?;
+                        // submit_write 返回 padded 的写入量(含前/后填充零),
+                        // 调用方期望的是用户数据字节数。O_DIRECT 对齐写入通常一次完成
+                        // (padded 全部写入),此时用户数据完整覆盖,返回 _data.len()。
+                        // 若短写未覆盖全部用户数据,按实际覆盖量返回(扣除 front_pad 偏移)。
+                        let user_written = written.saturating_sub(front_pad).min(_data.len());
+                        Ok(user_written)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {

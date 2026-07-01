@@ -1459,12 +1459,6 @@ impl DownloadTask {
                     remaining.len()
                 )));
             }
-            // 诊断:后端 write_at 不应返回 > 传入 data.len() 的值
-            debug_assert!(
-                written <= remaining.len(),
-                "write_at 返回 {written} > remaining.len() {} (pos={pos})",
-                remaining.len()
-            );
             let written_u64 = u64::try_from(written)
                 .map_err(|_| DownloadError::Fragment("存储写入长度溢出".into()))?;
             pos = pos.checked_add(written_u64).ok_or_else(|| {
