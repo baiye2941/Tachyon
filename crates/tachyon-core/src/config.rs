@@ -922,7 +922,7 @@ pub struct ConnectionPatch {
 }
 
 /// 磁力链接配置白名单补丁
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MagnetPatch {
     pub metadata_timeout_secs: Option<u64>,
@@ -935,6 +935,12 @@ pub struct MagnetPatch {
     pub peer_wait_timeout_secs: Option<u64>,
     /// None=不修改,Some(None)=清空(禁用代理),Some(Some(url))=设值
     pub socks_proxy_url: Option<Option<String>>,
+    pub peer_connect_timeout_secs: Option<u64>,
+    pub peer_read_write_timeout_secs: Option<u64>,
+    pub force_tracker_interval_secs: Option<u64>,
+    pub defer_writes_up_to_mb: Option<u64>,
+    pub disable_dht_when_socks: Option<bool>,
+    pub peer_addrs: Option<Vec<String>>,
 }
 
 /// 调度器配置白名单补丁
@@ -986,6 +992,24 @@ impl MagnetPatch {
         }
         if let Some(ref v) = self.socks_proxy_url {
             base.socks_proxy_url = v.clone();
+        }
+        if let Some(v) = self.peer_connect_timeout_secs {
+            base.peer_connect_timeout_secs = v;
+        }
+        if let Some(v) = self.peer_read_write_timeout_secs {
+            base.peer_read_write_timeout_secs = v;
+        }
+        if let Some(v) = self.force_tracker_interval_secs {
+            base.force_tracker_interval_secs = v;
+        }
+        if let Some(v) = self.defer_writes_up_to_mb {
+            base.defer_writes_up_to_mb = v;
+        }
+        if let Some(v) = self.disable_dht_when_socks {
+            base.disable_dht_when_socks = v;
+        }
+        if let Some(v) = &self.peer_addrs {
+            base.peer_addrs = v.clone();
         }
     }
 }
@@ -1904,14 +1928,9 @@ mod tests {
 
         let patch = MagnetPatch {
             metadata_timeout_secs: Some(60),
-            download_timeout_secs: None,
             enable_dht: Some(false),
-            enable_upnp: None,
             trackers: Some(vec!["udp://new.example.com:1337/announce".to_string()]),
-            stall_timeout_secs: None,
-            disable_dht_persistence: None,
-            peer_wait_timeout_secs: None,
-            socks_proxy_url: None,
+            ..Default::default()
         };
         patch.apply_to(&mut base);
 
@@ -1930,17 +1949,7 @@ mod tests {
         base.enable_dht = false;
         base.trackers = vec!["udp://kept.example.com:1337/announce".to_string()];
 
-        let patch = MagnetPatch {
-            metadata_timeout_secs: None,
-            download_timeout_secs: None,
-            enable_dht: None,
-            enable_upnp: None,
-            trackers: None,
-            stall_timeout_secs: None,
-            disable_dht_persistence: None,
-            peer_wait_timeout_secs: None,
-            socks_proxy_url: None,
-        };
+        let patch = MagnetPatch::default();
         patch.apply_to(&mut base);
 
         assert_eq!(base.metadata_timeout_secs, 200);
@@ -1958,15 +1967,9 @@ mod tests {
             download: None,
             connection: None,
             magnet: Some(MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
                 enable_dht: Some(false),
-                enable_upnp: None,
                 trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
+                ..Default::default()
             }),
             scheduler: None,
             hub: None,
@@ -1988,10 +1991,7 @@ mod tests {
             enable_dht: Some(false),
             enable_upnp: Some(true),
             trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
-            stall_timeout_secs: None,
-            disable_dht_persistence: None,
-            peer_wait_timeout_secs: None,
-            socks_proxy_url: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&patch).unwrap();
         let deserialized: MagnetPatch = serde_json::from_str(&json).unwrap();
@@ -2014,17 +2014,7 @@ mod tests {
         assert_eq!(base.stall_timeout_secs, 60);
         let patch = MagnetPatch {
             stall_timeout_secs: Some(120),
-            ..MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
-                enable_dht: None,
-                enable_upnp: None,
-                trackers: None,
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
-            }
+            ..Default::default()
         };
         patch.apply_to(&mut base);
         assert_eq!(base.stall_timeout_secs, 120);
@@ -2034,17 +2024,7 @@ mod tests {
     fn test_magnet_patch_stall_timeout_none_preserves() {
         let mut base = MagnetConfig::default();
         base.stall_timeout_secs = 90;
-        let patch = MagnetPatch {
-            metadata_timeout_secs: None,
-            download_timeout_secs: None,
-            enable_dht: None,
-            enable_upnp: None,
-            trackers: None,
-            stall_timeout_secs: None,
-            disable_dht_persistence: None,
-            peer_wait_timeout_secs: None,
-            socks_proxy_url: None,
-        };
+        let patch = MagnetPatch::default();
         patch.apply_to(&mut base);
         assert_eq!(base.stall_timeout_secs, 90, "None 应保留原值");
     }
@@ -2055,17 +2035,7 @@ mod tests {
         assert!(!base.disable_dht_persistence, "默认应为 false");
         let patch = MagnetPatch {
             disable_dht_persistence: Some(true),
-            ..MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
-                enable_dht: None,
-                enable_upnp: None,
-                trackers: None,
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
-            }
+            ..Default::default()
         };
         patch.apply_to(&mut base);
         assert!(base.disable_dht_persistence, "应被 patch 设为 true");
@@ -2077,17 +2047,7 @@ mod tests {
         assert_eq!(base.peer_wait_timeout_secs, 300, "默认 5 分钟");
         let patch = MagnetPatch {
             peer_wait_timeout_secs: Some(120),
-            ..MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
-                enable_dht: None,
-                enable_upnp: None,
-                trackers: None,
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
-            }
+            ..Default::default()
         };
         patch.apply_to(&mut base);
         assert_eq!(base.peer_wait_timeout_secs, 120);
@@ -2172,17 +2132,7 @@ mod tests {
         // Some(Some(url)) = 设值
         let patch = MagnetPatch {
             socks_proxy_url: Some(Some("socks5://127.0.0.1:7897".into())),
-            ..MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
-                enable_dht: None,
-                enable_upnp: None,
-                trackers: None,
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
-            }
+            ..Default::default()
         };
         patch.apply_to(&mut base);
         assert_eq!(
@@ -2192,20 +2142,67 @@ mod tests {
         // Some(None) = 清空
         let clear_patch = MagnetPatch {
             socks_proxy_url: Some(None),
-            ..MagnetPatch {
-                metadata_timeout_secs: None,
-                download_timeout_secs: None,
-                enable_dht: None,
-                enable_upnp: None,
-                trackers: None,
-                stall_timeout_secs: None,
-                disable_dht_persistence: None,
-                peer_wait_timeout_secs: None,
-                socks_proxy_url: None,
-            }
+            ..Default::default()
         };
         clear_patch.apply_to(&mut base);
         assert!(base.socks_proxy_url.is_none(), "Some(None) 应清空");
+    }
+
+    #[test]
+    fn test_magnet_patch_peer_connect_timeout_applies() {
+        let mut config = MagnetConfig::default();
+        let original = config.peer_connect_timeout_secs;
+        let patch = MagnetPatch {
+            peer_connect_timeout_secs: Some(15),
+            ..Default::default()
+        };
+        patch.apply_to(&mut config);
+        assert_eq!(config.peer_connect_timeout_secs, 15);
+        assert_ne!(config.peer_connect_timeout_secs, original);
+    }
+
+    #[test]
+    fn test_magnet_patch_force_tracker_interval_applies() {
+        let mut config = MagnetConfig::default();
+        let patch = MagnetPatch {
+            force_tracker_interval_secs: Some(300),
+            ..Default::default()
+        };
+        patch.apply_to(&mut config);
+        assert_eq!(config.force_tracker_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_magnet_patch_defer_writes_up_to_applies() {
+        let mut config = MagnetConfig::default();
+        let patch = MagnetPatch {
+            defer_writes_up_to_mb: Some(32),
+            ..Default::default()
+        };
+        patch.apply_to(&mut config);
+        assert_eq!(config.defer_writes_up_to_mb, 32);
+    }
+
+    #[test]
+    fn test_magnet_patch_disable_dht_when_socks_applies() {
+        let mut config = MagnetConfig::default();
+        let patch = MagnetPatch {
+            disable_dht_when_socks: Some(false),
+            ..Default::default()
+        };
+        patch.apply_to(&mut config);
+        assert!(!config.disable_dht_when_socks);
+    }
+
+    #[test]
+    fn test_magnet_patch_peer_addrs_applies() {
+        let mut config = MagnetConfig::default();
+        let patch = MagnetPatch {
+            peer_addrs: Some(vec!["1.2.3.4:6881".into()]),
+            ..Default::default()
+        };
+        patch.apply_to(&mut config);
+        assert_eq!(config.peer_addrs, vec!["1.2.3.4:6881"]);
     }
 
     #[test]
