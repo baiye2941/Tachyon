@@ -229,7 +229,6 @@ cd frontend && bun run build
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
 | QUIC 0-RTT 受 feature gate | 仅在 `quic` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
-| P2SP 源选择未接入引擎 | `tachyon-p2sp` 当前仅实现 Peer 评分与源选择算法，尚未接入下载管线；多源编排实际由 `MirrorProtocol` 承担（待统一） |
 | 无 SOCKS/HTTP 代理支持 | 当前 `HttpClient` 直接使用 reqwest，未暴露代理配置接口 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
 | FTP 单连接限制 | `FtpClient` 基于 suppaftp，受 FTP 协议本身限制不支持多路复用 |

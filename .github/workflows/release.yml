@@ -52,7 +52,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: 运行覆盖率检查(核心 crate >= 90%)
-        # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)、tachyon-p2sp(原型)
+        # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)
         run: |
           cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
             -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \

@@ -5436,16 +5436,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tachyon-p2sp"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
 name = "tachyon-protocol"
 version = "0.1.0"
 dependencies = [

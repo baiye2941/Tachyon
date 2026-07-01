@@ -4,11 +4,9 @@
 //! - 下载任务、分片、协议、存储、校验的 trait 抽象
 //! - 统一错误类型
 //! - 配置类型
-//! - 事件类型
 
 pub mod config;
 pub mod error;
-pub mod event;
 pub mod safety;
 #[cfg(any(test, feature = "test-harness"))]
 pub mod test_harness;

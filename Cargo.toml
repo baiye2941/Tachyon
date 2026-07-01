@@ -8,7 +8,6 @@ members = [
     "crates/tachyon-protocol",
     "crates/tachyon-sniffer",
     "crates/tachyon-crypto",
-    "crates/tachyon-p2sp",
     "crates/tachyon-store",
     "crates/tachyon-hub",
     "crates/tachyon-app",

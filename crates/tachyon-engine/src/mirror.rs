@@ -25,7 +25,7 @@ use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 /// 源 URL + Protocol 对
 type Source = (String, Arc<dyn Protocol>);
 
-/// 源质量统计(轻量,engine 内自管;P4 时可替换为完整 PeerScore)
+/// 源质量统计(轻量,engine 内自管)
 ///
 /// 记录每源的成功/失败次数、累计字节/耗时,派生 quality(0~1,越高越好)。
 /// 选源时用 `in_flight / (quality + ε)` 加权:质量高的源允许更多在途。

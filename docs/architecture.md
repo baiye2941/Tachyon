@@ -54,7 +54,6 @@ graph TB
         IO["tachyon-io<br/>io_uring · IOCP · BufferPool · WritePipeline"]
         CRYPT["tachyon-crypto<br/>BLAKE3 · SHA-256 · GPU 预留"]
         STORE["tachyon-store<br/>KV 存储 · 快照恢复"]
-        P2SP["tachyon-p2sp<br/>Peer 评分 · 多源选择"]
         HUB["tachyon-hub<br/>HuggingFace Hub API"]
         SNIFF["tachyon-sniffer<br/>资源嗅探与捕获"]
     end
@@ -79,7 +78,6 @@ graph TB
     IO --> CORELIB
     CRYPT --> CORELIB
     STORE --> CORELIB
-    P2SP --> CORELIB
     HUB --> CORELIB
     SNIFF --> CORELIB
     SCH --> CORELIB
@@ -96,7 +94,7 @@ graph TB
 
 | Crate | 职责 | 关键文件 |
 |------|------|----------|
-| `tachyon-core` | 所有 crate 共享的公共接口：类型、trait 抽象、错误体系、配置与安全校验 | `src/{config,error,event,traits,types,safety,utils}.rs` |
+| `tachyon-core` | 所有 crate 共享的公共接口：类型、trait 抽象、错误体系、配置与安全校验 | `src/{config,error,traits,types,safety,utils}.rs` |
 | `tachyon-engine` | 分片引擎、连接池、多源竞速、限速器、下载任务编排 | `src/{downloader,connection,fragment,mirror,circuit_breaker,rate_limit,storage_adapter}.rs` |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 | `src/{scheduler,predictor,download_scheduler}.rs` |
 | `tachyon-io` | 跨平台异步文件 I/O，多后端自动选择 | `src/{iouring,iocp,winio,tokio_file,buffer,pipeline,storage}.rs` |
@@ -104,7 +102,6 @@ graph TB
 | `tachyon-crypto` | CPU 哈希校验 + GPU 加速预留 | `src/{cpu,gpu}.rs` |
 | `tachyon-sniffer` | 浏览器资源类型识别与过滤捕获 | `src/{capture,filter,resources}.rs` |
 | `tachyon-store` | 断点续传快照持久化，基于文件系统 KV | `src/{kv,recovery,store}.rs` |
-| `tachyon-p2sp` | P2SP 源选择、Peer 评分（DHT 尚未深度集成） | `src/{peer,source}.rs` |
 | `tachyon-hub` | HuggingFace Hub API 客户端 | `src/{api,classify,lfs,token}.rs` |
 | `tachyon-app` | Tauri 桌面应用，注册 IPC 命令，管理生命周期 | `src/{lib,main,commands/,service/,runtime/,projection/,repository/,task_store}.rs` |
 
@@ -118,7 +115,6 @@ graph LR
     CRYPT["tachyon-crypto"]
     SCHED["tachyon-scheduler"]
     ENG["tachyon-engine"]
-    P2SP["tachyon-p2sp"]
     SNIFF["tachyon-sniffer"]
     STORE["tachyon-store"]
     HUB["tachyon-hub"]
@@ -128,7 +124,6 @@ graph LR
     IO --> CORE
     CRYPT --> CORE
     SCHED --> CORE
-    P2SP --> CORE
     SNIFF --> CORE
     STORE --> CORE
     HUB --> CORE
@@ -311,15 +306,7 @@ Tauri 层暴露的 HF 命令包括：浏览仓库文件、获取下载 URL、获
 | `RecoveryManager` | 任务快照恢复，过滤已完成/已取消任务 |
 | `TaskSnapshot` / `TaskRecord` | 快照数据结构 |
 
-### 4.10 tachyon-p2sp — P2SP 混合下载
-
-当前实现状态：
-
-- `PeerInfo` / `PeerScore`：Peer 信息与加权评分。
-- `DownloadSource` / `SourceSelector`：CDN + Peer 多源选择器。
-- Kademlia DHT 与 UDP 传输在文档中预留，但尚未在 `tachyon-p2sp` 中实现。
-
-### 4.11 tachyon-app — Tauri 应用入口
+### 4.10 tachyon-app — Tauri 应用入口
 
 **注册的 Tauri IPC 命令**（当前约 20 个）：
 
@@ -724,7 +711,6 @@ Tachyon/
 │   ├── tachyon-crypto/
 │   ├── tachyon-sniffer/
 │   ├── tachyon-store/
-│   ├── tachyon-p2sp/
 │   ├── tachyon-hub/
 │   └── tachyon-app/
 ├── frontend/                   # SolidJS + TailwindCSS v4 前端
