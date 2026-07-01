@@ -1459,6 +1459,12 @@ impl DownloadTask {
                     remaining.len()
                 )));
             }
+            // 诊断:后端 write_at 不应返回 > 传入 data.len() 的值
+            debug_assert!(
+                written <= remaining.len(),
+                "write_at 返回 {written} > remaining.len() {} (pos={pos})",
+                remaining.len()
+            );
             let written_u64 = u64::try_from(written)
                 .map_err(|_| DownloadError::Fragment("存储写入长度溢出".into()))?;
             pos = pos.checked_add(written_u64).ok_or_else(|| {
@@ -2718,6 +2724,166 @@ mod tests {
         let data = short_storage.data();
         assert_eq!(&data[..frag_size as usize], &first[..]);
         assert_eq!(&data[frag_size as usize..], &second[..]);
+    }
+
+    /// 直接测 StorageSet::Multi::write_at 数据正确性(短写场景,复现 CI 错位 bug)
+    ///
+    /// 用 ShortWriteStorage(max_write_len=17)强制段内短写,验证 Multi::write_at
+    /// 的 local_pos/total_written/remaining 推进在短写下不丢数据。
+    #[tokio::test]
+    async fn test_multi_write_at_short_write_correctness() {
+        let file0_len = 512u64;
+        let file1_len = 1024u64;
+        let total = file0_len + file1_len;
+
+        let s0_raw = ShortWriteStorage::with_capacity(file0_len as usize, 17);
+        let s1_raw = ShortWriteStorage::with_capacity(file1_len as usize, 17);
+        let s0 = StorageKind::new(s0_raw.clone());
+        let s1 = StorageKind::new(s1_raw.clone());
+
+        let layout = tachyon_core::types::FileLayout::from_spans(vec![
+            tachyon_core::types::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: file0_len,
+                name: "a.bin".into(),
+            },
+            tachyon_core::types::FileSpan {
+                file_id: 1,
+                global_offset: file0_len,
+                len: file1_len,
+                name: "b.bin".into(),
+            },
+        ]);
+        let ss = StorageSet::Multi {
+            storages: vec![s0, s1],
+            layout,
+        };
+
+        let data0: Vec<u8> = (0..file0_len).map(|i| (i % 251) as u8).collect();
+        let data1: Vec<u8> = (0..file1_len).map(|i| ((i + 7) % 251) as u8).collect();
+        let global: Vec<u8> = data0.iter().chain(data1.iter()).copied().collect();
+
+        // 整块写入(跨 512 边界),触发 Multi::write_at 段内短写循环
+        let chunk = bytes::Bytes::copy_from_slice(&global);
+        let written = ss.write_at(0, chunk).await.unwrap();
+        assert_eq!(written as u64, total, "Multi::write_at 应写入全部字节");
+
+        assert_eq!(s0_raw.data(), data0, "a.bin(file0) 内容应与 data0 一致");
+        assert_eq!(s1_raw.data(), data1, "b.bin(file1) 内容应与 data1 一致");
+    }
+
+    /// 测 write_all_at_mut + Multi + 短写的端到端数据正确性
+    ///
+    /// 复现 CI test_run_multi_file_writes_to_directory 的数据错位:
+    /// write_all_at_mut 调 Multi::write_at,段内短写导致 total_written < batch.len(),
+    /// 循环用 remaining.slice(total_written..) + pos 推进重写——验证不丢/不错位数据。
+    #[tokio::test]
+    async fn test_write_all_at_mut_multi_short_write_correctness() {
+        let file0_len = 512u64;
+        let file1_len = 1024u64;
+        let total = file0_len + file1_len;
+
+        let s0_raw = ShortWriteStorage::with_capacity(file0_len as usize, 17);
+        let s1_raw = ShortWriteStorage::with_capacity(file1_len as usize, 17);
+        let s0 = StorageKind::new(s0_raw.clone());
+        let s1 = StorageKind::new(s1_raw.clone());
+        let layout = tachyon_core::types::FileLayout::from_spans(vec![
+            tachyon_core::types::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: file0_len,
+                name: "a.bin".into(),
+            },
+            tachyon_core::types::FileSpan {
+                file_id: 1,
+                global_offset: file0_len,
+                len: file1_len,
+                name: "b.bin".into(),
+            },
+        ]);
+        let ss = StorageSet::Multi {
+            storages: vec![s0, s1],
+            layout,
+        };
+
+        let data0: Vec<u8> = (0..file0_len).map(|i| (i % 251) as u8).collect();
+        let data1: Vec<u8> = (0..file1_len).map(|i| ((i + 7) % 251) as u8).collect();
+        let global: Vec<u8> = data0.iter().chain(data1.iter()).copied().collect();
+
+        // 整块经 write_all_at_mut 写入(跨 512 边界 + 段内短写)
+        let batch = bytes::BytesMut::from(&global[..]);
+        let written = DownloadTask::write_all_at_mut(&ss, 0, batch, &mut None, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(written, total, "write_all_at_mut 应写入全部字节");
+
+        assert_eq!(s0_raw.data(), data0, "file0 数据错位");
+        assert_eq!(s1_raw.data(), data1, "file1 数据错位");
+    }
+
+    /// 测 write_all_at_mut + Multi + 并发(复现 CI test_run_multi_file_writes_to_directory)
+    ///
+    /// 多个 task 同时写不同 offset 的分片到同一 StorageSet::Multi,
+    /// 验证并发下数据不交错/不丢。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_all_at_mut_multi_concurrent_correctness() {
+        let file0_len = 512u64;
+        let file1_len = 1024u64;
+        let total = file0_len + file1_len;
+
+        let s0_raw = ShortWriteStorage::with_capacity(file0_len as usize, 4096);
+        let s1_raw = ShortWriteStorage::with_capacity(file1_len as usize, 4096);
+        let s0 = StorageKind::new(s0_raw.clone());
+        let s1 = StorageKind::new(s1_raw.clone());
+        let layout = tachyon_core::types::FileLayout::from_spans(vec![
+            tachyon_core::types::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: file0_len,
+                name: "a.bin".into(),
+            },
+            tachyon_core::types::FileSpan {
+                file_id: 1,
+                global_offset: file0_len,
+                len: file1_len,
+                name: "b.bin".into(),
+            },
+        ]);
+        let ss = Arc::new(StorageSet::Multi {
+            storages: vec![s0, s1],
+            layout,
+        });
+
+        let data0: Vec<u8> = (0..file0_len).map(|i| (i % 251) as u8).collect();
+        let data1: Vec<u8> = (0..file1_len).map(|i| ((i + 7) % 251) as u8).collect();
+        let global: Vec<u8> = data0.iter().chain(data1.iter()).copied().collect();
+
+        // 分片并发写,frag_size=300 跨 512 边界
+        let frag_size = 300u64;
+        let mut handles = tokio::task::JoinSet::new();
+        let mut offset = 0u64;
+        while offset < total {
+            let end = (offset + frag_size - 1).min(total - 1);
+            let chunk = bytes::BytesMut::from(&global[offset as usize..=end as usize]).freeze();
+            let ss = Arc::clone(&ss);
+            let start = offset;
+            handles.spawn(async move {
+                let batch = bytes::BytesMut::from(&chunk[..]);
+                let w =
+                    DownloadTask::write_all_at_mut(&ss, start, batch, &mut None, Duration::ZERO)
+                        .await
+                        .unwrap();
+                assert_eq!(w, end - start + 1, "分片 {start}..{end} 写入量不符");
+            });
+            offset = end + 1;
+        }
+        while let Some(r) = handles.join_next().await {
+            r.unwrap();
+        }
+
+        assert_eq!(s0_raw.data(), data0, "file0 并发写后数据错位");
+        assert_eq!(s1_raw.data(), data1, "file1 并发写后数据错位");
     }
 
     /// 验证 write_all_at_mut 短写循环正确性 + 计时(AGENTS.md:44/97)

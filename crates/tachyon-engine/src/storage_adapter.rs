@@ -305,9 +305,12 @@ impl StorageSet {
                                 "多文件存储短写未前进(file_id={file_id}, offset={local_pos})"
                             )));
                         }
-                        // clamp written:后端理论上不应返回 > 传入长度,但防御性
-                        // 避免 total_written 越界 + slice panic(与 write_all_at_mut 一致)
-                        let written = written.min(remaining.len());
+                        // 诊断:后端 write_at 不应返回 > 传入 data.len() 的值
+                        debug_assert!(
+                            written <= remaining.len(),
+                            "Multi 段内 write_at 返回 {written} > remaining.len() {} (file_id={file_id}, local_pos={local_pos})",
+                            remaining.len()
+                        );
                         local_pos += written as u64;
                         remaining = remaining.slice(written..);
                         total_written += written;
