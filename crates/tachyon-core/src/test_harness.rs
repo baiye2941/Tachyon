@@ -28,6 +28,10 @@ pub mod harness {
         pub range_data: Arc<Mutex<HashMap<(u64, u64), Bytes>>>,
         /// 全量下载数据(download_full 的返回值)
         default_data: Option<Bytes>,
+        /// 模拟"死 swarm"的区间:命中这些 (start,end) 的 download_range_stream
+        /// 返回永不产出项的 pending 流(等价于 librqbit FileStream.read() 在无 peer
+        /// 时永久 Pending),用于验证引擎流读取循环的取消信号穿透能力。
+        stalling_ranges: Arc<Mutex<HashMap<(u64, u64), ()>>>,
     }
 
     /// L-16: 保留 MockProtocol 中原始 DownloadError 的可 Clone 部分。
@@ -143,11 +147,23 @@ pub mod harness {
                 preserved_error: None,
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
+                stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
         pub fn with_range_data(self, start: u64, end: u64, data: Bytes) -> Self {
             self.range_data.lock().unwrap().insert((start, end), data);
+            self
+        }
+
+        /// 标记某区间为"死 swarm"区间:对该区间的 download_range_stream 返回
+        /// 永不产出项的 pending 流,模拟磁力链接无 peer 时 FileStream.read() 永久挂起。
+        /// 用于验证引擎流读取循环在死 swarm 下能否被取消信号穿透。
+        pub fn with_stalling_range(self, start: u64, end: u64) -> Self {
+            self.stalling_ranges
+                .lock()
+                .unwrap()
+                .insert((start, end), ());
             self
         }
 
@@ -170,6 +186,7 @@ pub mod harness {
                 preserved_error: Some(PreservedError::from_download_error(&error)),
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
+                stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
             }
         }
     }
@@ -219,6 +236,19 @@ pub mod harness {
             let this = self.clone();
             let url = url.to_owned();
             Box::pin(async move {
+                // 命中"死 swarm"区间:返回永不产出项的 pending 流,
+                // 模拟磁力链接无 peer 时 FileStream.read() 永久 Pending。
+                if this
+                    .stalling_ranges
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(start, end))
+                {
+                    return Ok(
+                        Box::pin(futures::stream::pending::<DownloadResult<Bytes>>())
+                            as crate::traits::ByteStream,
+                    );
+                }
                 let data = this.download_range(&url, start, end).await?;
                 Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
                     as crate::traits::ByteStream)

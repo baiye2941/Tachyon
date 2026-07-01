@@ -59,6 +59,9 @@ const mockConfig = {
     enableDht: true,
     enableUpnp: true,
     trackers: [],
+    disableDhtPersistence: false,
+    peerWaitTimeoutSecs: 300,
+    socksProxyUrl: null,
   },
   hub: {
     sourceMode: 'mirror' as const,
@@ -148,10 +151,82 @@ describe('SettingsPanel', () => {
     expect(calledWith.connection).toBeDefined()
     expect(calledWith.connection!.maxConnectionsPerHost).toBe(mockConfig.connection.maxConnectionsPerHost)
     expect(calledWith.connection!.enableQuic).toBe(mockConfig.connection.enableQuic)
+    // patch 应包含 magnet 字段(含 disableDhtPersistence)
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.disableDhtPersistence).toBe(mockConfig.magnet.disableDhtPersistence)
+    expect(calledWith.magnet!.socksProxyUrl).toBe(null)
     // patch 不应包含安全字段(userAgent/headers/authorizedDirs 不在 DownloadPatch 中)
     expect((calledWith.download as Record<string, unknown>).userAgent).toBeUndefined()
     expect((calledWith.download as Record<string, unknown>).headers).toBeUndefined()
     expect((calledWith.download as Record<string, unknown>).authorizedDirs).toBeUndefined()
+  })
+
+  it('切换禁用 DHT 持久化开关后保存,patch 携带新值(回归:设置页 DHT 配置开关)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    // 切到 magnet tab
+    fireEvent.click(screen.getByText('磁力链接'))
+    await waitFor(() => {
+      expect(screen.getByText('启用 DHT 协议')).toBeDefined()
+    })
+
+    // 找到"禁用 DHT 持久化"开关的 toggle 按钮并点击翻转
+    const toggleLabel = screen.getByText('禁用 DHT 持久化(仅内存)')
+    const toggleBtn = toggleLabel.parentElement!.querySelector('button')!
+    fireEvent.click(toggleBtn)
+
+    // 保存
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.disableDhtPersistence).toBe(true)
+  })
+
+  it('填写 SOCKS5 代理后保存,patch 携带代理 URL(回归:BT 代理支持)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('socks5://127.0.0.1:7897')).toBeDefined()
+    })
+
+    const input = screen.getByPlaceholderText('socks5://127.0.0.1:7897') as HTMLInputElement
+    fireEvent.input(input, { target: { value: 'socks5://127.0.0.1:7897' } })
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet).toBeDefined()
+    expect(calledWith.magnet!.socksProxyUrl).toBe('socks5://127.0.0.1:7897')
   })
 
   it('确认保存成功时显示 toast 配置已保存', async () => {

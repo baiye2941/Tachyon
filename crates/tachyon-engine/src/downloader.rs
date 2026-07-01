@@ -1016,28 +1016,11 @@ impl DownloadTask {
             worker_rxs.push(rx);
         }
 
-        // 将所有待下载分片入队
         // 入队前检查暂停/取消信号,避免在暂停状态下无意义地启动 worker
         if let Some(ref rx) = control_rx {
             let mut check_rx = rx.clone();
             Self::wait_control_rx(&mut check_rx, pause_timeout).await?;
         }
-        for spec in &fragment_specs {
-            let frag_index = spec.0;
-            if frag_index as usize >= self.fragments.len() {
-                return Err(DownloadError::Config("分片索引越界".into()));
-            }
-            self.fragments[frag_index as usize].start_download()?;
-            if let Some(ref m) = metrics {
-                m.inc_fragment();
-            }
-            if frag_tx.send(*spec).await.is_err() {
-                // worker 全部退出,后续入队无意义
-                break;
-            }
-        }
-        // 释放发送端,worker 在消费完所有分片后自动退出
-        drop(frag_tx);
 
         // 启动 dispatcher,将中央队列分片派发给 worker
         // 使用 try-send + skip-to-next-idle 策略避免 HOL blocking:
@@ -1272,6 +1255,24 @@ impl DownloadTask {
         }
         // 所有 worker 已持有发送端,释放原始端使 completed_rx 能在结束时关闭
         drop(completed_tx);
+
+        // 将所有待下载分片入队(dispatcher 已 spawn,可消费 frag_rx,不会死锁)
+        for spec in &fragment_specs {
+            let frag_index = spec.0;
+            if frag_index as usize >= self.fragments.len() {
+                return Err(DownloadError::Config("分片索引越界".into()));
+            }
+            self.fragments[frag_index as usize].start_download()?;
+            if let Some(ref m) = metrics {
+                m.inc_fragment();
+            }
+            if frag_tx.send(*spec).await.is_err() {
+                // worker 全部退出,后续入队无意义
+                break;
+            }
+        }
+        // 释放发送端,dispatcher 在消费完所有分片后自动退出
+        drop(frag_tx);
 
         loop {
             tokio::select! {
@@ -1634,8 +1635,31 @@ impl DownloadTask {
         let mut hasher: Option<Box<dyn tachyon_core::traits::StreamingHasher>> =
             compute_hash.then(|| verifier.new_hasher());
         tokio::pin!(stream);
-        while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
-            // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销
+        loop {
+            // 获取下一个 chunk:死 swarm 下(如磁力链接无 peer) stream.next() 永久 Pending,
+            // 必须与 watch_for_interrupt 竞速,否则取消信号无法穿透(协作式取消检查点
+            // 在循环体内,无 chunk 到达时不可达)。与 write_all_at_mut 的 select! 同构。
+            // cancel-safe:StreamExt::next 仅持有 &mut stream,被 select! 取消时无部分状态。
+            let chunk_result = if let Some(rx) = control_rx.as_mut() {
+                tokio::select! {
+                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
+                        Some(r) => r,
+                        None => break, // EOF:正常退出循环
+                    },
+                    interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
+                        interrupt?;
+                        return Err(DownloadError::Other("控制信号异常结束".into()));
+                    }
+                }
+            } else {
+                match tokio_stream::StreamExt::next(&mut stream).await {
+                    Some(r) => r,
+                    None => break,
+                }
+            };
+            // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销。
+            // 注意:上方 select! 已覆盖"无 chunk 到达"的死 swarm 场景;此降频检查
+            // 主要处理 Paused 等非取消状态在 chunk 间隙的快速响应(与原语义一致)。
             if let Some(rx) = control_rx.as_mut() {
                 if control_check_countdown == 0 {
                     Self::wait_control_rx(rx, pause_timeout).await?;
@@ -1956,8 +1980,26 @@ impl DownloadTask {
             self.control_rx = rx;
         }
 
-        // 步骤 4: 执行下载 (内部已有 cancel/pause 中断处理)
-        self.execute().await?;
+        // 步骤 4: 执行下载 (与取消信号竞速:execute 内部的流读取循环已 select! 化,
+        // 此处再包一层 wait_for_cancel 作纵深防御,与步骤 1/3/5 同构)
+        {
+            let mut rx = self.control_rx.take();
+            match rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        r = self.execute() => { r?; }
+                        _ = Self::wait_for_cancel(rx) => {
+                            self.state = DownloadState::Cancelled;
+                            return Err(DownloadError::Cancelled);
+                        }
+                    }
+                }
+                None => {
+                    self.execute().await?;
+                }
+            }
+            self.control_rx = rx;
+        }
 
         // 步骤 5: 校验 (与取消信号竞速)
         {
@@ -4781,6 +4823,112 @@ mod tests {
         cancel_on_write.await.unwrap();
         assert!(matches!(result, Err(DownloadError::Cancelled)));
         assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    /// 验证:死 swarm(流读取永久 Pending)下,取消信号能穿透 stream.next().await
+    ///
+    /// 复现磁力链接死 swarm 卡死根因:MockProtocol 的 stalling range 返回永不产出项的
+    /// pending 流(等价 librqbit FileStream.read() 在无 peer 时永久 Pending)。
+    /// 修复前:`download_single_fragment` 的 `while let Some(...) = stream.next().await`
+    /// 裸 await,取消检查点在循环体内不可达 → 500ms 测试超时失败。
+    /// 修复后:流读取循环用 `tokio::select!` 与 `watch_for_interrupt` 竞速,取消即时返回。
+    #[tokio::test]
+    async fn test_cancel_signal_interrupts_stalled_stream_read() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 2;
+        // 两个分片均标记为"死 swarm"区间:download_range_stream 返回 pending 流
+        let mut mock = MockProto::new(test_metadata("stall-stream.bin", total_size));
+        for i in 0..2u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_stalling_range(start, end);
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/stall-stream.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
+        task.set_control_rx(control_rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // 给 worker 一点时间进入 stream.next().await(永久 Pending)后再发取消
+        let cancel_after_stall = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            control_tx.send(TaskCommand::Cancel).unwrap();
+        });
+        let result = tokio::time::timeout(Duration::from_millis(500), task.execute())
+            .await
+            .expect("取消信号应中断死 swarm 下永久挂起的流读取");
+        cancel_after_stall.await.unwrap();
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "应返回 Cancelled,实际: {result:?}"
+        );
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    /// 回归测试:分片数 > channel 容量(worker_count * 2)时不得死锁
+    ///
+    /// 复现历史 bug:dispatcher spawn 曾在入队循环之后,导致 `frag_tx.send().await`
+    /// 在 channel 满时永久挂起(dispatcher 尚未 spawn 消费)。当分片数 > worker_count*2
+    /// 时必现死锁。修复后 dispatcher/worker spawn 在入队之前,send 可被消费。
+    /// 本测试用 10 分片 + 2 worker(容量 4),若回归则 1s 超时失败。
+    #[tokio::test]
+    async fn test_fragments_exceeding_channel_capacity_do_not_deadlock() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 10; // 10 分片
+        let mut mock = MockProto::new(test_metadata("deadlock.bin", total_size));
+        for i in 0..10u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(start, end, Bytes::from(vec![0xABu8; 100]));
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total_size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/deadlock.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2, // channel 容量 = 2*2 = 4 < 10 分片
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // 若死锁回归,execute 永久挂起 → 1s 超时失败
+        let result = tokio::time::timeout(Duration::from_secs(1), task.execute())
+            .await
+            .expect("分片数 > channel 容量时不应死锁,execute 应在超时内完成");
+        result.expect("execute 应成功完成所有分片下载");
+        assert_eq!(task.state(), DownloadState::Completed);
     }
 
     #[tokio::test]

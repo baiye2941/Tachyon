@@ -61,6 +61,8 @@ interface ConfigDraft {
     enableDht: boolean;
     enableUpnp: boolean;
     trackers: string[];
+    disableDhtPersistence: boolean;
+    socksProxyUrl: string | null;
   };
   hub: {
     sourceMode: HfSourceMode;
@@ -153,6 +155,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       enableDht: true,
       enableUpnp: true,
       trackers: [],
+      disableDhtPersistence: false,
+      socksProxyUrl: null,
     },
     hub: {
       sourceMode: "mirror",
@@ -193,6 +197,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: cfg.magnet.enableDht,
         enableUpnp: cfg.magnet.enableUpnp,
         trackers: cfg.magnet.trackers,
+        disableDhtPersistence: cfg.magnet.disableDhtPersistence,
+        socksProxyUrl: cfg.magnet.socksProxyUrl,
       },
       hub: {
         sourceMode: cfg.hub?.sourceMode ?? "mirror",
@@ -247,6 +253,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: draft.magnet.enableDht,
         enableUpnp: draft.magnet.enableUpnp,
         trackers: draft.magnet.trackers,
+        disableDhtPersistence: draft.magnet.disableDhtPersistence,
+        socksProxyUrl: draft.magnet.socksProxyUrl || null,
       },
       scheduler: {
         minFragmentSize: draft.scheduler.minFragmentSize,
@@ -650,6 +658,46 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                     value={draft.magnet.enableUpnp}
                     onChange={(v) => setDraft("magnet", "enableUpnp", v)}
                   />
+                  <ToggleItem
+                    label={t("settings.magnet.disableDhtPersistence")}
+                    value={draft.magnet.disableDhtPersistence}
+                    onChange={(v) => setDraft("magnet", "disableDhtPersistence", v)}
+                  />
+                  <div>
+                    <span
+                      style={{
+                        "font-size": "13px",
+                        color: "var(--color-text-title)",
+                      }}
+                    >
+                      {t("settings.magnet.socksProxyUrl")}
+                    </span>
+                    <input
+                      type="text"
+                      class="input"
+                      style={{
+                        width: "100%",
+                        "font-size": "13px",
+                        "margin-top": "4px",
+                      }}
+                      placeholder={t("settings.magnet.socksProxyUrlPlaceholder")}
+                      value={draft.magnet.socksProxyUrl ?? ""}
+                      onInput={(e) => {
+                        const raw = e.currentTarget.value.trim();
+                        setDraft("magnet", "socksProxyUrl", raw === "" ? null : raw);
+                      }}
+                    />
+                    <span
+                      style={{
+                        "font-size": "11px",
+                        color: "var(--color-text-secondary)",
+                        "margin-top": "2px",
+                        display: "block",
+                      }}
+                    >
+                      {t("settings.magnet.socksProxyUrlHint")}
+                    </span>
+                  </div>
                   <TrackerList
                     trackers={draft.magnet.trackers}
                     onAdd={(url) => {

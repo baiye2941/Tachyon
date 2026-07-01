@@ -78,6 +78,9 @@ export interface MagnetConfig {
   enableDht: boolean
   enableUpnp: boolean
   trackers: string[]
+  disableDhtPersistence: boolean
+  peerWaitTimeoutSecs: number
+  socksProxyUrl: string | null
 }
 
 export interface AppConfig {
@@ -129,6 +132,9 @@ export interface MagnetPatch {
   enableDht?: boolean
   enableUpnp?: boolean
   trackers?: string[]
+  disableDhtPersistence?: boolean
+  peerWaitTimeoutSecs?: number
+  socksProxyUrl?: string | null
 }
 
 /** 调度器配置白名单补丁 */

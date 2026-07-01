@@ -130,6 +130,13 @@ pub const PAUSE_TIMEOUT_SECS_LIMIT: u64 = 86400;
 /// 但禁用后磁力死 swarm 会永久卡死且取消信号无法穿透。
 pub const STALL_TIMEOUT_SECS_LIMIT: u64 = 86400;
 
+/// 磁力链接无 peer 时智能等待上限(秒)
+///
+/// 死 swarm 下无 peer 时,协议层会持续轮询 peer 健康状态并等待 peer 上线,
+/// 超过此上限则产出 `Err(Timeout)` 让引擎重试/失败。1 小时上限避免永久挂起,
+/// 实际默认 5 分钟(default_peer_wait_timeout_secs)平衡恢复概率与用户体验。
+pub const PEER_WAIT_TIMEOUT_SECS_LIMIT: u64 = 3600;
+
 /// 单主机最大连接数上限
 ///
 /// 128 路连接在常规多线程 HTTP 客户端中已属较高水平,
@@ -322,15 +329,39 @@ pub struct MagnetConfig {
     /// 格式：`udp://host:port/announce` 或 `http://host:port/announce`
     #[serde(default)]
     pub trackers: Vec<String>,
-    /// 单次读取无数据 stall 超时(秒),默认 60
+    /// 单次读取无数据 stall 超时(秒),默认 60(二级逃生舱)
     ///
-    /// 磁力链接的 `FileStream` 读取在找不到 peer 时会永久挂起,
-    /// 导致引擎 32 worker 全部卡死且取消信号无法穿透(协作式取消依赖
-    /// chunk 循环到达检查点)。本字段为单次 `read` 间隔设置上限:
-    /// 两次数据到达间隔超过此值则流产出 `Err(Timeout)`,触发引擎重试/失败。
+    /// 磁力链接的 `FileStream` 读取在找不到 peer 时会永久挂起。引擎层
+    /// 流读取循环现已 cancel-aware(select! 与 watch_for_interrupt 竞速),
+    /// 取消信号可即时穿透;本字段作为二级保险,在取消信号未到达(如无
+    /// control_rx 的路径)时为单次 `read` 间隔设置上限:两次数据到达间隔
+    /// 超过此值则流产出 `Err(Timeout)`,触发引擎重试/失败。
     /// 0 表示禁用(`Duration::MAX` 零开销跳过,向后兼容)。
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
+    /// 是否禁用 DHT 持久化(默认 false)
+    ///
+    /// librqbit 默认将 DHT 路由表持久化到磁盘,重启时复用以加速 bootstrap。
+    /// 某些环境(如测试、沙箱)下持久化文件可能因文件锁或权限失败导致
+    /// Session 创建报错,此时可设为 true 禁用持久化(纯内存 DHT)。
+    #[serde(default)]
+    pub disable_dht_persistence: bool,
+    /// 无 peer 时智能等待上限(秒),默认 300(5 分钟)
+    ///
+    /// 死 swarm 下(磁力链接无活跃 peer)协议层会持续轮询 peer 健康状态
+    /// 并等待 peer 上线,超过此上限则产出 `Err(Timeout)` 让引擎重试/失败。
+    /// 0 表示禁用(回退到纯 stall_timeout 行为,向后兼容)。
+    #[serde(default = "default_peer_wait_timeout_secs")]
+    pub peer_wait_timeout_secs: u64,
+    /// SOCKS5 代理 URL,用于让 BT tracker 和 peer 连接走代理
+    ///
+    /// 格式:`socks5://[username:password@]host:port`。None 表示禁用
+    /// (回退自动检测系统代理)。国内访问国外 BT 资源时必需:HTTP_PROXY
+    /// 环境变量只代理 HTTP tracker,UDP tracker/DHT/peer 直连会被墙。
+    /// 配置后 HTTP tracker(reqwest)和 peer TCP(StreamConnector)走 socks5;
+    /// UDP tracker/DHT 仍直连(socks5 不代理 UDP)。
+    #[serde(default)]
+    pub socks_proxy_url: Option<String>,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
@@ -344,6 +375,55 @@ fn default_metadata_timeout_secs() -> u64 {
 /// HTTP 不经此路径,不受影响。
 fn default_stall_timeout_secs() -> u64 {
     60
+}
+
+/// 无 peer 时智能等待默认值(秒)
+///
+/// 5 分钟给死 swarm 恢复的合理窗口:tracker 重试间隔通常 60s,DHT 路由表
+/// 重建约 1-2 分钟,5 分钟内 peer 重新上线的概率较高。过短会误杀瞬时波动,
+/// 过长则用户体验差。可由用户配置调整。
+fn default_peer_wait_timeout_secs() -> u64 {
+    300
+}
+
+/// 自动检测系统 SOCKS5 代理 URL(供 BT tracker+peer 使用)
+///
+/// 检测顺序(取首个非空):
+/// 1. `ALL_PROXY` 环境变量 —— 若 scheme 是 `socks5` 直接返回;若是 `http(s)://host:port`
+///    则提取 host:port 转 `socks5://host:port`(Clash/V2Ray 混合端口假设)
+/// 2. `HTTPS_PROXY` / `HTTP_PROXY` —— 同样提取 host:port 转 `socks5://`
+///
+/// 返回 None 表示未检测到代理。调用方应让用户可手动覆盖此自动检测结果。
+/// 注意:此检测假设 HTTP 代理端口同时支持 SOCKS5(Clash 混合端口通常如此),
+/// 非混合端口代理会连接失败(librqbit 报错,不静默失败)。
+pub fn detect_socks_proxy() -> Option<String> {
+    // 尝试将任意代理 URL 规范化为 socks5://host:port
+    fn normalize(url: &str) -> Option<String> {
+        let parsed = url::Url::parse(url).ok()?;
+        let host = parsed.host_str()?;
+        let port = parsed.port()?;
+        // socks5 直接用;http/https 转 socks5(混合端口假设)
+        match parsed.scheme() {
+            "socks5" => Some(url.to_string()),
+            "http" | "https" => Some(format!("socks5://{host}:{port}")),
+            _ => None,
+        }
+    }
+    // 优先 ALL_PROXY(可能含 socks5 scheme)
+    if let Some(url) = std::env::var("ALL_PROXY").ok().filter(|s| !s.is_empty())
+        && let Some(normalized) = normalize(&url)
+    {
+        return Some(normalized);
+    }
+    // 回退 HTTPS_PROXY / HTTP_PROXY(转 socks5)
+    for var in ["HTTPS_PROXY", "HTTP_PROXY"] {
+        if let Some(url) = std::env::var(var).ok().filter(|s| !s.is_empty())
+            && let Some(normalized) = normalize(&url)
+        {
+            return Some(normalized);
+        }
+    }
+    None
 }
 
 /// 布尔默认值 true 的辅助函数（serde default 不支持直接写 true）
@@ -360,6 +440,9 @@ impl Default for MagnetConfig {
             enable_upnp: true,
             trackers: Vec::new(),
             stall_timeout_secs: default_stall_timeout_secs(),
+            disable_dht_persistence: false,
+            peer_wait_timeout_secs: default_peer_wait_timeout_secs(),
+            socks_proxy_url: None,
         }
     }
 }
@@ -419,6 +502,26 @@ impl MagnetConfig {
             return Err(e(&format!(
                 "stall_timeout_secs 不能超过 {STALL_TIMEOUT_SECS_LIMIT} (24h)"
             )));
+        }
+        // peer_wait_timeout_secs == 0 合法(禁用智能等待,回退纯 stall_timeout)
+        if self.peer_wait_timeout_secs > PEER_WAIT_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "peer_wait_timeout_secs 不能超过 {PEER_WAIT_TIMEOUT_SECS_LIMIT} (1h)"
+            )));
+        }
+        // socks_proxy_url:Some 时校验 scheme 为 socks5(与 librqbit SocksProxyConfig 一致)
+        if let Some(ref url) = self.socks_proxy_url {
+            let parsed = url::Url::parse(url)
+                .map_err(|_| e(&format!("socks_proxy_url 不是合法 URL: {url}")))?;
+            if parsed.scheme() != "socks5" {
+                return Err(e(&format!(
+                    "socks_proxy_url scheme 必须是 socks5,实际: {}",
+                    parsed.scheme()
+                )));
+            }
+            if parsed.host_str().is_none() || parsed.port().is_none() {
+                return Err(e(&format!("socks_proxy_url 必须包含 host 和 port: {url}")));
+            }
         }
         // 校验 tracker URL 格式
         for (i, tracker) in self.trackers.iter().enumerate() {
@@ -718,6 +821,10 @@ pub struct MagnetPatch {
     pub enable_upnp: Option<bool>,
     pub trackers: Option<Vec<String>>,
     pub stall_timeout_secs: Option<u64>,
+    pub disable_dht_persistence: Option<bool>,
+    pub peer_wait_timeout_secs: Option<u64>,
+    /// None=不修改,Some(None)=清空(禁用代理),Some(Some(url))=设值
+    pub socks_proxy_url: Option<Option<String>>,
 }
 
 /// 调度器配置白名单补丁
@@ -760,6 +867,15 @@ impl MagnetPatch {
         }
         if let Some(v) = self.stall_timeout_secs {
             base.stall_timeout_secs = v;
+        }
+        if let Some(v) = self.disable_dht_persistence {
+            base.disable_dht_persistence = v;
+        }
+        if let Some(v) = self.peer_wait_timeout_secs {
+            base.peer_wait_timeout_secs = v;
+        }
+        if let Some(ref v) = self.socks_proxy_url {
+            base.socks_proxy_url = v.clone();
         }
     }
 }
@@ -943,6 +1059,9 @@ impl Default for AppConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    /// 环境变量测试串行化锁:防止 detect_socks_proxy 测试并发修改 env
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_download_config_default() {
@@ -1680,6 +1799,9 @@ mod tests {
             enable_upnp: None,
             trackers: Some(vec!["udp://new.example.com:1337/announce".to_string()]),
             stall_timeout_secs: None,
+            disable_dht_persistence: None,
+            peer_wait_timeout_secs: None,
+            socks_proxy_url: None,
         };
         patch.apply_to(&mut base);
 
@@ -1705,6 +1827,9 @@ mod tests {
             enable_upnp: None,
             trackers: None,
             stall_timeout_secs: None,
+            disable_dht_persistence: None,
+            peer_wait_timeout_secs: None,
+            socks_proxy_url: None,
         };
         patch.apply_to(&mut base);
 
@@ -1729,6 +1854,9 @@ mod tests {
                 enable_upnp: None,
                 trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
                 stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
             }),
             scheduler: None,
             hub: None,
@@ -1751,6 +1879,9 @@ mod tests {
             enable_upnp: Some(true),
             trackers: Some(vec!["udp://tracker.example.com:1337/announce".to_string()]),
             stall_timeout_secs: None,
+            disable_dht_persistence: None,
+            peer_wait_timeout_secs: None,
+            socks_proxy_url: None,
         };
         let json = serde_json::to_string(&patch).unwrap();
         let deserialized: MagnetPatch = serde_json::from_str(&json).unwrap();
@@ -1780,6 +1911,9 @@ mod tests {
                 enable_upnp: None,
                 trackers: None,
                 stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
             }
         };
         patch.apply_to(&mut base);
@@ -1797,9 +1931,184 @@ mod tests {
             enable_upnp: None,
             trackers: None,
             stall_timeout_secs: None,
+            disable_dht_persistence: None,
+            peer_wait_timeout_secs: None,
+            socks_proxy_url: None,
         };
         patch.apply_to(&mut base);
         assert_eq!(base.stall_timeout_secs, 90, "None 应保留原值");
+    }
+
+    #[test]
+    fn test_magnet_patch_disable_dht_persistence_applies() {
+        let mut base = MagnetConfig::default();
+        assert!(!base.disable_dht_persistence, "默认应为 false");
+        let patch = MagnetPatch {
+            disable_dht_persistence: Some(true),
+            ..MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: None,
+                enable_upnp: None,
+                trackers: None,
+                stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
+            }
+        };
+        patch.apply_to(&mut base);
+        assert!(base.disable_dht_persistence, "应被 patch 设为 true");
+    }
+
+    #[test]
+    fn test_magnet_patch_peer_wait_timeout_applies() {
+        let mut base = MagnetConfig::default();
+        assert_eq!(base.peer_wait_timeout_secs, 300, "默认 5 分钟");
+        let patch = MagnetPatch {
+            peer_wait_timeout_secs: Some(120),
+            ..MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: None,
+                enable_upnp: None,
+                trackers: None,
+                stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
+            }
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(base.peer_wait_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_magnet_config_validate_peer_wait_timeout() {
+        let mut cfg = MagnetConfig::default();
+        // 0 合法(禁用智能等待)
+        cfg.peer_wait_timeout_secs = 0;
+        assert!(cfg.validate().is_ok());
+        // 正常值
+        cfg.peer_wait_timeout_secs = 600;
+        assert!(cfg.validate().is_ok());
+        // 超限
+        cfg.peer_wait_timeout_secs = PEER_WAIT_TIMEOUT_SECS_LIMIT + 1;
+        let err = cfg.validate();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("peer_wait_timeout_secs"),
+            "错误信息应包含字段名"
+        );
+    }
+
+    #[test]
+    fn test_magnet_patch_socks_proxy_url_applies() {
+        let mut base = MagnetConfig::default();
+        assert!(base.socks_proxy_url.is_none(), "默认 None");
+        // Some(Some(url)) = 设值
+        let patch = MagnetPatch {
+            socks_proxy_url: Some(Some("socks5://127.0.0.1:7897".into())),
+            ..MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: None,
+                enable_upnp: None,
+                trackers: None,
+                stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
+            }
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(
+            base.socks_proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:7897")
+        );
+        // Some(None) = 清空
+        let clear_patch = MagnetPatch {
+            socks_proxy_url: Some(None),
+            ..MagnetPatch {
+                metadata_timeout_secs: None,
+                download_timeout_secs: None,
+                enable_dht: None,
+                enable_upnp: None,
+                trackers: None,
+                stall_timeout_secs: None,
+                disable_dht_persistence: None,
+                peer_wait_timeout_secs: None,
+                socks_proxy_url: None,
+            }
+        };
+        clear_patch.apply_to(&mut base);
+        assert!(base.socks_proxy_url.is_none(), "Some(None) 应清空");
+    }
+
+    #[test]
+    fn test_magnet_config_validate_socks_proxy_url() {
+        let mut cfg = MagnetConfig::default();
+        // None 合法
+        assert!(cfg.validate().is_ok());
+        // 合法 socks5
+        cfg.socks_proxy_url = Some("socks5://127.0.0.1:7897".into());
+        assert!(cfg.validate().is_ok());
+        // 带 auth
+        cfg.socks_proxy_url = Some("socks5://user:pass@127.0.0.1:7897".into());
+        assert!(cfg.validate().is_ok());
+        // 错误 scheme
+        cfg.socks_proxy_url = Some("http://127.0.0.1:7897".into());
+        let err = cfg.validate();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("socks5"));
+        // 缺 port
+        cfg.socks_proxy_url = Some("socks5://127.0.0.1".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_detect_socks_proxy_from_all_proxy_socks5() {
+        // ALL_PROXY 含 socks5 scheme 直接用
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:1080");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        let result = detect_socks_proxy();
+        assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:1080"));
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_detect_socks_proxy_from_http_proxy_convert() {
+        // HTTP_PROXY 是 http://host:port → 转 socks5://host:port
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7897");
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        let result = detect_socks_proxy();
+        assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:7897"));
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_detect_socks_proxy_none_when_unset() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        assert!(detect_socks_proxy().is_none());
     }
 }
 

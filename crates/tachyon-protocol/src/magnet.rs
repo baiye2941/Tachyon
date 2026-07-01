@@ -172,46 +172,123 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     Ok(())
 }
 
+/// 对等节点健康状态源(供 `make_chunk_stream` 判断 swarm 是否活跃)
+///
+/// 生产实现包装 `ManagedTorrent::stats_snapshot()`;测试实现可 mock。
+/// 返回 `true` 表示有活跃 peer(queued+connecting+live > 0),`false` 表示死 swarm。
+pub trait PeerHealthSource: Send + Sync {
+    /// 是否有活跃 peer(已连接或正在连接)
+    fn healthy(&self) -> bool;
+}
+
+/// 基于 librqbit `ManagedTorrent` 的 `PeerHealthSource` 生产实现
+struct ManagedTorrentPeerHealth {
+    handle: Arc<ManagedTorrent>,
+}
+
+impl ManagedTorrentPeerHealth {
+    fn new(handle: Arc<ManagedTorrent>) -> Self {
+        Self { handle }
+    }
+}
+
+impl PeerHealthSource for ManagedTorrentPeerHealth {
+    fn healthy(&self) -> bool {
+        // live 状态下取 stats_snapshot 的 peer_stats;非 live 或快照失败视为无 peer
+        self.handle.live().is_some_and(|live| {
+            let snap = live.stats_snapshot();
+            snap.peer_stats.live + snap.peer_stats.connecting > 0
+        })
+    }
+}
+
+/// 无 peer 时轮询 peer 健康状态的间隔(秒)
+const PEER_HEALTH_POLL_SECS: u64 = 5;
+
 /// 把 BufReader 包装成 64KB chunk 的 ByteStream(unfold)
 ///
 /// 读取到 EOF 返回 None 结束流,遇错误产出 Err 项。
 /// 单文件单段与多文件多段共用此 helper 把 FileStream 包装成统一的 ByteStream。
 ///
-/// `stall_timeout` 为单次 `read` 间隔设置上限。磁力链接的 `FileStream` 在找不到
-/// peer 时 `read()` 会永久挂起,导致引擎 32 worker 全卡死且取消信号无法穿透
-/// (协作式取消依赖 chunk 循环到达检查点)。本超时让流在 `stall_timeout` 内
-/// 无数据时产出 `Err(Timeout)`,触发引擎重试/失败。
-/// `Duration::MAX` 表示禁用:`tokio::time::timeout` 遇超大 deadline 直接 poll
-/// 内部 future,不注册定时器,零开销。
+/// # 超时分层(死 swarm 韧性)
+///
+/// 1. `stall_timeout`:单次 `read` 间隔上限(有 peer 时)。`FileStream::read` 在
+///    piece 未就绪时返回 `Pending` 注册 waker;有活跃 peer 时 piece 会陆续完成,
+///    stall_timeout 兜底防永久挂起。`Duration::MAX` 禁用(零开销)。
+/// 2. `peer_wait` + `peer_health`:无 peer 时智能等待。read 超时后检查 peer 健康状态:
+///    - 有 peer:重置等待计数,继续 stall_timeout 读(可能是 piece 延迟)
+///    - 无 peer:累计等待 `PEER_HEALTH_POLL_SECS`,超过 `peer_wait` 总限则产出
+///      `Err(Timeout("无可用 peer,等待 N秒后超时"))`,让引擎重试/失败
+///
+///    peer_wait 给死 swarm 恢复的窗口(tracker 重试 60s,DHT 重建 1-2min),
+///    默认 5 分钟。`Duration::MAX` 禁用(回退纯 stall_timeout)。
 fn make_chunk_stream<R>(
     reader: R,
     stall_timeout: Duration,
+    peer_wait: Duration,
+    peer_health: Option<Arc<dyn PeerHealthSource>>,
 ) -> impl futures::Stream<Item = DownloadResult<Bytes>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use futures::stream::unfold;
-    unfold(reader, move |mut reader| {
-        let stall = stall_timeout;
-        async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            match tokio::time::timeout(stall, reader.read(&mut buf)).await {
-                Ok(Ok(0)) => None, // EOF
-                Ok(Ok(n)) => {
-                    buf.truncate(n);
-                    Some((Ok(Bytes::from(buf)), reader))
+    // unfold 状态:reader + 无 peer 累计等待时间
+    unfold(
+        (reader, Duration::ZERO),
+        move |(mut reader, mut no_peer_elapsed)| {
+            let stall = stall_timeout;
+            let wait = peer_wait;
+            let health = peer_health.clone();
+            async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match tokio::time::timeout(stall, reader.read(&mut buf)).await {
+                        Ok(Ok(0)) => return None, // EOF
+                        Ok(Ok(n)) => {
+                            buf.truncate(n);
+                            // 有数据到达:peer 活跃,重置无 peer 累计
+                            return Some((Ok(Bytes::from(buf)), (reader, Duration::ZERO)));
+                        }
+                        Ok(Err(e)) => {
+                            return Some((Err(DownloadError::Io(e)), (reader, no_peer_elapsed)));
+                        }
+                        Err(_) => {
+                            // read 超时:检查 peer 健康状态决定是继续等待还是失败
+                            // None = 未启用 peer 监控,回退纯 stall_timeout 行为(产出 Timeout)
+                            let healthy = match &health {
+                                None => true,
+                                Some(h) => h.healthy(),
+                            };
+                            if healthy {
+                                // 有 peer(或无监控)但 read 超时:产出 stall Timeout
+                                return Some((
+                                    Err(DownloadError::Timeout(format!(
+                                        "磁力链接读取 stall 超时({}秒),有 peer 但无数据",
+                                        stall.as_secs()
+                                    ))),
+                                    (reader, Duration::ZERO),
+                                ));
+                            }
+                            // 无 peer:智能等待 —— 短轮询间隔累计,超 peer_wait 则失败
+                            let poll = Duration::from_secs(PEER_HEALTH_POLL_SECS);
+                            no_peer_elapsed = no_peer_elapsed.saturating_add(poll);
+                            if no_peer_elapsed >= wait {
+                                return Some((
+                                    Err(DownloadError::Timeout(format!(
+                                        "无可用 peer,等待 {}秒后超时",
+                                        wait.as_secs()
+                                    ))),
+                                    (reader, no_peer_elapsed),
+                                ));
+                            }
+                            // 等待一个轮询间隔后重试 read(loop 回到 read,不产出空项)
+                            tokio::time::sleep(poll).await;
+                        }
+                    }
                 }
-                Ok(Err(e)) => Some((Err(DownloadError::Io(e)), reader)),
-                Err(_) => Some((
-                    Err(DownloadError::Timeout(format!(
-                        "磁力链接读取 stall 超时({}秒),可能无可用 peer",
-                        stall.as_secs()
-                    ))),
-                    reader,
-                )),
             }
-        }
-    })
+        },
+    )
 }
 
 /// 解析首个文件的落盘路径(download_full / download_full_stream 回退路径用)
@@ -376,6 +453,13 @@ impl Protocol for MagnetProtocol {
         } else {
             Duration::from_secs(self.config.stall_timeout_secs)
         };
+        // peer 智能等待:0 禁用(回退纯 stall_timeout),否则按配置秒数。
+        // 死 swarm 下无 peer 时持续轮询 peer 健康,超此限则失败。
+        let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
+            Duration::MAX
+        } else {
+            Duration::from_secs(self.config.peer_wait_timeout_secs)
+        };
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
@@ -417,14 +501,21 @@ impl Protocol for MagnetProtocol {
                     let handle = Arc::clone(&handle);
                     async move {
                         let local_len = local_end - local_start + 1;
+                        // handle.stream() 消费 Arc<ManagedTorrent>,需先克隆供 peer_health
+                        let peer_health: Arc<dyn PeerHealthSource> =
+                            Arc::new(ManagedTorrentPeerHealth::new(Arc::clone(&handle)));
                         match handle.stream(file_id) {
                             Ok(mut stream) => {
                                 match stream.seek(std::io::SeekFrom::Start(local_start)).await {
                                     Ok(_) => {
                                         let reader =
                                             tokio::io::BufReader::new(stream.take(local_len));
-                                        Box::pin(make_chunk_stream(reader, stall_timeout))
-                                            as ByteStream
+                                        Box::pin(make_chunk_stream(
+                                            reader,
+                                            stall_timeout,
+                                            peer_wait,
+                                            Some(peer_health),
+                                        )) as ByteStream
                                     }
                                     Err(e) => Box::pin(futures::stream::once(async move {
                                         Err(DownloadError::Io(e))
@@ -555,7 +646,12 @@ impl Protocol for MagnetProtocol {
                 .await
                 .map_err(DownloadError::Io)?;
 
-            let stream = make_chunk_stream(tokio::io::BufReader::new(file), Duration::MAX);
+            let stream = make_chunk_stream(
+                tokio::io::BufReader::new(file),
+                Duration::MAX,
+                Duration::MAX,
+                None,
+            );
             Ok(Box::pin(stream) as ByteStream)
         })
     }
@@ -1186,7 +1282,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_make_chunk_stream_stall_timeout_triggers() {
         use futures::StreamExt;
-        let stream = make_chunk_stream(PendingReader, Duration::from_secs(2));
+        // 无 peer_health:回退纯 stall_timeout 行为(peer_wait=MAX 禁用)
+        let stream = make_chunk_stream(PendingReader, Duration::from_secs(2), Duration::MAX, None);
         let mut s = Box::pin(stream);
         // 用 tokio::time::timeout 双保险:若修复回归(永久挂起),测试本身不卡死
         let result = tokio::time::timeout(Duration::from_secs(10), s.next()).await;
@@ -1203,7 +1300,7 @@ mod tests {
     async fn test_make_chunk_stream_stall_disabled_reads_data() {
         let data = Bytes::from(vec![0xABu8; 200]);
         let reader = std::io::Cursor::new(data.clone());
-        let stream = make_chunk_stream(reader, Duration::MAX);
+        let stream = make_chunk_stream(reader, Duration::MAX, Duration::MAX, None);
         let collected = collect_stream(Box::pin(stream)).await;
         assert_eq!(collected, data.to_vec());
     }
@@ -1214,7 +1311,121 @@ mod tests {
         let data = Bytes::from(vec![0xCDu8; 100_000]);
         let reader = std::io::Cursor::new(data.clone());
         // 设一个很短的 stall,但 reader 立即产出数据,不应触发
-        let stream = make_chunk_stream(reader, Duration::from_millis(100));
+        let stream = make_chunk_stream(reader, Duration::from_millis(100), Duration::MAX, None);
+        let collected = collect_stream(Box::pin(stream)).await;
+        assert_eq!(collected, data.to_vec());
+    }
+
+    // ── make_chunk_stream peer 健康监控测试 ──────────────────────────
+
+    /// 可控的 PeerHealthSource mock:通过原子 bool 控制 healthy 返回值
+    struct MockPeerHealth {
+        healthy: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockPeerHealth {
+        fn new(healthy: bool) -> Self {
+            Self {
+                healthy: Arc::new(std::sync::atomic::AtomicBool::new(healthy)),
+            }
+        }
+    }
+
+    impl PeerHealthSource for MockPeerHealth {
+        fn healthy(&self) -> bool {
+            self.healthy.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// 验证:无 peer + peer_wait 短超时 → 触发"无可用 peer"Timeout
+    ///
+    /// PendingReader 永久 Pending,MockPeerHealth 始终 false(死 swarm)。
+    /// peer_wait=6s(PEER_HEALTH_POLL_SECS=5s × 2 次累计),应在 ~10-15s 内失败。
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_peer_dead_triggers_peer_wait_timeout() {
+        use futures::StreamExt;
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
+        // stall=2s(快速进入超时分支), peer_wait=6s(2 次轮询后超限)
+        let stream = make_chunk_stream(
+            PendingReader,
+            Duration::from_secs(2),
+            Duration::from_secs(6),
+            Some(health),
+        );
+        let mut s = Box::pin(stream);
+        let result = tokio::time::timeout(Duration::from_secs(60), s.next()).await;
+        assert!(result.is_ok(), "应在 peer_wait 内产出项,而非永久挂起");
+        let item = result.unwrap().expect("流应产出项");
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("无可用 peer"),
+                    "错误信息应包含'无可用 peer',实际: {msg}"
+                );
+            }
+            other => panic!("应产出 Timeout(无可用 peer),实际: {other:?}"),
+        }
+    }
+
+    /// 验证:无 peer→有 peer 切换,peer_wait 重置后避免"无可用 peer"超时
+    ///
+    /// 前 4s 无 peer(累计等待),第 4s 切换为有 peer。
+    /// 切换后 stall_timeout 触发产出"有 peer 但无数据"Timeout(因为 PendingReader 不产出数据),
+    /// 但不应是"无可用 peer"超时。
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_peer_recovered_avoids_peer_wait_timeout() {
+        use futures::StreamExt;
+        let health_handle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 用共享原子模拟:测试线程切换 healthy
+        struct SharedHealth(Arc<std::sync::atomic::AtomicBool>);
+        impl PeerHealthSource for SharedHealth {
+            fn healthy(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+        let source: Arc<dyn PeerHealthSource> = Arc::new(SharedHealth(health_handle.clone()));
+        // stall=2s, peer_wait=60s(足够长,确保不会因 peer_wait 超时)
+        let stream = make_chunk_stream(
+            PendingReader,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            Some(source),
+        );
+        let mut s = Box::pin(stream);
+        // 在等待期间切换 peer 为 healthy
+        let health_clone = health_handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            health_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let result = tokio::time::timeout(Duration::from_secs(30), s.next()).await;
+        assert!(result.is_ok(), "应在合理时间内产出项");
+        let item = result.unwrap().expect("流应产出项");
+        // peer 恢复后,下次 stall 超时应产出"有 peer 但无数据"而非"无可用 peer"
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    !msg.contains("无可用 peer"),
+                    "peer 恢复后不应是'无可用 peer'超时,实际: {msg}"
+                );
+            }
+            other => panic!("预期 Timeout,实际: {other:?}"),
+        }
+    }
+
+    /// 验证:有 peer + 数据正常 → 不触发 peer_wait,正常读完数据
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_peer_healthy_does_not_trigger() {
+        let data = Bytes::from(vec![0xEFu8; 5000]);
+        let reader = std::io::Cursor::new(data.clone());
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(true));
+        // stall 短(100ms),但 reader 立即产出,不应触发任何超时
+        let stream = make_chunk_stream(
+            reader,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            Some(health),
+        );
         let collected = collect_stream(Box::pin(stream)).await;
         assert_eq!(collected, data.to_vec());
     }

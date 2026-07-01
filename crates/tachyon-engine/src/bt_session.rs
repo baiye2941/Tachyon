@@ -36,8 +36,22 @@ impl BtSession {
         let mut opts = SessionOptions {
             disable_dht: !config.enable_dht,
             enable_upnp_port_forwarding: config.enable_upnp,
+            disable_dht_persistence: config.disable_dht_persistence,
             ..Default::default()
         };
+
+        // SOCKS5 代理:优先用户手动配置,None 时自动检测系统代理
+        // 让 BT tracker(reqwest)和 peer TCP(StreamConnector)走代理,
+        // 国内访问国外 BT 资源必需(UDP tracker/DHT 仍直连,socks5 不代理 UDP)
+        let socks_proxy = config.socks_proxy_url.clone().or_else(|| {
+            tachyon_core::config::detect_socks_proxy().inspect(|proxy| {
+                tracing::info!(proxy = %proxy, "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)");
+            })
+        });
+        if let Some(ref proxy) = socks_proxy {
+            opts.socks_proxy_url = Some(proxy.clone());
+            tracing::info!(proxy = %proxy, "BT SOCKS5 代理已启用");
+        }
 
         // 全局 tracker: 附加到每个磁力链接的 tracker 列表，
         // 即使磁力链接本身不包含 tracker 也能快速发现 peer。
