@@ -138,19 +138,23 @@ impl DownloadSession {
 
         // 1. URL 校验与启动前状态守卫
         let pause_timeout_secs = self.download_config.pause_timeout_secs;
-        let host = match validate_and_prepare_url(
-            &self.url,
-            &self.state,
-            &self.task_id,
-            &mut self.control_rx,
-            pause_timeout_secs,
-        )
-        .await
-        {
+
+        // 1+2. 并行: URL 校验 + 目录准备
+        let (host_result, dir_result) = tokio::join!(
+            validate_and_prepare_url(
+                &self.url,
+                &self.state,
+                &self.task_id,
+                &mut self.control_rx,
+                pause_timeout_secs,
+            ),
+            ensure_download_dir(&self.download_dir, &self.state, &self.task_id),
+        );
+
+        let host = match host_result {
             Some(h) => h,
             None => return,
         };
-
         tracing::info!(
             task_id = %self.task_id,
             host = %host,
@@ -158,11 +162,7 @@ impl DownloadSession {
             "开始真实下载"
         );
 
-        // 2. 确保下载目录存在
-        if ensure_download_dir(&self.download_dir, &self.state, &self.task_id)
-            .await
-            .is_err()
-        {
+        if dir_result.is_err() {
             return;
         }
 
@@ -267,12 +267,17 @@ impl DownloadSession {
         download_task.set_progress_sender(chunk_progress_tx);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let broker = self.state.runtime.progress_broker.clone();
+        let on_progress: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |task_id: &str| {
+            broker.mark_dirty(task_id);
+        });
         let job = ChunkReaderJob {
             task_id: self.task_id.clone(),
             progress_rx: chunk_progress_rx,
             task_repository: self.state.domain.task_repository.clone(),
             task_store: self.state.infra.task_store.clone(),
             done_tx,
+            on_progress: Some(on_progress),
         };
         if let Err(e) = self.state.infra.chunk_reader_pool.submit_async(job).await {
             tracing::error!(task_id = %self.task_id, error = %e, "提交 chunk reader job 失败");

@@ -33,6 +33,8 @@ pub struct ChunkReaderJob {
     pub task_store: Arc<TaskStore>,
     /// 完成通知：当 job 处理完毕后发送信号
     pub done_tx: oneshot::Sender<()>,
+    /// Callback to notify ProgressBroker of progress changes
+    pub on_progress: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +165,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
         task_repository,
         task_store,
         done_tx,
+        on_progress,
     } = job;
 
     // 已完成分片集合,用于断点续传 checkpoint
@@ -245,6 +248,11 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     task.progress = (frags_done as f64 / total_frags as f64).clamp(0.0, 1.0);
                 }
             }
+        }
+
+        // Notify ProgressBroker of progress change
+        if let Some(ref callback) = on_progress {
+            callback(&task_id);
         }
 
         // 批量 checkpoint(已完成分片)
@@ -390,6 +398,7 @@ mod tests {
             task_repository: task_repository.clone(),
             task_store,
             done_tx,
+            on_progress: None,
         };
 
         // 提交 job
@@ -466,6 +475,7 @@ mod tests {
                 task_repository: task_repository.clone(),
                 task_store: task_store.clone(),
                 done_tx,
+                on_progress: None,
             };
 
             pool.submit_async(job).await.unwrap();

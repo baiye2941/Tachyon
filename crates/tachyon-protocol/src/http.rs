@@ -117,6 +117,7 @@ impl HttpClient {
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(std::time::Duration::from_secs(keep_alive_secs))
             .tcp_keepalive(std::time::Duration::from_secs(keep_alive_secs))
+            .tcp_nodelay(true) // 禁用 Nagle 算法:减少小包延迟
             .no_proxy()
             .dns_resolver(PublicDnsResolver::new())
             .redirect(safe_redirect_policy());
@@ -135,6 +136,8 @@ impl HttpClient {
                 .http2_initial_stream_window_size(1024 * 1024)
                 // 初始连接窗口 16MB:聚合多流吞吐
                 .http2_initial_connection_window_size(16 * 1024 * 1024)
+                // 最大帧 1MB:减少大载荷的帧切分开销 (默认 16KB)
+                .http2_max_frame_size(1 << 20)
                 // HTTP/2 PING 保活:检测 NAT/代理超时的死连接
                 .http2_keep_alive_interval(std::time::Duration::from_secs(30))
                 .http2_keep_alive_timeout(std::time::Duration::from_secs(10));

@@ -2,12 +2,17 @@
 //!
 //! 将后端任务进度状态投影为前端可消费的 ProgressEvent。
 //! 职责：
-//! - 全局 progress aggregator：单一 250ms 定时器扫描所有活跃任务的进度
+//! - 全局 progress aggregator：事件驱动 + 250ms 超时兜底扫描
+//! - ChunkReaderPool 通过 mark_dirty + Notify 唤醒 aggregator
 //! - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
-//! - 活跃任务数从 O(tasks) events/s 降为 O(1) event/250ms
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use dashmap::DashSet;
+use tokio::sync::Notify;
 
 use tokio::sync::watch;
 
@@ -20,15 +25,19 @@ const AGGREGATOR_INTERVAL_MS: u64 = 250;
 /// 进度事件代理
 ///
 /// 全局 progress aggregator：
-/// - 单一 250ms 定时器扫描所有活跃任务的进度
+/// - 事件驱动：ChunkReaderPool 通过 mark_dirty + Notify 唤醒 aggregator
+/// - 250ms 超时兜底：确保无通知时也能更新
 /// - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
-/// - 活跃任务数从 O(tasks) events/s 降为 O(1) event/250ms
 pub struct ProgressBroker {
     progress_tx: watch::Sender<ProgressEvent>,
     /// 需要聚合的任务列表引用
     task_repository: TaskRepository,
     /// aggregator 是否已 spawn（幂等防护）
-    aggregator_spawned: std::sync::atomic::AtomicBool,
+    aggregator_spawned: AtomicBool,
+    /// Dirty task IDs — set by ChunkReaderPool when progress changes
+    dirty_tasks: Arc<DashSet<String>>,
+    /// Notify to wake aggregator
+    notify: Arc<Notify>,
 }
 
 impl ProgressBroker {
@@ -42,35 +51,52 @@ impl ProgressBroker {
         Self {
             progress_tx,
             task_repository,
-            aggregator_spawned: std::sync::atomic::AtomicBool::new(false),
+            aggregator_spawned: AtomicBool::new(false),
+            dirty_tasks: Arc::new(DashSet::new()),
+            notify: Arc::new(Notify::new()),
         }
     }
 
-    /// 启动全局 aggregator 定时器
+    /// 启动全局 event-driven aggregator
     ///
     /// **必须在 Tokio reactor 上下文中调用**（如 Tauri `setup` 钩子内）。
-    /// aggregator 以 250ms 间隔定期扫描 tasks，构建全量 ProgressEvent 并发送。
+    /// aggregator 由 ChunkReaderPool 的 mark_dirty 通知唤醒，辅以 250ms 超时兜底。
     /// 幂等：多次调用只启动一个 aggregator（通过 AtomicBool 防重复）。
     pub fn spawn_aggregator(&self) {
-        // 原子防重复：首次调用置位，后续调用直接返回
-        if self
-            .aggregator_spawned
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.aggregator_spawned.swap(true, Ordering::AcqRel) {
             return;
         }
         let tx = self.progress_tx.clone();
         let task_repository_ref = self.task_repository.clone();
+        let dirty_tasks = self.dirty_tasks.clone();
+        let notify = self.notify.clone();
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
+            // Force first tick to fire immediately
+            interval.tick().await;
+
             loop {
-                interval.tick().await;
+                // Wait for either: dirty notification OR interval timeout
+                tokio::select! {
+                    _ = notify.notified() => {
+                        // Debounce: wait a tiny bit for more events to coalesce
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    _ = interval.tick() => {
+                        // Timeout: ensure progress updates even during quiet periods
+                    }
+                }
+
                 // 直接构建并发送全量事件:进度字段(downloaded/speed/progress/fragments_done)
                 // 通过 DashMap 的 get_mut 直接写入,不会触发 TaskRepository::version() 递增,
                 // 因此不能用 version 做短路,否则下载期间的进度更新永远无法广播。
                 // 下游 compute_progress_delta 会按值过滤掉无变化任务,保证前端不会收到冗余数据。
                 let event = build_progress_event(&task_repository_ref);
                 let _ = tx.send(event);
+
+                // Clear dirty set after building event
+                dirty_tasks.clear();
             }
         });
     }
@@ -83,8 +109,17 @@ impl ProgressBroker {
         Self {
             progress_tx,
             task_repository,
-            aggregator_spawned: std::sync::atomic::AtomicBool::new(false),
+            aggregator_spawned: AtomicBool::new(false),
+            dirty_tasks: Arc::new(DashSet::new()),
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Mark a task as having changed progress data.
+    /// Called by ChunkReaderPool after updating TaskRepository.
+    pub fn mark_dirty(&self, task_id: &str) {
+        self.dirty_tasks.insert(task_id.to_string());
+        self.notify.notify_one();
     }
 
     /// 广播进度事件（手动触发，用于终态等特殊时刻）
