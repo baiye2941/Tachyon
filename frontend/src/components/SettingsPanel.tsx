@@ -983,7 +983,7 @@ function SliderItem(props: {
   displayValue: string;
 }) {
   // step<1 视为浮点滑块(如 EWMA alpha),用 parseFloat 解析;否则整数滑块用 parseInt
-  const isFloat = props.step !== undefined && props.step < 1;
+  // 注意:isFloat 在 onInput 内计算,避免在组件体中读取 props.step 触发非追踪访问告警
   return (
     <div>
       <div
@@ -1009,13 +1009,15 @@ function SliderItem(props: {
         max={props.max}
         step={props.step ?? 1}
         value={props.value}
-        onInput={(e) =>
+        onInput={(e) => {
+          // 在事件处理内读取 props.step,保证响应式追踪正确
+          const isFloat = props.step !== undefined && props.step < 1;
           props.onChange(
             isFloat
               ? parseFloat(e.currentTarget.value)
               : parseInt(e.currentTarget.value),
-          )
-        }
+          );
+        }}
         style={{ width: "100%" }}
       />
     </div>
