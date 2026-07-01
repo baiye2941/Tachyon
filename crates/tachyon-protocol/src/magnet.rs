@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use librqbit::file_info::FileInfo;
 use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -60,6 +61,54 @@ impl MagnetProtocol {
         }
     }
 
+    /// 缓存 handle + layout,带容量上限防无限增长(修复 MEDIUM-2)
+    ///
+    /// `handle_cache` 持 `Arc<ManagedTorrent>`(可能含文件句柄/peer 连接/piece 缓存),
+    /// 无上限会导致用户注入大量不同磁力链接时内存/fd 耗尽 DoS。
+    /// 超过 `MAX_CACHED_HANDLES` 时淘汰一个旧条目(非严格 LRU,DashMap 无序,
+    /// 但足以防无限增长;实际并发下载数通常 ≤ 10,上限 64 足够)。
+    /// handle_cache 容量上限(修复 MEDIUM-2:防 ManagedTorrent 句柄无限增长 DoS)
+    const MAX_CACHED_HANDLES: usize = 64;
+
+    /// 带容量上限的 insert(供 cache_handle 与 async 闭包共用)
+    ///
+    /// 超过 `MAX_CACHED_HANDLES` 时淘汰一个旧条目(非严格 LRU,DashMap 无序,
+    /// 但足以防无限增长;实际并发下载数通常 ≤ 10,上限 64 足够)。
+    fn insert_with_capacity(
+        cache: &DashMap<String, (Arc<ManagedTorrent>, FileLayout)>,
+        url: String,
+        handle: Arc<ManagedTorrent>,
+        layout: FileLayout,
+    ) {
+        // 容量超限时淘汰一个旧条目(iter 顺序非确定,但任意淘汰即可防泄漏)
+        if cache.len() >= Self::MAX_CACHED_HANDLES
+            && let Some(entry) = cache.iter().next()
+        {
+            let key = entry.key().clone();
+            drop(entry); // 释放 iter 的读锁,避免与 remove 的写锁死锁
+            cache.remove(&key);
+        }
+        cache.insert(url, (handle, layout));
+    }
+
+    /// 从 librqbit 的 file_infos 构造 FileLayout(消除 DUP-1:四处重复的闭包)
+    ///
+    /// 单文件退化为单元素,多文件按 file_infos 各文件段(file_id=索引,
+    /// global_offset=offset_in_torrent,len=fi.len,name=relative_filename)。
+    fn layout_from_file_infos(file_infos: &[FileInfo]) -> FileLayout {
+        let spans: Vec<FileSpan> = file_infos
+            .iter()
+            .enumerate()
+            .map(|(file_id, fi)| FileSpan {
+                file_id,
+                global_offset: fi.offset_in_torrent,
+                len: fi.len,
+                name: fi.relative_filename.to_string_lossy().into_owned(),
+            })
+            .collect();
+        FileLayout::from_spans(spans)
+    }
+
     /// 从已构造的 `ManagedTorrent` 注入构造(测试与离线场景接缝)
     ///
     /// 跳过 magnet URL 解析与 `add_torrent` 注册,直接把预构造的 handle 塞进缓存。
@@ -82,7 +131,7 @@ impl MagnetProtocol {
         layout: FileLayout,
     ) -> Self {
         let proto = Self::new(session, config, download_dir);
-        proto.handle_cache.insert(url.to_string(), (handle, layout));
+        Self::insert_with_capacity(&proto.handle_cache, url.to_string(), handle, layout);
         proto
     }
 }
@@ -236,25 +285,18 @@ impl Protocol for MagnetProtocol {
                         .clone()
                         .unwrap_or_else(|| "unknown_torrent".to_string());
                     let size = m.lengths.total_length();
-                    // 构造 FileLayout:单文件退化为单元素,多文件按 file_infos 各文件段
-                    let spans: Vec<FileSpan> = m
-                        .file_infos
-                        .iter()
-                        .enumerate()
-                        .map(|(file_id, fi)| FileSpan {
-                            file_id,
-                            global_offset: fi.offset_in_torrent,
-                            len: fi.len,
-                            name: fi.relative_filename.to_string_lossy().into_owned(),
-                        })
-                        .collect();
-                    let layout = FileLayout::from_spans(spans);
+                    let layout = Self::layout_from_file_infos(&m.file_infos);
                     (name, size, layout)
                 })
                 .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
 
             // 缓存 handle + layout,供后续 download_range_stream 每分片命中
-            handle_cache.insert(url.clone(), (Arc::clone(&handle), layout.clone()));
+            Self::insert_with_capacity(
+                &handle_cache,
+                url.clone(),
+                Arc::clone(&handle),
+                layout.clone(),
+            );
 
             Ok(FileMetadata {
                 file_name,
@@ -316,22 +358,14 @@ impl Protocol for MagnetProtocol {
                 let h = add_magnet_to_session(&session, &url, &download_dir).await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
                 let layout = h
-                    .with_metadata(|m| {
-                        let spans: Vec<FileSpan> = m
-                            .file_infos
-                            .iter()
-                            .enumerate()
-                            .map(|(fid, fi)| FileSpan {
-                                file_id: fid,
-                                global_offset: fi.offset_in_torrent,
-                                len: fi.len,
-                                name: fi.relative_filename.to_string_lossy().into_owned(),
-                            })
-                            .collect();
-                        FileLayout::from_spans(spans)
-                    })
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
                     .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
-                handle_cache.insert(url.clone(), (Arc::clone(&h), layout.clone()));
+                Self::insert_with_capacity(
+                    &handle_cache,
+                    url.clone(),
+                    Arc::clone(&h),
+                    layout.clone(),
+                );
                 (h, layout)
             };
 
@@ -403,22 +437,9 @@ impl Protocol for MagnetProtocol {
                 let h = add_magnet_to_session(&session, &url, &download_dir).await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
                 let layout = h
-                    .with_metadata(|m| {
-                        let spans: Vec<FileSpan> = m
-                            .file_infos
-                            .iter()
-                            .enumerate()
-                            .map(|(fid, fi)| FileSpan {
-                                file_id: fid,
-                                global_offset: fi.offset_in_torrent,
-                                len: fi.len,
-                                name: fi.relative_filename.to_string_lossy().into_owned(),
-                            })
-                            .collect();
-                        FileLayout::from_spans(spans)
-                    })
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
-                handle_cache.insert(url.clone(), (Arc::clone(&h), layout));
+                Self::insert_with_capacity(&handle_cache, url.clone(), Arc::clone(&h), layout);
                 h
             };
 
@@ -481,7 +502,7 @@ impl Protocol for MagnetProtocol {
                         FileLayout::from_spans(spans)
                     })
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
-                handle_cache.insert(url.clone(), (Arc::clone(&h), layout));
+                Self::insert_with_capacity(&handle_cache, url.clone(), Arc::clone(&h), layout);
                 h
             };
 
@@ -791,20 +812,7 @@ mod tests {
 
         // 从 handle 的 file_infos 构造 FileLayout(与 probe 路径一致)
         let layout = handle
-            .with_metadata(|m| {
-                let spans: Vec<FileSpan> = m
-                    .file_infos
-                    .iter()
-                    .enumerate()
-                    .map(|(fid, fi)| FileSpan {
-                        file_id: fid,
-                        global_offset: fi.offset_in_torrent,
-                        len: fi.len,
-                        name: fi.relative_filename.to_string_lossy().into_owned(),
-                    })
-                    .collect();
-                FileLayout::from_spans(spans)
-            })
+            .with_metadata(|m| MagnetProtocol::layout_from_file_infos(&m.file_infos))
             .map_err(|e| DownloadError::Protocol(format!("获取元数据失败: {e}")))?;
 
         let config = MagnetConfig::default();
@@ -1042,6 +1050,85 @@ mod tests {
             elapsed < std::time::Duration::from_millis(2000),
             "1MB 本地读取耗时 {:?} 过长,可能存在性能问题",
             elapsed
+        );
+    }
+
+    /// bench 缺口 1b:magnet range_stream 单段 vs 多段 timing
+    ///
+    /// 隔离测量"每段新建 FileStream + then/flatten 拼接"的额外开销:
+    /// 同一多文件 torrent,读单段(单文件内)vs 多段(跨 4 文件边界),
+    /// 按 per-µs 归一化对比。多段应有额外开销(每段 FileStream::new + seek),
+    /// 但不应数量级放大(段数通常 ≤ 文件数)。
+    #[tokio::test]
+    async fn bench_range_stream_single_vs_multi_segment() {
+        // 4 文件各 256KB,piece 16KB
+        let file_size = 256 * 1024;
+        let (protocol, url, _files, _global, _dir) =
+            make_offline_multi_protocol(&[file_size, file_size, file_size, file_size], 16 * 1024)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        let iterations = 20u32;
+
+        // 单段:文件 0 内 [0, 64KB-1](1 段,64KB)
+        let single_len = 64 * 1024u64;
+        // 预热
+        for _ in 0..3 {
+            let s = protocol
+                .download_range_stream(&url, 0, single_len - 1)
+                .await
+                .unwrap();
+            let _ = collect_stream(s).await;
+        }
+        let single_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = protocol
+                .download_range_stream(&url, 0, single_len - 1)
+                .await
+                .unwrap();
+            let collected = collect_stream(s).await;
+            debug_assert_eq!(collected.len() as u64, single_len);
+        }
+        let single_elapsed = single_start.elapsed();
+
+        // 多段:跨 4 文件 [0, 1MB-1](4 段,每段 256KB,总 1MB)
+        let multi_len = 4 * file_size as u64;
+        // 预热
+        for _ in 0..3 {
+            let s = protocol
+                .download_range_stream(&url, 0, multi_len - 1)
+                .await
+                .unwrap();
+            let _ = collect_stream(s).await;
+        }
+        let multi_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = protocol
+                .download_range_stream(&url, 0, multi_len - 1)
+                .await
+                .unwrap();
+            let collected = collect_stream(s).await;
+            debug_assert_eq!(collected.len() as u64, multi_len);
+        }
+        let multi_elapsed = multi_start.elapsed();
+
+        let single_per_us = single_elapsed.as_micros() / iterations as u128;
+        let multi_per_us = multi_elapsed.as_micros() / iterations as u128;
+        // per-byte 归一化:多段读 4x 字节,若开销仅来自 I/O 则 per-byte 应接近;
+        // 额外的段拼接开销体现在多段 per-byte 略高
+        let single_per_byte_ns =
+            single_elapsed.as_nanos() / (iterations as u128 * single_len as u128);
+        let multi_per_byte_ns = multi_elapsed.as_nanos() / (iterations as u128 * multi_len as u128);
+        eprintln!(
+            "range_stream 单段(1段 {single_len}B): {single_per_us} µs/op, \
+             {single_per_byte_ns} ns/byte | \
+             多段(4段 {multi_len}B): {multi_per_us} µs/op, {multi_per_byte_ns} ns/byte"
+        );
+        // 回归监控:多段 per-byte 不应比单段差 10x(段拼接开销有界)
+        // 放宽阈值因本地磁盘 pread 波动;主要供同会话对比观测
+        assert!(
+            multi_per_byte_ns < single_per_byte_ns * 10,
+            "多段 per-byte {multi_per_byte_ns} ns 不应比单段 {single_per_byte_ns} 差 10x"
         );
     }
 }

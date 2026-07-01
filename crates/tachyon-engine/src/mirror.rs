@@ -25,6 +25,9 @@ use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 /// 源 URL + Protocol 对
 type Source = (String, Arc<dyn Protocol>);
 
+/// 单源 probe 超时(修复 MEDIUM-3:防源挂起致永久阻塞/detached 任务泄漏)
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 源质量统计(轻量,engine 内自管)
 ///
 /// 记录每源的成功/失败次数、累计字节/耗时,派生 quality(0~1,越高越好)。
@@ -368,11 +371,23 @@ impl Protocol for MirrorProtocol {
 
             // 并行 probe 所有源,首成功即返回(修复 BUG-H:不等慢源)
             // 剩余源后台 spawn,完成时补全 probe_ok(least-in-flight 后续可用更多源)
+            // 修复 MEDIUM-3:probe 闭包加 timeout,防源挂起导致永久阻塞/detached 任务泄漏
             let mut set = JoinSet::new();
             for (i, (src_url, proto)) in sources.iter().enumerate() {
                 let p = proto.clone();
                 let u = if i == 0 { url.clone() } else { src_url.clone() };
-                set.spawn(async move { (i, p.probe(&u).await) });
+                set.spawn(async move {
+                    // 单源 probe 超时 30s,超时视为该源失败(不阻塞首成功返回)
+                    match tokio::time::timeout(PROBE_TIMEOUT, p.probe(&u)).await {
+                        Ok(result) => (i, result),
+                        Err(_) => (
+                            i,
+                            Err(DownloadError::Protocol(format!(
+                                "probe 超时({PROBE_TIMEOUT:?}): {u}"
+                            ))),
+                        ),
+                    }
+                });
             }
 
             let mut first_ok_meta: Option<FileMetadata> = None;
@@ -404,9 +419,15 @@ impl Protocol for MirrorProtocol {
 
             // 第二阶段:剩余 probe 任务后台 spawn,完成时补全 probe_ok
             // set 还持有未完成的 probe,detach 让它们继续跑
+            // 修复 MEDIUM-3:detached spawn 的 join_next 加超时,防慢源永久驻留 runtime
             let probe_ok_bg = probe_ok.clone();
             tokio::spawn(async move {
-                while let Some(result) = set.join_next().await {
+                // 每个剩余 probe 最多再等 PROBE_TIMEOUT,超时即放弃补全(首成功已返回,
+                // 慢源即使后续成功也非关键)。逐次 join_next + timeout 避免整体超时
+                // 误杀快源。
+                while let Ok(Some(result)) =
+                    tokio::time::timeout(PROBE_TIMEOUT, set.join_next()).await
+                {
                     if let Ok((idx, Ok(_))) = result {
                         probe_ok_bg.lock().await.insert(idx);
                     }
@@ -1162,6 +1183,70 @@ mod tests {
         assert!(
             improvement > 10.0,
             "多源并发收益 {improvement:.0}% 未达 10% 门禁(单源 {single_elapsed:?} vs 多源 {multi_elapsed:?})"
+        );
+    }
+
+    /// bench 缺口 3:选源锁开销监控(零延迟,隔离 in_flight/stats 锁竞争)
+    ///
+    /// 4 源零 delay,128 分片并发 download_range_stream。对比"直连主源"(绕过
+    /// MirrorProtocol 选源)的基线,隔离 least-in-flight 选源路径的纯锁开销。
+    /// 断言绝对值 <1ms(非百分比,避免 Windows 调度波动),作回归监控防恶化。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_source_selection_lock_overhead() {
+        let fast = Arc::new(MockProtocol::new()); // delay=0
+        let slow = Arc::new(MockProtocol::new());
+        let mp = Arc::new(MirrorProtocol::new(
+            fast.clone(),
+            vec![("http://slow/file".into(), slow.clone())],
+        ));
+
+        let frag_count = 128u64;
+
+        // 直连基线:绕过 MirrorProtocol,直接调主源 download_range_stream
+        let mut handles = tokio::task::JoinSet::new();
+        let direct_start = std::time::Instant::now();
+        for i in 0..frag_count {
+            let fast = fast.clone();
+            handles.spawn(async move {
+                let stream = fast
+                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                    .await
+                    .unwrap();
+                use futures::StreamExt;
+                let mut s = Box::pin(stream);
+                while s.next().await.is_some() {}
+            });
+        }
+        while handles.join_next().await.is_some() {}
+        let direct_elapsed = direct_start.elapsed();
+
+        // 经 MirrorProtocol 选源:含 in_flight/stats 锁 + candidates 排序 + quality 计算
+        let mut handles = tokio::task::JoinSet::new();
+        let select_start = std::time::Instant::now();
+        for i in 0..frag_count {
+            let mp = mp.clone();
+            handles.spawn(async move {
+                let stream = mp
+                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                    .await
+                    .unwrap();
+                use futures::StreamExt;
+                let mut s = Box::pin(stream);
+                while s.next().await.is_some() {}
+            });
+        }
+        while handles.join_next().await.is_some() {}
+        let select_elapsed = select_start.elapsed();
+
+        let overhead = select_elapsed.saturating_sub(direct_elapsed);
+        eprintln!(
+            "选源锁开销: 直连 {direct_elapsed:?} vs 选源 {select_elapsed:?}, \
+             开销 {overhead:?} (128 分片, 4 源, 零延迟)"
+        );
+        // 回归监控:选源锁开销绝对值应 <1ms(零延迟下纯锁竞争)
+        assert!(
+            overhead < std::time::Duration::from_millis(1),
+            "选源锁开销 {overhead:?} 超过 1ms,可能存在锁竞争恶化"
         );
     }
 }

@@ -788,4 +788,39 @@ mod tests {
         );
         assert!(per_op_us > 0);
     }
+
+    /// bench 缺口 2:storage read_multi 跨边界 timing(对称 write_at_mut)
+    ///
+    /// read_multi 是 verify 阶段读盘哈希的跨文件路径。用 NoopStorage 隔离 I/O,
+    /// 对照 write_at_mut large_file 基线(~1500µs/4MB),确认读路径无异常开销。
+    #[tokio::test]
+    async fn test_multi_read_at_large_file_timing() {
+        let n_files = 4;
+        let file_len = 1024 * 1024u64; // 1MB 每文件
+        let total = n_files as u64 * file_len; // 4MB
+        let ss = make_noop_multi_storage_set(n_files, file_len);
+
+        let batch_size = total as usize; // 4MB 读跨 3 边界
+        let iterations = 200u32;
+
+        // 预热
+        for _ in 0..10 {
+            let mut buf = vec![0u8; batch_size];
+            let _ = ss.read_at(0, &mut buf).await.unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let mut buf = vec![0u8; batch_size];
+            let read = ss.read_at(0, &mut buf).await.unwrap();
+            assert_eq!(read, batch_size);
+        }
+        let elapsed = start.elapsed();
+        let per_op_us = elapsed.as_micros() / iterations as u128;
+        eprintln!(
+            "StorageSet::read_at 大文件(4x1MB) 跨 3 边界 4MB batch: \
+             {iterations} 次 {elapsed:?} = {per_op_us} µs/op"
+        );
+        assert!(per_op_us > 0);
+    }
 }

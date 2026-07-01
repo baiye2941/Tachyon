@@ -237,7 +237,9 @@ impl FileLayout {
     pub fn total_len(&self) -> u64 {
         self.files
             .last()
-            .map(|f| f.global_offset + f.len)
+            // 修复 MEDIUM-1:global_offset + len 可能溢出(恶意 torrent 元数据构造超大 offset),
+            // 用 saturating_add 饱和到 u64::MAX,与 split_range 的 span_end 一致
+            .map(|f| f.global_offset.saturating_add(f.len))
             .unwrap_or(0)
     }
 
@@ -269,7 +271,9 @@ impl FileLayout {
         let mut out = Vec::new();
         for span in &self.files {
             let span_start = span.global_offset;
-            let span_end = span.global_offset + span.len; // exclusive
+            // 修复 MEDIUM-1:global_offset + len 可能溢出(恶意 torrent 元数据),
+            // 用 saturating_add 饱和到 u64::MAX(语义:到末尾)
+            let span_end = span.global_offset.saturating_add(span.len); // exclusive
             // 该文件区间 [span_start, span_end) 与 [start, end_exclusive) 的交集
             let lo = start.max(span_start);
             let hi = end_exclusive.min(span_end);
@@ -743,6 +747,66 @@ mod tests {
         assert!(
             layout.split_range(50, 49).is_empty(),
             "start > end 应返回空"
+        );
+    }
+
+    /// 修复 MEDIUM-1:global_offset + len 溢出时不应 panic,应饱和到 u64::MAX
+    #[test]
+    fn test_file_layout_span_end_overflow_saturates() {
+        // 构造一个 global_offset 接近 u64::MAX 的 span,len 使 global_offset+len 溢出
+        let layout = FileLayout::from_spans(vec![FileSpan {
+            file_id: 0,
+            global_offset: u64::MAX - 10,
+            len: 100,
+            name: "overflow.bin".into(),
+        }]);
+        // total_len 应饱和到 u64::MAX,不 panic
+        assert_eq!(layout.total_len(), u64::MAX);
+        // split_range 应正常工作:span_end 饱和到 MAX,range [MAX-10, MAX-5] 命中该 span
+        let segs = layout.split_range(u64::MAX - 10, u64::MAX - 5);
+        assert_eq!(segs.len(), 1, "应命中溢出 span 的单段");
+        assert_eq!(segs[0].0, 0, "file_id 应为 0");
+        assert_eq!(segs[0].1, 0, "local_start 应为 0(span 起点即 range 起点)");
+    }
+
+    /// bench 缺口 1a:split_range 纯 CPU 折算开销 micro-bench
+    ///
+    /// split_range 是 magnet download_range_stream 和 storage Multi read/write 的公共
+    /// 折算层,每次跨文件 range 调用一次。隔离测量其纯 CPU 开销(无 I/O),
+    /// 确认在大文件多文件场景(16 文件,跨 15 边界)下不成为瓶颈。
+    #[test]
+    fn bench_split_range_cross_boundary() {
+        // 16 个 1MB 文件,总 16MB
+        let n_files = 16usize;
+        let file_len = 1024 * 1024u64;
+        let spans: Vec<FileSpan> = (0..n_files)
+            .map(|i| FileSpan {
+                file_id: i,
+                global_offset: i as u64 * file_len,
+                len: file_len,
+                name: format!("f{i}"),
+            })
+            .collect();
+        let layout = FileLayout::from_spans(spans);
+        let total = layout.total_len();
+
+        // 跨 15 个边界的 range:[0, total-1]
+        let iterations = 100_000u32;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let segs = layout.split_range(0, total - 1);
+            // 防优化:确认段数正确(16 段,每段一文件)
+            debug_assert_eq!(segs.len(), n_files);
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!(
+            "split_range 跨 {n_files} 文件边界: {iterations} 次 {elapsed:?} = {per_op_ns} ns/op"
+        );
+        // 纯 CPU 折算应在微秒级以下;硬断言 <10µs(回归监控,防恶化)
+        assert!(
+            per_op_ns < 10_000,
+            "split_range 单次应 <10µs,实际 {per_op_ns} ns"
         );
     }
 }

@@ -309,16 +309,15 @@ impl AsyncStorage for WinFile {
                 self.file.clone()
             };
 
-            let data_ptr = data.as_mut_ptr() as usize;
-            let data_len = data.len();
             let write_lock = self.write_lock.clone();
+            // CRITICAL 修复:复制成 owned Bytes move 进 spawn_blocking,消除裸指针 UAF
+            // (future 被 select! 取消时 batch drop 但 spawn_blocking 任务仍跑)
+            let data_bytes = bytes::Bytes::copy_from_slice(&data[..]);
             tokio::task::spawn_blocking(move || {
                 // seek_write 非原子,串行化保证并发写不交错文件指针
                 let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
-                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
-                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 target_file
-                    .seek_write(slice, offset)
+                    .seek_write(&data_bytes, offset)
                     .map_err(DownloadError::Io)
             })
             .await
@@ -439,12 +438,11 @@ impl AsyncStorage for WinFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
-            let data_ptr = data.as_mut_ptr() as usize;
-            let data_len = data.len();
+            // CRITICAL 修复:复制成 owned Bytes move 进 spawn_blocking,消除裸指针 UAF
+            let data_bytes = bytes::Bytes::copy_from_slice(&data[..]);
             tokio::task::spawn_blocking(move || {
-                // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
-                let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
-                file.write_at(slice, offset).map_err(DownloadError::Io)
+                file.write_at(&data_bytes, offset)
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?

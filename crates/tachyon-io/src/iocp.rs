@@ -1161,23 +1161,31 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
             if needs_fallback {
                 let fallback_file = self.get_or_init_fallback()?;
-                let data_ptr = data.as_mut_ptr() as usize;
-                let data_len = data.len();
+                // CRITICAL 修复:复制成 owned Bytes move 进 spawn_blocking,消除裸指针 UAF
+                // (future 被 select! 取消时 batch drop 但 spawn_blocking 任务仍跑)
+                let data_bytes = bytes::Bytes::copy_from_slice(&data[..]);
                 return tokio::task::spawn_blocking(move || {
                     use std::os::windows::fs::FileExt;
-                    // Safety: data_ptr 来自 &mut BytesMut，在 await 返回前始终有效。
-                    let slice =
-                        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                     fallback_file
-                        .seek_write(slice, offset)
+                        .seek_write(&data_bytes, offset)
                         .map_err(DownloadError::Io)
                 })
                 .await
                 .map_err(|e| DownloadError::Io(e.into()))?;
             }
 
-            self.submit_iocp_write(offset, data.as_mut_ptr() as usize, data.len(), None)
-                .await
+            // CRITICAL 修复:复制成 owned Bytes 传入 keep_alive,消除裸指针 UAF。
+            // 旧实现传 None(依赖 &mut BytesMut 生命周期),但 future 被 select! 取消时
+            // batch drop,IOCP 内核操作仍持裸指针 → UAF。owned Bytes 由 PendingWrite.data
+            // 持有,内核完成前不被释放。
+            let data_bytes = bytes::Bytes::copy_from_slice(&data[..]);
+            self.submit_iocp_write(
+                offset,
+                data_bytes.as_ptr() as usize,
+                data_bytes.len(),
+                Some(data_bytes),
+            )
+            .await
         })
     }
 }
