@@ -15,6 +15,7 @@
 //!   走 `wait_until_completed` + 磁盘读两段式
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -172,6 +173,45 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     Ok(())
 }
 
+/// 从磁力链接解析 `&pe=` 参数为 peer 地址列表(BEP 9)
+///
+/// magnet URI 可含多个 `pe=host:port` 参数,返回所有合法 SocketAddr。
+/// 非法格式跳过(不报错,容错)。
+pub fn parse_pe_from_magnet(uri: &str) -> Vec<SocketAddr> {
+    uri[8..] // 跳过 "magnet:?"
+        .split('&')
+        .filter_map(|param| {
+            let lower = param.to_ascii_lowercase();
+            lower
+                .strip_prefix("pe=")
+                .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        })
+        .collect()
+}
+
+#[test]
+fn test_parse_pe_from_magnet_extracts_addrs() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&pe=1.2.3.4:6881&pe=5.6.7.8:6882";
+    let addrs = parse_pe_from_magnet(uri);
+    assert_eq!(addrs.len(), 2);
+    assert_eq!(addrs[0].to_string(), "1.2.3.4:6881");
+    assert_eq!(addrs[1].to_string(), "5.6.7.8:6882");
+}
+
+#[test]
+fn test_parse_pe_from_magnet_no_pe_param() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    let addrs = parse_pe_from_magnet(uri);
+    assert!(addrs.is_empty());
+}
+
+#[test]
+fn test_parse_pe_from_magnet_invalid_addr_skipped() {
+    let uri = "magnet:?xt=urn:btih:abc&pe=invalid&pe=1.2.3.4:6881";
+    let addrs = parse_pe_from_magnet(uri);
+    assert_eq!(addrs.len(), 1); // invalid 被跳过
+}
+
 /// 对等节点健康状态源(供 `make_chunk_stream` 判断 swarm 是否活跃)
 ///
 /// 生产实现包装 `ManagedTorrent::stats_snapshot()`;测试实现可 mock。
@@ -323,14 +363,27 @@ fn resolve_first_file_path(
 ///
 /// `download_dir` 用于设置输出目录，`overwrite` 设为 true 允许覆盖已有文件
 /// （磁力链接可能重复添加同一资源，BT 协议本身支持断点续传）。
+///
+/// `force_tracker_interval` 透传 librqbit `AddTorrentOptions.force_tracker_interval`,
+/// 强制定期回连 tracker 刷新 peer 列表(None 禁用,由 librqbit 默认策略决定)。
+/// `initial_peers` 透传 `AddTorrentOptions.initial_peers`,预置已知 peer 直连
+/// (BEP 9 magnet `&pe=` 参数解析出的地址 + 配置 `peer_addrs`)。
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
     download_dir: &std::path::Path,
+    force_tracker_interval: Option<Duration>,
+    initial_peers: Vec<SocketAddr>,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
     let opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(download_dir.to_string_lossy().into()),
+        force_tracker_interval,
+        initial_peers: if initial_peers.is_empty() {
+            None
+        } else {
+            Some(initial_peers)
+        },
         ..Default::default()
     };
     session
@@ -358,7 +411,31 @@ impl Protocol for MagnetProtocol {
         let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
+            // force_tracker_interval: 0 禁用(None),否则按配置秒数强制 tracker 回连间隔
+            let force_tracker_interval = if config.force_tracker_interval_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(config.force_tracker_interval_secs))
+            };
+            // initial_peers: magnet &pe= 参数解析(BEP 9) + 配置 peer_addrs,合并去重前合并
+            let initial_peers = {
+                let mut addrs = parse_pe_from_magnet(&url);
+                addrs.extend(
+                    config
+                        .peer_addrs
+                        .iter()
+                        .filter_map(|s| s.parse::<SocketAddr>().ok()),
+                );
+                addrs
+            };
+            let handle = add_magnet_to_session(
+                &session,
+                &url,
+                &download_dir,
+                force_tracker_interval,
+                initial_peers,
+            )
+            .await?;
 
             // 等待元数据就绪（带超时）
             let timeout = Duration::from_secs(config.metadata_timeout_secs);
@@ -467,7 +544,14 @@ impl Protocol for MagnetProtocol {
             let (handle, layout) = if let Some(entry) = handle_cache.get(&url) {
                 (Arc::clone(&entry.0), entry.1.clone())
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
@@ -554,7 +638,14 @@ impl Protocol for MagnetProtocol {
             let handle = if let Some(entry) = handle_cache.get(&url) {
                 Arc::clone(&entry.0)
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
@@ -605,7 +696,14 @@ impl Protocol for MagnetProtocol {
             let handle = if let Some(entry) = handle_cache.get(&url) {
                 Arc::clone(&entry.0)
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 let layout = h
                     .with_metadata(|m| {
                         let spans: Vec<FileSpan> = m
