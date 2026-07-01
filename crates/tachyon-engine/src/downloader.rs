@@ -2102,7 +2102,7 @@ impl DownloadTask {
         };
         match execute_err {
             Ok(()) => {}
-            Err(ref e) if self.should_try_bt_fallback() => {
+            Err(ref e) if self.should_try_bt_fallback(e) => {
                 tracing::warn!(error = %e, "主源下载失败,尝试 BT fallback");
                 self.execute_bt_fallback().await?;
             }
@@ -2163,33 +2163,34 @@ impl DownloadTask {
 
     /// 判断主源下载失败后是否应尝试 BT fallback。
     ///
-    /// 条件:`bt_fallback` 存在(P2SP 混合模式,即 `with_hybrid_sources` 构造)。
-    /// 纯 HTTP / 纯 BT 路径无 `bt_fallback`,不触发,失败直接向上传播。
+    /// 条件:`bt_fallback` 存在(P2SP 混合模式,即 `with_hybrid_sources` 构造)
+    /// **且**失败错误不是 `DownloadError::Cancelled`。纯 HTTP / 纯 BT 路径无
+    /// `bt_fallback`,不触发,失败直接向上传播。
     ///
-    /// **layout 兼容性简化**:理论上严格 fallback 需「单文件 BT + 单文件 HTTP +
-    /// 大小一致」才允许(避免 range 分片 layout 冲突)。但 BT fallback 走
-    /// `download_full_stream`(整文件从 offset 0 顺序写入),不参与 range 分片,
-    /// 与 HTTP 的 range layout 冲突风险低。本任务不实现严格 layout 校验(需 BT probe
-    /// metadata,而 BT probe 是后台异步的,无法在此同步获取);若 BT `download_full_stream`
-    /// 自身失败,自然返回错误降级,不会写入错乱数据。
+    /// **排除 `Cancelled`**:用户主动取消(`DownloadError::Cancelled`)是确定的终态语义,
+    /// 不应再启动一次无意义的 BT 整文件下载,也不应掩盖取消语义。`Cancelled` 需立即向上
+    /// 传播,由 `run_inner` 的 `Err(e) => return Err(e)` 兜底分支处理。
+    ///
+    /// **layout 兼容性**:严格 fallback 需「单文件 BT + 单文件 HTTP + 大小一致」才允许,
+    /// 该校验在 `execute_bt_fallback` 内通过 BT `probe()` metadata 比对实现(见其文档)。
     #[cfg(feature = "magnet")]
-    fn should_try_bt_fallback(&self) -> bool {
-        self.bt_fallback.is_some()
+    fn should_try_bt_fallback(&self, err: &DownloadError) -> bool {
+        self.bt_fallback.is_some() && !matches!(err, DownloadError::Cancelled)
     }
 
     #[cfg(not(feature = "magnet"))]
-    fn should_try_bt_fallback(&self) -> bool {
+    fn should_try_bt_fallback(&self, _err: &DownloadError) -> bool {
         false
     }
 
     /// BT fallback 执行桩(无 magnet feature)。
     ///
-    /// 此方法在 `should_try_bt_fallback()` 恒为 `false` 时**不可达**(`run_inner`
-    /// 的 `Err(ref e) if self.should_try_bt_fallback()` 守卫保证),仅为让
+    /// 此方法在 `should_try_bt_fallback(..)` 恒为 `false` 时**不可达**(`run_inner`
+    /// 的 `Err(ref e) if self.should_try_bt_fallback(e)` 守卫保证),仅为让
     /// `run_inner` 的 fallback 分支在非 magnet 编译下通过方法解析而存在。
     #[cfg(not(feature = "magnet"))]
     async fn execute_bt_fallback(&mut self) -> DownloadResult<()> {
-        // 不可达:should_try_bt_fallback() 在非 magnet 下恒 false,守卫已挡住此分支。
+        // 不可达:should_try_bt_fallback(..) 在非 magnet 下恒 false,守卫已挡住此分支。
         unreachable!("execute_bt_fallback 在非 magnet 编译下不应被调用")
     }
 
@@ -2198,12 +2199,51 @@ impl DownloadTask {
     /// 由 `run_inner` 步骤 4 在主源 `execute()` 失败且 `should_try_bt_fallback()` 为真时调用。
     /// BT 协议以流式方式产出整个文件数据,写入与 HTTP 路径相同的 engine storage
     /// (offset 0 起,顺序追加)。失败则向上返回错误(自然降级,不写错乱数据)。
+    ///
+    /// **layout 兼容校验(修复 I-3)**:`download_full_stream` 返回 BT 全局字节流,
+    /// 但 engine storage 是按 HTTP 主源 probe 结果(`self.metadata`)初始化的单文件 layout。
+    /// 若 BT 是多文件 torrent,`download_full_stream` 只产出第一个文件的字节流,
+    /// 从 offset 0 写入会导致 storage 大小不匹配 / 内容错乱。因此在下载前先 `probe()`
+    /// 拿 BT metadata,与 HTTP metadata 比对:
+    /// - BT `file_count > 1` → 多文件 torrent,HTTP 单文件 layout 不兼容,返回错误;
+    /// - BT `file_size != HTTP file_size` → 大小不一致,返回错误;
+    /// - 单文件 + 大小一致(或 HTTP 无 size 信息) → 继续 `download_full_stream`。
     #[cfg(feature = "magnet")]
     async fn execute_bt_fallback(&mut self) -> DownloadResult<()> {
         let bt_proto = self.bt_fallback.as_ref().ok_or_else(|| {
             DownloadError::Other("BT fallback 不可用(bt_fallback 为 None)".into())
         })?;
         tracing::info!("启动 BT fallback 整文件下载");
+
+        // layout 兼容校验:BT probe 拿 metadata,与 HTTP 主源 self.metadata 比对。
+        // BT probe 失败直接返回错误(拿不到 metadata 无法校验,且后续 download 也大概率失败)。
+        let bt_meta = bt_proto.probe(&self.url).await.map_err(|e| {
+            tracing::warn!(error = %e, "BT fallback probe 失败");
+            e
+        })?;
+        if let Some(http_meta) = &self.metadata {
+            let bt_file_count = bt_meta
+                .file_layout
+                .as_ref()
+                .map(|l| l.file_count())
+                .unwrap_or(1);
+            if bt_file_count > 1 {
+                return Err(DownloadError::Other(format!(
+                    "BT fallback 不支持多文件 torrent({bt_file_count} 文件),HTTP 主源 layout 不兼容"
+                )
+                .into()));
+            }
+            if bt_meta.file_size != http_meta.file_size {
+                return Err(DownloadError::Other(
+                    format!(
+                        "BT fallback layout 不兼容:BT 大小 {} != HTTP 大小 {:?}",
+                        bt_meta.file_size.unwrap_or(0),
+                        http_meta.file_size
+                    )
+                    .into(),
+                ));
+            }
+        }
 
         // BT 走 download_full_stream,返回 ByteStream(与 HTTP execute_full_download 同构)。
         // 失败直接返回错误 —— 不再 fallback(已无更低层源)。
