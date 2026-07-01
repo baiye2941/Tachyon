@@ -17,7 +17,6 @@ tachyon-crypto = { path = "../tachyon-crypto" }
 tachyon-scheduler = { path = "../tachyon-scheduler" }
 tokio.workspace = true
 tokio-stream.workspace = true
-blake3.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 futures.workspace = true

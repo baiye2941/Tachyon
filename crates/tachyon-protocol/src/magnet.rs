@@ -1143,21 +1143,23 @@ mod tests {
 
         let single_per_us = single_elapsed.as_micros() / iterations as u128;
         let multi_per_us = multi_elapsed.as_micros() / iterations as u128;
-        // per-byte 归一化:多段读 4x 字节,若开销仅来自 I/O 则 per-byte 应接近;
+        // per-byte 归一化(浮点,避免小数据整数除法截断为 0 导致 CI flaky):
+        // 多段读 4x 字节,若开销仅来自 I/O 则 per-byte 应接近;
         // 额外的段拼接开销体现在多段 per-byte 略高
         let single_per_byte_ns =
-            single_elapsed.as_nanos() / (iterations as u128 * single_len as u128);
-        let multi_per_byte_ns = multi_elapsed.as_nanos() / (iterations as u128 * multi_len as u128);
+            single_elapsed.as_nanos() as f64 / (iterations as f64 * single_len as f64);
+        let multi_per_byte_ns =
+            multi_elapsed.as_nanos() as f64 / (iterations as f64 * multi_len as f64);
         eprintln!(
             "range_stream 单段(1段 {single_len}B): {single_per_us} µs/op, \
-             {single_per_byte_ns} ns/byte | \
-             多段(4段 {multi_len}B): {multi_per_us} µs/op, {multi_per_byte_ns} ns/byte"
+             {single_per_byte_ns:.2} ns/byte | \
+             多段(4段 {multi_len}B): {multi_per_us} µs/op, {multi_per_byte_ns:.2} ns/byte"
         );
         // 回归监控:多段 per-byte 不应比单段差 10x(段拼接开销有界)
         // 放宽阈值因本地磁盘 pread 波动;主要供同会话对比观测
         assert!(
-            multi_per_byte_ns < single_per_byte_ns * 10,
-            "多段 per-byte {multi_per_byte_ns} ns 不应比单段 {single_per_byte_ns} 差 10x"
+            multi_per_byte_ns < single_per_byte_ns * 10.0,
+            "多段 per-byte {multi_per_byte_ns:.2} ns 不应比单段 {single_per_byte_ns:.2} 差 10x"
         );
     }
 

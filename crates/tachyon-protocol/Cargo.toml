@@ -14,14 +14,11 @@ tachyon-core = { path = "../tachyon-core" }
 reqwest.workspace = true
 tokio.workspace = true
 bytes.workspace = true
-url.workspace = true
 tracing.workspace = true
 futures.workspace = true
 dashmap.workspace = true
-rcgen = { workspace = true }
 librqbit = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
-rcgen.workspace = true
