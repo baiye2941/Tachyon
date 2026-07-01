@@ -36,7 +36,7 @@ use tachyon_scheduler::AdaptiveDownloadScheduler;
 
 use crate::circuit_breaker::SourceCircuitBreakers;
 use crate::mirror::MirrorProtocol;
-use crate::storage_adapter::DynStorage;
+use crate::storage_adapter::{DynStorage, StorageSet};
 use tachyon_io::buffer::{BufferGuard, BufferPool};
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
@@ -106,7 +106,8 @@ pub struct DownloadTask {
     config: DownloadConfig,
     protocol: Arc<dyn Protocol>,
     /// 延迟初始化:probe() 后通过 init_storage() 创建
-    storage: Option<Arc<DynStorage>>,
+    /// 单文件用 StorageSet::Single(透传 DynStorage),多文件用 StorageSet::Multi(按 FileLayout 折算)
+    storage: Option<Arc<StorageSet>>,
     scheduler_config: SchedulerConfig,
     scheduler: Arc<dyn DownloadScheduler>,
     pool: Option<Arc<ConnectionPool>>,
@@ -395,7 +396,44 @@ impl DownloadTask {
             url,
             config,
             protocol,
-            storage: Some(Arc::new(storage)),
+            storage: Some(Arc::new(StorageSet::single(storage))),
+            scheduler_config: SchedulerConfig::default(),
+            scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
+            pool: None,
+            buffer_pool: None,
+            control_rx: None,
+            state: DownloadState::Pending,
+            metadata: None,
+            fragments: Vec::new(),
+            progress_tx: None,
+            verifier: default_blake3_verifier(),
+            completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
+            rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_session: None,
+        }
+    }
+
+    /// 测试构造器:不预置 storage,让 init_storage() 走真实路径(含 Multi 构造)
+    ///
+    /// 用于多文件端到端测试:probe 设置 metadata(含 file_layout)后,
+    /// init_storage 据 file_layout 构造 StorageSet::Multi。
+    #[cfg(test)]
+    fn new_for_test_no_storage(
+        url: String,
+        config: DownloadConfig,
+        protocol: Arc<dyn Protocol>,
+    ) -> Self {
+        Self {
+            id: TaskId::new_v4(),
+            url,
+            config,
+            protocol,
+            storage: None,
             scheduler_config: SchedulerConfig::default(),
             scheduler: Arc::new(AdaptiveDownloadScheduler::default_config()),
             pool: None,
@@ -580,20 +618,54 @@ impl DownloadTask {
 
         let safe_name = &metadata.file_name;
         let download_dir = std::path::Path::new(&self.config.download_dir);
-        let final_path = download_dir.join(safe_name);
 
-        // 纵深防御:校验路径不逃逸下载目录
-        let canonical_path = tachyon_core::validate_save_path(&final_path, download_dir)?;
-
-        info!(
-            safe_name = %safe_name,
-            save_path = %canonical_path.display(),
-            io_strategy = ?self.config.io_strategy,
-            "路径安全校验通过,创建存储"
-        );
-
-        let storage =
-            DynStorage::open_with_strategy(&canonical_path, self.config.io_strategy).await?;
+        // 多文件 torrent:metadata.file_layout 携带各文件段,构造 StorageSet::Multi
+        // 单文件(含 HTTP/FTP/单文件 torrent):file_layout 为 None,走 Single 路径
+        let storage = if let Some(layout) = metadata.file_layout.as_ref() {
+            if layout.file_count() > 1 {
+                let file_names = layout.file_names();
+                let paths =
+                    tachyon_core::validate_multi_save_paths(download_dir, safe_name, &file_names)?;
+                info!(
+                    torrent_name = %safe_name,
+                    file_count = paths.len(),
+                    io_strategy = ?self.config.io_strategy,
+                    "多文件路径安全校验通过,创建多文件存储"
+                );
+                let mut storages = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    storages
+                        .push(DynStorage::open_with_strategy(p, self.config.io_strategy).await?);
+                }
+                StorageSet::multi(storages, layout.clone())
+            } else {
+                // 单文件 torrent(file_layout 存在但只有 1 个文件)
+                let final_path = download_dir.join(safe_name);
+                let canonical_path = tachyon_core::validate_save_path(&final_path, download_dir)?;
+                info!(
+                    safe_name = %safe_name,
+                    save_path = %canonical_path.display(),
+                    io_strategy = ?self.config.io_strategy,
+                    "路径安全校验通过,创建存储"
+                );
+                let s = DynStorage::open_with_strategy(&canonical_path, self.config.io_strategy)
+                    .await?;
+                StorageSet::single(s)
+            }
+        } else {
+            // HTTP/FTP:无 file_layout,单文件
+            let final_path = download_dir.join(safe_name);
+            let canonical_path = tachyon_core::validate_save_path(&final_path, download_dir)?;
+            info!(
+                safe_name = %safe_name,
+                save_path = %canonical_path.display(),
+                io_strategy = ?self.config.io_strategy,
+                "路径安全校验通过,创建存储"
+            );
+            let s =
+                DynStorage::open_with_strategy(&canonical_path, self.config.io_strategy).await?;
+            StorageSet::single(s)
+        };
         self.storage = Some(Arc::new(storage));
         Ok(())
     }
@@ -1358,7 +1430,7 @@ impl DownloadTask {
     ///
     /// 通过 `batch.advance(written)` 处理后端短写，保证数据完整落盘。
     async fn write_all_at_mut(
-        storage: &StorageKind,
+        storage: &StorageSet,
         mut pos: u64,
         mut batch: bytes::BytesMut,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
@@ -1396,7 +1468,10 @@ impl DownloadTask {
                     "存储写入总长度溢出: written={total_written}, len={written_u64}"
                 ))
             })?;
-            batch.advance(written);
+            // advance 兼容 Multi 零拷贝路径:Multi::write_at_mut 用 split_to 消费 data,
+            // 成功时 batch 已空,written=原 len > batch.len()=0,直接 advance 会 panic。
+            // min 限制为剩余长度:Single 路径不消费,退化为 advance(written),行为不变。
+            batch.advance(written.min(batch.len()));
         }
         Ok(total_written)
     }
@@ -1410,7 +1485,7 @@ impl DownloadTask {
     /// 保证流式哈希顺序与文件字节顺序一致(双缓冲乱序落盘亦安全)。
     #[allow(clippy::too_many_arguments)]
     async fn flush_batch(
-        storage: &StorageKind,
+        storage: &StorageSet,
         pos: u64,
         batch: bytes::BytesMut,
         hasher: &mut Option<blake3::Hasher>,
@@ -1478,7 +1553,7 @@ impl DownloadTask {
     #[allow(clippy::too_many_arguments)]
     async fn download_single_fragment(
         protocol: &Arc<dyn Protocol>,
-        storage: &Arc<StorageKind>,
+        storage: &Arc<StorageSet>,
         pool: &Option<Arc<ConnectionPool>>,
         host: &str,
         url: &str,
@@ -2184,6 +2259,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
 
         let protocol: Arc<dyn Protocol> = Arc::new(
@@ -2239,6 +2315,99 @@ mod tests {
         assert_eq!(&buf[2 * frag_size as usize..], &frag_c[..]);
     }
 
+    /// 多文件端到端:Metadata 携带 file_layout(两文件),init_storage 构造 StorageSet::Multi,
+    /// run() 经分片下载 → StorageSet 按全局 offset 折算写入各文件 → 落盘到目录,
+    /// 验证两个文件内容正确(跨文件边界的分片也能正确分发)。
+    #[tokio::test]
+    async fn test_run_multi_file_writes_to_directory() {
+        use tachyon_core::{FileLayout, FileSpan};
+        let file0_len = 512u64;
+        let file1_len = 512u64;
+        let total = file0_len + file1_len;
+
+        // 两文件的确定性内容(不同基,便于区分)
+        let data0: Vec<u8> = (0..file0_len).map(|i| (i % 251) as u8).collect();
+        let data1: Vec<u8> = (0..file1_len).map(|i| ((i + 7) % 251) as u8).collect();
+        let global: Vec<u8> = data0.iter().chain(data1.iter()).copied().collect();
+
+        let layout = FileLayout::from_spans(vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: file0_len,
+                name: "a.bin".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: file0_len,
+                len: file1_len,
+                name: "b.bin".into(),
+            },
+        ]);
+
+        let meta = FileMetadata {
+            file_name: "multi_torrent".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            file_layout: Some(layout.clone()),
+        };
+
+        // MockProto:分片按 (start,end) 精确返回对应全局字节切片
+        // 用 frag_size=300 的分片,其中分片 [300,599] 跨 file0/file1 边界(512),
+        // StorageSet::Multi::write_at 会把它拆成 file0 的 [300,511] + file1 的 [0,87],
+        // 真正覆盖跨文件边界分片的多文件分发路径(而非每分片只命中单文件)。
+        let frag_size = 300u64;
+        // 确认 frag_size 确实能跨边界:边界 512 不是 frag_size 的整数倍
+        assert_ne!(
+            file0_len % frag_size,
+            0,
+            "frag_size 必须不整除文件长度,否则分片不跨边界"
+        );
+        let mut protocol = MockProto::new(meta);
+        let mut offset = 0u64;
+        while offset < total {
+            let end = (offset + frag_size - 1).min(total - 1);
+            let chunk = Bytes::from(global[offset as usize..=end as usize].to_vec());
+            protocol = protocol.with_range_data(offset, end, chunk);
+            offset = end + 1;
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(protocol);
+
+        // 临时 download_dir(真实文件系统,验证多文件落盘)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = DownloadConfig {
+            download_dir: tmp.path().to_string_lossy().into_owned(),
+            verify_checksum: false,
+            ..test_config()
+        };
+
+        let sched_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        // 不预置 storage:让 init_storage 据 file_layout 构造 StorageSet::Multi
+        let mut task = DownloadTask::new_for_test_no_storage(
+            "magnet:?xt=urn:btih:fakehash".into(),
+            config,
+            protocol,
+        );
+        task.scheduler_config = sched_config;
+
+        task.run().await.expect("多文件下载流程失败");
+        assert_eq!(task.state(), DownloadState::Completed);
+
+        // 验证两个文件落盘到 multi_torrent/ 子目录,内容正确
+        let file0 = std::fs::read(tmp.path().join("multi_torrent").join("a.bin")).unwrap();
+        let file1 = std::fs::read(tmp.path().join("multi_torrent").join("b.bin")).unwrap();
+        assert_eq!(file0, data0, "file0 (a.bin) 内容应与 data0 一致");
+        assert_eq!(file1, data1, "file1 (b.bin) 内容应与 data1 一致");
+    }
+
     #[tokio::test]
     async fn test_execute_fragmented_download_short_range_stream_errors() {
         let frag_size = 128u64;
@@ -2251,6 +2420,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
 
         let frag_a = Bytes::from(vec![0x11; frag_size as usize]);
@@ -2305,6 +2475,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
 
         let overlong_frag_a = Bytes::from(vec![0x11; frag_size as usize + 1]);
@@ -2361,6 +2532,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
 
         let overlong_frag_a = Bytes::from(vec![0x33; frag_size as usize + 1]);
@@ -2495,6 +2667,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol: Arc<dyn Protocol> = Arc::new(
             MockProto::new(meta)
@@ -2547,6 +2720,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
 
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
@@ -3260,6 +3434,7 @@ mod tests {
             supports_range: true,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta));
         let storage = StorageKind::memory();
@@ -3293,6 +3468,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta));
         let storage = StorageKind::memory();
@@ -4427,6 +4603,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory_with_capacity(data.len());
@@ -4462,6 +4639,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
         let storage = StorageKind::memory();
@@ -4735,6 +4913,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory_with_capacity(data.len());
@@ -5299,17 +5478,27 @@ mod tests {
         let metadata = protocol.probe("http://primary.com/file.bin").await.unwrap();
         assert_eq!(metadata.file_name, "mirror.bin");
 
+        // P2 least-in-flight:probe 都成功后,download 选在途最少源(初始 tie-break 选 index 小=primary)。
+        // 不再"probe 最快的源固定",而是多源并发按在途数选。单次调用可能选 primary 或 mirror。
         let full = protocol
             .download_full("http://primary.com/file.bin")
             .await
             .unwrap();
-        assert_eq!(full, Bytes::from_static(b"mirror-full"));
+        assert!(
+            full == Bytes::from_static(b"primary-full")
+                || full == Bytes::from_static(b"mirror-full"),
+            "least-in-flight 应从 probe 成功的源里选,实际: {full:?}"
+        );
 
         let range = protocol
             .download_range("http://primary.com/file.bin", 0, 11)
             .await
             .unwrap();
-        assert_eq!(range, Bytes::from_static(b"mirror-range"));
+        assert!(
+            range == Bytes::from_static(b"primary-range")
+                || range == Bytes::from_static(b"mirror-range"),
+            "least-in-flight 应从可用源选,实际: {range:?}"
+        );
 
         let mut stream = protocol
             .download_range_stream("http://primary.com/file.bin", 0, 11)
@@ -5319,7 +5508,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(chunk, Bytes::from_static(b"mirror-range"));
+        assert!(
+            chunk == Bytes::from_static(b"primary-range")
+                || chunk == Bytes::from_static(b"mirror-range"),
+            "least-in-flight 流式应从可用源选,实际: {chunk:?}"
+        );
         assert!(tokio_stream::StreamExt::next(&mut stream).await.is_none());
     }
 
@@ -5655,6 +5848,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
         let storage = StorageKind::memory_with_capacity(total_size as usize);
@@ -5698,6 +5892,7 @@ mod tests {
             supports_range: false,
             etag: None,
             last_modified: None,
+            file_layout: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory();

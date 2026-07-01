@@ -114,7 +114,7 @@ impl ChaoticProtocol {
         }
 
         if rng.random::<f64>() < self.config.network_delay_prob {
-            let delay_ms = rng.gen_range(0..=self.config.max_network_delay_ms);
+            let delay_ms = rng.random_range(0..=self.config.max_network_delay_ms);
             drop(rng);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -198,7 +198,7 @@ impl ChaoticStorage {
     async fn maybe_inject_storage_delay(&self) {
         let mut rng = self.rng.lock().await;
         if rng.random::<f64>() < self.config.storage_delay_prob {
-            let delay_ms = rng.gen_range(0..=self.config.max_storage_delay_ms);
+            let delay_ms = rng.random_range(0..=self.config.max_storage_delay_ms);
             drop(rng);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -259,6 +259,7 @@ fn build_mock_protocol(total_size: u64) -> (MockProtocol, Vec<u8>, Vec<FragmentI
         supports_range: true,
         etag: None,
         last_modified: None,
+        file_layout: None,
     };
 
     let scheduler_config = SchedulerConfig::default();
