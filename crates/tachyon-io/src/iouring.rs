@@ -272,6 +272,17 @@ fn validate_odirect_alignment(offset: u64, len: usize) -> DownloadResult<()> {
 struct IoUringHandle {
     /// 驱动任务命令通道
     cmd_tx: tokio::sync::mpsc::Sender<DriverCmd>,
+    /// 驱动任务 JoinHandle(Drop 时 abort + 尝试 join)
+    ///
+    /// H-01: IoUringStorage::drop 期间无法 .await(tokio 任务句柄的 join 需要
+    /// runtime 上下文),但保留 handle 以便在 Drop 中 abort 驱动任务,避免
+    /// 驱动任务在 IoUring 实例被释放后仍访问悬垂资源。
+    ///
+    /// 使用 std::sync::Mutex 而非 tokio::sync::Mutex:Drop 是同步的,
+    /// tokio Mutex 的 lock() 返回 Future 无法在 Drop 中 .await。此处临界区
+    /// 极短(仅 take 一次 JoinHandle),std::sync::Mutex 的阻塞不会跨 await 点
+    /// 持有,不会导致死锁。
+    driver_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 注册的 fixed buffers (Arc 共享，driver task 和调用方均可访问)
     ///
     /// 调用方需要在提交 WriteReq 前将数据复制到 buffer 中，
@@ -279,8 +290,12 @@ struct IoUringHandle {
     /// driver task 只负责构造 SQE 和提交。
     buffers: std::sync::Arc<Vec<AlignedBuffer>>,
     /// fixed buffer 分配位图(1=已占用, 0=空闲)
-    buffer_bitmap: AtomicU64,
-    /// buffer 数量(用于 alloc 失败时的诊断)
+    ///
+    /// M-01: 多字位图,支持超过 64 个 fixed buffer。
+    /// 字数 = `div_ceil(buffer_count, 64)`,最后一个 word 的越界高位预置为 1
+    /// (已占用),防止 alloc 分配到超出 buffer_count 的索引。
+    buffer_bitmap: Box<[AtomicU64]>,
+    /// buffer 数量(用于 alloc 失败时的诊断 + free 时边界检查)
     #[allow(dead_code)]
     buffer_count: usize,
 }
@@ -613,8 +628,12 @@ impl IoUringHandle {
     /// 原子分配一个空闲 fixed buffer 索引。
     ///
     /// 位图不变量: 每一位对应一个 fixed buffer, `1` = 已占用, `0` = 空闲。
-    /// 超出 `buffers.len()` 的高位在初始化时被预置为 `1`(见 `init` 中的 `used_mask`),
-    /// 因此本函数只会选中 `[0, buffers.len()-1]` 范围内的位。
+    /// 超出 `buffers.len()` 的高位在初始化时被预置为 `1`(见 `init` 中的
+    /// `build_buffer_bitmap`),因此本函数只会选中 `[0, buffers.len()-1]` 范围内的位。
+    ///
+    /// M-01: 支持多字位图(超过 64 个 buffer)。遍历每个 word,对其执行
+    /// `(!current).trailing_zeros()` 找空闲位,CAS 占用。全局索引 =
+    /// `word_idx * 64 + bit`,边界由 `buffer_count` 兜底校验。
     ///
     /// 返回的索引保证落在 `buffers` 内,当所有 buffer 都被占用时返回 None。
     fn alloc_buffer_index(&self) -> Option<usize> {
@@ -622,42 +641,87 @@ impl IoUringHandle {
     }
 
     /// 释放 fixed buffer 索引,使其可被后续操作重新分配。
+    ///
+    /// M-01: 多字位图下计算 `word_idx = idx / 64`、`bit = idx % 64`,
+    /// 对相应 word 执行 CAS 清位。idx 越界(>= buffer_count)时静默忽略,
+    /// 防止误清非本 handle 管辖的位。
     fn free_buffer_index(&self, idx: usize) {
-        if idx >= 64 {
+        if idx >= self.buffer_count {
             return;
         }
-        self.buffer_bitmap.fetch_and(!(1 << idx), Ordering::Relaxed);
+        let word_idx = idx / 64;
+        let bit = idx % 64;
+        // word_idx < buffer_bitmap.len() 由 init 保证(div_ceil(buffer_count,64)),
+        // 且 idx < buffer_count 时 word_idx 一定在位图范围内。
+        self.buffer_bitmap[word_idx].fetch_and(!(1u64 << bit), Ordering::Relaxed);
     }
 }
 
-/// 在 AtomicU64 位图上无锁查找并占用第一个空闲位。
+/// 构造 fixed buffer 分配位图(Box<[AtomicU64]>)。
 ///
-/// 位图不变量: `1` = 已占用, `0` = 空闲。
-/// 算法: `(!current).trailing_zeros()` 找出第一个 0 位的索引,
-/// CAS 设置该位以原子声明占用。
+/// M-01: 多字位图。字数 = `div_ceil(buffer_count, 64)`。
+/// 位图语义: `0` = 空闲, `1` = 已占用。最后一个 word 中超出 `buffer_count`
+/// 的高位预置为 `1`(已占用),防止 `alloc` 分配到越界索引——与 `iocp.rs`
+/// 的 `free_bitmap` 初始化模式一致(见 `CompletionSlots::new`)。
+#[cfg(target_os = "linux")]
+fn build_buffer_bitmap(buffer_count: usize) -> Box<[AtomicU64]> {
+    let words = buffer_count.div_ceil(64);
+    // Safety: words == 0 当且仅当 buffer_count == 0,但 init() 在此之前已通过
+    // validate_fixed_buffer_config 拒绝 buffer_count == 0,故 words >= 1。
+    (0..words)
+        .map(|word_idx| {
+            // 本 word 覆盖的位范围: [word_idx*64, word_idx*64 + 64)
+            // excess = 本 word 末位索引 - buffer_count,>0 表示有越界高位。
+            // 使用 i64 运算避免 usize 减法溢出(与 iocp.rs::CompletionSlots::new
+            // 的 free_bitmap 初始化模式一致)。
+            let excess = (word_idx as i64 + 1) * 64 - buffer_count as i64;
+            if excess >= 64 {
+                // 本 word 全部落在 buffer_count 范围内:全空闲
+                AtomicU64::new(0)
+            } else if excess > 0 {
+                // 最后一个 word: 越界高位预置为已占用
+                AtomicU64::new((!0u64) << (64 - excess as usize))
+            } else {
+                // excess <= 0:本 word 全部有效,全空闲
+                AtomicU64::new(0)
+            }
+        })
+        .collect()
+}
+
+/// 在多字 AtomicU64 位图上无锁查找并占用第一个空闲位。
+///
+/// M-01: 遍历每个 word,对 `current` 取反后 `trailing_zeros()` 找第一个 0 位
+/// (即空闲位),CAS 设置该位以原子声明占用。全局索引 = `word_idx * 64 + bit`。
+///
+/// 位图不变量: `1` = 已占用, `0` = 空闲。超出 `buffer_count` 的高位由
+/// `build_buffer_bitmap` 预置为 `1`,此处再做 `idx >= buffer_count` 兜底校验。
 ///
 /// 返回的索引保证 `< buffer_count`(超出范围则返回 None)。
 #[cfg(target_os = "linux")]
-fn bitmap_alloc_first_free(bitmap: &AtomicU64, buffer_count: usize) -> Option<usize> {
-    let mut current = bitmap.load(Ordering::Relaxed);
-    loop {
-        // 取反后 trailing_zeros 给出第一个空闲位(原值的第一个 0)。
-        // 直接对 current 取 trailing_zeros 会得到第一个"已占用"位,语义相反。
-        let idx = (!current).trailing_zeros();
-        if idx >= 64 {
-            return None; // 所有 64 位均为 1, 无空闲 buffer
-        }
-        // 防御性边界: 超出实际 buffer 数量的位不应被选中
-        // (正常情况下 init 的 used_mask 已保证, 此处为双重保险)
-        if idx as usize >= buffer_count {
-            return None;
-        }
-        let next = current | (1u64 << idx);
-        match bitmap.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Some(idx as usize),
-            Err(actual) => current = actual,
+fn bitmap_alloc_first_free(bitmap: &[AtomicU64], buffer_count: usize) -> Option<usize> {
+    for (word_idx, word) in bitmap.iter().enumerate() {
+        let mut current = word.load(Ordering::Relaxed);
+        loop {
+            if current == u64::MAX {
+                break; // 本 word 已满,继续下一个 word
+            }
+            // 取反后 trailing_zeros 给出第一个空闲位(原值的第一个 0)。
+            let bit = (!current).trailing_zeros() as usize;
+            let idx = word_idx * 64 + bit;
+            // 防御性边界: 超出实际 buffer 数量的位不应被选中
+            // (正常情况下 build_buffer_bitmap 已预占高位,此处为双重保险)
+            if idx >= buffer_count {
+                return None;
+            }
+            let next = current | (1u64 << bit);
+            match word.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(idx),
+                Err(actual) => current = actual,
+            }
         }
     }
+    None
 }
 
 /// 分配地址对齐的缓冲区(O_DIRECT/io_uring 要求)
@@ -802,33 +866,29 @@ impl IoUringStorage {
 
         self.file_fd = Some(std::sync::Arc::new(file));
 
-        // 超出 buffer_count 的位标记为已占用,防止分配越界
-        let buffer_count = buffers.len();
-        let used_mask = if buffer_count >= 64 {
-            0u64
-        } else {
-            (!0u64) << buffer_count
-        };
-
         // P1-04: 将 buffers 包装为 Arc，IoUringHandle 和 driver task 共享
         let buffers_arc = std::sync::Arc::new(buffers);
+        let buffer_count = buffers_arc.len();
 
         // P1-04: 启动 driver task，替代 Mutex 串行化
         // driver task 独占 IoUring 实例，通过 channel 接收操作请求，
         // 批量提交 SQE，一次 submit_and_wait(N) 替代逐请求 submit_and_wait(1)
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DriverCmd>(256);
-        let buffers_clone_info = buffer_count; // 用于日志
         let driver_buffers = std::sync::Arc::clone(&buffers_arc);
 
-        tokio::spawn(async move {
+        let driver_join = tokio::spawn(async move {
             driver_task(ring, cmd_rx, driver_buffers).await;
         });
 
+        // M-01: 多字位图,支持超过 64 个 fixed buffer。
+        let buffer_bitmap = build_buffer_bitmap(buffer_count);
+
         self.ring = Some(std::sync::Arc::new(IoUringHandle {
             cmd_tx,
+            driver_join: std::sync::Mutex::new(Some(driver_join)),
             buffers: buffers_arc,
-            buffer_bitmap: AtomicU64::new(used_mask),
-            buffer_count: buffers_clone_info,
+            buffer_bitmap,
+            buffer_count,
         }));
         self.state = IoUringState::Ready;
 
@@ -1056,6 +1116,69 @@ impl IoUringStorage {
     }
 }
 
+/// H-01: IoUringStorage 的 Drop 实现。
+///
+/// io_uring 驱动以独立 tokio task 运行,独占 `IoUring` 实例并通过 channel
+/// 接收操作请求。若不在 `IoUringStorage` 析构时通知驱动退出,则:
+///   1. 驱动 task 持有 `IoUring`(含已注册 fixed buffers 的内核映射)和
+///      `buffers: Arc<Vec<AlignedBuffer>>`,在 Storage drop 后仍存活,
+///      驱动可能在 IoUring / buffers 被释放后继续访问悬垂资源;
+///   2. IoUringHandle 的 Arc 引用计数不会归零,buffer_bitmap / channel
+///      等资源泄漏,直到驱动 task 自行结束(可能永不结束)。
+///
+/// Drop 策略(参照 `iocp.rs` 的 cancel + drain + join 模式,适配 tokio task):
+///   1. 尝试发送 `DriverCmd::Shutdown` 让驱动优雅退出(非阻塞——
+///      Drop 是同步的,不能 `.await`,故用 `try_send`);
+///   2. 若发送失败(channel 已满或驱动已退出)或驱动未及时结束,调用
+///      `JoinHandle::abort()` 强制取消驱动 task,避免资源泄漏;
+///   3. 轮询 `is_finished()` 短暂等待(最长约 100ms),给驱动一个收尾机会,
+///      但不阻塞调用方过久——这与 `iocp.rs::drain_pending_completions`
+///      的有界等待意图一致。
+///
+/// 注意:Drop 中不能 `.await`(无 async 上下文),故 join 采用同步轮询而非
+/// `JoinHandle::await`。即使驱动未在窗口内退出,`abort()` 也已请求取消,
+/// 驱动持有的 Arc 引用会在 task 真正结束后随 Arc 计数归零而释放。
+#[cfg(target_os = "linux")]
+impl Drop for IoUringStorage {
+    fn drop(&mut self) {
+        let Some(handle) = self.ring.take() else {
+            return; // 未初始化(init 失败或从未调用),无驱动需清理
+        };
+
+        // 1. 优雅退出:非阻塞发送 Shutdown 命令。
+        //    try_send 不阻塞;若 channel 满,下方 abort 兜底。
+        if handle.cmd_tx.try_send(DriverCmd::Shutdown).is_err() {
+            tracing::debug!("io_uring drop: Shutdown 命令发送失败,将直接 abort 驱动 task");
+        }
+
+        // 2. 取出 JoinHandle 并 abort,确保驱动不会在资源释放后继续运行。
+        //    driver_join 用 std::sync::Mutex<Option<_>> 包裹:Drop 中 take 出
+        //    JoinHandle。锁可能因 panic 中毒,此处 unwrap_or_else into_inner
+        //    安全恢复(仅取 JoinHandle,无内存安全问题)。
+        let join_handle = handle
+            .driver_join
+            .lock()
+            .map_or_else(|e| e.into_inner().take(), |mut guard| guard.take());
+        if let Some(jh) = join_handle {
+            // 若驱动已自行退出则无需 abort;否则 abort 请求取消。
+            if !jh.is_finished() {
+                jh.abort();
+                // 3. 有界等待驱动退出(同步轮询,最多 ~100ms)。
+                //    给驱动一个收尾窗口,但避免在 Drop 中长时间阻塞。
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                while !jh.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                if !jh.is_finished() {
+                    tracing::warn!("io_uring 驱动 task 在 drop 超时窗口内未退出,已请求 abort");
+                }
+            }
+        }
+
+        tracing::debug!("io_uring storage 已 drop,驱动 task 清理完成");
+    }
+}
+
 // =============================================================================
 // AsyncStorage trait 实现
 //
@@ -1234,6 +1357,16 @@ impl AsyncStorage for IoUringStorage {
 
     fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
+            // M-02: fallocate 的 len 参数为 i64(off_t)。若 size > i64::MAX,
+            // `size as i64` 会静默截断为负数,导致 fallocate 行为未定义或 EINVAL。
+            // 在入口处显式校验,拒绝溢出的 size。
+            #[cfg(target_os = "linux")]
+            i64::try_from(size).map_err(|_| {
+                invalid_input(format!(
+                    "io_uring allocate size {size} 超过 i64 最大值 {},fallocate 无法处理",
+                    i64::MAX
+                ))
+            })?;
             match self.state {
                 IoUringState::Ready => {
                     #[cfg(target_os = "linux")]
@@ -1650,8 +1783,9 @@ mod tests {
     #[test]
     fn test_bitmap_alloc_first_free_returns_zero_with_initial_used_mask() {
         let buffer_count = 16;
-        let used_mask = (!0u64) << buffer_count;
-        let bitmap = AtomicU64::new(used_mask);
+        // M-01: build_buffer_bitmap 构造多字位图,buffer_count=16 时为单 word,
+        // 高位(16-63)预置为 1(已占用)。
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
 
         let idx = bitmap_alloc_first_free(&bitmap, buffer_count);
         assert_eq!(idx, Some(0), "首次分配必须返回索引 0");
@@ -1666,25 +1800,37 @@ mod tests {
     #[test]
     fn test_bitmap_alloc_first_free_returns_none_when_all_used() {
         let buffer_count = 4;
-        // bits 0-3 占用, bits 4-63 由 used_mask 预占
-        let bitmap = AtomicU64::new(!0u64);
-        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), None);
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
+        // 占满全部 4 个有效槽
+        for _ in 0..buffer_count {
+            assert!(
+                bitmap_alloc_first_free(&bitmap, buffer_count).is_some(),
+                "未占满时应可分配"
+            );
+        }
+        assert_eq!(
+            bitmap_alloc_first_free(&bitmap, buffer_count),
+            None,
+            "占满后应返回 None"
+        );
     }
 
-    /// 回归测试: 防御性边界检查 - 即使 used_mask 漏掉高位,也不会返回越界索引。
+    /// 回归测试: 防御性边界检查 - 超出 buffer_count 的位不应被分配。
     #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_alloc_first_free_respects_buffer_count_boundary() {
         let buffer_count = 8;
-        // 模拟错误的 used_mask: 只占用 bits 0-3, bits 4-63 全空闲
-        let bitmap = AtomicU64::new(0b1111);
-        // 应返回 4 (在 buffer_count=8 范围内)
-        assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), Some(4));
-
-        // 占满 0-7 后, 即使位图高位(8-63)为 0, 也不应返回越界索引
-        let bitmap_full_in_range = AtomicU64::new(0xFF);
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
+        // 占满 0-7 后, 即使位图高位为 0(build_buffer_bitmap 已预占),
+        // 也不应返回越界索引
+        for expected in 0..buffer_count {
+            assert_eq!(
+                bitmap_alloc_first_free(&bitmap, buffer_count),
+                Some(expected)
+            );
+        }
         assert_eq!(
-            bitmap_alloc_first_free(&bitmap_full_in_range, buffer_count),
+            bitmap_alloc_first_free(&bitmap, buffer_count),
             None,
             "超出 buffer_count 的位不应被分配"
         );
@@ -1695,11 +1841,10 @@ mod tests {
     #[test]
     fn test_bitmap_alloc_free_reuse_cycle() {
         let buffer_count = 4;
-        let used_mask = (!0u64) << buffer_count;
-        let bitmap = AtomicU64::new(used_mask);
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
 
         // 占满 4 个槽
-        for expected in 0..4 {
+        for expected in 0..buffer_count {
             assert_eq!(
                 bitmap_alloc_first_free(&bitmap, buffer_count),
                 Some(expected)
@@ -1707,8 +1852,103 @@ mod tests {
         }
         assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), None);
 
-        // 释放索引 2 (清除 bit 2)
-        bitmap.fetch_and(!(1u64 << 2), Ordering::Relaxed);
+        // 释放索引 2 (清除 word 0 的 bit 2)
+        bitmap[0].fetch_and(!(1u64 << 2), Ordering::Relaxed);
         assert_eq!(bitmap_alloc_first_free(&bitmap, buffer_count), Some(2));
+    }
+
+    /// M-01: 多字位图测试 - buffer_count=128 时跨 2 个 word。
+    ///
+    /// 验证:
+    /// 1. build_buffer_bitmap 生成 2 个 word(div_ceil(128,64)=2);
+    /// 2. 第一个 word 全 0,第二个 word 全 0(128 恰为 64 倍数,无越界高位);
+    /// 3. 可分配 0..128 全部索引,不越界;
+    /// 4. 占满后返回 None。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_multi_word_alloc_across_word_boundary() {
+        let buffer_count = 128;
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
+        // div_ceil(128, 64) = 2 words
+        assert_eq!(bitmap.len(), 2, "128 个 buffer 应使用 2 个 word");
+        // 128 是 64 的整数倍,无越界高位,两个 word 均应初始化为 0
+        assert_eq!(bitmap[0].load(Ordering::Relaxed), 0);
+        assert_eq!(bitmap[1].load(Ordering::Relaxed), 0);
+
+        // 分配 word 0 的最后一位(idx=63)与 word 1 的第一位(idx=64),
+        // 验证跨 word 边界正确推进
+        for expected in 0..buffer_count {
+            assert_eq!(
+                bitmap_alloc_first_free(&bitmap, buffer_count),
+                Some(expected),
+                "应顺序分配索引 {expected}"
+            );
+        }
+        // 占满后返回 None
+        assert_eq!(
+            bitmap_alloc_first_free(&bitmap, buffer_count),
+            None,
+            "128 个槽占满后应返回 None"
+        );
+    }
+
+    /// M-01: 多字位图测试 - buffer_count=70(非 64 倍数)时,
+    /// 第二个 word 的越界高位(位 70-127)被预置为 1(已占用),
+    /// 不会分配到 idx >= 70 的索引。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_multi_word_excess_bits_preoccupied() {
+        let buffer_count = 70;
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
+        assert_eq!(bitmap.len(), 2, "70 个 buffer 应使用 2 个 word");
+        // 第二个 word: 位 0-5 对应 idx 64-69(有效),位 6-63 越界预置为 1
+        // excess = 2*64 - 70 = 58,故 mask = (!0u64) << (64 - 58) = (!0u64) << 6
+        assert_eq!(
+            bitmap[1].load(Ordering::Relaxed),
+            (!0u64) << 6,
+            "第二个 word 的越界高位应被预置为已占用"
+        );
+
+        // 顺序分配 idx 0-69(word 0 全部 64 位 + word 1 的位 0-5),
+        // 共 70 个有效槽
+        for expected in 0..buffer_count {
+            assert_eq!(
+                bitmap_alloc_first_free(&bitmap, buffer_count),
+                Some(expected),
+                "应顺序分配 idx {expected}"
+            );
+        }
+        // 70 个有效槽全部占满后,第二个 word 的越界高位(6-63)已被预占,
+        // 应返回 None,绝不返回 idx >= 70
+        assert_eq!(
+            bitmap_alloc_first_free(&bitmap, buffer_count),
+            None,
+            "占满 70 个有效槽后应返回 None,不越界"
+        );
+    }
+
+    /// M-01: 多字位图测试 - 释放跨 word 的索引后可重新分配。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bitmap_multi_word_free_and_realloc() {
+        let buffer_count = 96;
+        let bitmap: Box<[AtomicU64]> = build_buffer_bitmap(buffer_count);
+
+        // 顺序分配 idx 0-63(word 0 全部 64 位),再分配 idx 64(word 1 bit 0)
+        for expected in 0..=64 {
+            assert_eq!(
+                bitmap_alloc_first_free(&bitmap, buffer_count),
+                Some(expected),
+                "应顺序分配 idx {expected}"
+            );
+        }
+        // 释放 idx=64: word_idx=1, bit=0
+        bitmap[1].fetch_and(!(1u64 << 0), Ordering::Relaxed);
+        // 释放后 idx=64 重新成为第一个空闲位(word 0 已满,word 1 bit 0 空闲)
+        assert_eq!(
+            bitmap_alloc_first_free(&bitmap, buffer_count),
+            Some(64),
+            "释放 idx=64 后应重新分配到 64"
+        );
     }
 }
