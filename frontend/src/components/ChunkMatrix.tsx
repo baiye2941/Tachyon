@@ -10,8 +10,10 @@ import {
 import { resolveToken } from "../utils/resolveToken";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { tr, type MessageKey } from "../i18n";
+import { getTaskFragmentData, mergeFragmentDelta } from "../stores/taskFragments";
 
 interface ChunkMatrixProps {
+  taskId: string;
   fragmentsTotal: number;
   fragmentsDone: number;
   progress: number;
@@ -60,11 +62,15 @@ export function buildBlocks(
   total: number,
   done: number,
   progress: number,
+  doneSet: Set<number>,
+  concurrency: number,
 ): ChunkBlock[] {
   if (total <= 0) return [];
   const blockCount = Math.min(total, AGGREGATE_BLOCKS);
-  // 活跃带宽度(连续下载中分片,对齐 DOM 模式,避免单格乱跳)
-  const band = Math.max(2, Math.round(total / 8));
+  // 活跃带宽度:基于真实并发度推算,从 maxDoneIdx 后取 min(concurrency, remaining)
+  const maxDoneIdx = doneSet.size > 0 ? Math.max(...doneSet) : -1;
+  const remaining = total - done;
+  const band = Math.min(Math.max(1, concurrency), Math.max(1, remaining));
   const blocks: ChunkBlock[] = [];
   for (let i = 0; i < blockCount; i++) {
     const start = Math.floor((i * total) / blockCount);
@@ -73,9 +79,9 @@ export function buildBlocks(
     let blockDone = 0;
     let blockDownloading = 0;
     for (let f = start; f < end; f++) {
-      if (f < done) {
+      if (doneSet.has(f)) {
         blockDone++;
-      } else if (f >= done && f < done + band && progress < 1) {
+      } else if (f > maxDoneIdx && f <= maxDoneIdx + band && progress < 1) {
         blockDownloading++;
       }
     }
@@ -238,16 +244,23 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     () => props.fragmentsTotal > AGGREGATE_THRESHOLD,
   );
 
+  const fragData = createMemo(() => getTaskFragmentData(props.taskId));
+
   const chunks = createMemo(() => {
     if (props.fragmentsTotal > AGGREGATE_THRESHOLD) return [];
-    const total = props.fragmentsTotal;
+    const data = fragData();
+    // 无 store 数据时回退到旧推算(store 未加载完成期间)
+    const doneSet = data?.doneSet ?? new Set<number>();
+    const concurrency = data?.concurrency || Math.max(2, Math.round(props.fragmentsTotal / 8));
     const done = props.fragmentsDone;
-    const progress = props.progress;
-    const band = Math.max(2, Math.round(total / 8));
-    return Array.from({ length: total }, (_, i) => {
-      const isDone = i < done;
+    const maxDoneIdx = doneSet.size > 0 ? Math.max(...doneSet) : -1;
+    const remaining = props.fragmentsTotal - done;
+    const band = Math.min(Math.max(1, concurrency), Math.max(1, remaining));
+    return Array.from({ length: props.fragmentsTotal }, (_, i) => {
+      const isDone = doneSet.has(i);
+      // 已知折中:maxDoneIdx 之前未完成的分片(如重试中)显示为 pending
       const isDownloading =
-        !isDone && i >= done && i < done + band && progress < 1;
+        !isDone && i > maxDoneIdx && i <= maxDoneIdx + band && props.progress < 1;
       const status: ChunkBlock["status"] = isDone
         ? "done"
         : isDownloading
@@ -262,9 +275,19 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     });
   });
 
-  const blocks = createMemo(() =>
-    buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress),
-  );
+  const blocks = createMemo(() => {
+    const data = fragData();
+    const doneSet = data?.doneSet ?? new Set<number>();
+    const concurrency = data?.concurrency || Math.max(2, Math.round(props.fragmentsTotal / 8));
+    return buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress, doneSet, concurrency);
+  });
+
+  // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
+  createEffect(() => {
+    if (props.progress >= 1 && fragData() && fragData()!.doneSet.size === 0) {
+      mergeFragmentDelta(props.taskId, [0], 0);
+    }
+  });
 
   const canvasLayout = createMemo(() => {
     const blockList = blocks();
