@@ -774,7 +774,10 @@ mod tests {
     /// split_range 是 magnet download_range_stream 和 storage Multi read/write 的公共
     /// 折算层,每次跨文件 range 调用一次。隔离测量其纯 CPU 开销(无 I/O),
     /// 确认在大文件多文件场景(16 文件,跨 15 边界)下不成为瓶颈。
+    ///
+    /// Miri 下跳过:Miri 是解释器,执行慢 ~1000x,性能断言(<10µs)在 Miri 下必然误判。
     #[test]
+    #[cfg_attr(miri, ignore = "性能断言不适用于 Miri 解释器")]
     fn bench_split_range_cross_boundary() {
         // 16 个 1MB 文件,总 16MB
         let n_files = 16usize;
