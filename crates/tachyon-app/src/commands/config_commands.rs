@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_tasks, 5);
         assert_eq!(cfg.download.max_concurrent_fragments, 16);
         assert_eq!(cfg.connection.max_connections_per_host, 16);
-        assert!(!cfg.connection.enable_quic);
+        assert!(cfg.connection.enable_quic); // 默认 true(运行期意图开关)
         assert!(cfg.download.verify_checksum);
     }
 

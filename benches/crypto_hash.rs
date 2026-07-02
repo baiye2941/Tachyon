@@ -134,6 +134,50 @@ fn bench_verify(c: &mut Criterion) {
     group.finish();
 }
 
+/// 基准:blake3 整文件校验路径(compute_hash_from_path)
+///
+/// `compute_hash_from_path` 内部对 blake3 使用 `update_mmap_rayon`
+/// (mmap 零拷贝读 + 多线程哈希)。本组对比"从文件路径计算"与"内存全量计算",
+/// 验证大文件场景下 rayon 多线程 + mmap 的收益。
+///
+/// 注意:16MB 以下数据多已驻留 page cache,mmap 读接近零成本;rayon 线程
+/// 切换开销在小数据上可能抵消并行收益。真正 10-20x 收益体现在 GB 级文件,
+/// 此处以 1MB / 16MB 展示 API 正确性与中等规模趋势。
+fn bench_blake3_from_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blake3_from_path");
+    // compute_hash_from_path 为 async,需在 tokio 运行时中执行。
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for &size in [1048576usize, 16777216].iter() {
+        group.throughput(criterion::Throughput::Bytes(size as u64));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bench_file.bin");
+        let data = generate_test_data(size);
+        std::fs::write(&path, &data).unwrap();
+
+        let verifier = CpuVerifier::blake3();
+
+        // 从文件路径(mmap + rayon 多线程)
+        group.bench_with_input(BenchmarkId::new("mmap_rayon", size), &size, |b, &_size| {
+            b.iter(|| {
+                let h = rt
+                    .block_on(verifier.compute_hash_from_path(&path, 65536))
+                    .unwrap();
+                std::hint::black_box(h);
+            });
+        });
+
+        // 对照:内存全量(单线程 blake3::hash)
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, &_size| {
+            b.iter(|| {
+                let h = verifier.compute_hash(&data).unwrap();
+                std::hint::black_box(h);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = bench_config();
@@ -142,6 +186,7 @@ criterion_group! {
         bench_sha256,
         bench_blake3_direct,
         bench_sha256_direct,
-        bench_verify
+        bench_verify,
+        bench_blake3_from_path
 }
 criterion_main!(benches);

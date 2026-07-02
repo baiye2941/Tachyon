@@ -676,7 +676,10 @@ impl Default for ConnectionConfig {
             keep_alive_timeout_secs: 30,
             connect_timeout_secs: 10,
             enable_http2: true,
-            enable_quic: false,
+            // 默认启用 QUIC 意图:运行期声明优先使用 HTTP/3。
+            // 实际是否生效取决于编译期是否启用 tachyon-protocol 的 `http3` feature
+            // (及 reqwest_unstable cfg)——未启用时静默降级 HTTP/2,见 http.rs。
+            enable_quic: true,
         }
     }
 }
@@ -1236,7 +1239,7 @@ mod tests {
         assert_eq!(config.keep_alive_timeout_secs, 30);
         assert_eq!(config.connect_timeout_secs, 10);
         assert!(config.enable_http2);
-        assert!(!config.enable_quic);
+        assert!(config.enable_quic); // 默认 true(运行期意图;编译期 http3 feature 可用时生效)
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl HttpClient {
     /// - 连接超时防止连接黑洞 IP 永久挂起
     /// - 读取超时防止连接后静默断流,但不会误杀正常的长下载
     pub fn with_timeouts(connect_secs: u64, read_secs: u64) -> DownloadResult<Self> {
-        Self::build_client(connect_secs, read_secs, false, 16, 30)
+        Self::build_client(connect_secs, read_secs, false, false, 16, 30)
     }
 
     /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制与连接池调优)
@@ -99,6 +99,7 @@ impl HttpClient {
             connect_secs,
             read_secs,
             config.enable_http2,
+            config.enable_quic,
             config.max_connections_per_host as usize,
             config.keep_alive_timeout_secs,
         )
@@ -109,6 +110,7 @@ impl HttpClient {
         connect_secs: u64,
         read_secs: u64,
         enable_http2: bool,
+        enable_quic: bool,
         pool_max_idle_per_host: usize,
         keep_alive_secs: u64,
     ) -> DownloadResult<Self> {
@@ -130,7 +132,6 @@ impl HttpClient {
         }
         if enable_http2 {
             builder = builder
-                .http2_adaptive_window(true)
                 // 初始流窗口 1MB:高 BDP 网络下避免流级饥饿
                 // (默认 64KB 在 100Mbps×50ms RTT 下成为瓶颈)
                 .http2_initial_stream_window_size(1024 * 1024)
@@ -141,6 +142,28 @@ impl HttpClient {
                 // HTTP/2 PING 保活:检测 NAT/代理超时的死连接
                 .http2_keep_alive_interval(std::time::Duration::from_secs(30))
                 .http2_keep_alive_timeout(std::time::Duration::from_secs(10));
+            // 注:不启用 http2_adaptive_window。adaptive_window 会在运行时动态调整
+            // 接收窗口并覆盖上方固定的 initial_stream/connection_window_size 设置
+            // (见 reqwest 与 hyper 文档),使固定窗口成为无效配置。下载器场景为高 BDP
+            // 大文件传输,采用显式固定大窗口(1MB 流 / 16MB 连接)比 adaptive 的动态
+            // 试探更可控:后者面向通用 Web 浏览优化,可能在小请求上引入额外往返而
+            // 拖慢首字节。
+        }
+
+        // HTTP/3(QUIC):reqwest 在编译期开启 `http3` feature 后,默认即通过 Alt-Svc
+        // 协商自动升级到 HTTP/3,失败回退 HTTP/2(无需显式调用 builder 方法)。
+        // 本块仅在"编译期 http3 可用 + 运行期 enable_quic"时记录意图日志。
+        #[cfg(all(feature = "http3", reqwest_unstable))]
+        if enable_quic {
+            debug!("HTTP/3(QUIC)已启用:将通过 Alt-Svc 协商升级,失败回退 HTTP/2");
+        } else {
+            debug!("HTTP/3 编译可用但 enable_quic=false,仅使用 HTTP/2");
+        }
+        #[cfg(not(all(feature = "http3", reqwest_unstable)))]
+        if enable_quic {
+            // 运行期请求 QUIC 但编译期未启用 http3 feature(或未设 reqwest_unstable),
+            // 静默降级为 HTTP/2,不影响下载。
+            debug!("enable_quic=true 但 HTTP/3 未编译启用,降级使用 HTTP/2");
         }
 
         let client = builder
@@ -1501,7 +1524,7 @@ mod tests {
         // 验证 build_client 在 keep_alive_secs=60 时能正常创建
         // pool_idle_timeout 应与 keep_alive_secs 对齐,
         // 避免 reqwest 默认 90s idle timeout 与 semaphore 侧不一致
-        let client = HttpClient::build_client(10, 30, false, 16, 60);
+        let client = HttpClient::build_client(10, 30, false, false, 16, 60);
         assert!(
             client.is_ok(),
             "build_client(keep_alive=60) 应成功(已配置 pool_idle_timeout)"
