@@ -351,19 +351,33 @@ pub struct DownloadStateChange {
     pub new_state: DownloadState,
 }
 
-/// 分片进度回调消息
+/// 分片进度事件
 ///
-/// 通过 `progress_tx` 通道发送给上层(tachyon-app),用于:
-/// - `completed == false`:增量进度更新(每写一个 chunk 发一次)
-/// - `completed == true`:分片整体下载完成,触发上层 checkpoint 落盘(断点续传)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FragmentProgress {
-    /// 分片索引
-    pub fragment_index: u32,
-    /// 该分片是否已整体完成
-    pub completed: bool,
-    /// 该分片当前已下载字节数
-    pub fragment_downloaded: u64,
+/// 通过 `progress_tx` 通道发送给上层(tachyon-app)。
+/// 两变体:控制帧(PlanComplete,一次性可靠)、数据帧(Chunk,高频可丢)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FragmentProgress {
+    /// plan 完成:携带真实分片总数 + 续传已完成索引 + 初始并发度
+    ///
+    /// 仅在 `DownloadTask::plan()` 末尾发送一次。
+    /// 用 `send().await`——此时 channel 必为空(plan 是第一个事件),不会阻塞。
+    PlanComplete {
+        /// 真实分片总数(来自 plan_fragments,非 probe 估算)
+        total: u32,
+        /// 续传恢复的已完成分片索引(state==Done 的 index 列表)
+        completed_indices: Vec<u32>,
+        /// 初始并发度(调度器 recommendation.concurrency)
+        initial_concurrency: u32,
+    },
+    /// 分片下载进度(原 struct 三字段,语义不变)
+    ///
+    /// 增量用 `try_send`(可丢),完成用 `send().await`
+    Chunk {
+        fragment_index: u32,
+        completed: bool,
+        fragment_downloaded: u64,
+    },
 }
 
 #[cfg(test)]
@@ -811,6 +825,52 @@ mod tests {
             per_op_ns < 10_000,
             "split_range 单次应 <10µs,实际 {per_op_ns} ns"
         );
+    }
+
+    #[test]
+    fn test_fragment_progress_plan_complete_serialization() {
+        let progress = FragmentProgress::PlanComplete {
+            total: 16,
+            completed_indices: vec![0, 1, 2],
+            initial_concurrency: 4,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        let de: FragmentProgress = serde_json::from_str(&json).unwrap();
+        match de {
+            FragmentProgress::PlanComplete {
+                total,
+                completed_indices,
+                initial_concurrency,
+            } => {
+                assert_eq!(total, 16);
+                assert_eq!(completed_indices, vec![0, 1, 2]);
+                assert_eq!(initial_concurrency, 4);
+            }
+            FragmentProgress::Chunk { .. } => panic!("应为 PlanComplete"),
+        }
+    }
+
+    #[test]
+    fn test_fragment_progress_chunk_serialization() {
+        let progress = FragmentProgress::Chunk {
+            fragment_index: 5,
+            completed: true,
+            fragment_downloaded: 1024,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        let de: FragmentProgress = serde_json::from_str(&json).unwrap();
+        match de {
+            FragmentProgress::Chunk {
+                fragment_index,
+                completed,
+                fragment_downloaded,
+            } => {
+                assert_eq!(fragment_index, 5);
+                assert!(completed);
+                assert_eq!(fragment_downloaded, 1024);
+            }
+            FragmentProgress::PlanComplete { .. } => panic!("应为 Chunk"),
+        }
     }
 }
 
