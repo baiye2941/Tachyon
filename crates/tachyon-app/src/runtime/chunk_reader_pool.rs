@@ -298,7 +298,14 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
 
                 // Notify ProgressBroker of progress change
                 if let Some(ref callback) = on_progress {
-                    callback(&task_id, if chunk_completed { Some(fragment_index) } else { None });
+                    callback(
+                        &task_id,
+                        if chunk_completed {
+                            Some(fragment_index)
+                        } else {
+                            None
+                        },
+                    );
                 }
 
                 // 批量 checkpoint(已完成分片)

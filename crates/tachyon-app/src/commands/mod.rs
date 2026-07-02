@@ -8,7 +8,7 @@ pub mod task_commands;
 
 // Re-exports: Tauri commands and public types
 pub use self::config_commands::{get_config, update_config};
-pub use self::fragment_commands::{get_task_fragments, TaskFragmentsView};
+pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{
     add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info,
     list_model_favorites, list_repo_files, remove_model_favorite, scan_local_models, search_models,

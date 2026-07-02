@@ -95,6 +95,15 @@ export default function LiquidProgress(props: LiquidProgressProps) {
         />
       </div>
 
+      {/* 完成态 sparkle(在进度条右端绽放,任务列表与详情页均可见) */}
+      <Show when={isCompleted() && !props.reducedMotion}>
+        <div class="progress-sparkle" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 0L14.59 9.41L24 12L14.59 14.59L12 24L9.41 14.59L0 12L9.41 9.41L12 0Z" />
+          </svg>
+        </div>
+      </Show>
+
       {/* 完成/失败状态 icon(不遮挡进度条,悬浮在右侧) */}
       <Show when={props.showStateIcon && (isCompleted() || isFailed())}>
         <div
