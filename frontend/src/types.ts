@@ -187,9 +187,18 @@ export interface ProgressPayload {
   speed: number
   status: DownloadStatus
   fragmentsDone: number
+  fragmentsTotal: number
+  activeConcurrency: number
+  completedDelta?: number[]
 }
 
 export type ProgressEvent = Record<string, ProgressPayload>
+
+/** get_task_fragments 返回:真实分片总数 + 已完成分片索引 */
+export interface TaskFragmentsView {
+  total: number
+  doneIndices: number[]
+}
 
 export type ViewName = 'downloads' | 'sniffer' | 'settings' | 'history' | 'hub' | 'stats'
 

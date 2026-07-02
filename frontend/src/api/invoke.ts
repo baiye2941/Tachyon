@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask } from '../stores/mockData'
@@ -127,6 +127,8 @@ export const api = {
   getDownloadProgress: (taskId: string) => invoke<DownloadProgress>('get_download_progress', { taskId }),
   /** 订阅进度更新(通过 Tauri 事件推送) */
   subscribeProgress: () => invoke<void>('subscribe_progress'),
+  /** 获取任务分片状态(DetailPanel 打开时调用) */
+  getTaskFragments: (taskId: string) => invoke<TaskFragmentsView>('get_task_fragments', { taskId }),
   /** 获取应用配置 */
   getConfig: () => invoke<AppConfig>('get_config'),
   /** 更新应用配置(破坏性操作,需确认令牌。SettingsPanel 已自行确认,跳过 invoke 内 window.confirm) */

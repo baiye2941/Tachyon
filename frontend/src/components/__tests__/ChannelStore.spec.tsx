@@ -55,7 +55,7 @@ describe('ChannelStore 高频更新', () => {
     setTasksRaw(reconcile(initial, { key: 'id' }))
 
     const p1: ProgressEvent = {
-      a: { id: 'a', progress: 0.3, downloaded: 314572, speed: 5000000, status: 'downloading', fragmentsDone: 1 },
+      a: { id: 'a', progress: 0.3, downloaded: 314572, speed: 5000000, status: 'downloading', fragmentsDone: 1, fragmentsTotal: 0, activeConcurrency: 0 },
     }
     batch(() => {
       setTasksRaw(reconcile(applyProgress([...tasks], p1), { key: 'id' }))
@@ -80,6 +80,8 @@ describe('ChannelStore 高频更新', () => {
             speed: 10000000 + i * 1000,
             status: 'downloading',
             fragmentsDone: Math.floor(100 * (i / 200)),
+            fragmentsTotal: 0,
+            activeConcurrency: 0,
           },
         }
         setTasksRaw(reconcile(applyProgress([...tasks], payload), { key: 'id' }))
@@ -96,7 +98,7 @@ describe('ChannelStore 高频更新', () => {
     setTasksRaw(reconcile(initial, { key: 'id' }))
 
     const payload: ProgressEvent = {
-      n: { id: 'n', progress: 0.8, downloaded: 838860, speed: 12000000, status: 'downloading', fragmentsDone: 3 },
+      n: { id: 'n', progress: 0.8, downloaded: 838860, speed: 12000000, status: 'downloading', fragmentsDone: 3, fragmentsTotal: 0, activeConcurrency: 0 },
     }
 
     batch(() => {
