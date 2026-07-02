@@ -37,6 +37,39 @@ pub fn run() {
         )
         .with_target(true)
         .init();
+
+    // === tokio runtime 显式调优 ===
+    // Tauri v2 默认通过 `tokio::runtime::Runtime::new()` 创建 runtime:
+    //   - worker_threads = available_parallelism()
+    //   - max_blocking_threads = 512 (默认值过大,浪费线程栈内存)
+    // 高并发下载场景下,spawn_blocking 用于文件 I/O(checkpoint、snapshot 读写)、
+    // 512 个阻塞线程会显著增加内存占用(每线程 ~2MB 栈)且无实际吞吐收益。
+    //
+    // 通过 tauri::async_runtime::set(handle) 注入自定义 runtime:
+    //   - worker_threads: 显式取 available_parallelism,语义明确
+    //   - max_blocking_threads(128): 限制阻塞线程池上限,平衡 I/O 并发与内存
+    //   - thread_keep_alive(5s): 空闲线程快速回收,降低常驻内存
+    //
+    // 注意:tauri::async_runtime::set 接收 Handle,但底层 Runtime 不可被丢弃,
+    //       因此将 Runtime 绑定到 Guard 结构,随 Tauri 应用生命周期存活。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        )
+        .max_blocking_threads(128)
+        .thread_keep_alive(std::time::Duration::from_secs(5))
+        .enable_all()
+        .thread_name("tachyon-tokio")
+        .build()
+        .expect("构建 tokio runtime 失败");
+
+    // 将 runtime handle 注入 Tauri 全局 async runtime。
+    // Runtime 本身必须保活,否则 handle 失效——由 _runtime_guard 持有。
+    tauri::async_runtime::set(runtime.handle().clone());
+    let _runtime_guard = runtime;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
