@@ -10,6 +10,7 @@ import { api } from "../api/invoke";
 import { addToast } from "./toast";
 import { addHistoryRecord } from "./history";
 import { pushTaskSpeed } from "./taskSpeedHistory";
+import { mergeFragmentDelta, getTaskFragmentData, loadTaskFragments } from "./taskFragments";
 import { createRootMemo } from "../utils/reactive";
 import { tr } from "../i18n";
 
@@ -214,6 +215,8 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       const newSpeed = p.speed ?? task.speed;
       const newProgress = p.progress ?? task.progress;
       const newFragmentsDone = p.fragmentsDone ?? task.fragmentsDone;
+      const newFragmentsTotal = p.fragmentsTotal ?? task.fragmentsTotal;
+      const newConcurrency = p.activeConcurrency ?? 0;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -248,7 +251,24 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           status: newStatus,
           progress: newProgress,
           fragmentsDone: newFragmentsDone,
+          fragmentsTotal: newFragmentsTotal,
         });
+      }
+
+      // 合并分片 delta 到 fragment store
+      if (p.completedDelta && p.completedDelta.length > 0) {
+        mergeFragmentDelta(id, p.completedDelta, newConcurrency);
+      } else if (newConcurrency > 0) {
+        mergeFragmentDelta(id, [], newConcurrency);
+      }
+
+      // fragmentsTotal 从 0 变非 0:PlanComplete 到达,DetailPanel 若已打开需重拉
+      if (
+        task.fragmentsTotal === 0 &&
+        newFragmentsTotal > 0 &&
+        getTaskFragmentData(id) === undefined
+      ) {
+        loadTaskFragments(id);
       }
 
       // 状态转 terminal：只在 status 真正变化到 terminal 时触发
