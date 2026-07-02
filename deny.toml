@@ -32,6 +32,11 @@ ignore = [
     # quick-xml — librqbit-upnp 依赖,无界 namespace 分配导致内存耗尽 DoS
     # 同上,仅 UPnP 局域网场景,等 librqbit 上游升级 quick-xml
     "RUSTSEC-2026-0195",
+    # memmap2 — blake3 rayon/mmap feature 间接依赖,unchecked pointer offset
+    # 仅用于 blake3 update_mmap_rayon 只读 mmap 下载文件校验,风险低
+    "RUSTSEC-2026-0186",
+    # glib — gtk-rs GTK3 绑定,Tauri v2 Linux 依赖,等 v3 迁 GTK4
+    "RUSTSEC-2026-0190",
 ]
 
 [licenses]

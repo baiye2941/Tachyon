@@ -114,7 +114,7 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
-      - run: cargo audit
+      - run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2026-0190 --ignore RUSTSEC-2026-0186
 
   # SRE-013: TOML 格式检查
   taplo:
