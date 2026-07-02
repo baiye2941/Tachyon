@@ -1211,13 +1211,18 @@ impl AsyncStorage for IoUringStorage {
                             return self.submit_write(_offset, &_data).await;
                         }
 
-                        // 慢速路径:非对齐写入,自动填充对齐
+                        // 慢速路径:非对齐写入,采用读-改-写(RMW)
+                        //
+                        // 此前实现用全零缓冲区填充对齐边界后整块写入,导致 padding 区
+                        // 的零覆盖邻近已写数据(并发写同一段时相互破坏)并撑大文件。
+                        // 改为:先读回对齐块现有内容,仅覆盖用户数据区间,再整块写回。
+                        // 这样 padding 区保留的是文件真实旧数据,而非零。
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
                         let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
 
-                        // 如果填充后超过 fixed buffer 大小,回退到 TokioFile
+                        // 如果填充后超过 fixed buffer 大小,无法走 io_uring
                         if padded_len > self.config.buffer_size {
                             return Err(DownloadError::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
@@ -1228,16 +1233,20 @@ impl AsyncStorage for IoUringStorage {
                             )));
                         }
 
-                        // 构造对齐缓冲区:前填充零 + 用户数据 + 后填充零
-                        let mut padded = vec![0u8; padded_len];
-                        padded[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
+                        let mut buf = vec![0u8; padded_len];
+                        // 读回对齐块现有内容。短读/错误(文件尚未扩展到此区间)可忽略:
+                        // 未读回的尾部保持 0,这是文件真实 EOF 之后的扩展区,写回时
+                        // 由 O_DIRECT 扩展文件语义处理,不覆盖邻近已写数据。
+                        let _ = self.submit_read(aligned_offset, &mut buf).await;
+                        // 仅覆盖用户数据区间,padding 区保留读回的真实旧数据
+                        buf[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
-                        let written = self.submit_write(aligned_offset, &padded).await?;
-                        // submit_write 返回 padded 的写入量(含前/后填充零),
-                        // 调用方期望的是用户数据字节数。O_DIRECT 对齐写入通常一次完成
-                        // (padded 全部写入),此时用户数据完整覆盖,返回 _data.len()。
-                        // 若短写未覆盖全部用户数据,按实际覆盖量返回(扣除 front_pad 偏移)。
+                        let written = self.submit_write(aligned_offset, &buf).await?;
+                        // submit_write 返回整块写入量(含 padding),调用方期望用户数据字节数。
+                        // O_DIRECT 对齐写入通常一次完成(padded 全部写入),此时用户数据完整
+                        // 覆盖,返回 _data.len()。若短写未覆盖全部用户数据,按实际覆盖量
+                        // 返回(扣除 front_pad 偏移)。
                         let user_written = written.saturating_sub(front_pad).min(_data.len());
                         Ok(user_written)
                     }
@@ -1290,11 +1299,17 @@ impl AsyncStorage for IoUringStorage {
                             )));
                         }
 
-                        let mut padded = vec![0u8; padded_len];
-                        padded[front_pad..front_pad + _data.len()].copy_from_slice(_data);
+                        // 慢速路径读-改-写(RMW):先读回对齐块现有内容,仅覆盖用户数据
+                        // 区间,再整块写回。padding 区保留文件真实旧数据,而非零,避免
+                        // 零覆盖邻近已写数据并撑大文件。详见 write_at 慢速路径注释。
+                        let mut buf = vec![0u8; padded_len];
+                        let _ = self.submit_read(aligned_offset, &mut buf).await;
+                        buf[front_pad..front_pad + _data.len()].copy_from_slice(_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
-                        self.submit_write(aligned_offset, &padded).await
+                        let written = self.submit_write(aligned_offset, &buf).await?;
+                        let user_written = written.saturating_sub(front_pad).min(_data.len());
+                        Ok(user_written)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
