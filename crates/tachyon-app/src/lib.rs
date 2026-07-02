@@ -145,6 +145,7 @@ pub fn run() {
             // 进度查询
             get_download_progress,
             subscribe_progress,
+            get_task_fragments,
             // 嗅探
             get_sniffer_resources,
             add_sniffer_filter,
