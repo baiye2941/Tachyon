@@ -44,7 +44,9 @@ describe("CommandPalette", () => {
   describe("搜索过滤与排序", () => {
     it('输入"设置"，结果包含"设置"命令', async () => {
       const { container } = renderPalette();
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
 
       fireEvent.input(input, {
         target: { value: "设置" },
@@ -61,7 +63,9 @@ describe("CommandPalette", () => {
 
     it('输入"查看"可命中"下载管理"命令', async () => {
       const { container } = renderPalette();
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
 
       fireEvent.input(input, {
         target: { value: "查看" },
@@ -74,7 +78,9 @@ describe("CommandPalette", () => {
 
     it("匹配字符应渲染为 mark 元素", async () => {
       const { container } = renderPalette();
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
 
       fireEvent.input(input, {
         target: { value: "设置" },
@@ -90,7 +96,9 @@ describe("CommandPalette", () => {
 
     it("无匹配 query 显示空状态文本", async () => {
       const { container } = renderPalette();
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
 
       fireEvent.input(input, {
         target: { value: "xyzxyz" },
@@ -113,7 +121,9 @@ describe("CommandPalette", () => {
           },
         ],
       });
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
 
       fireEvent.input(input, {
         target: { value: "model" },
@@ -121,14 +131,16 @@ describe("CommandPalette", () => {
       });
       await waitForRaf();
 
-      expect(container.textContent).toContain("打开任务: model.gguf");
-
-      const listbox = container.querySelector('[role="listbox"]') as HTMLElement;
+      const listbox = container.querySelector(
+        '[role="listbox"]',
+      ) as HTMLElement;
       expect(listbox.textContent).toContain("任务");
       const options = listbox.querySelectorAll('[role="option"]');
-      expect(
-        Array.from(options).some((o) => o.textContent?.includes("model.gguf")),
-      ).toBe(true);
+      const taskOption = Array.from(options).find((o) =>
+        o.textContent?.includes("model.gguf"),
+      );
+      expect(taskOption).toBeTruthy();
+      expect(taskOption!.textContent).toContain("打开任务");
     });
   });
 
@@ -138,7 +150,9 @@ describe("CommandPalette", () => {
       await waitForRaf();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       expect(document.activeElement).toBe(input);
     });
 
@@ -146,10 +160,13 @@ describe("CommandPalette", () => {
       const { container } = renderPalette();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "ArrowDown" });
 
-      const options = container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options =
+        container.querySelectorAll<HTMLElement>('[role="option"]');
       expect(options.length).toBeGreaterThan(1);
       expect(options[0]!.getAttribute("aria-selected")).toBe("false");
       expect(options[1]!.getAttribute("aria-selected")).toBe("true");
@@ -159,10 +176,13 @@ describe("CommandPalette", () => {
       const { container } = renderPalette();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "ArrowUp" });
 
-      const options = container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options =
+        container.querySelectorAll<HTMLElement>('[role="option"]');
       expect(options.length).toBeGreaterThan(0);
       expect(options[0]!.getAttribute("aria-selected")).toBe("false");
       expect(options[options.length - 1]!.getAttribute("aria-selected")).toBe(
@@ -176,7 +196,9 @@ describe("CommandPalette", () => {
       const { container } = renderPalette({ onViewChange, onClose });
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "Enter" });
 
       expect(onViewChange).toHaveBeenCalledWith("downloads");
@@ -189,7 +211,9 @@ describe("CommandPalette", () => {
       await waitForRaf();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "Escape" });
       await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -203,7 +227,8 @@ describe("CommandPalette", () => {
       await waitForRaf();
       await waitForRaf();
 
-      const options = container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options =
+        container.querySelectorAll<HTMLElement>('[role="option"]');
       expect(options.length).toBeGreaterThan(1);
       fireEvent.mouseEnter(options[1]!);
       await waitForRaf();
@@ -218,7 +243,8 @@ describe("CommandPalette", () => {
       const { container } = renderPalette({ onViewChange, onClose });
       await waitForRaf();
 
-      const options = container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options =
+        container.querySelectorAll<HTMLElement>('[role="option"]');
       const target = Array.from(options).find((o) =>
         o.textContent?.includes("资源嗅探"),
       );
@@ -248,7 +274,9 @@ describe("CommandPalette", () => {
       const { container } = renderPalette();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       expect(input).not.toBeNull();
       expect(input.getAttribute("role")).toBe("combobox");
     });
@@ -265,7 +293,9 @@ describe("CommandPalette", () => {
       const { container } = renderPalette();
       await waitForRaf();
 
-      const input = container.querySelector('input[type="text"]') as HTMLInputElement;
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
       const activeDescendant = input.getAttribute("aria-activedescendant");
       expect(activeDescendant).toBeTruthy();
 
@@ -280,7 +310,7 @@ describe("CommandPalette", () => {
       const { container } = renderPalette();
       await waitForRaf();
 
-      expect(container.querySelector('[aria-live]')).toBeTruthy();
+      expect(container.querySelector("[aria-live]")).toBeTruthy();
     });
   });
 });

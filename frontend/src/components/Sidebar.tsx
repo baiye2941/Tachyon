@@ -48,21 +48,32 @@ interface NavEntry {
 
 const statusItems: NavEntry[] = [
   { key: "all", labelKey: "sidebar.filter.all", icon: StackIcon },
-  { key: "downloading", labelKey: "status.label.downloading", icon: DownloadSimpleIcon },
-  { key: "completed", labelKey: "status.label.completed", icon: CheckCircleIcon },
+  {
+    key: "downloading",
+    labelKey: "status.label.downloading",
+    icon: DownloadSimpleIcon,
+  },
+  {
+    key: "completed",
+    labelKey: "status.label.completed",
+    icon: CheckCircleIcon,
+  },
   { key: "paused", labelKey: "status.label.paused", icon: PauseIcon },
   { key: "failed", labelKey: "sidebar.filter.failed", icon: WarningCircleIcon },
 ];
 
-const typeItems: { key: FileTypeFilter; labelKey: MessageKey; icon: IconComponent }[] =
-  [
-    { key: "video", labelKey: "sidebar.filter.video", icon: VideoIcon },
-    { key: "audio", labelKey: "sidebar.filter.audio", icon: AudioIcon },
-    { key: "document", labelKey: "sidebar.filter.document", icon: DocumentIcon },
-    { key: "image", labelKey: "sidebar.filter.image", icon: ImageIcon },
-    { key: "archive", labelKey: "sidebar.filter.archive", icon: ArchiveIcon },
-    { key: "other", labelKey: "sidebar.filter.other", icon: AttachmentIcon },
-  ];
+const typeItems: {
+  key: FileTypeFilter;
+  labelKey: MessageKey;
+  icon: IconComponent;
+}[] = [
+  { key: "video", labelKey: "sidebar.filter.video", icon: VideoIcon },
+  { key: "audio", labelKey: "sidebar.filter.audio", icon: AudioIcon },
+  { key: "document", labelKey: "sidebar.filter.document", icon: DocumentIcon },
+  { key: "image", labelKey: "sidebar.filter.image", icon: ImageIcon },
+  { key: "archive", labelKey: "sidebar.filter.archive", icon: ArchiveIcon },
+  { key: "other", labelKey: "sidebar.filter.other", icon: AttachmentIcon },
+];
 
 type NavItemProps = {
   icon: IconComponent;
@@ -79,122 +90,39 @@ const NavItem = (p: NavItemProps) => {
   const label = () => tr(p.labelKey);
   return (
     <button
-      class={`sidebar-nav-item flex items-center cursor-pointer select-none focus:outline-none focus-visible:focus-ring relative ${p.active ? "is-active" : "hover-light"}`}
-      style={{
-        height: "34px",
-        padding: p.expanded ? "0 12px" : "0",
-        "border-radius": "7px",
-        background: p.active ? "var(--color-surface-2, var(--color-bg-tertiary))" : "transparent",
-        color: p.active
-          ? "var(--color-text-primary)"
-          : "var(--color-text-secondary)",
-        transition: "background 150ms ease, color 150ms ease",
-        "justify-content": p.expanded ? "space-between" : "center",
-        border: "none",
-        width: "100%",
-        /* active 态:顶光 inset + 微下沉阴影(参考稿 raised active) */
-        "box-shadow": p.active
-          ? "inset 0 1px 0 var(--color-inset-dark), inset 0 0 0 0.5px var(--color-inset-light)"
-          : "none",
+      class="sidebar-nav-item focus:outline-none focus-visible:focus-ring"
+      classList={{
+        "is-active": p.active,
+        "sidebar-nav-item--rail": !p.expanded,
       }}
       onClick={() => p.onClick()}
       aria-current={p.active ? "page" : undefined}
       aria-label={label()}
       title={label()}
     >
-      {/* active 左竖条(参考稿:2px 电青 bar) */}
-      <Show when={p.active}>
-        <span
-          aria-hidden="true"
-          style={{
-            position: "absolute",
-            left: p.expanded ? "-2px" : "0",
-            top: "50%",
-            transform: "translateY(-50%)",
-            width: "2px",
-            height: "20px",
-            "border-radius": "0 2px 2px 0",
-            background: "var(--color-accent-primary)",
-          }}
-        />
-      </Show>
-      <div
-        class="flex items-center min-w-0"
-        style={{ gap: p.expanded ? "12px" : "0" }}
-      >
-        <div
-          style={{
-            width: "20px",
-            height: "20px",
-            display: "flex",
-            "align-items": "center",
-            "justify-content": "center",
-            "flex-shrink": 0,
-          }}
-        >
+      <span class="sidebar-nav-indicator" aria-hidden="true" />
+      <div class="sidebar-nav-content">
+        <div class="sidebar-nav-icon">
           <Icon />
         </div>
         <Show when={p.expanded}>
-          <span class="truncate" style={{ "font-size": "14px" }}>
-            {label()}
-          </span>
+          <span class="sidebar-nav-label">{label()}</span>
           <Show when={p.badge}>
-            <span
-              style={{
-                "font-size": "10px",
-                "font-weight": 700,
-                color: "var(--color-accent-primary)",
-                background: "var(--color-accent-soft)",
-                "border-radius": "4px",
-                padding: "1px 4px",
-                "flex-shrink": 0,
-                "margin-left": "4px",
-              }}
-            >
-              {p.badge}
-            </span>
+            <span class="sidebar-nav-badge">{p.badge}</span>
           </Show>
         </Show>
       </div>
       <Show when={p.expanded}>
-        <span
-          style={{
-            "font-size": "12px",
-            color: "var(--color-text-tertiary)",
-            "flex-shrink": 0,
-          }}
-        >
-          {p.count}
-        </span>
+        <span class="sidebar-nav-count">{p.count}</span>
       </Show>
     </button>
   );
 };
 
-const divider = () => (
-  <div
-    style={{
-      height: "1px",
-      background: "var(--color-bg-hover)",
-      margin: "4px 10px",
-    }}
-  />
-);
+const divider = () => <div class="sidebar-divider" />;
 
 const SectionLabel = (props: { children: string }) => (
-  <div
-    style={{
-      "font-size": "11px",
-      "font-weight": 600,
-      color: "var(--color-text-tertiary)",
-      "text-transform": "uppercase",
-      "letter-spacing": "0.5px",
-      padding: "0 8px",
-      "margin-bottom": "4px",
-    }}
-  >
-    {props.children}
-  </div>
+  <div class="sidebar-section-label">{props.children}</div>
 );
 
 export default function Sidebar() {
@@ -232,8 +160,7 @@ export default function Sidebar() {
   };
 
   // 占位宽度:collapsed 仅留轨道;展开 = 面板宽度
-  const placeholderWidth = () =>
-    effectiveCollapsed() ? RAIL_WIDTH : width();
+  const placeholderWidth = () => (effectiveCollapsed() ? RAIL_WIDTH : width());
 
   const handleDragStart = (e: MouseEvent) => {
     if (isNarrow()) return; // 窄屏不可调宽
@@ -354,8 +281,16 @@ export default function Sidebar() {
             <Button
               variant="ghost"
               shape="icon-sm"
-              aria-label={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
-              title={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              aria-label={
+                effectivePinned()
+                  ? tr("sidebar.aria.unpin")
+                  : tr("sidebar.aria.pin")
+              }
+              title={
+                effectivePinned()
+                  ? tr("sidebar.aria.unpin")
+                  : tr("sidebar.aria.pin")
+              }
               class={effectivePinned() ? "is-pinned" : ""}
               onClick={$ui.toggleSidebarPin}
               disabled={isNarrow()}
@@ -400,29 +335,21 @@ export default function Sidebar() {
           }}
         >
           {/* Pin header */}
-          <div
-            class="flex items-center justify-between flex-shrink-0"
-            style={{
-              height: "40px",
-              padding: "0 12px",
-              "border-bottom": "1px solid var(--color-border-subtle)",
-            }}
-          >
-            <span
-              style={{
-                "font-size": "11px",
-                "font-weight": 600,
-                color: "var(--color-text-tertiary)",
-                "letter-spacing": "0.5px",
-              }}
-            >
-              {tr("sidebar.nav")}
-            </span>
+          <div class="sidebar-panel-header">
+            <span class="sidebar-panel-title">{tr("sidebar.nav")}</span>
             <Button
               variant="ghost"
               shape="icon-sm"
-              aria-label={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
-              title={effectivePinned() ? tr("sidebar.aria.unpin") : tr("sidebar.aria.pin")}
+              aria-label={
+                effectivePinned()
+                  ? tr("sidebar.aria.unpin")
+                  : tr("sidebar.aria.pin")
+              }
+              title={
+                effectivePinned()
+                  ? tr("sidebar.aria.unpin")
+                  : tr("sidebar.aria.pin")
+              }
               class={effectivePinned() ? "is-pinned" : ""}
               onClick={$ui.toggleSidebarPin}
             >

@@ -1,26 +1,27 @@
-import { api } from '../api/invoke'
-import { $tasks, refreshTaskList } from './downloads'
-import { $selectedIds, deselectAll } from './selection'
-import { addToast } from './toast'
-import { requestConfirm } from './confirm'
-import { tr } from '../i18n'
+import { api } from "../api/invoke";
+import { $tasks, refreshTaskList } from "./downloads";
+import { $selectedIds, deselectAll } from "./selection";
+import { addToast } from "./toast";
+import { requestConfirm } from "./confirm";
+import { clearTaskHistory } from "./taskSpeedHistory";
+import { tr } from "../i18n";
 
 export async function pauseSelected(): Promise<void> {
-  const ids = Array.from($selectedIds.get())
-  if (ids.length === 0) return
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
 
-  await Promise.allSettled(ids.map(id => api.pauseTask(id)))
-  deselectAll()
-  await refreshTaskList()
+  await Promise.allSettled(ids.map((id) => api.pauseTask(id)));
+  deselectAll();
+  await refreshTaskList();
 }
 
 export async function resumeSelected(): Promise<void> {
-  const ids = Array.from($selectedIds.get())
-  if (ids.length === 0) return
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
 
-  await Promise.allSettled(ids.map(id => api.resumeTask(id)))
-  deselectAll()
-  await refreshTaskList()
+  await Promise.allSettled(ids.map((id) => api.resumeTask(id)));
+  deselectAll();
+  await refreshTaskList();
 }
 
 /**
@@ -31,26 +32,31 @@ export async function resumeSelected(): Promise<void> {
  * 走一次应用内 ConfirmDialog(中性 tone,提示"停止但保留记录")。
  */
 export async function cancelSelected(): Promise<void> {
-  const ids = Array.from($selectedIds.get())
-  if (ids.length === 0) return
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
 
   const result = await requestConfirm({
-    title: tr('confirm.cancelBatch.title'),
-    message: tr('confirm.cancelBatch.message', { count: ids.length }),
-    confirmLabel: tr('confirm.cancelBatch.confirmLabel'),
-  })
-  if (!result.ok) return
+    title: tr("confirm.cancelBatch.title"),
+    message: tr("confirm.cancelBatch.message", { count: ids.length }),
+    confirmLabel: tr("confirm.cancelBatch.confirmLabel"),
+  });
+  if (!result.ok) return;
 
-  const results = await Promise.allSettled(ids.map(id => api.cancelTask(id)))
-  const failures = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[]
+  const results = await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
+  const failures = results.filter(
+    (r) => r.status === "rejected",
+  ) as PromiseRejectedResult[];
   if (failures.length > 0) {
-    addToast(tr('toast.cancelBatchPartialFailed', {
-      count: failures.length,
-      error: failures[0]?.reason ?? '',
-    }), 'error')
+    addToast(
+      tr("toast.cancelBatchPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
   }
-  deselectAll()
-  await refreshTaskList()
+  deselectAll();
+  await refreshTaskList();
 }
 
 /**
@@ -63,60 +69,77 @@ export async function cancelSelected(): Promise<void> {
  *         后端 confirmation token 机制仍对每个删除生效,安全边界不变。
  */
 export async function deleteSelected(): Promise<void> {
-  const ids = Array.from($selectedIds.get())
-  if (ids.length === 0) return
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
 
   const result = await requestConfirm({
-    title: tr('confirm.deleteBatch.title'),
-    message: tr('confirm.deleteBatch.message', { count: ids.length }),
-    confirmLabel: tr('confirm.delete.confirmLabel'),
-    tone: 'danger',
+    title: tr("confirm.deleteBatch.title"),
+    message: tr("confirm.deleteBatch.message", { count: ids.length }),
+    confirmLabel: tr("confirm.delete.confirmLabel"),
+    tone: "danger",
     showDeleteLocalFileOption: true,
     deleteLocalFileDefault: false,
-  })
-  if (!result.ok) return
+  });
+  if (!result.ok) return;
 
-  const results = await Promise.allSettled(ids.map(id => api.deleteTask(id, {
-    skipConfirm: true,
-    deleteLocalFile: result.deleteLocalFile,
-  })))
-  const failures = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[]
+  const results = await Promise.allSettled(
+    ids.map((id) =>
+      api.deleteTask(id, {
+        skipConfirm: true,
+        deleteLocalFile: result.deleteLocalFile,
+      }),
+    ),
+  );
+  const failures = results.filter(
+    (r) => r.status === "rejected",
+  ) as PromiseRejectedResult[];
   if (failures.length > 0) {
-    addToast(tr('toast.deleteBatchPartialFailed', {
-      count: failures.length,
-      error: failures[0]?.reason ?? '',
-    }), 'error')
+    addToast(
+      tr("toast.deleteBatchPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
   }
-  deselectAll()
-  await refreshTaskList()
+  ids.forEach((id) => clearTaskHistory(id));
+  deselectAll();
+  await refreshTaskList();
 }
 
 export async function pauseAll(): Promise<void> {
-  const ids = $tasks.get()
-    .filter(t => t.status === 'downloading' || t.status === 'connecting' || t.status === 'resuming')
-    .map(t => t.id)
+  const ids = $tasks
+    .get()
+    .filter(
+      (t) =>
+        t.status === "downloading" ||
+        t.status === "connecting" ||
+        t.status === "resuming",
+    )
+    .map((t) => t.id);
 
   if (ids.length === 0) {
-    addToast(tr('toast.noTasksToPause'), 'info')
-    return
+    addToast(tr("toast.noTasksToPause"), "info");
+    return;
   }
 
-  await Promise.allSettled(ids.map(id => api.pauseTask(id)))
-  await refreshTaskList()
+  await Promise.allSettled(ids.map((id) => api.pauseTask(id)));
+  await refreshTaskList();
 }
 
 export async function resumeAll(): Promise<void> {
-  const ids = $tasks.get()
-    .filter(t => t.status === 'paused')
-    .map(t => t.id)
+  const ids = $tasks
+    .get()
+    .filter((t) => t.status === "paused")
+    .map((t) => t.id);
 
   if (ids.length === 0) {
-    addToast(tr('toast.noTasksToResume'), 'info')
-    return
+    addToast(tr("toast.noTasksToResume"), "info");
+    return;
   }
 
-  await Promise.allSettled(ids.map(id => api.resumeTask(id)))
-  await refreshTaskList()
+  await Promise.allSettled(ids.map((id) => api.resumeTask(id)));
+  await refreshTaskList();
 }
 
 /**
@@ -125,22 +148,29 @@ export async function resumeAll(): Promise<void> {
  * cancelAll 走单次应用内确认(中性 tone),避免误触批量取消。
  */
 export async function cancelAll(): Promise<void> {
-  const ids = $tasks.get()
-    .filter(t => t.status === 'downloading' || t.status === 'connecting' || t.status === 'resuming' || t.status === 'paused')
-    .map(t => t.id)
+  const ids = $tasks
+    .get()
+    .filter(
+      (t) =>
+        t.status === "downloading" ||
+        t.status === "connecting" ||
+        t.status === "resuming" ||
+        t.status === "paused",
+    )
+    .map((t) => t.id);
 
   if (ids.length === 0) {
-    addToast(tr('toast.noTasksToCancel'), 'info')
-    return
+    addToast(tr("toast.noTasksToCancel"), "info");
+    return;
   }
 
   const result = await requestConfirm({
-    title: tr('confirm.cancelBatch.title'),
-    message: tr('confirm.cancelBatch.message', { count: ids.length }),
-    confirmLabel: tr('confirm.cancelBatch.confirmLabel'),
-  })
-  if (!result.ok) return
+    title: tr("confirm.cancelBatch.title"),
+    message: tr("confirm.cancelBatch.message", { count: ids.length }),
+    confirmLabel: tr("confirm.cancelBatch.confirmLabel"),
+  });
+  if (!result.ok) return;
 
-  await Promise.allSettled(ids.map(id => api.cancelTask(id)))
-  await refreshTaskList()
+  await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
+  await refreshTaskList();
 }

@@ -32,6 +32,14 @@ use tachyon_core::error::{DownloadError, DownloadResult};
 use tachyon_core::traits::{ByteStream, Protocol};
 use tachyon_core::types::{FileLayout, FileMetadata, FileSpan};
 
+/// 按 magnet URL 缓存的 ManagedTorrent 句柄 + 文件布局
+///
+/// 跨 MagnetProtocol 实例共享(由 BtSession 持有 Arc),使 probe_filename
+/// 命令探测后填充的缓存对后续 build_download_task 创建的下载实例可见,
+/// 避免重复 add_torrent(librqbit 对 magnet URL 即使 AlreadyManaged 也会先
+/// resolve_magnet 联网拉 metadata,死 swarm 下永久挂起)。
+pub type HandleCache = Arc<DashMap<String, (Arc<ManagedTorrent>, FileLayout)>>;
+
 /// 磁力链接协议客户端
 ///
 /// 持有 librqbit Session 引用，通过 Protocol trait
@@ -48,17 +56,30 @@ pub struct MagnetProtocol {
     /// 默认下载输出目录（与 Session 创建时的 default_output_folder 一致）
     download_dir: PathBuf,
     /// 按 magnet URL 缓存的 ManagedTorrent 句柄 + 文件布局
-    handle_cache: DashMap<String, (Arc<ManagedTorrent>, FileLayout)>,
+    ///
+    /// `Arc<DashMap>` 跨实例共享:probe_filename 命令与下载任务各自创建的
+    /// MagnetProtocol 传入同一 Arc,前者 insert 的 handle 对后者可见。
+    /// probe/download 方法内 `self.handle_cache.clone()` 是 Arc 浅拷贝,
+    /// 共享底层 map —— 修复了值字段 DashMap 深拷贝导致 insert 不生效的 bug。
+    handle_cache: HandleCache,
 }
 
 impl MagnetProtocol {
     /// 创建磁力链接协议客户端
-    pub fn new(session: Arc<Session>, config: MagnetConfig, download_dir: PathBuf) -> Self {
+    ///
+    /// `handle_cache` 由 BtSession 持有并跨实例共享,传入同一 Arc 使
+    /// probe_filename 命令与下载任务共享缓存,避免重复 add_torrent。
+    pub fn new(
+        session: Arc<Session>,
+        config: MagnetConfig,
+        download_dir: PathBuf,
+        handle_cache: HandleCache,
+    ) -> Self {
         Self {
             session,
             config,
             download_dir,
-            handle_cache: DashMap::new(),
+            handle_cache,
         }
     }
 
@@ -73,10 +94,11 @@ impl MagnetProtocol {
 
     /// 带容量上限的 insert(供 cache_handle 与 async 闭包共用)
     ///
+    /// 接收 `&HandleCache`(`&Arc<DashMap>`),通过 Deref 操作底层 DashMap。
     /// 超过 `MAX_CACHED_HANDLES` 时淘汰一个旧条目(非严格 LRU,DashMap 无序,
     /// 但足以防无限增长;实际并发下载数通常 ≤ 10,上限 64 足够)。
     fn insert_with_capacity(
-        cache: &DashMap<String, (Arc<ManagedTorrent>, FileLayout)>,
+        cache: &HandleCache,
         url: String,
         handle: Arc<ManagedTorrent>,
         layout: FileLayout,
@@ -151,7 +173,9 @@ impl MagnetProtocol {
         handle: Arc<ManagedTorrent>,
         layout: FileLayout,
     ) -> Self {
-        let proto = Self::new(session, config, download_dir);
+        // 测试接缝:创建独立 cache(不与生产 BtSession 共享),保持测试隔离
+        let handle_cache: HandleCache = Arc::new(DashMap::new());
+        let proto = Self::new(session, config, download_dir, handle_cache);
         Self::insert_with_capacity(&proto.handle_cache, url.to_string(), handle, layout);
         proto
     }
@@ -406,12 +430,19 @@ fn resolve_first_file_path(
 /// 强制定期回连 tracker 刷新 peer 列表(None 禁用,由 librqbit 默认策略决定)。
 /// `initial_peers` 透传 `AddTorrentOptions.initial_peers`,预置已知 peer 直连
 /// (BEP 9 magnet `&pe=` 参数解析出的地址 + 配置 `peer_addrs`)。
+///
+/// `timeout` 包裹 `session.add_torrent().await` 整体(含 librqbit 内部的
+/// `resolve_magnet` —— DHT get_peers + tracker announce + TCP peer ut_metadata 交换)。
+/// 死 swarm 下 `resolve_magnet` 会永久挂起,此超时兜底触发 `Err(Timeout)`,
+/// 使引擎能重试/失败而非永久卡死。复用 `metadata_timeout_secs`(语义一致:
+/// 元数据获取超时覆盖 add_torrent + wait_until_initialized 全流程)。
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
     download_dir: &std::path::Path,
     force_tracker_interval: Option<Duration>,
     initial_peers: Vec<SocketAddr>,
+    timeout: Duration,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
     let opts = AddTorrentOptions {
         overwrite: true,
@@ -424,10 +455,22 @@ async fn add_magnet_to_session(
         },
         ..Default::default()
     };
-    session
-        .add_torrent(AddTorrent::from_url(url), Some(opts))
-        .await
-        .map_err(|e| DownloadError::Network(format!("添加磁力链接失败: {e}")))?
+    // tokio::time::timeout 包裹 add_torrent:librqbit 对 magnet URL 即使
+    // AlreadyManaged 也会先 resolve_magnet 联网拉 metadata(session.rs:1072 在
+    // 1140 之前),死 swarm 下永久挂起。超时兜底让引擎能重试/失败。
+    let added = tokio::time::timeout(
+        timeout,
+        session.add_torrent(AddTorrent::from_url(url), Some(opts)),
+    )
+    .await
+    .map_err(|_| {
+        DownloadError::Timeout(format!(
+            "磁力链接添加超时（{}秒），可能无可用 peer 提供元数据",
+            timeout.as_secs()
+        ))
+    })?
+    .map_err(|e| DownloadError::Network(format!("添加磁力链接失败: {e}")))?;
+    added
         .into_handle()
         .ok_or_else(|| DownloadError::Protocol("磁力链接已存在或添加失败".into()))
 }
@@ -501,18 +544,20 @@ impl Protocol for MagnetProtocol {
                 );
                 addrs
             };
+            // metadata_timeout 覆盖 add_torrent(含 resolve_magnet)+ wait_until_initialized 全流程
+            let metadata_timeout = Duration::from_secs(config.metadata_timeout_secs);
             let handle = add_magnet_to_session(
                 &session,
                 &url,
                 &download_dir,
                 force_tracker_interval,
                 initial_peers,
+                metadata_timeout,
             )
             .await?;
 
             // 等待元数据就绪（带超时）
-            let timeout = Duration::from_secs(config.metadata_timeout_secs);
-            tokio::time::timeout(timeout, handle.wait_until_initialized())
+            tokio::time::timeout(metadata_timeout, handle.wait_until_initialized())
                 .await
                 .map_err(|_| {
                     DownloadError::Timeout(format!(
@@ -610,6 +655,8 @@ impl Protocol for MagnetProtocol {
         } else {
             Duration::from_secs(self.config.peer_wait_timeout_secs)
         };
+        // add_torrent 超时(复用 metadata_timeout,覆盖 resolve_magnet 死 swarm 兜底)
+        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
@@ -623,6 +670,7 @@ impl Protocol for MagnetProtocol {
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
+                    metadata_timeout,
                 )
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
@@ -705,6 +753,7 @@ impl Protocol for MagnetProtocol {
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
+        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
 
         Box::pin(async move {
             // 命中缓存(probe 已填充 handle + layout);未命中则现场添加(回退,无 layout)
@@ -717,6 +766,7 @@ impl Protocol for MagnetProtocol {
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
+                    metadata_timeout,
                 )
                 .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
@@ -763,6 +813,7 @@ impl Protocol for MagnetProtocol {
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
+        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
 
         Box::pin(async move {
             // 命中缓存;未命中则现场添加
@@ -775,6 +826,7 @@ impl Protocol for MagnetProtocol {
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
+                    metadata_timeout,
                 )
                 .await?;
                 let layout = h
@@ -1670,5 +1722,81 @@ mod tests {
         );
         let collected = collect_stream(Box::pin(stream)).await;
         assert_eq!(collected, data.to_vec());
+    }
+
+    // ── handle_cache 跨实例共享测试 ──────────────────────────────────
+
+    /// 验证:两个 MagnetProtocol 实例共享同一 Arc<DashMap> handle_cache
+    ///
+    /// 修复核心 bug:handle_cache 从值字段 DashMap(深拷贝,insert 不生效)改为
+    /// Arc<DashMap>(浅拷贝,跨实例共享)。probe_filename 命令与下载任务各自创建
+    /// MagnetProtocol 实例,但共享 BtSession 的 handle_cache:前者 insert 的 handle
+    /// 对后者可见,避免重复 add_torrent(librqbit 对 magnet URL 即使 AlreadyManaged
+    /// 也会先 resolve_magnet 联网拉 metadata,死 swarm 下永久挂起)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_cache_shared_across_instances() {
+        let (proto_a, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        // proto_a 的 handle_cache 已由 from_handle 预填充(离线测试接缝)
+        // 验证 proto_a 自身能命中缓存
+        assert!(
+            proto_a.handle_cache.get(&url).is_some(),
+            "proto_a 的 handle_cache 应有 url 条目"
+        );
+
+        // 创建 proto_b 共享 proto_a 的 handle_cache(模拟生产:两个 MagnetProtocol
+        // 实例从同一 BtSession 获取同一 Arc<DashMap>)
+        let proto_b = MagnetProtocol::new(
+            proto_a.session.clone(),
+            proto_a.config.clone(),
+            proto_a.download_dir.clone(),
+            Arc::clone(&proto_a.handle_cache),
+        );
+
+        // proto_b 应能命中 proto_a 填充的缓存(跨实例共享)
+        assert!(
+            proto_b.handle_cache.get(&url).is_some(),
+            "proto_b 共享 handle_cache 后应命中 proto_a 填充的条目"
+        );
+
+        // proto_b 的 probe 命中缓存短路:不调 add_magnet_to_session,
+        // 直接从缓存 handle 派生 FileMetadata(无需联网)
+        let meta = proto_b
+            .probe(&url)
+            .await
+            .expect("共享缓存下 probe 应命中短路,无需联网");
+        assert_eq!(
+            meta.file_size,
+            Some(4096),
+            "probe 返回的文件大小应与预置文件一致"
+        );
+        assert!(meta.supports_range, "磁力链接 probe 应支持 range");
+    }
+
+    /// 验证:handle_cache 不共享时(独立 Arc),实例 B 无法命中实例 A 的缓存
+    ///
+    /// 对照组:确认共享是 Arc 浅拷贝的效果,而非其他机制。
+    /// 独立 cache 的实例 B 命中失败,会回退到 add_magnet_to_session(联网路径)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_cache_independent_instances_miss() {
+        let (proto_a, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        // proto_b 用独立 cache(模拟修复前的旧行为)
+        let proto_b = MagnetProtocol::new(
+            proto_a.session.clone(),
+            proto_a.config.clone(),
+            proto_a.download_dir.clone(),
+            Arc::new(DashMap::new()), // 独立空 cache
+        );
+
+        // proto_b 的独立 cache 不含 proto_a 填充的条目
+        assert!(
+            proto_b.handle_cache.get(&url).is_none(),
+            "独立 cache 的 proto_b 不应命中 proto_a 的条目"
+        );
     }
 }

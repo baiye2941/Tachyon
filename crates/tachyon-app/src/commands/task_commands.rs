@@ -688,6 +688,7 @@ pub(crate) async fn probe_filename_inner(
                 session.session(),
                 session.config().clone(),
                 session.download_dir().clone(),
+                session.handle_cache(),
             );
             match protocol.probe(&url).await {
                 Ok(meta) => return Ok(meta.file_name),
@@ -932,6 +933,7 @@ mod tests {
                 progress: 0.0,
                 fragments_total: 0,
                 fragments_done: 0,
+                active_concurrency: 0,
                 created_at: now_iso8601(),
                 save_path: String::new(),
                 error_reason: None,
@@ -2210,6 +2212,7 @@ mod tests {
                 progress: 0.0,
                 fragments_total: 0,
                 fragments_done: 0,
+                active_concurrency: 0,
                 created_at: now_iso8601(),
                 save_path: String::new(),
                 error_reason: None,

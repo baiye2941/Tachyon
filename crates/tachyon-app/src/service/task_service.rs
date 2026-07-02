@@ -327,6 +327,7 @@ impl TaskService {
             progress: 0.0,
             fragments_total: 0,
             fragments_done: 0,
+            active_concurrency: 0,
             created_at,
             save_path: download_dir_str.clone(),
             error_reason: None,

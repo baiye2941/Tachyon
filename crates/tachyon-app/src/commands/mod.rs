@@ -120,6 +120,10 @@ pub struct TaskInfo {
     pub progress: f64,
     pub fragments_total: u32,
     pub fragments_done: u32,
+    /// 当前下载并发度,前端推算 downloading 带宽用
+    /// 由 PlanComplete 初始化,运行中不更新(静态初始值)
+    #[serde(default)]
+    pub active_concurrency: u32,
     pub created_at: String,
     pub save_path: String,
     /// 失败原因原文（仅 status=Failed 时有值）。
@@ -218,6 +222,8 @@ pub struct DownloadProgress {
     pub speed: u64,
     pub fragments_total: u32,
     pub fragments_done: u32,
+    #[serde(default)]
+    pub active_concurrency: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +235,12 @@ pub struct TaskProgress {
     pub downloaded: u64,
     pub status: DownloadState,
     pub fragments_done: u32,
+    #[serde(default)]
+    pub fragments_total: u32,
+    #[serde(default)]
+    pub active_concurrency: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_delta: Vec<u32>,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -316,6 +328,7 @@ pub struct AppState {
     pub(crate) infra: InfraState,
     pub(crate) service: ServiceState,
     pub(crate) runtime: RuntimeState,
+    pub(crate) fragment_state_store: crate::projection::FragmentStateStore,
 }
 
 impl Default for AppState {
@@ -413,6 +426,7 @@ impl AppState {
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
             },
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
         })
     }
 
@@ -440,6 +454,7 @@ impl AppState {
             infra: self.infra.clone(),
             service: self.service.clone(),
             runtime: self.runtime.clone(),
+            fragment_state_store: self.fragment_state_store.clone(),
         }
     }
 }
@@ -566,6 +581,7 @@ pub(crate) fn update_task_status(
 
 pub(crate) fn cleanup_runtime(state: &AppState, task_id: &str) {
     state.runtime.supervisor.cleanup(task_id);
+    state.fragment_state_store.remove(task_id);
 }
 
 pub(crate) async fn persist_task_snapshot(
@@ -768,6 +784,7 @@ pub(crate) mod tests {
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
             },
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
         })
     }
 
@@ -847,6 +864,7 @@ pub(crate) mod tests {
             progress: 0.5,
             fragments_total: 4,
             fragments_done: 2,
+            active_concurrency: 0,
             created_at: "2025-01-01T00:00:00+08:00".to_string(),
             save_path: "/downloads/file.zip".to_string(),
             error_reason: None,

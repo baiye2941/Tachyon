@@ -81,7 +81,9 @@ function isValidRecord(r: unknown): r is HistoryRecord {
     typeof rec.id === "string" &&
     typeof rec.url === "string" &&
     typeof rec.fileName === "string" &&
-    (rec.status === "completed" || rec.status === "failed" || rec.status === "cancelled")
+    (rec.status === "completed" ||
+      rec.status === "failed" ||
+      rec.status === "cancelled")
   );
 }
 
@@ -195,4 +197,14 @@ export function clearHistory(): void {
 export function getRecordById(id: string): HistoryRecord | undefined {
   const records = untrack(() => historyRecords);
   return records.find((r) => r.id === id);
+}
+
+export function deleteHistoryRecord(id: string): void {
+  setHistoryRecords((prev) => {
+    const idx = prev.findIndex((r) => r.id === id);
+    if (idx === -1) return prev;
+    const updated = [...prev.slice(0, idx), ...prev.slice(idx + 1)];
+    saveToStorage(updated);
+    return updated;
+  });
 }

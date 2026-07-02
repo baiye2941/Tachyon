@@ -249,7 +249,8 @@ export default function ContextMenu(props: ContextMenuProps) {
           border: "1px solid var(--color-border-default)",
           "box-shadow": "var(--shadow-lg)",
           padding: "6px 0",
-          animation: "fadeIn 100ms ease forwards",
+          "transform-origin": "top left",
+          animation: "context-menu-enter 120ms ease forwards",
         }}
       >
         <For each={menuItems()}>
@@ -273,7 +274,7 @@ export default function ContextMenu(props: ContextMenuProps) {
                 }}
                 role="menuitem"
                 tabindex={-1}
-                class={`flex items-center gap-2 w-full text-left ${item.danger ? "hover-danger" : "hover-light"}`}
+                class={`context-menu-item flex items-center gap-2 w-full text-left ${item.danger ? "context-menu-item--danger" : ""}`}
                 style={{
                   height: "32px",
                   padding: "0 12px",

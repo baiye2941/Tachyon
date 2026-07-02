@@ -10,30 +10,6 @@ import {
 } from "../components/icons";
 import { tr, type MessageKey } from "../i18n";
 
-/**
- * 分片线程/批次着色色板(仅 Canvas 场景使用)。
- *
- * 设计原则:禁止彩虹色,90%+ 界面深色,强调色少量使用。
- * 冷电青 3 阶覆盖 1-3 批次(主轴,= --accent-vel-*),电紫区分 4 批次,仅 5+ 批次点缀青色。
- *
- * 重要:以下十六进制必须与 index.css @theme primitive token 保持同步,
- * 改一处改两处。映射关系见右侧注释。Canvas 无法使用 var(),故保留字面值。
- */
-export const THREAD_COLORS = [
-  "#35DDE2", // = --accent-vel-400 (主强调,冷电青)
-  "#00E5FF", // = --accent-vel-500
-  "#40B1B7", // = --accent-vel-600
-  "#A855F7", // = --purple-500 (电紫,区分批次)
-  "#00E5FF", // = --cyan-500  (Neon Cyan,仅 5+ 批次点缀)
-  "#35DDE2",
-  "#00E5FF",
-  "#A855F7",
-  "#40B1B7",
-  "#00E5FF",
-  "#35DDE2",
-  "#00E5FF",
-];
-
 export function formatSize(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return tr("common.unknown");
   if (bytes === 0) return "0 B";

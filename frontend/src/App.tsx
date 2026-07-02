@@ -27,6 +27,7 @@ import {
   setSearchQuery,
   removeSearchFilter,
 } from "./stores/taskFilter";
+import { deleteHistoryRecord, getRecordById } from "./stores/history";
 import {
   pauseSelected,
   resumeSelected,
@@ -52,6 +53,7 @@ import BatchToolbar from "./components/BatchToolbar";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ErrorPage from "./components/ErrorPage";
 import { $confirm, requestConfirm, resolveConfirm } from "./stores/confirm";
+import { clearTaskHistory } from "./stores/taskSpeedHistory";
 import { tr } from "./i18n";
 
 const SnifferPanel = lazy(() => import("./components/SnifferPanel"));
@@ -110,20 +112,25 @@ function AppContent() {
     api
       .createTask(resource.url)
       .then(() => refreshTaskList())
-      .catch((e) => addToast(tr("toast.createTaskFailed", { error: e }), "error"));
+      .catch((e) =>
+        addToast(tr("toast.createTaskFailed", { error: e }), "error"),
+      );
   };
 
   const handleRedownload = (task: TaskInfo) => {
     api
       .createTask(task.url)
       .then(() => refreshTaskList())
-      .catch((e) => addToast(tr("toast.redownloadFailed", { error: e }), "error"));
+      .catch((e) =>
+        addToast(tr("toast.redownloadFailed", { error: e }), "error"),
+      );
   };
 
   const handleDeleteRecord = async (taskId: string) => {
     // 历史记录删除同样走应用层 ConfirmDialog(Iteration 11)
     const task = $tasks.get().find((t) => t.id === taskId);
-    const fileName = task?.fileName ?? taskId;
+    const record = getRecordById(taskId);
+    const fileName = task?.fileName ?? record?.fileName ?? taskId;
     const result = await requestConfirm({
       title: tr("confirm.deleteHistory.title"),
       message: tr("confirm.deleteHistory.message", { name: fileName }),
@@ -133,11 +140,48 @@ function AppContent() {
       deleteLocalFileDefault: false,
     });
     if (!result.ok) return;
+
+    // 先移除本地历史记录与速度采样,保证 UI 即时响应;后端删除失败也不影响本地清理
+    deleteHistoryRecord(taskId);
+    clearTaskHistory(taskId);
+
+    if (task) {
+      try {
+        await api.deleteTask(taskId, {
+          skipConfirm: true,
+          deleteLocalFile: result.deleteLocalFile,
+        });
+      } catch (e) {
+        addToast(tr("toast.deleteRecordFailed", { error: e }), "error");
+      }
+    }
+    await refreshTaskList();
+  };
+
+  const handleDelete = async (taskId: string) => {
+    // Iteration 11:走应用层 ConfirmDialog,与品牌视觉一致;
+    // 后端 confirmation token 仍在 invoke 层执行,安全边界不变。
+    const task = $tasks.get().find((t) => t.id === taskId);
+    const fileName = task?.fileName ?? taskId;
+    const result = await requestConfirm({
+      title: tr("confirm.delete.title"),
+      message: tr("confirm.delete.message", { name: fileName }),
+      confirmLabel: tr("confirm.delete.confirmLabel"),
+      showDeleteLocalFileOption: true,
+      deleteLocalFileDefault: false,
+      tone: "danger",
+    });
+    if (!result.ok) return;
     try {
-      await api.deleteTask(taskId, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile });
+      await api.deleteTask(taskId, {
+        skipConfirm: true,
+        deleteLocalFile: result.deleteLocalFile,
+      });
+      clearTaskHistory(taskId);
       await refreshTaskList();
+      if ($selectedId.get() === taskId) $selectedId.set(null);
     } catch (e) {
-      addToast(tr("toast.deleteRecordFailed", { error: e }), "error");
+      addToast(tr("toast.deleteFailed", { error: e }), "error");
     }
   };
 
@@ -169,6 +213,7 @@ function AppContent() {
             }}
           >
             <svg
+              class="empty-state-icon"
               width="48"
               height="48"
               viewBox="0 0 24 24"
@@ -278,9 +323,13 @@ function AppContent() {
         confirmLabel={$confirm.pending()?.confirmLabel}
         cancelLabel={$confirm.pending()?.cancelLabel}
         tone={$confirm.pending()?.tone}
-        showDeleteLocalFileOption={$confirm.pending()?.showDeleteLocalFileOption}
+        showDeleteLocalFileOption={
+          $confirm.pending()?.showDeleteLocalFileOption
+        }
         deleteLocalFileLabel={$confirm.pending()?.deleteLocalFileLabel}
-        deleteLocalFileDescription={$confirm.pending()?.deleteLocalFileDescription}
+        deleteLocalFileDescription={
+          $confirm.pending()?.deleteLocalFileDescription
+        }
         deleteLocalFileDefault={$confirm.pending()?.deleteLocalFileDefault}
         onConfirm={(options) => resolveConfirm({ ok: true, ...options })}
         onCancel={() => resolveConfirm(false)}
@@ -305,19 +354,25 @@ function AppContent() {
           api
             .pauseTask(taskId)
             .then(() => refreshTaskList())
-            .catch((e) => addToast(tr("toast.pauseFailed", { error: e }), "error"));
+            .catch((e) =>
+              addToast(tr("toast.pauseFailed", { error: e }), "error"),
+            );
         }}
         onResume={(taskId) => {
           api
             .resumeTask(taskId)
             .then(() => refreshTaskList())
-            .catch((e) => addToast(tr("toast.resumeFailed", { error: e }), "error"));
+            .catch((e) =>
+              addToast(tr("toast.resumeFailed", { error: e }), "error"),
+            );
         }}
         onCancel={(taskId) => {
           api
             .cancelTask(taskId)
             .then(() => refreshTaskList())
-            .catch((e) => addToast(tr("toast.cancelFailed", { error: e }), "error"));
+            .catch((e) =>
+              addToast(tr("toast.cancelFailed", { error: e }), "error"),
+            );
         }}
         onOpenFolder={(taskId) => {
           const task = $tasks.get().find((t) => t.id === taskId);
@@ -337,27 +392,7 @@ function AppContent() {
           const task = $tasks.get().find((t) => t.id === taskId);
           if (task) handleRedownload(task);
         }}
-        onDelete={(taskId) => {
-          // Iteration 11:走应用层 ConfirmDialog,与品牌视觉一致;
-          // 后端 confirmation token 仍在 invoke 层执行,安全边界不变。
-          const task = $tasks.get().find((t) => t.id === taskId);
-          const fileName = task?.fileName ?? taskId;
-          requestConfirm({
-            title: tr("confirm.delete.title"),
-            message: tr("confirm.delete.message", { name: fileName }),
-            confirmLabel: tr("confirm.delete.confirmLabel"),
-            showDeleteLocalFileOption: true,
-            deleteLocalFileDefault: false,
-            tone: "danger",
-          }).then((result) => {
-            if (!result.ok) return;
-            api
-              .deleteTask(taskId, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile })
-              .then(() => refreshTaskList())
-              .catch((e) => addToast(tr("toast.deleteFailed", { error: e }), "error"));
-            if ($selectedId.get() === taskId) $selectedId.set(null);
-          });
-        }}
+        onDelete={handleDelete}
       />
 
       {/* Panels */}

@@ -104,6 +104,7 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
         },
         fragments_total: snapshot.total_fragments,
         fragments_done: snapshot.completed_fragments.len() as u32,
+        active_concurrency: 0,
         created_at: snapshot.created_at.clone(),
         save_path: snapshot.save_path.clone(),
         // 从快照恢复时保留失败原因与重试计数,前端诊断面板可直接使用后端原文
@@ -322,6 +323,7 @@ mod tests {
             progress: 0.0,
             fragments_total: 0,
             fragments_done: 0,
+            active_concurrency: 0,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             save_path: "/downloads/file.bin".to_string(),
             error_reason: None,

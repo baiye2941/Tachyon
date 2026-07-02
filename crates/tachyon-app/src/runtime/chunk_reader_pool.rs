@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use tachyon_core::FragmentProgress;
 
+/// 进度变化回调:参数为 (task_id, 新完成分片 index),None 表示非完成事件
+pub type ProgressCallback = Arc<dyn Fn(&str, Option<u32>) + Send + Sync>;
+
 use crate::repository::TaskRepository;
 use crate::task_store::TaskStore;
 
@@ -34,7 +37,10 @@ pub struct ChunkReaderJob {
     /// 完成通知：当 job 处理完毕后发送信号
     pub done_tx: oneshot::Sender<()>,
     /// Callback to notify ProgressBroker of progress changes
-    pub on_progress: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// 第二参数: 新完成分片 index; None = 非完成事件(增量进度)
+    pub on_progress: Option<ProgressCallback>,
+    /// 分片状态存储(PlanComplete/Chunk 事件更新)
+    pub fragment_state_store: crate::projection::FragmentStateStore,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +172,13 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
         task_store,
         done_tx,
         on_progress,
+        fragment_state_store,
     } = job;
 
     // 已完成分片集合,用于断点续传 checkpoint
     let mut completed: BTreeSet<u32> = BTreeSet::new();
-    // 从 tasks 读取 probe 阶段已写入的 total_frags
-    let total_frags = task_repository
+    // 从 tasks 读取 probe 阶段已写入的 total_frags(PlanComplete 到达时覆盖为真实值)
+    let mut total_frags = task_repository
         .get(&task_id)
         .map(|t| t.fragments_total)
         .unwrap_or(0);
@@ -192,121 +199,162 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
     let mut last_speed_time = tokio::time::Instant::now();
 
     while let Some(progress) = progress_rx.recv().await {
-        event_count += 1;
-        if progress.completed {
-            completed.insert(progress.fragment_index);
-            pending_completed.push(progress.fragment_index);
-            // 已完成的分片不再保留在 partial map 中
-            frag_bytes.remove(&progress.fragment_index);
-        }
-        // 增量更新
-        let old = frag_bytes
-            .insert(progress.fragment_index, progress.fragment_downloaded)
-            .unwrap_or(0);
-        total_downloaded =
-            total_downloaded.saturating_add(progress.fragment_downloaded.saturating_sub(old));
-        if event_count == 1 || event_count.is_multiple_of(50) {
-            tracing::info!(
-                event = event_count,
-                idx = progress.fragment_index,
-                done = completed.len(),
-                total_frags,
-                total_downloaded,
-                "chunk reader 进度更新"
-            );
-        }
-        let frags_done = completed.len() as u32;
-
-        // 计算速度:每 500ms 采样一次
-        let now = tokio::time::Instant::now();
-        let elapsed = now.duration_since(last_speed_time).as_secs_f64();
-        let speed = if elapsed >= 0.5 {
-            let s = if elapsed > 0.0 {
-                ((total_downloaded as f64 - last_speed_sample as f64) / elapsed) as u64
-            } else {
-                0
-            };
-            last_speed_sample = total_downloaded;
-            last_speed_time = now;
-            s
-        } else {
-            // 未到采样间隔,保持上次的 speed 值
-            task_repository.get(&task_id).map(|t| t.speed).unwrap_or(0)
-        };
-
-        {
-            if let Some(mut task) = task_repository.get_mut(&task_id) {
-                task.downloaded = total_downloaded;
-                task.fragments_done = frags_done;
-                task.fragments_total = total_frags;
-                task.speed = speed;
-                // 主进度使用字节比例而非分片比例
-                // clamp 到 [0.0, 1.0] 防止进度事件乱序导致进度条溢出
-                if let Some(file_size) = task.file_size.filter(|&s| s > 0) {
-                    task.progress = (total_downloaded as f64 / file_size as f64).clamp(0.0, 1.0);
-                } else if total_frags > 0 {
-                    task.progress = (frags_done as f64 / total_frags as f64).clamp(0.0, 1.0);
+        match progress {
+            FragmentProgress::PlanComplete {
+                total,
+                completed_indices,
+                initial_concurrency,
+            } => {
+                // 覆盖真实分片数(替代 probe 估算)
+                total_frags = total;
+                if let Some(mut task) = task_repository.get_mut(&task_id) {
+                    task.fragments_total = total;
+                    task.active_concurrency = initial_concurrency;
                 }
+                // 初始化 FragmentStateStore
+                let state = crate::projection::TaskFragmentState::from_plan(
+                    total,
+                    completed_indices.clone(),
+                );
+                fragment_state_store.init(&task_id, state);
+                // 初始化 completed 集合(续传已完成分片)
+                completed = completed_indices.into_iter().collect();
+                // 触发广播(让前端拿到正确 total + concurrency)
+                if let Some(ref callback) = on_progress {
+                    callback(&task_id, None);
+                }
+                tracing::info!(
+                    task_id = %task_id,
+                    total_frags,
+                    "PlanComplete 已处理"
+                );
             }
-        }
-
-        // Notify ProgressBroker of progress change
-        if let Some(ref callback) = on_progress {
-            callback(&task_id);
-        }
-
-        // 批量 checkpoint(已完成分片)
-        if progress.completed
-            && (pending_completed.len() >= CHECKPOINT_BATCH_SIZE
-                || completed.len() as u32 == total_frags)
-        {
-            let batch: Vec<u32> = std::mem::take(&mut pending_completed);
-            let downloaded = total_downloaded;
-            let partial = frag_bytes.clone();
-            let ts = task_store.clone();
-            let tid = task_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                ts.update_snapshot(&tid, |snap| {
-                    snap.completed_fragments.extend(batch);
-                    snap.partial_fragments = partial;
-                    snap.downloaded = downloaded;
-                })
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(task_id = %task_id, error = %e, "checkpoint 落盘失败");
+            FragmentProgress::Chunk {
+                fragment_index,
+                completed: chunk_completed,
+                fragment_downloaded,
+            } => {
+                event_count += 1;
+                if chunk_completed {
+                    completed.insert(fragment_index);
+                    pending_completed.push(fragment_index);
+                    // 已完成的分片不再保留在 partial map 中
+                    frag_bytes.remove(&fragment_index);
+                    // 更新 FragmentStateStore.done_set
+                    fragment_state_store.mark_done(&task_id, fragment_index);
                 }
-                Err(e) => {
-                    tracing::warn!(task_id = %task_id, error = %e, "checkpoint spawn_blocking 失败");
+                // 增量更新
+                let old = frag_bytes
+                    .insert(fragment_index, fragment_downloaded)
+                    .unwrap_or(0);
+                total_downloaded =
+                    total_downloaded.saturating_add(fragment_downloaded.saturating_sub(old));
+                if event_count == 1 || event_count.is_multiple_of(50) {
+                    tracing::info!(
+                        event = event_count,
+                        idx = fragment_index,
+                        done = completed.len(),
+                        total_frags,
+                        total_downloaded,
+                        "chunk reader 进度更新"
+                    );
                 }
-            }
-        }
+                let frags_done = completed.len() as u32;
 
-        // 字节级进度 checkpoint(未完整分片):按事件数周期落盘,
-        // 避免崩溃后完整重下整个分片。
-        partial_checkpoint_counter += 1;
-        if partial_checkpoint_counter >= PARTIAL_CHECKPOINT_INTERVAL {
-            partial_checkpoint_counter = 0;
-            let downloaded = total_downloaded;
-            let partial = frag_bytes.clone();
-            let ts = task_store.clone();
-            let tid = task_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                ts.update_snapshot(&tid, |snap| {
-                    snap.partial_fragments = partial;
-                    snap.downloaded = downloaded;
-                })
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint 落盘失败");
+                // 计算速度:每 500ms 采样一次
+                let now = tokio::time::Instant::now();
+                let elapsed = now.duration_since(last_speed_time).as_secs_f64();
+                let speed = if elapsed >= 0.5 {
+                    let s = if elapsed > 0.0 {
+                        ((total_downloaded as f64 - last_speed_sample as f64) / elapsed) as u64
+                    } else {
+                        0
+                    };
+                    last_speed_sample = total_downloaded;
+                    last_speed_time = now;
+                    s
+                } else {
+                    // 未到采样间隔,保持上次的 speed 值
+                    task_repository.get(&task_id).map(|t| t.speed).unwrap_or(0)
+                };
+
+                {
+                    if let Some(mut task) = task_repository.get_mut(&task_id) {
+                        task.downloaded = total_downloaded;
+                        task.fragments_done = frags_done;
+                        task.fragments_total = total_frags;
+                        task.speed = speed;
+                        // 主进度使用字节比例而非分片比例
+                        // clamp 到 [0.0, 1.0] 防止进度事件乱序导致进度条溢出
+                        if let Some(file_size) = task.file_size.filter(|&s| s > 0) {
+                            task.progress =
+                                (total_downloaded as f64 / file_size as f64).clamp(0.0, 1.0);
+                        } else if total_frags > 0 {
+                            task.progress =
+                                (frags_done as f64 / total_frags as f64).clamp(0.0, 1.0);
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint spawn_blocking 失败");
+
+                // Notify ProgressBroker of progress change
+                if let Some(ref callback) = on_progress {
+                    callback(&task_id, if chunk_completed { Some(fragment_index) } else { None });
+                }
+
+                // 批量 checkpoint(已完成分片)
+                if chunk_completed
+                    && (pending_completed.len() >= CHECKPOINT_BATCH_SIZE
+                        || completed.len() as u32 == total_frags)
+                {
+                    let batch: Vec<u32> = std::mem::take(&mut pending_completed);
+                    let downloaded = total_downloaded;
+                    let partial = frag_bytes.clone();
+                    let ts = task_store.clone();
+                    let tid = task_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ts.update_snapshot(&tid, |snap| {
+                            snap.completed_fragments.extend(batch);
+                            snap.partial_fragments = partial;
+                            snap.downloaded = downloaded;
+                        })
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(task_id = %task_id, error = %e, "checkpoint 落盘失败");
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id = %task_id, error = %e, "checkpoint spawn_blocking 失败");
+                        }
+                    }
+                }
+
+                // 字节级进度 checkpoint(未完整分片):按事件数周期落盘,
+                // 避免崩溃后完整重下整个分片。
+                partial_checkpoint_counter += 1;
+                if partial_checkpoint_counter >= PARTIAL_CHECKPOINT_INTERVAL {
+                    partial_checkpoint_counter = 0;
+                    let downloaded = total_downloaded;
+                    let partial = frag_bytes.clone();
+                    let ts = task_store.clone();
+                    let tid = task_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ts.update_snapshot(&tid, |snap| {
+                            snap.partial_fragments = partial;
+                            snap.downloaded = downloaded;
+                        })
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint 落盘失败");
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id = %task_id, error = %e, "partial checkpoint spawn_blocking 失败");
+                        }
+                    }
                 }
             }
         }
@@ -380,6 +428,7 @@ mod tests {
                 progress: 0.0,
                 fragments_total: 2,
                 fragments_done: 0,
+                active_concurrency: 0,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -399,6 +448,7 @@ mod tests {
             task_store,
             done_tx,
             on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
         };
 
         // 提交 job
@@ -406,7 +456,7 @@ mod tests {
 
         // 发送进度事件
         progress_tx
-            .send(FragmentProgress {
+            .send(FragmentProgress::Chunk {
                 fragment_index: 0,
                 fragment_downloaded: 512,
                 completed: true,
@@ -414,7 +464,7 @@ mod tests {
             .await
             .unwrap();
         progress_tx
-            .send(FragmentProgress {
+            .send(FragmentProgress::Chunk {
                 fragment_index: 1,
                 fragment_downloaded: 512,
                 completed: true,
@@ -458,6 +508,7 @@ mod tests {
                     progress: 0.0,
                     fragments_total: 1,
                     fragments_done: 0,
+                    active_concurrency: 0,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     save_path: "/tmp/file.bin".to_string(),
                     error_reason: None,
@@ -476,6 +527,7 @@ mod tests {
                 task_store: task_store.clone(),
                 done_tx,
                 on_progress: None,
+                fragment_state_store: crate::projection::FragmentStateStore::new(),
             };
 
             pool.submit_async(job).await.unwrap();
@@ -483,7 +535,7 @@ mod tests {
 
             // 发送一个完成事件
             progress_tx
-                .send(FragmentProgress {
+                .send(FragmentProgress::Chunk {
                     fragment_index: 0,
                     fragment_downloaded: 256,
                     completed: true,

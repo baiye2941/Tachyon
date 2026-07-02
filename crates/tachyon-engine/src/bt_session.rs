@@ -7,8 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use librqbit::{PeerConnectionOptions, Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
+use tachyon_protocol::magnet::HandleCache;
 
 /// BitTorrent Session 单例
 ///
@@ -18,6 +20,13 @@ pub struct BtSession {
     inner: Arc<Session>,
     config: MagnetConfig,
     download_dir: PathBuf,
+    /// 跨 MagnetProtocol 实例共享的 handle 缓存。
+    ///
+    /// probe_filename 命令与 build_download_task 创建各自的 MagnetProtocol 实例,
+    /// 但共享同一份 handle_cache:前者探测后 insert 的 handle/layout,后者直接命中,
+    /// 跳过重复的 add_magnet_to_session(死 swarm 下会永久挂起)。
+    /// 热切换重建 BtSession 时,新实例自带空 cache,旧 handle 随旧 Session 丢弃。
+    handle_cache: HandleCache,
 }
 
 impl BtSession {
@@ -46,6 +55,7 @@ impl BtSession {
             inner: session,
             config,
             download_dir,
+            handle_cache: Arc::new(DashMap::new()),
         })
     }
 
@@ -135,6 +145,14 @@ impl BtSession {
     /// 获取默认下载目录
     pub fn download_dir(&self) -> &PathBuf {
         &self.download_dir
+    }
+
+    /// 获取跨实例共享的 handle 缓存(Arc 浅克隆)
+    ///
+    /// probe_filename 命令与下载任务各自创建 MagnetProtocol 时传入同一 Arc,
+    /// 使 handle_cache 跨实例共享:probe_filename 填充的 handle 对下载任务可见。
+    pub fn handle_cache(&self) -> HandleCache {
+        Arc::clone(&self.handle_cache)
     }
 }
 

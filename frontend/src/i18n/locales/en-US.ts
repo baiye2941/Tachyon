@@ -10,7 +10,8 @@ const enUS = {
   // —— Common ——
   "common.loading": "Loading...",
   "common.appError": "An error occurred",
-  "common.appErrorHint": "The app hit an unexpected error. You can retry; if it persists, please report the details below.",
+  "common.appErrorHint":
+    "The app hit an unexpected error. You can retry; if it persists, please report the details below.",
   "common.errorStack": "Error stack",
   "common.confirm": "Confirm",
   "common.cancel": "Cancel",
@@ -81,8 +82,7 @@ const enUS = {
   // —— Toolbar ——
   "toolbar.newDownload": "New Download",
   "toolbar.newDownloadShort": "New",
-  "toolbar.searchPlaceholder":
-    "Search tasks or settings",
+  "toolbar.searchPlaceholder": "Search tasks or settings",
   "toolbar.selectAll": "Select All",
   "toolbar.selectedCount": "{count} selected",
   "toolbar.pause": "Pause",
@@ -203,8 +203,7 @@ const enUS = {
   "detail.redownload": "Redownload",
   "detail.retry": "Retry",
   "detail.retryWithMirror": "Mirror retry",
-  "detail.retryWithMirrorHint":
-    "Redownload via hf-mirror.com",
+  "detail.retryWithMirrorHint": "Redownload via hf-mirror.com",
   "detail.copy.aria": "Copy",
   "detail.copied.aria": "Copied",
   "detail.section.diagnostics": "Failure diagnostics",
@@ -358,7 +357,8 @@ const enUS = {
   "settings.download.rateLimit": "Download rate limit",
   "settings.download.rateLimitPlaceholder": "Unlimited",
   "settings.download.rateLimitUnit": "bytes/s",
-  "settings.download.rateLimitHint": "Leave empty for unlimited. Value is max bytes per second.",
+  "settings.download.rateLimitHint":
+    "Leave empty for unlimited. Value is max bytes per second.",
   "settings.download.verifyChecksum": "Verify file integrity",
   "settings.connection.maxConnectionsPerHost": "Max connections per host",
   "settings.connection.connectTimeout": "Connection timeout",
@@ -379,14 +379,17 @@ const enUS = {
   "settings.tab.experimental": "Experimental",
   "settings.magnet.enableDht": "Enable DHT protocol",
   "settings.magnet.enableUpnp": "Enable UPnP port forwarding",
-  "settings.magnet.disableDhtPersistence": "Disable DHT persistence (in-memory only)",
+  "settings.magnet.disableDhtPersistence":
+    "Disable DHT persistence (in-memory only)",
   "settings.magnet.socksProxyUrl": "SOCKS5 proxy (BT tracker + peer)",
   "settings.magnet.socksProxyUrlPlaceholder": "socks5://127.0.0.1:7897",
-  "settings.magnet.socksProxyUrlHint": "Leave empty to auto-detect system proxy. Format: socks5://[user:pass@]host:port",
+  "settings.magnet.socksProxyUrlHint":
+    "Leave empty to auto-detect system proxy. Format: socks5://[user:pass@]host:port",
   "settings.magnet.trackerList": "Tracker server list",
   "settings.magnet.trackerCount": "{n} trackers",
   "settings.magnet.addTracker": "Add",
-  "settings.magnet.addTrackerPlaceholder": "udp://tracker.example.com:port/announce",
+  "settings.magnet.addTrackerPlaceholder":
+    "udp://tracker.example.com:port/announce",
   "settings.magnet.removeTracker": "Remove",
   "settings.magnet.importPreset": "Import presets",
   "settings.magnet.clearAll": "Clear all",
@@ -400,21 +403,28 @@ const enUS = {
   "settings.magnet.forceTrackerInterval": "Forced tracker interval",
   "settings.magnet.deferWritesUpToMb": "Deferred write buffer",
   "settings.magnet.disableDhtWhenSocks": "Disable DHT under SOCKS5",
-  "settings.magnet.peerConnectTimeoutHint": "1-300s. Drops dead peers faster than the default 10s to refresh the swarm.",
-  "settings.magnet.peerReadWriteTimeoutHint": "1-600s. Eviction threshold for a read/write with no data; too large stalls the swarm.",
-  "settings.magnet.forceTrackerIntervalHint": "0=disabled (honor tracker default), 30-3600s forces re-announce. Shorter intervals speed up cold-start peer discovery.",
-  "settings.magnet.deferWritesUpToMbHint": "0=disabled (synchronous writes), 1-256 MB. Buffers then flushes in batches to reduce slow-disk I/O wait.",
-  "settings.magnet.disableDhtWhenSocksHint": "DHT runs over UDP, which SOCKS5 does not proxy. Enable to avoid needless timeout waits.",
+  "settings.magnet.peerConnectTimeoutHint":
+    "1-300s. Drops dead peers faster than the default 10s to refresh the swarm.",
+  "settings.magnet.peerReadWriteTimeoutHint":
+    "1-600s. Eviction threshold for a read/write with no data; too large stalls the swarm.",
+  "settings.magnet.forceTrackerIntervalHint":
+    "0=disabled (honor tracker default), 30-3600s forces re-announce. Shorter intervals speed up cold-start peer discovery.",
+  "settings.magnet.deferWritesUpToMbHint":
+    "0=disabled (synchronous writes), 1-256 MB. Buffers then flushes in batches to reduce slow-disk I/O wait.",
+  "settings.magnet.disableDhtWhenSocksHint":
+    "DHT runs over UDP, which SOCKS5 does not proxy. Enable to avoid needless timeout waits.",
   "settings.magnet.restartRequired": "Restart required",
   "settings.magnet.newTaskOnly": "New tasks only",
   "settings.magnet.sectionPeer": "Peer timeouts",
   "settings.magnet.sectionAdvanced": "Advanced",
-  "toast.magnetSessionSwapFailed": "BtSession hot-swap failed, changes will apply after restart",
+  "toast.magnetSessionSwapFailed":
+    "BtSession hot-swap failed, changes will apply after restart",
   "settings.about.securityFields": "Protected security fields",
   "settings.about.userAgent": "User-Agent",
   "settings.about.customHeaders": "Custom headers",
   "settings.about.headersCount": "{n} entries",
-  "settings.about.securityHint": "These fields are protected by backend security policy and cannot be edited here (headers carry CRLF injection risk; user_agent should not be overridden by the frontend).",
+  "settings.about.securityHint":
+    "These fields are protected by backend security policy and cannot be edited here (headers carry CRLF injection risk; user_agent should not be overridden by the frontend).",
   "settings.save": "Save",
 
   // —— History panel ——
@@ -470,12 +480,16 @@ const enUS = {
   "speedChart.waiting": "Waiting for speed data...",
   "speedChart.peak": "Peak: ",
   "speedChart.average": "Avg: ",
+  "speedChart.live": "Current speed",
+  "speedChart.now": "Now",
+  "speedChart.ago": "{seconds}s ago",
 
   // —— Chunk matrix ——
   "chunk.sectionLabel": "Fragment Distribution",
   "chunk.infoHint":
-    "Fragments are aggregated by batch; colors represent download status (completed/downloading/waiting), not thread assignment.",
-  "chunk.tooltip.fragment": "Fragment",
+    "Chunk colors represent download status only: green=completed, cyan=downloading, gray=pending; unrelated to threads or batches.",
+  "chunk.tooltip.fragment": "Fragment #{index}",
+  "chunk.tooltip.fragmentRange": "Fragment #{start}-{end}",
   "chunk.tooltip.completed": "Completed",
 
   // —— Resource sniffer ——
@@ -509,8 +523,7 @@ const enUS = {
   "hub.download": "Download",
   "hub.downloadTitle": "Download directly from HuggingFace",
   "hub.mirrorDownload": "Mirror download",
-  "hub.mirrorDownloadTitle":
-    "Download via hf-mirror.com (accelerated in CN)",
+  "hub.mirrorDownloadTitle": "Download via hf-mirror.com (accelerated in CN)",
   "hub.aria.downloadFile": "Download {name}",
   "hub.largeTag": "L",
 
@@ -522,8 +535,10 @@ const enUS = {
 
   // —— Delete local files option ——
   "confirm.deleteLocalFile.label": "Also delete local files",
-  "confirm.deleteLocalFile.description": "Remove the saved file and deterministic temp files (.part/.tmp). This action cannot be undone.",
-  "toast.deleteBatchPartialFailed": "Batch delete partially failed ({count}): {error}",
+  "confirm.deleteLocalFile.description":
+    "Remove the saved file and deterministic temp files (.part/.tmp). This action cannot be undone.",
+  "toast.deleteBatchPartialFailed":
+    "Batch delete partially failed ({count}): {error}",
 
   // —— HuggingFace 模型管理 ——
   "hub.title": "HuggingFace Model Library",
@@ -569,7 +584,8 @@ const enUS = {
   "hub.verify.unverified": "Unverified",
   "hub.verify.fileMissing": "File missing",
   "hub.newTask.hfPreview": "HuggingFace Model",
-  "hub.newTask.hfPreviewInfo": "{files} files · {size} · {framework} · {license}",
+  "hub.newTask.hfPreviewInfo":
+    "{files} files · {size} · {framework} · {license}",
   "hub.scan.empty": "No local models",
   "hub.scan.scanning": "Scanning...",
   "hub.scan.error": "Scan failed: {error}",
@@ -582,11 +598,13 @@ const enUS = {
   "hub.batch.failed": "Batch download failed: {error}",
   "experimental.title": "Experimental Features",
   "experimental.huggingface": "HuggingFace Model Library",
-  "experimental.huggingfaceDesc": "Browse, search and download HuggingFace model weights, manage local model library",
+  "experimental.huggingfaceDesc":
+    "Browse, search and download HuggingFace model weights, manage local model library",
   "sidebar.huggingface": "Hugging Face",
   "settings.section.experimental": "Experimental Features",
   "settings.hub.sourceMode": "HuggingFace source mode",
-  "settings.hub.sourceModeDesc": "Mirror routes through hf-mirror.com for CN acceleration; Race connects official and mirror concurrently and picks the faster; Official connects directly, requires huggingface.co reachability",
+  "settings.hub.sourceModeDesc":
+    "Mirror routes through hf-mirror.com for CN acceleration; Race connects official and mirror concurrently and picks the faster; Official connects directly, requires huggingface.co reachability",
   "settings.hub.sourceOfficial": "Official",
   "settings.hub.sourceMirror": "Mirror",
   "settings.hub.sourceRace": "Race",

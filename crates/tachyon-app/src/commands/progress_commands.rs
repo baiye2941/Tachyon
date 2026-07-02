@@ -82,6 +82,7 @@ async fn get_download_progress_inner(
         speed: task.speed,
         fragments_total: task.fragments_total,
         fragments_done: task.fragments_done,
+        active_concurrency: task.active_concurrency,
     })
 }
 
@@ -103,6 +104,9 @@ fn build_initial_progress_event(
                     downloaded: t.downloaded,
                     status: t.status,
                     fragments_done: t.fragments_done,
+                    fragments_total: t.fragments_total,
+                    active_concurrency: t.active_concurrency,
+                    completed_delta: vec![],
                 },
             )
         })
@@ -215,6 +219,7 @@ mod tests {
             speed: 100,
             fragments_total: 4,
             fragments_done: 2,
+            active_concurrency: 0,
         };
         let json = serde_json::to_string(&progress).unwrap();
         assert!(json.contains("taskId"));
@@ -261,6 +266,9 @@ mod tests {
             downloaded: 512,
             status: DownloadState::Downloading,
             fragments_done: 2,
+            fragments_total: 0,
+            active_concurrency: 0,
+            completed_delta: vec![],
         };
         let mut last = HashMap::new();
         last.insert("t1".to_string(), tp.clone());
@@ -282,6 +290,9 @@ mod tests {
                 downloaded: 100,
                 status: DownloadState::Downloading,
                 fragments_done: 1,
+                fragments_total: 0,
+                active_concurrency: 0,
+                completed_delta: vec![],
             },
         );
         last.insert(
@@ -293,6 +304,9 @@ mod tests {
                 downloaded: 200,
                 status: DownloadState::Downloading,
                 fragments_done: 2,
+                fragments_total: 0,
+                active_concurrency: 0,
+                completed_delta: vec![],
             },
         );
 
@@ -324,6 +338,9 @@ mod tests {
                 downloaded: 0,
                 status: DownloadState::Pending,
                 fragments_done: 0,
+                fragments_total: 0,
+                active_concurrency: 0,
+                completed_delta: vec![],
             },
         );
 

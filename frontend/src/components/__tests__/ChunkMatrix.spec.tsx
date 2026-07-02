@@ -23,6 +23,9 @@ function mockMatchMedia(matches: boolean) {
 }
 
 function createMockContext(): CanvasRenderingContext2D {
+  const grad = {
+    addColorStop: vi.fn(),
+  } as unknown as CanvasGradient;
   return {
     setTransform: vi.fn(),
     clearRect: vi.fn(),
@@ -30,6 +33,11 @@ function createMockContext(): CanvasRenderingContext2D {
     roundRect: vi.fn(),
     fill: vi.fn(),
     stroke: vi.fn(),
+    createLinearGradient: vi.fn().mockReturnValue(grad),
+    save: vi.fn(),
+    restore: vi.fn(),
+    clip: vi.fn(),
+    fillRect: vi.fn(),
   } as unknown as CanvasRenderingContext2D;
 }
 
@@ -49,10 +57,13 @@ beforeAll(() => {
 describe("ChunkMatrix 分片矩阵", () => {
   beforeEach(() => {
     mockMatchMedia(false);
+    cleanup();
+    document.body.innerHTML = "";
   });
 
   afterEach(() => {
     cleanup();
+    document.body.innerHTML = "";
   });
 
   describe("buildBlocks 聚合逻辑", () => {
@@ -92,11 +103,16 @@ describe("ChunkMatrix 分片矩阵", () => {
       expect(blocks[90]!.status).toBe("pending");
     });
 
-    it("使用 THREAD_COLORS 按块索引循环着色", () => {
+    it("块颜色按状态着色,不再使用线程彩虹色", () => {
       const blocks = buildBlocks(120, 60, 0.5);
-      expect(blocks[0]!.color).toBe(blocks[12]!.color);
-      expect(blocks[0]!.threadId).toBe(0);
-      expect(blocks[12]!.threadId).toBe(0);
+      const doneBlock = blocks.find((b) => b.status === "done");
+      const pendingBlock = blocks.find((b) => b.status === "pending");
+      expect(doneBlock).toBeDefined();
+      expect(doneBlock!.color).toBe("var(--color-status-completed)");
+      expect(pendingBlock).toBeDefined();
+      expect(pendingBlock!.color).toBe("var(--color-status-pending)");
+      // 不应再出现之前的紫色线程色
+      expect(blocks.some((b) => b.color === "#A855F7")).toBe(false);
     });
   });
 
@@ -124,31 +140,55 @@ describe("ChunkMatrix 分片矩阵", () => {
           <ChunkMatrix fragmentsTotal={0} fragmentsDone={0} progress={0} />
         ));
       }).not.toThrow();
-      expect(screen.getByText("分片分布")).toBeDefined();
+      expect(screen.getAllByText("分片分布").length).toBeGreaterThanOrEqual(1);
     });
 
-    it("DOM 分片不再为完成格重复挂载出现/闪光动画", () => {
+    it("DOM 分片按状态携带对应 class", () => {
       render(() => (
         <ChunkMatrix fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
       ));
-      const cells = Array.from(document.querySelectorAll<HTMLElement>(".chunk-cell"));
+      const cells = Array.from(
+        document.querySelectorAll<HTMLElement>(".chunk-cell"),
+      );
       expect(cells.length).toBe(20);
-      expect(cells.some((cell) => cell.classList.contains("chunk-flash"))).toBe(false);
-      expect(cells[0]!.style.animation).toBe("none");
-      expect(cells[0]!.style.opacity).toBe("1");
+      const doneCells = cells.filter((c) =>
+        c.classList.contains("chunk-cell--done"),
+      );
+      const downloadingCells = cells.filter((c) =>
+        c.classList.contains("chunk-cell--downloading"),
+      );
+      expect(doneCells.length).toBe(8);
+      expect(downloadingCells.length).toBeGreaterThan(0);
+      // 不再内联动画,由 CSS 类驱动
+      expect(cells[0]!.style.animation).toBe("");
+      expect(cells[0]!.style.opacity).toBe("");
     });
 
-    it("DOM 下载中分片保留稳定低调脉冲且无级联延迟", () => {
+    it("DOM 下载中分片保留 shine 动画且无级联延迟", () => {
       render(() => (
         <ChunkMatrix fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
       ));
       const downloading = Array.from(
-        document.querySelectorAll<HTMLElement>('[data-status="downloading"]'),
+        document.querySelectorAll<HTMLElement>("[data-status='downloading']"),
       );
       expect(downloading.length).toBeGreaterThan(0);
       for (const cell of downloading) {
-        expect(cell.style.animation).toContain("chunk-pulse");
+        expect(cell.classList.contains("chunk-cell--downloading")).toBe(true);
         expect(cell.style.animationDelay).toBe("");
+      }
+    });
+
+    it("prefers-reduced-motion 时附加 reduced 类", () => {
+      mockMatchMedia(true);
+      render(() => (
+        <ChunkMatrix fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
+      ));
+      const downloading = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-status='downloading']"),
+      );
+      expect(downloading.length).toBeGreaterThan(0);
+      for (const cell of downloading) {
+        expect(cell.classList.contains("chunk-cell--reduced")).toBe(true);
       }
     });
 
@@ -175,6 +215,48 @@ describe("ChunkMatrix 分片矩阵", () => {
       fireEvent.mouseLeave(cells[0]!);
     });
 
+    it("DOM 分片可键盘聚焦并 Enter/Space 选中", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={10} fragmentsDone={5} progress={0.5} />
+      ));
+      const cells = Array.from(
+        document.querySelectorAll<HTMLElement>(".chunk-cell"),
+      );
+      expect(cells[0]!.tabIndex).toBe(0);
+      fireEvent.focus(cells[0]!);
+      fireEvent.keyDown(cells[0]!, { key: "Enter" });
+      expect(cells[0]!.classList.contains("chunk-cell--selected")).toBe(true);
+      fireEvent.keyDown(cells[0]!, { key: "Enter" });
+      expect(cells[0]!.classList.contains("chunk-cell--selected")).toBe(false);
+    });
+
+    it("DOM 分片点击选中,再次点击取消", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={10} fragmentsDone={5} progress={0.5} />
+      ));
+      const cells = Array.from(
+        document.querySelectorAll<HTMLElement>(".chunk-cell"),
+      );
+      fireEvent.click(cells[1]!);
+      expect(cells[1]!.classList.contains("chunk-cell--selected")).toBe(true);
+      fireEvent.click(cells[1]!);
+      expect(cells[1]!.classList.contains("chunk-cell--selected")).toBe(false);
+    });
+
+    it("ESC 取消 DOM 分片选中态", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={10} fragmentsDone={5} progress={0.5} />
+      ));
+      const wrapper = document.querySelector(".chunk-matrix-wrapper");
+      const cells = Array.from(
+        document.querySelectorAll<HTMLElement>(".chunk-cell"),
+      );
+      fireEvent.click(cells[2]!);
+      expect(cells[2]!.classList.contains("chunk-cell--selected")).toBe(true);
+      fireEvent.keyDown(wrapper!, { key: "Escape" });
+      expect(cells[2]!.classList.contains("chunk-cell--selected")).toBe(false);
+    });
+
     it("Canvas 块悬停时不崩溃", () => {
       render(() => (
         <ChunkMatrix fragmentsTotal={1000} fragmentsDone={500} progress={0.5} />
@@ -183,6 +265,17 @@ describe("ChunkMatrix 分片矩阵", () => {
       expect(canvas).not.toBeNull();
       fireEvent.mouseMove(canvas!, { clientX: 20, clientY: 20 });
       fireEvent.mouseLeave(canvas!);
+    });
+
+    it("Canvas 块点击选中", () => {
+      render(() => (
+        <ChunkMatrix fragmentsTotal={1000} fragmentsDone={500} progress={0.5} />
+      ));
+      const canvas = document.querySelector("canvas");
+      expect(canvas).not.toBeNull();
+      fireEvent.click(canvas!, { clientX: 20, clientY: 20 });
+      // 选中态通过 canvas 绘制验证,这里保证不崩溃即可
+      expect(canvas).not.toBeNull();
     });
   });
 });

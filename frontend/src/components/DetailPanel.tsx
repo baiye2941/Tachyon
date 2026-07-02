@@ -13,8 +13,6 @@ import {
   formatSize,
   formatSpeed,
   getFileType,
-  getStatusLabel,
-  getStatusColor,
   formatETA,
   formatDate,
 } from "../utils/format";
@@ -29,11 +27,13 @@ import {
   ChevronDownIcon,
   CancelIcon,
   ArrowLeftIcon,
+  ArrowDownIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
 import { addToast } from "../stores/toast";
 import { requestConfirm } from "../stores/confirm";
+import { clearTaskHistory } from "../stores/taskSpeedHistory";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -41,19 +41,29 @@ import { tr, type MessageKey } from "../i18n";
 import SpeedChart from "./SpeedChart";
 import InfoRow from "./DetailInfoRow";
 import Button from "../shared/ui/Button";
-import { inferFailure, parseHfUrl, type FailureInsight } from "../utils/errorReason";
+import LiquidProgress from "./LiquidProgress";
+import ProgressCelebration from "./ProgressCelebration";
+import MetricCard from "./MetricCard";
+import StatusBadge from "./StatusBadge";
+import AnimatedNumber from "./AnimatedNumber";
+import {
+  inferFailure,
+  parseHfUrl,
+  type FailureInsight,
+} from "../utils/errorReason";
 import { buildHfMirrorUrl } from "../utils/hfMirror";
 
 const ChunkMatrix = lazy(() => import("./ChunkMatrix"));
 
-const DIAGNOSTICS_CATEGORY_KEY: Record<FailureInsight["category"], MessageKey> = {
-  network: "detail.diagnostics.category.network",
-  auth: "detail.diagnostics.category.auth",
-  disk: "detail.diagnostics.category.disk",
-  ssl: "detail.diagnostics.category.ssl",
-  cancelled: "detail.diagnostics.category.cancelled",
-  unknown: "detail.diagnostics.category.unknown",
-};
+const DIAGNOSTICS_CATEGORY_KEY: Record<FailureInsight["category"], MessageKey> =
+  {
+    network: "detail.diagnostics.category.network",
+    auth: "detail.diagnostics.category.auth",
+    disk: "detail.diagnostics.category.disk",
+    ssl: "detail.diagnostics.category.ssl",
+    cancelled: "detail.diagnostics.category.cancelled",
+    unknown: "detail.diagnostics.category.unknown",
+  };
 
 interface DetailPanelProps {
   task: TaskInfo | null;
@@ -136,7 +146,8 @@ export default function DetailPanel(props: DetailPanelProps) {
   createEffect(() => {
     if (!menuOpen()) return;
     const raf = requestAnimationFrame(() => {
-      const first = menuRef?.querySelector<HTMLButtonElement>(".detail-menu-item");
+      const first =
+        menuRef?.querySelector<HTMLButtonElement>(".detail-menu-item");
       first?.focus();
     });
     const handler = (e: KeyboardEvent) => {
@@ -209,11 +220,11 @@ export default function DetailPanel(props: DetailPanelProps) {
       ? getFileType(currentTask.fileName)
       : { icon: FileIcon, color: "var(--color-file-other)" };
   });
-  const isCompleted = () => task()?.status === "completed";
-  const isFailed = () => task()?.status === "failed";
-  const isDownloading = () => task()?.status === "downloading";
+  const isCompleted = createMemo(() => task()?.status === "completed");
+  const isFailed = createMemo(() => task()?.status === "failed");
+  const isDownloading = createMemo(() => task()?.status === "downloading");
   // cancel:立即停止但保留记录,对未终止的活跃/暂停任务可用
-  const canCancel = () => {
+  const canCancel = createMemo(() => {
     const s = task()?.status;
     return (
       s === "downloading" ||
@@ -221,7 +232,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       s === "resuming" ||
       s === "paused"
     );
-  };
+  });
 
   // 失败诊断:优先用后端 errorReason,回退到启发式推断(诚实降级)
   const failureInsight = createMemo(() => {
@@ -292,7 +303,11 @@ export default function DetailPanel(props: DetailPanelProps) {
     });
     if (!result.ok) return;
     try {
-      await api.deleteTask(t2.id, { skipConfirm: true, deleteLocalFile: result.deleteLocalFile });
+      await api.deleteTask(t2.id, {
+        skipConfirm: true,
+        deleteLocalFile: result.deleteLocalFile,
+      });
+      clearTaskHistory(t2.id);
       props.onClose();
       await refreshTaskList();
     } catch (e) {
@@ -348,7 +363,11 @@ export default function DetailPanel(props: DetailPanelProps) {
     }
     setMirrorRetrying(true);
     try {
-      const mirrorUrl = buildHfMirrorUrl(parsed.repoId, parsed.revision, parsed.filePath);
+      const mirrorUrl = buildHfMirrorUrl(
+        parsed.repoId,
+        parsed.revision,
+        parsed.filePath,
+      );
       // 镜像单源重试:与 HfBrowserPanel 镜像下载策略一致
       await api.createTask(mirrorUrl);
       await refreshTaskList();
@@ -390,12 +409,7 @@ export default function DetailPanel(props: DetailPanelProps) {
           z-70:高于 Toolbar z-2 / BatchToolbar z-50,低于 CommandPalette z-100 与模态遮罩 z-200+ */}
       <Show when={visible()}>
         <div
-          class="absolute inset-0 z-[70]"
-          style={{
-            background: "var(--color-overlay-scrim)",
-            "backdrop-filter": "blur(4px)",
-            animation: reducedMotion() ? "none" : "fadeIn 150ms ease forwards",
-          }}
+          class="absolute inset-0 z-[70] detail-scrim"
           onClick={() => props.onClose()}
         />
       </Show>
@@ -403,37 +417,21 @@ export default function DetailPanel(props: DetailPanelProps) {
           统一 absolute inset-0(废弃宽屏 grid 列模式),窄屏宽屏同为覆盖式,
           宽屏居中限宽,窄屏全宽。 */}
       <div
+        class="detail-panel"
+        classList={{ "detail-panel--narrow": isNarrow() }}
         style={{
-          position: "absolute",
-          top: 0,
-          right: 0,
-          bottom: 0,
-          width: isNarrow() ? "100%" : "min(560px, 50vw)",
-          "max-width": "100%",
-          background: "var(--color-bg-secondary)",
-          "border-left": "1px solid var(--color-border-subtle)",
-          "box-shadow": "var(--shadow-xl)",
-          transform: visible() ? "translateX(0)" : "translateX(100%)",
-          transition: reducedMotion()
-            ? "none"
-            : "transform 260ms cubic-bezier(0.32, 0.72, 0, 1)",
-          "z-index": "80",
-          overflow: "hidden",
+          transform: visible()
+            ? "translateX(0) scale(1)"
+            : "translateX(100%) scale(0.98)",
+          opacity: visible() ? 1 : 0.92,
         }}
       >
-          <div
-            ref={panelContentRef}
-            role="complementary"
-            aria-label={t("detail.aria")}
+        <div
+          ref={panelContentRef}
+          role="complementary"
+          aria-label={t("detail.aria")}
           tabIndex={isNarrow() ? -1 : undefined}
-          style={{
-            width: "100%",
-            "max-width": "100%",
-            height: "100%",
-            background: "var(--color-bg-secondary)",
-            transition: reducedMotion() ? "none" : "opacity 220ms ease",
-          }}
-          class="flex flex-col h-full overflow-y-auto overflow-x-hidden"
+          class="detail-panel-content flex flex-col h-full overflow-y-auto overflow-x-hidden"
         >
           <div class="panel-header">
             <div class="flex items-center gap-2 min-w-0 flex-1">
@@ -517,147 +515,80 @@ export default function DetailPanel(props: DetailPanelProps) {
             </div>
           </div>
 
-          {/* File Info — 去 AI 味:实色容器 + 边框分层,移除装饰性高光渐变 */}
-          <div
-            class="flex items-center gap-3"
-            style={{
-              padding: "14px 20px 16px",
-              "max-width": "100%",
-              background: "transparent",
-              "border-bottom": "1px solid var(--color-border-subtle)",
-            }}
-          >
-            {/* 文件图标材质板(参考稿 file-icon:材质 plate + 顶光 + hue 着色) */}
+          {/* File Info — 材质板 + 协议 pill + 状态 dot */}
+          <div class="flex items-center gap-3 detail-file-info">
             <div
-              class="flex items-center justify-center flex-shrink-0 file-icon-plate"
+              class="flex items-center justify-center flex-shrink-0 file-icon-plate file-icon-plate--hero detail-file-icon-hero"
               style={{
-                width: "44px",
-                height: "44px",
-                "border-radius": "9px",
                 color: fileInfo().color,
+                "--file-glow": `color-mix(in srgb, ${fileInfo().color} 22%, transparent)`,
               }}
             >
               {(() => {
                 const Icon = fileInfo().icon;
-                return <Icon />;
+                return <Icon size={28} />;
               })()}
             </div>
             <div class="min-w-0 flex-1">
-              <div
-                class="truncate"
-                style={{
-                  "font-size": "14px",
-                  "font-weight": 600,
-                  color: "var(--color-text-title)",
-                  "max-width": "100%",
-                }}
-              >
-                {task()?.fileName}
-              </div>
-              <div
-                class="flex items-center gap-2"
-                style={{ "margin-top": "2px" }}
-              >
-                <span
-                  class="flex-shrink-0"
-                  style={{
-                    "font-size": "10px",
-                    color: "var(--color-text-tertiary)",
-                    padding: "1px 6px",
-                    "border-radius": "3px",
-                    background: "var(--color-bg-hover)",
-                  }}
-                >
+              <div class="truncate detail-file-name">{task()?.fileName}</div>
+              <div class="flex items-center gap-2 detail-file-meta">
+                <span class="flex-shrink-0 detail-protocol-pill">
                   {task()?.url?.split(":")[0]?.toUpperCase() || ""}
                 </span>
-                <span
-                  style={{
-                    "font-size": "11px",
-                    color: getStatusColor(task()?.status || ""),
-                    "font-weight": 600,
-                  }}
-                >
-                  {getStatusLabel(task()?.status || "")}
-                </span>
+                <StatusBadge
+                  status={task()?.status || "pending"}
+                  showIcon
+                  size="md"
+                />
               </div>
             </div>
           </div>
 
-          {/* Progress Section - compact,进度大字电青高亮(下载中呼吸) */}
-          <div
-            class="flex flex-col items-center"
-            style={{ padding: "0 20px 12px" }}
-          >
-            <div
-              class={`mono ${isDownloading() ? "speed-breathe" : ""}`}
-              style={{
-                "font-size": "36px",
-                "font-weight": 700,
-                color: isFailed()
-                  ? "var(--color-status-error)"
-                  : isCompleted()
-                    ? "var(--color-status-completed)"
-                    : "var(--color-accent-primary)",
-                "line-height": "1",
-                "letter-spacing": "-0.03em",
-                transition: "color 300ms ease",
-              }}
-            >
-              {((task()?.progress || 0) * 100).toFixed(1)}%
-            </div>
-
-            {/* Progress bar — 参考稿材质:凹槽 inset + 填充 sheen + 下载中斜纹前缘 */}
-            <div
-              class="relative overflow-hidden progress-track-inset"
-              style={{
-                height: "8px",
-                "margin-top": "14px",
-                "border-radius": "9999px",
-                background: "var(--color-bg-tertiary)",
-              }}
-            >
+          {/* Progress Theater — 大百分比 + LiquidProgress + 尺寸行 */}
+          <div class="flex flex-col detail-progress-theater">
+            <div class="flex items-end justify-between">
               <div
-                class={`absolute left-0 top-0 bottom-0 progress-fill-sheen${isDownloading() ? " progress-bar-active" : ""}`}
+                class={`mono detail-progress-percent ${isDownloading() ? "speed-breathe" : ""}`}
                 style={{
-                  position: "relative",
-                  width: `${Math.max((task()?.progress || 0) * 100, (task()?.progress || 0) > 0 ? 2 : 0)}%`,
-                  "border-radius": "9999px",
-                  background: isFailed()
+                  color: isFailed()
                     ? "var(--color-status-error)"
                     : isCompleted()
                       ? "var(--color-status-completed)"
-                      : isDownloading()
-                        ? "var(--color-status-downloading)"
-                        : "linear-gradient(90deg, var(--color-accent-primary) 0%, var(--color-accent-tertiary) 100%)",
-                  transition: "width 300ms ease-out",
-                  "min-width": (task()?.progress || 0) > 0 ? "8px" : "0",
+                      : "var(--color-accent-primary)",
                 }}
               >
-                <Show when={isDownloading() && (task()?.progress || 0) > 0 && (task()?.progress || 0) < 1}>
-                  <span class="progress-stripes absolute inset-0 rounded-full" aria-hidden="true" />
-                  <span
-                    class="progress-edge-glow absolute right-0 top-0 bottom-0 rounded-full"
-                    style={{ width: "2px", background: "var(--color-text-primary)" }}
-                    aria-hidden="true"
-                  />
-                </Show>
+                <AnimatedNumber
+                  value={((task()?.progress || 0) * 100).toFixed(1)}
+                />
+                %
               </div>
+              <Show when={isCompleted()}>
+                <ProgressCelebration reducedMotion={reducedMotion()} />
+              </Show>
             </div>
 
-            {/* Progress stats row */}
+            <LiquidProgress
+              progress={task()?.progress || 0}
+              status={task()?.status || "pending"}
+              size="lg"
+              showStateIcon
+              reducedMotion={reducedMotion()}
+              class="detail-liquid-progress"
+              aria-label={t("detail.label.status")}
+            />
+
             <div class="detail-progress-row">
-              <span
-                class="mono"
-                style={{ "font-size": "11px", color: "var(--color-text-secondary)" }}
-              >
+              <span class="mono detail-progress-size">
                 {formatSize(task()?.downloaded || 0)}
+                <span class="detail-progress-size-total">
+                  / {formatSize(task()?.fileSize || 0)}
+                </span>
               </span>
-              <span
-                class="mono"
-                style={{ "font-size": "11px", color: "var(--color-text-tertiary)" }}
-              >
-                {formatSize(task()?.fileSize || 0)}
-              </span>
+              <Show when={isDownloading()}>
+                <span class="mono detail-progress-speed">
+                  {formatSpeed(task()?.speed || 0)}
+                </span>
+              </Show>
             </div>
           </div>
 
@@ -666,7 +597,12 @@ export default function DetailPanel(props: DetailPanelProps) {
           <Show when={isFailed() && failureInsight()}>
             {(insight) => (
               <div style={{ padding: "0 20px 12px" }}>
-                <div class="detail-error-box" role="alert" aria-live="assertive">
+                <div
+                  class="detail-error-box error-shake"
+                  classList={{ "error-shake--reduced": reducedMotion() }}
+                  role="alert"
+                  aria-live="assertive"
+                >
                   <div class="detail-error-icon">
                     <span
                       style={{
@@ -711,12 +647,20 @@ export default function DetailPanel(props: DetailPanelProps) {
                       </Show>
                       <Show when={(task()?.retryCount ?? 0) > 0}>
                         <p class="detail-diagnostics-retry-count">
-                          {t("detail.diagnostics.retryCount", { count: task()?.retryCount ?? 0 })}
+                          {t("detail.diagnostics.retryCount", {
+                            count: task()?.retryCount ?? 0,
+                          })}
                         </p>
                       </Show>
                     </Show>
                     {/* 镜像重试入口:仅 HuggingFace 可解析链接显示(Iteration 16) */}
-                    <Show when={insight().canRetryWithMirror && task()?.url && parseHfUrl(task()!.url)}>
+                    <Show
+                      when={
+                        insight().canRetryWithMirror &&
+                        task()?.url &&
+                        parseHfUrl(task()!.url)
+                      }
+                    >
                       <button
                         class="detail-mirror-retry-link"
                         onClick={handleRetryWithMirror}
@@ -765,8 +709,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             )}
           </Show>
 
-          {/* Tier 2 — 活动指标:仅 downloading/paused 显示。消除冗余:
-              size→进度行已显示总大小;downloaded→进度行已显示;status→文件头已显示 */}
+          {/* Activity Metrics — 2x2 bento cards */}
           <Show
             when={
               isDownloading() ||
@@ -775,49 +718,34 @@ export default function DetailPanel(props: DetailPanelProps) {
               task()?.status === "resuming"
             }
           >
-            <div
-              style={{
-                padding: "0 20px 12px",
-                "border-top": "1px solid var(--color-border-subtle)",
-              }}
-            >
-              <div class="detail-stat-grid" style={{ "min-width": 0 }}>
-                <div class="detail-stat-cell">
-                  <div class="detail-stat-label">{t("detail.label.speed")}</div>
-                  <div class="detail-stat-value detail-stat-value--highlight">
-                    {formatSpeed(task()?.speed || 0)}
-                  </div>
-                </div>
-                <div class="detail-stat-cell">
-                  <div class="detail-stat-label">{t("detail.label.remaining")}</div>
-                  <div class="detail-stat-value detail-stat-value--highlight">
-                    {eta()}
-                  </div>
-                </div>
-                <div class="detail-stat-cell">
-                  <div class="detail-stat-label">{t("detail.label.fragments")}</div>
-                  <div class="detail-stat-value">
-                    {`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
-                  </div>
-                </div>
-                <div class="detail-stat-cell">
-                  <div class="detail-stat-label">{t("detail.label.threads")}</div>
-                  <div class="detail-stat-value">
-                    {/* 后端当前未下发活跃线程数,诚实展示占位 */}
-                    {"—"}
-                  </div>
-                </div>
+            <div class="detail-section">
+              <div class="metric-grid">
+                <MetricCard
+                  label={t("detail.label.speed")}
+                  value={formatSpeed(task()?.speed || 0)}
+                  highlight={isDownloading()}
+                  icon={<ArrowDownIcon aria-hidden="true" />}
+                />
+                <MetricCard
+                  label={t("detail.label.remaining")}
+                  value={eta()}
+                  highlight={isDownloading()}
+                />
+                <MetricCard
+                  label={t("detail.label.fragments")}
+                  value={`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
+                />
+                <MetricCard
+                  label={t("detail.label.threads")}
+                  value="—"
+                  hint={t("detail.label.threads")}
+                />
               </div>
             </div>
           </Show>
 
           {/* Tier 4 — 元数据:可折叠「更多详情」,默认收起,降低默认扫描成本 */}
-          <div
-            style={{
-              padding: "0 20px 12px",
-              "border-top": "1px solid var(--color-border-subtle)",
-            }}
-          >
+          <div class="detail-section detail-section--bordered">
             <button
               class="detail-disclosure-row"
               aria-expanded={metadataExpanded()}
@@ -859,7 +787,9 @@ export default function DetailPanel(props: DetailPanelProps) {
                 />
                 <InfoRow
                   label={t("detail.label.createdAt")}
-                  value={task()?.createdAt ? formatDate(task()!.createdAt) : "---"}
+                  value={
+                    task()?.createdAt ? formatDate(task()!.createdAt) : "---"
+                  }
                 />
               </div>
             </Show>
@@ -871,15 +801,19 @@ export default function DetailPanel(props: DetailPanelProps) {
               task()?.status === "downloading" || task()?.status === "paused"
             }
           >
-            <div style={{ padding: "0 20px 12px" }}>
+            <div class="detail-section">
               <SpeedChart task={task()!} />
             </div>
           </Show>
 
           {/* Chunk Matrix - collapsible, after chart */}
           <Show when={(task()?.fragmentsTotal || 0) > 0}>
-            <div style={{ padding: "0 20px 12px" }}>
-              <Suspense fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}>
+            <div class="detail-section">
+              <Suspense
+                fallback={
+                  <div class="animate-pulse bg-white/5 rounded-lg h-full" />
+                }
+              >
                 <ChunkMatrix
                   fragmentsTotal={task()!.fragmentsTotal}
                   fragmentsDone={task()!.fragmentsDone}
@@ -890,18 +824,7 @@ export default function DetailPanel(props: DetailPanelProps) {
           </Show>
 
           {/* Action Buttons - 固定底部(spec 8.2),sticky 不随内容滚动 */}
-          <div
-            class="flex flex-col"
-            style={{
-              padding: "12px 20px 20px",
-              gap: "8px",
-              position: "sticky",
-              bottom: "0",
-              "margin-top": "auto",
-              background: "var(--color-bg-elevated)",
-              "border-top": "1px solid var(--color-border-subtle)",
-            }}
-          >
+          <div class="flex flex-col detail-actions">
             <Show when={!isCompleted()}>
               <Button
                 variant="primary"
@@ -942,4 +865,3 @@ export default function DetailPanel(props: DetailPanelProps) {
     </Show>
   );
 }
-

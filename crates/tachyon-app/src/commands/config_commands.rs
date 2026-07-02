@@ -841,6 +841,7 @@ mod tests {
             progress: 0.125,
             fragments_total: 4,
             fragments_done: 1,
+            active_concurrency: 0,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             save_path: "/custom/file.bin".to_string(),
             error_reason: None,
