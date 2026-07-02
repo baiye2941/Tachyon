@@ -129,18 +129,28 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::windows::fs::FileExt;
             let file = self.file.clone();
-            // 通过 usize 中转指针,满足 Send + 'static 约束
-            // Safety: buf 指针在 spawn_blocking .await 返回前保持有效,
-            // seek_read 只写入 buf[..buf_len],不会越界。
-            let buf_addr = buf.as_mut_ptr() as usize;
+            // CRITICAL 修复(C-01 UAF):旧实现把 buf 的裸指针(as_mut_ptr as usize)
+            // move 进 spawn_blocking,再 from_raw_parts_mut 重建切片。当 future 被
+            // JoinSet::abort_all 取消时(downloader.rs verify 阶段某分片哈希不匹配),
+            // buf 随 future drop 释放,但 spawn_blocking 任务继续运行持悬垂指针 → UAF。
+            //
+            // 修复(与 write_at_mut 对称):闭包内分配 owned 本地缓冲读盘,await 成功
+            // 后再 copy_from_slice 写回调用方 buf。future 被取消时本地缓冲所有权随
+            // 闭包 drop,无外部裸指针持有 → 取消安全。复制代价可接受:spawn_blocking
+            // 本就有阻塞线程切换开销,且 read 后必须 memcpy 到调用方 buf。
             let buf_len = buf.len();
             tokio::task::spawn_blocking(move || {
-                let ptr = buf_addr as *mut u8;
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-                file.seek_read(slice, offset).map_err(DownloadError::Io)
+                let mut local = vec![0u8; buf_len];
+                file.seek_read(&mut local, offset)
+                    .map(|n| (n, local))
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map(|(n, local)| {
+                buf[..n].copy_from_slice(&local[..n]);
+                n
+            })
         })
     }
 
@@ -283,15 +293,22 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
-            let buf_addr = buf.as_mut_ptr() as usize;
+            // CRITICAL 修复(C-01 UAF):旧实现把 buf 裸指针 move 进 spawn_blocking,
+            // JoinSet::abort_all 取消 future 时 buf 释放但任务仍持悬垂指针 → UAF。
+            // 修复(与 write_at_mut 对称):闭包内 owned 本地缓冲读盘,await 后写回。
             let buf_len = buf.len();
             tokio::task::spawn_blocking(move || {
-                let ptr = buf_addr as *mut u8;
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-                file.read_at(slice, offset).map_err(DownloadError::Io)
+                let mut local = vec![0u8; buf_len];
+                file.read_at(&mut local, offset)
+                    .map(|n| (n, local))
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map(|(n, local)| {
+                buf[..n].copy_from_slice(&local[..n]);
+                n
+            })
         })
     }
 
@@ -391,15 +408,22 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
-            let buf_addr = buf.as_mut_ptr() as usize;
+            // CRITICAL 修复(C-01 UAF):旧实现把 buf 裸指针 move 进 spawn_blocking,
+            // JoinSet::abort_all 取消 future 时 buf 释放但任务仍持悬垂指针 → UAF。
+            // 修复(与 write_at_mut 对称):闭包内 owned 本地缓冲读盘,await 后写回。
             let buf_len = buf.len();
             tokio::task::spawn_blocking(move || {
-                let ptr = buf_addr as *mut u8;
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-                file.read_at(slice, offset).map_err(DownloadError::Io)
+                let mut local = vec![0u8; buf_len];
+                file.read_at(&mut local, offset)
+                    .map(|n| (n, local))
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map(|(n, local)| {
+                buf[..n].copy_from_slice(&local[..n]);
+                n
+            })
         })
     }
 
@@ -736,6 +760,62 @@ mod tests {
                 buf.iter().all(|&b| b == i),
                 "区域 {offset} 数据不一致，期望全部为 {i}"
             );
+        }
+    }
+
+    /// C-01 回归测试:`read_at` 跨 `spawn_blocking` 的 Use-After-Free。
+    ///
+    /// 复现 downloader.rs verify 阶段的取消路径:多个分片在 JoinSet 中并发
+    /// `read_at().await`,任一完成即 `abort_all()` 取消其余。旧实现把调用方
+    /// `&mut [u8]` 裸指针(as_mut_ptr as usize)move 进 spawn_blocking,被取消时
+    /// buf 随 future drop 释放,但阻塞任务仍持悬垂指针 → UAF / panic。
+    ///
+    /// 修复后:闭包内分配 owned `Vec<u8>` 本地缓冲,await 成功后写回调用方 buf,
+    /// future 被取消时本地缓冲所有权随闭包 drop,无外部裸指针持有 → 取消安全。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_read_at_joinset_abort_all_no_uaf() {
+        use tokio::task::JoinSet;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        // 预置足够大的文件(256 KiB),使 read_at 在 spawn_blocking 线程上有
+        // 可观的执行窗口,提高 abort 命中正在执行的阻塞任务的概率
+        storage.allocate(256 * 1024).await.unwrap();
+        let storage = std::sync::Arc::new(storage);
+
+        // 多轮迭代提高竞态检出概率
+        const ROUNDS: usize = 30;
+        for round in 0..ROUNDS {
+            let mut join_set: JoinSet<DownloadResult<usize>> = JoinSet::new();
+            // 32 个并发读任务,每个读 4 KiB
+            for i in 0u32..32 {
+                let s = storage.clone();
+                join_set.spawn(async move {
+                    let offset = (i as u64) * 4096;
+                    let mut buf = vec![0u8; 4096];
+                    s.read_at(offset, &mut buf).await
+                });
+            }
+
+            // 收第一个完成的结果后立即 abort_all,取消其余正在 await 的任务
+            let first = join_set.join_next().await;
+            join_set.abort_all();
+            // 排空被取消任务(JoinError::Cancelled 是正常的,不是 panic/UAF)
+            while let Some(res) = join_set.join_next().await {
+                if let Ok(Ok(_)) = res {
+                    // 个别任务可能在 abort 前正常完成,允许
+                }
+            }
+            // 第一个完成的任务应成功(无 panic / 无 UAF 报错)
+            let first = first.expect("至少一个任务应完成");
+            match first {
+                Ok(Ok(_n)) => {}
+                Ok(Err(e)) => panic!("round {round}: read_at 返回错误: {e:?}"),
+                Err(join_err) => {
+                    // 第一个任务不应是 cancelled(它是被 join_next 取出的)
+                    panic!("round {round}: 第一个任务 join 错误: {join_err}");
+                }
+            }
         }
     }
 }
