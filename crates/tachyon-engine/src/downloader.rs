@@ -265,6 +265,7 @@ impl DownloadTask {
                     session.session(),
                     session.config().clone(),
                     session.download_dir().clone(),
+                    session.handle_cache(),
                 ))
             }
             #[cfg(not(feature = "magnet"))]
@@ -439,11 +440,12 @@ impl DownloadTask {
             .collect();
         let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
 
-        // BT fallback:独立持有,不塞入 MirrorProtocol
+        // BT fallback:独立持有,不塞入 MirrorProtocol(但共享 handle_cache)
         let bt_fallback = Arc::new(MagnetProtocol::new(
             bt_session.session(),
             bt_session.config().clone(),
             bt_session.download_dir().clone(),
+            bt_session.handle_cache(),
         ));
 
         Ok(Self {
@@ -847,6 +849,26 @@ impl DownloadTask {
                 }
             }
             info!(resumed_partial, "字节级断点续传:恢复未完整分片");
+        }
+
+        // 发送 PlanComplete 事件:携带真实分片总数 + 续传已完成索引 + 初始并发度。
+        // plan() 是同步函数,用 try_send(非阻塞)。此时 channel 必为空(plan 是第一个事件),
+        // 不会因满而丢弃;若通道已关闭(任务取消)则丢弃,属正确行为。
+        if let Some(tx) = &self.progress_tx {
+            let total = self.fragments.len() as u32;
+            let completed_indices: Vec<u32> = self
+                .fragments
+                .iter()
+                .filter(|f| f.state == crate::fragment::FragmentState::Done)
+                .map(|f| f.info.index)
+                .collect();
+            if let Err(e) = tx.try_send(FragmentProgress::PlanComplete {
+                total,
+                completed_indices,
+                initial_concurrency: recommendation.concurrency,
+            }) {
+                warn!(error = %e, "PlanComplete 事件发送失败(通道满或关闭)");
+            }
         }
 
         Ok(fragments)
@@ -1635,7 +1657,7 @@ impl DownloadTask {
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) {
         if let Some(tx) = progress_tx {
-            match tx.try_send(FragmentProgress {
+            match tx.try_send(FragmentProgress::Chunk {
                 fragment_index: frag_index,
                 completed: false,
                 fragment_downloaded: total_written,
@@ -1857,7 +1879,7 @@ impl DownloadTask {
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx
             && let Err(e) = tx
-                .send(FragmentProgress {
+                .send(FragmentProgress::Chunk {
                     fragment_index: frag_index,
                     completed: true,
                     fragment_downloaded: total_written,
@@ -2536,6 +2558,7 @@ mod tests {
             session,
             tachyon_core::config::MagnetConfig::default(),
             dir.path().to_path_buf(),
+            std::sync::Arc::new(dashmap::DashMap::new()),
         ));
 
         // 1) bt_fallback = Some:Cancelled 必须排除,其他错误(Timeout/Network)触发 fallback
@@ -6969,7 +6992,18 @@ mod tests {
             events.push(event);
         }
 
-        let completed_events: Vec<_> = events.iter().filter(|e| e.completed).collect();
+        let completed_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    FragmentProgress::Chunk {
+                        completed: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
         assert_eq!(completed_events.len(), 3, "应收到 3 个分片完成事件");
 
         let (bytes, fragments, errors) = metrics.snapshot();
