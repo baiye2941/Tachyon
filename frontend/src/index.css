@@ -74,16 +74,16 @@
      hue 对比:198 蓝青(accent) / 165 绿青(ok) / 35 橙红(danger) —— 色盲可区分 ===== */
   --emerald-500: #49d3a1; /* ok,青绿(参考稿) */
   --amber-500: #ebbd57; /* warn,琥珀(参考稿) */
-  --red-500: #f3562e; /* danger,橙红(参考稿) */
+  --red-500: #dc2626; /* danger,橙红→纯红提深,白字前景 → 4.83:1(WCAG AA ✅)。原 #f3562e 仅 3.40:1。 */
 
-  /* ===== 字号阶梯(下载器高密度,1.250 major third)===== */
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 16px;
-  --text-xl: 20px;
-  --text-2xl: 28px;
+  /* ===== 字号阶梯(下载器高密度;rem 以浏览器默认 16px 为基准,WCAG 1.4.4 缩放友好)===== */
+  --text-xs: 0.6875rem; /* 11px */
+  --text-sm: 0.75rem; /* 12px */
+  --text-base: 0.8125rem; /* 13px */
+  --text-md: 0.875rem; /* 14px */
+  --text-lg: 1rem; /* 16px */
+  --text-xl: 1.25rem; /* 20px */
+  --text-2xl: 1.75rem; /* 28px */
 
   --weight-regular: 400;
   --weight-medium: 500;
@@ -145,8 +145,8 @@
   /* 粉星光:完成态静态点缀专用,不参与交互态 */
   --color-sparkle: var(--rose-400);
   --color-sparkle-soft: rgba(244, 114, 182, 0.10);
-  /* danger 软底:破坏性操作图标/容器背景(对齐参考稿 WarningCircle 底色) */
-  --color-danger-soft: rgba(243, 86, 46, 0.15);
+  /* danger 软底:破坏性操作图标/容器背景(对齐参考稿 WarningCircle 底色)。rgb 同步 --red-500 #dc2626。 */
+  --color-danger-soft: rgba(220, 38, 38, 0.15);
   /* inset 暗阴影:active 态下沉/键帽内阴影(中性黑 alpha,非颜色语义) */
   --color-inset-dark: rgba(0, 0, 0, 0.25);
   --color-inset-light: rgba(255, 255, 255, 0.06);
@@ -281,6 +281,11 @@ body,
   overflow: hidden;
 }
 
+/* 显式基准字号:确保 rem 以浏览器默认 16px 计,支持用户缩放(WCAG 1.4.4) */
+html {
+  font-size: 100%;
+}
+
 body {
   font-family: var(--font-sans);
   background: var(--color-bg-primary);
@@ -372,13 +377,6 @@ body {
   border: 1px solid var(--color-border-subtle);
 }
 
-/* glass-blur 仅保留给真正脱离文档流的浮层(tooltip/命令面板等),此处与 glass 同义,
-   具体 backdrop-filter 由使用方内联指定,避免全局默认开启 */
-.glass-blur {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-subtle);
-}
-
 /* 面板表面(质感升级:实色底 + 顶部 1px 高光 + 极淡的顶光渐变) */
 .panel-surface {
   background:
@@ -391,14 +389,6 @@ body {
 /* 可排序列头(Iteration 07 DI-3):hover 反馈,提示可点击排序 */
 .task-col-header:hover {
   color: var(--color-text-primary);
-}
-
-.accent-gradient {
-  background: linear-gradient(
-    135deg,
-    var(--color-accent-primary) 0%,
-    var(--color-accent-secondary) 100%
-  );
 }
 
 /* ============================================
@@ -1025,11 +1015,6 @@ body {
   background: rgba(239, 68, 68, 0.1);
 }
 
-.hover-close:hover {
-  color: white;
-  background: var(--color-error);
-}
-
 .hover-lift {
   transition:
     box-shadow 200ms var(--ease-spring),
@@ -1106,10 +1091,6 @@ body {
     rgba(53, 221, 226, 0.01) 100%
   );
   box-shadow: inset 2px 0 0 var(--color-accent-primary);
-}
-
-.hover-underline:hover {
-  text-decoration: underline;
 }
 
 /* ============================================
@@ -1444,15 +1425,6 @@ body {
   );
   background-size: 200% 100%;
   animation: progress-scan 0.9s linear infinite;
-}
-
-/* 分段刻度 overlay(让进度条不读作纯填充,带工具感) */
-.progress-ticks {
-  background-image: repeating-linear-gradient(
-    90deg,
-    transparent 0 9px,
-    var(--color-bg-void) 9px 10px
-  );
 }
 
 /* 前缘亮边发光(下载中 cap,强化"正在前进"感) */
@@ -2195,7 +2167,7 @@ body {
   --graphite-3: #c8cdd5;
   --gunmetal: #9ca3af;
   --charcoal: #6b7280;
-  --ash: #9ca3af;
+  --ash: #6b7280; /* text-tertiary:浅底 #6b7280 on #fafafa → 4.63:1(WCAG AA ✅)。原 #9ca3af 仅 2.43:1。 */
   --silver: #6b7280;
   --platinum: #3a3f48;
   --porcelain: #1a1d24;
@@ -2214,8 +2186,9 @@ body {
   --color-text-inverse: var(--black-2);
   --color-text-title: var(--porcelain);
 
-  /* 强调色:浅底用电青深档 accent-vel-600 作 primary,对比度≥4.5:1 */
-  --color-accent-primary: var(--accent-vel-600);
+  /* 强调色:浅底用 teal-700 #0f766e 作 primary,白字前景 → 5.47:1(WCAG AA ✅)。
+     原 accent-vel-600 #40b1b7 配白字仅 2.56:1,对比度不达标。 */
+  --color-accent-primary: var(--teal-700);
   --color-accent-secondary: var(--accent-vel-400);
   --color-accent-tertiary: #0891b2;
   --color-accent-foreground: #ffffff;
@@ -2275,8 +2248,7 @@ body {
 }
 
 /* Light 主题下的组件微调:边框/玻璃类跟随浅底 */
-[data-theme="light"] .glass,
-[data-theme="light"] .glass-blur {
+[data-theme="light"] .glass {
   background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-default);
 }

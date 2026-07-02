@@ -108,24 +108,51 @@ impl CpuVerifier {
         }
     }
 
-    /// 从文件路径流式计算哈希值
+    /// 从文件路径计算哈希值
     ///
-    /// 打开文件并使用 `compute_hash_streaming` 逐块计算哈希,
-    /// 适用于大文件(如 50GB 模型文件)的校验场景。
+    /// **Blake3 整文件校验路径**(verify 阶段):使用 blake3 的
+    /// `update_mmap_rayon`——mmap 零拷贝读 + 多线程哈希,对大文件(如 50GB 模型)
+    /// 可获得 10-20x 加速(见 blake3 官方基准)。该方法在 blake3 内部已含 fallback:
+    /// 文件不可 mmap 时退化为标准 IO(仍走 `update_rayon` 多线程)。
+    ///
+    /// **SHA-256 路径**:sha2 无多线程 API,沿用流式逐块读取(`compute_hash_streaming`),
+    /// `chunk_size` 仅对 sha256 生效。
     ///
     /// # 参数
     /// - `path`: 文件路径
-    /// - `chunk_size`: 每次读取的字节数
+    /// - `chunk_size`: sha256 流式读取的每次字节数(blake3 路径忽略此参数)
     pub async fn compute_hash_from_path(
         &self,
         path: &Path,
         chunk_size: usize,
     ) -> DownloadResult<String> {
-        let mut file = tokio::fs::File::open(path)
-            .await
-            .map_err(tachyon_core::error::DownloadError::Io)?;
-        let hash = self.compute_hash_streaming(&mut file, chunk_size).await?;
-        Ok(hash)
+        match self.algorithm {
+            HashAlgorithm::Blake3 => {
+                // update_mmap_rayon 是同步 + CPU 密集 + 文件 IO,放进
+                // spawn_blocking 避免阻塞异步运行时(下载管线并发校验时不卡 reactor)。
+                let path = path.to_owned();
+                // spawn_blocking 要求闭包 Send;path 已 owned HashAlgorithm: Copy。
+                let hash = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update_mmap_rayon(&path)?;
+                    Ok(hasher.finalize().to_hex().to_string())
+                })
+                .await
+                .map_err(|join_err| {
+                    // JoinError(panic/取消)转 Io 错误,保持单一错误类型出口
+                    std::io::Error::other(format!("blake3 校验任务失败: {join_err}"))
+                })??;
+                Ok(hash)
+            }
+            HashAlgorithm::Sha256 => {
+                // sha2 无多线程/mmap API,沿用流式逐块路径
+                let mut file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(tachyon_core::error::DownloadError::Io)?;
+                let hash = self.compute_hash_streaming(&mut file, chunk_size).await?;
+                Ok(hash)
+            }
+        }
     }
 }
 

@@ -2740,10 +2740,7 @@ mod tests {
             DownloadState::Completed,
             "HTTP 熔断 + BT 接管后任务应 Completed"
         );
-        assert!(
-            (task.progress() - 1.0).abs() < f64::EPSILON,
-            "进度应为 1.0"
-        );
+        assert!((task.progress() - 1.0).abs() < f64::EPSILON, "进度应为 1.0");
 
         // 验证 storage 数据 == BT 预置文件内容(证明数据由 BT fallback 写入,非 HTTP)
         let mut buf = vec![0u8; file_size];

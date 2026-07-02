@@ -3,6 +3,7 @@ import { Portal } from "solid-js/web";
 import { CloseIcon, WarningCircleIcon } from "./icons";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr } from "../i18n";
+import Button from "../shared/ui/Button";
 
 interface ConfirmDialogProps {
   /** 是否显示对话框 */
@@ -38,12 +39,11 @@ interface ConfirmDialogProps {
  *
  * 替代 window.confirm，提供:
  * - 完整的无障碍支持: role="dialog", aria-modal, 焦点陷阱, Esc 关闭
- * - 与应用 glass morphism 主题一致的视觉风格
+ * - 与应用实色面板(.panel-surface)一致的视觉风格
  * - 加载状态支持
  */
 export default function ConfirmDialog(props: ConfirmDialogProps) {
   let dialogRef: HTMLDivElement | undefined;
-  let confirmBtnRef: HTMLButtonElement | undefined;
 
   const [deleteLocalFile, setDeleteLocalFile] = createSignal(false);
 
@@ -129,20 +129,14 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
                 {props.title}
               </h3>
             </div>
-            <button
+            <Button
+              variant="ghost"
+              shape="icon-sm"
               aria-label={tr("confirmDialog.aria.close")}
-              style={{
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
-                color: "var(--color-text-tertiary)",
-                padding: "2px",
-                "flex-shrink": "0",
-              }}
               onClick={() => props.onCancel()}
             >
               <CloseIcon />
-            </button>
+            </Button>
           </div>
 
           {/* 描述 */}
@@ -212,51 +206,24 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
 
           {/* 按钮行 */}
           <div class="flex items-center justify-end gap-2">
-            <button
-              class="btn-secondary"
-              style={{
-                padding: "6px 16px",
-                "font-size": "13px",
-                "border-radius": "6px",
-                background: "var(--graphite-2)",
-                color: "var(--color-text-secondary)",
-                border: "none",
-                cursor: "pointer",
-                transition: "background 150ms ease",
-              }}
+            <Button
+              variant="secondary"
+              size="md"
               onClick={() => props.onCancel()}
               disabled={props.loading}
             >
               {props.cancelLabel ?? tr("common.cancel")}
-            </button>
-            <button
-              ref={confirmBtnRef}
-              class={props.tone === "danger" ? "btn-danger" : "btn-primary"}
+            </Button>
+            <Button
+              variant={props.tone === "danger" ? "danger" : "primary"}
+              size="md"
               data-autofocus
-              style={{
-                padding: "6px 16px",
-                "font-size": "13px",
-                "font-weight": 500,
-                "border-radius": "6px",
-                // danger 调性:删除等破坏性操作用红色警示(primary 默认品牌紫)
-                background:
-                  props.tone === "danger"
-                    ? "var(--color-error)"
-                    : "var(--color-accent-primary)",
-                color: "var(--color-text-inverse)",
-                border: "none",
-                cursor: props.loading ? "wait" : "pointer",
-                opacity: props.loading ? 0.7 : 1,
-                transition: "opacity 150ms ease, background 150ms ease",
-              }}
+              loading={props.loading}
               onClick={() => props.onConfirm({ deleteLocalFile: deleteLocalFile() })}
               disabled={props.loading}
             >
-              {props.tone === "danger" && (
-                <span class="confirm-dialog-icon--danger" aria-hidden="true" />
-              )}
               {props.loading ? tr("common.processing") : (props.confirmLabel ?? tr("common.confirm"))}
-            </button>
+            </Button>
           </div>
         </div>
       </Show>

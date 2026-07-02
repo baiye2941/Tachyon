@@ -11,6 +11,18 @@ magnet = ["dep:librqbit"]
 # 测试接缝:暴露 from_handle 等仅供离线集成测试使用的构造器。
 # 由下游 crate(tachyon-engine)在 dev-dependencies 中开启,不影响生产编译。
 test-harness = []
+# HTTP/3(QUIC)支持 —— **非默认开启**。
+#
+# reqwest 的 `http3` feature 标记为 unstable:仅启用本 feature 而未设置
+# `RUSTFLAGS='--cfg reqwest_unstable'` 时,reqwest 会触发 compile_error!。
+# 因此本 feature 默认关闭,仅在有 QUIC 需求且构建环境支持时显式开启:
+#
+#     RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
+#
+# 启用后 reqwest 通过 Alt-Svc 协商自动升级到 HTTP/3,失败则回退 HTTP/2(保留
+# fallback)。`ConnectionConfig.enable_quic` 为运行时意图开关(默认 true),
+# 仅在编译期 http3 feature 可用时生效——见 http.rs 的 #[cfg] 门控。
+http3 = ["reqwest/http3"]
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
@@ -25,3 +37,10 @@ librqbit = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+
+# 声明 `reqwest_unstable` 为合法的 cfg(由 RUSTFLAGS='--cfg reqwest_unstable' 注入),
+# 避免 `unexpected_cfgs` 警告。该 cfg 仅在启用 `http3` feature 时有意义,但 lint
+# 配置本身无条件声明是安全的。
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(reqwest_unstable)"]

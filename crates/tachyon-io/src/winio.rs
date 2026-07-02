@@ -343,23 +343,28 @@ impl AsyncStorage for WinFile {
                 self.file.clone()
             };
 
-            // 通过 usize 中转指针,满足 Send + 'static 约束(与 TokioFile::read_at 一致)。
-            // Safety: buf 指针在 spawn_blocking .await 返回前保持有效。
-            // read_at 的唯一生产调用点是 verify 阶段(downloader.rs:1821),
-            // 该路径为纯 .await(不在 tokio::select! 中),future 不会被取消,
-            // buf 生命周期覆盖整个 spawn_blocking 执行期,无 UAF 风险。
-            // seek_read 只写入 buf[..buf_len],不会越界。
-            let buf_addr = buf.as_mut_ptr() as usize;
+            // CRITICAL 修复(C-01 UAF):旧实现把 buf 裸指针(as_mut_ptr as usize)
+            // move 进 spawn_blocking,再 from_raw_parts_mut 重建切片。当 future 被
+            // JoinSet::abort_all 取消时(downloader.rs verify 某分片哈希不匹配),
+            // buf 随 future drop 释放,但 spawn_blocking 任务继续运行持悬垂指针 → UAF。
+            //
+            // 修复(与 write_at_mut 对称):闭包内分配 owned 本地缓冲读盘,await 成功
+            // 后再 copy_from_slice 写回调用方 buf。future 被取消时本地缓冲所有权随
+            // 闭包 drop,无外部裸指针持有 → 取消安全。
             let buf_len = buf.len();
             tokio::task::spawn_blocking(move || {
-                let ptr = buf_addr as *mut u8;
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
+                let mut local = vec![0u8; buf_len];
                 target_file
-                    .seek_read(slice, offset)
+                    .seek_read(&mut local, offset)
+                    .map(|n| (n, local))
                     .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map(|(n, local)| {
+                buf[..n].copy_from_slice(&local[..n]);
+                n
+            })
         })
     }
 
@@ -463,18 +468,22 @@ impl AsyncStorage for WinFile {
         Box::pin(async move {
             use std::os::unix::fs::FileExt;
             let file = self.file.clone();
-            // 通过 usize 中转指针,满足 Send + 'static 约束(与 TokioFile::read_at 一致)。
-            // Safety: buf 指针在 spawn_blocking .await 返回前保持有效。
-            // read_at 的唯一生产调用点是 verify 阶段(纯 .await,无 select! 取消)。
-            let buf_addr = buf.as_mut_ptr() as usize;
+            // CRITICAL 修复(C-01 UAF):旧实现把 buf 裸指针 move 进 spawn_blocking,
+            // JoinSet::abort_all 取消 future 时 buf 释放但任务仍持悬垂指针 → UAF。
+            // 修复(与 write_at_mut 对称):闭包内 owned 本地缓冲读盘,await 后写回。
             let buf_len = buf.len();
             tokio::task::spawn_blocking(move || {
-                let ptr = buf_addr as *mut u8;
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-                file.read_at(slice, offset).map_err(DownloadError::Io)
+                let mut local = vec![0u8; buf_len];
+                file.read_at(&mut local, offset)
+                    .map(|n| (n, local))
+                    .map_err(DownloadError::Io)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
+            .map(|(n, local)| {
+                buf[..n].copy_from_slice(&local[..n]);
+                n
+            })
         })
     }
 
@@ -824,6 +833,51 @@ mod tests {
                     buf.iter().all(|&b| b == i),
                     "round {round} 区域 {offset} 数据不一致,期望全部为 {i}"
                 );
+            }
+        }
+    }
+
+    /// C-01 回归测试:`read_at` 跨 `spawn_blocking` 的 Use-After-Free(WinFile)。
+    ///
+    /// 复现 downloader.rs verify 取消路径:JoinSet 并发 read_at + abort_all。
+    /// 旧实现将 `&mut [u8]` 裸指针 move 进 spawn_blocking,abort 时 buf 释放
+    /// 但阻塞任务持悬垂指针 → UAF。修复后闭包内分配 owned Vec 读盘,await 后
+    /// 写回,取消安全。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_read_at_joinset_abort_all_no_uaf() {
+        use tokio::task::JoinSet;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let file = WinFile::open_standard(tmp.path()).await.unwrap();
+        file.allocate(256 * 1024).await.unwrap();
+        let storage = std::sync::Arc::new(file);
+
+        const ROUNDS: usize = 30;
+        for round in 0..ROUNDS {
+            let mut join_set: JoinSet<DownloadResult<usize>> = JoinSet::new();
+            for i in 0u32..32 {
+                let s = storage.clone();
+                join_set.spawn(async move {
+                    let offset = (i as u64) * 4096;
+                    let mut buf = vec![0u8; 4096];
+                    s.read_at(offset, &mut buf).await
+                });
+            }
+
+            let first = join_set.join_next().await;
+            join_set.abort_all();
+            while let Some(res) = join_set.join_next().await {
+                if let Ok(Ok(_)) = res {
+                    // 个别任务可能在 abort 前正常完成,允许
+                }
+            }
+            let first = first.expect("至少一个任务应完成");
+            match first {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("round {round}: read_at 返回错误: {e:?}"),
+                Err(join_err) => {
+                    panic!("round {round}: 第一个任务 join 错误: {join_err}");
+                }
             }
         }
     }

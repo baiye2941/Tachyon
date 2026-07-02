@@ -44,7 +44,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 rcgen = "0.14"
 
 # 哈希
-blake3 = "1"
+# blake3 启用 `mmap` + `rayon`:整文件校验路径(verify 阶段)用
+# `Hasher::update_mmap_rayon`(mmap 零拷贝读 + 多线程哈希,大文件 10-20x 加速)。
+# 流式增量 update(下载管线 batch < 128KB)保持单线程 `update`,rayon 反而更慢。
+blake3 = { version = "1", features = ["mmap", "rayon"] }
 sha2 = "0.11"
 
 # 随机数
