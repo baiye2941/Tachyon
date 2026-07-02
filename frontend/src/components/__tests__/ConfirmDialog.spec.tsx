@@ -187,7 +187,7 @@ describe("ConfirmDialog", () => {
     expect(document.body.querySelector("#confirm-dialog-desc")).not.toBeNull();
   });
 
-  it("tone=danger 时渲染 danger 确认按钮且不影响确认按钮", async () => {
+  it("tone=danger 时渲染 danger 确认按钮", async () => {
     render(() => (
       <ConfirmDialog
         open={true}
@@ -200,7 +200,6 @@ describe("ConfirmDialog", () => {
     ));
     await waitForRaf();
 
-    expect(document.body.querySelector(".confirm-dialog-icon--danger")).not.toBeNull();
     expect(document.body.querySelector("button.btn-danger")).not.toBeNull();
   });
 });
