@@ -473,7 +473,11 @@ pub mod harness {
             rate_limit_bytes_per_sec: None,
             max_full_stream_bytes: crate::config::default_max_full_stream_bytes(),
             authorized_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
-            io_strategy: IoStrategy::default(),
+            // 测试统一用 Standard(TokioFile),消除"Windows 跑 Standard、Linux 跑 IoUring"
+            // 的平台隐式分歧。IoUring 的 O_DIRECT 慢速路径有平台特定行为,
+            // 端到端落盘测试不应隐式依赖 IoStrategy::default()(Linux 上回退 IoUring)。
+            // IoUring 后端有独立的单元测试覆盖(crates/tachyon-io/src/iouring.rs)。
+            io_strategy: IoStrategy::Standard,
         }
     }
 
