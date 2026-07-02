@@ -94,7 +94,9 @@ describe("NewTaskModal", () => {
       await screen.findByDisplayValue("model.safetensors");
 
       expect(fileNameInput.value).toBe("model.safetensors");
-      expect(api.probeFilename).toHaveBeenCalledWith("https://example.com/model");
+      expect(api.probeFilename).toHaveBeenCalledWith(
+        "https://example.com/model",
+      );
     });
 
     it("探测后用户可继续编辑 input", async () => {
@@ -199,12 +201,10 @@ describe("NewTaskModal", () => {
       const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
       fireEvent.input(urlInput, {
         target: {
-          value:
-            "https://example.com/file1\nhttps://example.com/file2",
+          value: "https://example.com/file1\nhttps://example.com/file2",
         },
         currentTarget: {
-          value:
-            "https://example.com/file1\nhttps://example.com/file2",
+          value: "https://example.com/file1\nhttps://example.com/file2",
         },
       });
 
@@ -244,7 +244,8 @@ describe("NewTaskModal", () => {
 
       // 断言 createTask 被调用,第 4 参数(文件名)为探测名
       expect(api.createTask).toHaveBeenCalled();
-      const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock.calls[0];
+      const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock
+        .calls[0]!;
       expect(callArgs[0]).toBe("https://example.com/model");
       expect(callArgs[3]).toBe("model.safetensors");
     });
