@@ -1219,7 +1219,10 @@ mod tests {
     /// 这是 librqbit 自身的平台兼容性问题,非 Tachyon 代码 bug。
     /// 单文件离线测试(test_download_range_stream_*)在所有平台通过。
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(not(target_os = "windows"), ignore = "librqbit 多文件 initial_check 非 Windows 偶发字节错位")]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        ignore = "librqbit 多文件 initial_check 非 Windows 偶发字节错位"
+    )]
     async fn test_multi_file_full_range_reads_concatenated_bytes() {
         let (protocol, url, _files, global, _dir) =
             make_offline_multi_protocol(&[4096, 4096, 4096], 1024)
@@ -1238,7 +1241,10 @@ mod tests {
 
     /// 跨文件边界的子区间:range 横跨 file0/file1 边界,拆分拼接正确
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(not(target_os = "windows"), ignore = "librqbit 多文件 initial_check 非 Windows 偶发字节错位")]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        ignore = "librqbit 多文件 initial_check 非 Windows 偶发字节错位"
+    )]
     async fn test_multi_file_subrange_across_boundary() {
         // file0 [0,4095], file1 [4096,8191], file2 [8192,12287]
         let (protocol, url, _files, global, _dir) =
