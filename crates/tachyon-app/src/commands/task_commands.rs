@@ -173,49 +173,74 @@ pub(crate) async fn build_download_task(
     mirror_urls: Option<Vec<String>>,
     #[cfg(feature = "magnet")] bt_session: Option<Arc<tachyon_engine::BtSession>>,
 ) -> Result<Box<dyn TaskRunner>, ()> {
-    match mirror_urls {
-        Some(mirrors) if !mirrors.is_empty() => {
-            tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
-            match DownloadTask::with_mirrors(
+    let is_magnet = url.starts_with("magnet:?");
+    let has_mirrors = mirror_urls.as_ref().is_some_and(|v| !v.is_empty());
+
+    // P2SP 路由:按 is_magnet × has_mirrors 分四路。
+    //   - magnet + mirrors:混合下载(HTTP 主源 + BT fallback)
+    //   - magnet(纯 BT):with_pool_and_scheduler(传 bt_session)
+    //   - http + mirrors:多源镜像
+    //   - http(单源):with_pool_and_scheduler(bt_session=None)
+    use tachyon_scheduler::AdaptiveDownloadScheduler;
+    let scheduler: Arc<dyn tachyon_core::traits::DownloadScheduler> =
+        Arc::new(AdaptiveDownloadScheduler::default_config());
+
+    let task_result = if is_magnet && has_mirrors {
+        #[cfg(feature = "magnet")]
+        {
+            let bt_session = bt_session.ok_or_else(|| {
+                tracing::error!(task_id = %task_id, "磁力+镜像混合下载缺少 BT Session");
+            })?;
+            tracing::info!(task_id = %task_id, "P2SP 混合下载:HTTP 镜像主源 + BT fallback");
+            DownloadTask::with_hybrid_sources(
                 url.to_string(),
-                mirrors,
-                download_config,
-                Some(connection_pool),
-            )
-            .await
-            {
-                Ok(mut t) => {
-                    t.set_buffer_pool(buffer_pool.clone());
-                    Ok(Box::new(t))
-                }
-                Err(e) => {
-                    tracing::error!(task_id = %task_id, error = %e, "创建镜像 DownloadTask 失败");
-                    Err(())
-                }
-            }
-        }
-        _ => {
-            use tachyon_scheduler::AdaptiveDownloadScheduler;
-            let scheduler = Arc::new(AdaptiveDownloadScheduler::default_config());
-            match DownloadTask::with_pool_and_scheduler(
-                url.to_string(),
+                mirror_urls.unwrap(),
                 download_config,
                 Some(connection_pool),
                 scheduler,
-                #[cfg(feature = "magnet")]
                 bt_session,
             )
             .await
-            {
-                Ok(mut t) => {
-                    t.set_buffer_pool(buffer_pool.clone());
-                    Ok(Box::new(t))
-                }
-                Err(e) => {
-                    tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
-                    Err(())
-                }
-            }
+        }
+        #[cfg(not(feature = "magnet"))]
+        {
+            tracing::error!(task_id = %task_id, "magnet feature 未启用,无法执行混合下载");
+            Err(tachyon_core::DownloadError::Config(
+                "magnet feature 未启用".into(),
+            ))
+        }
+    } else if has_mirrors {
+        let mirrors = mirror_urls.unwrap();
+        tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
+        DownloadTask::with_mirrors(
+            url.to_string(),
+            mirrors,
+            download_config,
+            Some(connection_pool),
+        )
+        .await
+    } else {
+        // 纯 HTTP 单源 或 纯 BT(magnet:?) 均走 with_pool_and_scheduler。
+        // is_magnet 时 bt_session 透传,否则传 None。
+        DownloadTask::with_pool_and_scheduler(
+            url.to_string(),
+            download_config,
+            Some(connection_pool),
+            scheduler,
+            #[cfg(feature = "magnet")]
+            bt_session,
+        )
+        .await
+    };
+
+    match task_result {
+        Ok(mut t) => {
+            t.set_buffer_pool(buffer_pool.clone());
+            Ok(Box::new(t))
+        }
+        Err(e) => {
+            tracing::error!(task_id = %task_id, error = %e, "创建 DownloadTask 失败");
+            Err(())
         }
     }
 }
@@ -2466,7 +2491,47 @@ mod tests {
         );
     }
 
-    // ---- probe_filename 测试 ----
+    /// 验证 P2SP 路由:magnet + 镜像但缺少 bt_session 时返回 Err(Task 8)
+    ///
+    /// Task 8 在 build_download_task 新增 magnet+mirrors 分支调 with_hybrid_sources,
+    /// 该分支要求 bt_session.is_some()。此处用 None 触发路由的 ok_or_else 错误路径,
+    /// 断言返回 Err 且 buffer_pool 未被消费(在 set_buffer_pool 之前返回)。
+    /// 覆盖新分支的路由契约,无需真实 BT session。
+    #[tokio::test]
+    #[cfg(feature = "magnet")]
+    async fn test_build_download_task_p2sp_missing_bt_session_returns_err() {
+        let state = test_state();
+        let capacity = state.infra.buffer_pool.capacity();
+        let download_config = {
+            let cfg = state.domain.config.lock().await;
+            build_download_config(&cfg, "/tmp/tachyon-task8-p2sp-unused")
+        };
+
+        // magnet + 镜像 + bt_session=None -> P2SP 分支的 ok_or_else 错误路径
+        let result = build_download_task(
+            "task8-p2sp-contract",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            download_config,
+            state.infra.connection_pool.clone(),
+            state.infra.buffer_pool.clone(),
+            Some(vec!["https://mirror.example.com/file.bin".to_string()]),
+            #[cfg(feature = "magnet")]
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "magnet+镜像缺少 BT Session 应使 P2SP 路由返回 Err"
+        );
+
+        // 错误路径在 set_buffer_pool 之前返回,buffer_pool 不应被消费
+        assert_eq!(
+            state.infra.buffer_pool.available(),
+            capacity,
+            "P2SP 路由错误路径不应消费 buffer_pool 许可"
+        );
+    }
 
     /// 无效 URL 应返回错误
     #[tokio::test]

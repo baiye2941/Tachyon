@@ -5,8 +5,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use librqbit::{Session, SessionOptions};
+use librqbit::{PeerConnectionOptions, Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
 
 /// BitTorrent Session 单例
@@ -33,33 +34,7 @@ impl BtSession {
         download_dir: PathBuf,
         config: MagnetConfig,
     ) -> tachyon_core::DownloadResult<Self> {
-        let mut opts = SessionOptions {
-            disable_dht: !config.enable_dht,
-            enable_upnp_port_forwarding: config.enable_upnp,
-            disable_dht_persistence: config.disable_dht_persistence,
-            ..Default::default()
-        };
-
-        // SOCKS5 代理:优先用户手动配置,None 时自动检测系统代理
-        // 让 BT tracker(reqwest)和 peer TCP(StreamConnector)走代理,
-        // 国内访问国外 BT 资源必需(UDP tracker/DHT 仍直连,socks5 不代理 UDP)
-        let socks_proxy = config.socks_proxy_url.clone().or_else(|| {
-            tachyon_core::config::detect_socks_proxy().inspect(|proxy| {
-                tracing::info!(proxy = %proxy, "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)");
-            })
-        });
-        if let Some(ref proxy) = socks_proxy {
-            opts.socks_proxy_url = Some(proxy.clone());
-            tracing::info!(proxy = %proxy, "BT SOCKS5 代理已启用");
-        }
-
-        // 全局 tracker: 附加到每个磁力链接的 tracker 列表，
-        // 即使磁力链接本身不包含 tracker 也能快速发现 peer。
-        for tracker_url in &config.trackers {
-            if let Ok(url) = url::Url::parse(tracker_url) {
-                opts.trackers.insert(url);
-            }
-        }
+        let opts = Self::build_session_options(&config);
 
         let session = Session::new_with_opts(download_dir.clone(), opts)
             .await
@@ -72,6 +47,79 @@ impl BtSession {
             config,
             download_dir,
         })
+    }
+
+    /// 根据 MagnetConfig 构造 SessionOptions(纯函数,可独立测试)
+    ///
+    /// 填充:peer_opts(connect/read_write 超时)、defer_writes_up_to、
+    /// SOCKS5 代理 + DHT 联动、tracker 注入(SOCKS5 下过滤 UDP,追加 HTTPS)。
+    fn build_session_options(config: &MagnetConfig) -> SessionOptions {
+        // SOCKS5 检测:用户配置优先,否则自动检测系统代理
+        let socks_proxy = config.socks_proxy_url.clone().or_else(|| {
+            tachyon_core::config::detect_socks_proxy().inspect(|proxy| {
+                tracing::info!(proxy = %proxy, "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)");
+            })
+        });
+        let socks_enabled = socks_proxy.is_some();
+
+        // DHT:SOCKS5 下按 disable_dht_when_socks 决定(UDP 不可达)
+        let disable_dht = if socks_enabled && config.disable_dht_when_socks {
+            tracing::info!("SOCKS5 启用且 disable_dht_when_socks=true,禁用 DHT(UDP 不可达)");
+            true
+        } else {
+            !config.enable_dht
+        };
+
+        let mut opts = SessionOptions {
+            disable_dht,
+            enable_upnp_port_forwarding: config.enable_upnp,
+            disable_dht_persistence: config.disable_dht_persistence,
+            // peer 连接超时调优(快速淘汰死 peer,腾出 128 槽位)
+            peer_opts: Some(PeerConnectionOptions {
+                connect_timeout: Some(Duration::from_secs(config.peer_connect_timeout_secs)),
+                read_write_timeout: Some(Duration::from_secs(config.peer_read_write_timeout_secs)),
+                ..Default::default()
+            }),
+            // 延迟写入缓冲(慢盘优化,0 禁用)
+            defer_writes_up_to: if config.defer_writes_up_to_mb == 0 {
+                None
+            } else {
+                Some(config.defer_writes_up_to_mb as usize)
+            },
+            ..Default::default()
+        };
+
+        // SOCKS5 代理
+        if let Some(ref proxy) = socks_proxy {
+            opts.socks_proxy_url = Some(proxy.clone());
+            tracing::info!(proxy = %proxy, "BT SOCKS5 代理已启用");
+        }
+
+        // tracker 注入:SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
+        for tracker_url in &config.trackers {
+            let is_udp = tracker_url.starts_with("udp://");
+            if socks_enabled && is_udp {
+                tracing::debug!(tracker = %tracker_url, "SOCKS5 启用,跳过 UDP tracker(不可达)");
+                continue;
+            }
+            if let Ok(url) = url::Url::parse(tracker_url) {
+                opts.trackers.insert(url);
+            }
+        }
+        if socks_enabled {
+            const HTTPS_TRACKERS_FOR_PROXY: &[&str] = &[
+                "https://tracker.tamersunion.org:443/announce",
+                "https://tracker.gbitt.info:443/announce",
+            ];
+            for https_tracker in HTTPS_TRACKERS_FOR_PROXY {
+                if let Ok(url) = url::Url::parse(https_tracker) {
+                    opts.trackers.insert(url);
+                }
+            }
+            tracing::info!("SOCKS5 启用,追加 HTTPS tracker(经代理可达)");
+        }
+
+        opts
     }
 
     /// 获取内部 Session 引用
@@ -87,5 +135,222 @@ impl BtSession {
     /// 获取默认下载目录
     pub fn download_dir(&self) -> &PathBuf {
         &self.download_dir
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// 构造不启用 DHT/UPnP 的最小配置(测试用,避免真实网络副作用)
+    fn test_config() -> MagnetConfig {
+        let mut config = MagnetConfig::default();
+        config.enable_dht = false;
+        config.enable_upnp = false;
+        config.disable_dht_persistence = true;
+        // 清空默认 tracker,测试自行注入可控行为
+        config.trackers = Vec::new();
+        config
+    }
+
+    #[test]
+    fn test_peer_opts_filled_from_config() {
+        let mut config = test_config();
+        config.peer_connect_timeout_secs = 5;
+        config.peer_read_write_timeout_secs = 7;
+        let opts = BtSession::build_session_options(&config);
+
+        let peer_opts = opts.peer_opts.expect("peer_opts 应为 Some(由 config 填充)");
+        assert_eq!(
+            peer_opts.connect_timeout,
+            Some(Duration::from_secs(5)),
+            "connect_timeout 应取自 peer_connect_timeout_secs"
+        );
+        assert_eq!(
+            peer_opts.read_write_timeout,
+            Some(Duration::from_secs(7)),
+            "read_write_timeout 应取自 peer_read_write_timeout_secs"
+        );
+    }
+
+    #[test]
+    fn test_defer_writes_filled_when_nonzero() {
+        let mut config = test_config();
+        config.defer_writes_up_to_mb = 32;
+        let opts = BtSession::build_session_options(&config);
+        assert_eq!(
+            opts.defer_writes_up_to,
+            Some(32),
+            "defer_writes_up_to 应为 MB 值(usize)"
+        );
+    }
+
+    #[test]
+    fn test_defer_writes_disabled_when_zero() {
+        let mut config = test_config();
+        config.defer_writes_up_to_mb = 0;
+        let opts = BtSession::build_session_options(&config);
+        assert_eq!(
+            opts.defer_writes_up_to, None,
+            "defer_writes_up_to=0 应映射为 None(禁用)"
+        );
+    }
+
+    #[test]
+    fn test_no_socks_keeps_udp_trackers() {
+        // 显式不设 socks_proxy_url 且无系统代理环境 → SOCKS5 关闭,
+        // UDP tracker 应被保留(不过滤)
+        let mut config = test_config();
+        config.socks_proxy_url = None;
+        config.trackers = vec![
+            "udp://tracker.opentrackr.org:1337/announce".into(),
+            "https://tracker.example.org:443/announce".into(),
+        ];
+
+        // 确保检测不到系统代理(清掉相关环境变量,本测试内局部清理)
+        let vars = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
+        for v in vars {
+            // SAFETY: 测试串行运行(本测试独占修改 env),且仅测试期间临时清空
+            // 代理环境变量。下方 finally 风格恢复保证不泄漏到其他测试。
+            unsafe {
+                std::env::remove_var(v);
+            }
+        }
+
+        let opts = BtSession::build_session_options(&config);
+
+        // 恢复环境变量
+        for (v, val) in saved {
+            if let Some(val) = val {
+                // SAFETY: 同上,恢复原值
+                unsafe {
+                    std::env::set_var(v, val);
+                }
+            }
+        }
+
+        assert!(
+            opts.socks_proxy_url.is_none(),
+            "无 SOCKS5 时 socks_proxy_url 应为 None"
+        );
+        // enable_dht=false → disable_dht=true;此处仅断言 SOCKS5 未额外影响
+        assert!(
+            opts.disable_dht,
+            "enable_dht=false 时 disable_dht 应为 true"
+        );
+        // UDP tracker 应被保留
+        let tracker_schemes: HashSet<&str> = opts.trackers.iter().map(|u| u.scheme()).collect();
+        assert!(
+            tracker_schemes.contains("udp"),
+            "无 SOCKS5 时 UDP tracker 不应被过滤,实际: {tracker_schemes:?}"
+        );
+        assert_eq!(
+            opts.trackers.len(),
+            2,
+            "不应追加额外 HTTPS tracker(非 SOCKS5 模式)"
+        );
+    }
+
+    #[test]
+    fn test_socks_filters_udp_trackers_and_appends_https() {
+        // SOCKS5 启用(通过显式配置,确定性,不依赖环境变量)
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.disable_dht_when_socks = true;
+        config.trackers = vec![
+            "udp://tracker.opentrackr.org:1337/announce".into(),
+            "https://tracker.example.org:443/announce".into(),
+        ];
+
+        let opts = BtSession::build_session_options(&config);
+
+        // SOCKS5 代理 URL 注入
+        assert_eq!(
+            opts.socks_proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080"),
+            "socks_proxy_url 应注入到 opts"
+        );
+        // DHT 在 SOCKS5 + disable_dht_when_socks=true 下禁用
+        assert!(
+            opts.disable_dht,
+            "SOCKS5 + disable_dht_when_socks=true 应禁用 DHT"
+        );
+        // UDP tracker 被过滤
+        let has_udp = opts.trackers.iter().any(|u| u.scheme() == "udp");
+        assert!(
+            !has_udp,
+            "SOCKS5 启用时 UDP tracker 应被过滤(不可达),实际仍含 UDP"
+        );
+        // 原有 HTTPS tracker 保留
+        assert!(
+            opts.trackers
+                .iter()
+                .any(|u| u.as_str().contains("tracker.example.org")),
+            "原有 HTTPS tracker 应保留"
+        );
+        // 追加的 HTTPS tracker 存在
+        assert!(
+            opts.trackers
+                .iter()
+                .any(|u| u.as_str().contains("tracker.tamersunion.org")),
+            "SOCKS5 启用应追加 HTTPS tracker(tamersunion)"
+        );
+        assert!(
+            opts.trackers
+                .iter()
+                .any(|u| u.as_str().contains("tracker.gbitt.info")),
+            "SOCKS5 启用应追加 HTTPS tracker(gbitt)"
+        );
+    }
+
+    #[test]
+    fn test_socks_keeps_dht_when_disable_dht_when_socks_false() {
+        let mut config = test_config();
+        config.enable_dht = true;
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.disable_dht_when_socks = false;
+
+        let opts = BtSession::build_session_options(&config);
+
+        assert!(
+            !opts.disable_dht,
+            "SOCKS5 启用但 disable_dht_when_socks=false 且 enable_dht=true 时 DHT 不应禁用"
+        );
+    }
+
+    #[test]
+    fn test_default_config_has_peer_opts_and_defer_writes() {
+        // 默认配置应产出非空 peer_opts 与非 None defer_writes
+        let config = MagnetConfig::default();
+        let opts = BtSession::build_session_options(&config);
+        let peer_opts = opts.peer_opts.expect("默认配置 peer_opts 应为 Some");
+        assert_eq!(
+            peer_opts.connect_timeout,
+            Some(Duration::from_secs(8)),
+            "默认 peer_connect_timeout_secs=8"
+        );
+        assert_eq!(
+            peer_opts.read_write_timeout,
+            Some(Duration::from_secs(10)),
+            "默认 peer_read_write_timeout_secs=10"
+        );
+        assert_eq!(
+            opts.defer_writes_up_to,
+            Some(16),
+            "默认 defer_writes_up_to_mb=16"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bt_session_new_constructs_without_panic() {
+        // 端到端:build_session_options 产出的 opts 能被 Session 接受
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config();
+        let session = BtSession::new(dir.path().to_path_buf(), config).await;
+        assert!(session.is_ok(), "BtSession 应创建成功: {:?}", session.err());
     }
 }

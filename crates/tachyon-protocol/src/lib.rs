@@ -11,6 +11,8 @@ pub mod magnet;
 
 pub use http::HttpClient;
 #[cfg(feature = "magnet")]
+pub use magnet::BtPeerStats;
+#[cfg(feature = "magnet")]
 pub use magnet::MagnetProtocol;
 
 // 验证测试:放在 crate 根级别,以便 `--exact` 匹配

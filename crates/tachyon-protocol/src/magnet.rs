@@ -15,6 +15,7 @@
 //!   走 `wait_until_completed` + 磁盘读两段式
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -91,6 +92,26 @@ impl MagnetProtocol {
         cache.insert(url, (handle, layout));
     }
 
+    /// 采集 BT 层 peer/piece 统计快照
+    ///
+    /// 返回 [`BtPeerStats`],None 表示 torrent 未进入 live 状态或 url 未命中缓存
+    /// —— 不影响下载流程,app 层诊断应容忍 None(展示"无可用统计")。
+    ///
+    /// 由 tachyon-app 层持有 `MagnetProtocol` 具体类型时调用(不经 `dyn Protocol`,
+    /// 因 `peer_stats_snapshot` 是协议特有的诊断方法,不在 `Protocol` trait 上)。
+    pub fn peer_stats_snapshot(&self, url: &str) -> Option<BtPeerStats> {
+        let entry = self.handle_cache.get(url)?;
+        let live = entry.0.live()?;
+        let snap = live.stats_snapshot();
+        Some(BtPeerStats {
+            live_peers: snap.peer_stats.live,
+            connecting_peers: snap.peer_stats.connecting,
+            queued_peers: snap.peer_stats.queued,
+            downloaded_bytes: snap.downloaded_and_checked_bytes,
+            uploaded_bytes: snap.uploaded_bytes,
+        })
+    }
+
     /// 从 librqbit 的 file_infos 构造 FileLayout(消除 DUP-1:四处重复的闭包)
     ///
     /// 单文件退化为单元素,多文件按 file_infos 各文件段(file_id=索引,
@@ -121,7 +142,7 @@ impl MagnetProtocol {
     /// `layout` 由调用方从 `handle.with_metadata` 构造(测试 helper 用 `FileLayout::single`)。
     ///
     /// 仅测试可用:生产代码只走 `new`,本接缝不暴露给外部 crate。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn from_handle(
         session: Arc<Session>,
         config: MagnetConfig,
@@ -170,6 +191,63 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     }
 
     Ok(())
+}
+
+/// 从磁力链接解析 `&pe=` 参数为 peer 地址列表(BEP 9)
+///
+/// magnet URI 可含多个 `pe=host:port` 参数,返回所有合法 SocketAddr。
+/// 非法格式跳过(不报错,容错)。
+pub fn parse_pe_from_magnet(uri: &str) -> Vec<SocketAddr> {
+    uri[8..] // 跳过 "magnet:?"
+        .split('&')
+        .filter_map(|param| {
+            let lower = param.to_ascii_lowercase();
+            lower
+                .strip_prefix("pe=")
+                .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        })
+        .collect()
+}
+
+#[test]
+fn test_parse_pe_from_magnet_extracts_addrs() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&pe=1.2.3.4:6881&pe=5.6.7.8:6882";
+    let addrs = parse_pe_from_magnet(uri);
+    assert_eq!(addrs.len(), 2);
+    assert_eq!(addrs[0].to_string(), "1.2.3.4:6881");
+    assert_eq!(addrs[1].to_string(), "5.6.7.8:6882");
+}
+
+#[test]
+fn test_parse_pe_from_magnet_no_pe_param() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    let addrs = parse_pe_from_magnet(uri);
+    assert!(addrs.is_empty());
+}
+
+#[test]
+fn test_parse_pe_from_magnet_invalid_addr_skipped() {
+    let uri = "magnet:?xt=urn:btih:abc&pe=invalid&pe=1.2.3.4:6881";
+    let addrs = parse_pe_from_magnet(uri);
+    assert_eq!(addrs.len(), 1); // invalid 被跳过
+}
+
+/// BT 层 peer/piece 统计快照(跨 crate 传递,不依赖 librqbit 类型)
+///
+/// 由 [`MagnetProtocol::peer_stats_snapshot`] 采集,供 app 层展示下载健康度。
+/// 持有此结构不接触 librqbit 内部类型,可在 app 层自由序列化/展示。
+#[derive(Debug, Clone, Default)]
+pub struct BtPeerStats {
+    /// 已连接的活跃 peer 数
+    pub live_peers: usize,
+    /// 正在连接的 peer 数
+    pub connecting_peers: usize,
+    /// 排队等待连接的 peer 数
+    pub queued_peers: usize,
+    /// 已下载并校验的字节数
+    pub downloaded_bytes: u64,
+    /// 已上传的字节数
+    pub uploaded_bytes: u64,
 }
 
 /// 对等节点健康状态源(供 `make_chunk_stream` 判断 swarm 是否活跃)
@@ -323,14 +401,27 @@ fn resolve_first_file_path(
 ///
 /// `download_dir` 用于设置输出目录，`overwrite` 设为 true 允许覆盖已有文件
 /// （磁力链接可能重复添加同一资源，BT 协议本身支持断点续传）。
+///
+/// `force_tracker_interval` 透传 librqbit `AddTorrentOptions.force_tracker_interval`,
+/// 强制定期回连 tracker 刷新 peer 列表(None 禁用,由 librqbit 默认策略决定)。
+/// `initial_peers` 透传 `AddTorrentOptions.initial_peers`,预置已知 peer 直连
+/// (BEP 9 magnet `&pe=` 参数解析出的地址 + 配置 `peer_addrs`)。
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
     download_dir: &std::path::Path,
+    force_tracker_interval: Option<Duration>,
+    initial_peers: Vec<SocketAddr>,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
     let opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(download_dir.to_string_lossy().into()),
+        force_tracker_interval,
+        initial_peers: if initial_peers.is_empty() {
+            None
+        } else {
+            Some(initial_peers)
+        },
         ..Default::default()
     };
     session
@@ -358,7 +449,66 @@ impl Protocol for MagnetProtocol {
         let handle_cache = self.handle_cache.clone();
 
         Box::pin(async move {
-            let handle = add_magnet_to_session(&session, &url, &download_dir).await?;
+            // 缓存命中短路:若 handle_cache 已有该 url 的 handle + layout(此前 probe /
+            // from_handle / download_range_stream 已填充),直接从缓存 handle 派生
+            // FileMetadata,跳过 add_magnet_to_session 的重新添加。
+            //
+            // 动机:probe 可能被多次调用(run 内 + UI 刷新),重复 add_torrent(from_url)
+            // 既浪费开销,又会在「离线预置 torrent + 无 DHT/无 peer」场景下硬失败
+            // (librqbit 需 DHT/peer 发现元数据,无源时报 "no way to discover torrent
+            // metainfo")。缓存命中意味着元数据已就绪,无需再走发现路径。
+            //
+            // 安全性:缓存 handle 的 with_metadata 是权威元数据来源,与重新 add 后拿到的
+            // 是同一 handle(librqbit 对已存在 torrent 返回 AlreadyManaged),结果等价;
+            // layout 同样取自缓存(由先前 probe 从 file_infos 构造),一致。生产首次 probe
+            // 缓存为空,走原路径不受影响。
+            if let Some(entry) = handle_cache.get(&url) {
+                let (handle, layout) = (Arc::clone(&entry.0), entry.1.clone());
+                let (file_name, file_size) = handle
+                    .with_metadata(|m| {
+                        let name = m
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "unknown_torrent".to_string());
+                        (name, m.lengths.total_length())
+                    })
+                    .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
+                return Ok(FileMetadata {
+                    file_name,
+                    file_size: Some(file_size),
+                    content_type: None,
+                    supports_range: true,
+                    etag: None,
+                    last_modified: None,
+                    file_layout: Some(layout),
+                });
+            }
+
+            // force_tracker_interval: 0 禁用(None),否则按配置秒数强制 tracker 回连间隔
+            let force_tracker_interval = if config.force_tracker_interval_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(config.force_tracker_interval_secs))
+            };
+            // initial_peers: magnet &pe= 参数解析(BEP 9) + 配置 peer_addrs,合并去重前合并
+            let initial_peers = {
+                let mut addrs = parse_pe_from_magnet(&url);
+                addrs.extend(
+                    config
+                        .peer_addrs
+                        .iter()
+                        .filter_map(|s| s.parse::<SocketAddr>().ok()),
+                );
+                addrs
+            };
+            let handle = add_magnet_to_session(
+                &session,
+                &url,
+                &download_dir,
+                force_tracker_interval,
+                initial_peers,
+            )
+            .await?;
 
             // 等待元数据就绪（带超时）
             let timeout = Duration::from_secs(config.metadata_timeout_secs);
@@ -467,7 +617,14 @@ impl Protocol for MagnetProtocol {
             let (handle, layout) = if let Some(entry) = handle_cache.get(&url) {
                 (Arc::clone(&entry.0), entry.1.clone())
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
@@ -554,7 +711,14 @@ impl Protocol for MagnetProtocol {
             let handle = if let Some(entry) = handle_cache.get(&url) {
                 Arc::clone(&entry.0)
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
@@ -605,7 +769,14 @@ impl Protocol for MagnetProtocol {
             let handle = if let Some(entry) = handle_cache.get(&url) {
                 Arc::clone(&entry.0)
             } else {
-                let h = add_magnet_to_session(&session, &url, &download_dir).await?;
+                let h = add_magnet_to_session(
+                    &session,
+                    &url,
+                    &download_dir,
+                    None, // 回退路径不强制 tracker interval
+                    Vec::new(),
+                )
+                .await?;
                 let layout = h
                     .with_metadata(|m| {
                         let spans: Vec<FileSpan> = m
@@ -1257,6 +1428,44 @@ mod tests {
             multi_per_byte_ns < single_per_byte_ns * 10.0,
             "多段 per-byte {multi_per_byte_ns:.2} ns 不应比单段 {single_per_byte_ns:.2} 差 10x"
         );
+    }
+
+    // ── peer_stats_snapshot 诊断测试 ─────────────────────────────────
+
+    /// 未知 url 应返回 None(未命中缓存,不影响下载流程)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_peer_stats_snapshot_returns_none_for_unknown_url() {
+        let (protocol, _url, _content, _dir) = make_offline_protocol(1024, 512)
+            .await
+            .expect("构造离线 protocol 失败");
+        assert!(
+            protocol
+                .peer_stats_snapshot("magnet:?xt=urn:btih:unknown")
+                .is_none(),
+            "未缓存的 url 应返回 None"
+        );
+    }
+
+    /// 已缓存 url 的 torrent:若 live 则快照字段合理;若未 live(离线 completed)返回 None 亦接受
+    ///
+    /// 离线预置 torrent 经 initial_check 后 piece 全 have,但 `downloaded_and_checked_bytes`
+    /// 统计计数器只在真实下载路径(`mark_piece_downloaded`)递增,initial_check 不触及,
+    /// 故离线下该字段为 0(已源码核验:`torrent_state/initializing.rs::check` 走 `FileOps::initial_check`
+    /// 构造 ChunkTracker,不经 `mark_piece_downloaded`)。因此本测试只校验 peer 计数
+    /// (离线无真实 peer → 各项 == 0),不断言 downloaded_bytes。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_peer_stats_snapshot_returns_some_for_live_torrent() {
+        let (protocol, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let stats = protocol.peer_stats_snapshot(&url);
+        // 不强制 Some:离线预置 torrent 经 initial_check 后可能 completed 而非 live
+        if let Some(s) = stats {
+            assert_eq!(s.live_peers, 0, "离线无真实 peer,live_peers 应为 0");
+            assert_eq!(s.connecting_peers, 0, "离线无连接中的 peer");
+            assert_eq!(s.queued_peers, 0, "离线无排队 peer");
+        }
     }
 
     // ── make_chunk_stream stall 超时测试 ──────────────────────────────
