@@ -76,14 +76,14 @@
   --amber-500: #ebbd57; /* warn,琥珀(参考稿) */
   --red-500: #dc2626; /* danger,橙红→纯红提深,白字前景 → 4.83:1(WCAG AA ✅)。原 #f3562e 仅 3.40:1。 */
 
-  /* ===== 字号阶梯(下载器高密度,1.250 major third)===== */
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 16px;
-  --text-xl: 20px;
-  --text-2xl: 28px;
+  /* ===== 字号阶梯(下载器高密度;rem 以浏览器默认 16px 为基准,WCAG 1.4.4 缩放友好)===== */
+  --text-xs: 0.6875rem; /* 11px */
+  --text-sm: 0.75rem; /* 12px */
+  --text-base: 0.8125rem; /* 13px */
+  --text-md: 0.875rem; /* 14px */
+  --text-lg: 1rem; /* 16px */
+  --text-xl: 1.25rem; /* 20px */
+  --text-2xl: 1.75rem; /* 28px */
 
   --weight-regular: 400;
   --weight-medium: 500;
@@ -281,6 +281,11 @@ body,
   overflow: hidden;
 }
 
+/* 显式基准字号:确保 rem 以浏览器默认 16px 计,支持用户缩放(WCAG 1.4.4) */
+html {
+  font-size: 100%;
+}
+
 body {
   font-family: var(--font-sans);
   background: var(--color-bg-primary);
@@ -372,13 +377,6 @@ body {
   border: 1px solid var(--color-border-subtle);
 }
 
-/* glass-blur 仅保留给真正脱离文档流的浮层(tooltip/命令面板等),此处与 glass 同义,
-   具体 backdrop-filter 由使用方内联指定,避免全局默认开启 */
-.glass-blur {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-subtle);
-}
-
 /* 面板表面(质感升级:实色底 + 顶部 1px 高光 + 极淡的顶光渐变) */
 .panel-surface {
   background:
@@ -391,14 +389,6 @@ body {
 /* 可排序列头(Iteration 07 DI-3):hover 反馈,提示可点击排序 */
 .task-col-header:hover {
   color: var(--color-text-primary);
-}
-
-.accent-gradient {
-  background: linear-gradient(
-    135deg,
-    var(--color-accent-primary) 0%,
-    var(--color-accent-secondary) 100%
-  );
 }
 
 /* ============================================
@@ -1025,11 +1015,6 @@ body {
   background: rgba(239, 68, 68, 0.1);
 }
 
-.hover-close:hover {
-  color: white;
-  background: var(--color-error);
-}
-
 .hover-lift {
   transition:
     box-shadow 200ms var(--ease-spring),
@@ -1106,10 +1091,6 @@ body {
     rgba(53, 221, 226, 0.01) 100%
   );
   box-shadow: inset 2px 0 0 var(--color-accent-primary);
-}
-
-.hover-underline:hover {
-  text-decoration: underline;
 }
 
 /* ============================================
@@ -1444,15 +1425,6 @@ body {
   );
   background-size: 200% 100%;
   animation: progress-scan 0.9s linear infinite;
-}
-
-/* 分段刻度 overlay(让进度条不读作纯填充,带工具感) */
-.progress-ticks {
-  background-image: repeating-linear-gradient(
-    90deg,
-    transparent 0 9px,
-    var(--color-bg-void) 9px 10px
-  );
 }
 
 /* 前缘亮边发光(下载中 cap,强化"正在前进"感) */
@@ -2276,8 +2248,7 @@ body {
 }
 
 /* Light 主题下的组件微调:边框/玻璃类跟随浅底 */
-[data-theme="light"] .glass,
-[data-theme="light"] .glass-blur {
+[data-theme="light"] .glass {
   background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-default);
 }

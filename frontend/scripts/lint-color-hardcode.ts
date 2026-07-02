@@ -30,7 +30,6 @@ const ALLOW_FILES = new Set<string>([
   'index.css', // token 定义文件,允许原始十六进制
   'utils/format.ts', // THREAD_COLORS 数组(Canvas 场景,附 token 映射注释)
   'utils/resolveToken.ts', // fallback 色,本身是 token 解析器
-  'utils/stateMachine.ts', // 死代码(审查 P3-2),待删除,暂豁免
   'components/__tests__/Accessibility.spec.tsx', // 对比度自验证测试
 ])
 

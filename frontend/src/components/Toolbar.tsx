@@ -20,7 +20,7 @@ import { $model, searchRemoteModels } from "../stores/model";
 function getFilterColor(type: string): string {
   switch (type) {
     case "status":
-      return "var(--color-accent-primary)"; // Tachyon Violet - 状态筛选
+      return "var(--color-accent-primary)"; // 电青 - 状态筛选
     case "type":
       return "var(--color-status-connecting)"; // cyan-400 - 类型筛选
     case "size":

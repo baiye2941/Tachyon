@@ -39,7 +39,7 @@ interface ConfirmDialogProps {
  *
  * 替代 window.confirm，提供:
  * - 完整的无障碍支持: role="dialog", aria-modal, 焦点陷阱, Esc 关闭
- * - 与应用 glass morphism 主题一致的视觉风格
+ * - 与应用实色面板(.panel-surface)一致的视觉风格
  * - 加载状态支持
  */
 export default function ConfirmDialog(props: ConfirmDialogProps) {
