@@ -212,5 +212,60 @@ describe("NewTaskModal", () => {
       const probeBtn = screen.getByRole("button", { name: /探测/ });
       expect((probeBtn as HTMLButtonElement).disabled).toBe(true);
     });
+
+    it("T-1 探测填名后提交,探测名作为 file_name 传入后端", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.probeFilename as ReturnType<typeof vi.fn>).mockResolvedValue(
+        "model.safetensors",
+      );
+      (api.createTask as ReturnType<typeof vi.fn>).mockResolvedValue("task-1");
+
+      render(() => <NewTaskModal onClose={() => {}} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: "https://example.com/model" },
+        currentTarget: { value: "https://example.com/model" },
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+      await screen.findByLabelText("重命名(可选)");
+
+      // 点探测填名
+      const probeBtn = screen.getByRole("button", { name: /探测/ });
+      await fireEvent.click(probeBtn);
+      await screen.findByDisplayValue("model.safetensors");
+
+      // 点提交(主按钮文案为"开始下载"或含"开始",用 getByRole 取主按钮)
+      const submitBtn = screen.getByRole("button", { name: /开始/ });
+      await fireEvent.click(submitBtn);
+      // createTask 是异步 Promise.allSettled,等一下
+      await new Promise((r) => setTimeout(r, 50));
+
+      // 断言 createTask 被调用,第 4 参数(文件名)为探测名
+      expect(api.createTask).toHaveBeenCalled();
+      const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(callArgs[0]).toBe("https://example.com/model");
+      expect(callArgs[3]).toBe("model.safetensors");
+    });
+
+    it("T-2 单 URL 时探测按钮可用(非 disabled)", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.probeFilename as ReturnType<typeof vi.fn>).mockResolvedValue(
+        "model.safetensors",
+      );
+
+      render(() => <NewTaskModal onClose={() => {}} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: "https://example.com/model" },
+        currentTarget: { value: "https://example.com/model" },
+      });
+
+      // 单 URL 时探测按钮应 enabled(与批量 disabled 对称)
+      const probeBtn = screen.getByRole("button", { name: /探测/ });
+      expect((probeBtn as HTMLButtonElement).disabled).toBe(false);
+    });
   });
 });
