@@ -9,6 +9,7 @@ import {
   Suspense,
 } from "solid-js";
 import type { TaskInfo } from "../types";
+import { loadTaskFragments, clearTaskFragments, getTaskFragmentData } from "../stores/taskFragments";
 import {
   formatSize,
   formatSpeed,
@@ -128,6 +129,20 @@ export default function DetailPanel(props: DetailPanelProps) {
         closeTimer = null;
       }, 300);
     }
+  });
+
+  // task 变化时按需加载分片数据(DetailPanel 打开/task 切换)
+  createEffect(() => {
+    const task = props.task;
+    if (!task) return;
+    if (getTaskFragmentData(task.id)) return; // 已有数据,不重复拉
+    loadTaskFragments(task.id);
+  });
+
+  // DetailPanel 关闭时清理分片数据
+  onCleanup(() => {
+    const task = props.task;
+    if (task) clearTaskFragments(task.id);
   });
 
   // Click outside to close menu
@@ -815,6 +830,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                 }
               >
                 <ChunkMatrix
+                  taskId={task()!.id}
                   fragmentsTotal={task()!.fragmentsTotal}
                   fragmentsDone={task()!.fragmentsDone}
                   progress={task()!.progress}
