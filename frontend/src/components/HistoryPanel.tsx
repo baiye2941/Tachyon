@@ -161,7 +161,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
   const toggleBatchMode = () => {
     const wasBatch = batchMode();
     setBatchMode((v) => !v);
-    if (wasBatch) setSelectedIds(new Set());
+    if (wasBatch) setSelectedIds(new Set<string>());
   };
 
   // 批量删除选中历史记录:纯前端 localStorage 操作,无后端调用
@@ -195,7 +195,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
         "error",
       );
     }
-    setSelectedIds(new Set());
+    setSelectedIds(new Set<string>());
     if (selectedIds().size === 0) {
       // 全部删除成功后退出批量模式
       setBatchMode(false);

@@ -5,7 +5,11 @@ const STORAGE_KEY = "tachyon:download_history";
 
 interface HistoryStore {
   records: HistoryRecord[];
-  addRecord: (record: Omit<HistoryRecord, "id" | "completedAt">) => void;
+  addRecord: (
+    record: Omit<HistoryRecord, "id" | "completedAt" | "savePath"> & {
+      savePath?: string;
+    },
+  ) => void;
   getRecords: (filter?: HistoryFilter) => HistoryRecord[];
   getStats: () => HistoryStats;
   clearHistory: () => void;
