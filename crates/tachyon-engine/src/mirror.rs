@@ -22,22 +22,39 @@ use tachyon_core::traits::Protocol;
 use tachyon_core::types::FileMetadata;
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 
+use crate::connection::ConnectionPool;
+
 /// 源 URL + Protocol 对
 type Source = (String, Arc<dyn Protocol>);
 
 /// 单源 probe 超时(修复 MEDIUM-3:防源挂起致永久阻塞/detached 任务泄漏)
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 软熔断阈值:连续失败达到此值后,该源在选源时被跳过(半开探测除外)。
+///
+/// 与 engine 层 circuit_breaker 分工:engine 层管全局请求级熔断
+/// (不可达主机 / 连续失败致整体不可用),本阈值管 MirrorProtocol 内
+/// per-source 软熔断 —— 避免对已知坏源反复重试,浪费 max_retries×源数
+/// 次尝试。clear_selected 重置(配合 stats 衰减),给半开探测机会。
+const SOFT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+
 /// 源质量统计(轻量,engine 内自管)
 ///
 /// 记录每源的成功/失败次数、累计字节/耗时,派生 quality(0~1,越高越好)。
 /// 选源时用 `in_flight / (quality + ε)` 加权:质量高的源允许更多在途。
+///
+/// 另维护连续失败计数(consecutive_failures),超过
+/// [`SOFT_CIRCUIT_BREAKER_THRESHOLD`] 时该源被软熔断,选源时跳过
+/// (除非全部源都熔断,则全部重置尝试一次——半开探测)。
 #[derive(Debug, Clone, Default)]
 struct SourceStats {
     success: u64,
     fail: u64,
     total_bytes: u64,
     total_duration_ns: u128,
+    /// 连续失败计数:成功时清零,失败时递增。达 [`SOFT_CIRCUIT_BREAKER_THRESHOLD`]
+    /// 时 [`Self::is_circuit_open`] 返回 true,选源跳过该源。
+    consecutive_failures: u32,
 }
 
 impl SourceStats {
@@ -85,15 +102,38 @@ impl SourceStats {
     }
 
     /// 记录一次成功下载
+    ///
+    /// 成功时清零连续失败计数(解除软熔断)。
     fn record_success(&mut self, bytes: u64, duration_ns: u128) {
         self.success += 1;
         self.total_bytes += bytes;
         self.total_duration_ns += duration_ns;
+        self.consecutive_failures = 0;
     }
 
     /// 记录一次失败
+    ///
+    /// 递增连续失败计数;达 [`SOFT_CIRCUIT_BREAKER_THRESHOLD`] 后
+    /// [`Self::is_circuit_open`] 返回 true。
     fn record_failure(&mut self) {
         self.fail += 1;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// 该源是否已软熔断(连续失败达阈值)。
+    ///
+    /// 软熔断状态下选源跳过该源;若所有候选源都熔断,则全部重置
+    /// (半开探测),见 [`Self::reset_circuit`]。
+    fn is_circuit_open(&self) -> bool {
+        self.consecutive_failures >= SOFT_CIRCUIT_BREAKER_THRESHOLD
+    }
+
+    /// 重置该源的软熔断状态(半开探测 / clear_selected 恢复时调用)。
+    ///
+    /// 仅清零连续失败计数,不动 success/fail 累积(quality 衰减由
+    /// clear_selected 单独处理),使该源能重新参与选源。
+    fn reset_circuit(&mut self) {
+        self.consecutive_failures = 0;
     }
 }
 
@@ -105,6 +145,9 @@ impl SourceStats {
 ///   (避免误惩罚用户取消;in_flight 递减是事实,stats 不记是保守)
 ///
 /// 修复 BUG-A:in_flight 延迟到流真正结束时递减,而非 download_range_stream 返回时。
+///
+/// P1:可选持有 `ConnectionPermit`,使镜像路径的 per-host 连接许可生命周期
+/// 与流消费对齐(流 EOF/Err/Drop 时 drop permit,释放连接槽位)。
 struct StatsStream {
     inner: ByteStream,
     source_idx: usize,
@@ -113,6 +156,12 @@ struct StatsStream {
     start: Option<std::time::Instant>, // 首字节时记录(修复 OPT-6:不含排队等待)
     bytes_seen: u64,
     finished: bool,
+    /// P1:镜像路径按真实 host 获取的连接许可,流结束时 drop 释放
+    ///
+    /// 此字段无显式读取:仅靠 `StatsStream` 被丢弃时字段的隐式 `Drop` 释放许可
+    /// (RAII)。`ConnectionPermit::Drop` 归还全局 + per-host 信号量。
+    #[allow(dead_code)]
+    permit: Option<crate::connection::ConnectionPermit>,
 }
 
 impl StatsStream {
@@ -121,6 +170,7 @@ impl StatsStream {
         source_idx: usize,
         stats: Arc<std::sync::Mutex<Vec<SourceStats>>>,
         in_flight: Arc<std::sync::Mutex<Vec<usize>>>,
+        permit: Option<crate::connection::ConnectionPermit>,
     ) -> ByteStream {
         Box::pin(Self {
             inner,
@@ -132,6 +182,7 @@ impl StatsStream {
             start: Some(std::time::Instant::now()),
             bytes_seen: 0,
             finished: false,
+            permit,
         }) as ByteStream
     }
 
@@ -218,12 +269,37 @@ pub(crate) struct MirrorProtocol {
     /// 用 std::sync::Mutex 而非 tokio::sync::Mutex:StatsStream::poll_next 是同步的,
     /// 且 stats 更新极短(计数递增),不会阻塞 runtime。
     stats: Arc<std::sync::Mutex<Vec<SourceStats>>>,
+    /// 可选的连接许可池(P1:镜像路径按选中源真实 host acquire,而非主 URL host)
+    ///
+    /// 引擎层在镜像路径跳过 pool.acquire(主 host),由本协议适配器在选源后
+    /// 按真实命中镜像 URL 的 host 单独 acquire,使各镜像能各自占满自己的
+    /// per-host 配额(聚合多源带宽)。为 None 时(单源 / 测试)不 acquire,
+    /// 行为与旧行为一致。
+    pool: Option<Arc<ConnectionPool>>,
 }
 
 impl MirrorProtocol {
+    /// 构造多镜像源适配器(无连接池,测试 / 单源路径使用)
+    ///
+    /// 生产路径(`with_mirrors`/`with_hybrid_sources`)使用 `with_pool` 注入连接池;
+    /// 本构造器供测试(MockProtocol 无需 pool)与未来单源降级路径使用。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         primary: Arc<dyn Protocol>,
         mirrors: Vec<(String, Arc<dyn Protocol>)>,
+    ) -> Self {
+        Self::with_pool(primary, mirrors, None)
+    }
+
+    /// 构造多镜像源适配器并注入连接许可池
+    ///
+    /// `pool` 为 Some 时,适配器在选源后按真实命中镜像 URL 的 host 单独
+    /// acquire 连接许可(P1:使各镜像能各自占满自己的 per-host 配额),
+    /// 引擎层在镜像路径不再对主 URL host 重复 acquire。
+    pub(crate) fn with_pool(
+        primary: Arc<dyn Protocol>,
+        mirrors: Vec<(String, Arc<dyn Protocol>)>,
+        pool: Option<Arc<ConnectionPool>>,
     ) -> Self {
         let mut sources = vec![(String::new(), primary)];
         sources.extend(mirrors);
@@ -233,16 +309,37 @@ impl MirrorProtocol {
             probe_ok: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(std::sync::Mutex::new(vec![0; n])),
             stats: Arc::new(std::sync::Mutex::new(vec![SourceStats::default(); n])),
+            pool,
         }
     }
 
     /// 清除 probe 结果 + 重置选源状态(修复 BUG-B:不清 in_flight 导致失败源永久饿死)
+    ///
+    /// P3 遗忘机制:同时对 stats 做衰减(success/fail 各除以 2),避免瞬时故障
+    /// 镜像因 fail 永久累积被永久冷落。衰减保留趋势(质量排序大致不变)但弱化
+    /// 历史权重,使恢复中的镜像能重新被选中。total_bytes/duration 不衰减(它们
+    /// 反映真实带宽采样,非失败惩罚)。
     pub(crate) async fn clear_selected(&self) {
         *self.probe_ok.lock().await = HashSet::new();
         // 重置 in_flight:重试前所有源在途数归零(避免跨调用累积)
         if let Ok(mut inflight) = self.in_flight.lock() {
             for v in inflight.iter_mut() {
                 *v = 0;
+            }
+        }
+        // P3 衰减:success/fail 各除以 2(整数除法,保留趋势弱化历史)
+        // 遗忘机制避免瞬时故障永久污名化:某镜像曾连续失败数次,quality 持续
+        // 偏低,即使后续恢复也会因历史 fail 累积而难被选中。衰减后 fail 计数
+        // 减半,stability 回升,使恢复中的镜像能重新参与 least-in-flight 调度。
+        if let Ok(mut stats) = self.stats.lock() {
+            for s in stats.iter_mut() {
+                s.success /= 2;
+                s.fail /= 2;
+                // 软熔断恢复:重置连续失败计数,给半开探测机会。
+                // 与 engine 层 circuit_breaker 分工:此处仅 per-source 软熔断,
+                // clear_selected 是 MirrorProtocol 选源状态重置入口,熔断重置
+                // 与 stats 衰减配合,使坏源能被重新评估而非永久跳过。
+                s.reset_circuit();
             }
         }
     }
@@ -252,12 +349,19 @@ impl MirrorProtocol {
     /// 选源:in_flight / (quality + ε),质量高的源允许更多在途(快源多干)。
     /// 失败源惩罚性保留在途数(不递减),使后续选源优先选其他源。
     /// 遍历所有候选源直到成功或全失败(对调用方透明)。
-    /// 成功返回 (数据, 选中源 idx)(idx 供 stream 路径包 StatsStream 用)。
+    /// 成功返回 (数据, 选中源 idx, 连接许可)(idx 供 stream 路径包 StatsStream 用,
+    /// permit 供 stream 路径持有到流结束;Bytes 路径调用方立即 drop)。
+    ///
+    /// P1:`pool` 为 Some 时,选源后按真实命中镜像 URL 的 host 单独 acquire 连接许可,
+    /// 引擎层镜像路径不再对主 URL host 重复 acquire,使各镜像能各自占满自己的
+    /// per-host 配额(聚合多源带宽)。为 None 时不 acquire(单源 / 测试路径)。
+    #[allow(clippy::too_many_arguments)]
     async fn download_via_least_in_flight<T: Send + 'static>(
         sources: Vec<Source>,
         probe_ok: Arc<Mutex<HashSet<usize>>>,
         in_flight: Arc<std::sync::Mutex<Vec<usize>>>,
         stats: Arc<std::sync::Mutex<Vec<SourceStats>>>,
+        pool: Option<Arc<ConnectionPool>>,
         url: &str,
         download_fn: impl Fn(
             Arc<dyn Protocol>,
@@ -267,7 +371,7 @@ impl MirrorProtocol {
         + Send
         + 'static,
         error_label: &str,
-    ) -> DownloadResult<(T, usize)> {
+    ) -> DownloadResult<(T, usize, Option<crate::connection::ConnectionPermit>)> {
         // 候选源 index 列表:probe_ok 优先,全部源兜底
         // 修复 BUG-D:排序保证确定性 tie-break(HashSet 迭代顺序随机导致 flaky)
         // 修复 BUG-H 副作用:probe 首成功即返回时,后台 probe_ok 可能未补全,
@@ -290,22 +394,47 @@ impl MirrorProtocol {
         candidates.sort_unstable();
         candidates.dedup();
 
+        // 软熔断半开探测:若所有候选源均已连续失败达阈值(熔断),全部重置
+        // 连续失败计数,给一次恢复探测机会(不阻断下载)。与 engine 层
+        // circuit_breaker 分工:此处仅 per-source 软熔断,engine 层管全局。
+        {
+            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
+            let all_open =
+                !candidates.is_empty() && candidates.iter().all(|&i| s[i].is_circuit_open());
+            if all_open {
+                for &i in &candidates {
+                    s[i].reset_circuit();
+                }
+                tracing::info!(error_label, "所有候选源均已软熔断,执行半开探测重置");
+            }
+        }
+
         let mut last_err = None;
         // 遍历候选源,每次选加权最小的(in_flight 主导 + quality 辅助)
         for _ in 0..candidates.len() {
             let (idx, src_url, proto) = {
-                let mut inflight = in_flight.lock().unwrap();
-                // 快照各源 quality(std Mutex,持锁极短,不跨 await)
-                let qualities: Vec<f64> =
-                    stats.lock().unwrap().iter().map(|s| s.quality()).collect();
+                let mut inflight = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                // 快照各源 quality + 软熔断状态(std Mutex,持锁极短,不跨 await)
+                let (qualities, circuit_open): (Vec<f64>, Vec<bool>) = {
+                    let s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = sources.len();
+                    let mut q = Vec::with_capacity(n);
+                    let mut c = Vec::with_capacity(n);
+                    for st in s.iter() {
+                        q.push(st.quality());
+                        c.push(st.is_circuit_open());
+                    }
+                    (q, c)
+                };
                 // 加权(修复 BUG-A/C):加性公式 inflight*W1 + (1-quality)*W2
                 // inflight=0 时按 quality 排序(quality 高→(1-quality)小→优先);
                 // inflight>0 时在途数主导(负载均衡)。
                 // W1=10000(在途数权重高),W2=1000(质量权重)
+                // 软熔断:跳过 circuit_open 的源(半开重置已在前面处理 all-open)
                 let pick = candidates
                     .iter()
                     .copied()
-                    .filter(|&i| inflight[i] < usize::MAX)
+                    .filter(|&i| inflight[i] < usize::MAX && !circuit_open[i])
                     .min_by(|&a, &b| {
                         let sa = inflight[a] as f64 * 10000.0 + (1.0 - qualities[a]) * 1000.0;
                         let sb = inflight[b] as f64 * 10000.0 + (1.0 - qualities[b]) * 1000.0;
@@ -322,27 +451,71 @@ impl MirrorProtocol {
                 (pick, actual_url, sources[pick].1.clone())
             };
 
+            // P1:按真实命中镜像 URL 的 host acquire 连接许可(若注入了 pool)
+            // 引擎层镜像路径已跳过主 host 的 acquire,此处接管 per-host 限流,
+            // 使各镜像能各自占满自己的配额。host 解析失败时跳过(降级为不限流,
+            // 不阻断下载)。
+            let permit = if let Some(ref pool) = pool {
+                match Self::host_of(&src_url) {
+                    Some(host) => match pool.acquire(&host).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            // 许可获取失败(信号量关闭等),记 fail 并切换下一源
+                            let mut inflight = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                            if inflight[idx] > 0 {
+                                inflight[idx] -= 1;
+                            }
+                            tracing::info!(error = %e, source_idx = idx, error_label, "镜像源连接许可获取失败,切换下一源");
+                            stats.lock().unwrap_or_else(|e| e.into_inner())[idx].record_failure();
+                            last_err = Some(e);
+                            continue;
+                        }
+                    },
+                    // 修复 host_of-Low:畸形镜像 URL 无 host,静默降级会绕过 per-host 限流。
+                    // 此处 warn 一次(畸形 URL 罕见,刷屏风险低),降级为不 acquire,不阻断下载。
+                    None => {
+                        tracing::warn!(url = %src_url, source_idx = idx, "镜像 URL 无 host,跳过 per-host 限流(降级为不限流)");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             match download_fn(proto, src_url).await {
                 Ok(data) => {
                     // 不在此递减 in_flight(修复 BUG-A):
-                    // - Bytes 路径:调用方(download_range/download_full)拿 (data, idx) 后递减
-                    // - stream 路径:StatsStream 在流 EOF/Err/Drop 时递减
-                    return Ok((data, idx));
+                    // - Bytes 路径:调用方(download_range/download_full)拿 (data, idx) 后递减,
+                    //   并 drop permit(数据已就绪,连接许可可释放)
+                    // - stream 路径:StatsStream 在流 EOF/Err/Drop 时递减,并 drop permit
+                    return Ok((data, idx, permit));
                 }
                 Err(e) => {
                     // 失败:递减 in_flight(不累积,修复 BUG-B)+ 记 fail stats(降 quality)
-                    let mut inflight = in_flight.lock().unwrap();
+                    // permit 在此 drop(连接许可归还)
+                    drop(permit);
+                    let mut inflight = in_flight.lock().unwrap_or_else(|e| e.into_inner());
                     if inflight[idx] > 0 {
                         inflight[idx] -= 1;
                     }
                     tracing::info!(error = %e, source_idx = idx, error_label, "源下载失败,切换下一源");
-                    stats.lock().unwrap()[idx].record_failure();
+                    stats.lock().unwrap_or_else(|e| e.into_inner())[idx].record_failure();
                     last_err = Some(e);
                 }
             }
         }
         Err(last_err
             .unwrap_or_else(|| DownloadError::Protocol(format!("所有源均失败{error_label}"))))
+    }
+
+    /// 从 URL 提取 host(用于 P1 按真实镜像 host acquire 连接许可)
+    ///
+    /// 主源(index 0)的 src_url 复用上层传入的主 URL,此处统一解析。
+    /// 解析失败或无 host(如相对路径)返回 None,调用方降级为不限流。
+    fn host_of(url: &str) -> Option<String> {
+        url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(ToString::to_string))
     }
 }
 
@@ -448,23 +621,36 @@ impl Protocol for MirrorProtocol {
         let probe_ok = self.probe_ok.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
+        let pool = self.pool.clone();
         let url = url.to_string();
         Box::pin(async move {
-            let (data, idx) = Self::download_via_least_in_flight(
+            // 计时:覆盖 download_via_least_in_flight 全程(选源 + 下载),用于
+            // 记 success stats(派生 quality)与软熔断恢复(record_success 清零
+            // consecutive_failures)。Bytes 路径此前不记 stats,坏源即使成功也
+            // 永久熔断;此处补齐使软熔断在 Bytes 路径正确恢复。
+            let started = std::time::Instant::now();
+            let (data, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
                 in_flight.clone(),
-                stats,
+                stats.clone(),
+                pool,
                 &url,
                 move |proto, u| proto.download_range(&u, start, end),
                 "",
             )
             .await?;
             // Bytes 路径:data 已就绪,立即递减 in_flight(stream 路径由 StatsStream 递减)
+            // 并 drop permit(数据已就绪,连接许可可释放)
+            drop(permit);
             if let Ok(mut inflight) = in_flight.lock()
                 && inflight[idx] > 0
             {
                 inflight[idx] -= 1;
+            }
+            // 记 success:清零 consecutive_failures(解除软熔断)+ 累积 quality 采样
+            if let Ok(mut s) = stats.lock() {
+                s[idx].record_success(data.len() as u64, started.elapsed().as_nanos());
             }
             Ok(data)
         })
@@ -481,20 +667,23 @@ impl Protocol for MirrorProtocol {
         let probe_ok = self.probe_ok.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
+        let pool = self.pool.clone();
         let url = url.to_string();
         Box::pin(async move {
-            let (stream, idx) = Self::download_via_least_in_flight(
+            let (stream, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
                 in_flight.clone(),
                 stats.clone(),
+                pool,
                 &url,
                 move |proto, u| proto.download_range_stream(&u, start, end),
                 "(流式)",
             )
             .await?;
             // 包 StatsStream:流 EOF/Err/Drop 时递减 in_flight + 记 stats(修复 BUG-A)
-            Ok(StatsStream::wrap(stream, idx, stats, in_flight))
+            // + drop permit(P1:连接许可随流生命周期释放)
+            Ok(StatsStream::wrap(stream, idx, stats, in_flight, permit))
         })
     }
 
@@ -506,23 +695,34 @@ impl Protocol for MirrorProtocol {
         let probe_ok = self.probe_ok.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
+        let pool = self.pool.clone();
         let url = url.to_string();
         Box::pin(async move {
-            let (data, idx) = Self::download_via_least_in_flight(
+            // 计时:覆盖 download_via_least_in_flight 全程,记 success stats
+            // (派生 quality + 清零 consecutive_failures 解除软熔断)。
+            // Bytes 路径此前不记 stats,补齐使软熔断正确恢复。
+            let started = std::time::Instant::now();
+            let (data, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
                 in_flight.clone(),
-                stats,
+                stats.clone(),
+                pool,
                 &url,
                 move |proto, u| proto.download_full(&u),
                 "(全量)",
             )
             .await?;
-            // Bytes 路径:立即递减 in_flight
+            // Bytes 路径:立即递减 in_flight + drop permit
+            drop(permit);
             if let Ok(mut inflight) = in_flight.lock()
                 && inflight[idx] > 0
             {
                 inflight[idx] -= 1;
+            }
+            // 记 success:清零 consecutive_failures(解除软熔断)+ 累积 quality 采样
+            if let Ok(mut s) = stats.lock() {
+                s[idx].record_success(data.len() as u64, started.elapsed().as_nanos());
             }
             Ok(data)
         })
@@ -539,19 +739,21 @@ impl Protocol for MirrorProtocol {
         let probe_ok = self.probe_ok.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
+        let pool = self.pool.clone();
         let url = url.to_string();
         Box::pin(async move {
-            let (stream, idx) = Self::download_via_least_in_flight(
+            let (stream, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
                 in_flight.clone(),
                 stats.clone(),
+                pool,
                 &url,
                 move |proto, u| proto.download_full_stream(&u),
                 "(全量流式)",
             )
             .await?;
-            Ok(StatsStream::wrap(stream, idx, stats, in_flight))
+            Ok(StatsStream::wrap(stream, idx, stats, in_flight, permit))
         })
     }
 }
@@ -582,6 +784,9 @@ mod tests {
         download_delay: Duration,
         /// 被选计数器(共享,记录该源被调 download_* 的次数,验证 least-in-flight 分配)
         select_counter: Arc<std::sync::atomic::AtomicUsize>,
+        /// 若为 true,download_range_stream 返回一个永不产出的 pending 流
+        /// (用于测试流 abort 时 permit RAII 释放)
+        pending_stream: bool,
     }
 
     impl MockProtocol {
@@ -601,6 +806,7 @@ mod tests {
                 expected_url: None,
                 download_delay: Duration::ZERO,
                 select_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                pending_stream: false,
             }
         }
 
@@ -629,6 +835,12 @@ mod tests {
             self.download_delay = delay;
             self
         }
+
+        /// 使 download_range_stream 返回永不产出的 pending 流(测试流 abort 释放 permit)
+        fn with_pending_stream(mut self) -> Self {
+            self.pending_stream = true;
+            self
+        }
     }
 
     impl Protocol for MockProtocol {
@@ -655,7 +867,9 @@ mod tests {
             let result = self.download_data.clone();
             let expected = self.expected_url.clone();
             let url = url.to_string();
+            let counter = self.select_counter.clone();
             Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(exp) = expected
                     && exp != url
                 {
@@ -676,8 +890,14 @@ mod tests {
             let result = self.download_data.clone();
             let delay = self.download_delay;
             let counter = self.select_counter.clone();
+            let pending = self.pending_stream;
             Box::pin(async move {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // pending 流:永不产出(测试流 abort 时 permit RAII 释放)
+                if pending {
+                    let stream = futures::stream::pending();
+                    return Ok(Box::pin(stream) as ByteStream);
+                }
                 let data = result.map_err(DownloadError::Protocol)?;
                 // delay 放到首 chunk 内(模拟传输耗时,StatsStream 能测到 duration)
                 let stream = futures::stream::once(async move {
@@ -697,7 +917,9 @@ mod tests {
             let result = self.download_data.clone();
             let expected = self.expected_url.clone();
             let url = url.to_string();
+            let counter = self.select_counter.clone();
             Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(exp) = expected
                     && exp != url
                 {
@@ -1248,5 +1470,382 @@ mod tests {
             overhead < std::time::Duration::from_millis(1),
             "选源锁开销 {overhead:?} 超过 1ms,可能存在锁竞争恶化"
         );
+    }
+
+    // ===== P3 衰减测试:clear_selected 遗忘历史 stats =====
+
+    /// P3:clear_selected 应对 stats 做 success/fail 衰减(各除以 2),
+    /// 避免瞬时故障镜像因 fail 永久累积被永久冷落。
+    ///
+    /// 构造一个 stats 中 success=10/fail=10 的 MirrorProtocol(直接写内部 stats),
+    /// 调 clear_selected 后断言 success=5/fail=5(整数除法衰减保留趋势但弱化历史)。
+    /// total_bytes/total_duration_ns 不衰减(反映真实带宽采样,非失败惩罚)。
+    #[tokio::test]
+    async fn test_p3_clear_selected_decays_stats() {
+        let primary = Arc::new(MockProtocol::new());
+        let mp = MirrorProtocol::new(primary, vec![]);
+
+        // 直接写内部 stats,构造"曾连续失败 10 次 + 成功 10 次"的历史
+        {
+            let mut stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats[0].success = 10;
+            stats[0].fail = 10;
+            stats[0].total_bytes = 4096;
+            stats[0].total_duration_ns = 1_000_000_000;
+        }
+
+        mp.clear_selected().await;
+
+        let stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            stats[0].success, 5,
+            "P3: clear_selected 应将 success 衰减为 10/2=5"
+        );
+        assert_eq!(
+            stats[0].fail, 5,
+            "P3: clear_selected 应将 fail 衰减为 10/2=5"
+        );
+        // 带宽采样不衰减
+        assert_eq!(stats[0].total_bytes, 4096, "total_bytes 不应衰减");
+        assert_eq!(
+            stats[0].total_duration_ns, 1_000_000_000,
+            "total_duration_ns 不应衰减"
+        );
+    }
+
+    /// P3 衰减的幂等性:连续多次 clear_selected 多次衰减(success/fail 反复减半)。
+    /// 验证衰减不会下溢到 panic(usize 减法),且最终趋近 0。
+    #[tokio::test]
+    async fn test_p3_clear_selected_decay_idempotent_no_underflow() {
+        let primary = Arc::new(MockProtocol::new());
+        let mp = MirrorProtocol::new(primary, vec![]);
+
+        {
+            let mut stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats[0].success = 3;
+            stats[0].fail = 1; // 奇数,验证整数除法不向下溢出
+        }
+
+        // 连续衰减 3 次:3→1→0→0, 1→0→0→0
+        mp.clear_selected().await;
+        {
+            let stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats[0].success, 1, "第一次衰减: 3/2=1");
+            assert_eq!(stats[0].fail, 0, "第一次衰减: 1/2=0");
+        }
+        mp.clear_selected().await;
+        {
+            let stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats[0].success, 0, "第二次衰减: 1/2=0");
+            assert_eq!(stats[0].fail, 0, "第二次衰减: 0/2=0(不溢出)");
+        }
+        mp.clear_selected().await;
+        {
+            let stats = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats[0].success, 0, "第三次衰减: 0/2=0(稳定)");
+            assert_eq!(stats[0].fail, 0, "第三次衰减: 0/2=0(稳定)");
+        }
+    }
+
+    // ===== host_of 降级测试(修复 host_of-Low:畸形镜像 URL 静默绕过 per-host 限流)=====
+
+    /// host_of 对畸形 URL(无 host)应返回 None 且不 panic。
+    #[test]
+    fn test_host_of_malformed_url_returns_none() {
+        // 相对路径无 scheme/host
+        assert_eq!(MirrorProtocol::host_of("not-a-url"), None);
+        // 无 host 的 scheme
+        assert_eq!(MirrorProtocol::host_of("file:///path/to/file"), None);
+        // 空串
+        assert_eq!(MirrorProtocol::host_of(""), None);
+        // 仅 scheme
+        assert_eq!(MirrorProtocol::host_of("http://"), None);
+    }
+
+    /// host_of 对正常 URL 应返回 host。
+    #[test]
+    fn test_host_of_normal_url_returns_host() {
+        assert_eq!(
+            MirrorProtocol::host_of("http://mirror.example.com/file"),
+            Some("mirror.example.com".to_string())
+        );
+        assert_eq!(
+            MirrorProtocol::host_of("https://cdn.example.org:8080/path"),
+            Some("cdn.example.org".to_string())
+        );
+    }
+
+    /// host_of 降级路径:畸形镜像 URL(pool 注入时)应不阻断下载,降级为不 acquire。
+    ///
+    /// 构造 mirror URL 为相对路径(无 host),pool 为 max_per_host=1 的真实池。
+    /// download_range 应成功(降级不阻断),且 pool active_connections 仍为 0
+    /// (因 host_of 返回 None 未 acquire)。此测试验证降级行为不 panic 且不
+    /// 绕过限流(此处"绕过"指畸形 URL 不 acquire,符合预期降级)。
+    #[tokio::test]
+    async fn test_host_of_none_degrades_without_acquire() {
+        use crate::connection::{ConnectionPool, PoolConfig};
+
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 10,
+            ..Default::default()
+        }));
+        let primary =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"degraded"))));
+        // 镜像 URL 为畸形(无 host),host_of 返回 None → 不 acquire
+        let mp = MirrorProtocol::with_pool(
+            primary,
+            vec![("not-a-url".into(), Arc::new(MockProtocol::new()))],
+            Some(pool.clone()),
+        );
+
+        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        assert!(result.is_ok(), "畸形镜像 URL 不应阻断下载(降级)");
+        assert_eq!(
+            pool.active_connections(),
+            0,
+            "畸形 URL 未 acquire,active 应为 0"
+        );
+    }
+
+    // ===== P1: permit RAII 生命周期测试(修复 P1-测试缺口)=====
+
+    /// P1:per-host acquire 互斥。构造 max_per_host=1 的池 + 2 个同 host 镜像,
+    /// 并发调 download_range_stream,第二个应因 per-host 信号量满而排队(不立即获得)。
+    ///
+    /// 用 pending 流(永不产出)使首个下载长期占用 permit,验证第二个下载在
+    /// 短超时内无法获得 permit(被 per-host 限流阻塞)。
+    #[tokio::test]
+    async fn test_p1_per_host_acquire_mutex() {
+        use crate::connection::{ConnectionPool, PoolConfig};
+
+        // max_per_host=1:同 host 只能有一个活跃 permit
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 10,
+            enable_http2: false, // 避免默认值自动提升 max_per_host
+            ..Default::default()
+        }));
+        // 两个同 host 镜像(http://same.host/...),pending 流永不产出(占住 permit)
+        let primary = Arc::new(MockProtocol::new().with_pending_stream());
+        let mirror = Arc::new(MockProtocol::new().with_pending_stream());
+        let mp = Arc::new(MirrorProtocol::with_pool(
+            primary,
+            vec![("http://same.host/file".into(), mirror)],
+            Some(pool.clone()),
+        ));
+
+        // 首个下载:拿到 permit,pending 流占住(永不释放,直到 drop)
+        let first = mp
+            .download_range_stream("http://same.host/file", 0, 99)
+            .await;
+        assert!(first.is_ok(), "首个下载应成功获取 permit");
+        assert_eq!(
+            pool.active_connections(),
+            1,
+            "首个下载应占住 1 个 per-host permit"
+        );
+
+        // 第二个下载:同 host,per-host 信号量已满(max_per_host=1),应排队阻塞。
+        // 用短超时验证它不立即获得 permit。
+        let mp2 = Arc::clone(&mp);
+        let second = tokio::time::timeout(
+            Duration::from_millis(50),
+            mp2.download_range_stream("http://same.host/file", 100, 199),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "同 host 第二个下载应被 per-host 限流阻塞,不应在 50ms 内获得 permit"
+        );
+        // 首个流 drop 前仍占住 permit
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    /// P1:permit 释放。Bytes 路径(download_full)完成后,permit 应立即释放,
+    /// pool active_connections 归零。
+    #[tokio::test]
+    async fn test_p1_permit_released_after_bytes_download() {
+        use crate::connection::{ConnectionPool, PoolConfig};
+
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 2,
+            max_global: 10,
+            enable_http2: false,
+            ..Default::default()
+        }));
+        let primary =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"done"))));
+        let mp = MirrorProtocol::with_pool(primary, vec![], Some(pool.clone()));
+
+        assert_eq!(pool.active_connections(), 0, "下载前 active 应为 0");
+        let result = mp.download_full("http://example.com/file").await;
+        assert!(result.is_ok(), "下载应成功");
+        assert_eq!(
+            pool.active_connections(),
+            0,
+            "Bytes 路径完成后 permit 应释放,active 归零"
+        );
+    }
+
+    /// P1:流 abort 释放 permit。构造 pending 流(永不产出),拿到 StatsStream 后
+    /// 立即 drop,验证 permit 通过 RAII 释放(active_connections 归零)。
+    #[tokio::test]
+    async fn test_p1_permit_released_on_stream_abort() {
+        use crate::connection::{ConnectionPool, PoolConfig};
+
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 2,
+            max_global: 10,
+            enable_http2: false,
+            ..Default::default()
+        }));
+        // pending 流:永不产出,模拟挂起的下载(占住 permit 直到流被 drop)
+        let primary = Arc::new(MockProtocol::new().with_pending_stream());
+        let mp = MirrorProtocol::with_pool(primary, vec![], Some(pool.clone()));
+
+        // 拿到流:permit 被 StatsStream 持有,active=1
+        let stream = mp
+            .download_range_stream("http://example.com/file", 0, 99)
+            .await
+            .expect("流创建应成功");
+        assert_eq!(pool.active_connections(), 1, "流存在时应持有 1 个 permit");
+
+        // drop 流:StatsStream Drop 触发 permit Drop,active 归零
+        drop(stream);
+        assert_eq!(
+            pool.active_connections(),
+            0,
+            "流 abort(drop)后 permit 应通过 RAII 释放,active 归零"
+        );
+    }
+
+    // ===== 软熔断测试(修复 软熔断-Medium:坏源无快速失败)=====
+
+    /// 软熔断:连续失败达阈值(5)的源,选源时应被跳过(不被 min_by 选中)。
+    ///
+    /// 构造两源(primary=fail 5 次已熔断,mirror=健康),download 应跳过 primary
+    /// 直接选 mirror。用 select_counter 验证 primary 被跳过(计数为 0)。
+    #[tokio::test]
+    async fn test_soft_circuit_breaker_skips_open_source() {
+        let primary =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"primary"))));
+        let mirror =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"mirror"))));
+        let primary_counter = primary.select_counter.clone();
+        let mirror_counter = mirror.select_counter.clone();
+
+        let mp = MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+        // 手动将 primary(index 0)置为软熔断(连续失败 5 次)
+        {
+            let mut s = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s[0].consecutive_failures = super::SOFT_CIRCUIT_BREAKER_THRESHOLD;
+        }
+
+        // download:primary 已熔断应被跳过,选 mirror
+        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        assert!(result.is_ok(), "应跳过熔断源选 mirror 成功");
+        assert_eq!(
+            result.unwrap(),
+            Bytes::from_static(b"mirror"),
+            "应选中 mirror(primary 被熔断跳过)"
+        );
+        assert_eq!(
+            primary_counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "熔断源 primary 不应被选中"
+        );
+        assert_eq!(
+            mirror_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "健康源 mirror 应被选中"
+        );
+    }
+
+    /// 软熔断半开探测:所有候选源都已熔断时,应全部重置,给一次恢复探测机会
+    /// (不阻断下载)。
+    ///
+    /// 构造两源都熔断(连续失败 5 次),download 应触发半开重置,任一源成功后
+    /// 通过 record_success 清零 consecutive_failures。验证下载成功且熔断状态解除。
+    #[tokio::test]
+    async fn test_soft_circuit_breaker_half_open_when_all_open() {
+        let primary =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"primary"))));
+        let mirror =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"mirror"))));
+
+        let mp = MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+        // 两源都熔断
+        {
+            let mut s = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s[0].consecutive_failures = super::SOFT_CIRCUIT_BREAKER_THRESHOLD;
+            s[1].consecutive_failures = super::SOFT_CIRCUIT_BREAKER_THRESHOLD;
+        }
+
+        // download:全熔断应半开重置,不阻断
+        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        assert!(result.is_ok(), "全熔断时应半开重置,不阻断下载");
+
+        // 成功后(record_success)选中源的 consecutive_failures 应清零
+        let s = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !s[0].is_circuit_open() || !s[1].is_circuit_open(),
+            "至少一个源的熔断状态应因成功而解除"
+        );
+    }
+
+    /// 软熔断恢复:clear_selected 应重置所有源的软熔断状态(给恢复机会)。
+    ///
+    /// 构造一源熔断,clear_selected 后断言 consecutive_failures=0(可重新被选)。
+    #[tokio::test]
+    async fn test_soft_circuit_breaker_reset_on_clear_selected() {
+        let primary = Arc::new(MockProtocol::new());
+        let mp = MirrorProtocol::new(primary, vec![]);
+        {
+            let mut s = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s[0].consecutive_failures = super::SOFT_CIRCUIT_BREAKER_THRESHOLD;
+            assert!(s[0].is_circuit_open(), "构造前置为熔断态");
+        }
+
+        mp.clear_selected().await;
+
+        let s = mp.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s[0].consecutive_failures, 0,
+            "clear_selected 应重置软熔断状态"
+        );
+        assert!(!s[0].is_circuit_open(), "重置后应不再熔断");
+    }
+
+    /// 软熔断生命周期:record_failure 递增连续失败,达阈值熔断;record_success
+    /// 清零解除。验证 SourceStats 的熔断状态转换。
+    #[test]
+    fn test_soft_circuit_breaker_lifecycle() {
+        let mut s = super::SourceStats::default();
+        assert!(!s.is_circuit_open(), "初始未熔断");
+
+        // 连续失败 4 次:未达阈值(5),未熔断
+        for _ in 0..4 {
+            s.record_failure();
+        }
+        assert!(!s.is_circuit_open(), "4 次失败未达阈值,未熔断");
+
+        // 第 5 次失败:达阈值,熔断
+        s.record_failure();
+        assert!(s.is_circuit_open(), "5 次连续失败应熔断");
+
+        // 一次成功:清零,解除熔断
+        s.record_success(100, 1_000_000);
+        assert!(!s.is_circuit_open(), "成功应清零连续失败,解除熔断");
+
+        // 再次连续失败 5 次重新熔断(验证可重复)
+        for _ in 0..5 {
+            s.record_failure();
+        }
+        assert!(s.is_circuit_open(), "再次 5 次失败应重新熔断");
+
+        // reset_circuit 手动重置
+        s.reset_circuit();
+        assert!(!s.is_circuit_open(), "reset_circuit 应解除熔断");
     }
 }

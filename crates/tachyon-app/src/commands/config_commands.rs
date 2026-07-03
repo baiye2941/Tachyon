@@ -62,6 +62,12 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     // 检查 magnet 配置是否有变更,必须在 drop(cfg) 前完成比较
     let magnet_changed = updated.magnet != cfg.magnet;
     let magnet_config = updated.magnet.clone();
+    // 检查连接配置是否有变更,必须在 *cfg = updated 前完成比较。
+    // ConnectionConfig / PoolConfig 未派生 PartialEq,逐字段比较(均在 allowed 5 文件外,
+    // 不在此修改)以避免改动 tachyon-core / tachyon-engine。
+    let old_connection = cfg.connection.clone();
+    let new_connection = updated.connection.clone();
+    let connection_changed = !connection_eq(&old_connection, &new_connection);
     *cfg = updated;
     // 将配置变更持久化到磁盘,避免重启后丢失
     let config_to_save = cfg.clone();
@@ -101,7 +107,35 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
         }
     }
 
+    // 连接池热重建:连接配置变更时重建 ConnectionPool。
+    // ConnectionPool 内部信号量容量不可变(std 信号量),原地 reconfigure 不可行,
+    // 故采用「外层句柄热替换」:写锁内用新配置构造新 pool 替换内层 Arc<ConnectionPool>。
+    // 运行中任务持有的旧 pool Arc clone 自然存活至引用归零,新任务拿到新 pool。
+    if connection_changed {
+        use tachyon_engine::connection::{ConnectionPool, PoolConfig};
+        let new_pool = Arc::new(ConnectionPool::new(PoolConfig::from(new_connection)));
+        let mut pool_guard = state.infra.connection_pool.write().await;
+        *pool_guard = new_pool;
+        tracing::info!("ConnectionPool 已热重建(连接配置变更)");
+    }
+
     Ok(())
+}
+
+/// 连接配置逐字段相等性比较。
+///
+/// `ConnectionConfig` / `PoolConfig` 未派生 `PartialEq`,
+/// 在不改动 tachyon-core / tachyon-engine 的前提下用字段比较替代。
+fn connection_eq(
+    a: &tachyon_core::config::ConnectionConfig,
+    b: &tachyon_core::config::ConnectionConfig,
+) -> bool {
+    a.max_connections_per_host == b.max_connections_per_host
+        && a.max_global_connections == b.max_global_connections
+        && a.keep_alive_timeout_secs == b.keep_alive_timeout_secs
+        && a.connect_timeout_secs == b.connect_timeout_secs
+        && a.enable_http2 == b.enable_http2
+        && a.enable_quic == b.enable_quic
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use tachyon_core::config::AppConfig;
 use tachyon_engine::connection::ConnectionPool;
@@ -34,7 +34,17 @@ pub struct DomainState {
 /// 基础设施状态：连接、存储、I/O 池
 #[derive(Clone)]
 pub struct InfraState {
-    pub connection_pool: Arc<ConnectionPool>,
+    /// 全局连接池(热替换句柄)
+    ///
+    /// 外层 `Arc<RwLock<...>>` 用于在 `update_config` 时热重建:
+    /// - 写路径(update_config):写锁内替换内层 `Arc<ConnectionPool>`,
+    ///   重建出携带新配置的新 pool;
+    /// - 读路径(task_fn 启动 / supervisor.start_download):读锁内 clone
+    ///   出当前 `Arc<ConnectionPool>` 传入任务。
+    ///
+    /// 运行中的任务持有旧 pool 的 Arc clone,旧 pool 自然存活至最后一个引用释放,
+    /// 新任务拿到新 pool,实现配置变更对运行中任务零干扰、对新任务即时生效。
+    pub connection_pool: Arc<RwLock<Arc<ConnectionPool>>>,
     pub task_store: Arc<TaskStore>,
     /// 收藏 KV 存储（独立目录，与任务存储分离）
     pub favorites_store: Arc<tachyon_store::KvStore>,

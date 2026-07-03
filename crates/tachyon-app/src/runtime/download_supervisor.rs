@@ -20,19 +20,24 @@ use crate::commands::task_commands::task_fn;
 /// 管理：
 /// - `handles`: 每个下载任务的 Tokio JoinHandle
 /// - `controls`: 每个下载任务的控制命令通道（TaskCommand）
-/// - `connection_pool`: 全局连接池
+/// - `connection_pool`: 全局连接池热替换句柄
+///
+/// 持有 `Arc<RwLock<Arc<ConnectionPool>>>` 而非直接的 `Arc<ConnectionPool>`:
+/// `start_download` 在创建新任务时读锁内 clone 出当前 `Arc<ConnectionPool>`
+/// 传给 task_fn。`update_config` 热重建时在写锁内替换内层 Arc,
+/// 已启动任务持有的旧 pool 不受影响,新任务拿到新 pool。
 pub struct DownloadSupervisor {
     /// 下载任务 JoinHandle
     pub(crate) handles: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     /// 控制命令通道（TaskCommand，而非 DownloadState）
     pub(crate) command_channels: Arc<DashMap<String, watch::Sender<TaskCommand>>>,
-    /// 全局连接池
-    pub(crate) connection_pool: Arc<ConnectionPool>,
+    /// 全局连接池热替换句柄
+    pub(crate) connection_pool: Arc<tokio::sync::RwLock<Arc<ConnectionPool>>>,
 }
 
 impl DownloadSupervisor {
     /// 创建新的 DownloadSupervisor
-    pub fn new(connection_pool: Arc<ConnectionPool>) -> Self {
+    pub fn new(connection_pool: Arc<tokio::sync::RwLock<Arc<ConnectionPool>>>) -> Self {
         Self {
             handles: Arc::new(DashMap::new()),
             command_channels: Arc::new(DashMap::new()),
@@ -61,7 +66,7 @@ impl DownloadSupervisor {
         self.command_channels
             .insert(task_id.to_string(), control_tx);
 
-        let pool_clone = self.connection_pool.clone();
+        let pool_handle = self.connection_pool.clone();
         // 切片2:从 AppState.infra 取全局 BufferPool 经 task_fn 注入到 DownloadTask,
         // 使 worker 用池化 buffer 写入磁盘(反压 + 内存有界)。
         let buffer_pool_clone = state.infra.buffer_pool.clone();
@@ -70,6 +75,9 @@ impl DownloadSupervisor {
 
         let handle = tokio::spawn(async move {
             let _ = start_rx.await;
+            // 读锁内 clone 出当前 Arc<ConnectionPool>:
+            // 取的是任务启动时刻的 pool 快照,后续热重建不影响本任务。
+            let pool_clone = pool_handle.read().await.clone();
             task_fn(
                 state,
                 tid,
@@ -108,6 +116,16 @@ impl DownloadSupervisor {
         } else {
             false
         }
+    }
+
+    /// 检测任务是否有运行中的 task_fn(存在 control channel)
+    ///
+    /// 用于 `resume_task_inner` 区分两种恢复场景:
+    /// - 有 channel:task_fn 仍在运行(被 Paused),直接 `send_command(Resume)` 即可。
+    /// - 无 channel:task_fn 已退出(应用启动恢复的任务),需重新 `start_download` 激活,
+    ///   否则 `send_command` 静默返回 false,Resume 信号丢失。
+    pub fn has_running_task(&self, task_id: &str) -> bool {
+        self.command_channels.contains_key(task_id)
     }
 
     /// 清理运行时资源

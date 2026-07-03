@@ -50,8 +50,8 @@ graph TB
     end
 
     subgraph INFRA["基础设施层"]
-        PROTO["tachyon-protocol<br/>HTTP/HTTPS · QUIC · FTP · BitTorrent Magnet"]
-        IO["tachyon-io<br/>io_uring · IOCP · BufferPool · WritePipeline"]
+        PROTO["tachyon-protocol<br/>HTTP/HTTPS · QUIC · BitTorrent Magnet"]
+        IO["tachyon-io<br/>io_uring · IOCP · BufferPool · 直接 async write"]
         CRYPT["tachyon-crypto<br/>BLAKE3 · SHA-256 · GPU 预留"]
         STORE["tachyon-store<br/>KV 存储 · 快照恢复"]
         HUB["tachyon-hub<br/>HuggingFace Hub API"]
@@ -97,8 +97,8 @@ graph TB
 | `tachyon-core` | 所有 crate 共享的公共接口：类型、trait 抽象、错误体系、配置与安全校验 | `src/{config,error,traits,types,safety,utils}.rs` |
 | `tachyon-engine` | 分片引擎、连接池、多源竞速、限速器、下载任务编排 | `src/{downloader,connection,fragment,mirror,circuit_breaker,rate_limit,storage_adapter}.rs` |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 | `src/{scheduler,predictor,download_scheduler}.rs` |
-| `tachyon-io` | 跨平台异步文件 I/O，多后端自动选择 | `src/{iouring,iocp,winio,tokio_file,buffer,pipeline,storage}.rs` |
-| `tachyon-protocol` | HTTP/HTTPS/QUIC/FTP/BitTorrent Magnet 协议统一抽象 | `src/{http,quic,ftp,magnet}.rs` |
+| `tachyon-io` | 跨平台异步文件 I/O，多后端自动选择 | `src/{iouring,iocp,winio,tokio_file,buffer,storage}.rs` |
+| `tachyon-protocol` | HTTP/HTTPS/QUIC/BitTorrent Magnet 协议统一抽象 | `src/{http,magnet}.rs` |
 | `tachyon-crypto` | CPU 哈希校验 + GPU 加速预留 | `src/{cpu,gpu}.rs` |
 | `tachyon-sniffer` | 浏览器资源类型识别与过滤捕获 | `src/{capture,filter,resources}.rs` |
 | `tachyon-store` | 断点续传快照持久化，基于文件系统 KV | `src/{kv,recovery,store}.rs` |
@@ -145,9 +145,7 @@ graph LR
 | 依赖 | 用途 |
 |------|------|
 | tokio | 异步运行时，多线程调度 |
-| reqwest (rustls, stream, json, http2) | HTTP 客户端，HTTP/2 支持 |
-| quinn + rustls + h3 + h3-quinn | QUIC / HTTP/3 传输 |
-| suppaftp | FTP 客户端 |
+| reqwest (rustls, stream, json, http2, 可选 http3) | HTTP 客户端，HTTP/2 支持；启用 `http3` feature 后经 Alt-Svc 协商升级 HTTP/3 |
 | librqbit | BitTorrent 磁力链接下载 |
 | blake3 / sha2 | 高性能哈希 |
 | serde + serde_json + postcard | 序列化/反序列化 |
@@ -244,21 +242,18 @@ rate_limiter, metrics, circuit_breakers
 | `WinFile` | Windows | NO_BUFFERING + SEQUENTIAL_SCAN 优化 |
 | `TokioFile` | 全平台 | tokio::fs 标准异步 I/O（回退） |
 
-**缓冲与管线**：
+**缓冲管理**：
 
 | 组件 | 说明 |
 |------|------|
 | `BufferPool` | 64KB buffer 池，`Semaphore` 反压，`BufferGuard` RAII 自动归还 |
-| `WritePipeline` | `Semaphore` 反压写入管线，256KB 批量合并，按实际 I/O 数精确消耗信号量 |
 | `AsyncStorage` | 统一 Storage trait 实现，封装平台差异 |
 
 ### 4.5 tachyon-protocol — 协议层
 
 | 实现 | 依赖 | Feature Gate |
 |------|------|--------------|
-| `HttpClient` | reqwest（rustls + HTTP/2） | 始终启用 |
-| `QuicTransport` | quinn + rustls + h3 + h3-quinn | `quic` |
-| `FtpClient` | suppaftp | `ftp` |
+| `HttpClient` | reqwest（rustls + HTTP/2，可选 HTTP/3） | 始终启用；HTTP/3 需 `http3` feature |
 | `MagnetProtocol` | librqbit | `magnet` |
 
 所有实现均支持 `download_range_stream()` 流式下载，逐块产出数据。
@@ -386,7 +381,7 @@ sequenceDiagram
     participant DT as DownloadTask (engine)
     participant SCH as AdaptiveScheduler
     participant PROTO as Protocol (HttpClient)
-    participant IO as tachyon-io (WritePipeline)
+    participant IO as tachyon-io (BufferPool + 直接 async write)
     participant VERIFY as tachyon-crypto
     participant STORE as tachyon-store
 
@@ -456,8 +451,7 @@ sequenceDiagram
 flowchart LR
     subgraph NET["网络层"]
         HTTP["HTTP/HTTPS<br/>reqwest + rustls + HTTP/2"]
-        QUIC["QUIC / HTTP3<br/>quinn + rustls + h3"]
-        FTP["FTP<br/>suppaftp"]
+        QUIC["HTTP/3 over QUIC<br/>reqwest http3 feature"]
         BT["BitTorrent Magnet<br/>librqbit"]
     end
 
@@ -469,7 +463,6 @@ flowchart LR
 
     subgraph BUF["缓冲层"]
         POOL["BufferPool<br/>Semaphore 反压<br/>64KB buffer 复用"]
-        PIPE["WritePipeline<br/>256KB批量合并写入"]
     end
 
     subgraph DISK["存储层"]
@@ -490,15 +483,13 @@ flowchart LR
 
     HTTP --> SSRF
     QUIC --> SSRF
-    FTP --> SSRF
     BT --> SSRF
     SSRF --> REDIR
     REDIR --> RANGE
     RANGE --> POOL
-    POOL --> PIPE
-    PIPE --> IOCP
-    PIPE --> IOURING
-    PIPE --> TOKIO
+    POOL --> IOCP
+    POOL --> IOURING
+    POOL --> TOKIO
     RANGE --> VERIFY
     VERIFY --> BLAKE3
     VERIFY --> SHA256
@@ -572,18 +563,13 @@ stateDiagram-v2
 - `BufferGuard` RAII 自动归还，避免泄漏。
 - 许可耗尽时 `alloc()` 阻塞，形成背压。
 
-### 7.5 WritePipeline
-
-- 256KB 批量合并写入，减少小 I/O 次数。
-- `Semaphore` 按实际 I/O 数精确消耗许可，磁盘慢时自动反压网络层。
-
-### 7.6 HoltLinearPredictor
+### 7.5 HoltLinearPredictor
 
 - 双指数平滑（alpha=0.3，beta=0.1）。
 - Level 分量跟踪当前带宽，Trend 分量捕捉趋势。
 - 自动过滤 NaN / Inf / 负值。
 
-### 7.7 Verifier
+### 7.6 Verifier
 
 - CPU 路径支持 BLAKE3 与 SHA-256。
 - 流式增量哈希，边下载边计算。
@@ -597,7 +583,7 @@ stateDiagram-v2
 
 - tokio multi-thread runtime，充分利用多核。
 - `JoinSet` 并发分片，失败隔离。
-- `Semaphore` 门控连接、buffer、写入管线。
+- `Semaphore` 门控连接、buffer 数量。
 - `watch` 通道控制暂停/恢复/取消，开销极低。
 - `ChunkReaderPool` 固定 worker 数，避免 task 数量随任务数线性增长。
 
@@ -605,7 +591,7 @@ stateDiagram-v2
 
 - **Linux io_uring**：O_DIRECT 绕过页缓存，fixed buffer 避免每 I/O 分配，SQE/CQE 批量提交。
 - **Windows IOCP**：无锁完成端口 + NO_BUFFERING 写入，OVERLAPPED 对象池复用。
-- **WritePipeline**：256KB 批量合并写入，精确背压。
+- **直接 async write**：下载主路径经 `BufferPool` 池化后直接 `storage.write_at`，反压由 buffer 许可承担。
 
 ### 8.3 调度与预测
 
@@ -702,7 +688,7 @@ Tachyon/
 │   ├── ITERATION/              # 迭代报告
 │   ├── superpowers/            # 计划与规格
 │   └── ...
-├── crates/                     # Rust workspace 11 crate
+├── crates/                     # Rust workspace 10 crate
 │   ├── tachyon-core/
 │   ├── tachyon-engine/
 │   ├── tachyon-scheduler/

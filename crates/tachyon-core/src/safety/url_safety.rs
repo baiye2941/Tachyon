@@ -396,8 +396,18 @@ mod tests {
 
     #[test]
     fn validate_resolved_ip_rejects_empty_host() {
-        let url = Url::parse("https://example.com/file.bin").unwrap();
-        let _ = validate_resolved_ip(&url);
+        // data: scheme 属 cannot-be-a-base URL,host_str() 返回 None(url crate doctest 已证实),
+        // 且无 host 字段。validate_resolved_ip 应返回 Err("URL 主机为空")。
+        // 注:函数内 .filter(|h| !h.is_empty()) 同时覆盖 Some("") 情况(如 file:/// URL)。
+        let url = Url::parse("data:text/plain,Stuff").unwrap();
+        assert_eq!(url.host_str(), None, "前置条件:该 URL 无 host");
+
+        let result = validate_resolved_ip(&url);
+        assert!(result.is_err(), "无 host 的 URL 应被拒绝,实际: {result:?}");
+        assert!(
+            result.unwrap_err().to_string().contains("主机为空"),
+            "错误信息应包含'主机为空'"
+        );
     }
 
     #[test]

@@ -190,9 +190,85 @@ pub async fn scan_local_models(state: State<'_, AppState>) -> Result<Vec<LocalMo
     Ok(models.into_values().collect())
 }
 
+/// 单个文件的校验任务快照。
+///
+/// 脱离 DashMap 借用后使用,自包含校验所需信息,便于并发执行。
+enum VerifyJob {
+    /// LFS 文件: 计算 sha256 并与 oid 比对(oid 已去除 "sha256:" 前缀)
+    Lfs {
+        file_path: String,
+        save_path: String,
+        oid: String,
+    },
+    /// 普通文件: 比对本地与远程文件大小
+    Size {
+        file_path: String,
+        save_path: String,
+        size: u64,
+    },
+    /// 远程文件信息缺失
+    Missing { file_path: String },
+}
+
+/// 对单个文件执行校验,返回 (file_path, 校验状态)。
+///
+/// LFS 文件计算 sha256 与期望 oid 比对;普通文件比对大小。
+/// 文件不存在直接判为失败,不进行后续读取。
+/// metadata 为轻量 syscall,直接在 async 上下文调用,无需 spawn_blocking。
+async fn compute_verify_status(job: VerifyJob) -> (String, VerifyStatus) {
+    match job {
+        VerifyJob::Missing { file_path } => (
+            file_path,
+            VerifyStatus::Failed("远程文件信息缺失".to_string()),
+        ),
+        VerifyJob::Lfs {
+            file_path,
+            save_path,
+            oid,
+        } => {
+            if !Path::new(&save_path).exists() {
+                return (file_path, VerifyStatus::Failed("文件不存在".to_string()));
+            }
+            let verifier = tachyon_crypto::cpu::CpuVerifier::sha256();
+            let status = match verifier
+                .compute_hash_from_path(std::path::Path::new(&save_path), 8192)
+                .await
+            {
+                Ok(hash) => {
+                    if hash.eq_ignore_ascii_case(&oid) {
+                        VerifyStatus::Verified
+                    } else {
+                        VerifyStatus::Failed(format!("sha256 不匹配: 期望 {oid}, 实际 {hash}"))
+                    }
+                }
+                Err(e) => VerifyStatus::Failed(format!("校验计算失败: {e}")),
+            };
+            (file_path, status)
+        }
+        VerifyJob::Size {
+            file_path,
+            save_path,
+            size,
+        } => {
+            if !Path::new(&save_path).exists() {
+                return (file_path, VerifyStatus::Failed("文件不存在".to_string()));
+            }
+            // 普通文件大小比对:metadata 为轻量 syscall,直接在 async 上下文调用
+            let actual_size = std::fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0);
+            let status = if actual_size == size {
+                VerifyStatus::Verified
+            } else {
+                VerifyStatus::Failed(format!("大小不匹配: 期望 {size}, 实际 {actual_size}"))
+            };
+            (file_path, status)
+        }
+    }
+}
+
 /// 校验模型文件
 ///
 /// LFS 文件使用 sha256 校验，普通文件使用文件大小比对。
+/// 各文件校验并发执行(上限 4),避免多个大文件串行 sha256 耗时过长。
 #[tauri::command]
 pub async fn verify_model(
     state: State<'_, AppState>,
@@ -218,6 +294,10 @@ pub async fn verify_model(
 
     let mut results = Vec::new();
 
+    // 1. 遍历 task_repository 收集校验任务快照。
+    //    DashMap 迭代器为同步借用,不能跨 await 持有,故先快照为 Vec,
+    //    释放借用后再并发执行各文件的校验。
+    let mut jobs: Vec<(VerifyJob, std::time::Instant)> = Vec::new();
     for entry in state.domain.task_repository.iter() {
         let task = entry.value();
         let Some(ref meta) = task.hf_meta else {
@@ -227,51 +307,79 @@ pub async fn verify_model(
             continue;
         }
 
-        let path = &task.save_path;
-        let start = std::time::Instant::now();
-        let status = if !Path::new(path).exists() {
-            VerifyStatus::Failed("文件不存在".to_string())
-        } else if let Some(remote) = remote_map.get(&meta.file_path) {
-            if let Some(ref lfs) = remote.lfs {
-                // LFS 文件: sha256 校验
-                let verifier = tachyon_crypto::cpu::CpuVerifier::sha256();
-                match verifier
-                    .compute_hash_from_path(std::path::Path::new(path), 8192)
-                    .await
-                {
-                    Ok(hash) => {
-                        let expected = lfs.oid.trim_start_matches("sha256:");
-                        if hash.eq_ignore_ascii_case(expected) {
-                            VerifyStatus::Verified
-                        } else {
-                            VerifyStatus::Failed(format!(
-                                "sha256 不匹配: 期望 {expected}, 实际 {hash}"
-                            ))
-                        }
+        let job = match remote_map.get(&meta.file_path) {
+            Some(remote) => {
+                if let Some(ref lfs) = remote.lfs {
+                    VerifyJob::Lfs {
+                        file_path: meta.file_path.clone(),
+                        save_path: task.save_path.clone(),
+                        oid: lfs.oid.trim_start_matches("sha256:").to_string(),
                     }
-                    Err(e) => VerifyStatus::Failed(format!("校验计算失败: {e}")),
-                }
-            } else {
-                // 普通文件: 大小比对
-                let actual_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                if actual_size == remote.size {
-                    VerifyStatus::Verified
                 } else {
-                    VerifyStatus::Failed(format!(
-                        "大小不匹配: 期望 {}, 实际 {actual_size}",
-                        remote.size
-                    ))
+                    VerifyJob::Size {
+                        file_path: meta.file_path.clone(),
+                        save_path: task.save_path.clone(),
+                        size: remote.size,
+                    }
                 }
             }
-        } else {
-            VerifyStatus::Failed("远程文件信息缺失".to_string())
+            None => VerifyJob::Missing {
+                file_path: meta.file_path.clone(),
+            },
         };
+        jobs.push((job, std::time::Instant::now()));
+    }
 
-        results.push(FileVerifyResult {
-            path: meta.file_path.clone(),
-            status,
-            elapsed_ms: start.elapsed().as_millis() as u64,
+    // 2. 并发执行校验。
+    //    使用 JoinSet 驱动各 future,配合 Semaphore 限制并发度为 4,
+    //    避免同时打开过多文件句柄。每个 future 独立计时(elapsed_ms)。
+    let concurrency = 4usize;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (job, start) in jobs {
+        let permit = semaphore.clone();
+        join_set.spawn(async move {
+            // 先提取 file_path 用于结果构造(无论成功失败都需要),
+            // 避免在 permit 获取失败的提前返回分支中无法访问 job 内字段
+            let file_path = match &job {
+                VerifyJob::Lfs { file_path, .. }
+                | VerifyJob::Size { file_path, .. }
+                | VerifyJob::Missing { file_path } => file_path.clone(),
+            };
+            // 申请并发许可,获取后执行校验;释放后自动让出给下一个任务
+            let _permit = match permit.acquire_owned().await {
+                Ok(p) => p,
+                // 信号量关闭视为任务被取消,直接返回失败
+                Err(_) => {
+                    return (
+                        file_path,
+                        VerifyStatus::Failed("并发调度被取消".to_string()),
+                        start,
+                    );
+                }
+            };
+            let (_path, status) = compute_verify_status(job).await;
+            (file_path, status, start)
         });
+    }
+
+    // 3. 收集结果。JoinSet::join_next 完成顺序不确定,但每条结果携带
+    //    file_path,无序收集不影响最终语义。
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok((file_path, status, start)) => results.push(FileVerifyResult {
+                path: file_path,
+                status,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+            // 任务 panic:记为失败
+            Err(join_err) => results.push(FileVerifyResult {
+                path: String::new(),
+                status: VerifyStatus::Failed(format!("校验任务异常: {join_err}")),
+                elapsed_ms: 0,
+            }),
+        }
     }
 
     Ok(results)

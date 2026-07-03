@@ -357,6 +357,9 @@ impl AppState {
             }
         };
         let connection_pool = ConnectionPool::new(PoolConfig::from(config.connection.clone()));
+        // 连接池热替换句柄:外层 Arc<RwLock<Arc<ConnectionPool>>>,
+        // update_config 时在写锁内替换内层 Arc,新任务读锁 clone 拿到新 pool。
+        let connection_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(connection_pool)));
         let data_root =
             tachyon_core::config::dirs().unwrap_or_else(|| std::path::PathBuf::from("."));
         // 兼容旧版 .aimd 数据目录:若 .aimd 存在但 .tachyon 不存在,自动重命名
@@ -384,7 +387,6 @@ impl AppState {
         let max_concurrent_fragments = config.download.max_concurrent_fragments;
         let config_arc = Arc::new(tokio::sync::Mutex::new(config));
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let connection_pool_arc = Arc::new(connection_pool);
         // 全局 buffer 池:容量 = 任务并发 × 分片并发,buffer_size = WRITE_BATCH_BYTES。
         // 惰性分配(用 new 而非 with_prefill),首次 alloc 才创建 buffer,降低启动内存开销。
         let buffer_pool = Arc::new(BufferPool::new(
@@ -398,7 +400,7 @@ impl AppState {
             task_store.clone(),
             create_task_lock,
         ));
-        let supervisor = Arc::new(DownloadSupervisor::new(connection_pool_arc.clone()));
+        let supervisor = Arc::new(DownloadSupervisor::new(connection_pool.clone()));
         let progress_broker = Arc::new(ProgressBroker::start(task_repository.clone()));
         let confirmation_service = Arc::new(ConfirmationService::new());
         let sniffer_service = Arc::new(SnifferService::new());
@@ -410,7 +412,7 @@ impl AppState {
                 config: config_arc,
             },
             infra: InfraState {
-                connection_pool: connection_pool_arc,
+                connection_pool,
                 task_store,
                 favorites_store,
                 chunk_reader_pool,
@@ -739,11 +741,13 @@ pub(crate) mod tests {
         let tmp_favorites = tempfile::tempdir().unwrap();
         let favorites_store = Arc::new(tachyon_store::KvStore::open(tmp_favorites.path()).unwrap());
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let connection_pool = Arc::new(ConnectionPool::new(PoolConfig {
-            max_per_host: 16,
-            max_global: 256,
-            ..Default::default()
-        }));
+        let connection_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(ConnectionPool::new(
+            PoolConfig {
+                max_per_host: 16,
+                max_global: 256,
+                ..Default::default()
+            },
+        ))));
         let progress_broker = Arc::new(ProgressBroker::new_no_aggregator(task_repository.clone()));
 
         let task_service = Arc::new(TaskService::new(

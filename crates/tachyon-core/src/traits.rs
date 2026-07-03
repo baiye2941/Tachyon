@@ -232,18 +232,23 @@ pub trait Verifier: Send + Sync {
 
 /// 常量时间字符串比较,防止时序侧信道攻击
 ///
-/// 对所有字节进行 XOR 运算并累积差异,不提前返回,
-/// 比较时间仅取决于较长字符串的长度,与内容无关。
+/// 基于 `subtle` crate(经 rustls 等审计)的 `ConstantTimeEq` 实现。
+/// subtle 的 slice `ct_eq` 在长度不等时会短路返回 `Choice(0)`,
+/// 这会通过时序泄漏长度差异;为保持与原手写实现一致的安全语义
+/// (不因长度不同而提前返回),先取较短长度做等长内容比较,
+/// 再以常量时间方式合并长度差异。最终比较时间仅取决于较短前缀长度,
+/// 与内容无关。
 fn constant_time_eq_str(a: &[u8], b: &[u8]) -> bool {
-    // 长度不同也应保持恒定时间(不直接返回 false)
-    let len = a.len().max(b.len());
-    let mut diff: u8 = (a.len() != b.len()) as u8;
-    for i in 0..len {
-        let byte_a = a.get(i).copied().unwrap_or(0);
-        let byte_b = b.get(i).copied().unwrap_or(0);
-        diff |= byte_a ^ byte_b;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    // 取较短长度做等长比较,避免 subtle 在长度不等时的提前返回
+    let min_len = a.len().min(b.len());
+    let prefix_eq = a[..min_len].ct_eq(&b[..min_len]);
+    // 长度差异编码为常量时间比较:用 1 字节表示长度是否相等,
+    // 再与内容比较结果常量时间合并(subtle 的 & 是常量时间 AND)。
+    // stable 不支持 Choice::new,故借 u8 的 ConstantTimeEq 构造 Choice。
+    let len_byte = (a.len() == b.len()) as u8;
+    let len_eq = [len_byte].ct_eq(&[1u8]);
+    (prefix_eq & len_eq).into()
 }
 
 /// 下载任务执行器 trait:抽象下载任务的生命周期操作
