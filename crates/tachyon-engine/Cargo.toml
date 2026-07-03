@@ -8,6 +8,9 @@ description = "Tachyon 引擎层:分片引擎、连接管理"
 [features]
 default = ["tachyon-protocol/magnet"]
 magnet = ["tachyon-protocol/magnet", "dep:librqbit"]
+# 暴露测试构造器(new_for_test)和 MockProtocol 注入路径,供 bench/集成测试复用。
+# 开启后 tachyon-core 的 test-harness(MockProtocol 等)可用。
+test-harness = ["tachyon-core/test-harness"]
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }

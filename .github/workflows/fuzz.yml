@@ -24,7 +24,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 安装系统依赖(Ubuntu)
         run: |
           sudo apt-get update
@@ -40,7 +40,7 @@ jobs:
       - name: 运行 fuzz target
         working-directory: fuzz
         run: |
-          for target in config_parse file_metadata http_headers ipc_deserialize url_safety; do
+          for target in config_parse file_metadata http_headers ipc_deserialize magnet_parse url_safety; do
             echo "::group::Fuzz target: $target"
             # 每个 target 运行 60 秒,crash 不中断后续 target
             cargo fuzz run "$target" -- -max_total_time=60 || true

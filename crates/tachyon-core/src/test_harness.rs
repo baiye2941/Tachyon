@@ -32,6 +32,11 @@ pub mod harness {
         /// 返回永不产出项的 pending 流(等价于 librqbit FileStream.read() 在无 peer
         /// 时永久 Pending),用于验证引擎流读取循环的取消信号穿透能力。
         stalling_ranges: Arc<Mutex<HashMap<(u64, u64), ()>>>,
+        /// 分块流模式:Some(n) 时 download_range_stream 将 range 数据按 n 字节拆成
+        /// 多个 chunk 流式产出(模拟 HTTP chunked / BT FileStream 多次 read),
+        /// 覆盖引擎流读取循环的逐块哈希、批量刷写、取消信号穿透路径。
+        /// None(默认)时整个 range 一次性产出(stream::once)。
+        chunk_size: Option<usize>,
     }
 
     /// L-16: 保留 MockProtocol 中原始 DownloadError 的可 Clone 部分。
@@ -148,6 +153,7 @@ pub mod harness {
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
                 stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
+                chunk_size: None,
             }
         }
 
@@ -175,6 +181,19 @@ pub mod harness {
             }
         }
 
+        /// 启用分块流模式:download_range_stream 将 range 数据按 `size` 字节拆成
+        /// 多个 chunk 流式产出(模拟 HTTP chunked transfer / BT FileStream 多次 read)。
+        ///
+        /// 默认(None)时整个 range 一次性产出(stream::once)。设为 Some(n) 后,
+        /// 引擎流读取循环会按 n 字节逐块接收,覆盖逐块哈希、批量刷写、取消信号穿透路径。
+        pub fn with_chunk_size(self, size: usize) -> Self {
+            assert!(size > 0, "chunk_size 必须大于 0");
+            Self {
+                chunk_size: Some(size),
+                ..self
+            }
+        }
+
         /// 创建一个总是失败的 MockProtocol。
         ///
         /// L-16: 保留原始 DownloadError 的关键信息(变体类型 + 附加字段)。
@@ -187,6 +206,7 @@ pub mod harness {
                 range_data: Arc::new(Mutex::new(HashMap::new())),
                 default_data: None,
                 stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
+                chunk_size: None,
             }
         }
     }
@@ -250,8 +270,25 @@ pub mod harness {
                     );
                 }
                 let data = this.download_range(&url, start, end).await?;
-                Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
-                    as crate::traits::ByteStream)
+                // 分块流模式:按 chunk_size 拆成多个 chunk 流式产出,
+                // 模拟 HTTP chunked / BT FileStream 多次 read,覆盖引擎流读取循环
+                // 的逐块哈希、批量刷写、取消信号穿透路径。
+                if let Some(chunk_sz) = this.chunk_size {
+                    let chunks: Vec<Bytes> = (0..data.len())
+                        .step_by(chunk_sz)
+                        .map(|offset| {
+                            let end = (offset + chunk_sz).min(data.len());
+                            data.slice(offset..end)
+                        })
+                        .collect();
+                    Ok(
+                        Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+                            as crate::traits::ByteStream,
+                    )
+                } else {
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
+                        as crate::traits::ByteStream)
+                }
             })
         }
 
