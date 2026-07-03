@@ -59,6 +59,9 @@ jobs:
             --fail-under-lines 90 --summary-only
 
       # SRE-002: Miri 检查门禁
+      # 注意:Miri 组件只在 nightly 可用,必须设置 RUSTUP_TOOLCHAIN=nightly
+      # 否则 cargo miri setup 会用 stable 报错 "miri component not available"
+      # (与 ci.yml 的 miri job 配置一致)
       - name: 安装 nightly 工具链(Miri)
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -66,12 +69,18 @@ jobs:
 
       - name: 初始化 Miri
         run: cargo miri setup
+        env:
+          RUSTUP_TOOLCHAIN: nightly
 
       - name: Miri 检测 tachyon-core
         run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip proptests
+        env:
+          RUSTUP_TOOLCHAIN: nightly
 
       - name: Miri 检测 tachyon-io (非平台特定代码)
         run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring --skip pipeline --skip tokio_file --skip winio --skip write_pipeline
+        env:
+          RUSTUP_TOOLCHAIN: nightly
 
   # 安全审计门禁
   security-gate:
