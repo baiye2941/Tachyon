@@ -139,20 +139,7 @@ export default function TaskList(props: TaskListProps) {
   return (
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* List Header */}
-      <div
-        class="flex items-center flex-shrink-0"
-        style={{
-          height: "36px",
-          padding: "0 16px",
-          background: "var(--color-bg-elevated)",
-          "border-bottom": "1px solid var(--color-border-subtle)",
-          "font-size": "12px",
-          color: "var(--color-text-tertiary)",
-          "font-weight": 600,
-          "text-transform": "uppercase",
-          "letter-spacing": "0.5px",
-        }}
-      >
+      <div class="flex items-center flex-shrink-0 task-list-header">
         <For each={COLUMNS}>
           {(col) => {
             const sortState = $taskSort.state();
@@ -162,29 +149,20 @@ export default function TaskList(props: TaskListProps) {
                 ? "ascending"
                 : "descending"
               : "none";
-            const widthStyle =
-              col.width === "flex-1" ? { flex: "1" } : { width: col.width };
+            const widthClass =
+              col.width === "flex-1"
+                ? "task-list-col--flex"
+                : `task-list-col--${col.key}`;
             return (
               <div
                 role="columnheader"
                 aria-sort={ariaSort}
                 class={
                   col.sortable
-                    ? "task-col-header focus:outline-none focus-visible:focus-ring"
-                    : ""
+                    ? `task-list-col task-list-col--align-${col.align} ${widthClass} task-col-header focus:outline-none focus-visible:focus-ring`
+                    : `task-list-col task-list-col--align-${col.align} ${widthClass}`
                 }
-                style={{
-                  ...widthStyle,
-                  "text-align": col.align,
-                  cursor: col.sortable ? "pointer" : "default",
-                  "user-select": "none",
-                  display: "flex",
-                  "align-items": "center",
-                  "justify-content":
-                    col.align === "right" ? "flex-end" : "flex-start",
-                  gap: "4px",
-                  "border-radius": "4px",
-                }}
+                classList={{ "task-list-col--sortable": col.sortable }}
                 onClick={() => col.sortable && toggleSort(col.key)}
                 onKeyDown={(e) => {
                   if (col.sortable && (e.key === "Enter" || e.key === " ")) {
@@ -197,13 +175,8 @@ export default function TaskList(props: TaskListProps) {
                 <span>{i18n.t(col.labelKey) as string}</span>
                 <Show when={col.sortable}>
                   <span
-                    style={{
-                      "font-size": "9px",
-                      color: isSorted
-                        ? "var(--color-accent-primary)"
-                        : "var(--color-text-tertiary)",
-                      opacity: isSorted ? 1 : 0.4,
-                    }}
+                    class="task-sort-indicator"
+                    classList={{ "task-sort-indicator--active": isSorted }}
                   >
                     {isSorted ? (sortState.dir === "asc" ? "▲" : "▼") : "↕"}
                   </span>
@@ -232,20 +205,9 @@ export default function TaskList(props: TaskListProps) {
         <Show
           when={props.tasks.length > 0}
           fallback={
-            <div class="flex flex-col items-center justify-center h-full gap-5">
+            <div class="flex flex-col items-center justify-center h-full gap-5 empty-state">
               {/* 品牌抽象图形:速度粒子轨道,无渐变,纯单色调 */}
-              <div
-                style={{
-                  width: "96px",
-                  height: "96px",
-                  color: "var(--color-text-tertiary)",
-                  opacity: 0.25,
-                  display: "flex",
-                  "align-items": "center",
-                  "justify-content": "center",
-                }}
-                aria-hidden="true"
-              >
+              <div class="empty-state-icon" aria-hidden="true">
                 <svg
                   width="80"
                   height="80"
@@ -263,49 +225,31 @@ export default function TaskList(props: TaskListProps) {
                   <path d="M74 40 L66 44 L66 36 Z" fill="currentColor" />
                 </svg>
               </div>
-              <div class="text-center" style={{ "max-width": "320px" }}>
-                <p
-                  style={{
-                    "font-size": "16px",
-                    "font-weight": 500,
-                    color: "var(--color-text-secondary)",
-                    "margin-bottom": "6px",
-                  }}
-                >
-                  暂无下载任务
-                </p>
-                <p
-                  style={{
-                    "font-size": "13px",
-                    color: "var(--color-text-tertiary)",
-                    "line-height": "1.5",
-                    "margin-bottom": "16px",
-                  }}
-                >
+              <div class="empty-state-body">
+                <p class="empty-state-title">暂无下载任务</p>
+                <p class="empty-state-desc">
                   新建下载任务,或拖拽链接到窗口开始体验 Tachyon 速度
                 </p>
                 <Show when={props.onNewTask}>
-                  <Button variant="primary" size="md" onClick={props.onNewTask}>
+                  <Button
+                    variant="primary"
+                    size="lg"
+                    aria-label="新建下载任务 (快捷键 N)"
+                    onClick={props.onNewTask}
+                  >
                     <PlusIcon />
                     <span>新建下载</span>
                   </Button>
                 </Show>
               </div>
-              <div
-                class="flex items-center gap-2 flex-wrap justify-center"
-                style={{
-                  "font-size": "12px",
-                  color: "var(--color-text-tertiary)",
-                  "margin-top": "4px",
-                }}
-              >
+              <div class="empty-state-hints">
                 <span class="kbd">N</span>
                 <span>新建任务</span>
-                <span style={{ color: "var(--color-border-strong)" }}>·</span>
+                <span class="empty-state-hint-sep">·</span>
                 <span class="kbd">⌘</span>
                 <span class="kbd">V</span>
                 <span>粘贴链接</span>
-                <span style={{ color: "var(--color-border-strong)" }}>·</span>
+                <span class="empty-state-hint-sep">·</span>
                 <span>拖拽 .txt 链接文件</span>
               </div>
             </div>

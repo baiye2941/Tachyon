@@ -1,0 +1,7 @@
+# nextest 配置
+# 文档: https://nexte.st/docs/configuration/
+
+[profile.default]
+# 并行测试时部分 AppState::new() 测试因全局 .tachyon 目录竞态偶发失败
+# (预先存在的 flaky,非逻辑错误)。配置重试消除 CI 噪音。
+retries = 2

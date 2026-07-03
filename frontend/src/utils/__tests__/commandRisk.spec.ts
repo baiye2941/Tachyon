@@ -20,6 +20,13 @@ describe('commandRisk (P1-11a)', () => {
         'get_config',
         'list_repo_files',
         'get_hf_download_url',
+        // B6 补登:Hub/模型查询类只读命令
+        'get_task_fragments',
+        'get_model_info',
+        'search_models',
+        'scan_local_models',
+        'verify_model',
+        'list_model_favorites',
       ]
       for (const cmd of expected) {
         expect(safe).toContain(cmd)
@@ -30,7 +37,17 @@ describe('commandRisk (P1-11a)', () => {
       const mutate = Object.entries(COMMAND_RISK)
         .filter(([, tier]) => tier === 'mutate')
         .map(([cmd]) => cmd)
-      const expected = ['pause_task', 'resume_task', 'cancel_task', 'add_sniffer_filter', 'create_task']
+      const expected = [
+        'pause_task',
+        'resume_task',
+        'cancel_task',
+        'add_sniffer_filter',
+        'create_task',
+        // B6 补登:模型收藏与 HF 批量任务写操作
+        'add_model_favorite',
+        'remove_model_favorite',
+        'batch_create_hf_tasks',
+      ]
       for (const cmd of expected) {
         expect(mutate).toContain(cmd)
       }
@@ -47,6 +64,34 @@ describe('commandRisk (P1-11a)', () => {
     it('风险表至少覆盖 15 个命令(无遗漏)', () => {
       // invoke.ts 暴露的命令数
       expect(Object.keys(COMMAND_RISK).length).toBeGreaterThanOrEqual(15)
+    })
+
+    it('B6 补登:9 条新增命令 getRiskTier 返回正确等级', () => {
+      // 查询类(只读校验,无副作用)→ safe
+      expect(getRiskTier('get_task_fragments')).toBe('safe')
+      expect(getRiskTier('get_model_info')).toBe('safe')
+      expect(getRiskTier('search_models')).toBe('safe')
+      expect(getRiskTier('scan_local_models')).toBe('safe')
+      expect(getRiskTier('verify_model')).toBe('safe')
+      expect(getRiskTier('list_model_favorites')).toBe('safe')
+      // 写操作(状态变更/网络触发)→ mutate
+      expect(getRiskTier('add_model_favorite')).toBe('mutate')
+      expect(getRiskTier('remove_model_favorite')).toBe('mutate')
+      expect(getRiskTier('batch_create_hf_tasks')).toBe('mutate')
+    })
+
+    it('B6 补登后不再误判为 destructive(避免查询类误弹确认)', () => {
+      // 回归:get_task_fragments 在 DetailPanel 打开时调用,不得被判为 destructive
+      for (const cmd of [
+        'get_task_fragments',
+        'get_model_info',
+        'search_models',
+        'scan_local_models',
+        'verify_model',
+        'list_model_favorites',
+      ]) {
+        expect(getRiskTier(cmd)).not.toBe('destructive')
+      }
     })
   })
 

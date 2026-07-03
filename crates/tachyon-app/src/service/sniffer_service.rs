@@ -70,6 +70,7 @@ impl SnifferService {
         let resource = SnifferResource {
             id: Uuid::new_v4().to_string(),
             url: redacted_url.clone(),
+            download_url: url.clone(),
             file_name,
             resource_type: resource_type_to_string(resource_type).to_string(),
             file_size: None,

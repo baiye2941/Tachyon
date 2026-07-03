@@ -28,7 +28,7 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | 能力 | 说明 |
 |------|------|
 | 多线程分片下载 | `DownloadTask` 动态分片规划，`JoinSet` 并发执行 |
-| 多协议传输 | HTTP/HTTPS、QUIC、FTP、BitTorrent 磁力链接 |
+| 多协议传输 | HTTP/HTTPS、QUIC、BitTorrent 磁力链接 |
 | 零拷贝存储引擎 | Linux io_uring、Windows IOCP / WinFile、TokioFile 自动回退 |
 | 智能调度 | `AdaptiveDownloadScheduler` + `HoltLinearPredictor` 双指数平滑 |
 | 流式哈希校验 | BLAKE3 / SHA-256 CPU 校验，GPU 校验预留 |
@@ -56,15 +56,15 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | Storybook | 10.4.6 | 组件开发 |
 | solid-i18n | ^1.1.0 | 中 / 英国际化 |
 
-### 后端（Rust workspace 11 crate）
+### 后端（Rust workspace 10 crate）
 
 | Crate | 职责 |
 |------|------|
 | `tachyon-core` | 类型、trait、错误体系、配置、安全校验 |
 | `tachyon-engine` | 分片引擎、连接池、多源竞速、限速器 |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 |
-| `tachyon-io` | 跨平台异步 I/O、BufferPool、WritePipeline |
-| `tachyon-protocol` | HTTP/HTTPS、QUIC、FTP、BitTorrent 协议实现 |
+| `tachyon-io` | 跨平台异步 I/O（io_uring/IOCP）、BufferPool 池化、直接 async write |
+| `tachyon-protocol` | HTTP/HTTPS、QUIC、BitTorrent 协议实现 |
 | `tachyon-crypto` | BLAKE3 / SHA-256 校验、GPU 加速预留 |
 | `tachyon-sniffer` | 浏览器资源类型识别与捕获过滤 |
 | `tachyon-store` | 断点续传快照、文件系统 KV |
@@ -91,7 +91,7 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 git clone https://github.com/baiye2941/Tachyon.git
 cd Tachyon
 
-# 调试构建（默认启用 ftp + quic + magnet）
+# 调试构建（默认 HTTP + magnet；QUIC/HTTP3 需显式 --features tachyon-protocol/http3）
 cargo build
 
 # 发布构建

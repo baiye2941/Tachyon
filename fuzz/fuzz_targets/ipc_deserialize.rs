@@ -7,18 +7,12 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tachyon_core::event::{DownloadEvent, FragmentEvent, PeerEvent};
 use tachyon_core::types::{
     DownloadState, DownloadStateChange, FileMetadata, FragmentInfo, TaskCommand, TaskProgress,
 };
 
 fuzz_target!(|data: &[u8]| {
     let input = String::from_utf8_lossy(data);
-
-    // 事件类型反序列化
-    let _: Result<DownloadEvent, _> = serde_json::from_str(&input);
-    let _: Result<FragmentEvent, _> = serde_json::from_str(&input);
-    let _: Result<PeerEvent, _> = serde_json::from_str(&input);
 
     // 核心类型反序列化
     let _: Result<FileMetadata, _> = serde_json::from_str(&input);

@@ -24,8 +24,7 @@ Tachyon 支持以下传输协议，可通过 Feature Flag 裁剪：
 | 协议 | 实现 | 说明 |
 |------|------|------|
 | HTTP/HTTPS | reqwest + rustls + HTTP/2 | 始终启用，支持 Range 分片与流式下载 |
-| QUIC / HTTP3 | quinn + rustls + h3 + h3-quinn | 启用 `quic` feature 后可用 |
-| FTP | suppaftp | 启用 `ftp` feature 后可用 |
+| HTTP/3 (over QUIC) | reqwest `http3` feature | 启用 `http3` feature 后可用（需 `--cfg reqwest_unstable`，经 Alt-Svc 协商升级） |
 | BitTorrent Magnet | librqbit | 启用 `magnet` feature 后可用 |
 
 ### 1.2 下载核心能力
@@ -102,23 +101,20 @@ pub enum IoStrategy {
 
 | Feature | 默认 | 作用 |
 |---------|------|------|
-| `ftp` | 启用 | 编译 FTP 协议支持（suppaftp） |
-| `quic` | 启用 | 编译 QUIC / HTTP3 协议支持（quinn + rustls + h3） |
 | `magnet` | 启用 | 编译 BitTorrent 磁力链接支持（librqbit） |
+| `http3` | 禁用 | 编译 HTTP/3 支持（reqwest `http3` feature，需 `--cfg reqwest_unstable`，经 Alt-Svc 协商升级） |
 | `gpu` | 禁用 | GPU 加速哈希校验（wgpu，实验性） |
 
 ```bash
 # 仅 HTTP，最小二进制
 cargo build --no-default-features
 
-# HTTP + FTP
-cargo build --features ftp
+# HTTP + Magnet（同默认）
+cargo build
+cargo build --features magnet
 
-# HTTP + QUIC
-cargo build --features quic
-
-# 全协议（同默认）
-cargo build --features "ftp,quic,magnet"
+# 启用 QUIC / HTTP3（reqwest http3 标记为 unstable，须注入 cfg）
+RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
 ```
 
 ---
@@ -149,7 +145,7 @@ cargo build --features "ftp,quic,magnet"
 git clone https://github.com/baiye2941/Tachyon.git
 cd Tachyon
 
-# 调试构建（默认全部协议）
+# 调试构建（默认 HTTP + Magnet）
 cargo build
 
 # 发布构建
@@ -157,9 +153,8 @@ cargo build --release
 
 # Feature 裁剪
 cargo build --no-default-features                    # 仅 HTTP
-cargo build --features ftp                           # HTTP + FTP
-cargo build --features quic                          # HTTP + QUIC
-cargo build --features magnet                        # HTTP + Magnet
+cargo build --features magnet                        # HTTP + Magnet（同默认）
+RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3  # 启用 QUIC/HTTP3
 ```
 
 ### 5.3 开发模式
@@ -228,10 +223,9 @@ cd frontend && bun run build
 | 限制 | 说明 |
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
-| QUIC 0-RTT 受 feature gate | 仅在 `quic` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
+| QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
 | 无 SOCKS/HTTP 代理支持 | 当前 `HttpClient` 直接使用 reqwest，未暴露代理配置接口 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
-| FTP 单连接限制 | `FtpClient` 基于 suppaftp，受 FTP 协议本身限制不支持多路复用 |
 | 前端仅支持中/英双语 | `solid-i18n` 当前仅配置 zh-CN 和 en-US |
 | BitTorrent Magnet 已支持分片并发 | 单文件 magnet 走 `download_range_stream`（基于 librqbit `FileStream`）进入引擎多 worker 分片路径；多文件 magnet 仍回退整文件流式 |
 

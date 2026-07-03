@@ -314,11 +314,14 @@ impl TaskService {
             .clone()
             .unwrap_or_else(|| extract_filename_from_url(url));
         let created_at = now_iso8601();
+        // 去重键:用脱敏 URL 比较,使不同 token 的同源 URL 视为同一任务。
+        // 存储层(TaskInfo.url)保留原始 URL,供断点续传 restart_download 复用;
+        // 序列化到前端时由 serialize_url_for_display 脱敏(见 commands/mod.rs)。
         let redacted_url = redact_url_for_log(url);
 
         let task = TaskInfo {
             id: task_id.clone(),
-            url: redacted_url.clone(),
+            url: url.to_string(),
             file_name,
             file_size: None,
             downloaded: 0,
@@ -327,6 +330,7 @@ impl TaskService {
             progress: 0.0,
             fragments_total: 0,
             fragments_done: 0,
+            active_concurrency: 0,
             created_at,
             save_path: download_dir_str.clone(),
             error_reason: None,
@@ -344,7 +348,7 @@ impl TaskService {
             for r in self.task_repository.iter() {
                 let t = r.value();
                 if !url_exists
-                    && t.url == redacted_url
+                    && redact_url_for_log(&t.url) == redacted_url
                     && t.status != DownloadState::Cancelled
                     && t.status != DownloadState::Completed
                     && t.status != DownloadState::Failed
@@ -434,20 +438,32 @@ impl TaskService {
     }
 
     /// 恢复任务
+    ///
+    /// 允许 Pending / Paused 两种状态恢复:
+    /// - Paused: 运行中被显式暂停,task_fn 仍在等待 Resume 信号。
+    /// - Pending: 应用启动时由 `load_recovered_tasks` 恢复的任务(原 Downloading/Verifying
+    ///   被 `normalize_recovered_status` 归一化为 Pending),此时**无运行中的 task_fn**。
+    ///
+    /// 状态校验通过后,仅修改状态并持久化快照;真正激活下载(发 Resume 或重新 start_download)
+    /// 由调用方 `resume_task_inner` 根据 supervisor 是否有运行中的 task_fn 决定。
     pub async fn resume_task(&self, task_id: &str) -> Result<(), AppError> {
         {
             let mut task = self
                 .task_repository
                 .get_mut(task_id)
                 .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
-            if task.status == DownloadState::Paused {
-                task.status = DownloadState::Downloading;
-                tracing::info!(task_id = %task_id, "恢复任务");
-            } else {
-                return Err(AppError::Config(format!(
-                    "仅暂停状态可恢复,当前状态: '{}'",
-                    task.status
-                )));
+            match task.status {
+                DownloadState::Pending | DownloadState::Paused => {
+                    task.status = DownloadState::Downloading;
+                    task.speed = 0;
+                    tracing::info!(task_id = %task_id, "恢复任务");
+                }
+                other => {
+                    return Err(AppError::Config(format!(
+                        "仅 Pending/Paused 状态可恢复,当前状态: '{}'",
+                        other
+                    )));
+                }
             }
         }
 

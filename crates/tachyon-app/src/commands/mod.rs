@@ -1,4 +1,5 @@
 pub mod config_commands;
+pub mod fragment_commands;
 pub mod hub_commands;
 pub mod progress_commands;
 pub mod sniffer_commands;
@@ -7,6 +8,7 @@ pub mod task_commands;
 
 // Re-exports: Tauri commands and public types
 pub use self::config_commands::{get_config, update_config};
+pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{
     add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info,
     list_model_favorites, list_repo_files, remove_model_favorite, scan_local_models, search_models,
@@ -120,6 +122,10 @@ pub struct TaskInfo {
     pub progress: f64,
     pub fragments_total: u32,
     pub fragments_done: u32,
+    /// 当前下载并发度,前端推算 downloading 带宽用
+    /// 由 PlanComplete 初始化,运行中不更新(静态初始值)
+    #[serde(default)]
+    pub active_concurrency: u32,
     pub created_at: String,
     pub save_path: String,
     /// 失败原因原文（仅 status=Failed 时有值）。
@@ -218,6 +224,8 @@ pub struct DownloadProgress {
     pub speed: u64,
     pub fragments_total: u32,
     pub fragments_done: u32,
+    #[serde(default)]
+    pub active_concurrency: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +237,16 @@ pub struct TaskProgress {
     pub downloaded: u64,
     pub status: DownloadState,
     pub fragments_done: u32,
+    #[serde(default)]
+    pub fragments_total: u32,
+    #[serde(default)]
+    pub active_concurrency: u32,
+    /// 文件总大小。探测完成后由后端写入,通过进度事件同步到前端,
+    /// 避免前端在探测完成前显示 0B(只能靠 get_task_list 全量刷新)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_delta: Vec<u32>,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -316,6 +334,7 @@ pub struct AppState {
     pub(crate) infra: InfraState,
     pub(crate) service: ServiceState,
     pub(crate) runtime: RuntimeState,
+    pub(crate) fragment_state_store: crate::projection::FragmentStateStore,
 }
 
 impl Default for AppState {
@@ -342,6 +361,9 @@ impl AppState {
             }
         };
         let connection_pool = ConnectionPool::new(PoolConfig::from(config.connection.clone()));
+        // 连接池热替换句柄:外层 Arc<RwLock<Arc<ConnectionPool>>>,
+        // update_config 时在写锁内替换内层 Arc,新任务读锁 clone 拿到新 pool。
+        let connection_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(connection_pool)));
         let data_root =
             tachyon_core::config::dirs().unwrap_or_else(|| std::path::PathBuf::from("."));
         // 兼容旧版 .aimd 数据目录:若 .aimd 存在但 .tachyon 不存在,自动重命名
@@ -369,7 +391,6 @@ impl AppState {
         let max_concurrent_fragments = config.download.max_concurrent_fragments;
         let config_arc = Arc::new(tokio::sync::Mutex::new(config));
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let connection_pool_arc = Arc::new(connection_pool);
         // 全局 buffer 池:容量 = 任务并发 × 分片并发,buffer_size = WRITE_BATCH_BYTES。
         // 惰性分配(用 new 而非 with_prefill),首次 alloc 才创建 buffer,降低启动内存开销。
         let buffer_pool = Arc::new(BufferPool::new(
@@ -383,7 +404,7 @@ impl AppState {
             task_store.clone(),
             create_task_lock,
         ));
-        let supervisor = Arc::new(DownloadSupervisor::new(connection_pool_arc.clone()));
+        let supervisor = Arc::new(DownloadSupervisor::new(connection_pool.clone()));
         let progress_broker = Arc::new(ProgressBroker::start(task_repository.clone()));
         let confirmation_service = Arc::new(ConfirmationService::new());
         let sniffer_service = Arc::new(SnifferService::new());
@@ -395,7 +416,7 @@ impl AppState {
                 config: config_arc,
             },
             infra: InfraState {
-                connection_pool: connection_pool_arc,
+                connection_pool,
                 task_store,
                 favorites_store,
                 chunk_reader_pool,
@@ -413,6 +434,7 @@ impl AppState {
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
             },
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
         })
     }
 
@@ -440,6 +462,7 @@ impl AppState {
             infra: self.infra.clone(),
             service: self.service.clone(),
             runtime: self.runtime.clone(),
+            fragment_state_store: self.fragment_state_store.clone(),
         }
     }
 }
@@ -566,6 +589,7 @@ pub(crate) fn update_task_status(
 
 pub(crate) fn cleanup_runtime(state: &AppState, task_id: &str) {
     state.runtime.supervisor.cleanup(task_id);
+    state.fragment_state_store.remove(task_id);
 }
 
 pub(crate) async fn persist_task_snapshot(
@@ -721,11 +745,13 @@ pub(crate) mod tests {
         let tmp_favorites = tempfile::tempdir().unwrap();
         let favorites_store = Arc::new(tachyon_store::KvStore::open(tmp_favorites.path()).unwrap());
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let connection_pool = Arc::new(ConnectionPool::new(PoolConfig {
-            max_per_host: 16,
-            max_global: 256,
-            ..Default::default()
-        }));
+        let connection_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(ConnectionPool::new(
+            PoolConfig {
+                max_per_host: 16,
+                max_global: 256,
+                ..Default::default()
+            },
+        ))));
         let progress_broker = Arc::new(ProgressBroker::new_no_aggregator(task_repository.clone()));
 
         let task_service = Arc::new(TaskService::new(
@@ -768,6 +794,7 @@ pub(crate) mod tests {
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
             },
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
         })
     }
 
@@ -847,6 +874,7 @@ pub(crate) mod tests {
             progress: 0.5,
             fragments_total: 4,
             fragments_done: 2,
+            active_concurrency: 0,
             created_at: "2025-01-01T00:00:00+08:00".to_string(),
             save_path: "/downloads/file.zip".to_string(),
             error_reason: None,

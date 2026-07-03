@@ -268,9 +268,10 @@ impl DownloadSession {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let broker = self.state.runtime.progress_broker.clone();
-        let on_progress: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |task_id: &str| {
-            broker.mark_dirty(task_id);
-        });
+        let on_progress: crate::runtime::chunk_reader_pool::ProgressCallback =
+            Arc::new(move |task_id, idx| {
+                broker.mark_dirty_with_delta(task_id, idx);
+            });
         let job = ChunkReaderJob {
             task_id: self.task_id.clone(),
             progress_rx: chunk_progress_rx,
@@ -278,6 +279,7 @@ impl DownloadSession {
             task_store: self.state.infra.task_store.clone(),
             done_tx,
             on_progress: Some(on_progress),
+            fragment_state_store: self.state.fragment_state_store.clone(),
         };
         if let Err(e) = self.state.infra.chunk_reader_pool.submit_async(job).await {
             tracing::error!(task_id = %self.task_id, error = %e, "提交 chunk reader job 失败");

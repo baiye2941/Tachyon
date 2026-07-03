@@ -133,6 +133,8 @@ describe('downloads store', () => {
         speed: 150,
         status: 'downloading',
         fragmentsDone: 3,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       },
     })
 
@@ -171,6 +173,8 @@ describe('downloads store', () => {
         speed: 100,
         status: 'downloading',
         fragmentsDone: 1,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       },
     })
 
@@ -191,6 +195,8 @@ describe('downloads store', () => {
         speed: 250,
         status: 'downloading',
         fragmentsDone: 3,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       },
     })
 
@@ -215,6 +221,8 @@ describe('downloads store', () => {
         speed: 0,
         status: 'completed',
         fragmentsDone: 4,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       },
     })
 
@@ -240,6 +248,8 @@ describe('downloads store', () => {
         speed: 0,
         status: 'completed',
         fragmentsDone: 4,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       },
     })
 

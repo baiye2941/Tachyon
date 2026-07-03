@@ -56,10 +56,11 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     return url ? extractSuggestedFileName(url) ?? "" : "";
   });
 
-  // URL 变化时清除探测结果(新 URL 需重新探测)
+  // URL 变化时清除探测结果(新 URL 需重新探测),同步清空已填入的文件名
   createEffect(() => {
     validUrls();
     setProbedFilename(null);
+    setFileName("");
   });
 
   // ── HF URL 识别与预览 ──────────────────────────────────
@@ -95,7 +96,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     return suggestedFileName();
   });
 
-  // 探测按钮处理
+  // 探测按钮处理:探测成功后把名字填入重命名 input(可编辑,重新探测覆盖)
   const handleProbe = async () => {
     const url = validUrls()[0];
     if (!url) return;
@@ -103,6 +104,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     try {
       const name = await api.probeFilename(url);
       setProbedFilename(name);
+      setFileName(name);
     } catch {
       // 探测失败保持本地提取结果
     } finally {
@@ -478,7 +480,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               variant="ghost"
               size="sm"
               loading={probing()}
-              disabled={probing() || validCount() === 0}
+              disabled={probing() || validCount() !== 1}
               onClick={handleProbe}
             >
               <SearchIcon />
@@ -576,7 +578,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
                     id="new-task-filename-input"
                     type="text"
                     placeholder={
-                      suggestedFileName() || tr("newTask.fileNamePlaceholder")
+                      displayFilename() || tr("newTask.fileNamePlaceholder")
                     }
                     value={fileName()}
                     onInput={(e) => setFileName(e.currentTarget.value)}

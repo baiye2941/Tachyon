@@ -60,7 +60,9 @@ describe("TaskItem", () => {
       />
     ));
 
-    const checkbox = screen.getByRole("checkbox", { name: /annual-report-2025\.pdf/ });
+    const checkbox = screen.getByRole("checkbox", {
+      name: /annual-report-2025\.pdf/,
+    });
     expect(checkbox.getAttribute("aria-checked")).toBe("true");
   });
 
@@ -96,6 +98,7 @@ describe("TaskItem", () => {
     expect(container.textContent).toContain("pdf");
     expect(container.textContent).toContain("12.0%");
     expect(container.textContent).toContain("出错");
-    expect(container.querySelector(".linear-progress-fill--failed")).toBeTruthy();
+    expect(container.querySelector('[role="progressbar"]')).toBeTruthy();
+    expect(container.querySelector(".status-badge--failed")).toBeTruthy();
   });
 });

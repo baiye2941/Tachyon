@@ -8,20 +8,26 @@ import {
   TrashIcon,
   TrophyIcon,
   PackageIcon,
+  CheckboxIcon,
 } from "./icons";
 import { formatSize, formatSpeed, getStatusLabel } from "../utils/format";
 import {
   historyRecords,
   getHistoryStatsForRecords,
+  deleteHistoryRecord,
   type HistoryRecord,
 } from "../stores/history";
+import { requestConfirm } from "../stores/confirm";
+import { addToast } from "../stores/toast";
 import { tr, type MessageKey } from "../i18n";
+import Button from "../shared/ui/Button";
 
 interface HistoryPanelProps {
   visible: boolean;
   tasks: TaskInfo[];
   onClose: () => void;
-  onOpenFolder: (taskId: string) => void;
+  /** 打开所在文件夹,直接接收保存路径(非任务 id) */
+  onOpenFolder: (savePath: string) => void;
   onRedownload: (task: TaskInfo) => void;
   onDeleteRecord: (taskId: string) => void;
 }
@@ -39,7 +45,7 @@ function recordToTaskInfo(record: HistoryRecord): TaskInfo {
     fragmentsTotal: 0,
     fragmentsDone: 0,
     createdAt: record.completedAt,
-    savePath: "",
+    savePath: record.savePath || "",
   };
 }
 
@@ -73,6 +79,9 @@ export default function HistoryPanel(props: HistoryPanelProps) {
     tr(key, values as Record<string, string | number | unknown>);
   const [timeRange, setTimeRange] = createSignal<"7d" | "30d" | "all">("all");
   const [searchQuery, setSearchQuery] = createSignal("");
+  // 批量选择状态:batchMode 开启后每条记录前显示复选框
+  const [batchMode, setBatchMode] = createSignal(false);
+  const [selectedIds, setSelectedIds] = createSignal<Set<string>>(new Set());
 
   const filteredRecords = createMemo(() => {
     let records = [...historyRecords];
@@ -114,6 +123,84 @@ export default function HistoryPanel(props: HistoryPanelProps) {
   const maxTrendSize = createMemo(() => {
     return Math.max(...trendData().map((d) => d.size), 1);
   });
+
+  const allSelected = createMemo(() => {
+    const records = filteredRecords();
+    if (records.length === 0) return false;
+    const sel = selectedIds();
+    return records.every((r) => sel.has(r.id));
+  });
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    const records = filteredRecords();
+    if (allSelected()) {
+      // 取消当前过滤结果的全选(仅移除当前可见的,保留过滤外的)
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        records.forEach((r) => next.delete(r.id));
+        return next;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        records.forEach((r) => next.add(r.id));
+        return next;
+      });
+    }
+  };
+
+  const toggleBatchMode = () => {
+    const wasBatch = batchMode();
+    setBatchMode((v) => !v);
+    if (wasBatch) setSelectedIds(new Set<string>());
+  };
+
+  // 批量删除选中历史记录:纯前端 localStorage 操作,无后端调用
+  const handleDeleteSelected = async () => {
+    const ids = Array.from(selectedIds());
+    if (ids.length === 0) return;
+
+    const result = await requestConfirm({
+      title: t("confirm.deleteHistoryBatch.title"),
+      message: t("confirm.deleteHistoryBatch.message", { count: ids.length }),
+      confirmLabel: t("confirm.delete.confirmLabel"),
+      tone: "danger",
+    });
+    if (!result.ok) return;
+
+    let failed = 0;
+    for (const id of ids) {
+      // onDeleteRecord 处理单条删除(同步到后端/清理内存),这里逐条调用
+      try {
+        props.onDeleteRecord(id);
+      } catch {
+        failed++;
+      }
+    }
+    if (failed > 0) {
+      addToast(
+        t("toast.deleteBatchPartialFailed", {
+          count: failed,
+          error: "",
+        }),
+        "error",
+      );
+    }
+    setSelectedIds(new Set<string>());
+    if (selectedIds().size === 0) {
+      // 全部删除成功后退出批量模式
+      setBatchMode(false);
+    }
+  };
 
   return (
     <div
@@ -437,9 +524,41 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           </div>
         </Show>
 
-        {/* Records */}
-        <div class="section-label" style={{ "margin-bottom": "12px" }}>
-          {t("history.records")}
+        {/* Records — 工具栏:搜索 + 批量选择切换 + 全选 */}
+        <div
+          class="flex items-center justify-between gap-2"
+          style={{ "margin-bottom": "12px" }}
+        >
+          <div class="section-label">{t("history.records")}</div>
+          <div class="flex items-center gap-2">
+            <Show when={batchMode()}>
+              <Button
+                variant="ghost"
+                size="sm"
+                class="flex items-center gap-1"
+                onClick={toggleSelectAll}
+                disabled={filteredRecords().length === 0}
+              >
+                <CheckboxIcon checked={allSelected()} />
+                <span>{t("history.selectAll")}</span>
+              </Button>
+            </Show>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="flex items-center gap-1"
+              style={{
+                color: batchMode()
+                  ? "var(--color-accent-primary)"
+                  : "var(--color-text-tertiary)",
+              }}
+              onClick={toggleBatchMode}
+              aria-label={t("history.batchSelect")}
+            >
+              <CheckboxIcon checked={batchMode()} />
+              <span>{t("history.batchSelect")}</span>
+            </Button>
+          </div>
         </div>
         <input
           type="text"
@@ -462,65 +581,136 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           }
         >
           <For each={filteredRecords()}>
-            {(record) => (
-              <div
-                class="flex items-center gap-3 hover-row"
-                style={{
-                  padding: "10px 12px",
-                  "border-radius": "8px",
-                  transition: "all 150ms ease",
-                }}
-              >
-                <PackageIcon />
-                <div class="flex-1 min-w-0">
-                  <div
-                    class="truncate"
-                    style={{
-                      "font-size": "14px",
-                      color: "var(--color-text-primary)",
-                    }}
+            {(record) => {
+              const isSelected = () => selectedIds().has(record.id);
+              return (
+                <div
+                  class="flex items-center gap-3 hover-row"
+                  role={batchMode() ? "checkbox" : undefined}
+                  aria-checked={batchMode() ? isSelected() : undefined}
+                  aria-label={
+                    batchMode()
+                      ? t("history.aria.selectRecord", { name: record.fileName })
+                      : undefined
+                  }
+                  style={{
+                    padding: "10px 12px",
+                    "border-radius": "8px",
+                    background: isSelected()
+                      ? "var(--color-accent-soft)"
+                      : "transparent",
+                    "border-left": isSelected()
+                      ? "2px solid var(--color-accent-primary)"
+                      : "2px solid transparent",
+                    transition: "all 150ms ease",
+                  }}
+                  onClick={() => {
+                    if (batchMode()) toggleSelect(record.id);
+                  }}
+                >
+                  {/* 批量模式:复选框;否则:包图标 */}
+                  <Show
+                    when={batchMode()}
+                    fallback={<PackageIcon />}
                   >
-                    {record.fileName}
+                    <div
+                      style={{
+                        color: isSelected()
+                          ? "var(--color-accent-primary)"
+                          : "var(--color-text-tertiary)",
+                        "flex-shrink": "0",
+                      }}
+                    >
+                      <CheckboxIcon checked={isSelected()} />
+                    </div>
+                  </Show>
+                  <div class="flex-1 min-w-0">
+                    <div
+                      class="truncate"
+                      style={{
+                        "font-size": "14px",
+                        color: "var(--color-text-primary)",
+                      }}
+                    >
+                      {record.fileName}
+                    </div>
+                    <div
+                      style={{
+                        "font-size": "12px",
+                        color: "var(--color-text-tertiary)",
+                      }}
+                    >
+                      {formatSize(record.fileSize || 0)} ·{" "}
+                      {historyStatusLabel(record.status)} ·{" "}
+                      {timeAgo(record.completedAt)}
+                    </div>
                   </div>
-                  <div
-                    style={{
-                      "font-size": "12px",
-                      color: "var(--color-text-tertiary)",
-                    }}
-                  >
-                    {formatSize(record.fileSize || 0)} ·{" "}
-                    {historyStatusLabel(record.status)} ·{" "}
-                    {timeAgo(record.completedAt)}
-                  </div>
+                  {/* 非批量模式:显示操作按钮 */}
+                  <Show when={!batchMode()}>
+                    <div class="flex items-center gap-1">
+                      <button
+                        class="icon-btn-sm hover-light"
+                        // 问题2修复:直接用 record.savePath 打开,不再按 id 查 $tasks
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          props.onOpenFolder(record.savePath || "");
+                        }}
+                        aria-label={t("history.aria.openFolder", { name: record.fileName })}
+                      >
+                        <FolderOpenIcon />
+                      </button>
+                      <button
+                        class="icon-btn-sm hover-light"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          props.onRedownload(recordToTaskInfo(record));
+                        }}
+                        aria-label={t("history.aria.redownload", { name: record.fileName })}
+                      >
+                        <RefreshIcon />
+                      </button>
+                      <button
+                        class="icon-btn-sm hover-danger"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          props.onDeleteRecord(record.id);
+                        }}
+                        aria-label={t("history.aria.delete", { name: record.fileName })}
+                      >
+                        <TrashIcon />
+                      </button>
+                    </div>
+                  </Show>
                 </div>
-                <div class="flex items-center gap-1">
-                  <button
-                    class="icon-btn-sm hover-light"
-                    onClick={() => props.onOpenFolder(record.id)}
-                    aria-label={t("history.aria.openFolder", { name: record.fileName })}
-                  >
-                    <FolderOpenIcon />
-                  </button>
-                  <button
-                    class="icon-btn-sm hover-light"
-                    onClick={() => props.onRedownload(recordToTaskInfo(record))}
-                    aria-label={t("history.aria.redownload", { name: record.fileName })}
-                  >
-                    <RefreshIcon />
-                  </button>
-                  <button
-                    class="icon-btn-sm hover-danger"
-                    onClick={() => props.onDeleteRecord(record.id)}
-                    aria-label={t("history.aria.delete", { name: record.fileName })}
-                  >
-                    <TrashIcon />
-                  </button>
-                </div>
-              </div>
-            )}
+              );
+            }}
           </For>
         </Show>
       </div>
+
+      {/* 批量操作栏:批量模式下有选中时显示 */}
+      <Show when={batchMode() && selectedIds().size > 0}>
+        <div
+          class="flex items-center justify-between"
+          style={{
+            padding: "12px 20px",
+            "border-top": "1px solid var(--color-border-default)",
+            background: "var(--color-bg-elevated)",
+          }}
+        >
+          <span style={{ "font-size": "12px", color: "var(--color-text-tertiary)" }}>
+            {t("batch.selectedCount", { count: selectedIds().size })}
+          </span>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={handleDeleteSelected}
+          >
+            <TrashIcon />
+            <span>{t("history.deleteSelected")}</span>
+          </Button>
+        </div>
+      </Show>
     </div>
   );
 }

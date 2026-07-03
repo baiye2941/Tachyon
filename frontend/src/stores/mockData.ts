@@ -112,6 +112,8 @@ export function startMockData(): void {
         speed: completed ? 0 : Math.max(0.5e6, t.speed * jitter),
         status: completed ? "completed" : "downloading",
         fragmentsDone: Math.floor((t.fragmentsTotal || 0) * pct),
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
       };
       changed = true;
     }

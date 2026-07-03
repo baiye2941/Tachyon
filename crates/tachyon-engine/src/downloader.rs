@@ -35,7 +35,7 @@ use tachyon_scheduler::AdaptiveDownloadScheduler;
 
 use crate::circuit_breaker::SourceCircuitBreakers;
 use crate::mirror::MirrorProtocol;
-use crate::storage_adapter::{DynStorage, StorageSet};
+use crate::storage_adapter::{DynStorage, StorageSet, check_disk_space};
 use tachyon_io::buffer::{BufferGuard, BufferPool};
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
@@ -75,6 +75,17 @@ const WRITE_BATCH_BYTES: usize = tachyon_core::config::WRITE_BATCH_BYTES;
 /// (小 chunk)下每 chunk 检查会累积。降频到每 8 chunk 检查一次,暂停/取消
 /// 响应延迟仍在 MB 级(8 chunk),用户无感。
 const CONTROL_CHECK_CHUNK_INTERVAL: u64 = 8;
+
+/// P6:verify 读盘哈希循环的取消检查点间隔 — 每累计 N 字节已读数据检查一次中断信号。
+///
+/// verify 阶段读盘哈希在大文件(数十 GB)上可能持续数分钟,无检查点时取消
+/// 信号无法穿透(裸 while 循环)。按"已读字节"而非"迭代次数"度量检查点,
+/// 使响应延迟与单次 read_at 的返回量无关:无论 read_at 一次返回 8MiB(常态)
+/// 还是 1 字节(异常短读),都保证每 64MiB 已读数据检查一次中断信号。
+///
+/// 对 GB 级单分片:每 64MiB 一次检查,秒级响应;对 64MB 单分片:约 1 次检查点。
+/// 相较旧实现(固定 64 次迭代 × 8MiB = 512MiB/检查点)改善 8 倍,且对短读鲁棒。
+const VERIFY_CANCEL_CHECK_BYTES: u64 = 64 * 1024 * 1024;
 
 type FragmentTaskOk = (u32, u64, Duration, Option<String>);
 type FragmentTaskErr = (u32, DownloadError);
@@ -127,6 +138,13 @@ pub struct DownloadTask {
     metrics: Option<Arc<Metrics>>,
     /// 每源熔断器,防止持续失败的源浪费连接资源
     circuit_breakers: SourceCircuitBreakers,
+    /// 是否使用镜像源(`with_mirrors` / `with_hybrid_sources` 构造时为 true)。
+    ///
+    /// B5:镜像路径下 engine 层熔断器以主 URL 为 key,单镜像连续失败会误熔断
+    /// 整个任务(所有分片被挡 30s)。镜像路径禁用 engine 层熔断,改由
+    /// `MirrorProtocol` 的 per-source stats(quality 衰减 + least-in-flight 降权)
+    /// 接管故障隔离。单源路径仍用 engine 熔断(语义不变)。
+    has_mirrors: bool,
     /// 用户重命名(可选):若为 `Some`,在 `probe()` 拿到元数据后会以此名覆盖
     /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
     /// 调用方负责传入已 sanitize 的合法文件名(由 app 层 service 完成)。
@@ -265,6 +283,7 @@ impl DownloadTask {
                     session.session(),
                     session.config().clone(),
                     session.download_dir().clone(),
+                    session.handle_cache(),
                 ))
             }
             #[cfg(not(feature = "magnet"))]
@@ -299,6 +318,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: false,
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session,
@@ -339,16 +359,29 @@ impl DownloadTask {
         config: DownloadConfig,
         pool: Option<Arc<ConnectionPool>>,
     ) -> DownloadResult<Self> {
-        let primary = Arc::new(HttpClient::with_timeouts(
-            config.connect_timeout_secs,
-            config.request_timeout_secs,
-        )?);
+        // P2:镜像路径复用连接池配置(对齐 with_pool_and_scheduler:247-256)
+        // pool 存在时用 with_connection_config 透传 max_per_host/keep_alive/http2,
+        // 使每镜像的 reqwest 连接池与全局并发控制对齐;否则回退 with_timeouts。
+        let build_http = || -> DownloadResult<HttpClient> {
+            if let Some(ref p) = pool {
+                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
+                HttpClient::with_connection_config(
+                    &conn_config,
+                    config.connect_timeout_secs,
+                    config.request_timeout_secs,
+                )
+            } else {
+                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+            }
+        };
+
+        let primary = Arc::new(build_http()?);
 
         let total_mirrors = mirror_urls.len();
         let mirrors: Vec<(String, Arc<dyn Protocol>)> = mirror_urls
             .iter()
             .filter_map(|m| {
-                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                build_http()
                     .ok()
                     .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
             })
@@ -362,7 +395,7 @@ impl DownloadTask {
             );
         }
 
-        let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
+        let protocol = Arc::new(MirrorProtocol::with_pool(primary, mirrors, pool.clone()));
 
         Ok(Self {
             id: TaskId::new_v4(),
@@ -385,6 +418,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: true,
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
@@ -425,25 +459,37 @@ impl DownloadTask {
         }
 
         // HTTP 镜像主源:塞入 MirrorProtocol(least-in-flight 调度)
-        let primary = Arc::new(HttpClient::with_timeouts(
-            config.connect_timeout_secs,
-            config.request_timeout_secs,
-        )?);
+        // P2:pool 存在时用 with_connection_config 透传连接池配置(对齐单源路径),
+        // 否则回退 with_timeouts
+        let build_http = || -> DownloadResult<HttpClient> {
+            if let Some(ref p) = pool {
+                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
+                HttpClient::with_connection_config(
+                    &conn_config,
+                    config.connect_timeout_secs,
+                    config.request_timeout_secs,
+                )
+            } else {
+                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+            }
+        };
+        let primary = Arc::new(build_http()?);
         let mirrors: Vec<(String, Arc<dyn Protocol>)> = http_mirrors
             .iter()
             .filter_map(|m| {
-                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                build_http()
                     .ok()
                     .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
             })
             .collect();
-        let protocol = Arc::new(MirrorProtocol::new(primary, mirrors));
+        let protocol = Arc::new(MirrorProtocol::with_pool(primary, mirrors, pool.clone()));
 
-        // BT fallback:独立持有,不塞入 MirrorProtocol
+        // BT fallback:独立持有,不塞入 MirrorProtocol(但共享 handle_cache)
         let bt_fallback = Arc::new(MagnetProtocol::new(
             bt_session.session(),
             bt_session.config().clone(),
             bt_session.download_dir().clone(),
+            bt_session.handle_cache(),
         ));
 
         Ok(Self {
@@ -467,6 +513,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: true,
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: Some(bt_session),
@@ -475,8 +522,8 @@ impl DownloadTask {
         })
     }
 
-    #[cfg(test)]
-    fn new_for_test(
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn new_for_test(
         url: String,
         config: DownloadConfig,
         protocol: Arc<dyn Protocol>,
@@ -503,6 +550,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: false,
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
@@ -515,8 +563,8 @@ impl DownloadTask {
     ///
     /// 用于多文件端到端测试:probe 设置 metadata(含 file_layout)后,
     /// init_storage 据 file_layout 构造 StorageSet::Multi。
-    #[cfg(test)]
-    fn new_for_test_no_storage(
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn new_for_test_no_storage(
         url: String,
         config: DownloadConfig,
         protocol: Arc<dyn Protocol>,
@@ -542,6 +590,7 @@ impl DownloadTask {
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: false,
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
@@ -849,6 +898,26 @@ impl DownloadTask {
             info!(resumed_partial, "字节级断点续传:恢复未完整分片");
         }
 
+        // 发送 PlanComplete 事件:携带真实分片总数 + 续传已完成索引 + 初始并发度。
+        // plan() 是同步函数,用 try_send(非阻塞)。此时 channel 必为空(plan 是第一个事件),
+        // 不会因满而丢弃;若通道已关闭(任务取消)则丢弃,属正确行为。
+        if let Some(tx) = &self.progress_tx {
+            let total = self.fragments.len() as u32;
+            let completed_indices: Vec<u32> = self
+                .fragments
+                .iter()
+                .filter(|f| f.state == crate::fragment::FragmentState::Done)
+                .map(|f| f.info.index)
+                .collect();
+            if let Err(e) = tx.try_send(FragmentProgress::PlanComplete {
+                total,
+                completed_indices,
+                initial_concurrency: recommendation.concurrency,
+            }) {
+                warn!(error = %e, "PlanComplete 事件发送失败(通道满或关闭)");
+            }
+        }
+
         Ok(fragments)
     }
 
@@ -857,6 +926,11 @@ impl DownloadTask {
     /// 预分配文件空间
     ///
     /// 根据文件大小在存储后端预留空间,支持分片并发写入。
+    ///
+    /// P4:allocate 前先做磁盘空间预检。检查 save_dir 所在分区可用空间是否
+    /// 大于等于 file_size + margin(1% 或 100MB 取小),不足则返回 Config 错误
+    /// (不可重试),带中文提示含可用/需求数值。无法获取磁盘信息时跳过预检
+    /// (降级,不阻断下载)。
     pub async fn prepare_storage(&self) -> DownloadResult<()> {
         let metadata = self
             .metadata
@@ -869,6 +943,9 @@ impl DownloadTask {
             .as_ref()
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
         if size > 0 {
+            // P4:磁盘空间预检(allocate 前快速失败,避免分配失败或写到一半磁盘满)
+            let save_dir = std::path::Path::new(&self.config.download_dir);
+            check_disk_space(save_dir, size)?;
             storage.allocate(size).await?;
             debug!(size, "存储空间预分配完成");
         }
@@ -917,9 +994,12 @@ impl DownloadTask {
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
         Self::wait_control(&mut self.control_rx, pause_timeout).await?;
         let host = self.request_host()?;
-        let _pool_permit = match &self.pool {
-            Some(pool) => Some(pool.acquire(&host).await?),
-            None => None,
+        // P1:镜像路径跳过主 host 的 pool.acquire,改由 MirrorProtocol
+        // (已注入同一 pool)按真实命中镜像 host acquire,使各镜像能各自
+        // 占满自己的 per-host 配额。单源路径保持 engine 层 acquire 不变。
+        let _pool_permit = match (&self.pool, self.has_mirrors) {
+            (Some(pool), false) => Some(pool.acquire(&host).await?),
+            _ => None,
         };
         let start_instant = std::time::Instant::now();
 
@@ -953,7 +1033,30 @@ impl DownloadTask {
         // 逐块消费并写入,顺序追加偏移
         let mut pos: u64 = 0;
         tokio::pin!(stream);
-        while let Some(chunk_result) = tokio_stream::StreamExt::next(&mut stream).await {
+        // B11:改裸 `while let stream.next().await` 为 `loop { select!{...} }`,
+        // 使取消信号能在"无 chunk 到达"时(如死连接静默挂起)穿透到检查点,
+        // 与 download_single_fragment:1762 的 select! 同构。cancel-safe:
+        // StreamExt::next 仅持 &mut stream,被 select! 取消时无部分状态。
+        loop {
+            let chunk_result = if let Some(rx) = self.control_rx.as_mut() {
+                tokio::select! {
+                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
+                        Some(r) => r,
+                        None => break, // EOF:正常退出循环
+                    },
+                    interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
+                        interrupt?;
+                        return Err(DownloadError::Other("控制信号异常结束".into()));
+                    }
+                }
+            } else {
+                match tokio_stream::StreamExt::next(&mut stream).await {
+                    Some(r) => r,
+                    None => break,
+                }
+            };
+            // chunk 间隙快速响应暂停/取消(降频检查已在 select! 覆盖死连接场景,
+            // 此处补充 Paused 等非取消状态在 chunk 间隙的快速响应)
             if let Some(rx) = self.control_rx.as_mut() {
                 Self::wait_control_rx(rx, pause_timeout).await?;
             }
@@ -1182,7 +1285,10 @@ impl DownloadTask {
             let frag_storage = storage.clone();
             let frag_protocol = protocol.clone();
             let frag_semaphore = semaphore.clone();
-            let frag_pool = pool.clone();
+            // P1:镜像路径下 engine 层跳过主 host 的 pool.acquire,
+            // 改由 MirrorProtocol(已注入同一 pool)按真实命中镜像 host acquire,
+            // 使各镜像能各自占满自己的 per-host 配额。单源路径保持 engine 层 acquire。
+            let frag_pool = if self.has_mirrors { None } else { pool.clone() };
             let frag_buffer_pool = buffer_pool.clone();
             let frag_host = host.clone();
             let frag_limiter = rate_limiter.clone();
@@ -1190,6 +1296,9 @@ impl DownloadTask {
             let frag_progress_tx = progress_tx.clone();
             let frag_metrics = metrics.clone();
             let frag_circuit_breakers = circuit_breakers.clone();
+            // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
+            // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
+            let frag_has_mirrors = self.has_mirrors;
             let frag_verifier = self.verifier.clone();
             let completed_tx = completed_tx.clone();
 
@@ -1219,7 +1328,9 @@ impl DownloadTask {
                     let mut attempt: u32 = 0;
                     let frag_result: FragmentTaskResult = loop {
                         // 熔断器检查:若源已被熔断,直接跳过本次尝试
-                        if !frag_circuit_breakers.allow(&frag_url) {
+                        // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
+                        // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
+                        if !frag_has_mirrors && !frag_circuit_breakers.allow(&frag_url) {
                             if attempt >= max_retries {
                                 break Err((
                                     frag_index,
@@ -1273,7 +1384,10 @@ impl DownloadTask {
 
                         match result {
                             Ok((downloaded, duration, computed_hash)) => {
-                                frag_circuit_breakers.record_success(&frag_url);
+                                // B5:镜像路径不调用 engine 熔断器(MirrorProtocol stats 接管)
+                                if !frag_has_mirrors {
+                                    frag_circuit_breakers.record_success(&frag_url);
+                                }
                                 break Ok((frag_index, downloaded, duration, computed_hash));
                             }
                             Err(e) => {
@@ -1282,14 +1396,20 @@ impl DownloadTask {
                                     if let Some(ref m) = frag_metrics {
                                         m.inc_error();
                                     }
-                                    frag_circuit_breakers.record_failure(&frag_url);
+                                    // B5:镜像路径不调用 engine 熔断器
+                                    if !frag_has_mirrors {
+                                        frag_circuit_breakers.record_failure(&frag_url);
+                                    }
                                     break Err((frag_index, e));
                                 }
                                 if attempt >= max_retries {
                                     if let Some(ref m) = frag_metrics {
                                         m.inc_error();
                                     }
-                                    frag_circuit_breakers.record_failure(&frag_url);
+                                    // B5:镜像路径不调用 engine 熔断器
+                                    if !frag_has_mirrors {
+                                        frag_circuit_breakers.record_failure(&frag_url);
+                                    }
                                     break Err((frag_index, e));
                                 }
                                 // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
@@ -1324,7 +1444,10 @@ impl DownloadTask {
                                     worker_id,
                                     "分片下载失败,退避后重试"
                                 );
-                                frag_circuit_breakers.record_failure(&frag_url);
+                                // B5:镜像路径不调用 engine 熔断器
+                                if !frag_has_mirrors {
+                                    frag_circuit_breakers.record_failure(&frag_url);
+                                }
                                 // 重试前清除已选中的镜像源,触发下次尝试重新竞速
                                 frag_protocol.clear_selected().await;
                                 tokio::time::sleep(backoff).await;
@@ -1635,7 +1758,7 @@ impl DownloadTask {
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) {
         if let Some(tx) = progress_tx {
-            match tx.try_send(FragmentProgress {
+            match tx.try_send(FragmentProgress::Chunk {
                 fragment_index: frag_index,
                 completed: false,
                 fragment_downloaded: total_written,
@@ -1857,7 +1980,7 @@ impl DownloadTask {
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx
             && let Err(e) = tx
-                .send(FragmentProgress {
+                .send(FragmentProgress::Chunk {
                     fragment_index: frag_index,
                     completed: true,
                     fragment_downloaded: total_written,
@@ -1920,6 +2043,14 @@ impl DownloadTask {
         let mut join_set: tokio::task::JoinSet<DownloadResult<(u32, String, String)>> =
             tokio::task::JoinSet::new();
 
+        // P6:verify 读盘哈希循环需要取消检查点(大文件读盘持续数分钟,
+        // 裸 while 循环下取消信号无法穿透)。将 control_rx clone 传入每个
+        // spawn task,读盘循环每累计 VERIFY_CANCEL_CHECK_BYTES 字节已读数据
+        // 与 watch_for_interrupt 竞速一次。按字节(而非迭代次数)度量,使检查点
+        // 频率与 read_at 单次返回量解耦,对短读与大块读均保证一致的响应延迟。
+        let verify_pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
+        let verify_control_rx = self.control_rx.clone();
+
         for frag in &self.fragments {
             let Some(expected_hash) = frag.info.hash.clone() else {
                 continue;
@@ -1932,6 +2063,7 @@ impl DownloadTask {
             let storage = storage.clone();
             let permit_sem = semaphore.clone();
             let verifier = self.verifier.clone();
+            let mut control_rx = verify_control_rx.clone();
             join_set.spawn(async move {
                 let _permit = permit_sem.acquire().await;
                 // 流式哈希优先:下载阶段已边写边算,直接比对,消除 I/O 放大。
@@ -1945,11 +2077,26 @@ impl DownloadTask {
                     let end = start + size;
                     let mut buf = vec![0u8; chunk_size];
                     let mut hasher = verifier.new_hasher();
+                    // P6:读盘循环每累计 N 字节已读数据插入一次取消检查点,与下载路径的
+                    // chunk 循环 select! 同构(协作式取消依赖检查点可达)。
+                    // 大文件读盘持续数分钟,无检查点时取消信号无法穿透。
+                    // 按字节度量:read_at 返回量越大,累加越快、检查越频繁,与"已读数据量"
+                    // 成正比,而非与"调用次数"成正比(后者对 1 字节短读会过度检查,对
+                    // 8MiB 大块读则检查过疏)。
+                    let mut bytes_read_since_check: u64 = 0;
                     while offset < end {
                         let read_len = ((end - offset).min(chunk_size as u64)) as usize;
                         let read = storage.read_at(offset, &mut buf[..read_len]).await?;
                         hasher.update(&buf[..read]);
                         offset += read as u64;
+                        // 按已读字节降频检查:累计达阈值后检查一次中断信号并归零
+                        bytes_read_since_check = bytes_read_since_check.saturating_add(read as u64);
+                        if bytes_read_since_check >= VERIFY_CANCEL_CHECK_BYTES {
+                            if let Some(rx) = control_rx.as_mut() {
+                                Self::wait_control_rx(rx, verify_pause_timeout).await?;
+                            }
+                            bytes_read_since_check = 0;
+                        }
                     }
                     hasher.finalize()
                 };
@@ -2536,6 +2683,7 @@ mod tests {
             session,
             tachyon_core::config::MagnetConfig::default(),
             dir.path().to_path_buf(),
+            std::sync::Arc::new(dashmap::DashMap::new()),
         ));
 
         // 1) bt_fallback = Some:Cancelled 必须排除,其他错误(Timeout/Network)触发 fallback
@@ -6969,7 +7117,18 @@ mod tests {
             events.push(event);
         }
 
-        let completed_events: Vec<_> = events.iter().filter(|e| e.completed).collect();
+        let completed_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    FragmentProgress::Chunk {
+                        completed: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
         assert_eq!(completed_events.len(), 3, "应收到 3 个分片完成事件");
 
         let (bytes, fragments, errors) = metrics.snapshot();
@@ -7954,6 +8113,362 @@ mod tests {
             limiter.bytes_per_sec(),
             CAP,
             "限速器上限必须保持用户配置值,不得被实测带宽降低(负反馈 bug)"
+        );
+    }
+
+    // ===== B5: 镜像路径不误熔断 engine 层 circuit_breaker =====
+
+    /// B5 回归:`has_mirrors=true` 时,即使分片下载连续失败(超过熔断阈值 5),
+    /// engine 层 `circuit_breakers` 也不应被熔断(allow 仍返回 true)。
+    ///
+    /// 根因:镜像路径下 `frag_url` 是主 URL,若 engine 仍以主 URL 为 key 调
+    /// `record_failure`,单镜像故障会熔断整个任务(误熔断)。修复(B5):镜像路径
+    /// 跳过 engine 层熔断,改由 MirrorProtocol 的 per-source stats 接管故障隔离。
+    ///
+    /// 构造:`has_mirrors=true` + 失败协议(download_range 无数据 → Network 错误),
+    /// `max_retries=0` 快速失败。execute 必然失败,但断言 `circuit_breakers.allow(&url)`
+    /// 仍为 true(从未 record_failure → 从未熔断)。
+    #[tokio::test]
+    async fn test_b5_mirrors_path_does_not_trip_engine_circuit_breaker() {
+        let url = "http://example.com/b5-mirror.bin";
+        // 失败协议:probe 成功但 download_range 无数据 → 失败
+        let protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(test_metadata("b5.bin", 200)));
+        let storage = StorageKind::memory_with_capacity(200);
+        let mut task = DownloadTask::new_for_test(
+            url.to_string(),
+            DownloadConfig {
+                max_retries: 0,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: 100,
+            max_fragment_size: 100,
+            ..Default::default()
+        };
+        // 标记为镜像路径(B5:engine 层熔断应被跳过)
+        task.has_mirrors = true;
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // execute 必然失败(协议无 range 数据),但失败不应触发 engine 熔断器
+        let result = task.execute().await;
+        assert!(result.is_err(), "失败协议下 execute 应返回错误");
+
+        // B5 核心断言:engine 层 circuit_breakers 未被熔断(allow 仍为 true)
+        assert!(
+            task.circuit_breakers.allow(url),
+            "B5: 镜像路径下 engine 层熔断器不应被触发(应仍 Closed),\
+             实际已被误熔断(主 URL 为 key 记了 failure)"
+        );
+    }
+
+    /// B5 对照组:`has_mirrors=false`(单源路径)时,分片连续失败应触发 engine 熔断器,
+    /// 证明 B5 的跳过逻辑仅在镜像路径生效(不破坏单源故障隔离语义)。
+    #[tokio::test]
+    async fn test_b5_single_source_path_trips_engine_circuit_breaker() {
+        let url = "http://example.com/b5-single.bin";
+        let protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(test_metadata("b5s.bin", 200)));
+        let storage = StorageKind::memory_with_capacity(200);
+        let mut task = DownloadTask::new_for_test(
+            url.to_string(),
+            DownloadConfig {
+                max_retries: 3, // 允许重试以累积 failure 到阈值 5
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: 100,
+            max_fragment_size: 100,
+            ..Default::default()
+        };
+        // 单源路径(has_mirrors=false):engine 熔断器应工作
+        task.has_mirrors = false;
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        let _ = task.execute().await;
+
+        // 对照组:单源路径下失败应触发 engine 熔断器(allow 为 false)
+        // 注:2 个分片 × (max_retries+1)=4 次尝试 = 8 次 failure > 阈值 5 → 熔断
+        assert!(
+            !task.circuit_breakers.allow(url),
+            "B5 对照组: 单源路径下连续失败应触发 engine 熔断器(应 Open),\
+             实际未熔断(B5 跳过逻辑可能误覆盖了单源路径)"
+        );
+    }
+
+    // ===== B11: execute_full_download 取消穿透 =====
+
+    /// B11 回归:`execute_full_download` 的流读取循环必须能被取消信号穿透,
+    /// 即使流永不产出 chunk(死连接静默挂起)。
+    ///
+    /// 根因:旧实现 `while let Some(chunk) = stream.next().await` 是裸 await,
+    /// 取消检查点在循环体内不可达(流 Pending 时 select 不竞速)→ 取消信号无法穿透。
+    /// 修复(B11):改为 `loop { select!{ chunk=stream.next()=>..., interrupt=watch_for_interrupt()=>... } }`。
+    ///
+    /// 构造:不支持 Range 的协议(走 execute_full_download),其 `download_full_stream`
+    /// 返回永不产出项的 pending 流。注入 control_rx,50ms 后发 Cancel。
+    /// 修复前:500ms 超时失败(流 Pending,取消不可达);修复后:取消即时返回 Cancelled。
+    #[tokio::test]
+    async fn test_b11_cancel_penetrates_full_download_stalled_stream() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        /// 死流协议:probe 成功,download_full_stream 返回永不产出的 pending 流
+        struct StallingFullProtocol {
+            meta: FileMetadata,
+        }
+        impl Clone for StallingFullProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                }
+            }
+        }
+        impl Protocol for StallingFullProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>> {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+            fn download_range(
+                &self,
+                _url: &str,
+                _start: u64,
+                _end: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+                Box::pin(async { Err(DownloadError::Protocol("不应调用".into())) })
+            }
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                _start: u64,
+                _end: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+                Box::pin(async {
+                    Ok(Box::pin(futures::stream::pending::<DownloadResult<Bytes>>()) as ByteStream)
+                })
+            }
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+                Box::pin(async { Err(DownloadError::Protocol("不应调用".into())) })
+            }
+            fn download_full_stream(
+                &self,
+                _url: &str,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+                Box::pin(async {
+                    Ok(Box::pin(futures::stream::pending::<DownloadResult<Bytes>>()) as ByteStream)
+                })
+            }
+        }
+
+        let url = "http://example.com/b11-stall.bin";
+        // 不支持 Range → 走 execute_full_download 路径
+        let meta = FileMetadata {
+            file_name: "b11.bin".into(),
+            file_size: Some(100),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(StallingFullProtocol { meta });
+        let storage = StorageKind::memory_with_capacity(100);
+        let mut task = DownloadTask::new_for_test(
+            url.to_string(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
+        task.set_control_rx(control_rx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // 50ms 后发取消,给 execute 进入 stream.next().await(永久 Pending)留时间
+        let cancel_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            control_tx.send(TaskCommand::Cancel).unwrap();
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(500), task.execute())
+            .await
+            .expect("B11: 取消信号应穿透 execute_full_download 的 stalled 流读取");
+        cancel_handle.await.unwrap();
+
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "B11: stalled 流下取消应返回 Cancelled,实际: {result:?}"
+        );
+    }
+
+    // ===== P6: verify 读盘哈希循环取消穿透 =====
+
+    /// P6 回归:`verify` 读盘哈希循环必须能被取消信号穿透,即使读盘持续很久。
+    ///
+    /// 根因:旧实现裸 `while offset < end { read_at... }`,无取消检查点 → 大文件
+    /// 读盘(数分钟)时取消信号无法穿透。修复(P6):每累计 `VERIFY_CANCEL_CHECK_BYTES`
+    /// (64MiB)已读数据插入一次 `wait_control_rx` 检查点。按字节度量使检查频率与
+    /// read_at 单次返回量解耦。
+    ///
+    /// 构造:单分片 + 预期 hash + 慢速大块读存储(每次 read_at 返回整段 buf 并 sleep,
+    /// 文件 72MiB > 64MiB 阈值,8MiB chunk → 第 9 次读盘累计 72MiB ≥ 64MiB 触发检查点)。
+    /// 注入 control_rx,读盘开始后发 Cancel。修复前:取消不可达(读盘循环无检查点)→
+    /// 超时;修复后:累计达 64MiB 时检查点触发取消,返回 Cancelled。
+    #[tokio::test]
+    async fn test_p6_cancel_penetrates_verify_disk_read_loop() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        /// 慢速大块读存储:每次 read_at 返回整段 buf(最多 chunk_size=8MiB)并 sleep,
+        /// 模拟慢速大文件读盘。文件 72MiB > 64MiB 阈值,8 次 8MiB 读盘后累计 64MiB,
+        /// 第 9 次读盘时触发 P6 检查点。无需真实数十 GB 文件,但数据量足以验证字节累加。
+        struct SlowShortReadStorage {
+            data: Vec<u8>,
+            read_started: Arc<Notify>,
+        }
+        impl Clone for SlowShortReadStorage {
+            fn clone(&self) -> Self {
+                Self {
+                    data: self.data.clone(),
+                    read_started: self.read_started.clone(),
+                }
+            }
+        }
+        impl AsyncStorage for SlowShortReadStorage {
+            fn write_at(
+                &self,
+                _offset: u64,
+                data: Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                Box::pin(async move { Ok(data.len()) })
+            }
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.read_started.notify_waiters();
+                    // 模拟慢速读盘:sleep 使取消信号有窗口发送。
+                    // 30ms × 9 次 ≈ 270ms,远大于 50ms 取消延迟,确保取消在 verify 完成前到达。
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let pos = offset as usize;
+                    if pos >= self.data.len() {
+                        return Ok(0);
+                    }
+                    // 大块读:返回整段 buf(受剩余数据量限制),使字节累加快速达阈值
+                    let n = (self.data.len() - pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[pos..pos + n]);
+                    Ok(n)
+                })
+            }
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn allocate(
+                &self,
+                _size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                Box::pin(async move { Ok(self.data.len() as u64) })
+            }
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        // 72MiB 文件:8MiB chunk × 9 次读盘,第 9 次累计 72MiB ≥ 64MiB(检查点阈值)
+        // 选 72 而非 64:确保有一次"超阈值"读盘触发检查,而非恰好卡在边界。
+        let file_size: u64 = 72 * 1024 * 1024;
+        let data: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+        let hash = {
+            let v = CpuVerifier::blake3();
+            v.compute_hash(&data).unwrap()
+        };
+        let slow_storage = SlowShortReadStorage {
+            data: data.clone(),
+            read_started: Arc::new(Notify::new()),
+        };
+        let read_started = slow_storage.read_started.clone();
+        let storage = StorageKind::new(slow_storage.clone());
+
+        let frag_info = FragmentInfo {
+            index: 0,
+            start: 0,
+            end: file_size - 1,
+            size: file_size,
+            downloaded: 0,
+            hash: Some(hash),
+        };
+        // protocol 仅占位(verify 不下载,直接读盘)
+        let protocol = Arc::new(MockProto::new(test_metadata("p6.bin", file_size)));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/p6.bin".into(),
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![FragmentRecord::new(frag_info, 3)];
+        task.metadata = Some(test_metadata("p6.bin", file_size));
+        // 确保走"无 computed_hash → 读盘计算"路径(断点续传分片)
+        assert!(
+            task.fragments[0].computed_hash.is_none(),
+            "P6 测试需走读盘哈希路径(无 computed_hash)"
+        );
+
+        let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
+        task.set_control_rx(control_rx);
+
+        // 读盘开始后 50ms 发取消(此时已读 ~25 字节,尚未到 66 次检查点,
+        // 但 sleep 2ms × 66 ≈ 132ms,取消会在第 66 次检查点触发)
+        let cancel_handle = tokio::spawn(async move {
+            read_started.notified().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            control_tx.send(TaskCommand::Cancel).unwrap();
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(5000), task.verify())
+            .await
+            .expect("P6: 取消信号应穿透 verify 读盘哈希循环");
+        cancel_handle.await.unwrap();
+
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "P6: 读盘循环中取消应返回 Cancelled,实际: {result:?}"
         );
     }
 }

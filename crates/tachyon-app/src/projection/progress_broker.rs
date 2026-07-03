@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::Notify;
 
 use tokio::sync::watch;
@@ -38,6 +38,8 @@ pub struct ProgressBroker {
     dirty_tasks: Arc<DashSet<String>>,
     /// Notify to wake aggregator
     notify: Arc<Notify>,
+    /// 每任务本周期新完成分片索引增量
+    pub(crate) pending_deltas: Arc<DashMap<String, Vec<u32>>>,
 }
 
 impl ProgressBroker {
@@ -54,6 +56,7 @@ impl ProgressBroker {
             aggregator_spawned: AtomicBool::new(false),
             dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
+            pending_deltas: Arc::new(DashMap::new()),
         }
     }
 
@@ -70,6 +73,7 @@ impl ProgressBroker {
         let task_repository_ref = self.task_repository.clone();
         let dirty_tasks = self.dirty_tasks.clone();
         let notify = self.notify.clone();
+        let pending_deltas = self.pending_deltas.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
@@ -92,7 +96,7 @@ impl ProgressBroker {
                 // 通过 DashMap 的 get_mut 直接写入,不会触发 TaskRepository::version() 递增,
                 // 因此不能用 version 做短路,否则下载期间的进度更新永远无法广播。
                 // 下游 compute_progress_delta 会按值过滤掉无变化任务,保证前端不会收到冗余数据。
-                let event = build_progress_event(&task_repository_ref);
+                let event = build_progress_event(&task_repository_ref, &pending_deltas);
                 let _ = tx.send(event);
 
                 // Clear dirty set after building event
@@ -112,6 +116,7 @@ impl ProgressBroker {
             aggregator_spawned: AtomicBool::new(false),
             dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
+            pending_deltas: Arc::new(DashMap::new()),
         }
     }
 
@@ -122,12 +127,24 @@ impl ProgressBroker {
         self.notify.notify_one();
     }
 
+    /// 标记任务进度变化,并记录新完成的分片索引
+    pub fn mark_dirty_with_delta(&self, task_id: &str, delta_idx: Option<u32>) {
+        if let Some(idx) = delta_idx {
+            self.pending_deltas
+                .entry(task_id.to_string())
+                .or_default()
+                .push(idx);
+        }
+        self.dirty_tasks.insert(task_id.to_string());
+        self.notify.notify_one();
+    }
+
     /// 广播进度事件（手动触发，用于终态等特殊时刻）
     ///
     /// 扫描当前所有任务状态，构建全量 ProgressEvent 并立即发送。
     /// 不依赖 aggregator 定时器，确保终态变更被即时传播。
     pub fn broadcast_all(&self) {
-        let event = build_progress_event(&self.task_repository);
+        let event = build_progress_event(&self.task_repository, &self.pending_deltas);
         let _ = self.progress_tx.send(event);
     }
 
@@ -145,12 +162,19 @@ impl ProgressBroker {
 }
 
 /// 根据任务列表构建全量进度事件
-fn build_progress_event(task_repository: &TaskRepository) -> ProgressEvent {
+fn build_progress_event(
+    task_repository: &TaskRepository,
+    pending_deltas: &DashMap<String, Vec<u32>>,
+) -> ProgressEvent {
     task_repository
         .iter()
         .map(|r| {
             let id = r.key();
             let t = r.value();
+            let completed_delta = pending_deltas
+                .get_mut(id)
+                .map(|mut d| std::mem::take(&mut *d))
+                .unwrap_or_default();
             (
                 id.clone(),
                 TaskProgress {
@@ -160,6 +184,10 @@ fn build_progress_event(task_repository: &TaskRepository) -> ProgressEvent {
                     downloaded: t.downloaded,
                     status: t.status,
                     fragments_done: t.fragments_done,
+                    fragments_total: t.fragments_total,
+                    active_concurrency: t.active_concurrency,
+                    file_size: t.file_size,
+                    completed_delta,
                 },
             )
         })
@@ -183,7 +211,8 @@ mod tests {
     #[test]
     fn test_build_progress_event_empty() {
         let repository = make_test_repository();
-        let event = build_progress_event(&repository);
+        let deltas = DashMap::new();
+        let event = build_progress_event(&repository, &deltas);
         assert!(event.is_empty());
     }
 
@@ -203,6 +232,7 @@ mod tests {
                 progress: 0.5,
                 fragments_total: 4,
                 fragments_done: 2,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,
@@ -223,6 +253,7 @@ mod tests {
                 progress: 1.0,
                 fragments_total: 2,
                 fragments_done: 2,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,
@@ -231,7 +262,7 @@ mod tests {
             },
         );
 
-        let event = build_progress_event(&repository);
+        let event = build_progress_event(&repository, &DashMap::new());
         assert_eq!(event.len(), 2);
 
         let tp1 = event.get("t1").unwrap();
@@ -264,6 +295,7 @@ mod tests {
                 progress: 0.5,
                 fragments_total: 4,
                 fragments_done: 2,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,
@@ -317,6 +349,7 @@ mod tests {
                 progress: 0.5,
                 fragments_total: 4,
                 fragments_done: 2,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,
@@ -354,6 +387,7 @@ mod tests {
                 progress: 0.0,
                 fragments_total: 4,
                 fragments_done: 0,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,
@@ -418,6 +452,7 @@ mod tests {
                 progress: 0.5,
                 fragments_total: 4,
                 fragments_done: 2,
+                active_concurrency: 0,
                 created_at: "2025-01-01T00:00:00+08:00".to_string(),
                 save_path: String::new(),
                 error_reason: None,

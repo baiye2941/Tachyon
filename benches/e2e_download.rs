@@ -198,6 +198,69 @@ fn bench_bandwidth_tracking_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+/// 端到端下载执行路径基准:MockProtocol(分块流) -> probe -> execute_fragmented_download
+///
+/// 覆盖旧 bench 未触及的真实下载热路径:分片规划、并发下载、流式写入、
+/// 状态机转换。MockProtocol 用 with_chunk_size 模拟 HTTP chunked transfer,
+/// 使 download_range_stream 按 chunk 多次产出,覆盖引擎流读取循环的逐块刷写路径。
+///
+/// 数据规模:4 MiB / 4 分片 / 256 KiB chunk,兼顾可测性与运行速度。
+fn bench_execute_download_path(c: &mut Criterion) {
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use tachyon_core::test_harness::harness::{test_config, test_metadata};
+    use tachyon_core::traits::Protocol;
+    use tachyon_engine::{DownloadTask, StorageKind};
+
+    // 4 MiB 数据,4 个 1 MiB 分片,每分片按 256 KiB chunk 流式产出
+    const FILE_SIZE: u64 = 4 * 1024 * 1024;
+    const FRAGMENT_SIZE: u64 = 1024 * 1024;
+    const CHUNK_SIZE: usize = 256 * 1024;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("e2e_execute_download");
+    support::configure_group(&mut group, 10);
+
+    group.bench_function("4MiB_4frag_chunked_mock", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                // 构造 MockProtocol:每个分片区间填充随机数据,启用分块流模式
+                let mut protocol = tachyon_core::test_harness::harness::MockProtocol::new(
+                    test_metadata("bench.bin", FILE_SIZE),
+                );
+                let payload = Bytes::from(vec![0xA5u8; FRAGMENT_SIZE as usize]);
+                for i in 0..4u64 {
+                    let start = i * FRAGMENT_SIZE;
+                    let end = start + FRAGMENT_SIZE - 1;
+                    protocol = protocol.with_range_data(start, end, payload.clone());
+                }
+                protocol = protocol.with_chunk_size(CHUNK_SIZE);
+
+                let protocol: Arc<dyn Protocol> = Arc::new(protocol);
+                let mut task = DownloadTask::new_for_test(
+                    "http://example.com/bench.bin".into(),
+                    test_config(),
+                    protocol,
+                    StorageKind::memory(),
+                );
+
+                // probe 设置 metadata,plan 据此规划分片,execute 走并发分片下载
+                task.probe().await.expect("probe 失败");
+                task.plan().expect("plan 失败");
+                task.execute().await.expect("execute 失败");
+                assert_eq!(
+                    task.state(),
+                    tachyon_core::DownloadState::Completed,
+                    "execute 后任务状态应为 Completed"
+                );
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = bench_config();
@@ -207,6 +270,7 @@ criterion_group! {
         bench_recover_pending,
         bench_fragment_size_computation,
         bench_fragment_lifecycle,
-        bench_bandwidth_tracking_cycle
+        bench_bandwidth_tracking_cycle,
+        bench_execute_download_path
 }
 criterion_main!(benches);

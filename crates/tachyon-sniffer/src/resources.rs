@@ -41,8 +41,15 @@ const SENSITIVE_PARAM_NAMES: &[&str] = &[
 pub struct SnifferResource {
     /// 唯一标识
     pub id: String,
-    /// 资源 URL
+    /// 资源 URL(脱敏后,用于显示和去重)
     pub url: String,
+    /// 资源原始 URL(含凭据,用于实际下载)
+    ///
+    /// 与 `url` 的区别:`url` 经 `redact_sensitive_params` 脱敏(token/key/signature 等移除),
+    /// 无法用于下载需鉴权的资源;`download_url` 保留原始 URL 供 `createTask` 使用。
+    /// 前端拿到后立即传给 `createTask`,后者存储到 TaskInfo.url 时再脱敏。
+    #[serde(rename = "downloadUrl")]
+    pub download_url: String,
     /// 文件名
     #[serde(rename = "name")]
     pub file_name: String,
@@ -124,6 +131,7 @@ impl ResourceManager {
             SnifferResource {
                 id,
                 url: redact_sensitive_params(url),
+                download_url: url.to_string(),
                 file_name,
                 resource_type: resource_type.as_str().to_string(),
                 file_size,

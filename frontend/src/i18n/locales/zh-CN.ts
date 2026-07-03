@@ -10,7 +10,8 @@ const zhCN = {
   // —— 通用 ——
   "common.loading": "加载中...",
   "common.appError": "应用发生错误",
-  "common.appErrorHint": "应用遇到未预期的错误。可尝试重试,若反复出现请反馈以下信息。",
+  "common.appErrorHint":
+    "应用遇到未预期的错误。可尝试重试,若反复出现请反馈以下信息。",
   "common.errorStack": "错误堆栈",
   "common.confirm": "确认",
   "common.cancel": "取消",
@@ -80,8 +81,7 @@ const zhCN = {
   // —— 工具栏 ——
   "toolbar.newDownload": "新建下载",
   "toolbar.newDownloadShort": "新建",
-  "toolbar.searchPlaceholder":
-    "搜索任务或设置",
+  "toolbar.searchPlaceholder": "搜索任务或设置",
   "toolbar.selectAll": "全选",
   "toolbar.selectedCount": "已选 {count} 项",
   "toolbar.pause": "暂停",
@@ -200,8 +200,7 @@ const zhCN = {
   "detail.redownload": "重新下载",
   "detail.retry": "重试",
   "detail.retryWithMirror": "镜像重试",
-  "detail.retryWithMirrorHint":
-    "通过 hf-mirror.com 镜像重新下载",
+  "detail.retryWithMirrorHint": "通过 hf-mirror.com 镜像重新下载",
   "detail.copy.aria": "复制",
   "detail.copied.aria": "已复制",
   "detail.section.diagnostics": "失败诊断",
@@ -367,11 +366,13 @@ const zhCN = {
   "settings.magnet.disableDhtPersistence": "禁用 DHT 持久化(仅内存)",
   "settings.magnet.socksProxyUrl": "SOCKS5 代理(BT tracker + peer)",
   "settings.magnet.socksProxyUrlPlaceholder": "socks5://127.0.0.1:7897",
-  "settings.magnet.socksProxyUrlHint": "留空自动检测系统代理。格式: socks5://[用户:密码@]主机:端口",
+  "settings.magnet.socksProxyUrlHint":
+    "留空自动检测系统代理。格式: socks5://[用户:密码@]主机:端口",
   "settings.magnet.trackerList": "Tracker 服务器列表",
   "settings.magnet.trackerCount": "{n} 个",
   "settings.magnet.addTracker": "添加",
-  "settings.magnet.addTrackerPlaceholder": "udp://tracker.example.com:port/announce",
+  "settings.magnet.addTrackerPlaceholder":
+    "udp://tracker.example.com:port/announce",
   "settings.magnet.removeTracker": "移除",
   "settings.magnet.importPreset": "一键导入预设",
   "settings.magnet.clearAll": "清空全部",
@@ -385,11 +386,16 @@ const zhCN = {
   "settings.magnet.forceTrackerInterval": "强制 Tracker 间隔",
   "settings.magnet.deferWritesUpToMb": "延迟写入缓冲",
   "settings.magnet.disableDhtWhenSocks": "SOCKS5 时禁用 DHT",
-  "settings.magnet.peerConnectTimeoutHint": "1-300 秒。超时后淘汰死 peer,快于默认 10s 可加速 swarm 刷新。",
-  "settings.magnet.peerReadWriteTimeoutHint": "1-600 秒。单次读写无数据的淘汰阈值,过大易卡死 swarm。",
-  "settings.magnet.forceTrackerIntervalHint": "0=禁用(遵循 tracker 默认),30-3600 秒强制重 announce。较短间隔加速冷启动 peer 发现。",
-  "settings.magnet.deferWritesUpToMbHint": "0=禁用(同步写入),1-256 MB。攒满后批量落盘,减少慢盘 I/O 等待。",
-  "settings.magnet.disableDhtWhenSocksHint": "DHT 走 UDP,SOCKS5 不代理 UDP。启用此项避免无谓的超时等待。",
+  "settings.magnet.peerConnectTimeoutHint":
+    "1-300 秒。超时后淘汰死 peer,快于默认 10s 可加速 swarm 刷新。",
+  "settings.magnet.peerReadWriteTimeoutHint":
+    "1-600 秒。单次读写无数据的淘汰阈值,过大易卡死 swarm。",
+  "settings.magnet.forceTrackerIntervalHint":
+    "0=禁用(遵循 tracker 默认),30-3600 秒强制重 announce。较短间隔加速冷启动 peer 发现。",
+  "settings.magnet.deferWritesUpToMbHint":
+    "0=禁用(同步写入),1-256 MB。攒满后批量落盘,减少慢盘 I/O 等待。",
+  "settings.magnet.disableDhtWhenSocksHint":
+    "DHT 走 UDP,SOCKS5 不代理 UDP。启用此项避免无谓的超时等待。",
   "settings.magnet.restartRequired": "需重启生效",
   "settings.magnet.newTaskOnly": "对新任务生效",
   "settings.magnet.sectionPeer": "Peer 超时",
@@ -399,7 +405,8 @@ const zhCN = {
   "settings.about.userAgent": "User-Agent",
   "settings.about.customHeaders": "自定义 Headers",
   "settings.about.headersCount": "{n} 项",
-  "settings.about.securityHint": "以上字段受后端安全策略保护,不可在此修改(headers 有 CRLF 注入风险,user_agent 不应被前端覆盖)。",
+  "settings.about.securityHint":
+    "以上字段受后端安全策略保护,不可在此修改(headers 有 CRLF 注入风险,user_agent 不应被前端覆盖)。",
   "settings.save": "保存配置",
 
   // —— 历史面板 ——
@@ -422,6 +429,12 @@ const zhCN = {
   "history.aria.openFolder": "打开目录 {name}",
   "history.aria.redownload": "重新下载 {name}",
   "history.aria.delete": "删除记录 {name}",
+  "history.batchSelect": "批量选择",
+  "history.selectAll": "全选",
+  "history.deleteSelected": "删除选中",
+  "history.aria.selectRecord": "选择记录 {name}",
+  "confirm.deleteHistoryBatch.title": "删除选中历史记录",
+  "confirm.deleteHistoryBatch.message": "确定删除选中的 {count} 条历史记录?此操作不可撤销。",
 
   // —— 批量工具栏 ——
   "batch.aria": "批量操作",
@@ -455,12 +468,16 @@ const zhCN = {
   "speedChart.waiting": "等待速度数据...",
   "speedChart.peak": "峰值: ",
   "speedChart.average": "平均: ",
+  "speedChart.live": "当前速度",
+  "speedChart.now": "现在",
+  "speedChart.ago": "{seconds}秒前",
 
   // —— 分片矩阵 ——
   "chunk.sectionLabel": "分片分布",
   "chunk.infoHint":
-    "分片按批次聚合显示,颜色代表下载状态(已完成/下载中/等待),非线程分配",
-  "chunk.tooltip.fragment": "分片",
+    "分片颜色仅代表下载状态: 绿色=已完成, 青色=下载中, 灰色=等待中; 与线程/批次无关",
+  "chunk.tooltip.fragment": "分片 #{index}",
+  "chunk.tooltip.fragmentRange": "分片 #{start}-{end}",
   "chunk.tooltip.completed": "已完成",
 
   // —— 资源嗅探 ——
@@ -494,8 +511,7 @@ const zhCN = {
   "hub.download": "下载",
   "hub.downloadTitle": "直接从 HuggingFace 下载",
   "hub.mirrorDownload": "镜像下载",
-  "hub.mirrorDownloadTitle":
-    "通过 hf-mirror.com 镜像下载(国内加速)",
+  "hub.mirrorDownloadTitle": "通过 hf-mirror.com 镜像下载(国内加速)",
   "hub.aria.downloadFile": "下载 {name}",
   "hub.largeTag": "大",
 
@@ -507,7 +523,8 @@ const zhCN = {
 
   // —— 删除本地文件选项 ——
   "confirm.deleteLocalFile.label": "同时删除本地文件",
-  "confirm.deleteLocalFile.description": "删除最终保存文件及确定性临时文件(如 .part/.tmp)。此操作不可撤销。",
+  "confirm.deleteLocalFile.description":
+    "删除最终保存文件及确定性临时文件(如 .part/.tmp)。此操作不可撤销。",
   "toast.deleteBatchPartialFailed": "批量删除部分失败({count} 个): {error}",
 
   // —— HuggingFace 模型管理 ——
@@ -554,7 +571,8 @@ const zhCN = {
   "hub.verify.unverified": "未校验",
   "hub.verify.fileMissing": "文件不存在",
   "hub.newTask.hfPreview": "HuggingFace 模型",
-  "hub.newTask.hfPreviewInfo": "{files} 文件 · {size} · {framework} · {license}",
+  "hub.newTask.hfPreviewInfo":
+    "{files} 文件 · {size} · {framework} · {license}",
   "hub.scan.empty": "暂无本地模型",
   "hub.scan.scanning": "扫描中...",
   "hub.scan.error": "扫描失败: {error}",
@@ -567,11 +585,13 @@ const zhCN = {
   "hub.batch.failed": "批量下载创建失败: {error}",
   "experimental.title": "实验性功能",
   "experimental.huggingface": "Hugging Face 模型库",
-  "experimental.huggingfaceDesc": "浏览、搜索和下载 HuggingFace 模型权重，管理本地模型库",
+  "experimental.huggingfaceDesc":
+    "浏览、搜索和下载 HuggingFace 模型权重，管理本地模型库",
   "sidebar.huggingface": "Hugging Face",
   "settings.section.experimental": "实验性功能",
   "settings.hub.sourceMode": "HuggingFace 源模式",
-  "settings.hub.sourceModeDesc": "镜像模式经 hf-mirror.com 国内加速;竞速模式官方与镜像同时连接取快者;官方模式直连,需可访问 huggingface.co",
+  "settings.hub.sourceModeDesc":
+    "镜像模式经 hf-mirror.com 国内加速;竞速模式官方与镜像同时连接取快者;官方模式直连,需可访问 huggingface.co",
   "settings.hub.sourceOfficial": "官方",
   "settings.hub.sourceMirror": "镜像",
   "settings.hub.sourceRace": "竞速",

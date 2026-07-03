@@ -14,7 +14,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 serde_json = "1"
 url = "2"
 tachyon-core = { path = "../crates/tachyon-core" }
-tachyon-protocol = { path = "../crates/tachyon-protocol", default-features = false }
+# 启用 magnet feature:暴露 tachyon_protocol::magnet 模块
+# (validate_magnet_uri / parse_pe_from_magnet 纯解析函数,magnet_parse target 用)
+tachyon-protocol = { path = "../crates/tachyon-protocol", default-features = false, features = ["magnet"] }
 
 [workspace]
 
@@ -45,5 +47,11 @@ doc = false
 [[bin]]
 name = "ipc_deserialize"
 path = "fuzz_targets/ipc_deserialize.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "magnet_parse"
+path = "fuzz_targets/magnet_parse.rs"
 test = false
 doc = false

@@ -4,8 +4,12 @@
 //! 添加新存储后端只需实现 `AsyncStorage` trait,无需修改引擎层枚举。
 
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
 
 use bytes::{Bytes, BytesMut};
 
@@ -15,11 +19,199 @@ use tachyon_io::TokioFile;
 use tachyon_io::WinFile;
 use tachyon_io::storage::AsyncStorage;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-harness"))]
 use tachyon_core::test_harness::harness::MemoryStorage as MemStorage;
 
 // DownloadError 仅在部分错误路径使用
 use tachyon_core::DownloadError;
+
+// ---------------------------------------------------------------------------
+// P4: 下载前磁盘空间预检(跨平台,无新增 crate 依赖)
+// ---------------------------------------------------------------------------
+
+/// P4:磁盘空间预检 margin —— file_size 的 1% 或 100MB 取小值。
+///
+/// 预检需留余量:文件系统元数据、簇对齐、并发写入峰值等可能使实际占用
+/// 略大于声明的 file_size。margin 取较小者避免大文件时 margin 过大
+/// (1GB 文件 1% = 10MB 已足够),小文件时保底 100MB(覆盖文件系统开销)。
+const fn disk_space_margin(file_size: u64) -> u64 {
+    let one_pct = file_size / 100;
+    const HUNDRED_MB: u64 = 100 * 1024 * 1024;
+    if one_pct < HUNDRED_MB {
+        one_pct
+    } else {
+        HUNDRED_MB
+    }
+}
+
+/// P4:查询 `dir` 所在分区的可用磁盘空间(字节)。
+///
+/// 跨平台实现,不引入新 crate 依赖:
+/// - Windows:`GetDiskFreeSpaceExW`(kernel32,原始 extern "system" 声明)
+/// - Unix(Linux/macOS):`statvfs`(libc,原始 extern "C" 声明)
+///
+/// `dir` 不存在时,向上回溯到最近的存在的父目录(下载目录可能尚未创建)。
+/// 全部回溯失败或系统调用失败时返回 `Ok(None)`,调用方降级为"不预检"
+/// (不阻断下载,保持向后兼容)。
+///
+/// # Safety
+///
+/// 本函数内部使用 `unsafe` 调用平台 FFI:
+/// - Windows:`GetDiskFreeSpaceExW` 接收 UTF-16 路径指针(以 null 结尾),
+///   传出三个 `u64` 出参指针。指针均指向栈上合法内存,调用后立即读取。
+/// - Unix:`statvfs` 接收 C 字符串路径,传出 `Statvfs` 结构体指针。
+///   结构体为 `#[repr(C)]`,字段类型按平台 ABI 精确还原:f_bsize/f_frsize 用
+///   `c_ulong`,块计数字段用 `fsblkcnt_t`(macOS=c_uint,Linux=c_ulong),
+///   消除旧实现"全 u64"断言导致的 macOS 偏移错位。仅取 f_bavail*f_frsize。
+///
+/// 两条路径的 FFI 调用均不跨越 await 点,指针生命周期在同步栈帧内。
+pub(crate) fn available_disk_space(dir: &Path) -> Option<u64> {
+    // 回溯到存在的目录(下载目录可能尚未创建)
+    let probe = existing_ancestor(dir)?;
+    available_disk_space_inner(probe)
+}
+
+/// 向上回溯直到找到存在的目录;若 `dir` 本身存在则直接返回。
+fn existing_ancestor(dir: &Path) -> Option<&Path> {
+    let mut cur = dir;
+    loop {
+        if cur.is_dir() {
+            return Some(cur);
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn available_disk_space_inner(dir: &Path) -> Option<u64> {
+    // Safety:GetDiskFreeSpaceExW 是 Win32 稳定 API,签名自 NT 以来不变。
+    // 路径以 UTF-16 编码并以 null 结尾(encode_wide + push(0))。
+    // 三个出参指针指向栈上 u64,调用后立即读取返回值判断成败。
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory_name: *const u16,
+            free_bytes_available: *mut u64,
+            total_number_of_bytes: *mut u64,
+            total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+
+    // 目录路径转 UTF-16(null 结尾),FFI 要求宽字符串
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut free_available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY:wide 以 null 结尾且指针在调用期间有效;三个 out 指针指向
+    // 栈上合法 u64 内存。GetDiskFreeSpaceExW 无线程亲和性,可在任意线程调用。
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_available,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    if ok == 0 {
+        // 调用失败,降级为不预检(不阻断下载)
+        tracing::warn!(
+            dir = %dir.display(),
+            "GetDiskFreeSpaceExW 失败,跳过磁盘空间预检"
+        );
+        return None;
+    }
+    Some(free_available)
+}
+
+#[cfg(unix)]
+fn available_disk_space_inner(dir: &Path) -> Option<u64> {
+    // statvfs 返回结构体的"块计数字段"类型(fsblkcnt_t),按平台 ABI 区分:
+    //
+    // - macOS: `unsigned int`(c_uint, 4 字节)—— f_blocks/f_bfree/f_bavail 均为
+    //   `fsblkcnt_t = unsigned int`,而 f_bsize/f_frsize 是 `unsigned long`(8 字节)。
+    // - Linux: `unsigned long`(c_ulong)—— 64 位为 8 字节,32 位为 4 字节;
+    //   fsblkcnt_t 在 glibc 与 musl 均为 `unsigned long`,与 f_bsize/f_frsize 同类型。
+    //
+    // 历史问题(P4-statvfs):旧实现把 5 个字段全部硬编码为 u64,断言"布局在
+    // Linux/macOS 一致"。该断言对 macOS 错误:f_bavail(u32)位于偏移 24,但按 u64
+    // 读取会从偏移 32 取到 f_ffree/f_favail 拼接的垃圾值,导致 check_disk_space
+    // 恒放行(保护失效)。此类型别名按平台 ABI 精确还原字段宽度,消除偏移错位。
+    // f_bsize/f_frsize 统一用 c_ulong(跟随平台:macOS/Linux-64=8 字节,Linux-32=4 字节)。
+    #[cfg(target_os = "macos")]
+    type FsblkcntT = std::os::raw::c_uint;
+    #[cfg(not(target_os = "macos"))]
+    type FsblkcntT = std::os::raw::c_ulong;
+
+    // statvfs 结构体:仅取前 5 个字段,字段类型按平台 ABI 还原(见 FsblkcntT)。
+    // 完整结构体更长,但只读 f_frsize(第 2)和 f_bavail(第 5),
+    // 后续字段不影响前 5 个的偏移布局。
+    #[repr(C)]
+    struct Statvfs {
+        f_bsize: std::os::raw::c_ulong,
+        f_frsize: std::os::raw::c_ulong,
+        f_blocks: FsblkcntT,
+        f_bfree: FsblkcntT,
+        f_bavail: FsblkcntT,
+        // 其余字段省略(不读取,不影响前 5 个字段布局)
+    }
+
+    unsafe extern "C" {
+        fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
+    }
+
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+
+    let mut stat = Statvfs {
+        f_bsize: 0,
+        f_frsize: 0,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+    };
+    // SAFETY:c_path 以 null 结尾且指针在调用期间有效;stat 指针指向栈上
+    // 合法 Statvfs 内存。statvfs 是 POSIX 线程安全函数(无全局可变状态)。
+    let rc = unsafe { statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        tracing::warn!(dir = %dir.display(), "statvfs 失败,跳过磁盘空间预检");
+        return None;
+    }
+    // f_bavail(fsblkcnt_t)与 f_frsize(c_ulong)宽度因平台而异(macOS u32 / Linux u64),
+    // 统一提升为 u64 后用 saturating_mul 防止乘法溢出(超大磁盘 f_bavail*f_frsize 可能超 u64)。
+    // c_ulong/c_uint 是平台别名,Linux-64 上与 u64 同宽会触发 clippy unnecessary_cast,
+    // 但 macOS 上 f_bavail 为 c_uint(u32)确需转换,故整行 allow。
+    #[allow(clippy::unnecessary_cast)]
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// P4:预检磁盘空间是否足够容纳 `file_size`(+margin)。
+///
+/// 在 `prepare_storage` 之前调用:若可用空间 < file_size + margin,返回
+/// `DownloadError::Config`(不可重试),带中文提示含可用/需求数值,便于
+/// 用户定位问题。无法获取磁盘信息时返回 `Ok(())`(降级为不预检,保持
+/// 向后兼容,不阻断下载)。
+pub(crate) fn check_disk_space(dir: &Path, file_size: u64) -> DownloadResult<()> {
+    let Some(available) = available_disk_space(dir) else {
+        // 无法获取磁盘信息(目录不存在 / FFI 失败):不阻断下载
+        return Ok(());
+    };
+    let margin = disk_space_margin(file_size);
+    let needed = file_size.saturating_add(margin);
+    if available < needed {
+        return Err(DownloadError::Config(format!(
+            "磁盘空间不足: 可用 {} 字节 (约 {:.2} GB), 需求 {} 字节 (约 {:.2} GB, 含 {} 字节余量)",
+            available,
+            available as f64 / 1_073_741_824.0,
+            needed,
+            needed as f64 / 1_073_741_824.0,
+            margin,
+        )));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // ErasedStorage: 内部 trait
@@ -490,13 +682,14 @@ fn layout_split_iter(layout: &tachyon_core::FileLayout) -> impl Iterator<Item = 
 // F-26:AsyncMemWrapper 已删除。MemoryStorage 现在直接实现 AsyncStorage
 // (trait 已上移到 tachyon-core),无需适配器桥接 core::Storage -> io::AsyncStorage。
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-harness"))]
 impl DynStorage {
-    pub(crate) fn memory() -> Self {
+    /// 内存存储(测试/bench 用),避免文件系统 I/O 噪声干扰被测路径
+    pub fn memory() -> Self {
         Self::new(MemStorage::new())
     }
 
-    pub(crate) fn memory_with_capacity(cap: usize) -> Self {
+    pub fn memory_with_capacity(cap: usize) -> Self {
         Self::new(MemStorage::with_capacity(cap))
     }
 }
@@ -822,5 +1015,138 @@ mod tests {
              {iterations} 次 {elapsed:?} = {per_op_us} µs/op"
         );
         assert!(per_op_us > 0);
+    }
+
+    // ===== P4: 磁盘空间预检测试 =====
+
+    use super::{available_disk_space, check_disk_space, disk_space_margin};
+    use tachyon_core::DownloadError;
+
+    /// P4:available_disk_space 对系统临时目录应返回合理区间的可用空间。
+    ///
+    /// 验证跨平台 FFI 调用成功且字段布局正确:Windows 走 GetDiskFreeSpaceExW,
+    /// Unix 走 statvfs。仅断言 >0 无法捕获 macOS 上的偏移错位 bug(旧实现误读
+    /// f_ffree/f_favail 拼接的垃圾值,常为巨大正数,也 >0)。改用合理区间断言:
+    /// 下界 1MB(临时目录几乎不可能比这更少),上界 1EB(1 EiB ≈ 1.15e18 字节,
+    /// 远超任何现实磁盘;垃圾拼接值往往逼近 u64 上限,必然越界)。
+    #[test]
+    fn test_available_disk_space_returns_positive_for_temp_dir() {
+        let tmp = std::env::temp_dir();
+        let space = available_disk_space(&tmp);
+        assert!(space.is_some(), "临时目录 {:?} 应能获取可用磁盘空间", tmp);
+        let available = space.unwrap();
+        const ONE_MB: u64 = 1024 * 1024;
+        const ONE_EB: u64 = 1u64 << 60;
+        assert!(
+            available >= ONE_MB,
+            "临时目录可用空间 {available} 字节异常偏低(< 1MB),FFI 返回值可疑"
+        );
+        assert!(
+            available < ONE_EB,
+            "临时目录可用空间 {available} 字节异常偏高(>= 1EB),\
+             疑似 statvfs 字段偏移错位产生的垃圾值"
+        );
+    }
+
+    /// P4:available_disk_space 返回值不得为垃圾量级(回归 P4-statvfs)。
+    ///
+    /// 旧实现把 statvfs 的 5 个字段全声明为 u64,在 macOS 上 f_bavail(u32,
+    /// 偏移 24)被当作 u64 从偏移 32 读取,取到 f_ffree/f_favail 拼接的垃圾值,
+    /// 常逼近 u64 上限。check_disk_space 因此恒放行(保护失效)。本测试以
+    /// 系统临时目录为探针,断言返回值落在合理物理范围(>= 1MB 且 < 1EB),
+    /// 在 macOS 上能真正捕获该 bug;Windows/Linux-64 字段布局本就正确,继续通过。
+    #[test]
+    fn test_available_disk_space_not_garbage_magnitude() {
+        let tmp = std::env::temp_dir();
+        let Some(available) = available_disk_space(&tmp) else {
+            // FFI 失败不在本测试范围(由 returns_positive 测试覆盖)
+            return;
+        };
+        const ONE_MB: u64 = 1024 * 1024;
+        const ONE_EB: u64 = 1u64 << 60;
+        assert!(
+            (ONE_MB..ONE_EB).contains(&available),
+            "可用空间 {available} 字节不在合理物理区间 [1MB, 1EB),\
+             疑似 statvfs 字段偏移错位产生的垃圾值"
+        );
+    }
+
+    /// P4:available_disk_space 对不存在的目录应向上回溯到存在的父目录。
+    ///
+    /// 下载目录可能尚未创建(init_storage 之前),预检需能处理此场景。
+    /// 回溯到 existing_ancestor 后调用 FFI,应返回 Some(正值)。
+    #[test]
+    fn test_available_disk_space_handles_nonexistent_dir() {
+        let tmp = std::env::temp_dir();
+        let nonexistent = tmp.join("tachyon_p4_nonexistent_subdir_for_test");
+        let space = available_disk_space(&nonexistent);
+        // 回溯到 tmp(存在),应能获取空间。FFI 成功时返回 Some。
+        assert!(
+            space.is_some(),
+            "不存在的目录应回溯到存在的父目录并获取空间"
+        );
+    }
+
+    /// P4:check_disk_space 在空间充足时应返回 Ok。
+    ///
+    /// 临时目录通常有数 GB 可用空间,1 字节文件需求必然满足。
+    #[test]
+    fn test_check_disk_space_ok_when_sufficient() {
+        let tmp = std::env::temp_dir();
+        // 1 字节文件,margin = 1/100 = 0 字节(整数除法),需求 1 字节
+        let result = check_disk_space(&tmp, 1);
+        assert!(result.is_ok(), "1 字节文件应有足够空间: {result:?}");
+    }
+
+    /// P4:check_disk_space 在空间不足时应返回 Config 错误(不可重试)。
+    ///
+    /// 构造一个超出磁盘容量的需求(u64::MAX),应触发不足分支。
+    /// 错误消息应含"磁盘空间不足"和数值,便于用户定位。
+    #[test]
+    fn test_check_disk_space_err_when_insufficient() {
+        let tmp = std::env::temp_dir();
+        // u64::MAX 远超任何真实磁盘容量,必然不足
+        let result = check_disk_space(&tmp, u64::MAX);
+        assert!(result.is_err(), "u64::MAX 字节需求应触发磁盘空间不足");
+        let err = result.as_ref().unwrap_err();
+        match err {
+            DownloadError::Config(msg) => {
+                assert!(
+                    msg.contains("磁盘空间不足"),
+                    "错误消息应含'磁盘空间不足': {msg}"
+                );
+                assert!(msg.contains("字节"), "错误消息应含数值(字节): {msg}");
+            }
+            other => panic!("预期 Config 错误,实际: {other:?}"),
+        }
+        // Config 错误不可重试(磁盘空间不会因重试而改变)
+        assert!(!err.is_retryable(), "磁盘空间不足应为不可重试错误");
+    }
+
+    /// P4:disk_space_margin 取 file_size 的 1% 与 100MB(二进制)的较小值。
+    ///
+    /// - 小文件(1KB):1% = 10 字节,小于 100MB,margin = 10
+    /// - 大文件(100GB):1% = 1GB,大于 100MB,margin = 100MB(二进制 104857600)
+    /// - 边界(file_size=0):1% = 0,margin = 0
+    #[test]
+    fn test_disk_space_margin_uses_smaller_of_one_pct_and_100mb() {
+        // 小文件:1% < 100MB(二进制)
+        assert_eq!(disk_space_margin(1024), 10, "1KB 的 1% = 10 字节");
+        assert_eq!(disk_space_margin(1_000_000), 10_000, "1MB 的 1% = 10KB");
+        // 临界点:1% == 100MB(二进制)时 file_size = 10_485_760_000
+        // 10_485_760_001 的 1% = 104_857_600.01 → 整数 104_857_600 = 100MB(二进制)
+        assert_eq!(
+            disk_space_margin(10_485_760_001),
+            104_857_600,
+            "临界值+1 的 1% = 100MB(二进制),应取 100MB"
+        );
+        // 大文件:1% > 100MB(二进制),取 100MB(二进制)
+        assert_eq!(
+            disk_space_margin(100 * 1024 * 1024 * 1024),
+            104_857_600,
+            "100GB 的 1% = 1GB > 100MB,应取 100MB(二进制)"
+        );
+        // 边界:file_size = 0 → margin = 0
+        assert_eq!(disk_space_margin(0), 0, "0 字节文件的 margin 应为 0");
     }
 }

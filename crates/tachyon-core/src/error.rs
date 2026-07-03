@@ -113,6 +113,9 @@ impl DownloadError {
             // 需要重试的具体错误应使用 Network/Protocol 等明确变体
             DownloadError::Other(_) => false,
 
+            // 磁盘满不可恢复:重试只会反复失败浪费带宽,应快速失败
+            DownloadError::Io(e) => e.kind() != std::io::ErrorKind::StorageFull,
+
             // 其余错误默认可重试
             _ => true,
         }
@@ -445,5 +448,23 @@ mod tests {
                 "HTTP {status} 不应可重试"
             );
         }
+    }
+
+    #[test]
+    fn test_is_retryable_io_storage_full_not_retryable() {
+        // 磁盘满不可恢复:重试只会反复失败浪费带宽
+        assert!(
+            !DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "磁盘空间不足"
+            ))
+            .is_retryable(),
+            "StorageFull 应不可重试"
+        );
+        // 其他 Io 错误仍可重试
+        assert!(
+            DownloadError::Io(std::io::Error::other("io")).is_retryable(),
+            "普通 Io 错误应可重试"
+        );
     }
 }

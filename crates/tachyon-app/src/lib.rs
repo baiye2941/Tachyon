@@ -145,6 +145,7 @@ pub fn run() {
             // 进度查询
             get_download_progress,
             subscribe_progress,
+            get_task_fragments,
             // 嗅探
             get_sniffer_resources,
             add_sniffer_filter,
@@ -192,6 +193,7 @@ async fn any_fragment() {
         progress: 0.0,
         fragments_total: 4,
         fragments_done: 0,
+        active_concurrency: 0,
         created_at: chrono::Local::now().to_rfc3339(),
         save_path: String::new(),
         error_reason: None,
@@ -241,6 +243,7 @@ async fn max_concurrent() {
                     progress: 0.0,
                     fragments_total: 0,
                     fragments_done: 0,
+                    active_concurrency: 0,
                     created_at: chrono::Local::now().to_rfc3339(),
                     save_path: String::new(),
                     error_reason: None,

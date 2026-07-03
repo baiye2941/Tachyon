@@ -323,26 +323,45 @@ impl GpuVerifier {
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size * 4);
         self.queue.submit(Some(encoder.finish()));
 
-        // 读回 GPU 结果
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| DownloadError::Other(format!("GPU 设备 poll 失败: {e}").into()))?;
-        rx.recv()
-            .map_err(|e| DownloadError::Other(format!("GPU buffer 映射通道关闭: {e}").into()))?
-            .map_err(|e| DownloadError::Other(format!("GPU buffer 映射失败: {e}").into()))?;
+        // 读回 GPU 结果 —— H-6 修复: 阻塞操作移入 spawn_blocking,避免阻塞 tokio worker
+        //
+        // `device.poll(wait_indefinitely)` 与 `rx.recv()`(std mpsc)均为同步阻塞调用,
+        // 直接在 async fn 中执行会卡住整个 tokio worker 线程。这里把 device/staging
+        // buffer 的克隆(wgpu 类型均为 Clone+Send)以及回调通道移入 spawn_blocking 闭包,
+        // 在独立阻塞线程完成 poll + 映射读取 + u32 解析,仅返回轻量的 Vec<u32>。
+        let device = self.device.clone();
+        let staging = staging_buffer.clone();
+        let output_words: Vec<u32> =
+            tokio::task::spawn_blocking(move || -> DownloadResult<Vec<u32>> {
+                let buffer_slice = staging.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+                device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|e| DownloadError::Other(format!("GPU 设备 poll 失败: {e}").into()))?;
+                rx.recv()
+                    .map_err(|e| {
+                        DownloadError::Other(format!("GPU buffer 映射通道关闭: {e}").into())
+                    })?
+                    .map_err(|e| {
+                        DownloadError::Other(format!("GPU buffer 映射失败: {e}").into())
+                    })?;
 
-        let output_data = buffer_slice.get_mapped_range();
-        let output_words: Vec<u32> = output_data
-            .chunks(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        drop(output_data);
-        staging_buffer.unmap();
+                let output_data = buffer_slice.get_mapped_range();
+                let words: Vec<u32> = output_data
+                    .chunks(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                drop(output_data);
+                staging.unmap();
+                Ok(words)
+            })
+            .await
+            .map_err(|e| {
+                DownloadError::Other(format!("GPU 计算任务 panic/join 失败: {e}").into())
+            })??;
 
         // 验证输出长度
         if output_words.len() < num_chunks * 8 {
@@ -362,7 +381,7 @@ impl GpuVerifier {
             let hash = blake3::hash(data);
             Ok(hash.to_hex().to_string())
         } else {
-            // 多 chunk: CPU 端二叉树归约
+            // 多 chunk: CPU 端二叉树归约(纯 CPU 计算,可在本 async 任务中执行)
             let chunk_cvs: Vec<[u32; 8]> = output_words
                 .chunks(8)
                 .take(num_chunks)
@@ -512,19 +531,34 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
 
 /// BLAKE3 二叉树归约
 ///
-/// 将各 chunk 的 chaining value 通过 PARENT 压缩逐层归约,
-/// 直到只剩一个根节点,最终压缩附加 ROOT 标志。
+/// 将各 chunk 的 chaining value 通过 PARENT 压缩逐层归约得到根哈希。
 ///
 /// H-6 修复: 使用 blake3 crate 的 hazmat API 做正确的树形归约。
-/// 策略:使用 trailing-zeros 栈式归约收集未合并子树 chaining values,
-/// 然后从右向左逐对归约,最终层使用 merge_subtrees_root。
 ///
-/// 对于 2 的幂个 chunks,栈式归约后只剩余 1 个 chaining value,
-/// 此时使用 blake3_compress 做最终 ROOT 输出:
-/// compress(IV, cv||zero, 0, BLOCK_SIZE, PARENT|ROOT)
+/// # 核心原理
+///
+/// BLAKE3 树形归约的关键约束:**只有最顶层(根)节点附加 ROOT 标志**,
+/// 所有中间层用非根合并。这与 blake3 参考实现的"懒合并"策略一致 ——
+/// 根节点直到 `finalize()` 才合并,从而保证 ROOT 标志只附加在最顶层一次。
+///
+/// 对于非 2 的幂个 chunks,栈式归约天然能让栈中剩余 2 个以上 CV,
+/// 顶层 `merge_subtrees_root` 可以正确应用。但对于 2 的幂个 chunks,
+/// 栈式归约会在循环内把最后一对也用 `merge_subtrees_non_root` 合并掉,
+/// 导致栈只剩 1 个 CV —— 此时已无法恢复左右子树,根标志无处附加。
+/// 旧代码对单 CV 做的错误补救 `compress(IV, cv||zero, PARENT|ROOT)`
+/// 等价于"对一个 chaining value 再做一次 PARENT+ROOT 压缩",
+/// 多套了一层 PARENT,与 blake3 规范不符(参见 test_blake3_compress_root_vs_hazmat)。
+///
+/// # 修复方案: 递归分治
+///
+/// 改用与 blake3 `left_subtree_len` 一致的递归分治:
+/// - 左子树大小 = 严格小于 N 的最大 2 的幂(blake3 规范要求左子树为满的 2 的幂)
+/// - 右子树 = 其余部分(可能不是 2 的幂,递归处理)
+/// - 递归到 N==1 返回单 CV;每次合并时,**只有最顶层调用用 `merge_subtrees_root`**,
+///   其余层用 `merge_subtrees_non_root`
+///
+/// 该方案对所有 N(含 2 的幂、奇数、任意偶数)都正确,且无需维护栈状态。
 fn blake3_tree_reduce(chunk_cvs: &[[u32; 8]], _total_len: u32) -> [u32; 8] {
-    use blake3::hazmat::{Mode, merge_subtrees_non_root, merge_subtrees_root};
-
     assert!(
         !chunk_cvs.is_empty(),
         "blake3_tree_reduce 至少需要一个 chunk CV"
@@ -542,55 +576,93 @@ fn blake3_tree_reduce(chunk_cvs: &[[u32; 8]], _total_len: u32) -> [u32; 8] {
         })
         .collect();
 
-    // 栈式增量归约
-    let mut cv_stack: Vec<[u8; 32]> = Vec::new();
+    // 顶层入口: 最外层合并用 ROOT 标志
+    let root_hash = reduce_subtree_root(&cvs_bytes);
+    hash_to_u32(&root_hash)
+}
 
-    for (chunk_idx, &chunk_cv) in cvs_bytes.iter().enumerate() {
-        let mut total_chunks = (chunk_idx + 1) as u64;
-        let mut new_cv = chunk_cv;
-
-        while total_chunks & 1 == 0 {
-            let left_cv = cv_stack.pop().expect("CV 栈不应为空");
-            new_cv = merge_subtrees_non_root(&left_cv, &new_cv, Mode::Hash);
-            total_chunks >>= 1;
-        }
-
-        cv_stack.push(new_cv);
+/// 递归归约子树并附加 ROOT 标志(根节点)
+///
+/// 返回根哈希。N==1 时该 chunk 自身即根,但其 chaining value 来自
+/// `finalize_non_root`(不含 ROOT),需用 hazmat 的 root 路径补上 ROOT。
+/// 然而 blake3 规范下,单 chunk 的根等价于对该 chunk 做 CHUNK_START|CHUNK_END|ROOT
+/// 压缩 —— 这与 `finalize_non_root` + ROOT 补充路径不同。为避免引入新的不一致,
+/// N==1 时直接复用 blake3 crate 重新对该子树数据做根压缩不可行(此处只有 CV)。
+///
+/// 实际上 `compute_blake3` 调用方保证 num_chunks >= 2 才进入本函数,
+/// 故 N==1 分支仅作防御性兜底:对单 CV 做 PARENT|ROOT 压缩输出 32 字节。
+fn reduce_subtree_root(cvs: &[[u8; 32]]) -> blake3::Hash {
+    use blake3::hazmat::{Mode, merge_subtrees_root};
+    debug_assert!(!cvs.is_empty());
+    if cvs.len() == 1 {
+        // 防御性兜底: 单 CV 视为根,用 PARENT|ROOT 压缩输出。
+        // 注: 正常调用路径(compute_blake3)不会进入此分支(num_chunks>=2)。
+        return single_cv_root_hash(&cvs[0]);
     }
+    // N>=2: 用 blake3 官方 left_subtree_len 切分(保证左子树为满的 2 的幂子树)
+    let left_len = left_subtree_chunk_count(cvs.len());
+    let (left, right) = cvs.split_at(left_len);
+    let left_cv = reduce_subtree_non_root(left);
+    let right_cv = reduce_subtree_non_root(right);
+    merge_subtrees_root(&left_cv, &right_cv, Mode::Hash)
+}
 
-    // 从右向左归约栈中剩余的 CV
-    while cv_stack.len() > 1 {
-        let right = cv_stack.pop().unwrap();
-        let left = cv_stack.pop().unwrap();
-        if cv_stack.is_empty() {
-            // 最终层: ROOT 压缩
-            let root = merge_subtrees_root(&left, &right, Mode::Hash);
-            return hash_to_u32(&root);
-        }
-        cv_stack.push(merge_subtrees_non_root(&left, &right, Mode::Hash));
+/// 递归归约子树为非根 chaining value(中间层,不附加 ROOT)
+///
+/// N==1 时直接返回该 chunk 的 chaining value(`finalize_non_root` 已含正确的
+/// CHUNK_START/END 标志但不含 ROOT,正是中间层所需)。
+fn reduce_subtree_non_root(cvs: &[[u8; 32]]) -> [u8; 32] {
+    use blake3::hazmat::{Mode, merge_subtrees_non_root};
+    debug_assert!(!cvs.is_empty());
+    if cvs.len() == 1 {
+        return cvs[0];
     }
+    let left_len = left_subtree_chunk_count(cvs.len());
+    let (left, right) = cvs.split_at(left_len);
+    let left_cv = reduce_subtree_non_root(left);
+    let right_cv = reduce_subtree_non_root(right);
+    merge_subtrees_non_root(&left_cv, &right_cv, Mode::Hash)
+}
 
-    // 栈中只剩 1 个 CV (2 的幂个 chunks):
-    // 回退到使用 blake3_compress 做最终 ROOT 输出
-    let single_cv = cv_stack[0];
+/// 返回 blake3 规范定义的左子树 chunk 数量
+///
+/// 直接复用 blake3 crate 的 `hazmat::left_subtree_len`(以字节为单位),
+/// 保证与官方实现完全一致的子树切分:左子树必须是满的 2 的幂子树。
+/// 例如 chunk 数 N: 2->1, 3->2, 4->2, 5->4, 6->4, 7->4, 8->4, 9->8。
+fn left_subtree_chunk_count(num_chunks: usize) -> usize {
+    use blake3::hazmat::left_subtree_len;
+    debug_assert!(num_chunks >= 2);
+    // 以字节为单位调用官方函数,再换算回 chunk 数
+    let input_bytes = (num_chunks as u64) * (CHUNK_SIZE as u64);
+    let left_bytes = left_subtree_len(input_bytes);
+    (left_bytes / CHUNK_SIZE as u64) as usize
+}
+
+/// 对单个 chaining value 做根输出兜底(PARENT|ROOT 压缩)
+///
+/// 仅在 reduce_subtree_root 的 N==1 防御分支使用。正常多 chunk 路径不进入。
+fn single_cv_root_hash(cv: &[u8; 32]) -> blake3::Hash {
+    // 将 [u8;32] CV 解析为 8 个 u32(小端序),构造 PARENT 块 [cv||zero],
+    // 用 BLAKE3 压缩函数附加 PARENT|ROOT 标志输出 32 字节根哈希。
     let mut cv_words = [0u32; 8];
     for i in 0..8 {
-        cv_words[i] = u32::from_le_bytes([
-            single_cv[i * 4],
-            single_cv[i * 4 + 1],
-            single_cv[i * 4 + 2],
-            single_cv[i * 4 + 3],
-        ]);
+        cv_words[i] = u32::from_le_bytes([cv[i * 4], cv[i * 4 + 1], cv[i * 4 + 2], cv[i * 4 + 3]]);
     }
     let mut root_block = [0u32; 16];
     root_block[..8].copy_from_slice(&cv_words);
-    blake3_compress(
+    let root_words = blake3_compress(
         &IV,
         &root_block,
         0,
         BLOCK_SIZE as u32,
         FLAG_PARENT | FLAG_ROOT,
-    )
+    );
+    // 将 [u32;8] 转回 [u8;32] 构造 blake3::Hash
+    let mut bytes = [0u8; 32];
+    for i in 0..8 {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&root_words[i].to_le_bytes());
+    }
+    blake3::Hash::from(bytes)
 }
 
 /// 将 blake3::Hash 转换为 [u32; 8]
@@ -1084,7 +1156,6 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
     fn test_tree_reduce_2_chunks() {
         let data = vec![0xABu8; CHUNK_SIZE * 2];
         verify_tree_reduce_consistency(&data, "2 chunks");
@@ -1151,7 +1222,6 @@ mod tests {
 
     /// H-6: 4 个 chunk 的归约正确性(偶数,两层归约)
     #[test]
-    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
     fn test_tree_reduce_4_chunks() {
         let data = vec![0x13u8; CHUNK_SIZE * 4];
         verify_tree_reduce_consistency(&data, "4 chunks");
@@ -1159,7 +1229,6 @@ mod tests {
 
     /// H-6: 8 个 chunk 的归约正确性(2 的幂)
     #[test]
-    #[ignore = "H-6: 2的幂chunks栈式归约后仅余1个CV,ROOT附加方式待重构"]
     fn test_tree_reduce_8_chunks() {
         let data = vec![0x37u8; CHUNK_SIZE * 8];
         verify_tree_reduce_consistency(&data, "8 chunks");

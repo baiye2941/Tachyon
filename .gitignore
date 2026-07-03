@@ -56,3 +56,5 @@ bun.lockb
 
 # Git worktrees（隔离工作区）
 .worktrees/
+.playwright-mcp/
+.superpowers/sdd/

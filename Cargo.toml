@@ -50,9 +50,6 @@ rcgen = "0.14"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
 sha2 = "0.11"
 
-# 随机数
-getrandom = "0.4"
-
 # 密码学
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
 rand = "0.9"
@@ -124,10 +121,6 @@ name = "hex_encode"
 harness = false
 
 [[bench]]
-name = "write_pipeline"
-harness = false
-
-[[bench]]
 name = "e2e_download"
 harness = false
 
@@ -135,7 +128,7 @@ harness = false
 criterion = { workspace = true }
 tachyon-core = { path = "crates/tachyon-core", features = ["test-harness"] }
 tachyon-io = { path = "crates/tachyon-io" }
-tachyon-engine = { path = "crates/tachyon-engine" }
+tachyon-engine = { path = "crates/tachyon-engine", features = ["test-harness"] }
 tachyon-crypto = { path = "crates/tachyon-crypto" }
 tachyon-scheduler = { path = "crates/tachyon-scheduler" }
 tachyon-sniffer = { path = "crates/tachyon-sniffer" }
