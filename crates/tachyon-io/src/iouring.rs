@@ -2077,18 +2077,20 @@ mod tests {
             r1.expect("task1 join").expect("write_at(10) 应成功");
             r2.expect("task2 join").expect("write_at(100) 应成功");
 
-            // 读回验证两段数据都正确落盘,互不覆盖
-            let mut buf_a = [0u8; 20];
-            storage.read_at(10, &mut buf_a).await.expect("read_at(10)");
+            // 读回验证两段数据都正确落盘,互不覆盖。
+            // read_at 要求 O_DIRECT 对齐(offset/len 均 4096 倍数),
+            // 故读整个对齐块后切片检查非对齐区间。
+            let mut block = vec![0u8; 4096];
+            storage
+                .read_at(0, &mut block)
+                .await
+                .expect("read_at(0) 对齐块");
+            let buf_a = &block[10..30];
             assert!(
                 buf_a.iter().all(|&b| b == 0xAA),
                 "round {round}: offset=10 应为 0xAA,实际 {buf_a:?}(并发 RMW lost-update)"
             );
-            let mut buf_b = [0u8; 20];
-            storage
-                .read_at(100, &mut buf_b)
-                .await
-                .expect("read_at(100)");
+            let buf_b = &block[100..120];
             assert!(
                 buf_b.iter().all(|&b| b == 0xBB),
                 "round {round}: offset=100 应为 0xBB,实际 {buf_b:?}(并发 RMW lost-update)"
