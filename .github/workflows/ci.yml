@@ -126,9 +126,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: cargo-bins/cargo-binstall@v1.20.0
-      - name: 安装 taplo
-        run: cargo binstall -y --force taplo-cli
+      - name: 安装 taplo(预编译二进制)
+        # cargo-binstall 回退源码编译会因 globset 依赖解析失败而报错(quickinstall 无预编译包),
+        # 改用 taplo 官方 GitHub release 的预编译二进制,避免源码编译。
+        run: |
+          set -eu
+          TAPLO_VERSION=$(curl -sSL https://api.github.com/repos/tamasfe/taplo/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+          curl -sSL "https://github.com/tamasfe/taplo/releases/download/${TAPLO_VERSION}/taplo-linux-x86_64.gz" -o taplo.gz
+          gunzip taplo.gz
+          chmod +x taplo
+          sudo mv taplo /usr/local/bin/taplo
+          taplo --version
       - name: TOML 格式检查
         run: taplo check
 
