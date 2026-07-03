@@ -8377,8 +8377,9 @@ mod tests {
             ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
                 Box::pin(async move {
                     self.read_started.notify_waiters();
-                    // 模拟慢速读盘:sleep 使取消信号有窗口发送
-                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    // 模拟慢速读盘:sleep 使取消信号有窗口发送。
+                    // 30ms × 9 次 ≈ 270ms,远大于 50ms 取消延迟,确保取消在 verify 完成前到达。
+                    tokio::time::sleep(Duration::from_millis(30)).await;
                     let pos = offset as usize;
                     if pos >= self.data.len() {
                         return Ok(0);
