@@ -238,17 +238,22 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 if chunk_completed {
                     completed.insert(fragment_index);
                     pending_completed.push(fragment_index);
-                    // 已完成的分片不再保留在 partial map 中
-                    frag_bytes.remove(&fragment_index);
                     // 更新 FragmentStateStore.done_set
                     fragment_state_store.mark_done(&task_id, fragment_index);
                 }
-                // 增量更新
+                // 增量更新:先 insert 取出旧值计算差量,再按需清理 partial map。
+                // 注意:完成事件必须在 insert 之后 remove。若先 remove 则 insert
+                // 返回 None(old=0),会把整片大小再次累加,导致字节双重计数
+                // (前端显示 ≈ 2× 文件大小,完成后被 file_size 覆盖跳回)。
                 let old = frag_bytes
                     .insert(fragment_index, fragment_downloaded)
                     .unwrap_or(0);
                 total_downloaded =
                     total_downloaded.saturating_add(fragment_downloaded.saturating_sub(old));
+                if chunk_completed {
+                    // 已完成的分片不再保留在 partial map 中
+                    frag_bytes.remove(&fragment_index);
+                }
                 if event_count == 1 || event_count.is_multiple_of(50) {
                     tracing::info!(
                         event = event_count,
@@ -489,6 +494,91 @@ mod tests {
         let task = task_repository.get(&task_id).unwrap();
         assert_eq!(task.fragments_done, 2);
         assert_eq!(task.downloaded, 1024);
+    }
+
+    /// 验证分片完成事件不会导致字节双重计数。
+    ///
+    /// 回归场景:分片在流式下载过程中通过 `Chunk { completed: false }`
+    /// 事件逐块累加 `total_downloaded`,分片结束时再发送
+    /// `Chunk { completed: true, fragment_downloaded: 整片大小 }`。
+    /// 若 app 层在完成事件时先 `remove` 再 `insert`,`insert` 返回 None(old=0),
+    /// 会把整片大小再次累加,导致前端显示 ≈ 2× 文件大小。
+    #[tokio::test]
+    async fn test_chunk_completion_does_not_double_count_bytes() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "test-double-count".to_string();
+        let frag_size: u64 = 1_000;
+
+        task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.bin".to_string(),
+                file_name: "file.bin".to_string(),
+                file_size: Some(frag_size),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 1,
+                fragments_done: 0,
+                active_concurrency: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
+                hf_meta: None,
+            },
+        );
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        // 流式增量:分片 0 在写入过程中逐块上报累计字节
+        for partial in [200_u64, 500, 800] {
+            progress_tx
+                .send(FragmentProgress::Chunk {
+                    fragment_index: 0,
+                    completed: false,
+                    fragment_downloaded: partial,
+                })
+                .await
+                .unwrap();
+        }
+        // 分片完成事件:上报整片大小(与最后一个增量值一致)
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: true,
+                fragment_downloaded: frag_size,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        // 完成事件不应再次累加整片大小
+        assert_eq!(
+            task.downloaded, frag_size,
+            "分片完成事件导致字节双重计数: got {} expected {}",
+            task.downloaded, frag_size
+        );
     }
 
     #[tokio::test]
