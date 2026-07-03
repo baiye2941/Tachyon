@@ -105,9 +105,11 @@ jobs:
         working-directory: frontend
         run: bun install
       # SRE-003: 前端安全审计门禁
+      # 使用 bun audit(项目用 bun 管理依赖,无 package-lock.json,
+      # npm audit 会因 ENOLOCK 失败)。与 ci.yml 的前端审计命令保持一致。
       - name: 前端依赖安全审计
         working-directory: frontend
-        run: npx npm audit --audit-level=high
+        run: bun audit --audit-level=high
       - name: TypeScript 类型检查
         working-directory: frontend
         run: bun run typecheck
