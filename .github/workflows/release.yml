@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+# tauri-action 需要创建 Release 和上传产物,需要 contents: write 权限
+# 默认 GITHUB_TOKEN 只有只读权限,会导致 "Resource not accessible by integration"
+permissions:
+  contents: write
+
 jobs:
   # 完整 CI 门禁: release 必须在所有 CI 检查通过后才能构建
   ci-gate:
@@ -341,8 +346,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-          - platform: macos-13
-            target: x86_64-apple-darwin
+          # macos-13(Intel)runner 常年 queued 超时,仅保留 macos-latest(Apple Silicon)
           - platform: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.platform }}
