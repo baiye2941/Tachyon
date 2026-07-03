@@ -12,8 +12,8 @@ use tokio::sync::watch;
 use url::Url;
 
 use super::{
-    AppError, AppState, TaskCommand, TaskInfo, cleanup_runtime, update_task_status,
-    validate_download_url,
+    AppError, AppState, TaskCommand, TaskInfo, build_download_config, cleanup_runtime,
+    update_task_status, validate_download_url,
 };
 
 // ---------------------------------------------------------------------------
@@ -834,11 +834,68 @@ pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Resul
 }
 
 pub(crate) async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
+    // task_service.resume_task 仅改状态(Pending/Paused -> Downloading)并持久化快照,
+    // 不负责激活下载。激活逻辑由下方根据 supervisor 是否有运行中的 task_fn 决定。
     state.service.task_service.resume_task(&task_id).await?;
-    state
-        .runtime
-        .supervisor
-        .send_command(&task_id, TaskCommand::Resume);
+
+    // 若任务已有运行中的 task_fn(存在 control channel),直接发 Resume 信号。
+    // 这覆盖「运行中被暂停(Paused)」的场景:task_fn 仍在等待 Resume。
+    if state.runtime.supervisor.has_running_task(&task_id) {
+        state
+            .runtime
+            .supervisor
+            .send_command(&task_id, TaskCommand::Resume);
+        return Ok(());
+    }
+
+    // 无运行 task_fn(应用启动恢复的任务、task_fn 已退出的任务):
+    // send_command 对这种任务会静默返回 false,Resume 信号会丢失。
+    // 因此必须重新 start_download 激活 task_fn——新 task_fn 启动后通过
+    // inject_resume_snapshot 从磁盘快照注入已完成分片,实现断点续传。
+    restart_download(state, &task_id).await
+}
+
+/// 从 TaskInfo 重建下载参数并重启 task_fn(断点续传)
+///
+/// 用于 resume 无运行 task_fn 的任务(应用启动恢复的任务、task_fn 已退出的任务)。
+///
+/// 参数重建策略(TaskInfo/Snapshot 均不存 download_dir/mirror_urls/download_config):
+/// - `download_dir`: 从 `save_path` 的父目录推导。
+/// - `download_config`: 用当前 `AppConfig` 经 `build_download_config` 重建。
+/// - `mirror_urls`: 快照未存储,无法恢复,故传 `None`(单源续传;原镜像配置丢失是已知限制)。
+/// - `preferred_file_name`: 传 `None`,probe 会复用磁盘上既有文件名。
+async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppError> {
+    let task = state
+        .domain
+        .task_repository
+        .get(task_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+
+    // 从 save_path 推导 download_dir(父目录)
+    let save_path = std::path::Path::new(&task.save_path);
+    let download_dir = save_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| AppError::Config(format!("save_path 无父目录: {}", task.save_path)))?;
+
+    // 用当前 AppConfig 重建 download_config
+    let download_config = {
+        let cfg = state.domain.config.lock().await;
+        build_download_config(&cfg, &download_dir)
+    };
+
+    let state_arc = Arc::new(state.clone_for_task());
+    state.runtime.supervisor.start_download(
+        state_arc,
+        task_id,
+        task.url,
+        download_dir,
+        download_config,
+        None, // mirror_urls 无法从快照恢复,单源续传
+        None, // preferred_file_name 无需覆盖,probe 复用既有文件名
+    );
+    tracing::info!(task_id = %task_id, "重启 task_fn 激活断点续传");
     Ok(())
 }
 
@@ -888,8 +945,8 @@ pub(crate) async fn get_task_detail_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::super::now_iso8601;
     use super::super::tests::test_state;
-    use super::super::{build_download_config, now_iso8601};
     use super::*;
     use tachyon_core::safety::redact_url_for_log;
     use tachyon_core::types::DownloadState;
@@ -945,13 +1002,15 @@ mod tests {
         let (start_tx, start_rx) = oneshot::channel();
         let handle = tokio::spawn({
             let state = state.clone();
-            let connection_pool = state.infra.connection_pool.clone();
+            // 连接池热替换句柄:在 spawn 内读锁 clone 出当前 Arc<ConnectionPool>
+            let pool_handle = state.infra.connection_pool.clone();
             // 切片2 夹具修复:task_fn 新签名增加 buffer_pool 参数,
             // 从 AppState.infra.buffer_pool 取池注入,使 worker 用池化 buffer。
             let buffer_pool = state.infra.buffer_pool.clone();
             let task_id = task_id.clone();
             async move {
                 let _ = start_rx.await;
+                let connection_pool = pool_handle.read().await.clone();
                 task_fn(
                     state,
                     task_id,
@@ -1241,7 +1300,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resume_non_paused_task_fails() {
+    async fn test_resume_pending_task_succeeds() {
+        // 修复回归:恢复的任务被 normalize_recovered_status 归一化为 Pending,
+        // 此前 resume_task 仅允许 Paused 恢复,Pending 会报错"仅暂停状态可恢复"。
+        // 现在 Pending/Paused 均可恢复,create_task 后任务初始即为 Pending。
         let state = test_state();
         let id = create_task_inner(
             &state,
@@ -1253,9 +1315,34 @@ mod tests {
         )
         .await
         .unwrap();
+        resume_task_inner(&state, id.clone()).await.unwrap();
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.status, DownloadState::Downloading);
+    }
+
+    #[tokio::test]
+    async fn test_resume_cancelled_task_fails() {
+        // 终态任务(Cancelled)不可恢复
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/file.zip".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        cancel_task_inner(&state, id.clone()).await.unwrap();
         let result = resume_task_inner(&state, id).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("仅暂停状态可恢复"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("仅 Pending/Paused 状态可恢复")
+        );
     }
 
     #[tokio::test]
@@ -2366,13 +2453,15 @@ mod tests {
 
         // 调用新签名:传入 state.infra.buffer_pool.clone() 作为 buffer_pool 参数。
         // 仅构造会话,不调用 run()(run 会触发真实下载)。
+        // connection_pool 字段现为热替换句柄,读锁 clone 出当前 Arc<ConnectionPool>。
+        let connection_pool = state.infra.connection_pool.read().await.clone();
         let _session = crate::runtime::DownloadSession::new(
             state.clone(),
             "slice2-signature-contract".to_string(),
             "https://example.com/slice2-signature.bin".to_string(),
             "/tmp/tachyon-slice2-unused".to_string(),
             download_config,
-            state.infra.connection_pool.clone(),
+            connection_pool,
             state.infra.buffer_pool.clone(),
             control_rx,
             None,
@@ -2469,11 +2558,13 @@ mod tests {
 
         // 调用新签名:传入 state.infra.buffer_pool.clone() 作为 buffer_pool 参数。
         // ftp 协议使 with_pool 返回 Err,build_download_task 应返回 Err。
+        // connection_pool 字段现为热替换句柄,读锁 clone 出当前 Arc<ConnectionPool>。
+        let connection_pool = state.infra.connection_pool.read().await.clone();
         let result = build_download_task(
             "slice2-bdt-contract",
             "ftp://example.com/slice2-bdt.bin",
             download_config,
-            state.infra.connection_pool.clone(),
+            connection_pool,
             state.infra.buffer_pool.clone(),
             None,
             #[cfg(feature = "magnet")]
@@ -2511,11 +2602,13 @@ mod tests {
         };
 
         // magnet + 镜像 + bt_session=None -> P2SP 分支的 ok_or_else 错误路径
+        // connection_pool 字段现为热替换句柄,读锁 clone 出当前 Arc<ConnectionPool>。
+        let connection_pool = state.infra.connection_pool.read().await.clone();
         let result = build_download_task(
             "task8-p2sp-contract",
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
             download_config,
-            state.infra.connection_pool.clone(),
+            connection_pool,
             state.infra.buffer_pool.clone(),
             Some(vec!["https://mirror.example.com/file.bin".to_string()]),
             #[cfg(feature = "magnet")]

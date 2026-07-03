@@ -110,7 +110,7 @@ function AppContent() {
 
   const handleAddFromSniffer = (resource: SnifferResource) => {
     api
-      .createTask(resource.url)
+      .createTask(resource.downloadUrl)
       .then(() => refreshTaskList())
       .catch((e) =>
         addToast(tr("toast.createTaskFailed", { error: e }), "error"),

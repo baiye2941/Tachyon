@@ -114,7 +114,10 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
-      - run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2026-0190 --ignore RUSTSEC-2026-0186
+      # 与 deny.toml [advisories].ignore 对齐,治理同一组已知的间接依赖漏洞
+      # (librqbit/Tauri 引入的 quick-xml、glib、bincode、backoff 等)。
+      # RUSTSEC-2026-0186(memmap2)已随 0.9.11 升级消除,不再忽略。
+      - run: cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0012 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0060 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0190
 
   # SRE-013: TOML 格式检查
   taplo:

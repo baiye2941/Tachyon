@@ -172,6 +172,8 @@ export type SnifferResourceType = 'video' | 'audio' | 'document' | 'archive' | '
 export interface SnifferResource {
   id: string
   url: string
+  /** 资源原始 URL(含凭据,用于实际下载) */
+  downloadUrl: string
   name: string
   type: SnifferResourceType
   size: number | null
@@ -248,6 +250,12 @@ export interface DownloadProgress {
   speed: number
   fragmentsTotal: number
   fragmentsDone: number
+  /**
+   * 当前活跃并发分片数。
+   * 后端 #[serde(default)] active_concurrency: u32,旧版快照可能缺省(0)。
+   * 与 ProgressPayload.activeConcurrency 对齐。
+   */
+  activeConcurrency: number
 }
 
 /** 应用信息 -- 与后端 AppInfo 对齐 */

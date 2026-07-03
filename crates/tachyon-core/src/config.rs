@@ -87,6 +87,10 @@ fn is_io_uring_available() -> bool {
         const SYS_IO_URING_SETUP: i64 = 425;
         // io_uring_params 结构体大小约 120 字节,用零初始化即可用于探测
         let mut params = [0u8; 128];
+        // Safety: params 为 128 字节零初始化数组(>= io_uring_params 结构体的 120 字节),
+        // 作为 io_uring_setup 的第二个参数传入,内核只读取不写入(探测模式 entries=1)。
+        // SYS_IO_URING_SETUP(425)在 x86_64/aarch64 Linux 正确。ring_fd >= 0 时立即 close
+        // 不泄漏 fd;探测失败返回 false,不影响调用方。
         unsafe {
             let ring_fd = libc::syscall(SYS_IO_URING_SETUP, 1u32, params.as_mut_ptr());
             if ring_fd >= 0 {
@@ -148,6 +152,12 @@ pub const MAX_CONNECTIONS_PER_HOST_LIMIT: u32 = 128;
 /// 4096 足以支撑高并发下载场景,
 /// 同时避免文件描述符耗尽。
 pub const MAX_GLOBAL_CONNECTIONS_LIMIT: u32 = 4096;
+
+/// keep_alive_timeout_secs 上限(秒)
+///
+/// 与连接池 idle 超时上限对齐,10 分钟足以覆盖常规复用窗口,
+/// 超过此值意味着连接长期空闲占用资源而失去 keep-alive 收益。
+pub const KEEP_ALIVE_TIMEOUT_SECS_LIMIT: u64 = 600;
 
 /// 最大并发任务数上限
 ///
@@ -462,35 +472,54 @@ fn default_trackers() -> Vec<String> {
 
 /// 自动检测系统 SOCKS5 代理 URL(供 BT tracker+peer 使用)
 ///
-/// 检测顺序(取首个非空):
-/// 1. `ALL_PROXY` 环境变量 —— 若 scheme 是 `socks5` 直接返回;若是 `http(s)://host:port`
-///    则提取 host:port 转 `socks5://host:port`(Clash/V2Ray 混合端口假设)
-/// 2. `HTTPS_PROXY` / `HTTP_PROXY` —— 同样提取 host:port 转 `socks5://`
+/// 检测顺序(取首个非空,每个变量名同时查大小写两形,POSIX 惯例):
+/// 1. `ALL_PROXY` / `all_proxy` —— 若 scheme 是 `socks5`/`socks5h` 直接返回;
+///    若是 `http(s)://host:port` 则提取 host:port 转 `socks5://host:port`
+///    (Clash/V2Ray 混合端口假设)
+/// 2. `HTTPS_PROXY` / `https_proxy` —— 同上提取 host:port 转 `socks5://`
+/// 3. `HTTP_PROXY` / `http_proxy` —— 同上
+///
+/// 优先级:`ALL_PROXY > all_proxy > HTTPS_PROXY > https_proxy > HTTP_PROXY > http_proxy`,
+/// 即大写优先于小写,同形之间保持上述变量优先级。
 ///
 /// 返回 None 表示未检测到代理。调用方应让用户可手动覆盖此自动检测结果。
 /// 注意:此检测假设 HTTP 代理端口同时支持 SOCKS5(Clash 混合端口通常如此),
 /// 非混合端口代理会连接失败(librqbit 报错,不静默失败)。
 pub fn detect_socks_proxy() -> Option<String> {
     // 尝试将任意代理 URL 规范化为 socks5://host:port
+    //
+    // `socks5h` 表示远程 DNS 解析,语义上等价于 `socks5`(librqbit 的
+    // SocksProxyConfig 只认 socks5 scheme),故统一规范化为 socks5://host:port。
     fn normalize(url: &str) -> Option<String> {
         let parsed = url::Url::parse(url).ok()?;
-        let host = parsed.host_str()?;
-        let port = parsed.port()?;
-        // socks5 直接用;http/https 转 socks5(混合端口假设)
         match parsed.scheme() {
+            // socks5:librqbit 只认 socks5 scheme,直接返回原 URL(已含 host:port)。
+            // 不走 host_str()/port() 提取 —— url crate 对非特殊 scheme(如 socks5)
+            // 的 port 解析不稳定,直接用原串更可靠(与历史行为一致)。
             "socks5" => Some(url.to_string()),
-            "http" | "https" => Some(format!("socks5://{host}:{port}")),
+            // socks5h:远程 DNS 变体,规范化 scheme 为 socks5。用字符串前缀替换,
+            // 避免依赖 url crate 对 socks5h 的 host/port 提取。
+            "socks5h" => Some(url.replacen("socks5h://", "socks5://", 1)),
+            // http/https:提取 host:port 转 socks5(混合端口假设);http(s) 是特殊
+            // scheme,url crate 能可靠解析 host/port。要求显式端口(与历史行为一致)。
+            "http" | "https" => {
+                let host = parsed.host_str()?;
+                let port = parsed.port()?;
+                Some(format!("socks5://{host}:{port}"))
+            }
             _ => None,
         }
     }
-    // 优先 ALL_PROXY(可能含 socks5 scheme)
-    if let Some(url) = std::env::var("ALL_PROXY").ok().filter(|s| !s.is_empty())
-        && let Some(normalized) = normalize(&url)
-    {
-        return Some(normalized);
-    }
-    // 回退 HTTPS_PROXY / HTTP_PROXY(转 socks5)
-    for var in ["HTTPS_PROXY", "HTTP_PROXY"] {
+    // 按优先级依次探测每个变量名的大小写两形(POSIX 惯例小写也要查)。
+    // 顺序:大写优先于小写,保持 ALL_PROXY > HTTPS_PROXY > HTTP_PROXY 优先级。
+    for var in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
         if let Some(url) = std::env::var(var).ok().filter(|s| !s.is_empty())
             && let Some(normalized) = normalize(&url)
         {
@@ -503,6 +532,24 @@ pub fn detect_socks_proxy() -> Option<String> {
 /// 布尔默认值 true 的辅助函数（serde default 不支持直接写 true）
 fn default_true() -> bool {
     true
+}
+
+/// 脱敏 SOCKS5 代理 URL 的 userinfo,保留 scheme/host/port(修复 B12-config)
+///
+/// `validate` 失败时错误信息原样打印 `socks_proxy_url`,若 URL 含 `user:pass@`
+/// 会明文泄露凭据。本函数剥离 userinfo 后重组 URL:`socks5://host:port`,
+/// 供错误信息使用,保留 host:port 便于诊断定位。
+/// 无法解析的 URL 回退为占位符(不泄露原串,因原串可能含凭据)。
+fn redact_socks_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "<invalid-socks-url>".to_string();
+    };
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+    match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
 }
 
 impl Default for MagnetConfig {
@@ -620,9 +667,14 @@ impl MagnetConfig {
             )));
         }
         // socks_proxy_url:Some 时校验 scheme 为 socks5(与 librqbit SocksProxyConfig 一致)
+        // 修复 B12-config:错误信息用脱敏后的 URL,避免明文打印 user:pass 凭据。
         if let Some(ref url) = self.socks_proxy_url {
-            let parsed = url::Url::parse(url)
-                .map_err(|_| e(&format!("socks_proxy_url 不是合法 URL: {url}")))?;
+            let parsed = url::Url::parse(url).map_err(|_| {
+                e(&format!(
+                    "socks_proxy_url 不是合法 URL: {}",
+                    redact_socks_url(url)
+                ))
+            })?;
             if parsed.scheme() != "socks5" {
                 return Err(e(&format!(
                     "socks_proxy_url scheme 必须是 socks5,实际: {}",
@@ -630,7 +682,10 @@ impl MagnetConfig {
                 )));
             }
             if parsed.host_str().is_none() || parsed.port().is_none() {
-                return Err(e(&format!("socks_proxy_url 必须包含 host 和 port: {url}")));
+                return Err(e(&format!(
+                    "socks_proxy_url 必须包含 host 和 port: {}",
+                    redact_socks_url(url)
+                )));
             }
         }
         // 校验 tracker URL 格式
@@ -836,6 +891,22 @@ impl ConnectionConfig {
         if self.max_global_connections > MAX_GLOBAL_CONNECTIONS_LIMIT {
             return Err(e(&format!(
                 "max_global_connections 不能超过 {MAX_GLOBAL_CONNECTIONS_LIMIT}"
+            )));
+        }
+        if self.keep_alive_timeout_secs == 0 {
+            return Err(e("keep_alive_timeout_secs 必须 >= 1"));
+        }
+        if self.keep_alive_timeout_secs > KEEP_ALIVE_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "keep_alive_timeout_secs 不能超过 {KEEP_ALIVE_TIMEOUT_SECS_LIMIT}"
+            )));
+        }
+        if self.connect_timeout_secs == 0 {
+            return Err(e("connect_timeout_secs 必须 >= 1"));
+        }
+        if self.connect_timeout_secs > CONNECT_TIMEOUT_SECS_LIMIT {
+            return Err(e(&format!(
+                "connect_timeout_secs 不能超过 {CONNECT_TIMEOUT_SECS_LIMIT}"
             )));
         }
         Ok(())
@@ -1700,6 +1771,34 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_config_validate_keep_alive_timeout_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.keep_alive_timeout_secs = 0;
+        assert_config_error(cfg.validate(), "keep_alive_timeout_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_connection_config_validate_keep_alive_timeout_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.keep_alive_timeout_secs = KEEP_ALIVE_TIMEOUT_SECS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "keep_alive_timeout_secs 不能超过");
+    }
+
+    #[test]
+    fn test_connection_config_validate_connect_timeout_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.connect_timeout_secs = 0;
+        assert_config_error(cfg.validate(), "connect_timeout_secs 必须 >= 1");
+    }
+
+    #[test]
+    fn test_connection_config_validate_connect_timeout_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.connect_timeout_secs = CONNECT_TIMEOUT_SECS_LIMIT + 1;
+        assert_config_error(cfg.validate(), "connect_timeout_secs 不能超过");
+    }
+
+    #[test]
     fn test_connection_config_validate_valid() {
         assert!(ConnectionConfig::default().validate().is_ok());
     }
@@ -2229,19 +2328,196 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    // ── B12-config: socks_proxy_url 错误信息脱敏测试 ──────────────────────
+
+    /// 验证:socks_proxy_url 含凭据时,validate 失败错误信息不泄露凭据(修复 B12-config)
+    ///
+    /// 若 socks_proxy_url 含 user:pass,validate 失败时错误信息原样打印 {url}
+    /// 会明文泄露凭据。修复后用 redact_socks_url 剥离 userinfo,只保留 scheme/host/port。
+    #[test]
+    fn test_magnet_config_validate_socks_url_error_redacts_credentials() {
+        let secret_user = "topsecret_user";
+        let secret_pass = "s3cr3t_p4ss";
+
+        // 错误 scheme + 含凭据:错误信息不应泄露 user/pass
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some(format!("http://{secret_user}:{secret_pass}@127.0.0.1:7897"));
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret_user),
+            "错误信息不应泄露用户名,实际: {msg}"
+        );
+        assert!(
+            !msg.contains(secret_pass),
+            "错误信息不应泄露密码,实际: {msg}"
+        );
+
+        // 缺 port + 含凭据:错误信息不应泄露 user/pass
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some(format!("socks5://{secret_user}:{secret_pass}@127.0.0.1"));
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret_user),
+            "错误信息不应泄露用户名,实际: {msg}"
+        );
+        assert!(
+            !msg.contains(secret_pass),
+            "错误信息不应泄露密码,实际: {msg}"
+        );
+        // 但应保留 host 供诊断
+        assert!(
+            msg.contains("127.0.0.1"),
+            "错误信息应保留 host 供诊断,实际: {msg}"
+        );
+    }
+
+    /// 验证:非法 URL + 含凭据字符时,错误信息不泄露原串(回退占位符)
+    #[test]
+    fn test_magnet_config_validate_socks_url_invalid_redacts_raw() {
+        let secret = "leak_me_pass";
+        // 故意构造无法解析的 URL(空 scheme)+ 含凭据样字符
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some(format!("://{secret}@127.0.0.1:7897"));
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret),
+            "非法 URL 错误信息不应泄露原串(可能含凭据),实际: {msg}"
+        );
+    }
+
+    /// 验证:合法 socks5 + 凭据时 validate 通过(不触发错误信息路径)
+    #[test]
+    fn test_magnet_config_validate_socks_url_with_credentials_is_valid() {
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some("socks5://user:pass@127.0.0.1:7897".into());
+        assert!(cfg.validate().is_ok(), "带凭据的合法 socks5 URL 应通过校验");
+    }
+
+    /// 验证:redact_socks_url 单元:剥离 userinfo 保留 scheme/host/port
+    #[test]
+    fn test_redact_socks_url_strips_userinfo() {
+        // 含凭据 → 剥离
+        assert_eq!(
+            redact_socks_url("socks5://user:pass@127.0.0.1:7897"),
+            "socks5://127.0.0.1:7897"
+        );
+        // 无凭据 → 原样(已脱敏)
+        assert_eq!(
+            redact_socks_url("socks5://127.0.0.1:7897"),
+            "socks5://127.0.0.1:7897"
+        );
+        // 无端口 → 保留 scheme/host
+        assert_eq!(
+            redact_socks_url("socks5://user:pass@example.com"),
+            "socks5://example.com"
+        );
+        // 非法 URL → 占位符(不泄露原串)
+        assert_eq!(redact_socks_url("not a url"), "<invalid-socks-url>");
+        // 凭据含特殊字符也不泄露
+        let redacted = redact_socks_url("socks5://p@ss:w0rd@10.0.0.1:1080");
+        assert_eq!(redacted, "socks5://10.0.0.1:1080");
+        assert!(!redacted.contains("w0rd"));
+    }
+
     #[test]
     fn test_detect_socks_proxy_from_all_proxy_socks5() {
         // ALL_PROXY 含 socks5 scheme 直接用
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 测试串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续 detect_socks_proxy 测试。
+        // 注意:Windows 环境变量名大小写不敏感,remove_var("all_proxy") 会清除
+        // ALL_PROXY,故先清小写再 set 大写,顺序不能颠倒。
         unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("https_proxy");
             std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:1080");
             std::env::remove_var("HTTP_PROXY");
             std::env::remove_var("HTTPS_PROXY");
         }
         let result = detect_socks_proxy();
         assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // Safety: 清理仅传编译期字符串字面量给 remove_var,无裸指针解引用;ENV_TEST_LOCK
+        // 串行化锁(_guard 仍持有)保证无并发 env 改动,无数据竞争/UB 风险。
         unsafe {
             std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    /// 验证:socks5h(远程 DNS)被规范化为 socks5(librqbit 只认 socks5 scheme)
+    #[test]
+    fn test_detect_socks_proxy_from_all_proxy_socks5h_normalized() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 同上,串行化锁保护下修改并清理环境变量;先清小写再 set 大写。
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::set_var("ALL_PROXY", "socks5h://127.0.0.1:1080");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        let result = detect_socks_proxy();
+        assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // Safety: 清理仅传编译期字符串字面量给 remove_var,无裸指针解引用;ENV_TEST_LOCK
+        // 串行化锁(_guard 仍持有)保证无并发 env 改动,无数据竞争/UB 风险。
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    /// 验证(POSIX):小写 all_proxy 也应被检测到
+    ///
+    /// 仅 Unix:POSIX 环境变量名大小写敏感,all_proxy 与 ALL_PROXY 是不同变量。
+    /// Windows 环境变量名大小写不敏感,两者折叠为同一变量,此语义不适用。
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_socks_proxy_lowercase_all_proxy() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 同上,串行化锁保护下修改并清理环境变量。
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::set_var("all_proxy", "socks5://127.0.0.1:1080");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("https_proxy");
+        }
+        let result = detect_socks_proxy();
+        assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // Safety: 清理仅传编译期字符串字面量给 remove_var,无裸指针解引用;ENV_TEST_LOCK
+        // 串行化锁(_guard 仍持有)保证无并发 env 改动,无数据竞争/UB 风险。
+        unsafe {
+            std::env::remove_var("all_proxy");
+        }
+    }
+
+    /// 验证(POSIX):大写 ALL_PROXY 优先于小写 all_proxy
+    ///
+    /// 仅 Unix:大小写敏感时才有"优先级"语义;Windows 折叠为同一变量无此概念。
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_socks_proxy_uppercase_precedence_over_lowercase() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 同上,串行化锁保护下修改并清理环境变量。
+        unsafe {
+            std::env::set_var("ALL_PROXY", "socks5://10.0.0.1:1080");
+            std::env::set_var("all_proxy", "socks5://10.0.0.2:1080");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("https_proxy");
+        }
+        let result = detect_socks_proxy();
+        assert_eq!(result.as_deref(), Some("socks5://10.0.0.1:1080"));
+        // Safety: 清理仅传编译期字符串字面量给 remove_var,无裸指针解引用;ENV_TEST_LOCK
+        // 串行化锁(_guard 仍持有)保证无并发 env 改动,无数据竞争/UB 风险。
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("all_proxy");
         }
     }
 
@@ -2249,13 +2525,19 @@ mod tests {
     fn test_detect_socks_proxy_from_http_proxy_convert() {
         // HTTP_PROXY 是 http://host:port → 转 socks5://host:port
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 同上,串行化锁保护下修改并清理环境变量;先清小写再 set 大写。
         unsafe {
             std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("https_proxy");
             std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7897");
             std::env::remove_var("HTTPS_PROXY");
         }
         let result = detect_socks_proxy();
         assert_eq!(result.as_deref(), Some("socks5://127.0.0.1:7897"));
+        // Safety: 清理仅传编译期字符串字面量给 remove_var,无裸指针解引用;ENV_TEST_LOCK
+        // 串行化锁(_guard 仍持有)保证无并发 env 改动,无数据竞争/UB 风险。
         unsafe {
             std::env::remove_var("HTTP_PROXY");
         }
@@ -2264,10 +2546,14 @@ mod tests {
     #[test]
     fn test_detect_socks_proxy_none_when_unset() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: 同上,串行化锁保护下修改并清理环境变量。
         unsafe {
             std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("all_proxy");
             std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("http_proxy");
             std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("https_proxy");
         }
         assert!(detect_socks_proxy().is_none());
     }
