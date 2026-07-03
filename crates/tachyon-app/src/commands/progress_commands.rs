@@ -106,6 +106,7 @@ fn build_initial_progress_event(
                     fragments_done: t.fragments_done,
                     fragments_total: t.fragments_total,
                     active_concurrency: t.active_concurrency,
+                    file_size: t.file_size,
                     completed_delta: vec![],
                 },
             )
@@ -268,6 +269,7 @@ mod tests {
             fragments_done: 2,
             fragments_total: 0,
             active_concurrency: 0,
+            file_size: None,
             completed_delta: vec![],
         };
         let mut last = HashMap::new();
@@ -292,6 +294,7 @@ mod tests {
                 fragments_done: 1,
                 fragments_total: 0,
                 active_concurrency: 0,
+                file_size: None,
                 completed_delta: vec![],
             },
         );
@@ -306,6 +309,7 @@ mod tests {
                 fragments_done: 2,
                 fragments_total: 0,
                 active_concurrency: 0,
+                file_size: None,
                 completed_delta: vec![],
             },
         );
@@ -340,6 +344,7 @@ mod tests {
                 fragments_done: 0,
                 fragments_total: 0,
                 active_concurrency: 0,
+                file_size: None,
                 completed_delta: vec![],
             },
         );
@@ -347,5 +352,38 @@ mod tests {
         let delta = compute_progress_delta(&new, &last);
         assert_eq!(delta.len(), 1);
         assert!(delta.contains_key("t1"));
+    }
+
+    /// 回归测试:file_size 从 None 变 Some 时必须触发 delta 推送。
+    ///
+    /// 场景:任务创建时 file_size 未知(None),后端探测完成后写入 Some(size)。
+    /// 若 TaskProgress 不含 file_size 字段或 delta 比较忽略该字段,
+    /// 前端详情页会一直显示 0B,直到用户手动刷新任务列表。
+    #[test]
+    fn test_compute_progress_delta_file_size_change_triggers_delta() {
+        let mut last = HashMap::new();
+        last.insert(
+            "t1".to_string(),
+            TaskProgress {
+                id: "t1".to_string(),
+                progress: 0.0,
+                speed: 0,
+                downloaded: 0,
+                status: DownloadState::Connecting,
+                fragments_done: 0,
+                fragments_total: 0,
+                active_concurrency: 0,
+                file_size: None,
+                completed_delta: vec![],
+            },
+        );
+
+        let mut new = last.clone();
+        new.get_mut("t1").unwrap().file_size = Some(1024);
+
+        let delta = compute_progress_delta(&new, &last);
+        assert_eq!(delta.len(), 1, "file_size 变化应触发 delta 推送");
+        let changed = delta.get("t1").unwrap();
+        assert_eq!(changed.file_size, Some(1024));
     }
 }

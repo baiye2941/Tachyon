@@ -13,6 +13,11 @@ export interface HistoryRecord {
   duration: number;
   avgSpeed: number;
   completedAt: string;
+  /**
+   * 文件保存路径,用于"打开所在文件夹"功能。
+   * 旧版 localStorage 记录可能没有此字段(默认空字符串),允许兼容。
+   */
+  savePath: string;
 }
 
 export interface HistoryStats {
@@ -93,7 +98,11 @@ function loadFromStorage(): HistoryRecord[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isValidRecord);
+    // 旧版记录可能没有 savePath 字段,补默认空字符串保持向后兼容
+    return parsed.filter(isValidRecord).map((r) => ({
+      ...r,
+      savePath: typeof r.savePath === "string" ? r.savePath : "",
+    }));
   } catch {
     return [];
   }
@@ -113,10 +122,17 @@ const [historyRecords, setHistoryRecords] =
 export { historyRecords };
 
 export function addHistoryRecord(
-  record: Omit<HistoryRecord, "id" | "completedAt">,
+  record: Omit<HistoryRecord, "id" | "completedAt" | "savePath"> & {
+    /** 保存路径,用于"打开所在文件夹"。可选,缺省为空字符串 */
+    savePath?: string;
+  },
 ): void {
   // 脱敏 URL 中的敏感参数(token/signature/key 等),防止 localStorage 泄漏
-  const sanitizedRecord = { ...record, url: redactUrl(record.url) };
+  const sanitizedRecord = {
+    ...record,
+    url: redactUrl(record.url),
+    savePath: record.savePath ?? "",
+  };
   const newRecord: HistoryRecord = {
     ...sanitizedRecord,
     id: generateId(),

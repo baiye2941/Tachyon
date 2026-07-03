@@ -4,6 +4,12 @@ import type { HistoryRecord } from "../../stores/history";
 
 const STORAGE_KEY = "tachyon:download_history";
 
+// mock confirm store:批量删除测试需要控制 requestConfirm 返回值
+const mockRequestConfirm = vi.fn();
+vi.mock("../../stores/confirm", () => ({
+  requestConfirm: (...args: unknown[]) => mockRequestConfirm(...args),
+}));
+
 function makeRecord(overrides: Partial<HistoryRecord> = {}): HistoryRecord {
   return {
     id: `id-${Math.random().toString(36).slice(2)}`,
@@ -14,6 +20,7 @@ function makeRecord(overrides: Partial<HistoryRecord> = {}): HistoryRecord {
     duration: 5000,
     avgSpeed: 204800,
     completedAt: "2026-05-30T10:00:00Z",
+    savePath: "",
     ...overrides,
   };
 }
@@ -42,6 +49,7 @@ describe("HistoryPanel 历史记录面板", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.resetModules();
+    mockRequestConfirm.mockReset();
   });
 
   afterEach(() => {
@@ -104,13 +112,69 @@ describe("HistoryPanel 历史记录面板", () => {
     );
   });
 
-  it("点击打开目录触发 onOpenFolder", async () => {
+  it("点击打开目录触发 onOpenFolder 并传回 savePath", async () => {
     const onOpenFolder = vi.fn();
     await renderPanel({ onOpenFolder }, [
-      makeRecord({ id: "a", fileName: "a.zip" }),
+      makeRecord({
+        id: "a",
+        fileName: "a.zip",
+        savePath: "D:\\downloads\\a.zip",
+      }),
     ]);
     fireEvent.click(screen.getByLabelText("打开目录 a.zip"));
-    expect(onOpenFolder).toHaveBeenCalledWith("a");
+    expect(onOpenFolder).toHaveBeenCalledWith("D:\\downloads\\a.zip");
+  });
+
+  it("savePath 为空时点击打开目录传回空字符串", async () => {
+    const onOpenFolder = vi.fn();
+    await renderPanel({ onOpenFolder }, [
+      makeRecord({ id: "a", fileName: "a.zip", savePath: "" }),
+    ]);
+    fireEvent.click(screen.getByLabelText("打开目录 a.zip"));
+    expect(onOpenFolder).toHaveBeenCalledWith("");
+  });
+
+  it("批量模式:切换后显示复选框,点击记录切换选中", async () => {
+    await renderPanel({}, [
+      makeRecord({ id: "a", fileName: "a.zip" }),
+      makeRecord({ id: "b", fileName: "b.zip" }),
+    ]);
+    // 进入批量模式
+    fireEvent.click(screen.getByLabelText("批量选择"));
+    // 选中第一条
+    fireEvent.click(screen.getByLabelText("选择记录 a.zip"));
+    expect(screen.getByText("已选 1 项")).toBeDefined();
+  });
+
+  it("批量模式:全选按钮选中所有可见记录", async () => {
+    await renderPanel({}, [
+      makeRecord({ id: "a", fileName: "a.zip" }),
+      makeRecord({ id: "b", fileName: "b.zip" }),
+    ]);
+    fireEvent.click(screen.getByLabelText("批量选择"));
+    fireEvent.click(screen.getByText("全选"));
+    expect(screen.getByText("已选 2 项")).toBeDefined();
+  });
+
+  it("批量模式:删除选中触发确认对话框", async () => {
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false });
+    const onDeleteRecord = vi.fn();
+    await renderPanel({ onDeleteRecord }, [
+      makeRecord({ id: "a", fileName: "a.zip" }),
+      makeRecord({ id: "b", fileName: "b.zip" }),
+    ]);
+    fireEvent.click(screen.getByLabelText("批量选择"));
+    fireEvent.click(screen.getByText("全选"));
+    fireEvent.click(screen.getByText("删除选中"));
+    // 确认对话框应被调用
+    await vi.waitFor(() => {
+      expect(mockRequestConfirm).toHaveBeenCalled();
+    });
+    // 确认后逐条删除
+    await vi.waitFor(() => {
+      expect(onDeleteRecord).toHaveBeenCalledTimes(2);
+    });
+    mockRequestConfirm.mockReset();
   });
 
   it("没有历史记录时显示空状态", async () => {

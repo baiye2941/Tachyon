@@ -447,6 +447,12 @@ const enUS = {
   "history.aria.openFolder": "Open folder {name}",
   "history.aria.redownload": "Redownload {name}",
   "history.aria.delete": "Delete record {name}",
+  "history.batchSelect": "Batch select",
+  "history.selectAll": "Select all",
+  "history.deleteSelected": "Delete selected",
+  "history.aria.selectRecord": "Select record {name}",
+  "confirm.deleteHistoryBatch.title": "Delete selected history records",
+  "confirm.deleteHistoryBatch.message": "Delete {count} selected history record(s)? This action cannot be undone.",
 
   // —— Batch toolbar ——
   "batch.aria": "Batch actions",

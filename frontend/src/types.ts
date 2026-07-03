@@ -191,6 +191,8 @@ export interface ProgressPayload {
   fragmentsDone: number
   fragmentsTotal: number
   activeConcurrency: number
+  /** 文件总大小,探测完成后由后端通过进度事件同步,避免详情页显示 0B */
+  fileSize?: number | null
   completedDelta?: number[]
 }
 

@@ -241,6 +241,10 @@ pub struct TaskProgress {
     pub fragments_total: u32,
     #[serde(default)]
     pub active_concurrency: u32,
+    /// 文件总大小。探测完成后由后端写入,通过进度事件同步到前端,
+    /// 避免前端在探测完成前显示 0B(只能靠 get_task_list 全量刷新)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_delta: Vec<u32>,
 }

@@ -429,6 +429,12 @@ const zhCN = {
   "history.aria.openFolder": "打开目录 {name}",
   "history.aria.redownload": "重新下载 {name}",
   "history.aria.delete": "删除记录 {name}",
+  "history.batchSelect": "批量选择",
+  "history.selectAll": "全选",
+  "history.deleteSelected": "删除选中",
+  "history.aria.selectRecord": "选择记录 {name}",
+  "confirm.deleteHistoryBatch.title": "删除选中历史记录",
+  "confirm.deleteHistoryBatch.message": "确定删除选中的 {count} 条历史记录?此操作不可撤销。",
 
   // —— 批量工具栏 ——
   "batch.aria": "批量操作",

@@ -186,6 +186,7 @@ fn build_progress_event(
                     fragments_done: t.fragments_done,
                     fragments_total: t.fragments_total,
                     active_concurrency: t.active_concurrency,
+                    file_size: t.file_size,
                     completed_delta,
                 },
             )

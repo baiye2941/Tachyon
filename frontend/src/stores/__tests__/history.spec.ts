@@ -95,6 +95,7 @@ describe("HistoryStore 历史记录存储", () => {
         duration: 10000,
         avgSpeed: 409,
         completedAt: "2026-05-30T10:00:00Z",
+        savePath: "D:\\downloads\\old.zip",
       },
     ];
     localStorage.setItem(STORAGE_KEY, JSON.stringify(mockData));
@@ -103,6 +104,29 @@ describe("HistoryStore 历史记录存储", () => {
     const mod = await import("../history");
     expect(mod.historyRecords).toHaveLength(1);
     expect(mod.historyRecords[0]?.id).toBe("test-1");
+    expect(mod.historyRecords[0]?.savePath).toBe("D:\\downloads\\old.zip");
+  });
+
+  it("旧版 localStorage 记录无 savePath 时补默认空字符串", async () => {
+    // 模拟旧版本(无 savePath 字段)的持久化数据,加载后应兼容补空
+    const oldData = [
+      {
+        id: "old-1",
+        url: "https://example.com/legacy.zip",
+        fileName: "legacy.zip",
+        fileSize: 100,
+        status: "completed",
+        duration: 1000,
+        avgSpeed: 100,
+        completedAt: "2026-01-01T00:00:00Z",
+      },
+    ];
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(oldData));
+
+    vi.resetModules();
+    const mod = await import("../history");
+    expect(mod.historyRecords).toHaveLength(1);
+    expect(mod.historyRecords[0]?.savePath).toBe("");
   });
 
   it("环形缓冲区限制 100 条记录", () => {

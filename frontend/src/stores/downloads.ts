@@ -217,6 +217,10 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       const newFragmentsDone = p.fragmentsDone ?? task.fragmentsDone;
       const newFragmentsTotal = p.fragmentsTotal ?? task.fragmentsTotal;
       const newConcurrency = p.activeConcurrency ?? 0;
+      // 探测完成后后端通过进度事件同步 file_size,避免详情页显示 0B
+      // (后端 #[serde(skip_serializing_if = "Option::is_none")] 省略空值,
+      //  仅在探测完成有值时到达前端)
+      const newSize = p.fileSize ?? task.fileSize;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -242,9 +246,11 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       // cold 层:status 变化时才更新 tasks store(低频)
       // 同时 hot 层变化时也需同步 tasks store,保持数据一致性
       const hasChanged = hotChanged || newStatus !== oldStatus;
+      // file_size 变化(探测完成时 None → Some)也需同步到 tasks store
+      const sizeChanged = newSize !== task.fileSize;
 
       // 只有至少一个字段真正变化时才更新 store，避免无意义 reconcile
-      if (hasChanged) {
+      if (hasChanged || sizeChanged) {
         setTasksRaw(idx, {
           downloaded: newDownloaded,
           speed: newSpeed,
@@ -252,6 +258,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           progress: newProgress,
           fragmentsDone: newFragmentsDone,
           fragmentsTotal: newFragmentsTotal,
+          fileSize: newSize,
         });
       }
 
@@ -291,6 +298,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           status: newStatus as "completed" | "failed" | "cancelled",
           duration: Math.floor(duration / 1000), // 秒
           avgSpeed,
+          savePath: updatedTask.savePath || "",
         });
       }
     }

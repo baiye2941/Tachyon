@@ -417,10 +417,11 @@ function AppContent() {
             visible={$ui.historyVisible()}
             tasks={$tasks.get()}
             onClose={$ui.closeHistory}
-            onOpenFolder={(taskId) => {
-              const task = $tasks.get().find((t) => t.id === taskId);
-              if (task?.savePath) {
-                api.openFolder(task.savePath).catch(() => {
+            onOpenFolder={(savePath) => {
+              // 问题2修复:直接用历史记录的 savePath 打开,
+              // 不再按 id 查 $tasks(历史记录 id 与任务 id 不同,且任务可能已删除)
+              if (savePath) {
+                api.openFolder(savePath).catch(() => {
                   addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {
