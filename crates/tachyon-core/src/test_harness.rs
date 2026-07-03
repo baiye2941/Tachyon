@@ -281,10 +281,8 @@ pub mod harness {
                             data.slice(offset..end)
                         })
                         .collect();
-                    Ok(
-                        Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
-                            as crate::traits::ByteStream,
-                    )
+                    Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+                        as crate::traits::ByteStream)
                 } else {
                     Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
                         as crate::traits::ByteStream)
