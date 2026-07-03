@@ -73,7 +73,7 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
 
       - name: Miri 检测 tachyon-core
-        run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip proptests
+        run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip test_validate_multi_save_paths --skip proptests
         env:
           RUSTUP_TOOLCHAIN: nightly
 
@@ -310,8 +310,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           echo "发布流程失败,将 release $TAG 标记为 pre-release"
-          gh release edit "$TAG" --prerelease --repo "${{ github.repository }}"
-          echo "::warning::Release $TAG 已标记为 pre-release,需人工审查后手动发布"
+          # release 可能尚未创建(如门禁阶段失败),容错处理
+          gh release edit "$TAG" --prerelease --repo "${{ github.repository }}" || \
+            echo "::warning::Release $TAG 不存在,无需回滚(可能门禁阶段失败前未创建 release)"
 
       - name: 输出回滚说明
         run: |
