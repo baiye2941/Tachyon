@@ -169,6 +169,38 @@ impl std::fmt::Debug for FileStore {
 /// 全局临时文件计数器,确保每次写入使用唯一的临时文件名
 static FILE_STORE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// 临时文件清理守卫(RAII)
+///
+/// 持有临时文件路径,在 `Drop` 时删除该文件(忽略错误),保证 `write_entry`
+/// 在任意失败路径(创建/写入/同步/重命名)下都不残留临时文件,避免磁盘垃圾累积。
+///
+/// 写入成功并完成重命名后应调用 [`TempGuard::disarm`] 取消清理:
+/// 重命名已将临时文件移动至目标路径,此时无需再删除。
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    /// 为指定路径创建守卫,初始处于"武装"状态(`Drop` 时删除文件)
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// 取消清理:写入成功且已重命名后调用,`Drop` 不再删除文件
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl FileStore {
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::open_with_durability(dir, Durability::default())
@@ -216,6 +248,14 @@ impl FileStore {
     /// 获取存储目录
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 获取当前持久化模式
+    ///
+    /// 返回实例在 `open_with_durability` 时配置的模式。
+    /// 注意: 即使返回 `Fast`,`set_durable` 仍可对单次写入强制 fsync。
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
     /// 将键转换为安全的文件名
@@ -277,6 +317,84 @@ impl FileStore {
     pub(crate) fn path_for(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{}.json", Self::safe_key(key)))
     }
+
+    /// 强制持久化写入(单次调用 fsync),不受实例 durability 配置影响
+    ///
+    /// 用于崩溃恢复场景:即使 `FileStore` 以 `Durability::Fast` 打开,
+    /// 调用此方法仍会对本次写入执行 `sync_all`(数据文件 + 目录),
+    /// 保证进程崩溃/断电后数据可恢复。
+    ///
+    /// 典型用途: `RecoveryManager` 的任务快照写入。
+    pub fn set_durable(&self, key: &str, value: String) -> std::io::Result<()> {
+        self.write_entry(key, &value, Durability::Durable)
+    }
+
+    /// 写入一个键值对的底层实现
+    ///
+    /// `effective` 为本次写入的实际持久化模式:
+    /// - `Durable`: 走 File API + `sync_all` + 目录 sync
+    /// - `Fast`: 走 `std::fs::write`,仅依赖 OS 页面缓存
+    ///
+    /// 抽取此方法使 `set`(跟随实例配置)与 `set_durable`(强制 Durable)
+    /// 共享同一套原子写入逻辑,避免行为分叉。
+    fn write_entry(&self, key: &str, value: &str, effective: Durability) -> std::io::Result<()> {
+        let _guard = self.write_lock.write().map_err(|e| {
+            tracing::warn!(key, error = %e, "KV 操作失败");
+            std::io::Error::other(e.to_string())
+        })?;
+        std::fs::create_dir_all(&self.dir)?;
+        let final_path = self.path_for(key);
+        // 使用 pid + 计数器生成唯一临时文件名,避免多实例/多进程写冲突
+        let temp_path = final_path.with_extension(format!(
+            "tmp.{}-{}",
+            std::process::id(),
+            FILE_STORE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // RAII 守卫:此后任一失败路径(创建/写入/同步/重命名)均自动清理 temp 文件,
+        // 避免临时文件残留累积磁盘垃圾。成功重命名后通过 disarm 取消清理。
+        let temp_guard = TempGuard::new(temp_path.clone());
+
+        if effective == Durability::Durable {
+            let mut file = std::fs::File::create(&temp_path).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 创建临时文件失败");
+                e
+            })?;
+            use std::io::Write;
+            file.write_all(value.as_bytes()).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 写入临时文件失败");
+                e
+            })?;
+            file.sync_all().map_err(|e| {
+                tracing::warn!(key, error = %e, "KV fsync 临时文件失败");
+                e
+            })?;
+        } else {
+            std::fs::write(&temp_path, value).map_err(|e| {
+                tracing::warn!(key, error = %e, "KV 操作失败");
+                e
+            })?;
+        }
+
+        std::fs::rename(&temp_path, &final_path).map_err(|e| {
+            tracing::warn!(key, error = %e, "KV rename 失败");
+            e
+        })?;
+
+        // 重命名成功:临时文件已移动至目标路径,无需清理
+        temp_guard.disarm();
+
+        // 持久模式:重命名后同步目录以保证目录项更新落盘
+        if effective == Durability::Durable
+            && let Ok(dir_file) = std::fs::File::open(&self.dir)
+            && let Err(e) = dir_file.sync_all()
+        {
+            // 目录 sync 失败不阻断写入,仅记录警告
+            tracing::warn!(key, error = %e, "KV 目录 fsync 失败(数据文件已落盘)");
+        }
+
+        Ok(())
+    }
 }
 
 impl Store for FileStore {
@@ -293,57 +411,7 @@ impl Store for FileStore {
     }
 
     fn set(&self, key: &str, value: String) -> std::io::Result<()> {
-        let _guard = self.write_lock.write().map_err(|e| {
-            tracing::warn!(key, error = %e, "KV 操作失败");
-            std::io::Error::other(e.to_string())
-        })?;
-        std::fs::create_dir_all(&self.dir)?;
-        let final_path = self.path_for(key);
-        // 使用 pid + 计数器生成唯一临时文件名,避免多实例/多进程写冲突
-        let temp_path = final_path.with_extension(format!(
-            "tmp.{}-{}",
-            std::process::id(),
-            FILE_STORE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-
-        // 持久模式:使用 File API 以便 sync_all
-        if self.durability == Durability::Durable {
-            let mut file = std::fs::File::create(&temp_path).map_err(|e| {
-                tracing::warn!(key, error = %e, "KV 创建临时文件失败");
-                e
-            })?;
-            use std::io::Write;
-            file.write_all(value.as_bytes()).map_err(|e| {
-                tracing::warn!(key, error = %e, "KV 写入临时文件失败");
-                e
-            })?;
-            file.sync_all().map_err(|e| {
-                tracing::warn!(key, error = %e, "KV fsync 临时文件失败");
-                e
-            })?;
-        } else {
-            std::fs::write(&temp_path, &value).map_err(|e| {
-                tracing::warn!(key, error = %e, "KV 操作失败");
-                e
-            })?;
-        }
-
-        std::fs::rename(&temp_path, &final_path).map_err(|e| {
-            tracing::warn!(key, error = %e, "KV rename 失败");
-            let _ = std::fs::remove_file(&temp_path);
-            e
-        })?;
-
-        // 持久模式:重命名后同步目录以保证目录项更新落盘
-        if self.durability == Durability::Durable
-            && let Ok(dir_file) = std::fs::File::open(&self.dir)
-            && let Err(e) = dir_file.sync_all()
-        {
-            // 目录 sync 失败不阻断写入,仅记录警告
-            tracing::warn!(key, error = %e, "KV 目录 fsync 失败(数据文件已落盘)");
-        }
-
-        Ok(())
+        self.write_entry(key, &value, self.durability)
     }
 
     fn delete(&self, key: &str) -> std::io::Result<bool> {
@@ -425,6 +493,23 @@ impl KvStore {
     /// 存储可序列化值
     pub fn put<V: Serialize>(&self, key: &str, value: &V) -> std::io::Result<()> {
         self.inner.put_typed(key, value)
+    }
+
+    /// 强制持久化存储可序列化值(单次调用 fsync)
+    ///
+    /// 即使 `KvStore` 以默认 `Durability::Fast` 打开,本方法也会对本次写入
+    /// 执行 `sync_all`(数据文件 + 目录),保证崩溃后可恢复。
+    ///
+    /// 用于断点续传等对崩溃一致性有硬性要求的场景(见 `RecoveryManager`)。
+    pub fn put_durable<V: Serialize>(&self, key: &str, value: &V) -> std::io::Result<()> {
+        let json = serde_json::to_string(value)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.inner.set_durable(key, json)
+    }
+
+    /// 获取当前持久化模式
+    pub fn durability(&self) -> Durability {
+        self.inner.durability()
     }
 
     /// 读取可反序列化值
@@ -756,6 +841,81 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    /// 收集目录中匹配临时文件命名模式的文件名(形如 `<key>.tmp.<pid>-<n>`)
+    ///
+    /// `write_entry` 生成的临时文件名为 `path_for(key)` 去掉 `.json` 后追加
+    /// `tmp.<pid>-<n>`,故统一以子串 `.tmp.` 作为识别标志,排除 `.lock` 与 `.json`。
+    fn collect_temp_files(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.contains(".tmp.") {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// B7-temp: 正常写入(Fast 模式)后目录中不应残留任何临时文件
+    ///
+    /// 多次写入触发多次临时文件创建与 disarm 清理,随后扫描整个目录断言
+    /// 无匹配 `.tmp.` 模式的残留文件,比逐键猜测 `.tmp` 路径更鲁棒。
+    #[test]
+    fn file_write_leaves_no_temp_pattern_in_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        for i in 0..5 {
+            store.set(&format!("k{i}"), format!("v{i}")).unwrap();
+        }
+
+        let leftover = collect_temp_files(tmp.path());
+        assert!(leftover.is_empty(), "目录中残留临时文件: {leftover:?}");
+    }
+
+    /// B7-temp: `set_durable` 正常写入后目录中不应残留任何临时文件
+    #[test]
+    fn file_set_durable_leaves_no_temp_pattern_in_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        for i in 0..5 {
+            store
+                .set_durable(&format!("dk{i}"), format!("v{i}"))
+                .unwrap();
+        }
+
+        let leftover = collect_temp_files(tmp.path());
+        assert!(leftover.is_empty(), "目录中残留临时文件: {leftover:?}");
+    }
+
+    /// B7-temp: rename 失败路径应清理真正的临时文件
+    ///
+    /// 将目标路径设为目录迫使 `rename` 失败,随后扫描目录断言无以 `blocked.tmp`
+    /// 开头的残留文件,覆盖 RAII 守卫 `Drop` 的清理路径(此前仅 `rename` 失败
+    /// 显式清理,`write_all`/`sync_all` 失败路径未清理,现由守卫统一兜底)。
+    #[test]
+    fn file_set_cleans_real_temp_when_rename_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        let final_path = store.path_for("blocked");
+        // 将目标路径创建为目录,使 rename 无法用文件覆盖目录而失败
+        std::fs::create_dir(&final_path).unwrap();
+
+        assert!(store.set("blocked", "value".to_string()).is_err());
+
+        let leftover: Vec<_> = collect_temp_files(tmp.path())
+            .into_iter()
+            .filter(|n| n.starts_with("blocked.tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "rename 失败后残留临时文件: {leftover:?}"
+        );
+    }
+
     #[test]
     fn file_poisoned_write_lock_returns_io_error() {
         use std::sync::Arc;
@@ -861,6 +1021,63 @@ mod tests {
         // 不应残留 .tmp 文件
         let tmp_path = store.path_for("overwrite_key").with_extension("tmp");
         assert!(!tmp_path.exists(), "覆盖后不应残留临时文件");
+    }
+
+    // ── durability / set_durable 测试 ──
+
+    #[test]
+    fn file_open_default_is_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        assert_eq!(store.durability(), Durability::Fast);
+    }
+
+    #[test]
+    fn file_open_with_durability_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open_with_durability(tmp.path(), Durability::Durable).unwrap();
+        assert_eq!(store.durability(), Durability::Durable);
+    }
+
+    /// B7: `set_durable` 即使在 Fast 实例上也应写入成功且可读
+    #[test]
+    fn file_set_durable_writes_on_fast_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+        assert_eq!(store.durability(), Durability::Fast);
+
+        store
+            .set_durable("durable_key", r#"{"v":1}"#.to_string())
+            .unwrap();
+
+        let loaded = store.get("durable_key").unwrap();
+        assert_eq!(loaded, Some(r#"{"v":1}"#.to_string()));
+    }
+
+    /// B7: `set_durable` 写入不应残留临时文件
+    #[test]
+    fn file_set_durable_no_temp_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        store
+            .set_durable("durable_clean", r#"{"v":2}"#.to_string())
+            .unwrap();
+
+        let tmp_path = store.path_for("durable_clean").with_extension("tmp");
+        assert!(!tmp_path.exists(), "set_durable 后不应残留临时文件");
+    }
+
+    /// B7: `set_durable` 应覆盖已有值
+    #[test]
+    fn file_set_durable_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::open(tmp.path()).unwrap();
+
+        store.set("k", "v1".to_string()).unwrap();
+        store.set_durable("k", "v2".to_string()).unwrap();
+
+        assert_eq!(store.get("k").unwrap(), Some("v2".to_string()));
     }
 
     // ── KvStore 旧接口测试 ──
@@ -975,6 +1192,50 @@ mod tests {
         let store = KvStore::open(tmp.path()).unwrap();
         let val: Option<String> = store.get("persist").unwrap();
         assert_eq!(val, Some("data".to_string()));
+    }
+
+    // ── KvStore put_durable 测试 ──
+
+    /// B7: `KvStore::put_durable` 在 Fast 实例上写入并可读
+    #[test]
+    fn kv_put_durable_on_fast_instance_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        assert_eq!(store.durability(), Durability::Fast);
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Cfg {
+            v: u32,
+        }
+        store.put_durable("cfg", &Cfg { v: 7 }).unwrap();
+
+        let loaded: Option<Cfg> = store.get("cfg").unwrap();
+        assert_eq!(loaded, Some(Cfg { v: 7 }));
+    }
+
+    /// B7: `put_durable` 写入跨实例持久化(模拟崩溃后重开)
+    #[test]
+    fn kv_put_durable_persists_across_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = KvStore::open(tmp.path()).unwrap();
+            store.put_durable("persist", &"data".to_string()).unwrap();
+        }
+        // 重新打开,验证数据仍在(模拟进程崩溃后恢复)
+        let store = KvStore::open(tmp.path()).unwrap();
+        let val: Option<String> = store.get("persist").unwrap();
+        assert_eq!(val, Some("data".to_string()));
+    }
+
+    /// B7: `put_durable` 覆盖已有值
+    #[test]
+    fn kv_put_durable_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        store.put("k", &1u32).unwrap();
+        store.put_durable("k", &2u32).unwrap();
+        let val: Option<u32> = store.get("k").unwrap();
+        assert_eq!(val, Some(2));
     }
 
     // ── 并发测试 ──

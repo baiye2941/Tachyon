@@ -12,6 +12,29 @@ use librqbit::{PeerConnectionOptions, Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
 use tachyon_protocol::magnet::HandleCache;
 
+/// 脱敏 SOCKS 代理 URL 的凭据,保留 scheme/host/port 供日志排查
+///
+/// SOCKS 代理 URL 常含 user:pass 凭据(如 `socks5://user:pass@127.0.0.1:1080`),
+/// 明文打印会泄漏到日志聚合/SIEM/共享日志文件。本函数剥离 username/password,
+/// 保留 scheme/host/port(对代理排查必要),解析失败时返回固定占位符。
+///
+/// 不复用 `tachyon_core::safety::redact_url_for_log`:该函数面向 http 下载 URL,
+/// 取 `host_str()`(不含 port)并拼 basename,对 SOCKS 代理 URL 会丢失 port,
+/// 而 SOCKS 代理的端口(1080/7890/...)是排查必要信息。
+///
+/// 输入 `socks5://user:pass@127.0.0.1:1080` -> 输出 `socks5://127.0.0.1:1080`。
+fn redact_socks_proxy_for_log(proxy: &str) -> String {
+    match url::Url::parse(proxy) {
+        Ok(mut url) => {
+            // 剥离凭据:set_username/set_password 在有 host 时返回 Ok,失败也无碍
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "<invalid proxy url>".to_string(),
+    }
+}
+
 /// BitTorrent Session 单例
 ///
 /// 封装 librqbit Session，提供全局共享的 BitTorrent 引擎实例。
@@ -67,7 +90,10 @@ impl BtSession {
         // SOCKS5 检测:用户配置优先,否则自动检测系统代理
         let socks_proxy = config.socks_proxy_url.clone().or_else(|| {
             tachyon_core::config::detect_socks_proxy().inspect(|proxy| {
-                tracing::info!(proxy = %proxy, "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)");
+                tracing::info!(
+                    proxy = %redact_socks_proxy_for_log(proxy),
+                    "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)"
+                );
             })
         });
         let socks_enabled = socks_proxy.is_some();
@@ -102,7 +128,10 @@ impl BtSession {
         // SOCKS5 代理
         if let Some(ref proxy) = socks_proxy {
             opts.socks_proxy_url = Some(proxy.clone());
-            tracing::info!(proxy = %proxy, "BT SOCKS5 代理已启用");
+            tracing::info!(
+                proxy = %redact_socks_proxy_for_log(proxy),
+                "BT SOCKS5 代理已启用"
+            );
         }
 
         // tracker 注入:SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
@@ -370,5 +399,50 @@ mod tests {
         let config = test_config();
         let session = BtSession::new(dir.path().to_path_buf(), config).await;
         assert!(session.is_ok(), "BtSession 应创建成功: {:?}", session.err());
+    }
+
+    #[test]
+    fn test_redact_socks_proxy_strips_credentials_keeps_host_port() {
+        // 含凭据的 SOCKS5 URL:脱敏后不应含凭据,但保留 host:port
+        let proxy = "socks5://user:pass@127.0.0.1:1080";
+        let redacted = redact_socks_proxy_for_log(proxy);
+        assert!(
+            !redacted.contains("user"),
+            "脱敏后不应含 username,实际: {redacted}"
+        );
+        assert!(
+            !redacted.contains("pass"),
+            "脱敏后不应含 password,实际: {redacted}"
+        );
+        assert!(
+            redacted.contains("127.0.0.1:1080"),
+            "脱敏后应保留 host:port,实际: {redacted}"
+        );
+        assert!(
+            redacted.starts_with("socks5://"),
+            "脱敏后应保留 scheme,实际: {redacted}"
+        );
+        // 精确断言整体形态
+        assert_eq!(redacted, "socks5://127.0.0.1:1080");
+    }
+
+    #[test]
+    fn test_redact_socks_proxy_without_credentials_unchanged() {
+        // 无凭据的 SOCKS5 URL:脱敏后形态不变(幂等)
+        let proxy = "socks5://127.0.0.1:1080";
+        let redacted = redact_socks_proxy_for_log(proxy);
+        assert_eq!(redacted, "socks5://127.0.0.1:1080");
+    }
+
+    #[test]
+    fn test_redact_socks_proxy_invalid_url_returns_placeholder() {
+        // 非法 URL:返回固定占位符,绝不泄漏原始输入
+        let invalid = "not a url at all :::";
+        let redacted = redact_socks_proxy_for_log(invalid);
+        assert_eq!(redacted, "<invalid proxy url>");
+        assert!(
+            !redacted.contains(invalid),
+            "非法 URL 时不应回显原始输入(可能含凭据)"
+        );
     }
 }

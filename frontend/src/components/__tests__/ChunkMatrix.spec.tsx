@@ -9,6 +9,17 @@ import {
 } from "vitest";
 import { render, screen, cleanup, fireEvent } from "@solidjs/testing-library";
 import ChunkMatrix, { buildBlocks } from "../ChunkMatrix";
+import {
+  getTaskFragmentData,
+  mergeFragmentDelta,
+} from "../../stores/taskFragments";
+
+// 默认返回 undefined,保持与未 mock 时一致的回退行为(空 doneSet)。
+// 仅在需要精确分片状态的测试中通过 vi.mocked 注入数据。
+vi.mock("../../stores/taskFragments", () => ({
+  getTaskFragmentData: vi.fn(() => undefined),
+  mergeFragmentDelta: vi.fn(),
+}));
 
 function mockMatchMedia(matches: boolean) {
   Object.defineProperty(window, "matchMedia", {
@@ -59,6 +70,9 @@ describe("ChunkMatrix 分片矩阵", () => {
     mockMatchMedia(false);
     cleanup();
     document.body.innerHTML = "";
+    // 每个测试重置 store mock,避免上一测试注入的数据泄漏
+    vi.mocked(getTaskFragmentData).mockReturnValue(undefined);
+    vi.mocked(mergeFragmentDelta).mockReset();
   });
 
   afterEach(() => {
@@ -144,6 +158,13 @@ describe("ChunkMatrix 分片矩阵", () => {
     });
 
     it("DOM 分片按状态携带对应 class", () => {
+      // 注入分片数据:8 个已完成索引 [0..7],与 fragmentsDone=8 对齐。
+      // 组件 chunks() 据此构建 doneSet,使索引 0-7 判为 done。
+      vi.mocked(getTaskFragmentData).mockReturnValue({
+        total: 20,
+        concurrency: 4,
+        doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
+      });
       render(() => (
         <ChunkMatrix taskId="test-task" fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
       ));

@@ -129,6 +129,23 @@ pub struct IoUringStorage {
     file_fd: Option<std::sync::Arc<std::fs::File>>,
     /// 引擎状态
     state: IoUringState,
+    /// 非对齐写入读-改-写(RMW)临界区串行化锁
+    ///
+    /// 为什么需要锁:RMW 路径先读回对齐块、覆盖用户数据区间、再整块写回,
+    /// 这是非原子序列。两个并发 RMW 落在同一对齐块时会产生 lost-update:
+    /// A 读块 → B 读块 → A 写块 → B 写块,B 的写回覆盖 A 的修改。
+    /// 用锁串行化"读-改-写"临界区即可消除数据竞争。
+    ///
+    /// 为什么用 tokio::sync::Mutex:RMW 临界区内的 submit_read/submit_write
+    /// 都是 async(经 channel 向 driver task 发命令并 await 结果),guard 必须
+    /// 跨 await 点持有。std::sync::Mutex 的 guard 不可跨 await(持锁 await 会
+    /// 阻塞 tokio 工作线程甚至死锁),tokio::sync::Mutex 的 guard 可安全跨 await。
+    ///
+    /// 为什么只锁慢速路径:对齐快速路径单次 submit_write 是原子的(单条 SQE,
+    /// offset 由 SQE.offset 指定,内核保证不交错),无需锁。锁粒度只覆盖非对齐
+    /// RMW 路径,对齐写入零串行化,保持高并发吞吐。
+    #[cfg(target_os = "linux")]
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     // === Linux-only 字段(条件编译) ===
     // io_uring 实例持有者,在 Linux 上通过 Box 持有
     // 避免在非 Linux 平台上引入 io_uring crate 依赖
@@ -436,8 +453,15 @@ async fn driver_task(
                 .build()
                 .user_data(user_data);
 
-                // SAFETY: write_op 由 WriteFixed::build() 构造，是有效的 SQE
-                // 数据已由调用方复制到 fixed buffer，生命周期安全
+                // SAFETY:
+                // - write_op 由 WriteFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
+                // - req.fd 来自合法打开的 Arc<File>(submit_write 中 as_raw_fd),
+                //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
+                // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
+                //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
+                //   对齐地址,数据已由调用方在 submit_write 中复制完成,push 后 SQE 才被
+                //   内核消费,不存在悬垂引用。
+                // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
                 unsafe {
                     if sq.push(&write_op).is_ok() {
                         next_user_data = next_user_data.wrapping_add(1);
@@ -472,7 +496,15 @@ async fn driver_task(
                 .build()
                 .user_data(user_data);
 
-                // SAFETY: read_op 由 ReadFixed::build() 构造，是有效的 SQE
+                // SAFETY:
+                // - read_op 由 ReadFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
+                // - req.fd 来自合法打开的 Arc<File>(submit_read 中 as_raw_fd),
+                //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
+                // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
+                //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
+                //   对齐地址,actual_len = min(read_len, buf.len()),写入长度不越界,
+                //   内核 ReadFixed 完成后数据落在该 buffer 内,CQE 处理时再读出。
+                // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
                 unsafe {
                     if sq.push(&read_op).is_ok() {
                         next_user_data = next_user_data.wrapping_add(1);
@@ -497,7 +529,12 @@ async fn driver_task(
                     let fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
                         .build()
                         .user_data(user_data);
-                    // SAFETY: fsync_op 由 Fsync::build() 构造
+                    // SAFETY:
+                    // - fsync_op 由 Fsync::build() 构造,是符合 io_uring ABI 的有效 SQE。
+                    // - fd 来自最近一次 Write/Read 请求的 req.fd(合法 Arc<File> 的
+                    //   raw fd),IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理
+                    //   期间有效。fsync 操作不引用任何用户 buffer,无缓冲区生命周期问题。
+                    // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
                     unsafe {
                         if sq.push(&fsync_op).is_ok() {
                             next_user_data = next_user_data.wrapping_add(1);
@@ -581,6 +618,16 @@ async fn driver_task(
                         let bytes_read = r as usize;
                         // 从 fixed buffer 复制到 Vec 返回
                         let buf = &buffers[read_req.buf_idx];
+                        // SAFETY:
+                        // - buf.as_ptr() 返回该 fixed buffer 对齐后的起始地址,
+                        //   指向 buffers[buf_idx] 内核已读取的内存区域(ReadFixed 完成)。
+                        // - bytes_read = cqe.result(),是内核实际写入的字节数,满足
+                        //   0 <= bytes_read <= read_req.read_len(由 ReadFixed 语义保证)。
+                        //   read_len 已校验 <= buf.len()(submit_read 中 actual_len = min),
+                        //   故 bytes_read <= buf.len(),切片范围在 buffer 有效区间内。
+                        // - 此处只读不写,且 driver task 是 buffers 的唯一消费者此刻
+                        //   (该 buf_idx 已被 submit_read 分配并独占,完成后才 free),
+                        //   不存在并发别名引用。
                         let src = unsafe { std::slice::from_raw_parts(buf.as_ptr(), bytes_read) };
                         Ok(src.to_vec())
                     };
@@ -769,6 +816,8 @@ impl IoUringStorage {
             file_path: path.as_ref().to_path_buf(),
             file_fd: None,
             state: IoUringState::Created,
+            #[cfg(target_os = "linux")]
+            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(target_os = "linux")]
             ring: None,
         }
@@ -1087,7 +1136,13 @@ impl IoUringStorage {
         // 将数据复制到 fixed buffer（必须在发送请求前完成，
         // 因为 driver task 会直接引用 buffer 地址构造 SQE）
         let buf = &ring_handle.buffers[buf_idx];
-        // Safety: alloc_buffer_index 保证同一时刻只有一个操作使用该 buffer 索引
+        // SAFETY:
+        // - alloc_buffer_index 通过原子位图 CAS 保证同一时刻只有一个操作使用该
+        //   buffer 索引(独占),此刻无其他别名引用 buffers[buf_idx] 的数据区,可变访问安全。
+        // - len 已由上方 validate_fixed_buffer_write_len(len, buffer_len) 校验
+        //   len <= buffer_len(= buf.len()),from_raw_parts_mut 切片范围在 buffer 有效区间内。
+        // - buf.ptr() 返回对齐后的起始裸指针(UnsafeCell 内部可变性合法化),指向
+        //   buffers[buf_idx] 的堆数据,len 字节在 buffer 内存范围内。
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr(), len) };
         dst.copy_from_slice(data);
 
@@ -1217,6 +1272,12 @@ impl AsyncStorage for IoUringStorage {
                         // 的零覆盖邻近已写数据(并发写同一段时相互破坏)并撑大文件。
                         // 改为:先读回对齐块现有内容,仅覆盖用户数据区间,再整块写回。
                         // 这样 padding 区保留的是文件真实旧数据,而非零。
+                        //
+                        // B1 修复:RMW 是非原子序列(读块→改→写块),两个并发 RMW 落
+                        // 同一对齐块会产生 lost-update(A 读→B 读→A 写→B 写,B 覆盖 A)。
+                        // 用 write_lock 串行化整个 RMW 临界区,持锁从 submit_read 到
+                        // submit_write 完成。对齐快速路径单次 submit_write 原子,不加锁。
+                        let _rmw_guard = self.write_lock.lock().await;
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
@@ -1237,12 +1298,15 @@ impl AsyncStorage for IoUringStorage {
                         // 读回对齐块现有内容。短读/错误(文件尚未扩展到此区间)可忽略:
                         // 未读回的尾部保持 0,这是文件真实 EOF 之后的扩展区,写回时
                         // 由 O_DIRECT 扩展文件语义处理,不覆盖邻近已写数据。
+                        // 持有 _rmw_guard 保证此读不会被另一并发 RMW 的写回覆盖。
                         let _ = self.submit_read(aligned_offset, &mut buf).await;
                         // 仅覆盖用户数据区间,padding 区保留读回的真实旧数据
                         buf[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
+                        // 锁释放在此(drop _rmw_guard)——RMW 临界区结束。
+                        drop(_rmw_guard);
                         // submit_write 返回整块写入量(含 padding),调用方期望用户数据字节数。
                         // O_DIRECT 对齐写入通常一次完成(padded 全部写入),此时用户数据完整
                         // 覆盖,返回 _data.len()。若短写未覆盖全部用户数据,按实际覆盖量
@@ -1284,6 +1348,14 @@ impl AsyncStorage for IoUringStorage {
                             return self.submit_write(_offset, _data).await;
                         }
 
+                        // 慢速路径读-改-写(RMW):先读回对齐块现有内容,仅覆盖用户数据
+                        // 区间,再整块写回。padding 区保留文件真实旧数据,而非零,避免
+                        // 零覆盖邻近已写数据并撑大文件。详见 write_at 慢速路径注释。
+                        //
+                        // B1 修复:RMW 非原子,并发同块 lost-update。write_lock 串行化
+                        // 整个 RMW 临界区(submit_read → 改 → submit_write)。对齐快速
+                        // 路径单次 submit_write 原子,不加锁。
+                        let _rmw_guard = self.write_lock.lock().await;
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
@@ -1299,15 +1371,13 @@ impl AsyncStorage for IoUringStorage {
                             )));
                         }
 
-                        // 慢速路径读-改-写(RMW):先读回对齐块现有内容,仅覆盖用户数据
-                        // 区间,再整块写回。padding 区保留文件真实旧数据,而非零,避免
-                        // 零覆盖邻近已写数据并撑大文件。详见 write_at 慢速路径注释。
                         let mut buf = vec![0u8; padded_len];
                         let _ = self.submit_read(aligned_offset, &mut buf).await;
                         buf[front_pad..front_pad + _data.len()].copy_from_slice(_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
+                        drop(_rmw_guard);
                         let user_written = written.saturating_sub(front_pad).min(_data.len());
                         Ok(user_written)
                     }
@@ -1703,6 +1773,7 @@ mod tests {
             file_path: PathBuf::from("/tmp/iouring_oversized_write.bin"),
             file_fd: None,
             state: IoUringState::Ready,
+            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             ring: None,
         };
 
@@ -1965,5 +2036,64 @@ mod tests {
             Some(64),
             "释放 idx=64 后应重新分配到 64"
         );
+    }
+
+    /// B1 并发 RMW 数据完整性测试。
+    ///
+    /// io_uring 非对齐写入走读-改-写(RMW):读回对齐块→覆盖用户区→整块写回,
+    /// 这是非原子序列。修复前 IoUringStorage 无 write_lock,两个并发 RMW 落
+    /// 同一对齐块会产生 lost-update(A 读→B 读→A 写→B 写,B 覆盖 A 的修改)。
+    /// 本测试并发写同一对齐块(4096B)的不同非对齐 offset,验证两者数据都正确落盘。
+    ///
+    /// 设计:
+    /// - 同一 4096B 对齐块(offset 0..4096)内,并发写 offset=10(len=20,0xAA)
+    ///   和 offset=100(len=20,0xBB),两者非对齐且落同一块,均走 RMW 慢速路径。
+    /// - 多轮迭代提高竞态检出概率(无锁时偶发性丢失)。
+    /// - 读回验证:offset=10 处为 0xAA,offset=100 处为 0xBB,互不覆盖。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_iouring_concurrent_rmw_same_block_no_lost_update() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            let path = dir.path().join(format!("iouring_rmw_{round}.bin"));
+            let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+            storage.init().expect("io_uring init 应成功");
+            storage.allocate(4096).await.expect("预分配应成功");
+            let storage = std::sync::Arc::new(storage);
+
+            // 并发写同一对齐块(0..4096)的两个非对齐区间,均触发 RMW 慢速路径
+            let s1 = storage.clone();
+            let h1 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xAAu8; 20]);
+                s1.write_at(10, data).await
+            });
+            let s2 = storage.clone();
+            let h2 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xBBu8; 20]);
+                s2.write_at(100, data).await
+            });
+            let (r1, r2) = tokio::join!(h1, h2);
+            r1.expect("task1 join").expect("write_at(10) 应成功");
+            r2.expect("task2 join").expect("write_at(100) 应成功");
+
+            // 读回验证两段数据都正确落盘,互不覆盖
+            let mut buf_a = [0u8; 20];
+            storage.read_at(10, &mut buf_a).await.expect("read_at(10)");
+            assert!(
+                buf_a.iter().all(|&b| b == 0xAA),
+                "round {round}: offset=10 应为 0xAA,实际 {buf_a:?}(并发 RMW lost-update)"
+            );
+            let mut buf_b = [0u8; 20];
+            storage
+                .read_at(100, &mut buf_b)
+                .await
+                .expect("read_at(100)");
+            assert!(
+                buf_b.iter().all(|&b| b == 0xBB),
+                "round {round}: offset=100 应为 0xBB,实际 {buf_b:?}(并发 RMW lost-update)"
+            );
+            storage.close().await.expect("close");
+        }
     }
 }

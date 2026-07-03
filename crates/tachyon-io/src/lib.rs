@@ -5,12 +5,16 @@
 //! - Windows:WinFile 优化(NO_BUFFERING + SEQUENTIAL_SCAN)
 //! - macOS:tokio 标准异步文件 I/O
 //! - BufferPool 管理与 buffer 复用(带 Semaphore 反压)
-//! - 零拷贝写入管道(含批量合并写入)
+//!
+//! 注:旧的 `WritePipeline`(信号量字节级反压 + `write_batch` 相邻 segment 合并)
+//! 已移除。它从未接入下载主路径(`download_single_fragment` → `flush_batch` →
+//! `write_all_at_mut` 直接调 `storage.write_at`),实际反压由 `BufferPool` 在数量级
+//! 粒度承担;且 `write_pipeline` bench 全程直连 `TokioFile`,不经真实下载路径,
+//! 无法证明接入收益。如需重新引入,应先补跨文件接入与 >10% 收益的 bench 证据。
 
 pub mod buffer;
 pub mod iocp;
 pub mod iouring;
-pub mod pipeline;
 pub mod storage;
 pub mod tokio_file;
 pub mod winio;
@@ -18,7 +22,6 @@ pub mod winio;
 pub use buffer::{BufferGuard, BufferPool, BufferPoolStats};
 pub use iocp::IoCpStorage;
 pub use iouring::{IoUringConfig, IoUringState, IoUringStorage};
-pub use pipeline::WritePipeline;
 pub use storage::AsyncStorage;
 pub use tokio_file::TokioFile;
 pub use winio::WinFile;
@@ -43,26 +46,6 @@ fn buffer_align() {
 
     // 默认 64KB buffer 是 4096 的倍数
     assert_eq!((64 * 1024usize) % 4096, 0);
-}
-
-/// 验证 WritePipeline 可以正常创建并执行基本写入操作
-#[cfg(test)]
-#[tokio::test]
-async fn write_pipeline() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let storage = TokioFile::open(tmp.path()).await.unwrap();
-    let pipeline = WritePipeline::new(storage, 4096, 4);
-
-    assert_eq!(pipeline.available_permits(), 4 * 4096);
-    assert_eq!(pipeline.buffer_size(), 4096);
-
-    let written = pipeline.write(0, b"hello pipeline").await.unwrap();
-    assert_eq!(written, 14);
-
-    let mut buf = [0u8; 14];
-    let read = pipeline.storage().read_at(0, &mut buf).await.unwrap();
-    assert_eq!(read, 14);
-    assert_eq!(&buf, b"hello pipeline");
 }
 
 /// 验证 BufferPool 反压行为:许可耗尽时 alloc 阻塞,归还后恢复

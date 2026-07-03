@@ -153,6 +153,9 @@ pub struct RecoveryResult {
 }
 
 /// 恢复管理器
+///
+/// 负责任务快照的持久化与恢复。所有 `task_*` 键的写入均走强制 Durable 路径
+/// (fsync 数据文件 + 目录),以满足崩溃恢复承诺(见 [`Self::save_task_snapshot`])。
 pub struct RecoveryManager {
     store: KvStore,
     /// 序列化 read-modify-write 操作,防止并发分片进度更新丢失
@@ -168,9 +171,27 @@ impl RecoveryManager {
         }
     }
 
-    /// 保存任务快照
+    /// 保存任务快照(强制持久化)
+    ///
+    /// 即使底层 `KvStore` 以 `Durability::Fast` 打开,本方法仍通过
+    /// [`KvStore::put_durable`] 对本次写入执行 `sync_all`(数据文件 + 目录),
+    /// 保证进程崩溃/断电后任务进度不丢失。
+    ///
+    /// # 为什么 RecoveryManager 必须 Durable
+    ///
+    /// `RecoveryManager` 的核心职责是崩溃恢复:应用重启后从这里重建未完成下载。
+    /// 若快照写走 Fast 模式(仅依赖 OS 页面缓存),进程崩溃或断电时最新进度会丢失,
+    /// 恢复时只能读到上一次落盘的旧进度,导致已下载分片被重复下载。
+    ///
+    /// # 为什么 Durable 在热路径可接受
+    ///
+    /// 生产热路径(`chunk_reader_pool.rs`)走 [`Self::update_snapshot`],
+    /// 该方法已通过 `CHECKPOINT_BATCH_SIZE` 与 `PARTIAL_CHECKPOINT_INTERVAL`
+    /// 限频(批量 + 时间间隔双维度节流),Durable 的 fsync 开销被摊薄到可控频率,
+    /// 不会成为每分片的热点。
     pub fn save_task_snapshot(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
-        self.store.put(&format!("task_{}", snapshot.id), snapshot)
+        self.store
+            .put_durable(&format!("task_{}", snapshot.id), snapshot)
     }
 
     /// 加载任务快照
@@ -311,26 +332,6 @@ impl RecoveryManager {
         self.save_task_snapshot(&snapshot)?;
         Ok(Some(snapshot))
     }
-
-    /// 更新分片进度
-    ///
-    /// 使用内部锁序列化 read-modify-write,防止并发分片完成时丢失更新。
-    pub fn update_fragment_progress(
-        &self,
-        task_id: &str,
-        fragment_index: u32,
-        downloaded_bytes: u64,
-    ) -> std::io::Result<()> {
-        let _guard = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut record) = self.load_task(task_id)? {
-            if !record.completed_fragments.contains(&fragment_index) {
-                record.completed_fragments.push(fragment_index);
-            }
-            record.downloaded = downloaded_bytes;
-            self.save_task(&record)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -403,18 +404,6 @@ mod tests {
         let ids: Vec<&str> = pending.iter().map(|r| r.task_id.as_str()).collect();
         assert!(ids.contains(&"t1"));
         assert!(ids.contains(&"t3"));
-    }
-
-    #[test]
-    fn test_update_fragment_progress() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = KvStore::open(tmp.path()).unwrap();
-        let mgr = RecoveryManager::new(store);
-        mgr.save_task(&make_record("t1", "downloading")).unwrap();
-        mgr.update_fragment_progress("t1", 2, 768).unwrap();
-        let record = mgr.load_task("t1").unwrap().unwrap();
-        assert!(record.completed_fragments.contains(&2));
-        assert_eq!(record.downloaded, 768);
     }
 
     #[test]
@@ -682,6 +671,57 @@ mod tests {
         let result = mgr.load_all_task_snapshots().unwrap();
         assert_eq!(result.tasks.len(), 2);
         assert_eq!(result.corrupt_keys.len(), 1);
+    }
+
+    // ── B7: RecoveryManager 强制 Durable 测试 ──
+
+    /// B7: RecoveryManager 在 Fast store 上写入快照后,重新打开仍可恢复
+    ///
+    /// `save_task_snapshot` 必须走 `put_durable`(fsync),保证进程崩溃后进度不丢失。
+    /// 此测试用 "关闭实例后重开" 模拟崩溃:若写入仅停留在 OS 页面缓存,
+    /// 在真实断电场景会丢失;此处验证至少数据已正确落盘到文件系统可读状态。
+    #[test]
+    fn recovery_snapshot_survives_reopen_on_fast_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = make_snapshot("crash", tachyon_core::DownloadState::Downloading);
+
+        // 写入后关闭实例(模拟进程退出/崩溃)
+        {
+            let store = KvStore::open(tmp.path()).unwrap();
+            assert_eq!(store.durability(), crate::Durability::Fast);
+            let mgr = RecoveryManager::new(store);
+            mgr.save_task_snapshot(&snap).unwrap();
+        }
+
+        // 重新打开,验证快照可恢复
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let loaded = mgr.load_task_snapshot("crash").unwrap().unwrap();
+        assert_eq!(loaded, snap);
+    }
+
+    /// B7: `update_snapshot` 同样走 Durable 路径(经 save_task_snapshot),
+    /// 重开后 patch 后的进度可恢复
+    #[test]
+    fn recovery_update_snapshot_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = KvStore::open(tmp.path()).unwrap();
+            let mgr = RecoveryManager::new(store);
+            let snap = make_snapshot("up", tachyon_core::DownloadState::Downloading);
+            mgr.save_task_snapshot(&snap).unwrap();
+            mgr.update_snapshot("up", |s| {
+                s.downloaded = 999;
+                s.completed_fragments.push(2);
+            })
+            .unwrap();
+        }
+
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let loaded = mgr.load_task_snapshot("up").unwrap().unwrap();
+        assert_eq!(loaded.downloaded, 999);
+        assert!(loaded.completed_fragments.contains(&2));
     }
 
     // ── update_snapshot 原子性测试 ──

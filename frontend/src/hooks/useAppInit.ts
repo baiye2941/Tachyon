@@ -1,4 +1,4 @@
-import { onMount } from "solid-js";
+import { onMount, onCleanup } from "solid-js";
 import { api } from "../api/invoke";
 import { onRecoveryWarning } from "../api/events";
 import {
@@ -45,7 +45,7 @@ export function useAppInit(
       .catch((e) => addToast(tr("toast.progressSubscribeFailed", { error: e }), "error"));
 
     // 监听启动恢复告警(损坏的断点续传快照已被跳过)
-    onRecoveryWarning((payload) => {
+    const recoveryUnlistenPromise = onRecoveryWarning((payload) => {
       if (payload && payload.count > 0) {
         // 兼容层 addToast 仅支持 info/success/error 三态,warning 语义映射为 info
         addToast(
@@ -53,7 +53,15 @@ export function useAppInit(
           "info",
         );
       }
-    }).catch((e) => addToast(tr("toast.recoveryListenFailed", { error: e }), "error"));
+    }).catch((e) => {
+      addToast(tr("toast.recoveryListenFailed", { error: e }), "error");
+      // 监听失败时返回 no-op unlisten,保证下游 then(fn => fn()) 安全
+      return (() => {}) as (() => void);
+    });
+
+    onCleanup(() => {
+      recoveryUnlistenPromise.then((fn) => fn());
+    });
 
     // 加载 sniffer 资源
     api

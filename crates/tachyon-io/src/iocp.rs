@@ -412,6 +412,21 @@ pub struct IoCpStorage {
     slots: std::sync::Arc<CompletionSlots>,
     /// NO_BUFFERING 模式下非对齐写入的 buffered fallback 句柄
     fallback: std::sync::Mutex<Option<std::fs::File>>,
+    /// fallback 路径 seek_write 串行化锁
+    ///
+    /// 为什么需要锁:fallback 句柄是共享的 buffered File,其 seek_write
+    /// (SetFilePointerEx + WriteFile)非原子,共享 per-handle 文件指针。两个并发
+    /// seek_write 不同 offset 会互相覆盖文件指针位置,导致写入错位(lost-update)。
+    /// 主 OVERLAPPED 路径由 OVERLAPPED.offset 字段指定偏移,内核保证原子性,无需锁。
+    ///
+    /// 为什么用 std::sync::Mutex:fallback 的 seek_write 在 spawn_blocking 内
+    /// (同步上下文),guard 不跨 await 点,标准 Mutex 足够且比 tokio::Mutex 轻量。
+    /// 与 WinFile / tokio_file(Windows) 的 write_lock 模式一致。
+    ///
+    /// 为什么只锁 fallback 路径:主 IOCP 路径(对齐写入)走 WriteFile+OVERLAPPED,
+    /// offset 由 OVERLAPPED 字段传递,内核保证不交错,无需串行化。锁粒度只覆盖
+    /// 非对齐 fallback 的 seek_write,对齐写入零串行化。
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 // Safety: IoCpStorage 的所有字段均可安全跨线程共享:
@@ -438,6 +453,7 @@ impl IoCpStorage {
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slots: std::sync::Arc::new(CompletionSlots::new()),
             fallback: std::sync::Mutex::new(None),
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -984,8 +1000,14 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
             if needs_fallback {
                 let fallback_file = self.get_or_init_fallback()?;
+                // B1-iocp 修复:fallback 的 seek_write 非原子(共享 per-handle 文件指针),
+                // 用 write_lock 串行化。锁在 spawn_blocking 内获取(同步上下文),
+                // guard 不跨 await 点,主 OVERLAPPED 路径不受影响。
+                let write_lock = self.write_lock.clone();
                 return tokio::task::spawn_blocking(move || {
                     use std::os::windows::fs::FileExt;
+                    // seek_write 非原子,串行化保证并发写不交错文件指针
+                    let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
                     fallback_file
                         .seek_write(&data, offset)
                         .map_err(DownloadError::Io)
@@ -1176,8 +1198,13 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                 // CRITICAL 修复:复制成 owned Bytes move 进 spawn_blocking,消除裸指针 UAF
                 // (future 被 select! 取消时 batch drop 但 spawn_blocking 任务仍跑)
                 let data_bytes = bytes::Bytes::copy_from_slice(&data[..]);
+                // B1-iocp 修复:fallback 的 seek_write 非原子,用 write_lock 串行化
+                // (同 write_at fallback 路径,详见上文注释)
+                let write_lock = self.write_lock.clone();
                 return tokio::task::spawn_blocking(move || {
                     use std::os::windows::fs::FileExt;
+                    // seek_write 非原子,串行化保证并发写不交错文件指针
+                    let _guard = write_lock.lock().unwrap_or_else(|e| e.into_inner());
                     fallback_file
                         .seek_write(&data_bytes, offset)
                         .map_err(DownloadError::Io)
@@ -2023,5 +2050,63 @@ mod tests {
             }
         }
         storage.close().await.unwrap();
+    }
+
+    /// B1-iocp 并发 RMW 数据完整性测试。
+    ///
+    /// IOCP fallback 路径用 seek_write(非原子,共享 per-handle 文件指针),
+    /// 修复前无 write_lock,两个并发 seek_write 不同 offset 会互相覆盖文件指针,
+    /// 导致写入错位(lost-update)。本测试并发写同一对齐块的不同非对齐 offset,
+    /// 验证两者数据都正确落盘。
+    ///
+    /// 设计:
+    /// - 同一 512B 对齐块(offset 0..512)内,并发写 offset=10(len=20,内容 0xAA)
+    ///   和 offset=100(len=20,内容 0xBB),两者非对齐且落同一扇区,均走 fallback。
+    /// - 多轮迭代提高竞态检出概率(无锁时偶发性丢失)。
+    /// - 读回验证:offset=10 处为 0xAA,offset=100 处为 0xBB,互不覆盖。
+    #[cfg(target_os = "windows")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_iocp_concurrent_rmw_same_sector_no_lost_update() {
+        use crate::storage::AsyncStorage;
+
+        const ROUNDS: usize = 30;
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("iocp_rmw_{round}.dat"));
+            let mut storage = IoCpStorage::new(&path);
+            storage.init().expect("IOCP init 应成功");
+            storage.allocate(512).await.unwrap();
+            let storage = std::sync::Arc::new(storage);
+
+            // 并发写同一扇区(0..512)的两个非对齐区间
+            let s1 = storage.clone();
+            let h1 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xAAu8; 20]);
+                s1.write_at(10, data).await
+            });
+            let s2 = storage.clone();
+            let h2 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xBBu8; 20]);
+                s2.write_at(100, data).await
+            });
+            let (r1, r2) = tokio::join!(h1, h2);
+            r1.expect("task1 join").expect("write_at(10) 应成功");
+            r2.expect("task2 join").expect("write_at(100) 应成功");
+
+            // 读回验证两段数据都正确落盘,互不覆盖
+            let mut buf_a = [0u8; 20];
+            storage.read_at(10, &mut buf_a).await.unwrap();
+            assert!(
+                buf_a.iter().all(|&b| b == 0xAA),
+                "round {round}: offset=10 应为 0xAA,实际 {buf_a:?}(并发 RMW lost-update)"
+            );
+            let mut buf_b = [0u8; 20];
+            storage.read_at(100, &mut buf_b).await.unwrap();
+            assert!(
+                buf_b.iter().all(|&b| b == 0xBB),
+                "round {round}: offset=100 应为 0xBB,实际 {buf_b:?}(并发 RMW lost-update)"
+            );
+            storage.close().await.unwrap();
+        }
     }
 }

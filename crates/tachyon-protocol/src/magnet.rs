@@ -307,6 +307,54 @@ impl PeerHealthSource for ManagedTorrentPeerHealth {
 /// 无 peer 时轮询 peer 健康状态的间隔(秒)
 const PEER_HEALTH_POLL_SECS: u64 = 5;
 
+/// 解耦 stall_timeout 与 peer_wait(修复 B4)
+///
+/// config.rs 文档承诺 `stall_timeout_secs` 与 `peer_wait_timeout_secs` 各自独立:
+/// 0 禁用自身。但 `make_chunk_stream` 内 `timeout(stall, read)` 在 `stall=MAX` 时
+/// 对永久 Pending reader 永不触发超时分支,导致 peer 健康检查 / peer_wait 墙钟判断
+/// 全部不可达 —— 即"禁用 stall 会隐式禁用 peer_wait",违反独立性承诺。
+///
+/// 解法:
+/// - stall 显式启用(>0):直接用配置值。
+/// - stall 禁用(=0)且 peer_wait 也禁用(MAX):保持 MAX 零开销,纯依赖引擎层取消
+///   信号(向后兼容)。
+/// - stall 禁用(=0)但 peer_wait 启用(<MAX):用一个有限 stall 兜底值(取 peer_wait
+///   的 1/10 与 30s 较小者)使 `timeout(stall, read)` 超时分支可达,从而 peer_wait
+///   墙钟判断能生效。1/10 比例保证 stall 远小于 peer_wait,不会抢先于 peer_wait
+///   失败;30s 上限避免 peer_wait 极大时单次 stall 过长。
+fn resolve_stall_timeout(stall_timeout_secs: u64, peer_wait: Duration) -> Duration {
+    if stall_timeout_secs != 0 {
+        return Duration::from_secs(stall_timeout_secs);
+    }
+    // stall 禁用:仅当 peer_wait 启用时提供有限兜底值
+    if peer_wait == Duration::MAX {
+        Duration::MAX
+    } else {
+        // 兜底:peer_wait 的 1/10 与 30s 较小者,再取与 5s 的较大者。
+        // 下限 5s 防止 peer_wait 极小(如 5s,validate 允许 1-3600)时兜底 stall
+        // 跌到 500ms —— BT piece 256KB-16MB,慢 peer 传一个 piece 轻易超 500ms,
+        // 过短兜底会频繁触发 stall 超时,叠加 retryable 快速失败循环(修复 B4-Medium)。
+        // 默认 peer_wait=300s 时 min(30s, 30s)=30s,max(30s, 5s)=30s,行为不变。
+        std::cmp::max(
+            std::cmp::min(peer_wait / 10, Duration::from_secs(30)),
+            Duration::from_secs(5),
+        )
+    }
+}
+
+/// 把 Duration 格式化为人类可读的"X秒"或"X毫秒"
+///
+/// `as_secs()` 在亚秒级 Duration(如 500ms)下截断为 0,显示"0 秒"产生误导
+/// (修复 B4:兜底 stall 在 peer_wait 极小值时可跌到 5s,但仍需正确显示亚秒值)。
+/// 本函数:>= 1s 显示秒,否则显示毫秒,使错误信息在任何量级都清晰。
+fn format_duration_human(d: Duration) -> String {
+    if d >= Duration::from_secs(1) {
+        format!("{}秒", d.as_secs())
+    } else {
+        format!("{}毫秒", d.as_millis())
+    }
+}
+
 /// 把 BufReader 包装成 64KB chunk 的 ByteStream(unfold)
 ///
 /// 读取到 EOF 返回 None 结束流,遇错误产出 Err 项。
@@ -319,11 +367,16 @@ const PEER_HEALTH_POLL_SECS: u64 = 5;
 ///    stall_timeout 兜底防永久挂起。`Duration::MAX` 禁用(零开销)。
 /// 2. `peer_wait` + `peer_health`:无 peer 时智能等待。read 超时后检查 peer 健康状态:
 ///    - 有 peer:重置等待计数,继续 stall_timeout 读(可能是 piece 延迟)
-///    - 无 peer:累计等待 `PEER_HEALTH_POLL_SECS`,超过 `peer_wait` 总限则产出
-///      `Err(Timeout("无可用 peer,等待 N秒后超时"))`,让引擎重试/失败
+///    - 无 peer:轮询 `PEER_HEALTH_POLL_SECS` 后重试,以本次 `unfold` 调用以来的
+///      **墙钟** `started.elapsed()` 对比 `peer_wait` 总限决定是否失败
 ///
 ///    peer_wait 给死 swarm 恢复的窗口(tracker 重试 60s,DHT 重建 1-2min),
 ///    默认 5 分钟。`Duration::MAX` 禁用(回退纯 stall_timeout)。
+///
+/// 注意:`started` 在每次 `unfold` 产出后重置(每次 poll_next 一个新调用),
+/// 因此 peer_wait 是"单次 read 尝试序列"的上限,而非整流的总下载时间。
+/// 墙钟语义确保 stall 超时等待与轮询 sleep 都计入 peer_wait(修复 B3:
+/// 原累加计数漏算 stall 等待,实际墙钟耗时约为配置值的 13 倍)。
 fn make_chunk_stream<R>(
     reader: R,
     stall_timeout: Duration,
@@ -334,7 +387,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use futures::stream::unfold;
-    // unfold 状态:reader + 无 peer 累计等待时间
+    // unfold 状态:reader + 无 peer 累计等待时间(仅诊断用途,墙钟判断见下)
     unfold(
         (reader, Duration::ZERO),
         move |(mut reader, mut no_peer_elapsed)| {
@@ -343,6 +396,13 @@ where
             let health = peer_health.clone();
             async move {
                 let mut buf = vec![0u8; 64 * 1024];
+                // 计时起点:用 tokio::time::Instant 与本函数内的 timeout/sleep 共享
+                // 同一时间源 —— 生产(非 paused)下等同真实墙钟,start_paused 测试下
+                // 随 tokio 自动推进时钟一起前进,确保判断与已等待的虚拟时间一致。
+                // 这样 stall 等待 + sleep 轮询都计入 peer_wait 总限(修复 B3:原累加
+                // no_peer_elapsed 只算 sleep,漏算 stall 超时等待,导致实际耗时约
+                // 配置值的 13 倍)。peer_wait=MAX(禁用)时下方短路跳过。
+                let started = tokio::time::Instant::now();
                 loop {
                     match tokio::time::timeout(stall, reader.read(&mut buf)).await {
                         Ok(Ok(0)) => return None, // EOF
@@ -365,16 +425,19 @@ where
                                 // 有 peer(或无监控)但 read 超时:产出 stall Timeout
                                 return Some((
                                     Err(DownloadError::Timeout(format!(
-                                        "磁力链接读取 stall 超时({}秒),有 peer 但无数据",
-                                        stall.as_secs()
+                                        "磁力链接读取 stall 超时({}),有 peer 但无数据",
+                                        format_duration_human(stall)
                                     ))),
                                     (reader, Duration::ZERO),
                                 ));
                             }
-                            // 无 peer:智能等待 —— 短轮询间隔累计,超 peer_wait 则失败
+                            // 无 peer:智能等待 —— 用墙钟判断是否超 peer_wait 总限。
+                            // no_peer_elapsed 仅作诊断(保留累加供日志/调试),不参与超时决策。
                             let poll = Duration::from_secs(PEER_HEALTH_POLL_SECS);
                             no_peer_elapsed = no_peer_elapsed.saturating_add(poll);
-                            if no_peer_elapsed >= wait {
+                            // peer_wait=MAX(禁用)时短路:永不触发,继续轮询等待 peer。
+                            // 否则用墙钟 elapsed(含 stall 等待 + 轮询 sleep)对比 peer_wait。
+                            if wait != Duration::MAX && started.elapsed() >= wait {
                                 return Some((
                                     Err(DownloadError::Timeout(format!(
                                         "无可用 peer,等待 {}秒后超时",
@@ -473,6 +536,146 @@ async fn add_magnet_to_session(
     added
         .into_handle()
         .ok_or_else(|| DownloadError::Protocol("磁力链接已存在或添加失败".into()))
+}
+
+/// 进度采样器:抽取 BT 层"已下载并校验字节数"作为看门狗输入(修复 B2-Critical)
+///
+/// 生产实现包装 `ManagedTorrent::live().stats_snapshot().downloaded_and_checked_bytes`;
+/// 测试可注入 mock(常量值或线性增长)以验证看门狗判定逻辑,无需真实 BT 网络。
+/// 返回 `None` 表示 torrent 未 live(无法采样),看门狗视为"无进度"计入。
+pub trait ProgressSampler: Send + Sync {
+    /// 当前已下载并校验的字节数,None 表示无法采样(未 live)
+    fn downloaded_and_checked_bytes(&self) -> Option<u64>;
+}
+
+/// 基于 librqbit `ManagedTorrent` 的 `ProgressSampler` 生产实现
+struct ManagedTorrentProgress {
+    handle: Arc<ManagedTorrent>,
+}
+
+impl ManagedTorrentProgress {
+    fn new(handle: Arc<ManagedTorrent>) -> Self {
+        Self { handle }
+    }
+}
+
+impl ProgressSampler for ManagedTorrentProgress {
+    fn downloaded_and_checked_bytes(&self) -> Option<u64> {
+        // live 状态下取 stats_snapshot 的 downloaded_and_checked_bytes;
+        // 非 live(Initializing/Paused/None)返回 None,看门狗视为无进度。
+        self.handle
+            .live()
+            .map(|live| live.stats_snapshot().downloaded_and_checked_bytes)
+    }
+}
+
+/// 进度看门狗轮询间隔(秒)
+///
+/// 每次 sleep 后采样 downloaded_and_checked_bytes,与上次比较判断是否有进度。
+/// 5s 间隔平衡:对真实下载(< 1MB/s 也至少每数秒增 1MB)足够灵敏发现死 swarm,
+/// 又不会过度频繁采样(AtomicU64 load 几乎零开销,但减少唤醒)。
+const PROGRESS_WATCH_POLL_SECS: u64 = 5;
+
+/// 纯函数判定:看门狗是否应判死 swarm 触发超时(修复 B2-Critical 核心逻辑)
+///
+/// - `no_progress_secs`: 自上次进度增长以来累计的无进度秒数
+/// - `last_sample`/`current_sample`: 本轮与上轮采样值,None 表示无法采样(按无进度计)
+/// - `peer_wait_secs`: 无进度总上限(复用 peer_wait_timeout_secs;0 表示禁用看门狗)
+///
+/// 返回 `Some(no_progress_secs)` 表示应触发超时(已累计到上限);
+/// 返回 `None` 表示继续等待。抽成纯函数便于单元测试覆盖判定逻辑。
+fn progress_watch_should_timeout(
+    no_progress_secs: u64,
+    last_sample: Option<u64>,
+    current_sample: Option<u64>,
+    peer_wait_secs: u64,
+) -> Option<u64> {
+    // peer_wait=0:用户显式禁用看门狗(向后兼容,保留死 swarm 挂起 —— 文档说明)
+    if peer_wait_secs == 0 {
+        return None;
+    }
+    // 有进度增长(严格大于,避免初始 0==0 误判):看门狗不触发,返回 None 继续
+    // 两样本都 Some 且 current > last 才算增长;任一 None(未 live)按无进度计。
+    let progressed = matches!((last_sample, current_sample), (Some(l), Some(c)) if c > l);
+    if progressed {
+        return None;
+    }
+    // 无进度:累计达到 peer_wait 上限则判死 swarm 触发超时
+    if no_progress_secs >= peer_wait_secs {
+        Some(no_progress_secs)
+    } else {
+        None
+    }
+}
+
+/// 等待 BT 下载完成,同时运行无进度看门狗(修复 B2-Critical)
+///
+/// 替换原"固定总时长 completion_timeout"为"无进度看门狗":
+/// - 周期(每 `PROGRESS_WATCH_POLL_SECS` 秒)采样 `sampler.downloaded_and_checked_bytes()`
+/// - 有增长则重置无进度累计,继续等待
+/// - 无增长累计 `no_progress_secs`,超过 `peer_wait_secs` 上限则返回 `Timeout`
+///
+/// 语义:死 swarm = 无进度 = 等待 peer 上线的总窗口,`peer_wait_timeout_secs`
+/// 现在正确表达"无进度总上限"。大文件正常下载(持续有进度增长)不会被误杀,
+/// 即使下载耗时数小时。`peer_wait=0` 禁用看门狗(回退纯 wait,向后兼容,
+/// 但保留死 swarm 挂起风险 —— 文档已说明)。
+///
+/// 同时覆盖 librqbit task panic 静默卡死:panic 后进度不再增长,看门狗会在
+/// peer_wait 内触发超时,而非永久挂起。
+async fn wait_with_progress_watch(
+    handle: &Arc<ManagedTorrent>,
+    sampler: &dyn ProgressSampler,
+    peer_wait_secs: u64,
+) -> DownloadResult<()> {
+    // peer_wait=0:禁用看门狗,回退纯 wait_until_completed(向后兼容)
+    if peer_wait_secs == 0 {
+        return handle
+            .wait_until_completed()
+            .await
+            .map_err(|e| DownloadError::Network(format!("磁力链接下载失败: {e}")));
+    }
+
+    // pin wait future 以便在 select! 中按引用 poll
+    let wait_fut = handle.wait_until_completed();
+    tokio::pin!(wait_fut);
+
+    let poll = Duration::from_secs(PROGRESS_WATCH_POLL_SECS);
+    let mut last_sample: Option<u64> = sampler.downloaded_and_checked_bytes();
+    let mut no_progress_secs: u64 = 0;
+
+    loop {
+        // select!:wait 完成则返回;到 poll 间隔则采样进度
+        tokio::select! {
+            // wait_until_completed 完成(成功或失败)
+            res = &mut wait_fut => {
+                return res.map_err(|e| {
+                    DownloadError::Network(format!("磁力链接下载失败: {e}"))
+                });
+            }
+            // 轮询间隔到:采样进度并判定
+            _ = tokio::time::sleep(poll) => {
+                let current_sample = sampler.downloaded_and_checked_bytes();
+                no_progress_secs = no_progress_secs.saturating_add(PROGRESS_WATCH_POLL_SECS);
+                if let Some(elapsed) = progress_watch_should_timeout(
+                    no_progress_secs,
+                    last_sample,
+                    current_sample,
+                    peer_wait_secs,
+                ) {
+                    return Err(DownloadError::Timeout(format!(
+                        "磁力链接下载无进度超时({}秒),可能死 swarm 或大文件慢下载,\
+                         请检查 peer 数与文件大小",
+                        elapsed
+                    )));
+                }
+                // 有进度增长则重置累计与基准样本
+                if matches!((last_sample, current_sample), (Some(l), Some(c)) if c > l) {
+                    no_progress_secs = 0;
+                }
+                last_sample = current_sample;
+            }
+        }
+    }
 }
 
 impl Protocol for MagnetProtocol {
@@ -640,14 +843,6 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let url = url.to_string();
-        // stall 超时:0 禁用(Duration::MAX 零开销),否则按配置秒数。
-        // 解决磁力链接死 swarm 下 FileStream.read() 永久挂起导致 32 worker 卡死
-        // 且取消信号无法穿透的问题。
-        let stall_timeout = if self.config.stall_timeout_secs == 0 {
-            Duration::MAX
-        } else {
-            Duration::from_secs(self.config.stall_timeout_secs)
-        };
         // peer 智能等待:0 禁用(回退纯 stall_timeout),否则按配置秒数。
         // 死 swarm 下无 peer 时持续轮询 peer 健康,超此限则失败。
         let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
@@ -655,6 +850,11 @@ impl Protocol for MagnetProtocol {
         } else {
             Duration::from_secs(self.config.peer_wait_timeout_secs)
         };
+        // stall 超时:0 禁用(Duration::MAX 零开销),否则按配置秒数。
+        // 解决磁力链接死 swarm 下 FileStream.read() 永久挂起导致 32 worker 卡死
+        // 且取消信号无法穿透的问题。
+        // 修复 B4:stall 与 peer_wait 解耦(见 resolve_stall_timeout 文档)。
+        let stall_timeout = resolve_stall_timeout(self.config.stall_timeout_secs, peer_wait);
         // add_torrent 超时(复用 metadata_timeout,覆盖 resolve_magnet 死 swarm 兜底)
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
 
@@ -754,6 +954,14 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
+        // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
+        // 下载常需 30 分钟以上,5 分钟超时必然在下载中途误杀,产出误导错误信息
+        // "疑似死 swarm 无可用 peer",且 Timeout 是 retryable 触发重试又超时循环。
+        // 看门狗周期采样 downloaded_and_checked_bytes,有增长则不超时(大文件不误杀),
+        // 无增长超 peer_wait 才判死 swarm。peer_wait=0 禁用看门狗(向后兼容,
+        // 但保留死 swarm 挂起 —— 文档说明)。
+        let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
         Box::pin(async move {
             // 命中缓存(probe 已填充 handle + layout);未命中则现场添加(回退,无 layout)
@@ -777,11 +985,9 @@ impl Protocol for MagnetProtocol {
                 h
             };
 
-            // 等待下载完成
-            handle
-                .wait_until_completed()
-                .await
-                .map_err(|e| DownloadError::Network(format!("磁力链接下载失败: {e}")))?;
+            // 等待下载完成 + 无进度看门狗(修复 B2-Critical)
+            let sampler = ManagedTorrentProgress::new(Arc::clone(&handle));
+            wait_with_progress_watch(&handle, &sampler, peer_wait_secs).await?;
 
             // 修复 BUG-I:多文件 torrent 的 download_full 会丢数据(只读首文件)。
             // 多文件应走 download_range_stream(probe 恒 supports_range:true),
@@ -814,6 +1020,8 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
+        let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
         Box::pin(async move {
             // 命中缓存;未命中则现场添加
@@ -849,11 +1057,9 @@ impl Protocol for MagnetProtocol {
                 h
             };
 
-            // 等待下载完成
-            handle
-                .wait_until_completed()
-                .await
-                .map_err(|e| DownloadError::Network(format!("磁力链接下载失败: {e}")))?;
+            // 等待下载完成 + 无进度看门狗(修复 B2-Critical)
+            let sampler = ManagedTorrentProgress::new(Arc::clone(&handle));
+            wait_with_progress_watch(&handle, &sampler, peer_wait_secs).await?;
 
             // 修复 BUG-I:多文件 torrent 的 download_full_stream 只读首文件会丢数据。
             // 多文件应走 download_range_stream,此 fallback 只支持单文件。
@@ -1260,6 +1466,51 @@ mod tests {
         );
     }
 
+    // ── B2 download_full / download_full_stream 完成超时测试 ─────────
+
+    /// 验证(快乐路径):已就绪的离线 torrent 经 download_full 正常返回数据
+    ///
+    /// 修复 B2 给 wait_until_completed 套了 completion_timeout。本测试证明该封装
+    /// 不破坏正常完成路径(数据已就绪 → wait_until_completed 立即返回 → 读出字节正确)。
+    /// 用小文件(<=2MB)确保走 download_full 路径(非 range 路径)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_full_returns_data_with_completion_timeout() {
+        // peer_wait_timeout 设小(10s):证明 completion_timeout 封装不误杀已完成的下载
+        let (protocol, url, content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let data = protocol
+            .download_full(&url)
+            .await
+            .expect("download_full 应成功(数据已就绪,completion_timeout 不触发)");
+        assert_eq!(
+            data.as_ref(),
+            content,
+            "download_full 返回字节应与原文件一致"
+        );
+    }
+
+    /// 验证(快乐路径):已就绪的离线 torrent 经 download_full_stream 正常返回流
+    ///
+    /// 同上,证明 B2 的 completion_timeout 封装不破坏流式正常完成路径。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_full_stream_returns_data_with_completion_timeout() {
+        let (protocol, url, content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let stream = protocol
+            .download_full_stream(&url)
+            .await
+            .expect("download_full_stream 应成功(数据已就绪,completion_timeout 不触发)");
+        let collected = collect_stream(stream).await;
+        assert_eq!(
+            collected, content,
+            "download_full_stream 读出字节应与原文件一致"
+        );
+    }
+
     // ===== 多文件 torrent range 化测试 =====
 
     /// 多文件 torrent 全局范围读取:跨文件字节流拼接正确
@@ -1634,12 +1885,13 @@ mod tests {
     /// 验证:无 peer + peer_wait 短超时 → 触发"无可用 peer"Timeout
     ///
     /// PendingReader 永久 Pending,MockPeerHealth 始终 false(死 swarm)。
-    /// peer_wait=6s(PEER_HEALTH_POLL_SECS=5s × 2 次累计),应在 ~10-15s 内失败。
+    /// 这是 start_paused 快速路径覆盖(验证逻辑正确性,不验证墙钟);
+    /// 墙钟语义由 test_make_chunk_stream_peer_wait_wall_clock 验证。
     #[tokio::test(start_paused = true)]
     async fn test_make_chunk_stream_peer_dead_triggers_peer_wait_timeout() {
         use futures::StreamExt;
         let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
-        // stall=2s(快速进入超时分支), peer_wait=6s(2 次轮询后超限)
+        // stall=2s(快速进入超时分支), peer_wait=6s(墙钟判断:2s stall+5s poll ≥ 6s 即失败)
         let stream = make_chunk_stream(
             PendingReader,
             Duration::from_secs(2),
@@ -1722,6 +1974,500 @@ mod tests {
         );
         let collected = collect_stream(Box::pin(stream)).await;
         assert_eq!(collected, data.to_vec());
+    }
+
+    // ── B3 墙钟语义测试(非 start_paused,真实计时) ──────────────────
+
+    /// 验证(墙钟):无 peer + peer_wait 短超时 → 实际耗时在 [peer_wait, peer_wait+裕量)
+    ///
+    /// 修复 B3 的核心断言:原实现用累加 no_peer_elapsed 只计 sleep(5s),
+    /// 漏算 stall 超时等待(60s),导致实际墙钟耗时是配置值的 ~13 倍。
+    /// 修复后用 tokio::time::Instant 墙钟判断,实际耗时应接近 peer_wait。
+    ///
+    /// 不用 start_paused:用真实计时证明墙钟语义。配置 stall=1s;PEER_HEALTH_POLL_SECS
+    /// 固定 5s,故取 peer_wait=3s。每次 iteration:stall(1s) 超时 + sleep(5s poll)=6s
+    /// 墙钟,首 iteration 后 elapsed=6s ≥ peer_wait=3s 即失败,故应在 [3s, 10s) 内产出。
+    #[tokio::test]
+    async fn test_make_chunk_stream_peer_wait_wall_clock() {
+        use futures::StreamExt;
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
+        // stall=1s(快速进入超时分支), peer_wait=3s
+        let stream = make_chunk_stream(
+            PendingReader,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Some(health),
+        );
+        let mut s = Box::pin(stream);
+        let start = std::time::Instant::now();
+        // 外层 30s 兜底:若修复回归(墙钟未生效/永久挂起),测试不卡死
+        let result = tokio::time::timeout(Duration::from_secs(30), s.next()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "应在 peer_wait 内产出项,而非永久挂起(实际已等待 {elapsed:?})"
+        );
+        let item = result.unwrap().expect("流应产出项");
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("无可用 peer"),
+                    "错误信息应包含'无可用 peer',实际: {msg}"
+                );
+            }
+            other => panic!("应产出 Timeout(无可用 peer),实际: {other:?}"),
+        }
+        // 墙钟断言:应在 [3s, 10s) 内完成。
+        // 下限 peer_wait=3s(墙钟到 3s 才可能失败);上限 10s 容忍一次完整
+        // iteration(1s stall + 5s poll = 6s)+ 调度抖动。原 bug 下会达 ~39s。
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "墙钟耗时 {elapsed:?} 应 >= peer_wait(3s),说明 peer_wait 已生效"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "墙钟耗时 {elapsed:?} 应 < 10s(原 B3 bug 下约 39s,修复后应接近 peer_wait)"
+        );
+    }
+
+    // ── B4 stall/peer_wait 解耦测试 ──────────────────────────────────
+
+    /// 验证(resolve_stall_timeout 单元):stall=0 + peer_wait 启用 → 有限兜底值
+    #[test]
+    fn test_resolve_stall_timeout_disabled_stall_with_peer_wait() {
+        // stall=0 禁用,peer_wait=300s(5min) → 兜底 min(30s, 300/10=30s) = 30s
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        // stall=0,peer_wait=60s → 兜底 min(30s, 6s) = 6s
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(60)),
+            Duration::from_secs(6)
+        );
+    }
+
+    /// 验证(resolve_stall_timeout 单元):stall=0 + peer_wait 也禁用 → MAX(零开销)
+    #[test]
+    fn test_resolve_stall_timeout_both_disabled() {
+        assert_eq!(resolve_stall_timeout(0, Duration::MAX), Duration::MAX);
+    }
+
+    /// 验证(resolve_stall_timeout 单元):stall 显式启用 → 用配置值(不解耦)
+    #[test]
+    fn test_resolve_stall_timeout_explicit_stall() {
+        assert_eq!(
+            resolve_stall_timeout(60, Duration::from_secs(300)),
+            Duration::from_secs(60)
+        );
+        // stall 启用时即使 peer_wait 禁用也用配置值
+        assert_eq!(
+            resolve_stall_timeout(60, Duration::MAX),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// 验证(集成,stall=0 + peer_wait 启用):死 swarm 下在 peer_wait 内失败而非永久挂起
+    ///
+    /// 修复 B4:原实现 stall=0 → timeout(MAX, read) 永不触发 → peer_wait 不可达 → 永久挂起。
+    /// 修复后 resolve_stall_timeout 提供有限兜底值(max(min(pw/10, 30s), 5s)),使
+    /// timeout(stall, read) 超时分支可达,从而 peer_wait 墙钟判断能生效。
+    ///
+    /// 取 peer_wait=10s → 兜底 stall=max(min(1s,30s),5s)=5s。每次 iteration:
+    /// 5s stall 超时 + 5s poll = 10s 墙钟增量;墙钟在 ~10s 越过 peer_wait=10s
+    /// 后产出"无可用 peer"错误。
+    #[tokio::test]
+    async fn test_make_chunk_stream_stall_disabled_peer_wait_enabled_does_not_hang() {
+        use futures::StreamExt;
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
+        // stall=0(禁用), peer_wait=10s —— 经 resolve_stall_timeout 得兜底 5s(下限)
+        let stall = resolve_stall_timeout(0, Duration::from_secs(10));
+        assert_eq!(
+            stall,
+            Duration::from_secs(5),
+            "兜底 stall 应为下限 5s(max(min(1s,30s),5s))"
+        );
+        let stream = make_chunk_stream(PendingReader, stall, Duration::from_secs(10), Some(health));
+        let mut s = Box::pin(stream);
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(30), s.next()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "stall=0 + peer_wait 启用应在 peer_wait 内失败,而非永久挂起(实际 {elapsed:?})"
+        );
+        let item = result.unwrap().expect("流应产出项");
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("无可用 peer"),
+                    "应产出'无可用 peer'Timeout,实际: {msg}"
+                );
+            }
+            other => panic!("应产出 Timeout,实际: {other:?}"),
+        }
+        // 应在 [10s, 25s) 内完成:墙钟越过 peer_wait=10s 后才失败(一次 5s stall+5s poll=10s)
+        assert!(
+            elapsed >= Duration::from_secs(10),
+            "墙钟耗时 {elapsed:?} 应 >= peer_wait(10s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "墙钟耗时 {elapsed:?} 应 < 25s(不应永久挂起)"
+        );
+    }
+
+    // ── B4 极小 peer_wait 兜底下限测试(修复 B4-Medium) ─────────────────
+
+    /// 验证(resolve_stall_timeout):peer_wait 极小(5s)时兜底 stall 不跌到 500ms
+    ///
+    /// 修复 B4-Medium:原兜底 min(pw/10, 30s) 在 pw=5s 时得 500ms,慢 peer 传一个
+    /// piece(256KB-16MB)轻易超 500ms,频繁误触 stall 超时 + retryable 快速失败循环。
+    /// 修复后加 5s 下限:max(min(500ms, 30s), 5s) = 5s。
+    #[test]
+    fn test_resolve_stall_timeout_tiny_peer_wait_has_5s_floor() {
+        // peer_wait=5s(validate 允许 1-3600)→ 兜底 max(min(500ms,30s),5s)=5s(非 500ms)
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(5)),
+            Duration::from_secs(5),
+            "peer_wait=5s 时兜底 stall 应为 5s 下限,而非 500ms"
+        );
+        // peer_wait=1s(边界)→ 兜底 max(min(100ms,30s),5s)=5s
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(1)),
+            Duration::from_secs(5),
+            "peer_wait=1s 时兜底 stall 仍为 5s 下限"
+        );
+        // peer_wait=30s → 兜底 max(min(3s,30s),5s)=5s(3s 被下限拉到 5s)
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(30)),
+            Duration::from_secs(5),
+            "peer_wait=30s 时 min(3s,30s)=3s < 5s 下限,应取 5s"
+        );
+        // peer_wait=50s → 兜底 max(min(5s,30s),5s)=5s(恰好等于下限)
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(50)),
+            Duration::from_secs(5),
+            "peer_wait=50s 时 min(5s,30s)=5s=max 下限"
+        );
+        // peer_wait=60s → 兜底 max(min(6s,30s),5s)=6s(超过下限,用 pw/10)
+        assert_eq!(
+            resolve_stall_timeout(0, Duration::from_secs(60)),
+            Duration::from_secs(6),
+            "peer_wait=60s 时 min(6s,30s)=6s > 5s 下限,用 6s"
+        );
+    }
+
+    // ── format_duration_human 测试 ────────────────────────────────────
+
+    /// 验证:format_duration_human 在 >= 1s 显示秒,亚秒显示毫秒
+    #[test]
+    fn test_format_duration_human() {
+        assert_eq!(format_duration_human(Duration::from_secs(2)), "2秒");
+        assert_eq!(format_duration_human(Duration::from_secs(30)), "30秒");
+        // 亚秒:500ms 显示毫秒(原 as_secs() 显示"0 秒"误导,修复 B4)
+        assert_eq!(format_duration_human(Duration::from_millis(500)), "500毫秒");
+        assert_eq!(format_duration_human(Duration::from_millis(1)), "1毫秒");
+        // 恰好 1s 边界显示秒
+        assert_eq!(format_duration_human(Duration::from_secs(1)), "1秒");
+    }
+
+    // ── B2 无进度看门狗测试(修复 B2-Critical) ──────────────────────────
+
+    /// 验证(纯函数):peer_wait=0 禁用看门狗,任何情况都不超时
+    #[test]
+    fn test_progress_watch_disabled_when_peer_wait_zero() {
+        // 无进度已超上限,但 peer_wait=0 禁用 → 不触发
+        assert_eq!(
+            progress_watch_should_timeout(3600, Some(0), Some(0), 0),
+            None,
+            "peer_wait=0 应禁用看门狗,即使无进度也不触发"
+        );
+    }
+
+    /// 验证(纯函数):有进度增长(current > last)不触发超时
+    #[test]
+    fn test_progress_watch_progress_does_not_timeout() {
+        // 有增长:100 → 200,no_progress 累计已超 peer_wait → 仍不触发
+        assert_eq!(
+            progress_watch_should_timeout(3600, Some(100), Some(200), 300),
+            None,
+            "有进度增长时看门狗不应触发"
+        );
+        // 微小增长也重置:100 → 101
+        assert_eq!(
+            progress_watch_should_timeout(3600, Some(100), Some(101), 60),
+            None,
+            "微小进度增长也应重置看门狗"
+        );
+    }
+
+    /// 验证(纯函数):无进度且累计达上限 → 触发超时
+    #[test]
+    fn test_progress_watch_no_progress_at_limit_triggers() {
+        // 无增长(0==0),累计 300s >= peer_wait 300s → 触发,返回累计值
+        assert_eq!(
+            progress_watch_should_timeout(300, Some(0), Some(0), 300),
+            Some(300),
+            "无进度累计达上限应触发超时"
+        );
+        // 无增长(50==50),累计 60s >= peer_wait 60s → 触发
+        assert_eq!(
+            progress_watch_should_timeout(60, Some(50), Some(50), 60),
+            Some(60)
+        );
+    }
+
+    /// 验证(纯函数):无进度但未达上限 → 不触发
+    #[test]
+    fn test_progress_watch_no_progress_below_limit_no_trigger() {
+        // 无增长,累计 5s < peer_wait 300s → 不触发
+        assert_eq!(
+            progress_watch_should_timeout(5, Some(0), Some(0), 300),
+            None,
+            "无进度但未达上限不应触发"
+        );
+    }
+
+    /// 验证(纯函数):无法采样(None 视为无进度)
+    #[test]
+    fn test_progress_watch_none_sample_treated_as_no_progress() {
+        // 两样本都 None(未 live),累计达上限 → 触发
+        assert_eq!(
+            progress_watch_should_timeout(300, None, None, 300),
+            Some(300),
+            "无法采样(未 live)累计达上限应触发"
+        );
+        // last Some, current None(状态从 live 变非 live)→ 无增长,达上限触发
+        assert_eq!(
+            progress_watch_should_timeout(300, Some(100), None, 300),
+            Some(300)
+        );
+        // 未达上限不触发
+        assert_eq!(progress_watch_should_timeout(10, None, None, 300), None);
+    }
+
+    /// 验证(集成):离线已就绪 torrent 经 wait_with_progress_watch 正常完成
+    ///
+    /// 离线预置 torrent 经 initial_check 后 piece 全 have,wait_until_completed
+    /// 立即返回(不依赖进度采样),看门狗不误杀。这覆盖 download_full 的快乐路径
+    /// (修复 B2:看门狗封装不破坏正常完成)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wait_with_progress_watch_completes_for_ready_torrent() {
+        let (_proto, _url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+        // make_offline_protocol 内部已 wait_until_completed,handle 处于完成态。
+        // 用其 session + 一个新的小 torrent 复验:这里直接复用 make_offline_protocol
+        // 返回的 handle 不便(被 protocol 持有),故用一个独立构造。
+        // 简化:用 make_offline_protocol 二次构造,取其 handle。
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let content: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let file_path = dir.path().join("ready.bin");
+        std::fs::write(&file_path, &content).expect("写入文件失败");
+        let torrent = create_torrent(
+            &file_path,
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(512),
+            },
+        )
+        .await
+        .expect("创建 torrent 失败");
+        let session = Session::new_with_opts(
+            PathBuf::from(dir.path()),
+            SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("创建 session 失败");
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes().expect("序列化失败")),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(dir.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_torrent 失败")
+            .into_handle()
+            .expect("into_handle 失败");
+        handle.wait_until_completed().await.expect("初始完成失败");
+
+        // 看门狗快乐路径:已完成的 torrent,wait_with_progress_watch 立即返回 Ok
+        let sampler = ManagedTorrentProgress::new(Arc::clone(&handle));
+        let result = wait_with_progress_watch(&handle, &sampler, 300).await;
+        assert!(
+            result.is_ok(),
+            "已就绪 torrent 看门狗不应误杀,实际: {result:?}"
+        );
+    }
+
+    /// 验证(集成):peer_wait=0 禁用看门狗,直接 wait_until_completed
+    ///
+    /// 已完成的 torrent,peer_wait=0 走纯 wait 路径立即返回 Ok。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wait_with_progress_watch_disabled_returns_immediately() {
+        let (_proto, _url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+        // 复用 make_offline_protocol 的 session 不便,独立构造一个已完成 torrent
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let content: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let file_path = dir.path().join("disabled.bin");
+        std::fs::write(&file_path, &content).expect("写入文件失败");
+        let torrent = create_torrent(
+            &file_path,
+            CreateTorrentOptions {
+                name: None,
+                piece_length: Some(256),
+            },
+        )
+        .await
+        .expect("创建 torrent 失败");
+        let session = Session::new_with_opts(
+            PathBuf::from(dir.path()),
+            SessionOptions {
+                disable_dht: true,
+                persistence: None,
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("创建 session 失败");
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes().expect("序列化失败")),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(dir.path().to_string_lossy().into_owned()),
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_torrent 失败")
+            .into_handle()
+            .expect("into_handle 失败");
+        handle.wait_until_completed().await.expect("初始完成失败");
+
+        // peer_wait=0:禁用看门狗,走纯 wait_until_completed 立即返回 Ok
+        let sampler = ManagedTorrentProgress::new(Arc::clone(&handle));
+        let result = wait_with_progress_watch(&handle, &sampler, 0).await;
+        assert!(result.is_ok(), "peer_wait=0 应禁用看门狗立即完成");
+    }
+
+    /// 验证(纯函数 + 集成计时):有持续进度增长时看门狗不误杀
+    ///
+    /// 用 MockProgressSampler 模拟下载字节持续增长(每 PROGRESS_WATCH_POLL_SECS
+    /// 递增),wait_until_completed 永不完成(模拟大文件下载中)。验证看门狗在
+    /// 持续有进度时不触发超时 —— 即便墙钟远超 peer_wait。
+    ///
+    /// 注意:本测试用 start_paused=true 推进 tokio 时钟。wait_fut 来自
+    /// wait_until_completed,对已完成 torrent 立即返回(破坏测试前提)。
+    /// 故改用纯函数 + 累计逻辑模拟:验证多轮"有增长"判定均为 None。
+    #[test]
+    fn test_progress_watch_sustained_progress_never_times_out() {
+        let peer_wait = 60;
+        let mut last = Some(0u64);
+        let mut no_progress_secs = 0u64;
+        // 模拟 20 轮(每轮 5s = 100s 墙钟,远超 peer_wait=60s),每轮进度增长
+        for i in 1..=20u64 {
+            let current = Some(i * 1_000_000); // 每轮增 1MB
+            let decision =
+                progress_watch_should_timeout(no_progress_secs, last, current, peer_wait);
+            assert_eq!(
+                decision, None,
+                "第 {i} 轮有进度增长({current:?})不应触发超时,no_progress={no_progress_secs}"
+            );
+            // 模拟 wait_with_progress_watch 内部:有增长则重置
+            if matches!((last, current), (Some(l), Some(c)) if c > l) {
+                no_progress_secs = 0;
+            } else {
+                no_progress_secs = no_progress_secs.saturating_add(PROGRESS_WATCH_POLL_SECS);
+            }
+            last = current;
+        }
+    }
+
+    /// 验证(纯函数 + 累计逻辑):无进度时累计达上限触发超时
+    ///
+    /// 模拟死 swarm(downloaded_bytes 恒定 0),验证累计到 peer_wait 上限时触发。
+    #[test]
+    fn test_progress_watch_dead_swarm_accumulates_to_timeout() {
+        let peer_wait = 30;
+        let mut last = Some(0u64);
+        let mut no_progress_secs = 0u64;
+        let mut triggered_at: Option<u64> = None;
+        // 模拟 10 轮(每轮 5s = 50s 墙钟),downloaded_bytes 恒定 0
+        for _ in 1..=10u64 {
+            let current = Some(0u64); // 死 swarm 无进度
+            if let Some(elapsed) =
+                progress_watch_should_timeout(no_progress_secs, last, current, peer_wait)
+            {
+                triggered_at = Some(elapsed);
+                break;
+            }
+            no_progress_secs = no_progress_secs.saturating_add(PROGRESS_WATCH_POLL_SECS);
+            last = current;
+        }
+        // peer_wait=30s,每轮检查后 +5s:累计从 5/10/.../30,第 7 轮 no_progress=30
+        // 时触发(30 >= 30)。返回的 elapsed 即触发时的累计值 30。
+        assert_eq!(
+            triggered_at,
+            Some(30),
+            "死 swarm 应在累计 30s(=peer_wait)时触发,实际触发于 {triggered_at:?}"
+        );
+    }
+
+    /// 验证(download_full 集成):已完成 torrent 的 download_full 不被看门狗误杀
+    ///
+    /// 修复 B2-Critical 回归防护:进度看门狗替换了固定 completion_timeout,
+    /// 已就绪的离线 torrent(数据已就绪)经 download_full 应正常返回数据,
+    /// 不因看门狗误判无进度而超时。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_full_returns_data_with_progress_watch() {
+        // peer_wait 设小(10s):证明看门狗不误杀已完成的下载
+        let (mut protocol, url, content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+        protocol.config.peer_wait_timeout_secs = 10;
+
+        let data = protocol
+            .download_full(&url)
+            .await
+            .expect("download_full 应成功(数据已就绪,看门狗不误杀)");
+        assert_eq!(
+            data.as_ref(),
+            content,
+            "download_full 返回字节应与原文件一致"
+        );
+    }
+
+    /// 验证(download_full_stream 集成):已完成 torrent 的 download_full_stream 不被误杀
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_download_full_stream_returns_data_with_progress_watch() {
+        let (mut protocol, url, content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+        protocol.config.peer_wait_timeout_secs = 10;
+
+        let stream = protocol
+            .download_full_stream(&url)
+            .await
+            .expect("download_full_stream 应成功(数据已就绪,看门狗不误杀)");
+        let collected = collect_stream(stream).await;
+        assert_eq!(collected, content, "读出字节应与原文件一致");
     }
 
     // ── handle_cache 跨实例共享测试 ──────────────────────────────────
