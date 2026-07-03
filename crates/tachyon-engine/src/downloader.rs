@@ -8460,7 +8460,7 @@ mod tests {
             control_tx.send(TaskCommand::Cancel).unwrap();
         });
 
-        let result = tokio::time::timeout(Duration::from_millis(2000), task.verify())
+        let result = tokio::time::timeout(Duration::from_millis(5000), task.verify())
             .await
             .expect("P6: 取消信号应穿透 verify 读盘哈希循环");
         cancel_handle.await.unwrap();

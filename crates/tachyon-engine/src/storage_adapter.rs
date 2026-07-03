@@ -179,8 +179,11 @@ fn available_disk_space_inner(dir: &Path) -> Option<u64> {
         tracing::warn!(dir = %dir.display(), "statvfs 失败,跳过磁盘空间预检");
         return None;
     }
-    // f_bavail(fsblkcnt_t)与 f_frsize(c_ulong)宽度因平台而异,统一提升为 u64
-    // 后用 saturating_mul 防止乘法溢出(超大磁盘 f_bavail*f_frsize 可能超 u64)。
+    // f_bavail(fsblkcnt_t)与 f_frsize(c_ulong)宽度因平台而异(macOS u32 / Linux u64),
+    // 统一提升为 u64 后用 saturating_mul 防止乘法溢出(超大磁盘 f_bavail*f_frsize 可能超 u64)。
+    // c_ulong/c_uint 是平台别名,Linux-64 上与 u64 同宽会触发 clippy unnecessary_cast,
+    // 但 macOS 上 f_bavail 为 c_uint(u32)确需转换,故整行 allow。
+    #[allow(clippy::unnecessary_cast)]
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
