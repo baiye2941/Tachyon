@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import {
   createSignal,
   createEffect,
@@ -229,7 +230,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       $config.set(cfg);
       applyConfig(cfg);
     } catch (e) {
-      addToast(tr("toast.configLoadFailed", { error: String(e) }), "error");
+      addToast(tr("toast.configLoadFailed", { error: errorMessage(e) }), "error");
     } finally {
       $configLoading.set(false);
     }
@@ -304,7 +305,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       applyConfig(fresh);
       addToast(tr("toast.configSaved"), "success");
     } catch (e) {
-      addToast(tr("toast.configSaveFailed", { error: String(e) }), "error");
+      addToast(tr("toast.configSaveFailed", { error: errorMessage(e) }), "error");
     } finally {
       setSaving(false);
     }
@@ -318,7 +319,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         setDraft("download", "downloadDir", selected);
       }
     } catch (e) {
-      addToast(tr("toast.openDirPickerFailed", { error: String(e) }), "error");
+      addToast(tr("toast.openDirPickerFailed", { error: errorMessage(e) }), "error");
     }
   };
 

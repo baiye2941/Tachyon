@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import {
   createMemo,
   createSignal,
@@ -282,7 +283,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       await api.pauseTask(t2.id);
       await refreshTaskList();
     } catch (e) {
-      addToast(tr("toast.pauseFailed", { error: e }), "error");
+      addToast(tr("toast.pauseFailed", { error: errorMessage(e) }), "error");
     }
   };
 
@@ -297,7 +298,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       await refreshTaskList();
       addToast(tr("toast.resumeSuccess"), "success");
     } catch (e) {
-      addToast(tr("toast.resumeFailed", { error: e }), "error");
+      addToast(tr("toast.resumeFailed", { error: errorMessage(e) }), "error");
     } finally {
       setRetrying(false);
     }
@@ -326,7 +327,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       props.onClose();
       await refreshTaskList();
     } catch (e) {
-      addToast(tr("toast.deleteFailed", { error: e }), "error");
+      addToast(tr("toast.deleteFailed", { error: errorMessage(e) }), "error");
     }
   };
 
@@ -339,7 +340,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       await api.cancelTask(t2.id);
       await refreshTaskList();
     } catch (e) {
-      addToast(tr("toast.cancelFailed", { error: e }), "error");
+      addToast(tr("toast.cancelFailed", { error: errorMessage(e) }), "error");
     }
   };
 
@@ -353,7 +354,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       await refreshTaskList();
       addToast(tr("toast.redownloadSuccess"), "success");
     } catch (e) {
-      addToast(tr("toast.redownloadFailed", { error: e }), "error");
+      addToast(tr("toast.redownloadFailed", { error: errorMessage(e) }), "error");
     } finally {
       setRetrying(false);
     }
@@ -390,7 +391,7 @@ export default function DetailPanel(props: DetailPanelProps) {
       // 镜像重试创建新任务后,关闭当前失败任务的详情面板
       handleClose();
     } catch (e) {
-      addToast(tr("toast.mirrorRetryFailed", { error: e }), "error");
+      addToast(tr("toast.mirrorRetryFailed", { error: errorMessage(e) }), "error");
     } finally {
       setMirrorRetrying(false);
     }

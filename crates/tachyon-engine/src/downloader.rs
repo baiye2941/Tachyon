@@ -268,9 +268,14 @@ impl DownloadTask {
                     &conn_config,
                     config.connect_timeout_secs,
                     config.request_timeout_secs,
+                    config.proxy.as_deref(),
                 )?
             } else {
-                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)?
+                HttpClient::with_timeouts(
+                    config.connect_timeout_secs,
+                    config.request_timeout_secs,
+                    config.proxy.as_deref(),
+                )?
             })
         } else if url.starts_with("magnet:?") {
             #[cfg(feature = "magnet")]
@@ -369,9 +374,14 @@ impl DownloadTask {
                     &conn_config,
                     config.connect_timeout_secs,
                     config.request_timeout_secs,
+                    config.proxy.as_deref(),
                 )
             } else {
-                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                HttpClient::with_timeouts(
+                    config.connect_timeout_secs,
+                    config.request_timeout_secs,
+                    config.proxy.as_deref(),
+                )
             }
         };
 
@@ -468,9 +478,14 @@ impl DownloadTask {
                     &conn_config,
                     config.connect_timeout_secs,
                     config.request_timeout_secs,
+                    config.proxy.as_deref(),
                 )
             } else {
-                HttpClient::with_timeouts(config.connect_timeout_secs, config.request_timeout_secs)
+                HttpClient::with_timeouts(
+                    config.connect_timeout_secs,
+                    config.request_timeout_secs,
+                    config.proxy.as_deref(),
+                )
             }
         };
         let primary = Arc::new(build_http()?);
@@ -2158,6 +2173,20 @@ impl DownloadTask {
     }
 
     fn apply_terminal_error(&mut self, error: &DownloadError) {
+        // P1: 暂停态的 pause_timeout 超时不应升级为 Failed。
+        // 用户显式 Pause 后,若超过 pause_timeout_secs,wait_control_rx 返回 Timeout,
+        // 原 apply_terminal_error 会把 Paused 强制转为 Failed,违反"暂停可恢复"语义
+        // (用户离开片刻回来发现任务变 Failed)。此处对 Paused 态的 Timeout 降级:
+        // 保持 Paused,仅记录 warn,不进入终态。用户可后续 Resume 或 Cancel。
+        if self.state == DownloadState::Paused && matches!(error, DownloadError::Timeout(_)) {
+            warn!(
+                state = ?self.state,
+                error = %error,
+                "暂停态收到 Timeout,保持 Paused 不升级为 Failed(用户暂停语义优先)"
+            );
+            return;
+        }
+
         let target = if matches!(error, DownloadError::Cancelled)
             || self.state == DownloadState::Cancelled
         {
@@ -2582,7 +2611,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tachyon_core::test_harness::harness::{
-        MemoryStorage as MemStorage, test_config, test_metadata,
+        FailingStorage, MemoryStorage as MemStorage, test_config, test_metadata,
     };
     use tachyon_core::traits::{ByteStream, Verifier as VerifierTrait};
     use tachyon_io::storage::AsyncStorage;
@@ -4994,6 +5023,58 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(1500), task.execute()).await;
         assert!(result.is_ok(), "暂停超时后不应永久等待控制信号");
         assert!(result.unwrap().is_err(), "暂停超时应返回错误");
+    }
+
+    /// P1: 暂停态的 pause_timeout 超时不应升级为 Failed。
+    ///
+    /// 用户显式 Pause 后超过 pause_timeout_secs,apply_terminal_error 收到 Timeout,
+    /// 应保持 Paused 而非强制转 Failed(用户暂停语义优先,可后续 Resume/Cancel)。
+    #[test]
+    fn test_apply_terminal_error_paused_timeout_keeps_paused() {
+        use tachyon_core::DownloadError;
+
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(test_metadata("paused-keep.bin", 100)).with_range_data(
+                0,
+                99,
+                Bytes::from(vec![0x11; 100]),
+            ),
+        );
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/paused-keep.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                pause_timeout_secs: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            StorageKind::memory_with_capacity(100),
+        );
+
+        // 直接置为 Paused 态(模拟用户已暂停)
+        task.state = DownloadState::Paused;
+
+        // apply_terminal_error 收到 pause_timeout 触发的 Timeout
+        let err = DownloadError::Timeout("暂停超过 1 秒".into());
+        task.apply_terminal_error(&err);
+
+        // 关键断言:状态应保持 Paused,而非被升级为 Failed
+        assert_eq!(
+            task.state,
+            DownloadState::Paused,
+            "暂停态收到 pause_timeout 不应升级为 Failed,保持 Paused(用户暂停语义优先)"
+        );
+
+        // 对照:其他错误(如 Network)在 Paused 态应正常转 Failed
+        task.state = DownloadState::Paused;
+        let net_err = DownloadError::Network("连接失败".into());
+        task.apply_terminal_error(&net_err);
+        assert_eq!(
+            task.state,
+            DownloadState::Failed,
+            "暂停态收到非 Timeout 错误应正常转 Failed"
+        );
     }
 
     // ------ Head-Of-Line Blocking 韧性测试 ------
@@ -7709,6 +7790,140 @@ mod tests {
             pool.available(),
             capacity,
             "下载结束后 buffer 应全部归还,池许可恢复到 capacity"
+        );
+    }
+
+    // ------ 磁盘边界注入测试(ENOSPC 优雅降级) ------
+
+    /// 磁盘空间不足(ENOSPC)注入:FailingStorage 在第 N 次 write_at 后返回 StorageFull 错误,
+    /// 验证下载返回错误而非 panic、不无限重试。覆盖 cov 81.8% 覆盖不到的存储错误路径。
+    #[tokio::test]
+    async fn test_disk_full_storage_error_propagates_gracefully() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 4;
+
+        // MockProto 提供完整分片数据,数据正常到达
+        let mut mock = MockProto::new(test_metadata("disk-full.bin", total_size));
+        for i in 0..4u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(start, end, Bytes::from(vec![0xABu8; frag_size as usize]));
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+
+        // FailingStorage:首次 write_at 即失败(磁盘已满)
+        let failing = FailingStorage::new().fail_write_after(0);
+        let write_counter = failing.write_call_count_arc();
+        let storage = StorageKind::new(failing);
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/disk-full.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // execute 应返回错误(StorageFull 非 retryable,不无限重试)
+        let result = task.execute().await;
+        assert!(result.is_err(), "磁盘满时 execute 应返回错误而非成功或挂起");
+        let err = result.unwrap_err();
+        // 错误应为 Io 类型(StorageFull 映射到 DownloadError::Io)
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Io(ref e)
+                if e.kind() == std::io::ErrorKind::StorageFull),
+            "错误应为 Io(StorageFull),实际: {err:?}"
+        );
+        // 确认 write_at 确实被调用过(注入生效)
+        assert!(
+            write_counter.load(AtomicOrdering::Relaxed) > 0,
+            "FailingStorage.write_at 应被调用至少一次"
+        );
+    }
+
+    /// execute_fragmented_download 中途失败分支(1511-1519):多分片并发时,
+    /// 某 worker 在 write_at 失败(StorageFull 非 retryable)后上报 Err,
+    /// 主循环应 abort 其余 worker + drain completed channel + force_fail 失败分片 + 置 Failed。
+    ///
+    /// 与 test_disk_full_storage_error_propagates_gracefully 的区别:
+    /// - 前者 fail_write_after(0):首次写即失败,单分片路径
+    /// - 本测试 fail_write_after(1):第一次写成功,第二次失败,命中多 worker 中途 abort 路径
+    #[tokio::test]
+    async fn test_fragmented_download_aborts_on_midway_storage_failure() {
+        let frag_size = 100u64;
+        let total_size = frag_size * 4;
+
+        // MockProto 提供完整分片数据,数据正常到达
+        let mut mock = MockProto::new(test_metadata("midway-fail.bin", total_size));
+        for i in 0..4u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(start, end, Bytes::from(vec![0xCDu8; frag_size as usize]));
+        }
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+
+        // FailingStorage:第一次 write 成功,第二次起失败。
+        // 多 worker 并发下载时,第一个分片的首次写成功,后续写入触发 StorageFull。
+        let failing = FailingStorage::new().fail_write_after(1);
+        let storage = StorageKind::new(failing);
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/midway-fail.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 4,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+
+        // execute 应返回错误:某 worker write 失败 → Err 上报 → abort 分支(1511-1519)触发
+        let result = task.execute().await;
+        assert!(result.is_err(), "中途存储失败时 execute 应返回错误");
+        // 错误应为 Io(StorageFull)(非 retryable,worker 直接 break Err 不重试)
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Io(ref e)
+                if e.kind() == std::io::ErrorKind::StorageFull),
+            "错误应为 Io(StorageFull),实际: {err:?}"
+        );
+        // 任务状态应置为 Failed(1518 行的 self.state = DownloadState::Failed)
+        assert_eq!(
+            task.state,
+            DownloadState::Failed,
+            "中途失败后任务状态应为 Failed"
+        );
+        // 至少一个分片应被 force_fail(1515-1516 行)
+        let failed_count = task
+            .fragments
+            .iter()
+            .filter(|f| f.state == crate::fragment::FragmentState::Failed)
+            .count();
+        assert!(
+            failed_count > 0,
+            "中途失败应至少 force_fail 一个分片,实际 failed_count={failed_count}"
         );
     }
 

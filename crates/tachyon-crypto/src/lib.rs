@@ -1,21 +1,26 @@
-//! Tachyon 校验层:GPU 加速哈希与完整性校验
+//! Tachyon 校验层:哈希与完整性校验
 //!
 //! 提供多种哈希校验方案:
 //! - CPU 校验(blake3 / sha256)
-//! - GPU 校验(wgpu compute shader, 可选 feature `gpu`)
 //! - 并行校验调度
+//!
+//! # 关于 GPU 哈希
+//!
+//! 曾实现 wgpu compute shader 版 blake3(GpuVerifier,1253 行),但基于公开
+//! benchmark 数据交叉验证后移除:
+//! - blake3 CPU 单核 AVX2 ~3GB/s,8 核 rayon 20-40GB/s
+//! - GPU blake3 wall-clock 受 PCIe 上传带宽限制,V100 实测 ~9-10GB/s
+//! - 8 核 CPU rayon 吞吐已超过 PCIe 3.0/4.0 上传带宽上限
+//! - verify 阶段在正常下载流程是零开销冷路径(流式哈希已产出 computed_hash)
+//! - aria2/rclone/rsync 均不用 GPU 哈希(数据已在 CPU 侧,搬过 PCIe 纯倒贴)
+//!
+//! 详见 docs 决策记录。
 
 pub mod cpu;
 
-#[cfg(feature = "gpu")]
-pub mod gpu;
-
 pub use cpu::{CpuVerifier, HashAlgorithm};
 
-#[cfg(feature = "gpu")]
-pub use gpu::GpuVerifier;
-
-/// 验证 GPU blake3 校验路径:GPU compute_blake3 回退到 CPU 时,结果必须与 CpuVerifier 一致
+/// 验证 blake3 校验路径:CpuVerifier 计算结果必须与 blake3::hash 一致
 #[cfg(test)]
 #[test]
 fn gpu_blake3() {
@@ -40,7 +45,7 @@ fn gpu_blake3() {
     let result = verifier.verify(tampered, &expected);
     assert!(result.is_err(), "篡改数据后校验应失败");
 
-    // GPU 回退到 CPU 路径时,blake3::hash 的结果必须与 CpuVerifier 一致
+    // CpuVerifier 的 compute_hash 内部调用 blake3::hash,结果必须一致
     let direct_hash = blake3::hash(data);
     let direct_hex = direct_hash.to_hex().to_string();
     assert_eq!(

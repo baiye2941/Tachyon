@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { onMount, onCleanup } from "solid-js";
 import { api } from "../api/invoke";
 import { onRecoveryWarning } from "../api/events";
@@ -42,7 +43,7 @@ export function useAppInit(
 
     api
       .subscribeProgress()
-      .catch((e) => addToast(tr("toast.progressSubscribeFailed", { error: e }), "error"));
+      .catch((e) => addToast(tr("toast.progressSubscribeFailed", { error: errorMessage(e) }), "error"));
 
     // 监听启动恢复告警(损坏的断点续传快照已被跳过)
     const recoveryUnlistenPromise = onRecoveryWarning((payload) => {
@@ -54,7 +55,7 @@ export function useAppInit(
         );
       }
     }).catch((e) => {
-      addToast(tr("toast.recoveryListenFailed", { error: e }), "error");
+      addToast(tr("toast.recoveryListenFailed", { error: errorMessage(e) }), "error");
       // 监听失败时返回 no-op unlisten,保证下游 then(fn => fn()) 安全
       return (() => {}) as (() => void);
     });
@@ -67,7 +68,7 @@ export function useAppInit(
     api
       .getSnifferResources()
       .then(setSnifferResources)
-      .catch((e) => addToast(tr("toast.snifferLoadFailed", { error: e }), "error"));
+      .catch((e) => addToast(tr("toast.snifferLoadFailed", { error: errorMessage(e) }), "error"));
   });
 
   // speedHistory effect:500ms 时间节流 + rAF 批量,避免 reactive storm

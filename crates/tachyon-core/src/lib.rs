@@ -54,6 +54,7 @@ fn app_config() {
         max_full_stream_bytes: config::default_max_full_stream_bytes(),
         authorized_dirs: vec!["/tmp/test".to_string()],
         io_strategy: config::IoStrategy::default(),
+        proxy: None,
     };
     assert_eq!(cfg.download_dir, "/tmp/test");
     assert_eq!(cfg.max_concurrent_fragments, 8);

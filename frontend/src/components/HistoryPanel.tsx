@@ -14,7 +14,6 @@ import { formatSize, formatSpeed, getStatusLabel } from "../utils/format";
 import {
   historyRecords,
   getHistoryStatsForRecords,
-  deleteHistoryRecord,
   type HistoryRecord,
 } from "../stores/history";
 import { requestConfirm } from "../stores/confirm";

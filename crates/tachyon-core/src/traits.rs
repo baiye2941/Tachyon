@@ -535,5 +535,205 @@ mod tests {
         assert_eq!(s.preferred_file_name.as_deref(), Some("renamed.bin"));
         assert!(s.probe_called);
         assert!(s.run_called);
+        // 覆盖 Box<dyn TaskRunner>::metadata() 转发(L322-324)
+        assert!(runner.metadata().is_some());
+        assert_eq!(runner.metadata().unwrap().file_name, "test.bin");
+    }
+
+    #[test]
+    fn test_xor_verifier_and_streaming_hasher() {
+        // 覆盖 XorVerifier 和 XorStreamingHasher(L387-393, 401-403)
+        let verifier = XorVerifier;
+        let hash = verifier.compute_hash(b"abc").unwrap();
+        // 'a' ^ 'b' ^ 'c' = 0x61 ^ 0x62 ^ 0x63 = 0x60
+        assert_eq!(hash, "60");
+
+        // 流式哈希应与一次性哈希一致
+        let mut hasher = verifier.new_hasher();
+        hasher.update(b"a");
+        hasher.update(b"bc");
+        let streaming_hash = hasher.finalize();
+        assert_eq!(streaming_hash, hash);
+    }
+
+    // ── AsyncStorage trait 默认实现测试 ──────────────────────────────
+
+    /// 最小存储后端:仅在内存中保存数据,用于测试 trait 默认实现
+    struct InMemStorage {
+        data: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl InMemStorage {
+        fn new() -> Self {
+            Self {
+                data: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AsyncStorage for InMemStorage {
+        fn write_at<'a>(
+            &'a self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut guard = self.data.lock().unwrap();
+                let off = offset as usize;
+                let need = off + data.len();
+                if guard.len() < need {
+                    guard.resize(need, 0);
+                }
+                guard[off..off + data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                let guard = self.data.lock().unwrap();
+                let off = offset as usize;
+                if off >= guard.len() {
+                    return Ok(0);
+                }
+                let end = (off + buf.len()).min(guard.len());
+                let n = end - off;
+                buf[..n].copy_from_slice(&guard[off..end]);
+                Ok(n)
+            })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                let mut guard = self.data.lock().unwrap();
+                guard.resize(size as usize, 0);
+                Ok(())
+            })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async move {
+                let guard = self.data.lock().unwrap();
+                Ok(guard.len() as u64)
+            })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_at_mut_default_impl_copies_then_delegates() {
+        // 覆盖 AsyncStorage::write_at_mut 默认实现(L115-124)
+        // 默认实现复制 BytesMut → Bytes,然后委托 write_at
+        let storage = InMemStorage::new();
+        let mut data = bytes::BytesMut::from(&b"hello world"[..]);
+        let n = storage.write_at_mut(0, &mut data).await.unwrap();
+        assert_eq!(n, 11);
+        // data 未被消费(仍可读)
+        assert_eq!(&data[..], b"hello world");
+        // 数据已写入存储
+        let mut buf = [0u8; 11];
+        let read = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_write_at_aligned_invalid_alignment() {
+        // 覆盖 alignment=0 和非 2 幂错误分支(L155-159)
+        let storage = InMemStorage::new();
+        let result = storage.write_at_aligned(0, b"data", 0).await;
+        assert!(result.is_err());
+
+        let result = storage.write_at_aligned(0, b"data", 3).await; // 3 非 2 幂
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_at_aligned_empty_data() {
+        // 覆盖 data.is_empty() 短路返回 0(L161-163)
+        let storage = InMemStorage::new();
+        let n = storage.write_at_aligned(0, b"", 512).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_at_aligned_aligned_offset() {
+        // 覆盖 offset 已对齐的正常路径(L165-184)
+        let storage = InMemStorage::new();
+        let n = storage
+            .write_at_aligned(512, b"aligned", 512)
+            .await
+            .unwrap();
+        assert_eq!(n, 7);
+        let mut buf = [0u8; 7];
+        let read = storage.read_at(512, &mut buf).await.unwrap();
+        assert_eq!(read, 7);
+        assert_eq!(&buf, b"aligned");
+    }
+
+    #[tokio::test]
+    async fn test_write_at_aligned_unaligned_offset() {
+        // 覆盖 offset 未对齐时的前端填充路径(L168-177)
+        let storage = InMemStorage::new();
+        // offset=100, alignment=512 → aligned_offset=0, front_pad=100
+        let n = storage.write_at_aligned(100, b"test", 512).await.unwrap();
+        assert_eq!(n, 4);
+        let mut buf = [0u8; 4];
+        let read = storage.read_at(100, &mut buf).await.unwrap();
+        assert_eq!(read, 4);
+        assert_eq!(&buf, b"test");
+    }
+
+    #[tokio::test]
+    async fn test_write_at_aligned_partial_short_write() {
+        // 覆盖 written.saturating_sub(front_pad).min(data.len()) 路径(L183)
+        let storage = InMemStorage::new();
+        // offset=100, alignment=512, data="abc"
+        let n = storage.write_at_aligned(100, b"abc", 512).await.unwrap();
+        assert_eq!(n, 3, "应返回用户数据长度 3");
+    }
+
+    #[test]
+    fn test_schedule_recommendation_default() {
+        // 覆盖 ScheduleRecommendation::default(L341-347)
+        let rec = ScheduleRecommendation::default();
+        assert!(rec.fragment_size > 0, "默认 fragment_size 应 > 0");
+    }
+
+    #[tokio::test]
+    async fn test_inmem_storage_full_lifecycle() {
+        // 覆盖 InMemStorage 的 read_at/sync/allocate/file_size/close 全部方法
+        // (这些方法被定义但未直接测试,只通过 write_at_mut 间接调用)
+        let storage = InMemStorage::new();
+        // allocate
+        storage.allocate(100).await.unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), 100);
+        // write + read
+        let mut data = bytes::BytesMut::from(&b"hello"[..]);
+        storage.write_at_mut(0, &mut data).await.unwrap();
+        let mut buf = [0u8; 5];
+        let n = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+        // read past end
+        let n = storage.read_at(200, &mut buf).await.unwrap();
+        assert_eq!(n, 0, "越界读应返回 0");
+        // sync + close(仅验证不 panic)
+        storage.sync().await.unwrap();
+        storage.close().await.unwrap();
     }
 }

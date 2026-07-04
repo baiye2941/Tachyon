@@ -31,6 +31,8 @@ librqbit = { workspace = true, optional = true }
 [dev-dependencies]
 tachyon-core = { path = "../tachyon-core", features = ["test-harness"] }
 tachyon-protocol = { path = "../tachyon-protocol", default-features = false, features = ["test-harness"] }
+# 集成测试(chaos_test 等)需要 new_for_test 测试构造器,需启用 test-harness feature
+tachyon-engine = { path = ".", features = ["test-harness"] }
 tempfile.workspace = true
 tokio-test.workspace = true
 proptest.workspace = true

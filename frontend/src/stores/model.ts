@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal } from 'solid-js'
 import type { LocalModel, HfModelInfo, ModelFavorite, ModelSourceFilter, FileVerifyResult } from '../types'
 import { api } from '../api/invoke'
@@ -53,7 +54,7 @@ export async function scanLocalModels() {
     setLocalModels(models)
     return models
   } catch (e) {
-    addToast(tr('hub.scan.error', { error: String(e) }), 'error')
+    addToast(tr('hub.scan.error', { error: errorMessage(e) }), 'error')
     return []
   } finally {
     setScanning(false)
@@ -73,7 +74,7 @@ export async function searchRemoteModels(query: string) {
     }
     return remoteModels()
   } catch (e) {
-    addToast(tr('hub.search.error', { error: String(e) }), 'error')
+    addToast(tr('hub.search.error', { error: errorMessage(e) }), 'error')
     setRemoteModels([])
     return []
   } finally {
@@ -97,7 +98,7 @@ export async function addFavorite(repoId: string) {
     addToast(tr('hub.favorite.added'), 'success')
     await loadFavorites()
   } catch (e) {
-    addToast(tr('hub.favorite.addFailed', { error: String(e) }), 'error')
+    addToast(tr('hub.favorite.addFailed', { error: errorMessage(e) }), 'error')
   }
 }
 
@@ -107,7 +108,7 @@ export async function removeFavorite(repoId: string) {
     addToast(tr('hub.favorite.removed'), 'success')
     await loadFavorites()
   } catch (e) {
-    addToast(tr('hub.favorite.removeFailed', { error: String(e) }), 'error')
+    addToast(tr('hub.favorite.removeFailed', { error: errorMessage(e) }), 'error')
   }
 }
 
@@ -134,7 +135,7 @@ export async function batchDownload(repoId: string, filePaths: string[], revisio
     addToast(tr('hub.batch.created', { count: ids.length }), 'success')
     return ids
   } catch (e) {
-    addToast(tr('hub.batch.failed', { error: String(e) }), 'error')
+    addToast(tr('hub.batch.failed', { error: errorMessage(e) }), 'error')
     return []
   }
 }

@@ -2,6 +2,12 @@ import { defineConfig } from "vite";
 import solidPlugin from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
 import { visualizer } from "rollup-plugin-visualizer";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
+// ESM 下无 require,用 createRequire 桥接(同步语义,与 resolveId 契约一致)。
+// import.meta.resolve 返回 Promise,无法在同步 resolveId 中使用。
+const require = createRequire(import.meta.url);
 
 export default defineConfig({
   plugins: [
@@ -16,7 +22,12 @@ export default defineConfig({
       enforce: "pre",
       resolveId(id) {
         if (id === "/@solid-refresh") {
-          return require.resolve("solid-refresh/dist/solid-refresh.mjs");
+          // pathToFileURL:Windows 下 require.resolve 返回带反斜杠的绝对路径,
+          // rollup 的 resolveId 钩子约定返回 file:// URL 或绝对路径均可,
+          // 统一转 file:// URL 避免跨平台路径分隔符差异。
+          return pathToFileURL(
+            require.resolve("solid-refresh/dist/solid-refresh.mjs")
+          ).href;
         }
         return null;
       },

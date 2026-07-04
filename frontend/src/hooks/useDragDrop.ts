@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal } from "solid-js";
 import { api } from "../api/invoke";
 import { parseDroppedFiles } from "../utils/dragDrop";
@@ -39,7 +40,7 @@ export function useDragDrop() {
     urls.forEach((url) => {
       api
         .createTask(url.trim())
-        .catch((e) => addToast(tr("toast.createTaskFailed", { error: e }), "error"));
+        .catch((e) => addToast(tr("toast.createTaskFailed", { error: errorMessage(e) }), "error"));
     });
     setTimeout(() => refreshTaskList(), 300);
   };

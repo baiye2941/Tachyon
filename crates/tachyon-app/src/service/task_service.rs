@@ -26,6 +26,7 @@ use tachyon_store::TaskSnapshot;
 /// 任务创建结果
 ///
 /// 包含创建任务后所需的全部信息，供 DownloadSupervisor 启动下载。
+#[derive(Debug)]
 pub struct TaskCreation {
     pub task_id: String,
     pub url: String,
@@ -271,6 +272,11 @@ impl TaskService {
             let requested = download_dir
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| cfg.download.download_dir.clone());
+            // persist_config 走 std::fs 同步 IO(create_dir_all+write+rename),
+            // 在 async fn 内直接调用会阻塞 Tokio 工作线程。先在锁内完成授权逻辑,
+            // 记录待持久化的配置,drop 锁后用 spawn_blocking 包裹持久化,
+            // 与 update_config_inner 的模式一致。
+            let mut persist_pending: Option<AppConfig> = None;
             let authorized = match authorize_download_dir(&cfg, &requested) {
                 Ok(dir) => dir,
                 Err(_) if download_dir.is_some() => {
@@ -281,21 +287,30 @@ impl TaskService {
                             &requested,
                         )?;
                     cfg.download.authorized_dirs.push(validated.clone());
-                    // 将新的授权目录持久化,避免重启后丢失
-                    let config_to_save = cfg.clone();
-                    if let Err(e) =
-                        crate::commands::config_commands::persist_config(&config_to_save)
-                    {
-                        tracing::warn!(error = %e, "自动授权目录后持久化配置失败");
-                    } else {
-                        tracing::info!(dir = %validated, "已自动授权下载目录并持久化配置");
-                    }
                     // 重新授权(此时目录已在 authorized_dirs 中)
-                    authorize_download_dir(&cfg, &requested)?
+                    let authorized = authorize_download_dir(&cfg, &requested)?;
+                    persist_pending = Some(cfg.clone());
+                    authorized
                 }
                 Err(e) => return Err(e),
             };
             let config = build_download_config(&cfg, &authorized);
+            drop(cfg);
+            if let Some(config_to_save) = persist_pending {
+                match tokio::task::spawn_blocking(move || {
+                    crate::commands::config_commands::persist_config(&config_to_save)
+                })
+                .await
+                .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))?
+                {
+                    Err(e) => {
+                        tracing::warn!(error = %e, "自动授权目录后持久化配置失败");
+                    }
+                    Ok(()) => {
+                        tracing::info!(dir = %authorized, "已自动授权下载目录并持久化配置");
+                    }
+                }
+            }
             (max_tasks, authorized, config)
         };
 
@@ -536,7 +551,14 @@ impl TaskService {
                     .map_err(|e| AppError::Config(format!("加载任务快照任务失败: {e}")))??;
             if let Some(save_path) = resolve_delete_save_path(&task, snapshot.as_ref()) {
                 let config = self.config.lock().await.clone();
-                delete_local_file_candidates(&config, task_id, &save_path)?;
+                // delete_local_file_candidates 走 std::fs::remove_file 同步 IO,
+                // 删除多 GB 模型文件时可能阻塞较久,用 spawn_blocking 包裹避免阻塞 tokio。
+                let task_id_owned = task_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    delete_local_file_candidates(&config, &task_id_owned, &save_path)
+                })
+                .await
+                .map_err(|e| AppError::Config(format!("删除任务文件任务失败: {e}")))??;
             }
         }
 
@@ -647,3 +669,6 @@ impl TaskService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

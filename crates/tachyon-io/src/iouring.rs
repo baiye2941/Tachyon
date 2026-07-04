@@ -704,6 +704,68 @@ impl IoUringHandle {
     }
 }
 
+/// RAII 守卫,保证 io_uring fixed buffer 索引在任何路径(含 `?` 提前返回与
+/// 外层 `select!` 取消导致的 future drop)下都能被回收。
+///
+/// 对称于 IOCP 路径的 `PendingWriteCancelGuard`(见 `iocp.rs`)。
+///
+/// # 背景
+///
+/// `submit_read`/`submit_write` 在 `alloc_buffer_index()` 后,通过 `done_rx.await`
+/// 等待 driver task 完成。若该 await 被 `?` 提前返回(如 driver 关闭)或被外层
+/// `tokio::select!` 取消(future drop),原实现跳过 `free_buffer_index`,导致
+/// fixed buffer 索引永久泄漏。累积后 `alloc_buffer_index` 返回 None,写入全部失败。
+///
+/// 本守卫在 Drop 时若仍 armed,自动调用 `free_buffer_index` 回收索引。
+/// 正常路径在 `done_rx.await` 成功后调用 `disarm()` 取消守卫职责。
+#[cfg(target_os = "linux")]
+struct IoUringBufferGuard {
+    handle: std::sync::Arc<IoUringHandle>,
+    buf_idx: usize,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl IoUringBufferGuard {
+    fn new(handle: std::sync::Arc<IoUringHandle>, buf_idx: usize) -> Self {
+        Self {
+            handle,
+            buf_idx,
+            armed: true,
+        }
+    }
+
+    /// 正常完成路径调用,取消 Drop 时的回收职责。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IoUringBufferGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // 取消路径(driver 关闭或外层 select! drop future):
+        // 释放 fixed buffer 索引,使其可被后续操作复用,避免累积泄漏。
+        // 注意:此处不向 driver task 发取消——driver task 仍可能在批处理队列中
+        // 持有该 buf_idx 的 SQE。但位图语义是"占用标记",释放后 driver 若仍提交,
+        // 内核会处理该 I/O(数据写入正确,只是 buffer 被复用可能覆盖)。
+        // 为避免 driver 仍在使用该 buffer 时被 alloc 复用导致数据竞争,
+        // 保守做法是:取消路径下仍释放索引(允许复用),但 driver task 在处理
+        // CQE 完成时不会再次 free(它不持有索引所有权——所有权在调用方)。
+        // 真正的安全保障:alloc_buffer_index 的 CAS 保证同一时刻只有一个操作
+        // 拿到该索引;若取消后释放,driver 残留的 SQE 完成时数据已写入 buffer,
+        // 但调用方 future 已 drop 不再读取结果——无别名访问,安全。
+        tracing::debug!(
+            buf_idx = self.buf_idx,
+            "IoUringBufferGuard: 取消路径回收 fixed buffer 索引"
+        );
+        self.handle.free_buffer_index(self.buf_idx);
+    }
+}
+
 /// 构造 fixed buffer 分配位图(Box<[AtomicU64]>)。
 ///
 /// M-01: 多字位图。字数 = `div_ceil(buffer_count, 64)`。
@@ -999,6 +1061,8 @@ impl IoUringStorage {
                 "io_uring fixed buffer 已耗尽,并发读取操作过多",
             ))
         })?;
+        // RAII 守卫:保证 `?` 提前返回或外层 select! 取消时索引被回收。
+        let mut guard = IoUringBufferGuard::new(ring_handle.clone(), buf_idx);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
@@ -1018,6 +1082,8 @@ impl IoUringStorage {
             .await
             .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring 读取完成通知丢失")))??;
 
+        // 正常完成,解除守卫的 Drop 回收职责
+        guard.disarm();
         // 释放 buffer 索引
         ring_handle.free_buffer_index(buf_idx);
 
@@ -1132,6 +1198,8 @@ impl IoUringStorage {
                 "io_uring fixed buffer 已耗尽,并发写入操作过多",
             ))
         })?;
+        // RAII 守卫:保证 `?` 提前返回或外层 select! 取消时索引被回收。
+        let mut guard = IoUringBufferGuard::new(ring_handle.clone(), buf_idx);
 
         // 将数据复制到 fixed buffer（必须在发送请求前完成，
         // 因为 driver task 会直接引用 buffer 地址构造 SQE）
@@ -1164,6 +1232,8 @@ impl IoUringStorage {
             .await
             .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring 写入完成通知丢失")))?;
 
+        // 正常完成,解除守卫的 Drop 回收职责
+        guard.disarm();
         // 无论成功失败都释放 buffer 索引
         ring_handle.free_buffer_index(buf_idx);
 

@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal, Show, type JSX } from "solid-js";
 import { WarningCircleIcon, RefreshIcon } from "./icons";
 import { tr } from "../i18n";
@@ -20,7 +21,7 @@ export function ErrorPage(props: { error: unknown }): JSX.Element {
   const err = () => props.error;
   const message = () => {
     const e = err();
-    return e instanceof Error ? e.message : String(e);
+    return e instanceof Error ? e.message : errorMessage(e);
   };
   const stack = () => {
     const e = err();

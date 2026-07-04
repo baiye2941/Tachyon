@@ -1,3 +1,4 @@
+import { errorMessage } from "./utils/appError";
 import { createSignal, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
 import type { ListDensity, SnifferResource, TaskInfo, ViewName } from "./types";
 import { api } from "./api/invoke";
@@ -113,7 +114,7 @@ function AppContent() {
       .createTask(resource.downloadUrl)
       .then(() => refreshTaskList())
       .catch((e) =>
-        addToast(tr("toast.createTaskFailed", { error: e }), "error"),
+        addToast(tr("toast.createTaskFailed", { error: errorMessage(e) }), "error"),
       );
   };
 
@@ -122,7 +123,7 @@ function AppContent() {
       .createTask(task.url)
       .then(() => refreshTaskList())
       .catch((e) =>
-        addToast(tr("toast.redownloadFailed", { error: e }), "error"),
+        addToast(tr("toast.redownloadFailed", { error: errorMessage(e) }), "error"),
       );
   };
 
@@ -152,7 +153,7 @@ function AppContent() {
           deleteLocalFile: result.deleteLocalFile,
         });
       } catch (e) {
-        addToast(tr("toast.deleteRecordFailed", { error: e }), "error");
+        addToast(tr("toast.deleteRecordFailed", { error: errorMessage(e) }), "error");
       }
     }
     await refreshTaskList();
@@ -181,7 +182,7 @@ function AppContent() {
       await refreshTaskList();
       if ($selectedId.get() === taskId) $selectedId.set(null);
     } catch (e) {
-      addToast(tr("toast.deleteFailed", { error: e }), "error");
+      addToast(tr("toast.deleteFailed", { error: errorMessage(e) }), "error");
     }
   };
 
@@ -355,7 +356,7 @@ function AppContent() {
             .pauseTask(taskId)
             .then(() => refreshTaskList())
             .catch((e) =>
-              addToast(tr("toast.pauseFailed", { error: e }), "error"),
+              addToast(tr("toast.pauseFailed", { error: errorMessage(e) }), "error"),
             );
         }}
         onResume={(taskId) => {
@@ -363,7 +364,7 @@ function AppContent() {
             .resumeTask(taskId)
             .then(() => refreshTaskList())
             .catch((e) =>
-              addToast(tr("toast.resumeFailed", { error: e }), "error"),
+              addToast(tr("toast.resumeFailed", { error: errorMessage(e) }), "error"),
             );
         }}
         onCancel={(taskId) => {
@@ -371,7 +372,7 @@ function AppContent() {
             .cancelTask(taskId)
             .then(() => refreshTaskList())
             .catch((e) =>
-              addToast(tr("toast.cancelFailed", { error: e }), "error"),
+              addToast(tr("toast.cancelFailed", { error: errorMessage(e) }), "error"),
             );
         }}
         onOpenFolder={(taskId) => {

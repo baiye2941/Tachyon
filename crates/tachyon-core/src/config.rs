@@ -138,7 +138,7 @@ pub const STALL_TIMEOUT_SECS_LIMIT: u64 = 86400;
 ///
 /// 死 swarm 下无 peer 时,协议层会持续轮询 peer 健康状态并等待 peer 上线,
 /// 超过此上限则产出 `Err(Timeout)` 让引擎重试/失败。1 小时上限避免永久挂起,
-/// 实际默认 5 分钟(default_peer_wait_timeout_secs)平衡恢复概率与用户体验。
+/// 实际默认 2 分钟(default_peer_wait_timeout_secs)平衡恢复概率与用户体验。
 pub const PEER_WAIT_TIMEOUT_SECS_LIMIT: u64 = 3600;
 
 /// 单主机最大连接数上限
@@ -216,6 +216,11 @@ pub struct DownloadConfig {
     /// I/O 存储后端策略
     #[serde(default)]
     pub io_strategy: IoStrategy,
+    /// 显式代理 URL,如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`。
+    /// None 时 reqwest 读取系统环境变量(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`),
+    /// 与 BT 侧 `detect_socks_proxy` 的"自动嗅探系统代理"语义对齐。
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +246,8 @@ struct DownloadConfigSerde {
     max_full_stream_bytes: u64,
     #[serde(default)]
     io_strategy: IoStrategy,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 fn default_pause_timeout_secs() -> u64 {
@@ -277,6 +284,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             max_full_stream_bytes: value.max_full_stream_bytes,
             authorized_dirs,
             io_strategy: value.io_strategy,
+            proxy: value.proxy,
         }
     }
 }
@@ -307,6 +315,7 @@ impl Default for DownloadConfig {
             max_full_stream_bytes: default_max_full_stream_bytes(),
             authorized_dirs: vec![download_dir],
             io_strategy: IoStrategy::default(),
+            proxy: None,
         }
     }
 }
@@ -370,6 +379,12 @@ pub struct MagnetConfig {
     /// 环境变量只代理 HTTP tracker,UDP tracker/DHT/peer 直连会被墙。
     /// 配置后 HTTP tracker(reqwest)和 peer TCP(StreamConnector)走 socks5;
     /// UDP tracker/DHT 仍直连(socks5 不代理 UDP)。
+    ///
+    /// # 安全警告
+    /// 若 URL 含 `user:pass@` 凭据,会**明文落盘**到 config.json
+    /// (librqbit 的 `socks_proxy_url` 仅接受完整 URL 字符串,不支持环境变量传凭据,
+    /// 故无法像 `DownloadConfig.proxy` 那样强制凭据走环境变量)。
+    /// 如需凭据,建议用系统级代理或独立凭据管理,避免在共享环境落盘。
     #[serde(default)]
     pub socks_proxy_url: Option<String>,
     /// peer 连接超时(秒),默认 8(快于 librqbit 默认 10s 淘汰死 peer)
@@ -419,11 +434,12 @@ fn default_stall_timeout_secs() -> u64 {
 
 /// 无 peer 时智能等待默认值(秒)
 ///
-/// 5 分钟给死 swarm 恢复的合理窗口:tracker 重试间隔通常 60s,DHT 路由表
-/// 重建约 1-2 分钟,5 分钟内 peer 重新上线的概率较高。过短会误杀瞬时波动,
-/// 过长则用户体验差。可由用户配置调整。
+/// P1-T6: 从 300s(5 分钟)降到 120s(2 分钟)。
+/// 国内死 swarm(tracker 全墙、DHT 关闭、PEX 无 peer)场景下,5 分钟等待
+/// 体验差;120s 仍给 tracker 重试(默认 force_tracker_interval=120s)一轮机会,
+/// 失败后让引擎重试/P2SP 回退 HTTP 源,而非长时间空等。
 fn default_peer_wait_timeout_secs() -> u64 {
-    300
+    120
 }
 
 /// peer 连接超时默认值(秒)
@@ -460,13 +476,28 @@ fn default_defer_writes_up_to_mb() -> u64 {
 /// 含 UDP + HTTPS tracker。SOCKS5 下 UDP tracker 会被过滤(不可达),
 /// HTTPS tracker 经代理可达。
 fn default_trackers() -> Vec<String> {
+    // P1-T1: 国内网络适配的 tracker 列表。
+    //
+    // 分层策略:
+    // 1. HTTPS tracker(优先):SOCKS5 代理下可达,国内墙环境最可靠。
+    //    覆盖 tamersunion/gbitt/explodie 等,首 announce 命中率高。
+    // 2. UDP tracker(补充):直连不经 SOCKS5(librqbit 的 UDP tracker 走系统 UDP socket)。
+    //    非 SOCKS5 场景下 peer 来源 +3-5 倍。
+    //
+    // SOCKS5 启用时 bt_session 过滤掉 udp:// tracker(见 bt_session.rs),
+    // 保留 https:// 列表;非 SOCKS5 场景下全列表生效。
     vec![
+        // --- HTTPS tracker(SOCKS5 可达,国内优先)---
+        "https://tracker.tamersunion.org:443/announce".into(),
+        "https://tracker.gbitt.info:443/announce".into(),
+        "https://explodie.org:6969/announce".into(),
+        "https://tracker.leechers-paradise.org:443/announce".into(),
+        // --- UDP tracker(直连,非 SOCKS5 场景生效)---
         "udp://tracker.opentrackr.org:1337/announce".into(),
         "udp://open.demonii.com:1337/announce".into(),
         "udp://open.stealth.si:80/announce".into(),
         "udp://exodus.desync.com:6969/announce".into(),
         "udp://tracker.torrent.eu.org:451/announce".into(),
-        "https://tracker.tamersunion.org:443/announce".into(),
     ]
 }
 
@@ -534,15 +565,15 @@ fn default_true() -> bool {
     true
 }
 
-/// 脱敏 SOCKS5 代理 URL 的 userinfo,保留 scheme/host/port(修复 B12-config)
+/// 脱敏代理 URL 的 userinfo,保留 scheme/host/port(修复 B12-config)
 ///
-/// `validate` 失败时错误信息原样打印 `socks_proxy_url`,若 URL 含 `user:pass@`
-/// 会明文泄露凭据。本函数剥离 userinfo 后重组 URL:`socks5://host:port`,
+/// `validate` 失败时错误信息若原样打印 `proxy`/`socks_proxy_url`,URL 含 `user:pass@`
+/// 会明文泄露凭据。本函数剥离 userinfo 后重组 URL:`scheme://host:port`,
 /// 供错误信息使用,保留 host:port 便于诊断定位。
 /// 无法解析的 URL 回退为占位符(不泄露原串,因原串可能含凭据)。
-fn redact_socks_url(url: &str) -> String {
+pub fn redact_proxy_url(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
-        return "<invalid-socks-url>".to_string();
+        return "<invalid-proxy-url>".to_string();
     };
     let scheme = parsed.scheme();
     let host = parsed.host_str().unwrap_or("");
@@ -672,7 +703,7 @@ impl MagnetConfig {
             let parsed = url::Url::parse(url).map_err(|_| {
                 e(&format!(
                     "socks_proxy_url 不是合法 URL: {}",
-                    redact_socks_url(url)
+                    redact_proxy_url(url)
                 ))
             })?;
             if parsed.scheme() != "socks5" {
@@ -684,7 +715,7 @@ impl MagnetConfig {
             if parsed.host_str().is_none() || parsed.port().is_none() {
                 return Err(e(&format!(
                     "socks_proxy_url 必须包含 host 和 port: {}",
-                    redact_socks_url(url)
+                    redact_proxy_url(url)
                 )));
             }
         }
@@ -706,7 +737,7 @@ impl MagnetConfig {
 }
 
 /// 连接配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionConfig {
     /// 单主机最大连接数
@@ -740,7 +771,7 @@ impl Default for ConnectionConfig {
 }
 
 /// 调度器配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerConfig {
     /// 最小分片大小(字节)
@@ -868,6 +899,32 @@ impl DownloadConfig {
         if self.authorized_dirs.is_empty() {
             return Err(e("authorized_dirs 不能为空"));
         }
+        // proxy:Some 时校验 scheme 白名单 + 拒绝 userinfo(凭据须用环境变量传递)
+        // 安全:proxy URL 可能含 user:pass@,明文落盘 config.json 会泄露凭据。
+        // 此处拒绝 userinfo,强制用户通过 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量传凭据
+        // (reqwest 原生支持读取这些环境变量,与 BT 侧 detect_socks_proxy 语义一致)。
+        if let Some(ref url) = self.proxy {
+            let parsed = url::Url::parse(url)
+                .map_err(|_| e(&format!("proxy 不是合法 URL: {}", redact_proxy_url(url))))?;
+            if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+                return Err(e(&format!(
+                    "proxy scheme 必须是 http/https/socks5/socks5h,实际: {}",
+                    parsed.scheme()
+                )));
+            }
+            if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+                return Err(e(&format!(
+                    "proxy 必须包含 host: {}",
+                    redact_proxy_url(url)
+                )));
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(e(&format!(
+                    "proxy 禁止含 userinfo(user:pass@),请用 HTTP_PROXY/HTTPS_PROXY 环境变量传递凭据: {}",
+                    redact_proxy_url(url)
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -969,7 +1026,7 @@ pub struct ConfigPatch {
 }
 
 /// 下载配置白名单补丁
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadPatch {
     pub download_dir: Option<String>,
@@ -981,10 +1038,12 @@ pub struct DownloadPatch {
     pub pause_timeout_secs: Option<u64>,
     pub rate_limit_bytes_per_sec: Option<Option<u64>>,
     pub io_strategy: Option<IoStrategy>,
+    /// 显式代理 URL,None 表示不修改(保留原值,可能继续用系统环境变量)
+    pub proxy: Option<Option<String>>,
 }
 
 /// 连接配置白名单补丁
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionPatch {
     pub max_connections_per_host: Option<u32>,
@@ -1022,7 +1081,7 @@ pub struct MagnetPatch {
 /// 仅暴露 UI 可编辑字段。`sampling_interval_secs`(当前未生效)、
 /// `default_target_fragments`、`high/medium_bandwidth_threshold` 为内部调参字段,
 /// 不暴露给前端(与 `headers`/`authorized_dirs` 排除理由一致)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerPatch {
     pub min_fragment_size: Option<u64>,
@@ -1031,7 +1090,7 @@ pub struct SchedulerPatch {
 }
 
 /// HuggingFace Hub 配置白名单补丁
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HubPatch {
     pub source_mode: Option<HfSourceMode>,
@@ -1170,6 +1229,9 @@ impl DownloadPatch {
         if let Some(v) = self.io_strategy {
             base.io_strategy = v;
         }
+        if let Some(v) = &self.proxy {
+            base.proxy = v.clone();
+        }
     }
 }
 
@@ -1281,6 +1343,14 @@ mod tests {
         assert_eq!(config.verify_strategy, VerifyStrategy::BestEffort);
         assert!(config.user_agent.starts_with("Tachyon/"));
         assert!(config.headers.is_empty());
+    }
+
+    /// 测试辅助:构造一个通过 validate 的 DownloadConfig(download_dir 指向临时目录)
+    fn download_config_for_test() -> DownloadConfig {
+        let mut cfg = DownloadConfig::default();
+        // authorized_dirs 不能为空,用 download_dir 填充
+        cfg.authorized_dirs = vec![cfg.download_dir.clone()];
+        cfg
     }
 
     #[test]
@@ -1479,6 +1549,97 @@ mod tests {
         }"#;
         let config: DownloadConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.verify_strategy, VerifyStrategy::Require);
+    }
+
+    // ── proxy 安全校验测试 ──────────────────────────────────────────
+
+    #[test]
+    fn test_download_config_validate_proxy_http_ok() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("http://127.0.0.1:7890".into());
+        assert!(cfg.validate().is_ok(), "http 代理应通过校验");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_socks5_ok() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("socks5://127.0.0.1:1080".into());
+        assert!(cfg.validate().is_ok(), "socks5 代理应通过校验");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_https_ok() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("https://proxy.example.com:443".into());
+        assert!(cfg.validate().is_ok(), "https 代理应通过校验");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_socks5h_ok() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("socks5h://127.0.0.1:1080".into());
+        assert!(cfg.validate().is_ok(), "socks5h 代理应通过校验");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_rejects_ftp_scheme() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("ftp://127.0.0.1:21".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("scheme") && err.contains("ftp"),
+            "应拒绝 ftp scheme,实际: {err}"
+        );
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_rejects_userinfo() {
+        let mut cfg = download_config_for_test();
+        let secret = "leak_me_pass";
+        cfg.proxy = Some(format!("http://user:{secret}@127.0.0.1:7890"));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("userinfo"),
+            "应拒绝含 userinfo 的 proxy,实际: {err}"
+        );
+        assert!(!err.contains(secret), "错误信息不应泄露凭据,实际: {err}");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_rejects_invalid_url() {
+        let mut cfg = download_config_for_test();
+        let secret = "secret_pass";
+        cfg.proxy = Some(format!("://{secret}@bad"));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            !err.contains(secret),
+            "非法 URL 错误信息不应泄露原串(可能含凭据),实际: {err}"
+        );
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_rejects_no_host() {
+        let mut cfg = download_config_for_test();
+        // "socks5://" 解析后 host_str=None(url crate 对无 host 的非 file scheme 返回 None)
+        cfg.proxy = Some("socks5://".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("host"), "应拒绝无 host 的 proxy,实际: {err}");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_none_ok() {
+        let cfg = download_config_for_test();
+        assert!(cfg.validate().is_ok(), "proxy=None 应通过校验");
+    }
+
+    #[test]
+    fn test_download_config_validate_proxy_redacts_in_error() {
+        let mut cfg = download_config_for_test();
+        cfg.proxy = Some("http://user:password@127.0.0.1:7890".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        // 错误信息中 host:port 保留(便于诊断),但 user:pass 必须剥离
+        assert!(err.contains("127.0.0.1:7890"), "应保留 host:port: {err}");
+        assert!(!err.contains("password"), "不应泄露凭据: {err}");
     }
 
     #[test]
@@ -2146,7 +2307,10 @@ mod tests {
     #[test]
     fn test_magnet_patch_peer_wait_timeout_applies() {
         let mut base = MagnetConfig::default();
-        assert_eq!(base.peer_wait_timeout_secs, 300, "默认 5 分钟");
+        assert_eq!(
+            base.peer_wait_timeout_secs, 120,
+            "默认 2 分钟(P1-T6 降低死 swarm 等待)"
+        );
         let patch = MagnetPatch {
             peer_wait_timeout_secs: Some(120),
             ..Default::default()
@@ -2194,6 +2358,638 @@ mod tests {
         assert_eq!(config.force_tracker_interval_secs, 120);
         assert_eq!(config.defer_writes_up_to_mb, 16);
         assert!(config.disable_dht_when_socks);
+    }
+
+    // ── serde default_* 函数测试:通过反序列化缺失字段的 JSON 触发 ─────
+    // 这些函数仅在 JSON 缺少对应字段时被 serde 调用,Default::default() 不触发。
+    // 补测让 config.rs 行覆盖率从 76% 提升到 ≥90%(覆盖 15+ 个 default_* 函数)。
+
+    #[test]
+    fn test_serde_default_magnet_timeout_secs() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.metadata_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_enable_dht_and_upnp() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enable_dht, "default_true 应让 enable_dht 默认 true");
+        assert!(cfg.enable_upnp, "default_true 应让 enable_upnp 默认 true");
+    }
+
+    #[test]
+    fn test_serde_default_magnet_stall_timeout() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.stall_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_peer_wait_timeout() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.peer_wait_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_peer_connect_timeout() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.peer_connect_timeout_secs, 8);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_peer_read_write_timeout() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.peer_read_write_timeout_secs, 10);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_force_tracker_interval() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.force_tracker_interval_secs, 120);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_defer_writes_up_to_mb() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.defer_writes_up_to_mb, 16);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_disable_dht_when_socks() {
+        let json = r#"{"trackers":[]}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.disable_dht_when_socks);
+    }
+
+    #[test]
+    fn test_serde_default_magnet_trackers() {
+        // 不提供 trackers 字段,触发 #[serde(default)] → Vec::default()(空)
+        // default_trackers() 仅在 Default::default() 中调用,见 test_default_trackers_*
+        let json = r#"{}"#;
+        let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.trackers.is_empty(), "#[serde(default)] 产生空 Vec");
+        // 通过 Default::default() 触发 default_trackers()
+        let cfg2 = MagnetConfig::default();
+        assert!(!cfg2.trackers.is_empty(), "default_trackers 应返回非空列表");
+    }
+
+    #[test]
+    fn test_serde_default_download_connect_timeout() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn test_serde_default_download_pause_timeout() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.pause_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_serde_default_download_max_full_stream_bytes() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_full_stream_bytes, 64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_serde_default_scheduler_all_fields() {
+        // SchedulerConfig 的 min/max_fragment_size 和 ewma_alpha 无 #[serde(default)],
+        // {} JSON 会失败。改用 Default::default() 触发所有 default_* 函数。
+        let cfg = SchedulerConfig::default();
+        assert_eq!(cfg.min_fragment_size, 1024 * 1024);
+        assert_eq!(cfg.max_fragment_size, 64 * 1024 * 1024);
+        assert_eq!(cfg.default_target_fragments, 16);
+        assert_eq!(cfg.high_bandwidth_threshold, 100 * 1024 * 1024);
+        assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
+        assert!((cfg.ewma_alpha - 0.3).abs() < 1e-9);
+        assert!((cfg.ewma_beta - 0.09).abs() < 1e-9);
+        assert_eq!(cfg.sampling_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_serde_default_scheduler_individual() {
+        // serde 反序列化只触发有 #[serde(default)] 的字段
+        let json = r#"{"minFragmentSize":500000,"maxFragmentSize":8000000,"ewmaAlpha":0.5}"#;
+        let cfg: SchedulerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.min_fragment_size, 500_000);
+        assert_eq!(cfg.max_fragment_size, 8_000_000);
+        assert_eq!(cfg.ewma_alpha, 0.5);
+        // 有 default 的字段应触发 default_* 函数
+        assert_eq!(cfg.default_target_fragments, 16);
+        assert_eq!(cfg.high_bandwidth_threshold, 100 * 1024 * 1024);
+        assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
+        assert!((cfg.ewma_beta - 0.09).abs() < 1e-9);
+        assert_eq!(cfg.sampling_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_serde_default_connection_fields() {
+        // ConnectionConfig 无 #[serde(default)] 字段,用 Default::default() 触发
+        let cfg = ConnectionConfig::default();
+        assert_eq!(cfg.max_connections_per_host, 16);
+        assert_eq!(cfg.max_global_connections, 256);
+        assert_eq!(cfg.keep_alive_timeout_secs, 30);
+        assert_eq!(cfg.connect_timeout_secs, 10);
+        assert!(cfg.enable_http2);
+        assert!(cfg.enable_quic);
+    }
+
+    #[test]
+    fn test_serde_default_true_function_directly() {
+        // 直接调用 default_true() 覆盖(serde 路径已覆盖,此处补直接调用)
+        assert!(default_true());
+    }
+
+    #[test]
+    fn test_default_trackers_contains_https_and_udp() {
+        let trackers = default_trackers();
+        assert!(trackers.iter().any(|t| t.starts_with("https://")));
+        assert!(trackers.iter().any(|t| t.starts_with("udp://")));
+    }
+
+    #[test]
+    fn test_default_magnet_config_full_defaults() {
+        // 通过 Default impl 间接覆盖所有 default_* 函数(Default 内联调用 default_*)
+        let cfg = MagnetConfig::default();
+        assert_eq!(cfg.metadata_timeout_secs, default_metadata_timeout_secs());
+        assert_eq!(cfg.stall_timeout_secs, default_stall_timeout_secs());
+        assert_eq!(cfg.peer_wait_timeout_secs, default_peer_wait_timeout_secs());
+        assert_eq!(
+            cfg.peer_connect_timeout_secs,
+            default_peer_connect_timeout_secs()
+        );
+        assert_eq!(
+            cfg.peer_read_write_timeout_secs,
+            default_peer_read_write_timeout_secs()
+        );
+        assert_eq!(
+            cfg.force_tracker_interval_secs,
+            default_force_tracker_interval_secs()
+        );
+        assert_eq!(cfg.defer_writes_up_to_mb, default_defer_writes_up_to_mb());
+        assert_eq!(cfg.trackers, default_trackers());
+    }
+
+    #[test]
+    fn test_default_scheduler_config_full_defaults() {
+        let cfg = SchedulerConfig::default();
+        assert_eq!(cfg.high_bandwidth_threshold, default_high_bw_threshold());
+        assert_eq!(
+            cfg.medium_bandwidth_threshold,
+            default_medium_bw_threshold()
+        );
+        assert_eq!(cfg.default_target_fragments, default_target_fragments());
+        assert!((cfg.ewma_beta - default_ewma_beta()).abs() < 1e-9);
+        assert_eq!(cfg.sampling_interval_secs, default_sampling_interval_secs());
+    }
+
+    #[test]
+    fn test_default_download_config_serde_defaults() {
+        // DownloadConfig 的 default_connect_timeout_secs / default_pause_timeout_secs
+        // 通过 Default impl 覆盖
+        let cfg = DownloadConfig::default();
+        assert_eq!(cfg.connect_timeout_secs, default_connect_timeout_secs());
+        assert_eq!(cfg.pause_timeout_secs, default_pause_timeout_secs());
+        assert_eq!(cfg.max_full_stream_bytes, default_max_full_stream_bytes());
+    }
+
+    #[test]
+    fn test_serde_default_download_config_minimal_json() {
+        // 最小 JSON(仅必填字段)触发所有可选字段的 default
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout_secs, 10);
+        assert_eq!(cfg.pause_timeout_secs, 300);
+        assert_eq!(cfg.max_full_stream_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.verify_strategy, VerifyStrategy::BestEffort);
+        assert!(cfg.authorized_dirs.contains(&cfg.download_dir));
+    }
+
+    // ── 补覆盖:MagnetPatch 全字段 apply_to + HfSourceMode::list_endpoint ─────
+
+    #[test]
+    fn test_magnet_patch_apply_all_some_fields() {
+        // 覆盖 MagnetPatch::apply_to 的所有 Some 分支(而非 ..Default::default())
+        let mut cfg = MagnetConfig::default();
+        let patch = MagnetPatch {
+            metadata_timeout_secs: Some(200),
+            download_timeout_secs: Some(600),
+            enable_dht: Some(false),
+            enable_upnp: Some(false),
+            trackers: Some(vec!["https://custom.tracker:443/announce".into()]),
+            stall_timeout_secs: Some(90),
+            disable_dht_persistence: Some(true),
+            peer_wait_timeout_secs: Some(100),
+            socks_proxy_url: Some(Some("socks5://127.0.0.1:1080".into())),
+            peer_connect_timeout_secs: Some(15),
+            peer_read_write_timeout_secs: Some(20),
+            force_tracker_interval_secs: Some(180),
+            defer_writes_up_to_mb: Some(32),
+            disable_dht_when_socks: Some(false),
+            peer_addrs: Some(vec!["1.2.3.4:6881".into()]),
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.metadata_timeout_secs, 200);
+        assert_eq!(cfg.download_timeout_secs, 600);
+        assert!(!cfg.enable_dht);
+        assert!(!cfg.enable_upnp);
+        assert_eq!(cfg.trackers, vec!["https://custom.tracker:443/announce"]);
+        assert_eq!(cfg.stall_timeout_secs, 90);
+        assert!(cfg.disable_dht_persistence);
+        assert_eq!(cfg.peer_wait_timeout_secs, 100);
+        assert_eq!(
+            cfg.socks_proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(cfg.peer_connect_timeout_secs, 15);
+        assert_eq!(cfg.peer_read_write_timeout_secs, 20);
+        assert_eq!(cfg.force_tracker_interval_secs, 180);
+        assert_eq!(cfg.defer_writes_up_to_mb, 32);
+        assert!(!cfg.disable_dht_when_socks);
+        assert_eq!(cfg.peer_addrs, vec!["1.2.3.4:6881"]);
+    }
+
+    #[test]
+    fn test_magnet_patch_socks_proxy_url_clears() {
+        // 覆盖 Some(None) 清空 socks_proxy_url
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some("socks5://old:1080".into());
+        let patch = MagnetPatch {
+            socks_proxy_url: Some(None),
+            ..Default::default()
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.socks_proxy_url, None);
+    }
+
+    #[test]
+    fn test_hf_source_mode_list_endpoint_all_variants() {
+        assert_eq!(
+            HfSourceMode::Official.list_endpoint(),
+            "https://huggingface.co"
+        );
+        assert_eq!(
+            HfSourceMode::Mirror.list_endpoint(),
+            "https://hf-mirror.com"
+        );
+        assert_eq!(HfSourceMode::Race.list_endpoint(), "https://hf-mirror.com");
+    }
+
+    #[test]
+    fn test_hf_source_mode_serde_roundtrip() {
+        for mode in [
+            HfSourceMode::Official,
+            HfSourceMode::Mirror,
+            HfSourceMode::Race,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: HfSourceMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn test_hub_config_token_skip_serializing() {
+        let mut cfg = HubConfig::default();
+        cfg.token = Some("hf_secret_token".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("hf_secret_token"),
+            "token 不应被序列化(skip_serializing): {json}"
+        );
+        // source_mode 仍应序列化
+        assert!(json.contains("sourceMode"));
+    }
+
+    #[test]
+    fn test_app_config_validate_max_concurrent_tasks_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.max_concurrent_tasks = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_concurrent_tasks = MAX_CONCURRENT_TASKS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+        cfg.max_concurrent_tasks = 5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_download_config_serde_with_proxy() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "proxy":"http://127.0.0.1:7890"
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn test_download_config_serde_without_proxy() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.proxy, None);
+    }
+
+    #[test]
+    fn test_download_config_serde_io_strategy() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "ioStrategy":"iocp"
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.io_strategy, IoStrategy::Iocp);
+    }
+
+    #[test]
+    fn test_download_config_serde_verify_strategy_require() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":4,
+            "maxRetries":3,
+            "requestTimeoutSecs":30,
+            "verifyChecksum":true,
+            "verifyStrategy":"require",
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let cfg: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.verify_strategy, VerifyStrategy::Require);
+    }
+
+    // ── MagnetConfig::validate 全分支覆盖 ───────────────────────────
+
+    #[test]
+    fn test_magnet_validate_stall_timeout_over_limit() {
+        let mut cfg = MagnetConfig::default();
+        cfg.stall_timeout_secs = STALL_TIMEOUT_SECS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_peer_wait_timeout_over_limit() {
+        let mut cfg = MagnetConfig::default();
+        cfg.peer_wait_timeout_secs = PEER_WAIT_TIMEOUT_SECS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_peer_read_write_timeout_over_limit() {
+        let mut cfg = MagnetConfig::default();
+        cfg.peer_read_write_timeout_secs = 601;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_force_tracker_interval_below_30() {
+        let mut cfg = MagnetConfig::default();
+        cfg.force_tracker_interval_secs = 15; // 非 0 且 < 30
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_force_tracker_interval_over_3600() {
+        let mut cfg = MagnetConfig::default();
+        cfg.force_tracker_interval_secs = 3601;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_force_tracker_interval_zero_ok() {
+        let mut cfg = MagnetConfig::default();
+        cfg.force_tracker_interval_secs = 0; // 0 = 禁用,合法
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_magnet_validate_defer_writes_over_limit() {
+        let mut cfg = MagnetConfig::default();
+        cfg.defer_writes_up_to_mb = 257;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_socks_proxy_invalid_url() {
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some("not a url".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_socks_proxy_wrong_scheme() {
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some("http://127.0.0.1:1080".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("socks5"));
+    }
+
+    #[test]
+    fn test_magnet_validate_socks_proxy_missing_port() {
+        let mut cfg = MagnetConfig::default();
+        cfg.socks_proxy_url = Some("socks5://127.0.0.1".into()); // 无端口
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_tracker_empty_string() {
+        let mut cfg = MagnetConfig::default();
+        cfg.trackers = vec!["  ".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_tracker_invalid_url() {
+        let mut cfg = MagnetConfig::default();
+        cfg.trackers = vec!["not-a-url".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_magnet_validate_tracker_crlf_injection() {
+        let mut cfg = MagnetConfig::default();
+        cfg.trackers = vec!["https://valid.com:443/announce\r\nX-Inject: evil".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── ConnectionConfig::validate 全分支覆盖 ───────────────────────
+
+    #[test]
+    fn test_connection_validate_max_per_host_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_connections_per_host = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_max_per_host_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_connections_per_host = MAX_CONNECTIONS_PER_HOST_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_max_global_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_global_connections = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_keep_alive_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.keep_alive_timeout_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_connect_timeout_zero() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.connect_timeout_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── SchedulerConfig::validate 全分支覆盖 ────────────────────────
+
+    #[test]
+    fn test_scheduler_validate_min_fragment_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.min_fragment_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_max_fragment_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.max_fragment_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_max_lt_min() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.min_fragment_size = 10_000_000;
+        cfg.max_fragment_size = 5_000_000; // < min
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_ewma_alpha_out_of_range() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.ewma_alpha = 1.5;
+        assert!(cfg.validate().is_err());
+        cfg.ewma_alpha = -0.1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_ewma_beta_out_of_range() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.ewma_beta = 1.5;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_default_target_fragments_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.default_target_fragments = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_validate_sampling_interval_zero() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.sampling_interval_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_keep_alive_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.keep_alive_timeout_secs = KEEP_ALIVE_TIMEOUT_SECS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_connect_timeout_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.connect_timeout_secs = CONNECT_TIMEOUT_SECS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_connection_validate_max_global_over_limit() {
+        let mut cfg = ConnectionConfig::default();
+        cfg.max_global_connections = MAX_GLOBAL_CONNECTIONS_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── AppConfig::validate 补充分支 ────────────────────────────────
+
+    #[test]
+    fn test_app_config_validate_all_sub_configs_called() {
+        // 确保 AppConfig::validate 调用所有子配置的 validate
+        let cfg = AppConfig::default();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -2307,6 +3103,376 @@ mod tests {
         assert_eq!(config.peer_addrs, vec!["1.2.3.4:6881"]);
     }
 
+    // ── DownloadPatch::apply_to 测试 ────────────────────────────────
+
+    #[test]
+    fn test_download_patch_overwrites_some_fields() {
+        let mut cfg = DownloadConfig::default();
+        cfg.max_concurrent_fragments = 8;
+        cfg.max_retries = 5;
+        cfg.download_dir = "/original".into();
+
+        let patch = DownloadPatch {
+            download_dir: Some("/new".into()),
+            max_concurrent_fragments: Some(16),
+            max_retries: None, // None = 保留原值
+            request_timeout_secs: None,
+            connect_timeout_secs: Some(60),
+            verify_checksum: None,
+            pause_timeout_secs: None,
+            rate_limit_bytes_per_sec: None,
+            io_strategy: None,
+            proxy: Some(Some("http://127.0.0.1:7890".into())),
+        };
+        patch.apply_to(&mut cfg);
+
+        assert_eq!(cfg.download_dir, "/new");
+        assert_eq!(cfg.max_concurrent_fragments, 16);
+        assert_eq!(cfg.max_retries, 5, "None 字段应保留原值");
+        assert_eq!(cfg.connect_timeout_secs, 60);
+        assert_eq!(
+            cfg.proxy.as_deref(),
+            Some("http://127.0.0.1:7890"),
+            "proxy Some(Some) 应覆盖"
+        );
+    }
+
+    #[test]
+    fn test_download_patch_preserves_all_on_none() {
+        let mut cfg = DownloadConfig::default();
+        let original = cfg.clone();
+        let patch = DownloadPatch {
+            download_dir: None,
+            max_concurrent_fragments: None,
+            max_retries: None,
+            request_timeout_secs: None,
+            connect_timeout_secs: None,
+            verify_checksum: None,
+            pause_timeout_secs: None,
+            rate_limit_bytes_per_sec: None,
+            io_strategy: None,
+            proxy: None,
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.download_dir, original.download_dir);
+        assert_eq!(
+            cfg.max_concurrent_fragments,
+            original.max_concurrent_fragments
+        );
+        assert_eq!(cfg.proxy, original.proxy);
+    }
+
+    #[test]
+    fn test_download_patch_proxy_clears_existing() {
+        let mut cfg = DownloadConfig::default();
+        cfg.proxy = Some("http://old:7890".into());
+        let patch = DownloadPatch {
+            proxy: Some(None), // Some(None) = 清空 proxy
+            ..Default::default()
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.proxy, None, "Some(None) 应清空 proxy");
+    }
+
+    #[test]
+    fn test_download_patch_rate_limit_applies() {
+        let mut cfg = DownloadConfig::default();
+        cfg.rate_limit_bytes_per_sec = Some(1_000_000);
+        let patch = DownloadPatch {
+            rate_limit_bytes_per_sec: Some(Some(2_000_000)),
+            ..Default::default()
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.rate_limit_bytes_per_sec, Some(2_000_000));
+    }
+
+    #[test]
+    fn test_download_patch_rate_limit_clears() {
+        let mut cfg = DownloadConfig::default();
+        cfg.rate_limit_bytes_per_sec = Some(1_000_000);
+        let patch = DownloadPatch {
+            rate_limit_bytes_per_sec: Some(None), // 清空限速
+            ..Default::default()
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.rate_limit_bytes_per_sec, None);
+    }
+
+    // ── ConnectionPatch::apply_to 测试 ─────────────────────────────
+
+    #[test]
+    fn test_connection_patch_overwrites_some_fields() {
+        let mut cfg = ConnectionConfig::default();
+        let original_keep_alive = cfg.keep_alive_timeout_secs;
+        let patch = ConnectionPatch {
+            max_connections_per_host: Some(32),
+            max_global_connections: None,
+            keep_alive_timeout_secs: None,
+            connect_timeout_secs: Some(15),
+            enable_http2: Some(false),
+            enable_quic: None,
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.max_connections_per_host, 32);
+        assert_eq!(
+            cfg.max_global_connections,
+            ConnectionConfig::default().max_global_connections
+        );
+        assert_eq!(
+            cfg.keep_alive_timeout_secs, original_keep_alive,
+            "None 保留原值"
+        );
+        assert_eq!(cfg.connect_timeout_secs, 15);
+        assert!(!cfg.enable_http2);
+    }
+
+    #[test]
+    fn test_connection_patch_preserves_all_on_none() {
+        let mut cfg = ConnectionConfig::default();
+        let original = cfg.clone();
+        let patch = ConnectionPatch {
+            max_connections_per_host: None,
+            max_global_connections: None,
+            keep_alive_timeout_secs: None,
+            connect_timeout_secs: None,
+            enable_http2: None,
+            enable_quic: None,
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg, original);
+    }
+
+    // ── SchedulerPatch::apply_to 测试 ──────────────────────────────
+
+    #[test]
+    fn test_scheduler_patch_overwrites_some_fields() {
+        let mut cfg = SchedulerConfig::default();
+        let original_alpha = cfg.ewma_alpha;
+        let patch = SchedulerPatch {
+            min_fragment_size: Some(2_000_000),
+            max_fragment_size: Some(128_000_000),
+            ewma_alpha: None,
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.min_fragment_size, 2_000_000);
+        assert_eq!(cfg.max_fragment_size, 128_000_000);
+        assert_eq!(cfg.ewma_alpha, original_alpha, "None 保留原值");
+    }
+
+    #[test]
+    fn test_scheduler_patch_ewma_alpha_overwrites() {
+        let mut cfg = SchedulerConfig::default();
+        let patch = SchedulerPatch {
+            ewma_alpha: Some(0.5),
+            ..Default::default()
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.ewma_alpha, 0.5);
+    }
+
+    #[test]
+    fn test_connection_patch_all_some_fields() {
+        // 覆盖 ConnectionPatch::apply_to 的所有 Some 分支
+        let mut cfg = ConnectionConfig::default();
+        let patch = ConnectionPatch {
+            max_connections_per_host: Some(32),
+            max_global_connections: Some(512),
+            keep_alive_timeout_secs: Some(60),
+            connect_timeout_secs: Some(15),
+            enable_http2: Some(false),
+            enable_quic: Some(false),
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.max_connections_per_host, 32);
+        assert_eq!(cfg.max_global_connections, 512);
+        assert_eq!(cfg.keep_alive_timeout_secs, 60);
+        assert_eq!(cfg.connect_timeout_secs, 15);
+        assert!(!cfg.enable_http2);
+        assert!(!cfg.enable_quic);
+    }
+
+    #[test]
+    fn test_download_patch_all_some_fields() {
+        // 覆盖 DownloadPatch::apply_to 的所有 Some 分支
+        let mut cfg = DownloadConfig::default();
+        let patch = DownloadPatch {
+            download_dir: Some("/patched".into()),
+            max_concurrent_fragments: Some(32),
+            max_retries: Some(10),
+            request_timeout_secs: Some(120),
+            connect_timeout_secs: Some(30),
+            verify_checksum: Some(false),
+            pause_timeout_secs: Some(600),
+            rate_limit_bytes_per_sec: Some(Some(1_000_000)),
+            io_strategy: Some(IoStrategy::Standard),
+            proxy: Some(Some("http://127.0.0.1:7890".into())),
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.download_dir, "/patched");
+        assert_eq!(cfg.max_concurrent_fragments, 32);
+        assert_eq!(cfg.max_retries, 10);
+        assert_eq!(cfg.request_timeout_secs, 120);
+        assert_eq!(cfg.connect_timeout_secs, 30);
+        assert!(!cfg.verify_checksum);
+        assert_eq!(cfg.pause_timeout_secs, 600);
+        assert_eq!(cfg.rate_limit_bytes_per_sec, Some(1_000_000));
+        assert_eq!(cfg.io_strategy, IoStrategy::Standard);
+        assert_eq!(cfg.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn test_scheduler_patch_preserves_all_on_none() {
+        let mut cfg = SchedulerConfig::default();
+        let original = cfg.clone();
+        let patch = SchedulerPatch {
+            min_fragment_size: None,
+            max_fragment_size: None,
+            ewma_alpha: None,
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg, original);
+    }
+
+    // ── HubPatch::apply_to 测试 ────────────────────────────────────
+
+    #[test]
+    fn test_hub_patch_overwrites_source_mode() {
+        let mut cfg = HubConfig::default();
+        let original = cfg.source_mode;
+        // 选一个与 default 不同的值
+        let new_mode = match original {
+            HfSourceMode::Official => HfSourceMode::Mirror,
+            _ => HfSourceMode::Official,
+        };
+        let patch = HubPatch {
+            source_mode: Some(new_mode),
+        };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.source_mode, new_mode);
+        assert_ne!(cfg.source_mode, original);
+    }
+
+    #[test]
+    fn test_hub_patch_preserves_on_none() {
+        let mut cfg = HubConfig::default();
+        let original = cfg.source_mode;
+        let patch = HubPatch { source_mode: None };
+        patch.apply_to(&mut cfg);
+        assert_eq!(cfg.source_mode, original);
+    }
+
+    // ── ConfigPatch::apply_to 测试 ─────────────────────────────────
+
+    #[test]
+    fn test_config_patch_applies_max_concurrent_tasks() {
+        let base = AppConfig::default();
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(10),
+            download: None,
+            connection: None,
+            magnet: None,
+            scheduler: None,
+            hub: None,
+        };
+        let result = patch.apply_to(&base);
+        assert_eq!(result.max_concurrent_tasks, 10);
+        assert_eq!(
+            result.download.download_dir, base.download.download_dir,
+            "其余保留"
+        );
+    }
+
+    #[test]
+    fn test_config_patch_applies_nested_download_patch() {
+        let base = AppConfig::default();
+        let patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: Some(DownloadPatch {
+                download_dir: Some("/patched".into()),
+                max_concurrent_fragments: Some(32),
+                ..Default::default()
+            }),
+            connection: None,
+            magnet: None,
+            scheduler: None,
+            hub: None,
+        };
+        let result = patch.apply_to(&base);
+        assert_eq!(result.download.download_dir, "/patched");
+        assert_eq!(result.download.max_concurrent_fragments, 32);
+        assert_eq!(
+            result.max_concurrent_tasks, base.max_concurrent_tasks,
+            "未 patch 字段保留"
+        );
+    }
+
+    #[test]
+    fn test_config_patch_applies_all_nested_patches() {
+        let base = AppConfig::default();
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(8),
+            download: Some(DownloadPatch {
+                max_retries: Some(10),
+                ..Default::default()
+            }),
+            connection: Some(ConnectionPatch {
+                max_connections_per_host: Some(32),
+                ..Default::default()
+            }),
+            magnet: Some(MagnetPatch {
+                metadata_timeout_secs: Some(60),
+                ..Default::default()
+            }),
+            scheduler: Some(SchedulerPatch {
+                min_fragment_size: Some(2_000_000),
+                ..Default::default()
+            }),
+            hub: Some(HubPatch {
+                source_mode: Some(if base.hub.source_mode == HfSourceMode::Official {
+                    HfSourceMode::Mirror
+                } else {
+                    HfSourceMode::Official
+                }),
+            }),
+        };
+        let result = patch.apply_to(&base);
+        assert_eq!(result.max_concurrent_tasks, 8);
+        assert_eq!(result.download.max_retries, 10);
+        assert_eq!(result.connection.max_connections_per_host, 32);
+        assert_eq!(result.magnet.metadata_timeout_secs, 60);
+        assert_eq!(result.scheduler.min_fragment_size, 2_000_000);
+        assert_ne!(result.hub.source_mode, base.hub.source_mode);
+    }
+
+    #[test]
+    fn test_config_patch_preserves_base_on_all_none() {
+        let base = AppConfig::default();
+        let patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: None,
+            connection: None,
+            magnet: None,
+            scheduler: None,
+            hub: None,
+        };
+        let result = patch.apply_to(&base);
+        assert_eq!(result.max_concurrent_tasks, base.max_concurrent_tasks);
+        assert_eq!(result.download.download_dir, base.download.download_dir);
+    }
+
+    #[test]
+    fn test_config_patch_does_not_mutate_base() {
+        let base = AppConfig::default();
+        let original = base.clone();
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(99),
+            ..Default::default()
+        };
+        let _result = patch.apply_to(&base);
+        // apply_to 返回新 AppConfig,不修改原 base
+        assert_eq!(base.max_concurrent_tasks, original.max_concurrent_tasks);
+    }
+
     #[test]
     fn test_magnet_config_validate_socks_proxy_url() {
         let mut cfg = MagnetConfig::default();
@@ -2333,7 +3499,7 @@ mod tests {
     /// 验证:socks_proxy_url 含凭据时,validate 失败错误信息不泄露凭据(修复 B12-config)
     ///
     /// 若 socks_proxy_url 含 user:pass,validate 失败时错误信息原样打印 {url}
-    /// 会明文泄露凭据。修复后用 redact_socks_url 剥离 userinfo,只保留 scheme/host/port。
+    /// 会明文泄露凭据。修复后用 redact_proxy_url 剥离 userinfo,只保留 scheme/host/port。
     #[test]
     fn test_magnet_config_validate_socks_url_error_redacts_credentials() {
         let secret_user = "topsecret_user";
@@ -2396,30 +3562,35 @@ mod tests {
         assert!(cfg.validate().is_ok(), "带凭据的合法 socks5 URL 应通过校验");
     }
 
-    /// 验证:redact_socks_url 单元:剥离 userinfo 保留 scheme/host/port
+    /// 验证:redact_proxy_url 单元:剥离 userinfo 保留 scheme/host/port
     #[test]
-    fn test_redact_socks_url_strips_userinfo() {
+    fn test_redact_proxy_url_strips_userinfo() {
         // 含凭据 → 剥离
         assert_eq!(
-            redact_socks_url("socks5://user:pass@127.0.0.1:7897"),
+            redact_proxy_url("socks5://user:pass@127.0.0.1:7897"),
             "socks5://127.0.0.1:7897"
         );
         // 无凭据 → 原样(已脱敏)
         assert_eq!(
-            redact_socks_url("socks5://127.0.0.1:7897"),
+            redact_proxy_url("socks5://127.0.0.1:7897"),
             "socks5://127.0.0.1:7897"
         );
         // 无端口 → 保留 scheme/host
         assert_eq!(
-            redact_socks_url("socks5://user:pass@example.com"),
+            redact_proxy_url("socks5://user:pass@example.com"),
             "socks5://example.com"
         );
         // 非法 URL → 占位符(不泄露原串)
-        assert_eq!(redact_socks_url("not a url"), "<invalid-socks-url>");
+        assert_eq!(redact_proxy_url("not a url"), "<invalid-proxy-url>");
         // 凭据含特殊字符也不泄露
-        let redacted = redact_socks_url("socks5://p@ss:w0rd@10.0.0.1:1080");
+        let redacted = redact_proxy_url("socks5://p@ss:w0rd@10.0.0.1:1080");
         assert_eq!(redacted, "socks5://10.0.0.1:1080");
         assert!(!redacted.contains("w0rd"));
+        // http/https scheme 同样支持
+        assert_eq!(
+            redact_proxy_url("http://user:pass@proxy.example.com:8080"),
+            "http://proxy.example.com:8080"
+        );
     }
 
     #[test]
@@ -2557,6 +3728,46 @@ mod tests {
         }
         assert!(detect_socks_proxy().is_none());
     }
+
+    /// 覆盖 `DownloadConfig::default` 中 `dirs()` 返回 None 的回退路径(L298-302)。
+    ///
+    /// 当 `USERPROFILE` 和 `HOME` 环境变量均不存在时,`dirs()` 返回 None,
+    /// `download_dir` 回退到 `std::env::temp_dir().join("tachyon-downloads")`。
+    /// 此路径在正常测试环境(总有 HOME/USERPROFILE)下不会执行,需临时清除环境变量触发。
+    #[test]
+    fn test_download_config_default_falls_back_to_temp_dir_when_no_home() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下临时修改进程级环境变量,
+        // 测试结束前恢复原值。仅传编译期字符串字面量给 remove_var/set_var,
+        // 无裸指针解引用,无数据竞争/UB 风险。
+        let saved_userprofile = std::env::var_os("USERPROFILE");
+        let saved_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("USERPROFILE");
+            std::env::remove_var("HOME");
+        }
+        let cfg = DownloadConfig::default();
+        // 恢复环境变量(无论断言结果如何,确保不污染后续测试)
+        unsafe {
+            if let Some(v) = saved_userprofile {
+                std::env::set_var("USERPROFILE", v);
+            }
+            if let Some(v) = saved_home {
+                std::env::set_var("HOME", v);
+            }
+        }
+        // 回退路径应产生 temp_dir/tachyon-downloads
+        assert!(
+            cfg.download_dir.contains("tachyon-downloads"),
+            "dirs() 返回 None 时应回退到 temp_dir/tachyon-downloads,实际: {}",
+            cfg.download_dir
+        );
+        // authorized_dirs 应回退为 [download_dir](From 实现的 unwrap_or_else 路径)
+        assert!(
+            cfg.authorized_dirs.contains(&cfg.download_dir),
+            "authorized_dirs 应包含 download_dir"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2680,6 +3891,7 @@ mod proptests {
                     pause_timeout_secs: None,
                     rate_limit_bytes_per_sec: None,
                     io_strategy: None,
+                    proxy: None,
                 }),
                 connection: None,
                 magnet: None,

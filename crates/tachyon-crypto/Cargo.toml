@@ -3,7 +3,7 @@ name = "tachyon-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tachyon 校验层:GPU 加速哈希与完整性校验"
+description = "Tachyon 校验层:哈希与完整性校验"
 
 [dependencies]
 tachyon-core = { path = "../tachyon-core" }
@@ -12,13 +12,6 @@ sha2.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-wgpu = { workspace = true, optional = true }
-
-[features]
-default = []
-# experimental: GPU 加速 blake3 哈希校验，当前为空壳实现
-# 需要 wgpu 支持的环境（Vulkan/Metal/DX12）
-gpu = ["dep:wgpu"]
 
 [dev-dependencies]
 tempfile.workspace = true

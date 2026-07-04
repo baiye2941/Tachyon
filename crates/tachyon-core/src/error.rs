@@ -62,6 +62,83 @@ pub enum DownloadError {
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+impl serde::Serialize for DownloadError {
+    /// 结构化序列化:暴露 `type`/`message`/`retryable` 三个公共字段,
+    /// 以及变体特有字段(`retryAfterSecs`/`status`/`reason`/`expected`/`actual`),
+    /// 供前端按错误类型分级展示(warning vs error、重试按钮等),
+    /// 替代旧 `AppError::Core` 用 `to_string()` 压平丢失结构化信息的做法。
+    ///
+    /// `Io`/`Other` 变体含不可序列化的 `io::Error`/`Box<dyn Error>`,
+    /// 用 `to_string()` 转为 `message` 字符串,其余变体保留结构化字段。
+    ///
+    /// 实现策略:`type_name`/`serialize_extra` 拆分为独立方法,
+    /// 避免 `serialize` 主体对 17 个变体做两次 match(原 CC=33,重构后主体 CC≈5)。
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // size_hint 传 None:变体特有字段数(0/1/2)在 type_name 之外单独决定,
+        // 不值得为省几个字节预计算。JSON 序列化器内部会动态扩容。
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", self.type_name())?;
+        map.serialize_entry("message", &self.to_string())?;
+        map.serialize_entry("retryable", &self.is_retryable())?;
+        self.serialize_extra::<S>(&mut map)?;
+        map.end()
+    }
+}
+
+impl DownloadError {
+    /// 返回错误变体的类型名(前端据此分级展示)。
+    fn type_name(&self) -> &'static str {
+        match self {
+            DownloadError::Network(_) => "Network",
+            DownloadError::Protocol(_) => "Protocol",
+            DownloadError::Io(_) => "Io",
+            DownloadError::Fragment(_) => "Fragment",
+            DownloadError::ChecksumMismatch { .. } => "ChecksumMismatch",
+            DownloadError::NoExpectedChecksum => "NoExpectedChecksum",
+            DownloadError::Config(_) => "Config",
+            DownloadError::Cancelled => "Cancelled",
+            DownloadError::TaskNotFound(_) => "TaskNotFound",
+            DownloadError::ConnectionPoolExhausted => "ConnectionPoolExhausted",
+            DownloadError::Timeout(_) => "Timeout",
+            DownloadError::Throttled { .. } => "Throttled",
+            DownloadError::Forbidden { .. } => "Forbidden",
+            DownloadError::Http { .. } => "Http",
+            DownloadError::UrlParse(_) => "UrlParse",
+            DownloadError::Serialization(_) => "Serialization",
+            DownloadError::Other(_) => "Other",
+        }
+    }
+
+    /// 序列化变体特有字段(仅 4 个变体有额外字段,其余 no-op)。
+    /// 拆分后 `serialize` 主体不再含变体遍历,CC 从 33 降到 5。
+    fn serialize_extra<S: serde::Serializer>(
+        &self,
+        map: &mut S::SerializeMap,
+    ) -> Result<(), S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            DownloadError::ChecksumMismatch { expected, actual } => {
+                map.serialize_entry("expected", expected)?;
+                map.serialize_entry("actual", actual)?;
+            }
+            DownloadError::Throttled { retry_after_secs } => {
+                map.serialize_entry("retryAfterSecs", retry_after_secs)?;
+            }
+            DownloadError::Forbidden { status } => {
+                map.serialize_entry("status", status)?;
+            }
+            DownloadError::Http { status, reason } => {
+                map.serialize_entry("status", status)?;
+                map.serialize_entry("reason", reason)?;
+            }
+            // 其余 13 个变体无额外字段,message 已包含全部信息
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 impl From<String> for DownloadError {
     fn from(s: String) -> Self {
         DownloadError::Other(s.into())
@@ -287,6 +364,258 @@ mod tests {
         assert!(matches!(err, DownloadError::Protocol(_)));
         assert!(err.to_string().contains("FTP 登录失败"));
         assert!(err.to_string().contains("数据格式错误"));
+    }
+
+    // ── Serialize impl 测试:覆盖全部 17 个变体(修复 CRAP 1122 的 0% 覆盖) ──────
+
+    /// 辅助:序列化 DownloadError 为 serde_json::Value,便于字段断言
+    fn to_json(err: &DownloadError) -> serde_json::Value {
+        serde_json::to_value(err).expect("DownloadError 序列化不应失败")
+    }
+
+    #[test]
+    fn test_serialize_network() {
+        let v = to_json(&DownloadError::Network("超时".into()));
+        assert_eq!(v["type"], "Network");
+        assert_eq!(v["message"], "网络错误: 超时");
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_protocol() {
+        let v = to_json(&DownloadError::Protocol("404".into()));
+        assert_eq!(v["type"], "Protocol");
+        assert!(v["message"].as_str().unwrap().contains("404"));
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_io() {
+        let err = DownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "文件不存在",
+        ));
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Io");
+        assert!(v["message"].as_str().unwrap().contains("文件不存在"));
+        assert_eq!(v["retryable"], true); // NotFound 可重试(非 StorageFull)
+    }
+
+    #[test]
+    fn test_serialize_io_storage_full_not_retryable() {
+        let err = DownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "磁盘满",
+        ));
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Io");
+        assert_eq!(v["retryable"], false); // StorageFull 不可重试
+    }
+
+    #[test]
+    fn test_serialize_fragment() {
+        let v = to_json(&DownloadError::Fragment("分片 3 失败".into()));
+        assert_eq!(v["type"], "Fragment");
+        assert!(v["message"].as_str().unwrap().contains("分片 3"));
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_checksum_mismatch_with_extra_fields() {
+        let err = DownloadError::ChecksumMismatch {
+            expected: "abc123".into(),
+            actual: "def456".into(),
+        };
+        let v = to_json(&err);
+        assert_eq!(v["type"], "ChecksumMismatch");
+        assert_eq!(v["expected"], "abc123");
+        assert_eq!(v["actual"], "def456");
+        assert_eq!(v["retryable"], false);
+        assert!(v["message"].as_str().unwrap().contains("abc123"));
+    }
+
+    #[test]
+    fn test_serialize_no_expected_checksum() {
+        let v = to_json(&DownloadError::NoExpectedChecksum);
+        assert_eq!(v["type"], "NoExpectedChecksum");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_config() {
+        let v = to_json(&DownloadError::Config("参数错误".into()));
+        assert_eq!(v["type"], "Config");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_cancelled() {
+        let v = to_json(&DownloadError::Cancelled);
+        assert_eq!(v["type"], "Cancelled");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_task_not_found() {
+        let v = to_json(&DownloadError::TaskNotFound("task-42".into()));
+        assert_eq!(v["type"], "TaskNotFound");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_connection_pool_exhausted() {
+        let v = to_json(&DownloadError::ConnectionPoolExhausted);
+        assert_eq!(v["type"], "ConnectionPoolExhausted");
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_timeout() {
+        let v = to_json(&DownloadError::Timeout("30s".into()));
+        assert_eq!(v["type"], "Timeout");
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_throttled_with_retry_after() {
+        let err = DownloadError::Throttled {
+            retry_after_secs: Some(120),
+        };
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Throttled");
+        assert_eq!(v["retryAfterSecs"], 120);
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_throttled_without_retry_after() {
+        let err = DownloadError::Throttled {
+            retry_after_secs: None,
+        };
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Throttled");
+        assert_eq!(v["retryAfterSecs"], serde_json::Value::Null);
+        assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn test_serialize_forbidden_with_status() {
+        let err = DownloadError::Forbidden { status: 403 };
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Forbidden");
+        assert_eq!(v["status"], 403);
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_http_with_extra_fields() {
+        let err = DownloadError::Http {
+            status: 404,
+            reason: "Not Found".into(),
+        };
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Http");
+        assert_eq!(v["status"], 404);
+        assert_eq!(v["reason"], "Not Found");
+        assert_eq!(v["retryable"], false); // 404 不可重试
+    }
+
+    #[test]
+    fn test_serialize_http_429_retryable() {
+        let err = DownloadError::Http {
+            status: 429,
+            reason: "Too Many Requests".into(),
+        };
+        let v = to_json(&err);
+        assert_eq!(v["status"], 429);
+        assert_eq!(v["retryable"], true); // 429 可重试
+    }
+
+    #[test]
+    fn test_serialize_http_500_retryable() {
+        let err = DownloadError::Http {
+            status: 503,
+            reason: "Service Unavailable".into(),
+        };
+        let v = to_json(&err);
+        assert_eq!(v["retryable"], true); // 5xx 可重试
+    }
+
+    #[test]
+    fn test_serialize_url_parse() {
+        let err: DownloadError = url::ParseError::EmptyHost.into();
+        let v = to_json(&err);
+        assert_eq!(v["type"], "UrlParse");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_serialization() {
+        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let err: DownloadError = json_err.into();
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Serialization");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_other() {
+        let err = DownloadError::Other("未知".into());
+        let v = to_json(&err);
+        assert_eq!(v["type"], "Other");
+        assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn test_serialize_all_variants_have_three_common_fields() {
+        // 确保所有变体都输出 type/message/retryable 三个公共字段
+        let variants: Vec<DownloadError> = vec![
+            DownloadError::Network("e".into()),
+            DownloadError::Protocol("e".into()),
+            DownloadError::Io(std::io::Error::other("e")),
+            DownloadError::Fragment("e".into()),
+            DownloadError::ChecksumMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            DownloadError::NoExpectedChecksum,
+            DownloadError::Config("e".into()),
+            DownloadError::Cancelled,
+            DownloadError::TaskNotFound("e".into()),
+            DownloadError::ConnectionPoolExhausted,
+            DownloadError::Timeout("e".into()),
+            DownloadError::Throttled {
+                retry_after_secs: None,
+            },
+            DownloadError::Forbidden { status: 403 },
+            DownloadError::Http {
+                status: 500,
+                reason: "e".into(),
+            },
+            DownloadError::UrlParse(url::ParseError::EmptyHost),
+            DownloadError::Serialization(
+                serde_json::from_str::<serde_json::Value>("x").unwrap_err(),
+            ),
+            DownloadError::Other("e".into()),
+        ];
+        for err in &variants {
+            let v = to_json(err);
+            assert!(
+                v.get("type").is_some(),
+                "变体 {:?} 缺少 type 字段",
+                err.type_name()
+            );
+            assert!(
+                v.get("message").and_then(|m| m.as_str()).is_some(),
+                "变体 {:?} 缺少 message 字段",
+                err.type_name()
+            );
+            assert!(
+                v.get("retryable").and_then(|r| r.as_bool()).is_some(),
+                "变体 {:?} 缺少 retryable 字段",
+                err.type_name()
+            );
+        }
     }
 
     #[test]

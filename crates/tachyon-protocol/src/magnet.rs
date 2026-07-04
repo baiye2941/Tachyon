@@ -186,7 +186,10 @@ impl MagnetProtocol {
 /// 验证 magnet URI 的必要条件:
 /// - 以 `magnet:?` 开头
 /// - 包含 `xt=urn:btih:` 参数
-/// - btih 后的 info_hash 非空
+/// - btih 后的 info_hash 为 40 位十六进制(SHA1) 或 32 位 Base32
+///
+/// BEP 9 规范要求 info_hash 必须是合法的 SHA1(hex 40) 或 Base32(32) 编码,
+/// 此前仅校验非空,允许畸形输入深入到 librqbit 解析路径增加日志噪声与攻击面。
 pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     if !uri.starts_with("magnet:?") {
         return Err(DownloadError::Config(format!(
@@ -194,15 +197,15 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
         )));
     }
 
-    // 查找 xt=urn:btih: 参数（大小写不敏感）
+    // 查找 xt=urn:btih: 参数（大小写不敏感)
     let has_valid_xt = uri[8..] // 跳过 "magnet:?"
         .split('&')
         .any(|param| {
             let lower = param.to_ascii_lowercase();
             if let Some(hash) = lower.strip_prefix("xt=urn:btih:") {
-                // info_hash 必须非空
-                // 合法格式: 40 位十六进制(SHA1) 或 32 位 Base32
-                !hash.is_empty()
+                // BEP 9: info_hash 为 40 位 hex(SHA1) 或 32 位 Base32。
+                // hex: [0-9a-f]{40}; base32: [a-z2-7]{32}(RFC 4648,大小写不敏感)。
+                is_valid_info_hash(hash)
             } else {
                 false
             }
@@ -210,11 +213,29 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
 
     if !has_valid_xt {
         return Err(DownloadError::Protocol(format!(
-            "磁力链接缺少有效的 xt=urn:btih: 参数: {uri}"
+            "磁力链接缺少有效的 xt=urn:btih: 参数(info_hash 须为 40 位 hex 或 32 位 base32): {uri}"
         )));
     }
 
     Ok(())
+}
+
+/// 校验 info_hash 是否为合法的 40 位 hex(SHA1) 或 32 位 Base32 编码。
+///
+/// BEP 9 规范要求 `xt=urn:btih:` 后的 hash 必须是这两种编码之一。
+/// 拒绝畸形/超长输入,避免深入 librqbit 解析路径增加噪声与攻击面。
+fn is_valid_info_hash(hash: &str) -> bool {
+    if hash.is_empty() {
+        return false;
+    }
+    // 40 位十六进制(SHA1,大小写不敏感)
+    let is_hex_40 = hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    if is_hex_40 {
+        return true;
+    }
+    // 32 位 Base32(RFC 4648,大小写不敏感,字母 A-Z + 数字 2-7)
+    let is_base32_char = |b: u8| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'2'..=b'7');
+    hash.len() == 32 && hash.bytes().all(is_base32_char)
 }
 
 /// 从磁力链接解析 `&pe=` 参数为 peer 地址列表(BEP 9)
@@ -1098,8 +1119,41 @@ mod tests {
 
     #[test]
     fn test_validate_magnet_uri_valid_minimal() {
-        let uri = "magnet:?xt=urn:btih:a1b2c3d4e5";
+        // 40 位 hex(SHA1),最小合法磁力链接
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
         assert!(validate_magnet_uri(uri).is_ok());
+    }
+
+    #[test]
+    fn test_validate_magnet_uri_valid_base32() {
+        // 32 位 Base32(RFC 4648),大小写不敏感
+        let uri = "magnet:?xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567&dn=test";
+        assert!(validate_magnet_uri(uri).is_ok());
+        let uri_lower = "magnet:?xt=urn:btih:abcdefghijklmnopqrstuvwxyz234567";
+        assert!(validate_magnet_uri(uri_lower).is_ok());
+    }
+
+    #[test]
+    fn test_validate_magnet_uri_rejects_malformed_hash() {
+        // 10 位 hex:长度不足(BEP 9 要求 40 位 hex 或 32 位 base32)
+        let uri = "magnet:?xt=urn:btih:a1b2c3d4e5&dn=test";
+        let result = validate_magnet_uri(uri);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("缺少有效的 xt=urn:btih:")
+        );
+        // 41 位 hex:长度超长
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef0123456789";
+        assert!(validate_magnet_uri(uri).is_err());
+        // 含非 hex 字符的 40 位串
+        let uri = "magnet:?xt=urn:btih:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert!(validate_magnet_uri(uri).is_err());
+        // 含空格的超长畸形串(模拟恶意输入)
+        let uri = "magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(validate_magnet_uri(uri).is_err());
     }
 
     #[test]

@@ -87,8 +87,13 @@ impl serde::Serialize for AppError {
                 map.serialize_entry("message", msg)?;
             }
             AppError::Core(err) => {
+                // 嵌套序列化 DownloadError(保留 type/message/retryable 及变体特有字段),
+                // 替代旧 `to_string()` 压平:前端可读取 inner.retryable 决定 toast 严重度,
+                // 读取 inner.retryAfterSecs/status 等做精确提示。
+                // message 仍保留(err.to_string())供前端兜底展示。
                 map.serialize_entry("type", "Core")?;
                 map.serialize_entry("message", &err.to_string())?;
+                map.serialize_entry("inner", err)?;
             }
         }
         map.end()

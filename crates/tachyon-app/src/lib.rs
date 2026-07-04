@@ -312,6 +312,35 @@ fn app_error() {
         json.contains("任务已取消"),
         "序列化应包含 DownloadError 消息: {json}"
     );
+
+    // P2-10: Core 变体嵌套序列化 DownloadError,保留结构化字段供前端分级展示。
+    // 验证 inner 字段包含 type/message/retryable,前端据此决定 toast 严重度。
+    let throttled = AppError::Core(tachyon_core::DownloadError::Throttled {
+        retry_after_secs: Some(60),
+    });
+    let json = serde_json::to_string(&throttled).unwrap();
+    assert!(
+        json.contains("\"inner\""),
+        "Core 变体应嵌套 inner 字段: {json}"
+    );
+    assert!(
+        json.contains("\"retryable\":true"),
+        "Throttled 应 retryable=true: {json}"
+    );
+    assert!(
+        json.contains("\"retryAfterSecs\":60"),
+        "应保留 retryAfterSecs 结构化字段: {json}"
+    );
+    let forbidden = AppError::Core(tachyon_core::DownloadError::Forbidden { status: 403 });
+    let json = serde_json::to_string(&forbidden).unwrap();
+    assert!(
+        json.contains("\"retryable\":false"),
+        "Forbidden 应 retryable=false: {json}"
+    );
+    assert!(
+        json.contains("\"status\":403"),
+        "应保留 status 结构化字段: {json}"
+    );
 }
 
 /// 验证 RecoveryWarning 序列化为 camelCase(P1-06续)

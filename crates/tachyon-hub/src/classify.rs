@@ -5,7 +5,13 @@
 use serde::{Deserialize, Serialize};
 
 /// 文件分类枚举
+///
+/// 序列化为 camelCase 以与前端 `FileCategory` 类型对齐
+/// (前端 `types.ts`: `'modelWeight' | 'config' | ...`)。
+/// 缺失 `rename_all` 会导致 PascalCase 序列化(`"ModelWeight"`),
+/// 前端分类匹配失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum FileCategory {
     /// 模型权重文件
     ModelWeight,
@@ -221,5 +227,32 @@ mod tests {
         assert_eq!(classify_file("Tokenizer.JSON"), FileCategory::Tokenizer);
         assert_eq!(classify_file("README.MD"), FileCategory::Document);
         assert_eq!(classify_file("script.PY"), FileCategory::Code);
+    }
+
+    /// 锁定 wire format:FileCategory 必须序列化为 camelCase,
+    /// 与前端 `types.ts` 的 `'modelWeight' | 'config' | ...` 对齐。
+    /// 防止缺失 `#[serde(rename_all = "camelCase")]` 导致 PascalCase 失配。
+    #[test]
+    fn test_file_category_serializes_camel_case() {
+        let cases = [
+            (FileCategory::ModelWeight, "\"modelWeight\""),
+            (FileCategory::Config, "\"config\""),
+            (FileCategory::Tokenizer, "\"tokenizer\""),
+            (FileCategory::Code, "\"code\""),
+            (FileCategory::Data, "\"data\""),
+            (FileCategory::Document, "\"document\""),
+            (FileCategory::Other, "\"other\""),
+        ];
+        for (variant, expected_json) in cases {
+            let serialized = serde_json::to_string(&variant).expect("序列化失败");
+            assert_eq!(
+                serialized, expected_json,
+                "FileCategory::{variant:?} 序列化为 {serialized}, 期望 {expected_json}(camelCase)"
+            );
+            // 往返:反序列化必须还原
+            let deserialized: FileCategory =
+                serde_json::from_str(&expected_json).expect("反序列化失败");
+            assert_eq!(deserialized, variant, "反序列化 {expected_json} 失配");
+        }
     }
 }

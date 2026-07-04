@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt, future};
 use reqwest::Client;
 
 // ---------------------------------------------------------------------------
@@ -68,9 +68,9 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// 创建新的 HTTP 客户端(使用默认超时: 连接 10s, 读取 30s)
+    /// 创建新的 HTTP 客户端(使用默认超时: 连接 10s, 读取 30s, 无显式代理)
     pub fn new() -> DownloadResult<Self> {
-        Self::with_timeouts(10, 30)
+        Self::with_timeouts(10, 30, None)
     }
 
     /// 创建带自定义超时的 HTTP 客户端
@@ -78,22 +78,30 @@ impl HttpClient {
     /// # 参数
     /// - `connect_secs`: 连接超时(秒),0 表示禁用
     /// - `read_secs`: 读取超时(秒),0 表示禁用
+    /// - `proxy`: 显式代理 URL,如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`;
+    ///   None 时 reqwest 读取系统环境变量(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`)。
     ///
     /// # 说明
     /// - 连接超时防止连接黑洞 IP 永久挂起
     /// - 读取超时防止连接后静默断流,但不会误杀正常的长下载
-    pub fn with_timeouts(connect_secs: u64, read_secs: u64) -> DownloadResult<Self> {
-        Self::build_client(connect_secs, read_secs, false, false, 16, 30)
+    pub fn with_timeouts(
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<&str>,
+    ) -> DownloadResult<Self> {
+        Self::build_client(connect_secs, read_secs, false, false, 16, 30, proxy)
     }
 
     /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制与连接池调优)
     ///
     /// 将 `ConnectionConfig` 的 `max_connections_per_host` 和 `keep_alive_timeout_secs`
     /// 透传给 reqwest 连接池,使 reqwest 空闲连接池大小与信号量并发上限对齐。
+    /// `proxy` 为显式代理 URL,None 时 reqwest 读取系统环境变量。
     pub fn with_connection_config(
         config: &tachyon_core::config::ConnectionConfig,
         connect_secs: u64,
         read_secs: u64,
+        proxy: Option<&str>,
     ) -> DownloadResult<Self> {
         Self::build_client(
             connect_secs,
@@ -102,6 +110,7 @@ impl HttpClient {
             config.enable_quic,
             config.max_connections_per_host as usize,
             config.keep_alive_timeout_secs,
+            proxy,
         )
     }
 
@@ -113,6 +122,7 @@ impl HttpClient {
         enable_quic: bool,
         pool_max_idle_per_host: usize,
         keep_alive_secs: u64,
+        proxy: Option<&str>,
     ) -> DownloadResult<Self> {
         let mut builder = Client::builder()
             .user_agent(tachyon_core::config::USER_AGENT)
@@ -120,9 +130,26 @@ impl HttpClient {
             .pool_idle_timeout(std::time::Duration::from_secs(keep_alive_secs))
             .tcp_keepalive(std::time::Duration::from_secs(keep_alive_secs))
             .tcp_nodelay(true) // 禁用 Nagle 算法:减少小包延迟
-            .no_proxy()
             .dns_resolver(PublicDnsResolver::new())
             .redirect(safe_redirect_policy());
+
+        // 代理策略:显式 proxy > 系统环境变量(默认)。
+        // 不再调用 `.no_proxy()` —— 原实现强制屏蔽系统代理,导致国内被墙 CDN 直连失败,
+        // 且与 BT 侧 `detect_socks_proxy` 自动嗅探系统代理的语义割裂。
+        // None 时 reqwest 默认读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量。
+        if let Some(proxy_url) = proxy {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+                // 安全:proxy URL 可能含 user:pass@,错误信息须脱敏避免凭据泄露到前端。
+                // 用 redact_proxy_url 保留 scheme/host/port(代理诊断需要端口),
+                // 剥离 userinfo(凭据)。
+                DownloadError::Config(format!(
+                    "无效的代理 URL '{}': {}",
+                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    e
+                ))
+            })?;
+            builder = builder.proxy(proxy);
+        }
 
         if connect_secs > 0 {
             builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
@@ -324,6 +351,62 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     let after = after.strip_prefix("0-0")?.trim_start();
     let total = after.strip_prefix('/')?.trim();
     (total != "*").then(|| total.parse::<u64>().ok()).flatten()
+}
+
+/// 解析 `Content-Range` 头为 (start, end, total) 三元组。
+///
+/// 支持 RFC 7233 格式:
+/// - `bytes <start>-<end>/<total>` → `Some((start, end, Some(total)))`
+/// - `bytes <start>-<end>/*` → `Some((start, end, None))`(未定大小)
+/// - `bytes */<total>`(unsatisfied range) → `None`
+///
+/// 用于校验 206 响应的 Content-Range 与请求 Range 一致,
+/// 防止 CDN 缓存错位/负载均衡路由到不同版本文件时静默写入错位数据。
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let value = value.trim();
+    let after = value.strip_prefix("bytes")?.trim_start();
+    // unsatisfied range: `bytes */<total>` — 无 start-end,返回 None
+    if after.starts_with('*') {
+        return None;
+    }
+    let (range_part, total_part) = after.split_once('/')?;
+    let range_part = range_part.trim();
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start: u64 = start_str.trim().parse().ok()?;
+    let end: u64 = end_str.trim().parse().ok()?;
+    let total_str = total_part.trim();
+    let total = if total_str == "*" {
+        None
+    } else {
+        Some(total_str.parse::<u64>().ok()?)
+    };
+    Some((start, end, total))
+}
+
+/// 校验 206 响应的 Content-Range 与请求的 [start, end] 一致。
+///
+/// 不一致时返回 `RangeMismatch` 错误,交由上层(mirror 调度器)切源。
+/// 一致或无 Content-Range 头(部分服务器不返回)时返回 Ok。
+fn validate_content_range(
+    headers: &reqwest::header::HeaderMap,
+    start: u64,
+    end: u64,
+) -> DownloadResult<()> {
+    let Some(cr_value) = headers.get("content-range").and_then(|v| v.to_str().ok()) else {
+        // 无 Content-Range 头:无法校验,放行(部分服务器 206 时不返回此头)
+        return Ok(());
+    };
+    match parse_content_range(cr_value) {
+        Some((resp_start, resp_end, _)) => {
+            if resp_start != start || resp_end != end {
+                return Err(DownloadError::Protocol(format!(
+                    "Content-Range 不匹配: 请求 [{start},{end}], 响应 [{resp_start},{resp_end}]"
+                )));
+            }
+            Ok(())
+        }
+        None => Ok(()), // 解析失败(如 unsatisfied range),放行交由后续哈希校验兜底
+    }
 }
 
 /// 判断 HEAD 失败状态码是否应回退到 GET 探测
@@ -714,6 +797,63 @@ async fn probe_via_get_range(client: &Client, request_url: &str) -> DownloadResu
     ))
 }
 
+/// 对任意字节流应用"200 回退"扫描:跳过前 `start` 字节,截取 `need` 字节。
+///
+/// B-1/B-2 修复的核心逻辑,从 `make_200_fallback_stream` 拆出以便单元测试
+/// (用 `futures::stream::iter` 构造 mock 流,无需 mock HTTP server)。
+///
+/// - **不 OOM**:逐 chunk 跳过/截取,内存上限 = 单个 chunk 大小。
+/// - **不浪费带宽**:`need` 取满后返回 `None` 终止流(drop 上游 → reqwest 中断读取)。
+fn apply_200_fallback_scan(stream: ByteStream, start: usize, need: usize) -> ByteStream {
+    let limited = stream.scan((start, need), |state: &mut (usize, usize), chunk| {
+        let mut data = match chunk {
+            Ok(b) => b,
+            Err(e) => return future::ready(Some(Err(e))),
+        };
+        // 1) 跳过前导字节
+        if state.0 > 0 {
+            if data.len() <= state.0 {
+                state.0 -= data.len();
+                return future::ready(Some(Ok(Bytes::new()))); // 全部跳过,产空(下游 filter 过滤)
+            }
+            let rest = data.split_off(state.0);
+            state.0 = 0;
+            data = rest;
+        }
+        // 2) 截取 take 上限
+        if state.1 == 0 {
+            // 已取满:终止流(drop 上游 → reqwest 中断读取,不浪费带宽)
+            return future::ready(None);
+        }
+        let out_len = data.len().min(state.1);
+        state.1 -= out_len;
+        let out = if out_len < data.len() {
+            data.slice(..out_len)
+        } else {
+            data
+        };
+        future::ready(Some(Ok(out)))
+    });
+    // 过滤跳过段产出的空块;取满后流已终止
+    let exact = limited.filter(|chunk| {
+        let is_empty = chunk.as_ref().map(|b| b.is_empty()).unwrap_or(false);
+        future::ready(!is_empty)
+    });
+    Box::pin(exact)
+}
+
+/// 构造"服务器忽略 Range 返回 200"的回退流:跳过前 `start` 字节,截取 `[start, end]`。
+///
+/// B-1/B-2 修复:统一的 200 回退流式实现,被 `download_range`(收集为 Bytes)
+/// 和 `download_range_stream`(直接返回流)共用。
+fn make_200_fallback_stream(response: reqwest::Response, start: u64, end: u64) -> ByteStream {
+    let need = end.saturating_add(1).saturating_sub(start) as usize;
+    let stream = response.bytes_stream().map(|result| {
+        result.map_err(|e| DownloadError::Network(format!("读取 200 响应流失败: {e}")))
+    });
+    apply_200_fallback_scan(Box::pin(stream), start as usize, need)
+}
+
 impl Protocol for HttpClient {
     fn probe(
         &self,
@@ -804,15 +944,49 @@ impl Protocol for HttpClient {
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
-                warn!(url = %tachyon_core::redact_url_for_log(&url), "服务器忽略 Range 头,返回 HTTP 200");
-                return Err(DownloadError::Protocol(
-                    "服务器忽略 Range 头,返回 HTTP 200(不支持分片下载)".into(),
-                ));
+                // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
+                // B-1 修复:改用流式回退(make_200_fallback_stream)收集为 Bytes,
+                // 避免原 `response.bytes()` 把整个响应体载入内存导致大文件 OOM。
+                // 流式实现只缓冲单个 chunk + 取满即终止,内存上限 = 分片大小。
+                info!(
+                    url = %tachyon_core::redact_url_for_log(&url),
+                    start, end,
+                    "HTTP 200 回退:流式截取请求区间(避免整文件载入内存)"
+                );
+                let stream = make_200_fallback_stream(response, start, end);
+                let chunks: Vec<Bytes> = stream.try_collect().await?;
+                let total: usize = chunks.iter().map(|b| b.len()).sum();
+                let need = end.saturating_add(1).saturating_sub(start) as usize;
+                if total < need {
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&url),
+                        start, end, received = total, need,
+                        "服务器返回 200 但响应体不足以覆盖请求区间"
+                    );
+                    return Err(DownloadError::Protocol(format!(
+                        "服务器返回 200 但响应体长度({total})不足以覆盖请求区间 [{start},{end}]"
+                    )));
+                }
+                // 合并 chunks 为单个 Bytes(分片通常不超过 max_fragment_size=64MB)
+                let result = if chunks.len() == 1 {
+                    chunks.into_iter().next().unwrap()
+                } else {
+                    let mut buf = bytes::BytesMut::with_capacity(total);
+                    for chunk in &chunks {
+                        buf.extend_from_slice(chunk);
+                    }
+                    buf.freeze()
+                };
+                return Ok(result);
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "Range 请求返回非预期状态码");
                 return Err(classify_http_error(status, response.headers()));
             }
+
+            // 校验 Content-Range 与请求区间一致,防止 CDN 缓存错位/路由到不同版本文件
+            // 时静默写入错位数据(仅哈希校验才暴露,此时已浪费整片带宽)。
+            validate_content_range(response.headers(), start, end)?;
 
             let bytes = response
                 .bytes()
@@ -856,15 +1030,23 @@ impl Protocol for HttpClient {
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
-                warn!(url = %tachyon_core::redact_url_for_log(&url), "服务器忽略 Range 头,返回 HTTP 200");
-                return Err(DownloadError::Protocol(
-                    "服务器忽略 Range 头,返回 HTTP 200(不支持分片下载)".into(),
-                ));
+                // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
+                // B-2 修复:委托 make_200_fallback_stream 统一实现流式回退,
+                // 取满即终止流,避免浪费剩余带宽。download_range 路径也复用此函数。
+                info!(
+                    url = %tachyon_core::redact_url_for_log(&url),
+                    start, end,
+                    "服务器忽略 Range 头返回 200,流式回退:跳过 start 字节后截取请求区间"
+                );
+                return Ok(make_200_fallback_stream(response, start, end));
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "流式 Range 请求返回非预期状态码");
                 return Err(classify_http_error(status, response.headers()));
             }
+
+            // 校验 Content-Range 与请求区间一致(同 download_range 路径)
+            validate_content_range(response.headers(), start, end)?;
 
             info!(url = %tachyon_core::redact_url_for_log(&url), start, end, "HTTP 流式 Range 响应头已接收,开始流式传输");
 
@@ -1040,28 +1222,35 @@ mod tests {
 
     #[test]
     fn test_with_timeouts_custom_values() {
-        let client = HttpClient::with_timeouts(5, 60);
+        let client = HttpClient::with_timeouts(5, 60, None);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_with_timeouts_zero_connect_no_panic() {
         // connect_secs=0 表示禁用连接超时,不应 panic
-        let client = HttpClient::with_timeouts(0, 30);
+        let client = HttpClient::with_timeouts(0, 30, None);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_with_timeouts_zero_read_no_panic() {
         // read_secs=0 表示禁用读取超时,不应 panic
-        let client = HttpClient::with_timeouts(10, 0);
+        let client = HttpClient::with_timeouts(10, 0, None);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_with_timeouts_both_zero_no_panic() {
         // 同时禁用两项超时,不应 panic
-        let client = HttpClient::with_timeouts(0, 0);
+        let client = HttpClient::with_timeouts(0, 0, None);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_with_timeouts_explicit_proxy() {
+        // 显式代理 URL 应被接受(reqwest 在 build 时校验代理 URL 语法)
+        let client = HttpClient::with_timeouts(5, 30, Some("http://127.0.0.1:7890"));
         assert!(client.is_ok());
     }
 
@@ -1388,6 +1577,74 @@ mod tests {
         assert_eq!(super::parse_content_range_total("bytes 0-0/"), None);
     }
 
+    // --- Content-Range 一致性校验测试 (P1-2) ---
+
+    #[test]
+    fn test_parse_content_range_full() {
+        // 标准格式 bytes <start>-<end>/<total>
+        assert_eq!(
+            super::parse_content_range("bytes 0-99/1000"),
+            Some((0, 99, Some(1000)))
+        );
+        assert_eq!(
+            super::parse_content_range("bytes 500-999/2000"),
+            Some((500, 999, Some(2000)))
+        );
+    }
+
+    #[test]
+    fn test_parse_content_range_unknown_total() {
+        // 未定大小 bytes <start>-<end>/*
+        assert_eq!(
+            super::parse_content_range("bytes 0-99/*"),
+            Some((0, 99, None))
+        );
+    }
+
+    #[test]
+    fn test_parse_content_range_unsatisfied() {
+        // unsatisfied range bytes */<total> → None
+        assert_eq!(super::parse_content_range("bytes */1000"), None);
+    }
+
+    #[test]
+    fn test_parse_content_range_malformed() {
+        assert_eq!(super::parse_content_range("not-a-range"), None);
+        assert_eq!(super::parse_content_range("bytes abc-def/100"), None);
+        assert_eq!(super::parse_content_range("bytes 0-99"), None); // 缺少 /total
+    }
+
+    #[test]
+    fn test_validate_content_range_matches() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 100-199/1000".parse().unwrap());
+        // 请求 [100,199] 与响应一致 → Ok
+        assert!(super::validate_content_range(&headers, 100, 199).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_mismatch() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 200-299/1000".parse().unwrap());
+        // 请求 [100,199] 但响应 [200,299](CDN 缓存错位)→ Err
+        let result = super::validate_content_range(&headers, 100, 199);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Content-Range 不匹配"),
+            "应检测到 Content-Range 不匹配"
+        );
+    }
+
+    #[test]
+    fn test_validate_content_range_absent_header() {
+        // 无 Content-Range 头 → 放行(部分服务器 206 时不返回此头)
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(super::validate_content_range(&headers, 100, 199).is_ok());
+    }
+
     // --- HEAD 回退 GET 探测:回退判定 ---
 
     #[test]
@@ -1501,7 +1758,7 @@ mod tests {
     fn test_with_connection_config_creates_client() {
         // 验证 with_connection_config 能正确创建客户端
         let config = tachyon_core::config::ConnectionConfig::default();
-        let client = HttpClient::with_connection_config(&config, 10, 30);
+        let client = HttpClient::with_connection_config(&config, 10, 30, None);
         assert!(client.is_ok(), "with_connection_config 应成功创建客户端");
     }
 
@@ -1512,7 +1769,7 @@ mod tests {
             keep_alive_timeout_secs: 60,
             ..Default::default()
         };
-        let client = HttpClient::with_connection_config(&config, 10, 30);
+        let client = HttpClient::with_connection_config(&config, 10, 30, None);
         assert!(
             client.is_ok(),
             "自定义 keep_alive 应成功创建客户端(已对齐 pool_idle_timeout)"
@@ -1524,7 +1781,7 @@ mod tests {
         // 验证 build_client 在 keep_alive_secs=60 时能正常创建
         // pool_idle_timeout 应与 keep_alive_secs 对齐,
         // 避免 reqwest 默认 90s idle timeout 与 semaphore 侧不一致
-        let client = HttpClient::build_client(10, 30, false, false, 16, 60);
+        let client = HttpClient::build_client(10, 30, false, false, 16, 60, None);
         assert!(
             client.is_ok(),
             "build_client(keep_alive=60) 应成功(已配置 pool_idle_timeout)"
@@ -1639,5 +1896,174 @@ mod tests {
             }
             other => panic!("预期带 URL 的 Protocol 错误,实际: {other:?}"),
         }
+    }
+
+    // ── B-1/B-2 修复测试:apply_200_fallback_scan 流式回退 ───────────────────
+
+    /// 辅助:把 Vec<Bytes> 包装成 ByteStream
+    fn mock_stream(chunks: Vec<Bytes>) -> ByteStream {
+        use futures::stream;
+        Box::pin(stream::iter(
+            chunks
+                .into_iter()
+                .map(Ok::<_, DownloadError>)
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// 辅助:把 ByteStream 收集为 Vec<u8>
+    async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, DownloadError> {
+        use futures::TryStreamExt;
+        let chunks: Vec<Bytes> = stream.try_collect().await?;
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&c);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_basic_skip_and_take() {
+        // 响应体 0..=9 (10 字节),请求区间 [3,6](need=4)
+        let data = Bytes::from_static(b"0123456789");
+        let stream = mock_stream(vec![data]);
+        let out = collect_stream(apply_200_fallback_scan(stream, 3, 4))
+            .await
+            .unwrap();
+        assert_eq!(out, b"3456");
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_multi_chunk_skip() {
+        // 多 chunk:跳过跨 chunk 边界
+        let chunks = vec![
+            Bytes::from_static(b"012"),    // 跳过全部(start=3 > len=3)
+            Bytes::from_static(b"345678"), // 跳过前 0(已跳完),取 4 字节 "3456"
+            Bytes::from_static(b"9"),      // 不应到达(已取满)
+        ];
+        let stream = mock_stream(chunks);
+        let out = collect_stream(apply_200_fallback_scan(stream, 3, 4))
+            .await
+            .unwrap();
+        assert_eq!(out, b"3456");
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_terminates_early_saving_bandwidth() {
+        // B-2 核心断言:取满后流应终止,不消费后续 chunk
+        // 用计数器验证后续 chunk 未被 poll
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+
+        let stream: ByteStream = Box::pin(futures::stream::unfold(
+            (0u8, c1, c2),
+            |(i, c1, c2)| async move {
+                if i >= 10 {
+                    return None;
+                }
+                c1.fetch_add(1, Ordering::SeqCst);
+                // 第一个 chunk 含全部所需数据(start=0, need=3),取满后应终止
+                Some((
+                    Ok::<_, DownloadError>(Bytes::from(vec![i])),
+                    (i + 1, c1, c2),
+                ))
+            },
+        ));
+        let out = collect_stream(apply_200_fallback_scan(stream, 0, 3))
+            .await
+            .unwrap();
+        assert_eq!(out, vec![0u8, 1, 2]);
+        // 取满 3 字节后流应终止,counter 不应继续增长到 10
+        let polled = counter.load(Ordering::SeqCst);
+        assert!(
+            polled < 10,
+            "取满后应终止流,但继续 poll 了 {polled} 次(应 <10)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_start_zero() {
+        let data = Bytes::from_static(b"abcdef");
+        let stream = mock_stream(vec![data]);
+        let out = collect_stream(apply_200_fallback_scan(stream, 0, 3))
+            .await
+            .unwrap();
+        assert_eq!(out, b"abc");
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_split_at_chunk_boundary() {
+        // start 正好在 chunk 边界
+        let chunks = vec![Bytes::from_static(b"abc"), Bytes::from_static(b"def")];
+        let stream = mock_stream(chunks);
+        let out = collect_stream(apply_200_fallback_scan(stream, 3, 2))
+            .await
+            .unwrap();
+        assert_eq!(out, b"de");
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_single_byte_chunk() {
+        // 每个 chunk 1 字节,验证逐字节跳过/截取
+        let chunks: Vec<Bytes> = (0..6u8).map(|i| Bytes::from(vec![i])).collect();
+        let stream = mock_stream(chunks);
+        let out = collect_stream(apply_200_fallback_scan(stream, 2, 3))
+            .await
+            .unwrap();
+        assert_eq!(out, vec![2u8, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_need_larger_than_body() {
+        // need > 可用字节数:应返回全部可用(不报错,由上层 download_range 校验长度)
+        let data = Bytes::from_static(b"abc");
+        let stream = mock_stream(vec![data]);
+        let out = collect_stream(apply_200_fallback_scan(stream, 0, 10))
+            .await
+            .unwrap();
+        assert_eq!(out, b"abc");
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_skip_entire_body() {
+        // start >= body.len():应返回空
+        let data = Bytes::from_static(b"abc");
+        let stream = mock_stream(vec![data]);
+        let out = collect_stream(apply_200_fallback_scan(stream, 5, 3))
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_propagates_error() {
+        // 流中途出错应传播
+        use futures::stream;
+        let stream: ByteStream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(DownloadError::Network("模拟读取失败".into())),
+            Ok(Bytes::from_static(b"cd")),
+        ]));
+        let result = collect_stream(apply_200_fallback_scan(stream, 0, 4)).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DownloadError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn test_200_fallback_take_exactly_need_across_chunks() {
+        // need 跨 chunk:第一 chunk 不够,第二 chunk 补足,第三 chunk 不到达
+        let chunks = vec![
+            Bytes::from_static(b"ab"),  // 取全部 2 字节(need=5,剩 3)
+            Bytes::from_static(b"cde"), // 取全部 3 字节(need 满)
+            Bytes::from_static(b"fg"),  // 不应到达
+        ];
+        let stream = mock_stream(chunks);
+        let out = collect_stream(apply_200_fallback_scan(stream, 0, 5))
+            .await
+            .unwrap();
+        assert_eq!(out, b"abcde");
     }
 }

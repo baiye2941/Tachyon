@@ -1848,4 +1848,95 @@ mod tests {
         s.reset_circuit();
         assert!(!s.is_circuit_open(), "reset_circuit 应解除熔断");
     }
+
+    /// 端到端错误注入:单坏源(持续返回错误)通过实际 download_range 调用
+    /// 触发 record_failure 递增,达 SOFT_CIRCUIT_BREAKER_THRESHOLD 后被软熔断。
+    /// 验证从"实际失败"到"熔断"的完整路径
+    /// (区别于 test_soft_circuit_breaker_skips_open_source 手动设置 consecutive_failures)。
+    ///
+    /// 单源场景:每次 download_range 调用坏源失败一次(record_failure 递增),
+    /// 5 次后熔断。第 6 次触发半开重置(all-open),给一次恢复探测机会。
+    #[tokio::test]
+    async fn test_circuit_opens_via_actual_failures_single_source() {
+        let bad = Arc::new(MockProtocol::new().with_download_data(Err("源不可达".into())));
+        let bad_counter = bad.select_counter.clone();
+
+        // 单源:只有坏源,无 fallback
+        let mp = MirrorProtocol::new(bad, vec![]);
+
+        // 连续发起 5 次下载:每次坏源失败 → record_failure 递增
+        for i in 0..super::SOFT_CIRCUIT_BREAKER_THRESHOLD {
+            let result = mp.download_range("http://bad.com/file", 0, 99).await;
+            assert!(
+                result.is_err(),
+                "第 {} 次下载应失败(坏源无 fallback)",
+                i + 1
+            );
+        }
+        // 坏源应被调用恰好 5 次(每次失败一次,record_failure 递增)
+        assert_eq!(
+            bad_counter.load(std::sync::atomic::Ordering::Relaxed),
+            super::SOFT_CIRCUIT_BREAKER_THRESHOLD as usize,
+            "坏源应被尝试 5 次后熔断"
+        );
+
+        // 第 6 次下载:坏源已熔断,但单源场景触发半开重置(all-open),
+        // 给一次恢复探测机会 → 坏源被再试一次 → 仍失败
+        let result = mp.download_range("http://bad.com/file", 0, 99).await;
+        assert!(result.is_err(), "半开探测后坏源仍失败");
+        assert_eq!(
+            bad_counter.load(std::sync::atomic::Ordering::Relaxed),
+            super::SOFT_CIRCUIT_BREAKER_THRESHOLD as usize + 1,
+            "半开探测应再试坏源一次"
+        );
+    }
+
+    /// 双源错误注入:坏源失败 1 次后,因 quality 衰减被 least-in-flight 的质量加权
+    /// 自然跳过,流量迁移到好源。这验证了 MirrorProtocol 在"未达熔断阈值前"就通过
+    /// quality 加权实现流量迁移——软熔断是兜底机制,质量加权是主要机制。
+    #[tokio::test]
+    async fn test_traffic_migrates_via_quality_weighting_before_circuit() {
+        let bad = Arc::new(MockProtocol::new().with_download_data(Err("源不可达".into())));
+        let good =
+            Arc::new(MockProtocol::new().with_download_data(Ok(Bytes::from_static(b"good-data"))));
+        let bad_counter = bad.select_counter.clone();
+        let good_counter = good.select_counter.clone();
+
+        // 双源:primary=bad, mirror=good
+        let mp = MirrorProtocol::new(bad, vec![("http://good.com/file".into(), good)]);
+
+        // 第 1 次下载:两源 quality 相同(默认),index 0(bad)优先被选 → 失败 →
+        // fallback 到 good → 成功。good 的 quality 升高。
+        let result = mp.download_range("http://bad.com/file", 0, 99).await;
+        assert!(result.is_ok(), "第 1 次应 fallback 到 good 成功");
+        assert_eq!(result.unwrap(), Bytes::from_static(b"good-data"));
+        assert_eq!(
+            bad_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "坏源应被试 1 次"
+        );
+        assert_eq!(
+            good_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "好源应被选 1 次"
+        );
+
+        // 后续 9 次下载:good 的 quality 已升高(有成功记录),bad 的 quality 仍默认,
+        // least-in-flight 在 inflight=0 时按 quality 选 → 直接选 good,跳过 bad。
+        for _ in 0..9 {
+            let result = mp.download_range("http://bad.com/file", 0, 99).await;
+            assert!(result.is_ok(), "后续下载应直接选 good");
+        }
+        // 坏源计数不应增长(被 quality 加权跳过,未达熔断)
+        assert_eq!(
+            bad_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "坏源因 quality 衰减被跳过,计数应停在 1(未达熔断阈值 5)"
+        );
+        assert_eq!(
+            good_counter.load(std::sync::atomic::Ordering::Relaxed),
+            10,
+            "好源应承接全部后续流量"
+        );
+    }
 }

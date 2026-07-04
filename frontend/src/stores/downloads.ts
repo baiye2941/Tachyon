@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal, batch } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import type {
@@ -321,6 +322,6 @@ export async function refreshTaskList() {
     const tasks = await api.getTaskList();
     setTasks(tasks);
   } catch (e) {
-    addToast(tr("toast.refreshTasksFailed", { error: String(e) }), "error");
+    addToast(tr("toast.refreshTasksFailed", { error: errorMessage(e) }), "error");
   }
 }

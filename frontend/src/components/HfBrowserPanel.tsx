@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal, Show, For, createMemo, untrack } from 'solid-js'
 import { api } from '../api/invoke'
 import { $hub, listRepoFiles, clearRepoFiles } from '../stores/hub'
@@ -80,7 +81,7 @@ function TreeNodeItem(props: {
         addToast(tr('toast.hubAddedDownload', { name: props.node.name }), 'success')
       }
     } catch (e) {
-      addToast(tr('toast.hubDownloadFailed', { error: String(e) }), 'error')
+      addToast(tr('toast.hubDownloadFailed', { error: errorMessage(e) }), 'error')
     }
     props.onDownload(props.node.path)
   }

@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal, Show, For, createMemo, Switch, Match } from 'solid-js'
 import type {
   HfModelInfo,
@@ -171,7 +172,7 @@ export default function ModelDetail(props: ModelDetailProps) {
       await batchDownload(id, paths)
       addToast(tr('hub.batch.created', { count: paths.length }), 'success')
     } catch (e) {
-      addToast(tr('hub.batch.failed', { error: String(e) }), 'error')
+      addToast(tr('hub.batch.failed', { error: errorMessage(e) }), 'error')
     }
   }
 
@@ -214,7 +215,7 @@ export default function ModelDetail(props: ModelDetailProps) {
       addToast(tr('hub.batch.created', { count: paths.length }), 'success')
       clearFileSelection()
     } catch (e) {
-      addToast(tr('hub.batch.failed', { error: String(e) }), 'error')
+      addToast(tr('hub.batch.failed', { error: errorMessage(e) }), 'error')
     } finally {
       setDownloading(false)
     }

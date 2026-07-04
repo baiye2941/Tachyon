@@ -1,3 +1,4 @@
+import { errorMessage } from "../utils/appError";
 import { createSignal } from 'solid-js'
 import type { HubFileInfo, HfModelInfo } from '../types'
 import { api } from '../api/invoke'
@@ -22,7 +23,7 @@ export async function listRepoFiles(repoId: string, revision?: string) {
     setRepoFiles(files)
     return files
   } catch (e) {
-    const msg = String(e)
+    const msg = errorMessage(e)
     setError(msg)
     addToast(tr('toast.hubListFailed', { error: msg }), 'error')
     return []
@@ -48,7 +49,7 @@ export async function getHfDownloadUrl(repoId: string, path: string, revision?: 
   try {
     return await api.getHfDownloadUrl(repoId, path, revision)
   } catch (e) {
-    addToast(tr('toast.hubUrlFailed', { error: String(e) }), 'error')
+    addToast(tr('toast.hubUrlFailed', { error: errorMessage(e) }), 'error')
     return null
   }
 }

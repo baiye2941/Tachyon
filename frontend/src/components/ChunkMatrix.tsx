@@ -256,11 +256,14 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const maxDoneIdx = doneSet.size > 0 ? Math.max(...doneSet) : -1;
     const remaining = props.fragmentsTotal - done;
     const band = Math.min(Math.max(1, concurrency), Math.max(1, remaining));
+    // 在 memo 作用域内预先读取响应式值,避免在 Array.from 回调(非追踪作用域)
+    // 内读取 props.progress 触发 solid/reactivity 警告(变化会被忽略)。
+    const progressLt1 = props.progress < 1;
     return Array.from({ length: props.fragmentsTotal }, (_, i) => {
       const isDone = doneSet.has(i);
       // 已知折中:maxDoneIdx 之前未完成的分片(如重试中)显示为 pending
       const isDownloading =
-        !isDone && i > maxDoneIdx && i <= maxDoneIdx + band && props.progress < 1;
+        !isDone && i > maxDoneIdx && i <= maxDoneIdx + band && progressLt1;
       const status: ChunkBlock["status"] = isDone
         ? "done"
         : isDownloading

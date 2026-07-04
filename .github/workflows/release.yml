@@ -4,6 +4,24 @@ on:
   push:
     tags:
       - 'v*'
+  # 手动触发:支持不打 tag 干跑构建(不上传 Release),便于调试 release.yml
+  # 避免反复"打 tag → 失败 → 修 → 再打 tag"的低效循环
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: '干跑模式(跳过 Release 上传,仅验证构建)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+# 并发控制:同一 ref 的 release 不可并发(避免产物混乱)。
+# tag 推送不可取消(cancel-in-progress: false),保护正在进行的构建。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 # tauri-action 需要创建 Release 和上传产物,需要 contents: write 权限
 # 默认 GITHUB_TOKEN 只有只读权限,会导致 "Resource not accessible by integration"
@@ -15,6 +33,7 @@ jobs:
   ci-gate:
     name: CI 门禁检查
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -56,12 +75,19 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: 运行覆盖率检查(核心 crate >= 90%)
+      - name: 运行覆盖率检查(核心 crate 逐 crate >= 90%)
         # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)
+        # 逐 crate 门禁:避免合计门禁让单 crate 低覆盖被拉平(与 ci.yml 一致)
+        # --ignore-filename-regex: test_harness(测试基础设施) + iocp/winio/iouring(平台 IO 后端,内核 FFI)
         run: |
-          cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
-            -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
-            --fail-under-lines 90 --summary-only
+          set -e
+          for crate in tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tachyon-scheduler; do
+            echo "::group::覆盖率: $crate"
+            cargo llvm-cov -p "$crate" \
+              --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
+              --fail-under-lines 90 --summary-only
+            echo "::endgroup::"
+          done
 
       # SRE-002: Miri 检查门禁
       # 注意:Miri 组件只在 nightly 可用,必须设置 RUSTUP_TOOLCHAIN=nightly
@@ -91,6 +117,7 @@ jobs:
   security-gate:
     name: 安全审计门禁
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -112,6 +139,7 @@ jobs:
   frontend-gate:
     name: 前端构建门禁
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -141,6 +169,7 @@ jobs:
   version-check:
     name: 版本一致性检查
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - name: 检查 tag 与各配置文件版本一致
@@ -192,6 +221,7 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 10
     continue-on-error: true  # CI 无头环境缺少 display server,GUI 验证可能失败
     steps:
       - uses: actions/checkout@v7
@@ -291,6 +321,7 @@ jobs:
     needs: [install-smoke]
     if: success()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: 发布门禁通过
         run: |
@@ -309,6 +340,7 @@ jobs:
     if: failure()
     needs: [build-release, install-smoke]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: 标记当前 release 为 pre-release
         env:
@@ -351,6 +383,7 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60  # 跨平台 Tauri LTO 编译可能 40-60min,防止挂起耗尽 runner 分钟
     steps:
       - uses: actions/checkout@v7
 
@@ -399,8 +432,10 @@ jobs:
   publish-release:
     name: 发布 Release
     needs: [release-gate]
-    if: success()
+    # workflow_dispatch 干跑模式(dry-run=true)跳过发布,仅验证构建链路
+    if: success() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 

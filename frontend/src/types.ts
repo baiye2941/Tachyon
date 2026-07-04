@@ -47,6 +47,8 @@ export interface DownloadConfig {
   headers: Record<string, string>
   /** I/O 存储后端策略。后端默认按平台自适应: Windows→iocp, Linux 5.4+→ioUring, 其他→standard。可选以兼容旧版无此字段的快照 */
   ioStrategy?: IoStrategy
+  /** 显式代理 URL(http/socks5),null 时 reqwest 读取系统环境变量(HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) */
+  proxy?: string | null
 }
 
 export interface ConnectionConfig {
@@ -125,6 +127,8 @@ export interface DownloadPatch {
   pauseTimeoutSecs?: number
   rateLimitBytesPerSec?: number | null
   ioStrategy?: IoStrategy
+  /** 显式代理 URL,null 表示清除(回退系统环境变量) */
+  proxy?: string | null
 }
 
 /** 连接配置白名单补丁 */

@@ -655,6 +655,7 @@ mod tests {
                 max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
                 authorized_dirs: vec![download_dir.to_string()],
                 io_strategy: IoStrategy::default(),
+                proxy: None,
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host,
@@ -691,6 +692,7 @@ mod tests {
                 pause_timeout_secs: None,
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
+                proxy: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host,
@@ -739,6 +741,7 @@ mod tests {
                 pause_timeout_secs: None,
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
+                proxy: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),
@@ -778,6 +781,7 @@ mod tests {
                 pause_timeout_secs: None,
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
+                proxy: None,
             }),
             connection: None,
             magnet: None,
@@ -930,6 +934,7 @@ mod tests {
                 max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
                 authorized_dirs: vec!["/tmp".to_string()],
                 io_strategy: IoStrategy::default(),
+                proxy: None,
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host: 4,
@@ -1105,6 +1110,7 @@ mod tests {
                 pause_timeout_secs: Some(600),
                 rate_limit_bytes_per_sec: Some(Some(1_048_576)),
                 io_strategy: Some(IoStrategy::WinAligned),
+                proxy: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),

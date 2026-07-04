@@ -37,6 +37,15 @@ pub mod harness {
         /// 覆盖引擎流读取循环的逐块哈希、批量刷写、取消信号穿透路径。
         /// None(默认)时整个 range 一次性产出(stream::once)。
         chunk_size: Option<usize>,
+        /// 每个 chunk 产出前的延迟,模拟固定低带宽源(慢源)。
+        /// 与 chunk_size 配合:chunk 越小 + delay 越大 = 带宽越低。
+        /// 用于验证 MirrorProtocol 的质量加权选源、BT 回退的带宽阈值等错误注入场景。
+        chunk_delay: Option<std::time::Duration>,
+        /// 间歇失败注入:每次 download_range_stream 调用递增计数器,
+        /// 命中指定次数时返回错误,模拟源不稳定(间歇 5xx/连接重置)。
+        /// 配合重试逻辑验证 worker 的退避与切换。
+        fail_on_attempt: Arc<Mutex<Option<(usize, PreservedError)>>>,
+        attempt_counter: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// L-16: 保留 MockProtocol 中原始 DownloadError 的可 Clone 部分。
@@ -154,6 +163,9 @@ pub mod harness {
                 default_data: None,
                 stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
                 chunk_size: None,
+                chunk_delay: None,
+                fail_on_attempt: Arc::new(Mutex::new(None)),
+                attempt_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -194,6 +206,29 @@ pub mod harness {
             }
         }
 
+        /// 设置每个 chunk 产出前的延迟,模拟固定低带宽源(慢源)。
+        ///
+        /// 与 `with_chunk_size` 配合使用:chunk 越小 + delay 越大 = 带宽越低。
+        /// 用于错误注入场景:验证 MirrorProtocol 的质量加权选源能否识别慢源、
+        /// BT 回退的带宽阈值能否触发等。
+        pub fn with_chunk_delay(self, delay: std::time::Duration) -> Self {
+            Self {
+                chunk_delay: Some(delay),
+                ..self
+            }
+        }
+
+        /// 间歇失败注入:第 `attempt` 次(从 1 开始)调用 download_range_stream 时
+        /// 返回指定错误,模拟源不稳定(间歇 5xx/连接重置)。
+        ///
+        /// 配合 worker 的重试退避逻辑验证:首次失败 → 退避 → 重试成功。
+        /// `attempt` 从 1 开始计数,设为 1 表示首次调用即失败。
+        pub fn fail_on_attempt(self, attempt: usize, error: DownloadError) -> Self {
+            *self.fail_on_attempt.lock().unwrap() =
+                Some((attempt, PreservedError::from_download_error(&error)));
+            self
+        }
+
         /// 创建一个总是失败的 MockProtocol。
         ///
         /// L-16: 保留原始 DownloadError 的关键信息(变体类型 + 附加字段)。
@@ -207,6 +242,9 @@ pub mod harness {
                 default_data: None,
                 stalling_ranges: Arc::new(Mutex::new(HashMap::new())),
                 chunk_size: None,
+                chunk_delay: None,
+                fail_on_attempt: Arc::new(Mutex::new(None)),
+                attempt_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -256,6 +294,17 @@ pub mod harness {
             let this = self.clone();
             let url = url.to_owned();
             Box::pin(async move {
+                // 间歇失败注入:递增计数器,命中指定次数时返回错误。
+                // 用于验证 worker 的退避重试与源切换逻辑。
+                if let Some((fail_at, ref preserved)) = *this.fail_on_attempt.lock().unwrap() {
+                    let current = this
+                        .attempt_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    if current == fail_at {
+                        return Err(preserved.to_download_error());
+                    }
+                }
                 // 命中"死 swarm"区间:返回永不产出项的 pending 流,
                 // 模拟磁力链接无 peer 时 FileStream.read() 永久 Pending。
                 if this
@@ -281,8 +330,23 @@ pub mod harness {
                             data.slice(offset..end)
                         })
                         .collect();
-                    Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
-                        as crate::traits::ByteStream)
+                    // 慢源注入:每个 chunk 产出前 sleep,模拟固定低带宽。
+                    // 用 then 在每个 chunk 前 sleep,延迟放在流内部让消费方的 select!
+                    // 能在等待期间被取消信号穿透,而非阻塞整个 future。
+                    if let Some(delay) = this.chunk_delay {
+                        use futures::StreamExt;
+                        Ok(
+                            Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)).then(
+                                move |result| async move {
+                                    tokio::time::sleep(delay).await;
+                                    result
+                                },
+                            )) as crate::traits::ByteStream,
+                        )
+                    } else {
+                        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+                            as crate::traits::ByteStream)
+                    }
                 } else {
                     Ok(Box::pin(futures::stream::once(async move { Ok(data) }))
                         as crate::traits::ByteStream)
@@ -451,7 +515,91 @@ pub mod harness {
         }
     }
 
-    /// 创建测试用的文件元数据
+    /// 可故障存储,用于磁盘边界/IO 错误注入测试。
+    ///
+    /// 配置 `fail_after` 后,前 N 次 write_at 成功,第 N+1 次起返回 `DownloadError::Io`。
+    /// 用于验证 downloader 在磁盘满/IO 错误时优雅降级(返回错误而非 panic/无限重试)。
+    /// read_at/sync/allocate 等正常工作,仅 write_at 注入故障。
+    #[derive(Clone, Default)]
+    pub struct FailingStorage {
+        inner: MemoryStorage,
+        /// write_at 成功次数上限;超过后返回错误。None = 永不失败。
+        fail_after: Arc<std::sync::atomic::AtomicUsize>,
+        write_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailingStorage {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// 设置 write_at 成功 N 次后开始失败(模拟磁盘剩余空间耗尽)。
+        /// N=0 表示首次 write_at 即失败。
+        pub fn fail_write_after(self, n: usize) -> Self {
+            self.fail_after
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// 当前 write_at 被调用次数(含失败次数),用于测试断言。
+        pub fn write_call_count(&self) -> usize {
+            self.write_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// write_count 的 Arc 引用(供 storage 被 move 后测试仍能读取计数)。
+        pub fn write_call_count_arc(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            self.write_count.clone()
+        }
+    }
+
+    impl AsyncStorage for FailingStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let count = self
+                .write_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let limit = self.fail_after.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if count >= limit {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        "模拟磁盘空间不足(ENOSPC)",
+                    )));
+                }
+                self.inner.write_at(offset, data).await
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            self.inner.sync()
+        }
+
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            self.inner.allocate(size)
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            self.inner.file_size()
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            self.inner.close()
+        }
+    }
     pub fn test_metadata(file_name: &str, file_size: u64) -> FileMetadata {
         FileMetadata {
             file_name: file_name.to_string(),
@@ -513,6 +661,7 @@ pub mod harness {
             // 端到端落盘测试不应隐式依赖 IoStrategy::default()(Linux 上回退 IoUring)。
             // IoUring 后端有独立的单元测试覆盖(crates/tachyon-io/src/iouring.rs)。
             io_strategy: IoStrategy::Standard,
+            proxy: None,
         }
     }
 
@@ -599,6 +748,194 @@ mod tests {
         let protocol = MockProtocol::failing(DownloadError::Network("连接超时".into()));
         let result = protocol.probe("http://example.com/file.bin").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_chunk_delay_injects_slow_source() {
+        // 慢源注入:chunk_delay 让每个 chunk 产出前 sleep,
+        // 验证流确实延迟产出且数据完整。
+        use futures::StreamExt;
+        let meta = test_metadata("slow.bin", 1024);
+        let data = Bytes::from(vec![0xABu8; 1024]);
+        let protocol = MockProtocol::new(meta)
+            .with_range_data(0, 1023, data.clone())
+            .with_chunk_size(256)
+            .with_chunk_delay(std::time::Duration::from_millis(20));
+        let stream = protocol
+            .download_range_stream("http://example.com/slow.bin", 0, 1023)
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        let collected: Vec<_> = stream.collect::<Vec<_>>().await;
+        let elapsed = start.elapsed();
+        // 4 chunk × 20ms = 至少 80ms(允许调度抖动,断言下限 60ms)
+        assert!(
+            elapsed >= std::time::Duration::from_millis(60),
+            "慢源延迟未生效: elapsed={elapsed:?}"
+        );
+        // 数据完整性:4 chunk 拼回 1024 字节
+        let total: usize = collected.iter().map(|c| c.as_ref().unwrap().len()).sum();
+        assert_eq!(total, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_mock_protocol_fail_on_attempt_intermittent_failure() {
+        // 间歇失败注入:第 1 次调用失败,第 2 次成功,
+        // 验证计数器递增与错误返回语义。
+        let meta = test_metadata("flaky.bin", 64);
+        let data = Bytes::from(vec![0xCDu8; 64]);
+        let protocol = MockProtocol::new(meta)
+            .with_range_data(0, 63, data.clone())
+            .fail_on_attempt(1, DownloadError::Network("间歇连接重置".into()));
+        // 第 1 次:失败
+        let result = protocol
+            .download_range_stream("http://example.com/flaky.bin", 0, 63)
+            .await;
+        assert!(result.is_err(), "第 1 次调用应失败");
+        // 第 2 次:成功
+        let stream = protocol
+            .download_range_stream("http://example.com/flaky.bin", 0, 63)
+            .await
+            .unwrap();
+        use futures::StreamExt;
+        let collected: Vec<_> = stream.collect::<Vec<_>>().await;
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].as_ref().unwrap(), &data);
+    }
+
+    #[tokio::test]
+    async fn test_noop_storage_smoke() {
+        // NoopStorage 主要用于 bench(隔离存储适配层开销),
+        // 此冒烟测试覆盖其所有方法,避免 bench-only 代码拉低覆盖率。
+        let storage = NoopStorage;
+        let w = storage
+            .write_at(0, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        assert_eq!(w, 3);
+        let mut buf = bytes::BytesMut::zeroed(4);
+        let wm = storage.write_at_mut(0, &mut buf).await.unwrap();
+        assert_eq!(wm, 4);
+        let mut rbuf = [0u8; 4];
+        let r = storage.read_at(0, &mut rbuf).await.unwrap();
+        assert_eq!(r, 4);
+        storage.sync().await.unwrap();
+        storage.allocate(1024).await.unwrap();
+        assert_eq!(storage.file_size().await.unwrap(), u64::MAX);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_preserved_error_roundtrip_all_variants() {
+        // 通过 MockProtocol::failing + probe 间接覆盖 PreservedError 的
+        // from_download_error / to_download_error 全变体分支。
+        // PreservedError 是 harness 模块私有类型,测试经由公共 API(failing/probe)触达。
+        let cases: Vec<DownloadError> = vec![
+            DownloadError::Network("net".into()),
+            DownloadError::Protocol("proto".into()),
+            DownloadError::Fragment("frag".into()),
+            DownloadError::ChecksumMismatch {
+                expected: "abc".into(),
+                actual: "def".into(),
+            },
+            DownloadError::NoExpectedChecksum,
+            DownloadError::Config("cfg".into()),
+            DownloadError::Cancelled,
+            DownloadError::TaskNotFound("t1".into()),
+            DownloadError::ConnectionPoolExhausted,
+            DownloadError::Timeout("t".into()),
+            DownloadError::Throttled {
+                retry_after_secs: Some(30),
+            },
+            DownloadError::Throttled {
+                retry_after_secs: None,
+            },
+            DownloadError::Forbidden { status: 403 },
+            DownloadError::Http {
+                status: 500,
+                reason: "err".into(),
+            },
+            // 不可 Clone 变体:降级为 Network
+            DownloadError::Io(std::io::Error::other("io")),
+            DownloadError::Other("other".into()),
+            DownloadError::UrlParse(url::ParseError::EmptyHost),
+            DownloadError::Serialization(serde_json::from_str::<()>("bad").unwrap_err()),
+        ];
+        for err in cases {
+            // err 将被 move 进 failing,先记录判据
+            let is_downgraded = matches!(
+                err,
+                DownloadError::Io(_)
+                    | DownloadError::Other(_)
+                    | DownloadError::UrlParse(_)
+                    | DownloadError::Serialization(_)
+            );
+            let orig_discriminant = std::mem::discriminant(&err);
+            let proto = MockProtocol::failing(err);
+            let result = proto.probe("http://test.example/file").await;
+            assert!(result.is_err(), "failing protocol probe 应返回错误");
+            // 降级变体应还原为 Network;可 Clone 变体应保留类型
+            let restored = result.unwrap_err();
+            if is_downgraded {
+                assert!(
+                    matches!(restored, DownloadError::Network(_)),
+                    "降级变体应还原为 Network,实际: {restored:?}"
+                );
+            } else {
+                assert!(
+                    orig_discriminant == std::mem::discriminant(&restored),
+                    "可 Clone 变体应保留类型,还原: {restored:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failing_storage_write_succeeds_then_fails() {
+        // 前 2 次 write_at 成功,第 3 次起失败
+        let storage = FailingStorage::new().fail_write_after(2);
+        // 第 1 次:成功
+        let w1 = storage
+            .write_at(0, Bytes::from_static(b"aa"))
+            .await
+            .unwrap();
+        assert_eq!(w1, 2);
+        // 第 2 次:成功
+        let w2 = storage
+            .write_at(2, Bytes::from_static(b"bb"))
+            .await
+            .unwrap();
+        assert_eq!(w2, 2);
+        // 第 3 次:失败(StorageFull)
+        let err = storage
+            .write_at(4, Bytes::from_static(b"cc"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::Io(ref e)
+            if e.kind() == std::io::ErrorKind::StorageFull));
+        assert_eq!(storage.write_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_failing_storage_non_write_methods_delegate_to_inner() {
+        // FailingStorage 的 read_at/sync/allocate/file_size/close 委托给 MemoryStorage,
+        // 验证它们正常工作(不注入故障)。
+        let storage = FailingStorage::new().fail_write_after(0);
+        // allocate 不受故障注入影响
+        storage.allocate(64).await.unwrap();
+        // write_at 失败,但数据未写入(inner 为空)
+        let _ = storage.write_at(0, Bytes::from_static(b"xxx")).await;
+        // file_size 应反映 allocate 的 64
+        let size = storage.file_size().await.unwrap();
+        assert_eq!(size, 64);
+        // read_at 读取 allocate 预分配的零字节
+        let mut buf = [0u8; 4];
+        let n = storage.read_at(0, &mut buf).await.unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, &[0u8; 4]);
+        // sync 和 close 不报错
+        storage.sync().await.unwrap();
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]

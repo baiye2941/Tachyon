@@ -872,6 +872,39 @@ mod tests {
             FragmentProgress::PlanComplete { .. } => panic!("应为 Chunk"),
         }
     }
+
+    #[test]
+    fn test_file_layout_file_names() {
+        // 覆盖 FileLayout::file_names()(L254-256)
+        let layout = FileLayout {
+            files: vec![
+                FileSpan {
+                    file_id: 0,
+                    global_offset: 0,
+                    len: 1024,
+                    name: "part1.bin".into(),
+                },
+                FileSpan {
+                    file_id: 1,
+                    global_offset: 1024,
+                    len: 2048,
+                    name: "part2.bin".into(),
+                },
+            ],
+        };
+        let names = layout.file_names();
+        assert_eq!(names, vec!["part1.bin", "part2.bin"]);
+    }
+
+    #[test]
+    fn test_fragment_info_new_invariant_violation() {
+        // 覆盖 end+1 != start+size 的 invariant 违反分支(L323-326)
+        // index=0, start=0, end=100, size=50 → end+1=101 != start+size=50
+        let result = FragmentInfo::new(0, 0, 100, 50);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invariant"));
+    }
 }
 
 #[cfg(test)]

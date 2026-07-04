@@ -112,8 +112,13 @@ impl CpuVerifier {
     ///
     /// **Blake3 整文件校验路径**(verify 阶段):使用 blake3 的
     /// `update_mmap_rayon`——mmap 零拷贝读 + 多线程哈希,对大文件(如 50GB 模型)
-    /// 可获得 10-20x 加速(见 blake3 官方基准)。该方法在 blake3 内部已含 fallback:
-    /// 文件不可 mmap 时退化为标准 IO(仍走 `update_rayon` 多线程)。
+    /// 可获得 10-20x 加速(见 blake3 官方基准)。
+    ///
+    /// **fallback 行为**:`update_mmap_rayon` 内部仅在文件 < 16KiB 或不可 mmap 时
+    /// 退化为单线程标准 IO,**不**基于磁盘类型。HDD 上大文件仍会走多线程 mmap,
+    /// 可能 seek thrash(blake3 官方文档警告)。当前生产下载 verify 不经此路径
+    /// (走 `CpuStreamingHasher` 流式 `read_at` + 跨分片 `JoinSet` 并发),故不构成
+    /// 实际问题。若未来新增整文件 blake3 verify 调用方且面向 HDD 用户,需 revisit。
     ///
     /// **SHA-256 路径**:sha2 无多线程 API,沿用流式逐块读取(`compute_hash_streaming`),
     /// `chunk_size` 仅对 sha256 生效。
@@ -459,7 +464,6 @@ mod tests {
 
     #[test]
     fn test_streaming_hasher_blake3_matches_oneshot() {
-        use tachyon_core::traits::StreamingHasher;
         let data = b"streaming hasher blake3 consistency test payload";
         let verifier = CpuVerifier::blake3();
 
@@ -478,7 +482,6 @@ mod tests {
 
     #[test]
     fn test_streaming_hasher_sha256_matches_oneshot() {
-        use tachyon_core::traits::StreamingHasher;
         let data = b"streaming hasher sha256 consistency test payload";
         let verifier = CpuVerifier::sha256();
 
@@ -495,7 +498,6 @@ mod tests {
 
     #[test]
     fn test_streaming_hasher_empty_input() {
-        use tachyon_core::traits::StreamingHasher;
         let verifier = CpuVerifier::blake3();
         let oneshot = verifier.compute_hash(b"").unwrap();
         let streaming = verifier.new_hasher().finalize();
@@ -504,7 +506,6 @@ mod tests {
 
     #[test]
     fn test_streaming_hasher_single_chunk() {
-        use tachyon_core::traits::StreamingHasher;
         let data = b"single chunk no split";
         let verifier = CpuVerifier::blake3();
         let oneshot = verifier.compute_hash(data).unwrap();
