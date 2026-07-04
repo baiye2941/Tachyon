@@ -1882,8 +1882,7 @@ mod tests {
         for id in &task_ids[..3] {
             let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
             assert!(
-                task.status == DownloadState::Cancelled
-                    || task.status == DownloadState::Failed,
+                task.status == DownloadState::Cancelled || task.status == DownloadState::Failed,
                 "任务应处于终态(Cancelled 或 Failed),实际: {}",
                 task.status
             );
