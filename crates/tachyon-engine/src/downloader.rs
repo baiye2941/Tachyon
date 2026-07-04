@@ -1667,14 +1667,34 @@ impl DownloadTask {
     ///   move owned `Bytes` 进 `spawn_blocking`,Arc refcount 保证 select! 取消安全)
     /// - 消除 `advance(written.min(batch.len()))` 的 min hack(Bytes::slice 天然处理剩余)
     /// - `Bytes::clone()`/`slice()` 均为零拷贝指针调整,无内存复制
+    ///
+    /// 接受 `BytesMut` 的版本:仅测试使用(测试构造 `BytesMut` 较 `Bytes` 方便),
+    /// 内部 `freeze()`(零拷贝)后委托 [`write_all_at`]。
+    #[cfg(test)]
     async fn write_all_at_mut(
         storage: &StorageSet,
-        mut pos: u64,
+        pos: u64,
         batch: bytes::BytesMut,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
     ) -> DownloadResult<u64> {
-        let mut remaining = batch.freeze();
+        Self::write_all_at(storage, pos, batch.freeze(), control_rx, pause_timeout).await
+    }
+
+    /// 把已 owned 的 `Bytes` 完整写入存储(含短写重试 + 控制信号中断)
+    ///
+    /// 与 [`write_all_at_mut`] 的区别:直接接受 `Bytes`,省去调用方的
+    /// `BytesMut::from(chunk)` 分配 + memcpy。大 chunk 直写路径(网络 chunk
+    /// 本就是 owned `Bytes`)直接传入,消除 256KiB 的 `BytesMut::from` memcpy。
+    ///
+    /// `Bytes::clone()`/`slice()` 均为零拷贝指针调整(Arc refcount),无内存复制。
+    async fn write_all_at(
+        storage: &StorageSet,
+        mut pos: u64,
+        mut remaining: bytes::Bytes,
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
+        pause_timeout: Duration,
+    ) -> DownloadResult<u64> {
         let mut total_written = 0u64;
         while !remaining.is_empty() {
             let write = storage.write_at(pos, remaining.clone());
@@ -1728,7 +1748,7 @@ impl DownloadTask {
     async fn flush_batch(
         storage: &StorageSet,
         pos: u64,
-        batch: bytes::BytesMut,
+        batch: bytes::Bytes,
         hasher: &mut Option<Box<dyn tachyon_core::traits::StreamingHasher>>,
         frag_index: u32,
         total_written: u64,
@@ -1753,7 +1773,7 @@ impl DownloadTask {
                 "分片下载数据越界: index={frag_index}, 预期 {expected_len} 字节, 本次将写入 {attempted_written} 字节"
             )));
         }
-        let w = Self::write_all_at_mut(storage, pos, batch, control_rx, pause_timeout).await?;
+        let w = Self::write_all_at(storage, pos, batch, control_rx, pause_timeout).await?;
         let new_pos = pos.checked_add(w).ok_or_else(|| {
             DownloadError::Fragment(format!(
                 "分片写入偏移溢出: index={frag_index}, offset={pos}, len={w}"
@@ -1873,7 +1893,7 @@ impl DownloadTask {
         loop {
             // 获取下一个 chunk:死 swarm 下(如磁力链接无 peer) stream.next() 永久 Pending,
             // 必须与 watch_for_interrupt 竞速,否则取消信号无法穿透(协作式取消检查点
-            // 在循环体内,无 chunk 到达时不可达)。与 write_all_at_mut 的 select! 同构。
+            // 在循环体内,无 chunk 到达时不可达)。与 write_all_at 的 select! 同构。
             // cancel-safe:StreamExt::next 仅持有 &mut stream,被 select! 取消时无部分状态。
             let chunk_result = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
@@ -1905,11 +1925,12 @@ impl DownloadTask {
             let chunk = chunk_result?;
             // 零拷贝优化: 大 chunk 直接写入,跳过 BytesMut 聚合
             if chunk.len() >= WRITE_BATCH_BYTES && write_buf.is_empty() {
-                // BytesMut::from(chunk) 接管网络 chunk,等价于直接持有所有权后写入
+                // chunk 本就是 owned Bytes,直接传入 flush_batch,消除
+                // 旧路径 BytesMut::from(chunk) 的 256KiB memcpy + 堆分配。
                 let (new_pos, w) = Self::flush_batch(
                     storage,
                     pos,
-                    bytes::BytesMut::from(chunk),
+                    chunk,
                     &mut hasher,
                     frag_index,
                     total_written,
@@ -1932,8 +1953,8 @@ impl DownloadTask {
             progress_report_countdown = progress_report_countdown.saturating_sub(1);
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
-                // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
-                let batch = write_buf.split();
+                // split().freeze() 零拷贝:split_to 调整指针,freeze 转 Bytes(Arc inc)
+                let batch = write_buf.split().freeze();
                 let (new_pos, w) = Self::flush_batch(
                     storage,
                     pos,
@@ -1959,9 +1980,8 @@ impl DownloadTask {
         }
         // 刷写剩余数据
         if !write_buf.is_empty() {
-            // P1-05: 直接使用 BytesMut 写入，省去 freeze() 原子操作
-            // split() 抽取当前全部内容并清空 self,语义等价且适配借用。
-            let batch = write_buf.split();
+            // split().freeze() 零拷贝转 Bytes
+            let batch = write_buf.split().freeze();
             let (_new_pos, w) = Self::flush_batch(
                 storage,
                 pos,
@@ -2431,20 +2451,20 @@ impl DownloadTask {
                 e
             })?;
 
-        // 复用 write_all_at_mut 写入循环(与 download_single_fragment 的流式写入同构)。
+        // 复用 write_all_at 写入循环(与 download_single_fragment 的流式写入同构)。
         self.write_stream_to_storage_with_fallback(stream).await
     }
 
     /// 把 BT `ByteStream` 写入 storage(fallback 路径用)。
     ///
-    /// 从 offset 0 开始顺序写入,聚合到 `WRITE_BATCH_BYTES` 后用 `write_all_at_mut`
+    /// 从 offset 0 开始顺序写入,聚合到 `WRITE_BATCH_BYTES` 后用 `write_all_at`
     /// 批量刷写(与 `download_single_fragment` 的小 chunk 聚合 + 批量刷写同构)。
     /// 取消信号通过 `watch_for_interrupt` 与流读取竞速穿透(死 swarm 下
     /// `stream.next()` 永久 Pending 时仍可取消)。
     ///
-    /// 注:`write_all_at_mut` 签名为 `(storage: &StorageSet, pos: u64, batch:
-    /// bytes::BytesMut, control_rx: &mut Option<...>, pause_timeout: Duration)`
-    /// —— 接受 `BytesMut` 非 `Bytes`,`write_buf.split()` 返回 `BytesMut`,类型匹配。
+    /// 注:`write_all_at` 签名为 `(storage: &StorageSet, pos: u64, batch:
+    /// bytes::Bytes, control_rx: &mut Option<...>, pause_timeout: Duration)`
+    /// —— 接受 owned `Bytes`,`write_buf.split().freeze()` 零拷贝转 Bytes 后传入。
     #[cfg(feature = "magnet")]
     async fn write_stream_to_storage_with_fallback(
         &mut self,
@@ -2485,10 +2505,10 @@ impl DownloadTask {
             let chunk = chunk_result?;
             write_buf.extend_from_slice(&chunk);
             if write_buf.len() >= WRITE_BATCH_BYTES {
-                let written = Self::write_all_at_mut(
+                let written = Self::write_all_at(
                     &storage,
                     pos,
-                    write_buf.split(),
+                    write_buf.split().freeze(),
                     &mut self.control_rx,
                     pause_timeout,
                 )
@@ -2500,10 +2520,10 @@ impl DownloadTask {
         }
         // 刷残余
         if !write_buf.is_empty() {
-            let written = Self::write_all_at_mut(
+            let written = Self::write_all_at(
                 &storage,
                 pos,
-                write_buf,
+                write_buf.freeze(),
                 &mut self.control_rx,
                 pause_timeout,
             )
@@ -3561,10 +3581,10 @@ mod tests {
         assert_eq!(s1_raw.data(), data1, "b.bin(file1) 内容应与 data1 一致");
     }
 
-    /// 测 write_all_at_mut + Multi + 短写的端到端数据正确性
+    /// 测 write_all_at + Multi + 短写的端到端数据正确性
     ///
     /// 复现 CI test_run_multi_file_writes_to_directory 的数据错位:
-    /// write_all_at_mut 调 Multi::write_at,段内短写导致 total_written < batch.len(),
+    /// write_all_at 调 Multi::write_at,段内短写导致 total_written < batch.len(),
     /// 循环用 remaining.slice(total_written..) + pos 推进重写——验证不丢/不错位数据。
     #[tokio::test]
     async fn test_write_all_at_mut_multi_short_write_correctness() {
@@ -3599,12 +3619,12 @@ mod tests {
         let data1: Vec<u8> = (0..file1_len).map(|i| ((i + 7) % 251) as u8).collect();
         let global: Vec<u8> = data0.iter().chain(data1.iter()).copied().collect();
 
-        // 整块经 write_all_at_mut 写入(跨 512 边界 + 段内短写)
-        let batch = bytes::BytesMut::from(&global[..]);
-        let written = DownloadTask::write_all_at_mut(&ss, 0, batch, &mut None, Duration::ZERO)
+        // 整块经 write_all_at 写入(跨 512 边界 + 段内短写)
+        let batch = bytes::Bytes::from(global);
+        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(written, total, "write_all_at_mut 应写入全部字节");
+        assert_eq!(written, total, "write_all_at 应写入全部字节");
 
         assert_eq!(s0_raw.data(), data0, "file0 数据错位");
         assert_eq!(s1_raw.data(), data1, "file1 数据错位");
@@ -3653,15 +3673,13 @@ mod tests {
         let mut offset = 0u64;
         while offset < total {
             let end = (offset + frag_size - 1).min(total - 1);
-            let chunk = bytes::BytesMut::from(&global[offset as usize..=end as usize]).freeze();
+            let chunk = bytes::Bytes::copy_from_slice(&global[offset as usize..=end as usize]);
             let ss = Arc::clone(&ss);
             let start = offset;
             handles.spawn(async move {
-                let batch = bytes::BytesMut::from(&chunk[..]);
-                let w =
-                    DownloadTask::write_all_at_mut(&ss, start, batch, &mut None, Duration::ZERO)
-                        .await
-                        .unwrap();
+                let w = DownloadTask::write_all_at(&ss, start, chunk, &mut None, Duration::ZERO)
+                    .await
+                    .unwrap();
                 assert_eq!(w, end - start + 1, "分片 {start}..{end} 写入量不符");
             });
             offset = end + 1;
