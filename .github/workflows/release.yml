@@ -199,7 +199,8 @@ jobs:
       - name: 下载构建产物
         uses: actions/download-artifact@v4
         with:
-          pattern: tachyon-*${{ matrix.target }}*
+          # tauri-action 的 artifact 命名为 platform-arch-type(如 windows-x64-msi),
+          # 无统一前缀,不指定 pattern 下载全部,再按平台过滤验证
           path: dist
           merge-multiple: true
 
@@ -406,7 +407,8 @@ jobs:
       - name: 下载所有构建产物
         uses: actions/download-artifact@v4
         with:
-          pattern: tachyon-*
+          # tauri-action 的 artifact 命名为 platform-arch-type(如 windows-x64-msi),
+          # 无统一前缀,不指定 pattern 下载全部
           path: dist
           merge-multiple: true
 
