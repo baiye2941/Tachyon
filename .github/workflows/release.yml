@@ -389,6 +389,10 @@ jobs:
           releaseDraft: true
           prerelease: false
           projectPath: crates/tachyon-app
+          # 产物同时作为 workflow artifact 上传,供后续 install-smoke / publish-release
+          # 通过 actions/download-artifact 下载。默认 false 时产物只上传到 Release,
+          # 后续 job 用 download-artifact pattern: tachyon-* 会下载到 0 个文件。
+          uploadWorkflowArtifacts: true
 
   # 所有平台构建完成且门禁通过后,将 draft release 发布为 public
   publish-release:
