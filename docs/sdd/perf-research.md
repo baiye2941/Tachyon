@@ -106,3 +106,45 @@ Explore Agent 报告「TokioFile write_at_mut 的 256KiB Bytes::copy_from_slice 
 - TokioFile write_at_mut copy_from_slice 消除:热路径不走此路径(伪优化)
 - http.rs URL 预解析缓存:万级分片累积 ~10ms,相对下载耗时 0.01-0.1%
 - RL-based 多源调度:复杂度极高,当前 least-in-flight 已足够
+
+## 第二轮探针:并发度 scaling 与固定开销分析
+
+### 实验设计
+
+用一次性探针(不入库)测 max_concurrent_fragments = 1/2/4/8 下的 execute 时间,
+每配置 20 次采样取中位数。4MiB / 4 分片 / 256KiB chunk / MemoryStorage。
+
+### 结果
+
+```
+max_conc=1 median=1913us min=1690us
+max_conc=2 median=1945us min=1696us
+max_conc=4 median=1880us min=1629us
+max_conc=8 median=1969us min=1851us
+```
+
+### 结论
+
+**并发度从 1 到 8 几乎无差异**(1.9ms ± 0.1ms)。原因:
+- mock 的 I/O 零延迟,4 分片的总工作量(4MiB memcpy)固定
+- 内存带宽共享,并行不加速 memcpy
+- effective_concurrency = min(max_conc, fragment_count),max_conc=8 实际只 spawn 4 worker
+
+**固定开销 ~1.9ms 不可压缩**:4MiB 内存拷贝(~200µs @ 20GB/s)+ spawn 调度 +
+状态机 + channel 通信。write_all_at 纯逻辑开销 4.6µs/op(NoopStorage 隔离测量),
+16 chunk × 4.6µs = 74µs,占总时间 3%,非瓶颈。
+
+### 已实施优化(第二轮)
+
+**write_all_at 零拷贝直写**(commit 6f2abba):消除大 chunk 直写路径的
+`BytesMut::from(chunk)` memcpy。e2e bench 从 3.06ms 降到 2.42ms,改善 ~20%
+(p=0.00 统计显著,可重复)。此优化吃掉了"大 chunk 路径 memcpy"的最大红利,
+剩余 2.4ms 是不可压缩的固定开销(spawn + 内存拷贝 + 状态机)。
+
+### 后续优化方向
+
+mock+memory bench 的 CPU 路径已优化到极限。真实性能提升必须转向:
+1. **算法层**(动态 RTT、闭环并发控制,需真实网络验证)
+2. **真实 I/O 路径**(IOCP 对齐写入、磁盘调度,需磁盘 bench)
+3. **小 chunk 聚合路径**(真实 HTTP 16-64KiB chunk 的双 memcpy,需改 bench 用小 chunk)
+
