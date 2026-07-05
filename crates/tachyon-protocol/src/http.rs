@@ -1191,6 +1191,11 @@ mod tests {
         let _client = HttpClient::new().unwrap();
     }
 
+    /// 验证 SSRF 防护拒绝 loopback 重定向目标(生产模式)。
+    ///
+    /// test-harness feature 下 loopback 被放行(供 wiremock 端到端测试),
+    /// 此测试跳过。生产 binary 不开 test-harness,SSRF 防护完整。
+    #[cfg(not(feature = "test-harness"))]
     #[test]
     fn test_redirect_target_validation_rejects_loopback() {
         let target = reqwest::Url::parse("http://127.0.0.1/admin").unwrap();
@@ -1203,6 +1208,10 @@ mod tests {
         assert!(super::validate_redirect_target(&target).is_ok());
     }
 
+    /// 验证 PublicDnsResolver 拒绝 localhost 解析(生产模式)。
+    ///
+    /// test-harness feature 下 loopback 被放行,此测试跳过。
+    #[cfg(not(feature = "test-harness"))]
     #[tokio::test]
     async fn test_public_dns_resolver_rejects_localhost() {
         let resolver = super::PublicDnsResolver::new();
@@ -2065,5 +2074,355 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, b"abcde");
+    }
+
+    // =========================================================================
+    // 端到端 wiremock 测试(需 test-harness feature 放行 loopback)
+    // =========================================================================
+    // 以下测试用 wiremock 启动真实 HTTP server(绑定 127.0.0.1),通过 HttpClient
+    // 发真实 HTTP 请求,覆盖 probe/download_range/download_range_stream/download_full/
+    // download_full_stream 的协议层 IO 路径。此前这些方法仅通过 MockProtocol 在 engine
+    // 层间接测,协议层 0% 单测覆盖(CRAP=156)。
+    //
+    // test-harness feature 下 tachyon-core 放行 loopback,使 wiremock 可用;
+    // 生产 binary 不开 test-harness,SSRF 防护完整。
+
+    #[cfg(feature = "test-harness")]
+    mod wiremock_tests {
+        use super::*;
+        use crate::HttpClient;
+        use futures::StreamExt;
+        use tachyon_core::traits::Protocol;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// 构造测试用 HttpClient(无代理,短超时避免测试卡住)
+        fn test_client() -> HttpClient {
+            HttpClient::with_timeouts(5, 10, None).unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_probe_head_returns_metadata() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/file.bin"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "1000")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .insert_header("ETag", "\"abc123\"")
+                        .insert_header("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/file.bin", server.uri());
+            let meta = client.probe(&url).await.unwrap();
+            assert_eq!(meta.file_size, Some(1000));
+            assert!(meta.supports_range);
+            assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
+        }
+
+        #[tokio::test]
+        async fn test_probe_head_rejects_html_page() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/page"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "text/html; charset=utf-8"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/page", server.uri());
+            let result = client.probe(&url).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("HTML"), "应拒绝 HTML 页面: {err}");
+        }
+
+        #[tokio::test]
+        async fn test_probe_head_403_falls_back_to_get_range() {
+            let server = MockServer::start().await;
+            // HEAD 返回 403 → 触发 GET Range:0-0 回退
+            Mock::given(method("HEAD"))
+                .and(path("/signed"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            // GET Range:0-0 返回 206
+            Mock::given(method("GET"))
+                .and(path("/signed"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/5000")
+                        .insert_header("Content-Length", "1")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/signed", server.uri());
+            let meta = client.probe(&url).await.unwrap();
+            assert_eq!(meta.file_size, Some(5000));
+            assert!(meta.supports_range);
+        }
+
+        #[tokio::test]
+        async fn test_probe_head_404_returns_final_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/missing"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/missing", server.uri());
+            let result = client.probe(&url).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_download_range_206_returns_exact_bytes() {
+            let server = MockServer::start().await;
+            let body = b"hello world".to_vec();
+            Mock::given(method("GET"))
+                .and(path("/data"))
+                .and(header("Range", "bytes=0-4"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-4/11")
+                        .insert_header("Content-Length", "5")
+                        .set_body_raw(&body[..5], "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/data", server.uri());
+            let bytes = client.download_range(&url, 0, 4).await.unwrap();
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+        }
+
+        #[tokio::test]
+        async fn test_download_range_200_fallback_truncates() {
+            let server = MockServer::start().await;
+            // 服务端忽略 Range,返回完整文件(200)
+            let full_body = b"hello world".to_vec();
+            Mock::given(method("GET"))
+                .and(path("/no-range"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "11")
+                        .set_body_raw(&full_body[..], "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/no-range", server.uri());
+            // 请求 0-4,服务端返回完整 11 字节,应截取前 5 字节
+            let bytes = client.download_range(&url, 0, 4).await.unwrap();
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+        }
+
+        #[tokio::test]
+        async fn test_download_range_content_range_mismatch_rejected() {
+            let server = MockServer::start().await;
+            // 请求 bytes=0-4,但 Content-Range 返回 bytes=100-104(错位)
+            Mock::given(method("GET"))
+                .and(path("/mismatch"))
+                .and(header("Range", "bytes=0-4"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 100-104/1000")
+                        .insert_header("Content-Length", "5")
+                        .set_body_raw(b"xxxxx", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/mismatch", server.uri());
+            let result = client.download_range(&url, 0, 4).await;
+            assert!(result.is_err(), "Content-Range 错位应被拒绝");
+        }
+
+        #[tokio::test]
+        async fn test_download_range_404_returns_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/gone"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/gone", server.uri());
+            let result = client.download_range(&url, 0, 99).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_download_range_stream_206_streams_chunks() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/stream"))
+                .and(header("Range", "bytes=0-9"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-9/10")
+                        .insert_header("Content-Length", "10")
+                        .set_body_raw(b"0123456789", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/stream", server.uri());
+            let stream = client.download_range_stream(&url, 0, 9).await.unwrap();
+            let mut s = Box::pin(stream);
+            let mut collected = Vec::new();
+            while let Some(chunk) = s.next().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(&collected, b"0123456789");
+        }
+
+        #[tokio::test]
+        async fn test_download_range_stream_200_fallback_streams_truncated() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/stream200"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "10")
+                        .set_body_raw(b"0123456789", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/stream200", server.uri());
+            // 请求 2-5,服务端返回完整 10 字节,应流式截取 [2,5]
+            let stream = client.download_range_stream(&url, 2, 5).await.unwrap();
+            let mut s = Box::pin(stream);
+            let mut collected = Vec::new();
+            while let Some(chunk) = s.next().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(&collected, b"2345");
+        }
+
+        #[tokio::test]
+        async fn test_download_full_returns_complete_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/full"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "5")
+                        .set_body_raw(b"hello", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/full", server.uri());
+            let bytes = client.download_full(&url).await.unwrap();
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+        }
+
+        #[tokio::test]
+        async fn test_download_full_rejects_oversize() {
+            let server = MockServer::start().await;
+            // Content-Length 超过 MAX_FULL_DOWNLOAD_SIZE(64MB)。
+            // wiremock 需设 body 才会真正发送 Content-Length header,这里用小 body
+            // 但覆盖 header 为超大值,验证 download_full 的 OOM 防护分支。
+            let oversized = tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64 + 1;
+            Mock::given(method("GET"))
+                .and(path("/huge"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", oversized.to_string())
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/huge", server.uri());
+            let result = client.download_full(&url).await;
+            assert!(result.is_err(), "超大 Content-Length 应被拒绝(OOM 防护)");
+        }
+
+        #[tokio::test]
+        async fn test_download_full_stream_streams_complete_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/fullstream"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "5")
+                        .set_body_raw(b"world", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/fullstream", server.uri());
+            let stream = client.download_full_stream(&url).await.unwrap();
+            let mut s = Box::pin(stream);
+            let mut collected = Vec::new();
+            while let Some(chunk) = s.next().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(&collected, b"world");
+        }
+
+        #[tokio::test]
+        async fn test_download_full_500_returns_throttled_or_network_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/servererror"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/servererror", server.uri());
+            let result = client.download_full(&url).await;
+            assert!(result.is_err(), "500 应返回错误");
+        }
+
+        #[tokio::test]
+        async fn test_download_range_429_returns_throttled_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/throttled"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/throttled", server.uri());
+            let result = client.download_range(&url, 0, 99).await;
+            assert!(result.is_err());
+            // 429 应分类为 Throttled(含 retry_after_secs)
+            match result {
+                Err(DownloadError::Throttled { retry_after_secs }) => {
+                    assert_eq!(retry_after_secs, Some(120));
+                }
+                other => panic!("429 应分类为 Throttled,实际: {other:?}"),
+            }
+        }
     }
 }

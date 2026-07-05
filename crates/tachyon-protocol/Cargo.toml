@@ -10,7 +10,10 @@ default = ["magnet"]
 magnet = ["dep:librqbit"]
 # 测试接缝:暴露 from_handle 等仅供离线集成测试使用的构造器。
 # 由下游 crate(tachyon-engine)在 dev-dependencies 中开启,不影响生产编译。
-test-harness = []
+# 同时开启 tachyon-core/test-harness:放行 SSRF loopback,使 wiremock 端到端
+# HTTP 测试可运行。测试代码用 cfg(feature = "test-harness") 检测此状态,
+# 跳过"生产模式 SSRF 拒绝 loopback"的断言(因 test-harness 下 loopback 被放行)。
+test-harness = ["tachyon-core/test-harness"]
 # HTTP/3(QUIC)支持 —— **非默认开启**。
 #
 # reqwest 的 `http3` feature 标记为 unstable:仅启用本 feature 而未设置
@@ -37,6 +40,10 @@ librqbit = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+wiremock.workspace = true
+# 开启自身 test-harness feature(联动开启 tachyon-core/test-harness,放行 SSRF
+# loopback),使 wiremock 端到端 HTTP 测试可运行。仅 dev-dependencies,不影响生产。
+tachyon-protocol = { path = ".", features = ["test-harness"] }
 
 # 声明 `reqwest_unstable` 为合法的 cfg(由 RUSTFLAGS='--cfg reqwest_unstable' 注入),
 # 避免 `unexpected_cfgs` 警告。该 cfg 仅在启用 `http3` feature 时有意义,但 lint

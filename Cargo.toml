@@ -91,6 +91,9 @@ rstest = "0.22"
 tempfile = "3"
 tokio-test = "0.4"
 libfuzzer-sys = "0.4"
+# Mock HTTP server:用于 tachyon-protocol/http.rs 的 probe/download_range 等协议层
+# 端到端测试(配合 test-harness feature 下的 loopback 放行)。
+wiremock = "0.6"
 
 [package]
 name = "tachyon"

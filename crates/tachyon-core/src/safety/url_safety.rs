@@ -38,6 +38,10 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
         return Err(DownloadError::Config("URL 主机为空".into()));
     }
     if normalized_host.eq_ignore_ascii_case("localhost") {
+        // test-harness feature 下放行 localhost:wiremock 等 mock HTTP server 绑定
+        // 127.0.0.1,需绕过 loopback 拦截才能端到端测试 probe/download_range 等协议层
+        // 路径。仅 dev-dependencies 开启此 feature,生产 binary 不受影响。
+        #[cfg(not(feature = "test-harness"))]
         return Err(DownloadError::Config("不允许访问 localhost".into()));
     }
     if let Ok(ip) = normalized_host.parse::<IpAddr>() {
@@ -135,12 +139,26 @@ pub fn reject_forbidden_ip(ip: IpAddr) -> DownloadResult<()> {
 fn reject_forbidden_ipv4(ip: Ipv4Addr) -> DownloadResult<()> {
     let octets = ip.octets();
 
+    // test-harness feature 下放行 loopback:供 wiremock 端到端测试使用。
+    // 仅 dev-dependencies 开启,生产 binary 的 SSRF 防护完整。
+    #[cfg(not(feature = "test-harness"))]
     if ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip == Ipv4Addr::new(169, 254, 169, 254)
     {
+        return Err(DownloadError::Config(format!(
+            "不允许访问受限 IPv4 地址: {ip}"
+        )));
+    }
+    #[cfg(feature = "test-harness")]
+    if ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip == Ipv4Addr::new(169, 254, 169, 254)
+    {
+        // loopback 放行,其余受限地址仍拒绝
         return Err(DownloadError::Config(format!(
             "不允许访问受限 IPv4 地址: {ip}"
         )));
@@ -192,7 +210,17 @@ fn reject_forbidden_ipv6(ip: Ipv6Addr) -> DownloadResult<()> {
     let first_segment = segments[0];
     let unique_local = (first_segment & 0xfe00) == 0xfc00;
     let link_local = (first_segment & 0xffc0) == 0xfe80;
+    // test-harness feature 下放行 loopback(::1):供 wiremock 端到端测试使用。
+    // 仅 dev-dependencies 开启,生产 binary 的 SSRF 防护完整。
+    #[cfg(not(feature = "test-harness"))]
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || unique_local || link_local {
+        return Err(DownloadError::Config(format!(
+            "不允许访问受限 IPv6 地址: {ip}"
+        )));
+    }
+    #[cfg(feature = "test-harness")]
+    if ip.is_unspecified() || ip.is_multicast() || unique_local || link_local {
+        // loopback(::1)放行,其余受限地址仍拒绝
         return Err(DownloadError::Config(format!(
             "不允许访问受限 IPv6 地址: {ip}"
         )));
@@ -236,6 +264,12 @@ mod tests {
         assert!(validate_public_http_url(&url).is_err());
     }
 
+    /// 验证 SSRF 防护拒绝 loopback/私网/metadata IP(生产模式)。
+    ///
+    /// test-harness feature 下 loopback(127.0.0.1/::1)被放行供 wiremock 使用,
+    /// 此测试跳过。非 loopback 的受限 IP(私网/metadata)在 test-harness 下仍被拒绝,
+    /// 由 `rejects_non_loopback_private_ips_under_test_harness` 覆盖。
+    #[cfg(not(feature = "test-harness"))]
     #[test]
     fn rejects_private_and_metadata_ips() {
         for ip in [
@@ -252,6 +286,28 @@ mod tests {
         ] {
             assert!(reject_forbidden_ip(ip).is_err(), "{ip} should be rejected");
         }
+    }
+
+    /// test-harness 模式下验证非 loopback 受限 IP 仍被拒绝。
+    ///
+    /// loopback 放行后,私网/metadata/CGNAT 等仍应被拒绝,确保 test-harness
+    /// 只放行 loopback 而非全部 SSRF 防护。
+    #[cfg(feature = "test-harness")]
+    #[test]
+    fn rejects_non_loopback_private_ips_under_test_harness() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V6("fc00::1".parse().unwrap()),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+        ] {
+            assert!(reject_forbidden_ip(ip).is_err(), "{ip} should be rejected");
+        }
+        // loopback 应被放行
+        assert!(reject_forbidden_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_ok());
+        assert!(reject_forbidden_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_ok());
     }
 
     #[test]
@@ -348,6 +404,9 @@ mod tests {
         }
     }
 
+    /// 验证 localhost(带尾部点)被拒绝(生产模式)。
+    /// test-harness 下 localhost 放行,此测试跳过。
+    #[cfg(not(feature = "test-harness"))]
     #[test]
     fn rejects_localhost_with_trailing_dot() {
         let url = Url::parse("http://localhost./admin").unwrap();
@@ -376,6 +435,9 @@ mod tests {
         assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
     }
 
+    /// 验证 IP 字面量 localhost 被拒绝(生产模式)。
+    /// test-harness 下 loopback 放行,此测试跳过。
+    #[cfg(not(feature = "test-harness"))]
     #[test]
     fn validate_resolved_ip_rejects_ip_literal_localhost() {
         let url = Url::parse("http://127.0.0.1/file.bin").unwrap();
@@ -417,6 +479,9 @@ mod tests {
         assert!(validate_redirect(&url, 5, 5).is_err());
     }
 
+    /// 验证重定向到内网目标被拒绝(生产模式)。
+    /// test-harness 下 loopback 放行,此测试跳过。
+    #[cfg(not(feature = "test-harness"))]
     #[test]
     fn validate_redirect_rejects_internal_target() {
         let url = Url::parse("http://127.0.0.1/admin").unwrap();
