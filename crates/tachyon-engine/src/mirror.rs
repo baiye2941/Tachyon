@@ -426,18 +426,33 @@ impl MirrorProtocol {
                     }
                     (q, c)
                 };
-                // 加权(修复 BUG-A/C):加性公式 inflight*W1 + (1-quality)*W2
-                // inflight=0 时按 quality 排序(quality 高→(1-quality)小→优先);
-                // inflight>0 时在途数主导(负载均衡)。
-                // W1=10000(在途数权重高),W2=1000(质量权重)
+                // 选源:预期完成时间排序(乘性公式,替代旧加性公式的手工调参)
+                //
+                // score = (in_flight + 1) / max(quality, ε)
+                //
+                // 直觉:score 是"给该源追加一个分片后的预期完成时间"(正比)。
+                // 选 score 最小的源 = 预期最快完成新分片的源。
+                //
+                // 行为:
+                // - 快源(quality 高)→ score 小 → 多被选(快源多干)
+                // - 快源 in_flight 积累到一定值后 score 超过慢源 → 切换慢源(防过载)
+                // - 冷启动(quality=0.5 中性)→ score = 2×(in_flight+1) → 纯 in_flight 排序(负载均衡)
+                //
+                // 对比旧加性公式 inflight×10000+(1-quality)×1000:
+                // - 旧公式 in_flight 权重远大于 quality,inflight=0 的慢源总优先于
+                //   inflight=1 的快源 → 负载均衡主导,快源不能多干(与目标矛盾)
+                // - 新公式乘性关系,quality 能在 in_flight 差距小时影响选源,
+                //   实现快源多干 + 防过载的自平衡
+                //
                 // 软熔断:跳过 circuit_open 的源(半开重置已在前面处理 all-open)
+                const QUALITY_EPS: f64 = 0.01; // 防 quality=0 除零(极低质量源回退到 score=100)
                 let pick = candidates
                     .iter()
                     .copied()
                     .filter(|&i| inflight[i] < usize::MAX && !circuit_open[i])
                     .min_by(|&a, &b| {
-                        let sa = inflight[a] as f64 * 10000.0 + (1.0 - qualities[a]) * 1000.0;
-                        let sb = inflight[b] as f64 * 10000.0 + (1.0 - qualities[b]) * 1000.0;
+                        let sa = (inflight[a] as f64 + 1.0) / qualities[a].max(QUALITY_EPS);
+                        let sb = (inflight[b] as f64 + 1.0) / qualities[b].max(QUALITY_EPS);
                         sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 let Some(pick) = pick else { break };
@@ -1337,9 +1352,53 @@ mod tests {
         );
     }
 
-    /// bench 计时:多源并发(least-in-flight) vs 单源串行,验证收益>10%
+    /// 乘性选源公式:验证"快源多干 + 防过载"自平衡
     ///
-    /// 8 分片,2 源(快 5ms,慢 20ms)。
+    /// 新公式 score = (in_flight + 1) / max(quality, ε):
+    /// - 快源(quality 高)在 in_flight 较低时持续优先(快源多干)
+    /// - 快源 in_flight 积累到阈值后 score 超过慢源,切换慢源(防过载)
+    ///
+    /// 旧加性公式 inflight×10000+(1-quality)×1000 无法实现此行为:
+    /// inflight=0 的慢源(score=1000)总优先于 inflight=1 的快源(score=10000)。
+    ///
+    /// 串行下载(每分片完成后才发下一个)使 quality 能积累,验证 quality 感知。
+    /// 冷启动(quality=0.5)时退化为 in_flight 排序(负载均衡),也是正确行为。
+    #[tokio::test]
+    async fn test_multiplicative_scoring_fast_source_does_more_without_overload() {
+        let fast = Arc::new(MockProtocol::new().with_download_delay(Duration::from_millis(1)));
+        let slow = Arc::new(MockProtocol::new().with_download_delay(Duration::from_millis(30)));
+
+        let fast_counter = fast.select_counter.clone();
+        let slow_counter = slow.select_counter.clone();
+
+        let mp = Arc::new(MirrorProtocol::new(
+            fast.clone(),
+            vec![("http://slow/file".into(), slow.clone())],
+        ));
+        let _ = mp.probe("http://fast/file").await;
+
+        // 串行下载 12 个分片(每分片消费到 EOF 再发下一个,使 quality 积累)
+        for i in 0..12u64 {
+            let stream = mp
+                .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                .await
+                .unwrap();
+            use futures::StreamExt;
+            let mut s = Box::pin(stream);
+            while s.next().await.is_some() {}
+        }
+
+        let fast_count = fast_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let slow_count = slow_counter.load(std::sync::atomic::Ordering::Relaxed);
+
+        // 串行场景:quality 积累后快源 quality 远高于慢源,
+        // 快源即使 in_flight=0(串行无在途)也优先 → 快源应承担大部分分片
+        assert!(
+            fast_count > slow_count,
+            "快源应多干(quality 积累后优先): fast={fast_count}, slow={slow_count}"
+        );
+    }
+
     /// - 单源串行(只用快源):≈ 8 × 5ms = 40ms
     /// - least-in-flight 多源并发:快源多干 + 慢源分担,理论 < 40ms
     ///

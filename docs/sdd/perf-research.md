@@ -148,3 +148,40 @@ mock+memory bench 的 CPU 路径已优化到极限。真实性能提升必须转
 2. **真实 I/O 路径**(IOCP 对齐写入、磁盘调度,需磁盘 bench)
 3. **小 chunk 聚合路径**(真实 HTTP 16-64KiB chunk 的双 memcpy,需改 bench 用小 chunk)
 
+## 第三轮:算法层三方向深度反思与实施
+
+### 方向 3:bandwidth_based 钳制 — 不做(语义合理)
+
+分析 `recommend()` 的 `bandwidth_based = bw × target_secs / frag_size`:高带宽场景
+算出 48(1Gbps/64MB)。但最终有 `.min(max_concurrency)` 钳制——用户配置 max=8 时
+48→8。高估已被 max_concurrency 限制。
+
+语义上 bandwidth_based 是"分片并行加速大文件"(视角 2),非"TCP 管道充盈"(视角 1)。
+多分片并行在真实下载中有效(更快完成大文件),高估被合理限制。**非 bug,不做。**
+
+### 方向 2:MirrorProtocol 选源公式 — 已实施
+
+**发现的缺陷**:旧加性公式 `inflight×10000 + (1-quality)×1000` 中,in_flight 权重
+远大于 quality,导致 inflight=0 的慢源(score=1000)总优先于 inflight=1 的快源
+(score=10000)。**负载均衡主导,快源不能多干**,与"快源多干"目标矛盾。
+
+**修复**:改用乘性公式 `score = (in_flight + 1) / max(quality, ε)`(预期完成时间排序):
+- 快源(quality 高)→ score 小 → 多被选(快源多干)
+- 快源 in_flight 积累后 score 超过慢源 → 切换慢源(防过载)
+- 冷启动(quality=0.5)→ 退化为 in_flight 排序(负载均衡,正确)
+
+**验证**:35 个 mirror 测试全通过(含新增 test_multiplicative_scoring),旧 quality
+感知测试无回归。
+
+### 方向 1:闭环并发控制 — 不做(架构约束)
+
+FastBioDL 闭环控制(测吞吐→步进并发)需运行时增减并发度。当前 execute 的
+worker_count 在启动时固定(spawn N 个 worker task),Semaphore 只能 add_permits
+(增)不能减已发出的许可。改成动态并发需重构 execute spawn 模型,风险高。
+
+且 mock bench 带宽恒定,recommend 结果不变,无法验证闭环效果。**不做。**
+
+`record_completed_fragment` 已调 `observe_bandwidth` 更新预测器,下次 plan(断点续传)
+自然用新数据。闭环控制的真正价值在真实网络的带宽波动场景,需联网验证。
+
+
