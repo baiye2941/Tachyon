@@ -357,6 +357,16 @@ pub trait DownloadScheduler: Send + Sync {
     /// 记录带宽观测值
     fn observe_bandwidth(&self, bytes_per_sec: u64);
 
+    /// 记录链路往返时延(RTT)观测值
+    ///
+    /// 由 probe/下载阶段注入实测 RTT(如 TCP 握手 + TTFB),
+    /// 用于修正 BDP(带宽延迟积)估计。默认实现为空(保持原行为),
+    /// `AdaptiveDownloadScheduler` 覆盖为更新内部 RTT 状态。
+    ///
+    /// 高延迟链路(跨国 200ms+、卫星 600ms+)下,准确的 RTT 能避免
+    /// 分片过小导致 TCP 窗口未打满、并发度不足导致管道空闲。
+    fn observe_rtt(&self, _rtt: std::time::Duration) {}
+
     /// 获取调度建议
     ///
     /// 根据当前带宽预测、文件大小和配置约束,返回最优的并发度和分片大小建议。

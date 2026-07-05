@@ -282,6 +282,32 @@ fn bench_scheduler_batch(c: &mut Criterion) {
     group.finish();
 }
 
+/// 基准:AdaptiveDownloadScheduler::recommend 不同 RTT 下的 CPU 开销
+///
+/// 验证 observe_rtt 注入后 recommend 的开销不显著增加(读 RwLock + f64 运算)。
+fn bench_scheduler_recommend(c: &mut Criterion) {
+    use tachyon_core::traits::DownloadScheduler;
+    use tachyon_scheduler::AdaptiveDownloadScheduler;
+
+    let mut group = c.benchmark_group("scheduler_recommend");
+    for (name, rtt_ms) in [
+        ("rtt_50ms", 50u64),
+        ("rtt_200ms", 200),
+        ("rtt_2000ms", 2000),
+    ] {
+        group.bench_function(name, |b| {
+            let sched = AdaptiveDownloadScheduler::default_config();
+            // 预填充带宽样本(20 次,提升置信度使 recommend 走完整计算路径)
+            for _ in 0..20 {
+                sched.observe_bandwidth(50 * 1024 * 1024); // 50MB/s
+            }
+            sched.observe_rtt(std::time::Duration::from_millis(rtt_ms));
+            b.iter(|| sched.recommend(1024 * 1024 * 1024, 8));
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = bench_config();
@@ -295,6 +321,7 @@ criterion_group! {
         bench_fragment_state_machine,
         bench_fragment_backoff,
         bench_scheduler_push_pop,
-        bench_scheduler_batch
+        bench_scheduler_batch,
+        bench_scheduler_recommend
 }
 criterion_main!(benches);

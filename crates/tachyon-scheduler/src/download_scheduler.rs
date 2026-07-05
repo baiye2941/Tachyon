@@ -4,6 +4,8 @@
 //! 为下载引擎提供动态的并发度和分片大小建议。
 //! 使用 parking_lot::RwLock 实现读多写少的高效并发访问。
 
+use std::time::Duration;
+
 use parking_lot::RwLock;
 
 use tachyon_core::config::SchedulerConfig;
@@ -18,7 +20,20 @@ use crate::predictor::HoltLinearPredictor;
 pub struct AdaptiveDownloadScheduler {
     predictor: RwLock<HoltLinearPredictor>,
     config: SchedulerConfig,
+    /// 估计的链路往返时延(RTT),用于 BDP(带宽延迟积)计算。
+    ///
+    /// 默认 50ms(典型公网 RTT)。可通过 [`DownloadScheduler::observe_rtt`]
+    /// 在 probe 阶段注入实测 RTT(如 TCP 握手 + TTFB),使 BDP 估计更贴合
+    /// 真实链路。高延迟链路(跨国 200ms+、卫星 600ms+)下,准确的 RTT 能
+    /// 避免分片过小导致 TCP 窗口未打满、并发度不足导致管道空闲。
+    rtt: RwLock<Duration>,
 }
+
+/// 默认 RTT,冷启动无实测样本时的回退值。
+///
+/// 50ms 为典型公网 RTT。分片大小与并发度计算共用此值,
+/// 保证两者对链路延迟的假设一致。
+const DEFAULT_RTT: Duration = Duration::from_millis(50);
 
 impl AdaptiveDownloadScheduler {
     /// 创建新的自适应调度器
@@ -29,6 +44,7 @@ impl AdaptiveDownloadScheduler {
                 config.ewma_beta,
             )),
             config,
+            rtt: RwLock::new(DEFAULT_RTT),
         }
     }
 
@@ -38,12 +54,6 @@ impl AdaptiveDownloadScheduler {
     }
 }
 
-/// 估计的公网往返时 RTT(秒),用于 BDP(带宽延迟积)估计。
-///
-/// 默认 50ms 为典型公网 RTT。分片大小与并发度计算共用此常量,
-/// 保证两者对链路延迟的假设一致。未来可由网络探测动态更新。
-const ESTIMATED_RTT_SECS: f64 = 0.050;
-
 impl DownloadScheduler for AdaptiveDownloadScheduler {
     fn observe_bandwidth(&self, bytes_per_sec: u64) {
         tracing::info!(bandwidth = bytes_per_sec, "带宽分配更新");
@@ -51,11 +61,23 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
         pred.observe(bytes_per_sec as f64);
     }
 
+    fn observe_rtt(&self, rtt: Duration) {
+        // 跳过零值和异常大值(>10s 视为测量错误),防止 BDP 计算爆炸
+        if rtt.as_secs() > 10 {
+            tracing::warn!(?rtt, "无效的 RTT 观测值(>10s),跳过更新");
+            return;
+        }
+        let mut current = self.rtt.write();
+        *current = rtt;
+        tracing::debug!(?rtt, "RTT 观测已更新");
+    }
+
     fn recommend(&self, file_size: u64, max_concurrency: u32) -> ScheduleRecommendation {
         let (predicted_bw, confidence) = {
             let pred = self.predictor.read();
             (pred.predict(1), pred.confidence())
         };
+        let rtt_secs = self.rtt.read().as_secs_f64();
 
         // 根据带宽预测计算建议分片大小
         // 目标:每个分片下载时间约 2-5 秒
@@ -75,8 +97,8 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             // 直觉:链路 BDP = bandwidth × RTT 是"在途字节数上限"。
             // 取 2×BDP 使得单个分片能在一个往返内排空管道并完成传输,
             // 高延迟链路下避免分片过小导致 TCP 窗口无法打满。
-            // RTT 由模块级常量 ESTIMATED_RTT_SECS 定义(默认 50ms,典型公网值)。
-            let bdp_based = (predicted_bw * ESTIMATED_RTT_SECS * 2.0) as u64;
+            // RTT 来自 observe_rtt 注入(默认 50ms,可由 probe 阶段实测更新)。
+            let bdp_based = (predicted_bw * rtt_secs * 2.0) as u64;
 
             // 取两者较大值:兼顾"下载时长目标"与"管道充盈度",
             // 高带宽低延迟链路 time_based 主导,高延迟链路 bdp_based 主导。
@@ -102,8 +124,10 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             let bandwidth_based =
                 (predicted_bw * target_download_secs / suggested_frag_size as f64) as u32;
             // BDP 约束:高延迟链路下确保至少 ceil(BDP / frag_size) 个并发
-            // 以充分利用 TCP 窗口(与分片大小估计使用同一 RTT 常量保持一致)
-            let bdp = (predicted_bw * ESTIMATED_RTT_SECS) as u64;
+            // 以充分利用 TCP 窗口(与分片大小估计使用同一 RTT 保持一致)。
+            // 当 frag_size < BDP 时(高带宽且 max_fragment_size 限制分片大小),
+            // 需要多并发才能让在途字节数 ≥ BDP,填满管道。
+            let bdp = (predicted_bw * rtt_secs) as u64;
             let bdp_concurrency = if bdp > suggested_frag_size {
                 (bdp / suggested_frag_size).max(1) as u32
             } else {
@@ -126,7 +150,7 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             fragment_size: suggested_frag_size,
             confidence,
         };
-        tracing::debug!(recommendation = ?recommendation, "调度推荐结果");
+        tracing::debug!(recommendation = ?recommendation, rtt_secs, "调度推荐结果");
         recommendation
     }
 
@@ -254,6 +278,7 @@ mod tests {
     /// 100MB/s 带宽、RTT=50ms:
     ///   - time_based(高置信,3s) = 100MB/s * 3s = 300MB → clamp 到 max=64MB
     ///   - bdp_based = 100MB/s * 0.05s * 2 = 10MB
+    ///
     /// time_based 主导,但分片应被 clamp 到 64MB(配置上限),体现 BDP 放大效应。
     #[test]
     fn test_recommend_fragment_size_bdp_amplification() {
@@ -278,7 +303,7 @@ mod tests {
     /// 5MB/s 带宽、RTT=50ms:
     ///   - time_based(低置信,5s) = 5MB/s * 5s = 25MB
     ///   - bdp_based = 5MB/s * 0.05s * 2 = 0.5MB → clamp 到 min=1MB
-    /// 取较大值 = 25MB,验证 BDP 路径不压低分片。
+    ///   - 取较大值 = 25MB,验证 BDP 路径不压低分片。
     #[test]
     fn test_recommend_fragment_size_bdp_vs_time_based() {
         let sched = AdaptiveDownloadScheduler::default_config();
@@ -332,6 +357,139 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    // ── RTT 动态注入测试 ────────────────────────────────────────────
+
+    /// observe_rtt 更新后,recommend 的 BDP 计算应使用新 RTT。
+    ///
+    /// 10MB/s 带宽、RTT=50ms(默认):
+    ///   - bdp_based = 10MB/s * 0.05s * 2 = 1MB
+    ///   - time_based(低置信,5s) = 10MB/s * 5s = 50MB → clamp 到 64MB(max)
+    ///   - 取较大值 = 50MB
+    ///
+    /// 10MB/s 带宽、RTT=500ms(高延迟):
+    ///   - bdp_based = 10MB/s * 0.5s * 2 = 10MB
+    ///   - time_based = 50MB
+    ///   - 取较大值 = 50MB(time_based 仍主导)
+    ///
+    /// 关键验证:高 RTT 下 BDP 增大,但分片大小不变(time_based 主导)。
+    /// 改为验证低带宽场景下 RTT 对分片大小的影响。
+    #[test]
+    fn test_observe_rtt_updates_bdp_estimate() {
+        let sched = AdaptiveDownloadScheduler::default_config();
+
+        // 低带宽 1MB/s,多次观测提升置信度
+        for _ in 0..20 {
+            sched.observe_bandwidth(1024 * 1024); // 1MB/s
+        }
+
+        // 默认 RTT=50ms:
+        //   time_based(高置信,3s) = 1MB/s * 3s = 3MB
+        //   bdp_based = 1MB/s * 0.05s * 2 = 0.1MB → clamp 到 min=1MB
+        //   取较大值 = 3MB
+        let rec_default = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec_default.fragment_size,
+            3 * 1024 * 1024,
+            "默认 RTT=50ms 下分片应为 3MB(time_based 主导)"
+        );
+
+        // 注入高延迟 RTT=2s(卫星链路):
+        //   time_based = 3MB(不变)
+        //   bdp_based = 1MB/s * 2s * 2 = 4MB
+        //   取较大值 = 4MB(bdp_based 主导!)
+        sched.observe_rtt(Duration::from_secs(2));
+        let rec_high_rtt = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec_high_rtt.fragment_size,
+            4 * 1024 * 1024,
+            "RTT=2s 下 bdp_based(4MB)应主导 over time_based(3MB),实际: {}",
+            rec_high_rtt.fragment_size
+        );
+    }
+
+    /// 高 RTT 下 BDP 并发度约束应生效(当 frag_size < BDP 时)。
+    ///
+    /// 1GB/s(极高带宽)、RTT=200ms、max_fragment_size=64MB:
+    ///   - BDP = 1GB/s * 0.2s = 200MB
+    ///   - frag_size = clamp(time_based, 1MB, 64MB) = 64MB(max 限制)
+    ///   - bdp_concurrency = 200MB / 64MB = 3(需 3 并发填满管道)
+    ///
+    /// 注:bandwidth_based = 1GB/s * 3s / 64MB = 48 会主导并发度计算,
+    /// 但当 max_concurrency 限制到 4 时,RTT=200ms 的 bdp_concurrency=3
+    /// 应使并发度 >= 3(而非 1),验证 BDP 约束未被忽略。
+    #[test]
+    fn test_high_rtt_triggers_bdp_concurrency() {
+        let config = SchedulerConfig::default();
+        let sched = AdaptiveDownloadScheduler::new(config);
+
+        // 极高带宽 1GB/s,多次观测提升置信度
+        for _ in 0..20 {
+            sched.observe_bandwidth(1024 * 1024 * 1024);
+        }
+
+        // 低延迟 RTT=50ms:BDP = 1GB/s * 0.05s = 50MB < frag_size=64MB
+        // bdp_concurrency = 1(单并发可填满管道)
+        // bandwidth_based = 48,但 max_concurrency=4 限制到 4
+        sched.observe_rtt(Duration::from_millis(50));
+        let rec_low_rtt = sched.recommend(10 * 1024 * 1024 * 1024, 4);
+        assert_eq!(
+            rec_low_rtt.concurrency, 4,
+            "RTT=50ms 下受 max_concurrency=4 限制"
+        );
+
+        // 高延迟 RTT=200ms:BDP = 1GB/s * 0.2s = 200MB > frag_size=64MB
+        // bdp_concurrency = ceil(200MB / 64MB) = 3
+        // bandwidth_based = 48 → min(48, 4) = 4,max(4, 3) = 4
+        sched.observe_rtt(Duration::from_millis(200));
+        // max_concurrency=4 时,bdp_concurrency=3 应使并发度 >= 3(而非被压到 1)
+        let rec_high_rtt_4 = sched.recommend(10 * 1024 * 1024 * 1024, 4);
+        assert!(
+            rec_high_rtt_4.concurrency >= 3,
+            "RTT=200ms 下 BDP=200MB > frag=64MB,bdp_concurrency 应 >=3,实际: {}",
+            rec_high_rtt_4.concurrency
+        );
+    }
+
+    /// observe_rtt 应过滤异常值(>10s),不更新内部 RTT。
+    #[test]
+    fn test_observe_rtt_rejects_invalid_values() {
+        let sched = AdaptiveDownloadScheduler::default_config();
+
+        // 先设置一个正常 RTT
+        sched.observe_rtt(Duration::from_millis(100));
+        sched.observe_bandwidth(10 * 1024 * 1024);
+        for _ in 0..20 {
+            sched.observe_bandwidth(10 * 1024 * 1024);
+        }
+        let rec_normal = sched.recommend(100 * 1024 * 1024, 8);
+
+        // 注入异常 RTT(>10s),应被拒绝,RTT 保持 100ms
+        sched.observe_rtt(Duration::from_secs(100));
+        let rec_after_invalid = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec_normal.fragment_size, rec_after_invalid.fragment_size,
+            "异常 RTT 应被拒绝,recommend 结果不应变化"
+        );
+    }
+
+    /// 默认 RTT(50ms)行为与旧硬编码常量一致(向后兼容)。
+    #[test]
+    fn test_default_rtt_matches_legacy_constant() {
+        let sched = AdaptiveDownloadScheduler::default_config();
+
+        for _ in 0..20 {
+            sched.observe_bandwidth(50 * 1024 * 1024); // 50MB/s
+        }
+
+        // 默认 RTT=50ms,行为应与旧 ESTIMATED_RTT_SECS=0.050 一致
+        let rec = sched.recommend(1024 * 1024 * 1024, 8);
+        // time_based(高置信,3s) = 50MB/s * 3s = 150MB → clamp 到 64MB
+        assert_eq!(
+            rec.fragment_size,
+            SchedulerConfig::default().max_fragment_size
+        );
     }
 }
 

@@ -737,7 +737,14 @@ impl DownloadTask {
             return Ok(meta);
         }
         info!(url = %self.url, "开始探测文件元数据");
+        // 测量 probe 耗时作为 RTT 上界估计(DNS+TCP+TLS+HTTP 往返)。
+        // 偏大的 RTT 估计使 BDP 偏大(倾向更多并发),比偏小(管道未满)安全。
+        // observe_rtt 内部会过滤异常值(>10s),正常 probe 耗时 50ms-2s 均有效。
+        let probe_start = std::time::Instant::now();
         let mut metadata = self.protocol.probe(&self.url).await?;
+        let probe_elapsed = probe_start.elapsed();
+        self.scheduler.observe_rtt(probe_elapsed);
+        debug!(?probe_elapsed, "probe 耗时已作为 RTT 上界注入调度器");
         // 若用户在「新建任务」中显式重命名,以用户指定名覆盖协议探测得到的文件名。
         // 调用方(app 层 service)已对该名做过 sanitize,此处不再二次清洗,
         // 仅在源头覆盖一次保证下游 init_storage / 快照 / UI 全部读到同一个值。
