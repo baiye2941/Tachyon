@@ -184,4 +184,106 @@ worker_count 在启动时固定(spawn N 个 worker task),Semaphore 只能 add_pe
 `record_completed_fragment` 已调 `observe_bandwidth` 更新预测器,下次 plan(断点续传)
 自然用新数据。闭环控制的真正价值在真实网络的带宽波动场景,需联网验证。
 
+## 第四轮:磁力/HTTP 加速调研与瓶颈定位(bench+coverage+CRAP 交叉验证)
+
+### 调研范围
+
+针对"提升磁力链接和普通链接的下载与检测速度",执行了:
+1. 多 Agent 并行搜索最新论文/博客(FastBioDL、MDTP、BEP-6/9/11)
+2. 交叉验证 4 个关键假设(handle_cache 非 LRU、P2SP 预取未实现、双存储写放大、HTTP probe 无缓存)
+3. 评估自研 BT 引擎可行性(15-19 人月,4 痛点均非只能靠自研解决,**决定不自研**)
+4. 评估 librqbit 自定义 Storage 消除双存储(可行,需 cargo fetch 核实 4 项签名)
+5. bench + llvm-cov + cargo crap 交叉验证定位真实瓶颈
+
+### 交叉验证结论:4 个假设的最终裁决
+
+| 假设 | 验证结果 | 裁决 |
+|------|---------|------|
+| handle_cache 非 LRU | 确认(magnet.rs:108 iter().next()),但 MAX=64 实际并发≤10 永不触发 | **放弃**(死代码路径) |
+| P2SP 后台预取未实现 | 确认(downloader.rs:2415 同步 probe),但用户放弃预热优化方向 | **放弃** |
+| 双存储写放大 | 确认(magnet.rs:1022 read+write),但有协议约束(piece 校验) | **记录**(librqbit 自定义 Storage 可解,后续方向) |
+| HTTP probe 无缓存 | 确认,但 UI 不触发重复 probe(probe 在 run_inner 只调一次) | **放弃**(前提不成立) |
+
+### 自研 BT 引擎评估
+
+- 工程量:13,000-21,000 LOC,15-19 人月(含 DHT 3-4 人月)
+- 4 个痛点(同步 storage/handle 生命周期/策略不可调/UDP-over-SOCKS5)均已有 librqbit 之上扩展方案或被架构规避
+- 论文 cs/0609026 证明 rarest-first+choke 已近最优,替换收益有限
+- Tachyon 是 AI 模型下载器,BT 是补充协议,15-19 人月应投入 HTTP/HF 主路径
+- **结论:不自研,继续用 librqbit + 针对性扩展**
+
+### bench 基线(第四轮,cargo clean 后重测)
+
+| bench | 时间 | 说明 |
+|-------|------|------|
+| e2e_download(4MiB mock+memory) | 2.69-3.18ms | 固定开销不可压缩 |
+| e2e save/load snapshot | 1.25-2.04ms | 状态持久化 |
+| e2e fragment_state_machine | 5.87-12.26ms | 分片状态机 |
+| e2e bandwidth_sampling | 29.5-375ms | 含延迟模拟 |
+| scheduler_recommend | 23-25ns | 极快,非瓶颈 |
+| scheduler_batch_pop/1024 | 75µs | 批量调度 |
+| hex_encode/4096 | 3.6µs | hex 编码 |
+
+### 覆盖率与 CRAP 交叉验证(核心发现)
+
+| 文件 | 覆盖率(regions) | CRAP 最高函数 | 风险 |
+|------|----------------|--------------|------|
+| **http.rs** | **69.09%** | `download_range` CC=12 CRAP=156 **0%覆盖** | 极高 |
+| **http.rs** | | `probe` CC=8 CRAP=72 **0%覆盖** | 极高 |
+| **bt_session.rs** | **0%** | `build_session_options` CC=12 CRAP=156 | 极高 |
+| magnet.rs | 84.85% | `add_magnet_to_session` 0%覆盖 | 高 |
+| downloader.rs | 86.30% | `execute_fragmented_download` CC=53 CRAP=70 81.8% | 中 |
+| mirror.rs | 91.79% | — | 低 |
+
+**关键结论**:http.rs 的核心下载路径(probe/download_range/download_range_stream/download_full)
+全部 0% 单元测试覆盖(仅通过 MockProtocol 在 engine 层间接测);bt_session.rs 0% 覆盖。
+CRAP 高分(156)正是这些未覆盖的核心路径。**没有测试保护,任何性能优化都是盲改。**
+
+### 优化方向决策(数据驱动)
+
+当前最高 ROI **不是性能优化,而是补齐 HTTP/BT 协议层测试覆盖**:
+1. AGENTS.md 要求 ≥90% 覆盖率,http.rs(69%)、bt_session.rs(0%) 严重不达标
+2. CRAP 高分函数(download_range CRAP=156)正是未覆盖的核心下载路径
+3. 补测试后才能安全实施性能优化(librqbit 自定义 Storage、HTTP probe 优化等)
+4. 协议层测试需引入 mock HTTP server(wiremock/httpmock),当前 workspace 无此依赖
+
+### 根因发现与修复:bt_session.rs 0% 覆盖率的真正原因
+
+**根因**:tachyon-engine 的 `default` feature 仅含 `tachyon-protocol/magnet`(协议层 BT
+支持),**不含 engine 自身的 `magnet` feature**(bt_session 模块门控)。
+
+```
+# 修复前(Cargo.toml)
+default = ["tachyon-protocol/magnet"]  # 只开协议层,不开 engine 的 bt_session
+magnet = ["tachyon-protocol/magnet", "dep:librqbit"]
+```
+
+这导致 `cargo test -p tachyon-engine` / `cargo llvm-cov -p tachyon-engine` 等单 crate
+命令下 `#[cfg(feature = "magnet")] pub mod bt_session;` 不编译,bt_session.rs 的 11 个
+测试被排除出 test binary,lcov 显示 0% 覆盖率。只有 tachyon-app(显式开
+`tachyon-engine/magnet`)作为最终 binary 时 bt_session 才完整。
+
+CI 的 `cargo nextest run --all` 和 `cargo llvm-cov -p tachyon-engine` 均未传
+`--features magnet`,所以 CI 一直在"跳过 bt_session 测试"的状态下运行覆盖率门禁。
+
+**修复**:让 `default` 含 `magnet`,使单 crate 命令自动包含 bt_session:
+
+```
+# 修复后(Cargo.toml)
+default = ["magnet"]  # 含 engine 自身 magnet,bt_session 自动编译
+magnet = ["tachyon-protocol/magnet", "dep:librqbit"]
+```
+
+tachyon-app 用 `default-features = false` + `features = ["magnet"]` 显式控制,不受影响。
+
+**效果**:
+- bt_session.rs 覆盖率:0% → 92.35% regions
+- tachyon-engine 整体:88.65% → 90.20% regions(跨过 90% 门禁)
+- 测试数:236 → 250(+14,含 bt_session 11 个 + downloader magnet 路径 3 个)
+- 1370 全量测试通过,clippy 零警告
+
+**教训**:feature 门控的模块,其测试在单 crate 命令下可能被静默跳过。覆盖率门禁
+必须确保门控 feature 在门禁命令中被开启,否则覆盖率数据是假性的(跳过的模块显示 0%,
+而非"未编译")。`default` feature 应包含所有"生产环境必需"的 feature,使单 crate
+命令的行为与最终 binary 一致。
 

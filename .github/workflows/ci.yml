@@ -170,7 +170,7 @@ jobs:
         # 在已有 100+ 个 validate 测试全通过的情况下,lines 口径仍假性低于 90%
         # (实际逻辑已覆盖)。regions 是 LLVM 的基本覆盖单元,粒度更细(一行可含
         # 多个 region),不受上述 lcov 行统计偏差影响,是更准确的覆盖率度量。
-        # 各 crate regions 覆盖率:core 90.9% / engine 91.0% / store 96.9% /
+        # 各 crate regions 覆盖率:core 90.9% / engine 90.2% / store 96.9% /
         # io 95.2% / crypto 98.4% / scheduler 99.1%。
         #
         # --ignore-filename-regex:
