@@ -168,7 +168,12 @@ impl HttpClient {
                 .http2_max_frame_size(1 << 20)
                 // HTTP/2 PING 保活:检测 NAT/代理超时的死连接
                 .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-                .http2_keep_alive_timeout(std::time::Duration::from_secs(10));
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+                // 空闲连接也发 PING:多文件串行下载时,文件间隙连接空闲,
+                // 默认 false 会在空闲时停止 PING 导致 NAT/代理超时掐断连接,
+                // 下个文件需重建 TCP+TLS 握手(1-2 RTT)。开启后保持连接复用。
+                // P2SP 多源场景下池中的空闲镜像源连接同样受益。
+                .http2_keep_alive_while_idle(true);
             // 注:不启用 http2_adaptive_window。adaptive_window 会在运行时动态调整
             // 接收窗口并覆盖上方固定的 initial_stream/connection_window_size 设置
             // (见 reqwest 与 hyper 文档),使固定窗口成为无效配置。下载器场景为高 BDP
@@ -1794,6 +1799,18 @@ mod tests {
         assert!(
             client.is_ok(),
             "build_client(keep_alive=60) 应成功(已配置 pool_idle_timeout)"
+        );
+    }
+
+    #[test]
+    fn test_build_client_http2_keepalive_config_succeeds() {
+        // 验证启用 HTTP/2(含 keep_alive_while_idle)能正确创建客户端。
+        // 此前未配置 keep_alive_while_idle,空闲连接可能被 NAT 静默掐断。
+        // 开启后多文件串行下载的文件间隙连接保持复用,省 TCP+TLS 握手。
+        let client = HttpClient::build_client(10, 30, true, false, 16, 90, None);
+        assert!(
+            client.is_ok(),
+            "build_client(enable_http2=true) 应成功(含 keep_alive_while_idle 配置)"
         );
     }
 
