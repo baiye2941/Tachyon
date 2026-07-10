@@ -12,4 +12,3 @@ url.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-tokio-test.workspace = true

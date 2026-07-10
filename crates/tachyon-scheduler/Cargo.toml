@@ -12,5 +12,4 @@ tracing.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
-tokio-test.workspace = true
 proptest.workspace = true

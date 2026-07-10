@@ -5062,7 +5062,6 @@ dependencies = [
  "tachyon-core",
  "tempfile",
  "tokio",
- "tokio-test",
  "tracing",
 ]
 
@@ -5086,7 +5085,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
- "tokio-test",
  "tracing",
  "url",
 ]
@@ -5117,7 +5115,6 @@ dependencies = [
  "tachyon-core",
  "tempfile",
  "tokio",
- "tokio-test",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5135,7 +5132,6 @@ dependencies = [
  "tachyon-protocol",
  "tempfile",
  "tokio",
- "tokio-test",
  "tracing",
  "wiremock",
 ]
@@ -5148,7 +5144,6 @@ dependencies = [
  "proptest",
  "tachyon-core",
  "tokio",
- "tokio-test",
  "tracing",
 ]
 
@@ -5158,7 +5153,6 @@ version = "0.1.1-0"
 dependencies = [
  "serde",
  "tachyon-core",
- "tokio-test",
  "tracing",
  "url",
 ]
@@ -5768,17 +5762,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

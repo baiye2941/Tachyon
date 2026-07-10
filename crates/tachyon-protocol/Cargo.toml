@@ -39,7 +39,6 @@ librqbit = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio-test.workspace = true
 wiremock.workspace = true
 # 开启自身 test-harness feature(联动开启 tachyon-core/test-harness,放行 SSRF
 # loopback),使 wiremock 端到端 HTTP 测试可运行。仅 dev-dependencies,不影响生产。
