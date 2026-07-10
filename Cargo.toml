@@ -85,7 +85,7 @@ mimalloc = "0.1"
 
 # 开发依赖
 proptest = "1"
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 mockall = "0.13"
 rstest = "0.22"
 tempfile = "3"
@@ -94,6 +94,14 @@ libfuzzer-sys = "0.4"
 # Mock HTTP server:用于 tachyon-protocol/http.rs 的 probe/download_range 等协议层
 # 端到端测试(配合 test-harness feature 下的 loopback 放行)。
 wiremock = "0.6"
+# hyper streaming server:用于 bench 的真实 HTTP 节流流式响应(wiremock 不支持
+# 字节级节流和 chunked streaming)。hyper 1.x + http-body-util 已被 reqwest 传递
+# 依赖引入,这里显式声明供 bench 直接使用。
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+http-body = "1"
+http = "1"
 
 [package]
 name = "tachyon"
@@ -123,15 +131,29 @@ harness = false
 name = "e2e_download"
 harness = false
 
+[[bench]]
+name = "e2e_http_real"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
 tachyon-core = { path = "crates/tachyon-core", features = ["test-harness"] }
 tachyon-io = { path = "crates/tachyon-io" }
 tachyon-engine = { path = "crates/tachyon-engine", features = ["test-harness"] }
+# bench 需直接用 HttpClient(probe/download_range_stream 等),引入 protocol crate。
+# 开 test-harness 联动放行 loopback,使 bench server 绑定 127.0.0.1 可通过 SSRF 校验。
+tachyon-protocol = { path = "crates/tachyon-protocol", default-features = false, features = ["test-harness"] }
 tachyon-crypto = { path = "crates/tachyon-crypto" }
 tachyon-scheduler = { path = "crates/tachyon-scheduler" }
 tachyon-sniffer = { path = "crates/tachyon-sniffer" }
 tachyon-store = { path = "crates/tachyon-store" }
+# hyper streaming server:bench 的节流流式 HTTP 响应
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http-body = { workspace = true }
+http = { workspace = true }
+futures = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }
