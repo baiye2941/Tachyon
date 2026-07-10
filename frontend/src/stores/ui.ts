@@ -28,7 +28,7 @@ const [commandPaletteOpen, setCommandPaletteOpen] = createSignal(false);
 const [shortcutHelpOpen, setShortcutHelpOpen] = createSignal(false);
 // Settings 面板初始标签页(由 TitleBar\"关于\"等入口指定,openSettings 时消费)
 // 与 SettingsPanel 的 SettingsTab 保持一致(未导出,此处内联)
-type SettingsTab = "general" | "download" | "connection" | "scheduler" | "about";
+type SettingsTab = "general" | "download" | "connection" | "scheduler" | "shortcuts" | "about";
 const [settingsInitialTab, setSettingsInitialTab] = createSignal<SettingsTab | null>(
   null,
 );

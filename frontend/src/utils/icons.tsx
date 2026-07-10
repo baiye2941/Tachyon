@@ -18,6 +18,11 @@ import {
   ChartBarIcon,
   PauseCircleIcon,
   CancelIcon,
+  CopyIcon,
+  FolderOpenIcon,
+  RefreshIcon,
+  PinIcon,
+  PinOffIcon,
 } from "../components/icons";
 
 type IconComponent = (props: { class?: string }) => JSX.Element;
@@ -34,6 +39,11 @@ const ICON_MAP: Record<string, IconComponent> = {
   "chart-bar": ChartBarIcon,
   "pause-circle": PauseCircleIcon,
   cancel: CancelIcon,
+  copy: CopyIcon,
+  "folder-open": FolderOpenIcon,
+  refresh: RefreshIcon,
+  pin: PinIcon,
+  "pin-off": PinOffIcon,
 };
 
 export interface IconProps extends JSX.SvgSVGAttributes<SVGSVGElement> {

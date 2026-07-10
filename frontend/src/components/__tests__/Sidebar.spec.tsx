@@ -51,16 +51,18 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
     $ui.setSidebarCollapsed(true);
   });
 
-  it("默认 collapsed 态占位宽度为 RAIL_WIDTH(48px)", () => {
+  it("默认 collapsed 态占位容器宽度为轨道宽度,不产生主内容空档", () => {
     const { container } = render(() => <Sidebar />);
     const placeholder = container.querySelector(
       ".relative.flex-shrink-0.h-full.overflow-hidden",
     ) as HTMLElement | null;
     expect(placeholder).not.toBeNull();
+    // 修复:collapsed 态占位容器只占用轨道宽度,避免主内容区出现 MAX_WIDTH - RAIL_WIDTH 空档
     expect(placeholder!.style.width).toBe("48px");
+    expect(placeholder!.style.clipPath).toBe("");
   });
 
-  it("pin 后占位宽度从 RAIL 扩展到面板宽度", () => {
+  it("pin 后占位容器从轨道宽度扩展到面板宽度", () => {
     const { container } = render(() => <Sidebar />);
     const placeholder = () =>
       container.querySelector(
@@ -70,8 +72,9 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
 
     $ui.toggleSidebarPin();
 
-    const w = parseInt(placeholder().style.width, 10);
-    expect(w).toBeGreaterThanOrEqual(180);
+    const expandedWidth = parseInt(placeholder().style.width, 10);
+    expect(expandedWidth).toBeGreaterThanOrEqual(180);
+    expect(expandedWidth).toBeLessThanOrEqual(400);
   });
 
   it("collapsed 态轨道应渲染图标按钮(非空),提供 collapsed 交互", () => {
@@ -80,7 +83,7 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
     expect(navItems.length).toBeGreaterThan(5);
   });
 
-  it("展开后(setSidebarCollapsed=false)占位宽度变为面板宽度", () => {
+  it("展开后(setSidebarCollapsed=false)占位容器宽度显示面板宽度", () => {
     const { container } = render(() => <Sidebar />);
     const placeholder = () =>
       container.querySelector(
@@ -90,8 +93,9 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
 
     $ui.setSidebarCollapsed(false);
 
-    const w = parseInt(placeholder().style.width, 10);
-    expect(w).toBeGreaterThanOrEqual(180);
+    const expandedWidth = parseInt(placeholder().style.width, 10);
+    expect(expandedWidth).toBeGreaterThanOrEqual(180);
+    expect(expandedWidth).toBeLessThanOrEqual(400);
   });
 
   it("展开面板用 transform 定位(collapsed 时藏到轨道后)", () => {

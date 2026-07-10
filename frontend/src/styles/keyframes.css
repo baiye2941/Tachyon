@@ -1,0 +1,355 @@
+
+
+@keyframes logo-shimmer {
+  0%,
+  100% {
+    /* 去 AI 味:0.6→1 + brightness 1→1.3 太活泼,收敛为 0.8→1 + 1→1.15 */
+    opacity: 0.8;
+    filter: brightness(1);
+  }
+
+  50% {
+    opacity: 1;
+    filter: brightness(1.15);
+  }
+}
+
+
+@keyframes chunk-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    /* 保持可见:最低不透明度 0.85,避免下载中分片"消失" */
+    opacity: 0.85;
+    transform: scale(0.97);
+  }
+}
+
+
+@keyframes chunk-shine {
+  0% {
+    transform: translateX(-140%) skewX(-20deg);
+  }
+
+  100% {
+    transform: translateX(180%) skewX(-20deg);
+  }
+}
+
+
+@keyframes chunk-appear {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+
+  70% {
+    transform: scale(1.1);
+  }
+
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes tooltip-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+
+
+
+
+@keyframes drag-glow {
+  0%,
+  100% {
+    box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--color-accent-primary) 30%, transparent);
+  }
+
+  50% {
+    box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--color-accent-primary) 60%, transparent);
+  }
+}
+
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    /* 去 AI 味:opacity 0.5 太突兀,改为 0.75 让脉冲更含蓄 */
+    opacity: 0.75;
+  }
+}
+
+
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 1;
+  }
+}
+
+
+@keyframes card-fade-in {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+
+
+/* 右键菜单入场:轻微 scale + fade,避免生硬弹出 */
+@keyframes context-menu-enter {
+  0% {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes progress-completed-settle {
+  0% {
+    transform: scaleY(1);
+  }
+  40% {
+    transform: scaleY(1.18);
+  }
+  100% {
+    transform: scaleY(1);
+  }
+}
+
+/* 等待/连接/恢复中短梭子：起跑闸打开后加速的物理感
+   0%→30%：scaleX 0.6→1 + opacity 上升，模拟闸门开启后加速
+   30%→100%：scaleX 略收 + opacity 下降，模拟冲刺中尾迹消散
+   使用 per-keyframe cubic-bezier 分别控制加速段与巡航段。 */
+@keyframes progress-waiting-shuttle {
+  0% {
+    transform: translateX(0) scaleX(0.6);
+    opacity: 0.12;
+    animation-timing-function: cubic-bezier(0.65, 0, 0.9, 0.3);
+  }
+  30% {
+    transform: translateX(45%) scaleX(1);
+    opacity: 0.38;
+    animation-timing-function: cubic-bezier(0.22, 0.05, 0.25, 1);
+  }
+  100% {
+    transform: translateX(280%) scaleX(0.78);
+    opacity: 0.1;
+  }
+}
+
+@keyframes speed-breathe {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes ripple-wave {
+  0% {
+    transform: scale(0);
+    opacity: 0.42;
+  }
+  100% {
+    transform: scale(2.8);
+    opacity: 0;
+  }
+}
+
+@keyframes empty-icon-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.38;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes status-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent-primary) 25%, transparent);
+    opacity: 1;
+  }
+  50% {
+    /* 去 AI 味:6px→3px,opacity 范围 1→0.85 再收到 1→0.9 */
+    box-shadow: 0 0 3px 1px color-mix(in srgb, var(--color-accent-primary) 12%, transparent);
+    opacity: 0.9;
+  }
+}
+
+@keyframes input-drag-glow {
+  0%,
+  100% {
+    border-color: color-mix(in srgb, var(--color-accent-primary) 30%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent-primary) 6%, transparent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--color-accent-primary) 60%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent-primary) 12%, transparent);
+  }
+}
+
+@keyframes progress-icon-pop {
+  0% {
+    transform: translateY(-50%) scale(0);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(-50%) scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes progress-sparkle-pop {
+  0% {
+    transform: scale(0) rotate(-15deg);
+    opacity: 0;
+  }
+  40% {
+    transform: scale(1.1) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.7) rotate(15deg);
+    opacity: 0;
+  }
+}
+
+@keyframes status-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.85);
+  }
+}
+
+@keyframes celebration-check-in {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes celebration-particle {
+  0% {
+    transform: rotate(var(--pc-angle, 0deg)) translateX(0) scale(0);
+    opacity: 1;
+  }
+  70% {
+    opacity: 0.8;
+    transform: rotate(var(--pc-angle, 0deg)) translateX(var(--pc-distance, 16px)) scale(var(--pc-scale, 1));
+  }
+  100% {
+    transform: rotate(var(--pc-angle, 0deg)) translateX(var(--pc-distance, 16px)) scale(0);
+    opacity: 0;
+  }
+}
+
+@keyframes metric-value-pop {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+
+@keyframes error-shake-in {
+  0% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-3px);
+  }
+  40% {
+    transform: translateX(3px);
+  }
+  60% {
+    transform: translateX(-2px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+@keyframes speed-live-blink {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.85);
+  }
+}
+
+@keyframes speed-pulse-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.35;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}

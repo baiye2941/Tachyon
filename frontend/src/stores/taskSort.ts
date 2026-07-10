@@ -62,11 +62,26 @@ const STATUS_RANK: Record<DownloadStatus, number> = {
 
 type Comparator = (a: TaskInfo, b: TaskInfo) => number
 
-const COMPARATORS: Record<Exclude<SortKey, 'name'>, Comparator> = {
+const COMPARATORS: Record<Exclude<SortKey, "name">, Comparator> = {
   progress: (a, b) => a.progress - b.progress,
   speed: (a, b) => a.speed - b.speed,
   status: (a, b) => STATUS_RANK[a.status] - STATUS_RANK[b.status],
-}
+  size: (a, b) => (a.fileSize ?? 0) - (b.fileSize ?? 0),
+  remaining: (a, b) => {
+    const ra = a.fileSize ? a.fileSize - a.downloaded : Number.POSITIVE_INFINITY;
+    const rb = b.fileSize ? b.fileSize - b.downloaded : Number.POSITIVE_INFINITY;
+    return ra - rb;
+  },
+  downloaded: (a, b) => a.downloaded - b.downloaded,
+  fragments: (a, b) => {
+    const pa = a.fragmentsTotal > 0 ? a.fragmentsDone / a.fragmentsTotal : 0;
+    const pb = b.fragmentsTotal > 0 ? b.fragmentsDone / b.fragmentsTotal : 0;
+    return pa - pb;
+  },
+  threads: (a, b) => (a.activeConcurrency ?? 0) - (b.activeConcurrency ?? 0),
+  createdAt: (a, b) =>
+    new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+};
 
 /**
  * 按排序状态对任务列表排序(纯函数,不修改原数组)。
@@ -82,6 +97,26 @@ export function sortTasks(tasks: TaskInfo[], state: SortState): TaskInfo[] {
     const primary = baseCmp(a, b) * dirMul
     if (primary !== 0) return primary
     // 稳定:同序值按文件名
+    return a.fileName.localeCompare(b.fileName)
+  })
+}
+
+/**
+ * 分组视图下组内排序。
+ *
+ * - 若排序 key 为 progress/speed/status,调用现有 sortTasks 保持全局排序语义。
+ * - 若 key 为 null 或 name(name 不参与排序),按 createdAt 降序 → fileName 升序稳定排序。
+ *
+ * 这样每组内部的新鲜任务排在前面,同时避免等值抖动。
+ */
+export function sortGroupTasks(tasks: TaskInfo[], state: SortState): TaskInfo[] {
+  if (state.key === 'progress' || state.key === 'speed' || state.key === 'status') {
+    return sortTasks(tasks, state)
+  }
+  return [...tasks].sort((a, b) => {
+    const ta = new Date(a.createdAt).getTime()
+    const tb = new Date(b.createdAt).getTime()
+    if (ta !== tb) return tb - ta
     return a.fileName.localeCompare(b.fileName)
   })
 }

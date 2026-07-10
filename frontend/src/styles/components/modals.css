@@ -1,0 +1,8 @@
+/* ============================================
+   Modals — ConfirmDialog, NewTaskModal, etc.
+   ============================================
+   Project modals currently rely on shared primitive classes (.panel-overlay,
+   .slide-panel, .btn-*, .input) and do not define dedicated modal classes in
+   the global stylesheet. This file is reserved for modal-specific styles when
+   they are introduced.
+   ============================================ */

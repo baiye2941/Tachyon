@@ -42,6 +42,7 @@ url.workspace = true
 dashmap.workspace = true
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2.3.5"
+tauri-plugin-clipboard-manager = "2"
 mimalloc.workspace = true
 
 [dev-dependencies]

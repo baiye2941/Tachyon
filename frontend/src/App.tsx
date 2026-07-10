@@ -1,6 +1,6 @@
 import { errorMessage } from "./utils/appError";
-import { createSignal, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
-import type { ListDensity, SnifferResource, TaskInfo, ViewName } from "./types";
+import { createSignal, createEffect, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
+import type { ListDensity, SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
 import { api } from "./api/invoke";
 import {
   $activeCount,
@@ -15,7 +15,11 @@ import {
   $selectedIds,
   deselectAll,
   selectAll,
+  selectRange,
   toggleSelection,
+  getLastSelectedAnchorId,
+  setLastSelectedAnchorId,
+  hasSelection,
 } from "./stores/selection";
 import {
   $ui,
@@ -28,6 +32,7 @@ import {
   setSearchQuery,
   removeSearchFilter,
 } from "./stores/taskFilter";
+import { $taskListView, toggleGroupBy } from "./stores/taskListView";
 import { deleteHistoryRecord, getRecordById } from "./stores/history";
 import {
   pauseSelected,
@@ -37,6 +42,7 @@ import {
   pauseAll,
   resumeAll,
   cancelAll,
+  clearCompleted,
 } from "./stores/batchActions";
 import { useAppInit } from "./hooks/useAppInit";
 import { useGlobalKeyboard } from "./hooks/useGlobalKeyboard";
@@ -59,7 +65,7 @@ import { tr } from "./i18n";
 
 const SnifferPanel = lazy(() => import("./components/SnifferPanel"));
 const HistoryPanel = lazy(() => import("./components/HistoryPanel"));
-const SettingsPanel = lazy(() => import("./components/SettingsPanel"));
+const SettingsPanel = lazy(() => import("./components/settings/SettingsPanel"));
 const CommandPalette = lazy(() => import("./components/CommandPalette"));
 const NewTaskModal = lazy(() => import("./components/NewTaskModal"));
 const HfBrowserPanel = lazy(() => import("./components/HfBrowserPanel"));
@@ -72,8 +78,15 @@ function AppContent() {
   const [snifferResources, setSnifferResources] = createSignal<
     SnifferResource[]
   >([]);
+  const [snifferConfig, setSnifferConfig] = createSignal<CaptureConfig | null>(
+    null,
+  );
 
-  useAppInit(setSnifferResources);
+  useAppInit(setSnifferResources, (resource) =>
+    setSnifferResources((prev) =>
+      prev.some((r) => r.id === resource.id) ? prev : [resource, ...prev],
+    ),
+  );
   useGlobalKeyboard();
   const {
     contextMenu,
@@ -87,12 +100,59 @@ function AppContent() {
     $selectedId.set(null);
   };
 
-  const handleTaskClick = (taskId: string) => {
+  const handleTaskClick = (
+    taskId: string,
+    _index: number,
+    shiftKey: boolean,
+    orderedTaskIds: string[],
+  ) => {
+    if (isMultiSelectMode()) {
+      const anchorId = getLastSelectedAnchorId();
+      if (shiftKey && anchorId) {
+        selectRange(anchorId, taskId, orderedTaskIds);
+      } else {
+        toggleSelection(taskId);
+      }
+      setLastSelectedAnchorId(taskId);
+    } else {
+      // 非多选模式下 Shift 点击临时开启一段范围选择,以最后一次单选为锚点
+      const anchorId = $selectedId.get();
+      if (shiftKey && anchorId) {
+        setIsMultiSelectMode(true);
+        selectRange(anchorId, taskId, orderedTaskIds);
+      } else {
+        $selectedId.set((prev) => (prev === taskId ? null : taskId));
+      }
+    }
+  };
+
+  const handleTaskActivate = (taskId: string, _index: number) => {
     if (isMultiSelectMode()) {
       toggleSelection(taskId);
+      setLastSelectedAnchorId(taskId);
     } else {
-      $selectedId.set((prev) => (prev === taskId ? null : taskId));
+      $selectedId.set(taskId);
     }
+  };
+
+  const handleSelectRange = (
+    anchorIndex: number,
+    endIndex: number,
+    orderedTaskIds: string[],
+  ) => {
+    const anchorId = orderedTaskIds[anchorIndex];
+    const endId = orderedTaskIds[endIndex];
+    if (!anchorId || !endId) return;
+    if (!isMultiSelectMode()) {
+      setIsMultiSelectMode(true);
+    }
+    selectRange(anchorId, endId, orderedTaskIds);
+    setLastSelectedAnchorId(anchorId);
+  };
+
+  const handleDeleteSelected = () => {
+    if (!hasSelection()) return;
+    deleteSelected();
   };
 
   const handleSelectAll = () => {
@@ -117,6 +177,50 @@ function AppContent() {
         addToast(tr("toast.createTaskFailed", { error: errorMessage(e) }), "error"),
       );
   };
+
+  const handleAddSnifferResource = (url: string) => {
+    api
+      .addSnifferResource(url)
+      .catch((e) =>
+        addToast(tr("toast.snifferAddFailed", { error: errorMessage(e) }), "error"),
+      );
+  };
+
+  const handleClearSnifferResources = () => {
+    api
+      .clearSnifferResources()
+      .then(() => setSnifferResources([]))
+      .catch((e) =>
+        addToast(tr("toast.snifferClearFailed", { error: errorMessage(e) }), "error"),
+      );
+  };
+
+  const handleUpdateSnifferConfig = (config: CaptureConfig) => {
+    // 乐观更新:先更新本地状态,再异步提交后端
+    setSnifferConfig(config);
+    api
+      .setSnifferCaptureConfig(config)
+      .catch((e) =>
+        addToast(
+          tr("sniffer.config.updateFailed", { error: errorMessage(e) }),
+          "error",
+        ),
+      );
+  };
+
+  // 嗅探面板首次打开时加载捕获配置(响应式:监听面板可见性)
+  createEffect(() => {
+    if (!$ui.snifferVisible() || snifferConfig()) return;
+    api
+      .getSnifferCaptureConfig()
+      .then(setSnifferConfig)
+      .catch((e) =>
+        addToast(
+          tr("sniffer.config.loadFailed", { error: errorMessage(e) }),
+          "error",
+        ),
+      );
+  });
 
   const handleRedownload = (task: TaskInfo) => {
     api
@@ -197,10 +301,9 @@ function AppContent() {
       {/* Drag overlay */}
       <Show when={isDragOver()}>
         <div
-          class="fixed inset-0 z-[300] flex items-center justify-center"
+          class="fixed inset-0 z-[var(--z-drag)] flex items-center justify-center"
           style={{
             background: "var(--color-overlay-scrim)",
-            "backdrop-filter": "blur(4px)",
             animation: "fadeIn 150ms ease forwards",
           }}
         >
@@ -281,12 +384,15 @@ function AppContent() {
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
             onCancelAll={cancelAll}
+            groupBy={$taskListView.groupBy()}
+            onToggleGroupBy={toggleGroupBy}
           />
 
           <div class="flex flex-1 overflow-hidden relative">
             <TaskList
               tasks={$taskFilter.filteredTasks()}
               selectedTaskId={$selectedId.get()}
+              groupBy={$taskListView.groupBy()}
               onTaskClick={handleTaskClick}
               onTaskContextMenu={openContextMenu}
               isMultiSelectMode={isMultiSelectMode()}
@@ -294,6 +400,12 @@ function AppContent() {
               density={listDensity()}
               searchQuery={$taskFilter.searchQuery()}
               onNewTask={openNewTaskModal}
+              keyboardHandlers={{
+                onTaskActivate: handleTaskActivate,
+                onSelectRange: handleSelectRange,
+                onSelectAll: handleSelectAll,
+                onDeleteSelected: handleDeleteSelected,
+              }}
             />
 
             <DetailPanel
@@ -404,8 +516,12 @@ function AppContent() {
           <SnifferPanel
             visible={$ui.snifferVisible()}
             resources={snifferResources()}
+            captureConfig={snifferConfig()}
             onClose={$ui.closeSniffer}
             onAddDownload={handleAddFromSniffer}
+            onAddResource={handleAddSnifferResource}
+            onClearResources={handleClearSnifferResources}
+            onUpdateConfig={handleUpdateSnifferConfig}
           />
         </Suspense>
       </Show>
@@ -466,9 +582,27 @@ function AppContent() {
             onNewDownload={openNewTaskModal}
             onPauseAll={pauseAll}
             onResumeAll={resumeAll}
+            onCancelAll={cancelAll}
+            onClearCompleted={clearCompleted}
             onToggleSidebar={$ui.toggleSidebar}
             getTasks={() => $tasks.get()}
             onOpenTask={(taskId) => $selectedId.set(taskId)}
+            getSelectedTask={() => $selectedTask.get()}
+            onOpenTaskFolder={(taskId) => {
+              const task = $tasks.get().find((t) => t.id === taskId);
+              if (task?.savePath) {
+                api.openFolder(task.savePath).catch(() => {
+                  addToast(tr("toast.openFolderFailed"), "error");
+                });
+              } else {
+                addToast(tr("toast.noSavePath"), "info");
+              }
+            }}
+            onRedownloadTask={(taskId) => {
+              const task = $tasks.get().find((t) => t.id === taskId);
+              if (task) handleRedownload(task);
+            }}
+            onCopyToClipboard={(text) => navigator.clipboard.writeText(text)}
           />
         </Suspense>
       </Show>

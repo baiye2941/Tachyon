@@ -1,4 +1,4 @@
-import { mergeProps, type JSX, type Component } from 'solid-js'
+import { mergeProps, type JSX, type Component, For, createSignal, onCleanup } from 'solid-js'
 import { Dynamic } from 'solid-js/web'
 
 /**
@@ -13,7 +13,7 @@ import { Dynamic } from 'solid-js/web'
  *   <Button variant="ghost" shape="icon-sm" aria-label="关闭"><XIcon /></Button>
  */
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'brand'
 export type ButtonSize = 'sm' | 'md' | 'lg'
 export type ButtonShape = 'default' | 'icon' | 'icon-sm'
 
@@ -22,6 +22,7 @@ const VARIANT_CLASS: Record<ButtonVariant, string> = {
   secondary: 'btn-secondary',
   ghost: 'btn-ghost',
   danger: 'btn-danger',
+  brand: 'btn-brand',
 }
 
 const SIZE_CLASS: Record<ButtonSize, string> = {
@@ -87,22 +88,44 @@ const Button: Component<ButtonProps> = (rawProps) => {
     return parts.filter(Boolean).join(' ')
   }
 
-  // 点击 ripple:在点击位置生成涟漪 span,600ms 后自清。
-  // 仅对支持 ripple 的变体(primary/secondary/danger/ghost/icon)生效,
-  // disabled/loading 不触发。容器需 position:relative + overflow:hidden。
+  interface Ripple {
+    id: number
+    x: number
+    y: number
+    size: number
+  }
+
+  // 点击 ripple:用 SolidJS 信号管理列表,650ms 后自动移除。
+  // 不再直接操作 DOM,保持响应式与可预测清理。
+  // 仅对支持 ripple 的变体生效;disabled/loading 不触发。
+  const [ripples, setRipples] = createSignal<Ripple[]>([])
+  let rippleId = 0
+  const rippleTimers: number[] = []
+
+  onCleanup(() => {
+    rippleTimers.forEach(clearTimeout)
+    rippleTimers.length = 0
+  })
+
   const handleRipple = (e: MouseEvent) => {
     if (props.disabled || props.loading) return
     const target = e.currentTarget as HTMLElement
     const rect = target.getBoundingClientRect()
     const size = Math.max(rect.width, rect.height)
-    const wave = document.createElement('span')
-    wave.className = 'ripple-wave'
-    wave.style.width = `${size}px`
-    wave.style.height = `${size}px`
-    wave.style.left = `${e.clientX - rect.left - size / 2}px`
-    wave.style.top = `${e.clientY - rect.top - size / 2}px`
-    target.appendChild(wave)
-    window.setTimeout(() => wave.remove(), 650)
+    const id = rippleId++
+    const ripple: Ripple = {
+      id,
+      x: e.clientX - rect.left - size / 2,
+      y: e.clientY - rect.top - size / 2,
+      size,
+    }
+    setRipples((prev) => [...prev, ripple])
+    const timer = window.setTimeout(() => {
+      const idx = rippleTimers.indexOf(timer)
+      if (idx !== -1) rippleTimers.splice(idx, 1)
+      setRipples((prev) => prev.filter((r) => r.id !== id))
+    }, 650)
+    rippleTimers.push(timer)
   }
 
   return (
@@ -124,9 +147,22 @@ const Button: Component<ButtonProps> = (rawProps) => {
       onBlur={props.onBlur}
       onMouseEnter={props.onMouseEnter}
       onMouseLeave={props.onMouseLeave}
-      style={props.style}
+      style={{ position: 'relative', overflow: 'hidden', ...props.style }}
     >
       {props.children}
+      <For each={ripples()}>
+        {(ripple) => (
+          <span
+            class="ripple-wave"
+            style={{
+              width: `${ripple.size}px`,
+              height: `${ripple.size}px`,
+              left: `${ripple.x}px`,
+              top: `${ripple.y}px`,
+            }}
+          />
+        )}
+      </For>
     </Dynamic>
   )
 }

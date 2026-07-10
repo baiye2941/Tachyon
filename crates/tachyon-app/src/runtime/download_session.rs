@@ -269,8 +269,8 @@ impl DownloadSession {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let broker = self.state.runtime.progress_broker.clone();
         let on_progress: crate::runtime::chunk_reader_pool::ProgressCallback =
-            Arc::new(move |task_id, idx| {
-                broker.mark_dirty_with_delta(task_id, idx);
+            Arc::new(move |task_id, delta| {
+                broker.mark_dirty_with_delta(task_id, delta);
             });
         let job = ChunkReaderJob {
             task_id: self.task_id.clone(),
@@ -302,10 +302,10 @@ impl DownloadSession {
         // 10. 等待 chunk reader 完成
         let _ = wait_chunk_reader_done(done_rx, &self.task_id).await;
 
-        cleanup_runtime(&self.state, &self.task_id);
-
-        // 终态即时广播
+        // 终态即时广播:先广播再清理,确保 fragment_state_store 仍在,
+        // downloading_set 被正确序列化到最后一次 ProgressEvent
         self.state.runtime.progress_broker.broadcast_all();
+        cleanup_runtime(&self.state, &self.task_id);
 
         // 11. 持久化最终快照
         let fail_reason = extract_fail_reason(&self.state, &self.task_id, result.as_ref());

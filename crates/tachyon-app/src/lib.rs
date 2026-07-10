@@ -73,6 +73,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::new())
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -124,6 +125,14 @@ pub fn run() {
                     }
                     Err(e) => tracing::warn!(error = %e, "恢复未完成任务失败"),
                 }
+
+                // 启动剪贴板监听(若 clipboard.enable_watch 为 true)
+                let clipboard_watcher = crate::service::ClipboardWatcher::new(
+                    handle.clone(),
+                    state.domain.config.clone(),
+                    state.service.sniffer_service.clone(),
+                );
+                clipboard_watcher.start().await;
             });
             Ok(())
         })
@@ -150,6 +159,9 @@ pub fn run() {
             get_sniffer_resources,
             add_sniffer_filter,
             add_sniffer_resource,
+            get_sniffer_capture_config,
+            set_sniffer_capture_config,
+            clear_sniffer_resources,
             // 配置管理
             get_config,
             update_config,

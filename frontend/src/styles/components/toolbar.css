@@ -1,0 +1,187 @@
+/* 工具栏新建下载:保持克制描边形态,仅提高深色模式中文字/图标对比度 */
+.new-download-btn {
+  min-width: 120px;
+  height: 36px;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-hover);
+  color: var(--color-text-title);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transform: none;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    transform 80ms ease;
+}
+
+.new-download-btn svg {
+  width: 16px;
+  height: 16px;
+  color: var(--color-text-title);
+}
+
+.new-download-btn:hover {
+  border-color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
+}
+
+.new-download-btn:active {
+  transform: scale(0.97);
+  background: var(--color-border-subtle);
+}
+
+.new-download-btn:hover svg {
+  color: var(--color-text-title);
+}
+
+
+/* ============================================
+   Component Classes
+   ============================================ */
+
+/* Icon button (32x32) */
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  position: relative;
+  overflow: hidden;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease,
+    transform 80ms ease;
+}
+
+.icon-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.icon-btn:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* Small icon button (28x28 visual, 44x44 touch target) */
+.icon-btn-sm {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  position: relative;
+  overflow: hidden;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease,
+    transform 80ms ease;
+}
+
+.icon-btn-sm::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: var(--radius-sm);
+}
+
+.icon-btn-sm:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.icon-btn-sm:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* Window control button (36x36) */
+.win-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  position: relative;
+  overflow: hidden;
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.win-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.win-btn-close:hover {
+  color: white;
+  background: var(--color-error);
+}
+
+/* Pill button (small, inline) */
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.pill-btn-default {
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-hover);
+}
+
+.pill-btn-default:hover {
+  background: var(--color-border-subtle);
+  color: var(--color-text-primary);
+}
+
+.pill-btn-active {
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
+}
+
+
+
+.icon-btn:active {
+  transform: scale(0.92);
+  background: var(--color-border-subtle);
+}
+
+.icon-btn-sm:active {
+  transform: scale(0.92);
+  background: var(--color-border-subtle);
+}
+
+.win-btn:active {
+  transform: scale(0.92);
+}
+
+.pill-btn:active {
+  transform: scale(0.97);
+}
+

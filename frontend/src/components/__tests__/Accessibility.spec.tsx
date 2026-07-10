@@ -4,12 +4,33 @@ import { render, fireEvent } from "@solidjs/testing-library";
 import TaskItem from "../TaskItem";
 import TitleBar from "../TitleBar";
 import type { TaskInfo } from "../../types";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { resolve, join } from "node:path";
 
 // 直接读取 CSS 源文件而非 `?raw` 导入:Tailwind v4 的 Vite 插件会拦截并转换
 // CSS 导入,导致 `?raw` 返回空字符串。fs.readFileSync 绕过转换管线,拿到原始源码。
-const indexCss = readFileSync(resolve(__dirname, "../../index.css"), "utf-8");
+// index.css 已拆分为 styles/ 模块,测试需要遍历所有样式文件以保证断言覆盖完整 CSS。
+function collectCssFiles(dir: string, files: string[] = []): string[] {
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectCssFiles(fullPath, files);
+    } else if (entry.isFile() && entry.name.endsWith(".css")) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+const srcDir = resolve(__dirname, "../..");
+const allCssFiles = [
+  resolve(srcDir, "index.css"),
+  ...collectCssFiles(resolve(srcDir, "styles")).sort(),
+];
+const allCss = allCssFiles
+  .map((p) => readFileSync(p, "utf-8"))
+  .join("\n");
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
   getCurrentWebviewWindow: () => ({
@@ -58,15 +79,16 @@ describe("Accessibility Tests", () => {
 
   describe("prefers-reduced-motion 支持", () => {
     it("应该在 CSS 中定义 prefers-reduced-motion 媒体查询", () => {
-      expect(indexCss).toContain("@media (prefers-reduced-motion: reduce)");
-      expect(indexCss).toContain("animation-duration: 0.01ms !important");
-      expect(indexCss).toContain("animation-iteration-count: 1 !important");
-      expect(indexCss).toContain("transition-duration: 0.01ms !important");
-      expect(indexCss).toContain("scroll-behavior: auto !important");
+      expect(allCss).toContain("@media (prefers-reduced-motion: reduce)");
+      expect(allCss).toContain("animation-duration: 0.01ms !important");
+      expect(allCss).toContain("animation-iteration-count: 1 !important");
+      expect(allCss).toContain("transition-duration: 0.01ms !important");
+      expect(allCss).toContain("scroll-behavior: auto !important");
 
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -95,6 +117,7 @@ describe("Accessibility Tests", () => {
       render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -106,7 +129,7 @@ describe("Accessibility Tests", () => {
       expect(
         window.matchMedia("(prefers-reduced-motion: reduce)").matches,
       ).toBe(true);
-      expect(indexCss).toMatch(
+      expect(allCss).toMatch(
         /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*{[\s\S]*animation-duration:\s*0\.01ms !important/,
       );
     });
@@ -118,7 +141,7 @@ describe("Accessibility Tests", () => {
       const buttons = container.querySelectorAll(".win-btn");
 
       expect(buttons.length).toBeGreaterThan(0);
-      expect(indexCss).toMatch(
+      expect(allCss).toMatch(
         /\.win-btn\s*{[\s\S]*width:\s*36px;[\s\S]*height:\s*36px;/,
       );
       buttons.forEach((button) =>
@@ -135,7 +158,7 @@ describe("Accessibility Tests", () => {
 
       const button = expectElement(container.querySelector(".icon-btn-sm"));
       expect(button.classList.contains("icon-btn-sm")).toBe(true);
-      expect(indexCss).toMatch(
+      expect(allCss).toMatch(
         /\.icon-btn-sm::before\s*{[\s\S]*inset:\s*-8px;/,
       );
     });
@@ -144,6 +167,7 @@ describe("Accessibility Tests", () => {
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -156,7 +180,7 @@ describe("Accessibility Tests", () => {
         container.querySelector('[role="button"]'),
       );
       expect(taskElement.classList.contains("task-row")).toBe(true);
-      expect(indexCss).toMatch(/\.task-row\s*\{[^}]*padding:\s*12px\s*16px/);
+      expect(allCss).toMatch(/\.task-row\s*\{[^}]*padding:\s*12px\s*16px/);
     });
   });
 
@@ -193,6 +217,7 @@ describe("Accessibility Tests", () => {
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -212,6 +237,7 @@ describe("Accessibility Tests", () => {
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -231,6 +257,7 @@ describe("Accessibility Tests", () => {
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}
@@ -249,6 +276,7 @@ describe("Accessibility Tests", () => {
       const { container } = render(() => (
         <TaskItem
           task={mockTask}
+          index={0}
           isSelected={false}
           isMultiSelected={false}
           isMultiSelectMode={false}

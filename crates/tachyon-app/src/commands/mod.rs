@@ -15,7 +15,10 @@ pub use self::hub_commands::{
     verify_model,
 };
 pub use self::progress_commands::{get_download_progress, subscribe_progress};
-pub use self::sniffer_commands::{add_sniffer_filter, add_sniffer_resource, get_sniffer_resources};
+pub use self::sniffer_commands::{
+    add_sniffer_filter, add_sniffer_resource, clear_sniffer_resources, get_sniffer_capture_config,
+    get_sniffer_resources, set_sniffer_capture_config,
+};
 pub use self::task_commands::{
     cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
     probe_filename, resume_task,
@@ -252,6 +255,9 @@ pub struct TaskProgress {
     pub file_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_delta: Vec<u32>,
+    /// 本周期新开始下载的分片索引增量(Started 事件累积)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started_delta: Vec<u32>,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -742,6 +748,7 @@ pub(crate) mod tests {
             scheduler: Default::default(),
             magnet: Default::default(),
             hub: Default::default(),
+            clipboard: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
         // favorites_store 必须使用独立临时目录,不能与 task_store 共用同一目录:

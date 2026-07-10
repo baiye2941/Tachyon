@@ -64,7 +64,7 @@ describe('hub store', () => {
 
     expect(result).toEqual([])
     expect(hubModule.$hub.repoFiles()).toEqual([])
-    expect(hubModule.$hub.error()).toBe('Error: 网络超时')
+    expect(hubModule.$hub.error()).toBe('网络超时')
     expect(hubModule.$hub.loading()).toBe(false)
     expect(mockAddToast).toHaveBeenCalledWith(
       expect.stringContaining('获取仓库文件列表失败'),

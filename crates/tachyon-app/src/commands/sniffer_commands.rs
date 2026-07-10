@@ -1,4 +1,5 @@
 use tachyon_sniffer::SnifferResource;
+use tachyon_sniffer::capture::CaptureConfig;
 
 use super::{AppError, AppState};
 
@@ -24,15 +25,48 @@ pub async fn add_sniffer_filter(
 #[tauri::command]
 pub async fn add_sniffer_resource(
     state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     url: String,
 ) -> Result<(), AppError> {
-    state.service.sniffer_service.add_resource(url).await;
+    if let Some(resource) = state.service.sniffer_service.add_resource(url).await {
+        use tauri::Emitter;
+        let _ = app_handle.emit("sniffer://resource-added", &resource);
+    }
+    Ok(())
+}
+
+/// 设置嗅探捕获配置(类型白名单、最小文件大小、URL 过滤器)
+#[tauri::command]
+pub async fn set_sniffer_capture_config(
+    state: tauri::State<'_, AppState>,
+    config: CaptureConfig,
+) -> Result<(), AppError> {
+    state
+        .service
+        .sniffer_service
+        .set_capture_config(config)
+        .await;
+    Ok(())
+}
+
+/// 获取当前嗅探捕获配置
+#[tauri::command]
+pub async fn get_sniffer_capture_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<CaptureConfig, AppError> {
+    Ok(state.service.sniffer_service.capture_config().await)
+}
+
+/// 清空所有嗅探资源
+#[tauri::command]
+pub async fn clear_sniffer_resources(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    state.service.sniffer_service.clear_resources().await;
     Ok(())
 }
 
 /// 内部辅助:直接向嗅探器添加资源(供其他模块/测试调用,不经 Tauri 命令分发)
 pub async fn add_sniffer_resource_inner(state: &AppState, url: String) {
-    state.service.sniffer_service.add_resource(url).await
+    let _ = state.service.sniffer_service.add_resource(url).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,5 +194,39 @@ mod tests {
         assert_eq!(resource_type_to_string(ResourceType::Image), "image");
         assert_eq!(resource_type_to_string(ResourceType::Model), "model");
         assert_eq!(resource_type_to_string(ResourceType::Other), "other");
+    }
+
+    #[tokio::test]
+    async fn test_capture_config_round_trip() {
+        let state = test_state();
+        let mut cfg = state.service.sniffer_service.capture_config().await;
+        // 禁用 Video,提高 min_size
+        cfg.enabled_types.remove(&ResourceType::Video);
+        cfg.min_size = 10_000;
+        state
+            .service
+            .sniffer_service
+            .set_capture_config(cfg.clone())
+            .await;
+        let got = state.service.sniffer_service.capture_config().await;
+        assert!(!got.enabled_types.contains(&ResourceType::Video));
+        assert_eq!(got.min_size, 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_clear_sniffer_resources() {
+        let state = test_state();
+        add_sniffer_resource_inner(&state, "http://example.com/a.mp4".to_string()).await;
+        add_sniffer_resource_inner(&state, "http://example.com/b.mp3".to_string()).await;
+        assert_eq!(state.service.sniffer_service.get_resources().await.len(), 2);
+        state.service.sniffer_service.clear_resources().await;
+        assert!(
+            state
+                .service
+                .sniffer_service
+                .get_resources()
+                .await
+                .is_empty()
+        );
     }
 }

@@ -7,6 +7,7 @@ import {
   platformKeys,
   type ShortcutGroup,
 } from "../commands/shortcuts";
+import { getShortcutKeys } from "../stores/shortcuts";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr, type MessageKey } from "../i18n";
 
@@ -51,7 +52,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
         aria-modal="true"
         aria-labelledby="shortcut-help-title"
         tabindex={-1}
-        class="fixed z-[220] flex flex-col panel-surface"
+        class="fixed z-[var(--z-panel-content)] flex flex-col panel-surface"
         style={{
           top: "50%",
           left: "50%",
@@ -89,7 +90,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
         </div>
 
         {/* 快捷键分组列表 */}
-        <div class="flex-1 overflow-y-auto" style={{ padding: "8px 0" }}>
+        <div class="flex-1 scroll-container" style={{ padding: "8px 0" }}>
           <For each={groupOrder}>
             {(gkey) => (
               <Show when={groups()[gkey].length > 0}>
@@ -115,7 +116,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
                         {t(s.labelKey)}
                       </span>
                       <span class="flex items-center gap-1">
-                        <For each={platformKeys(s.keys, isMac)}>
+                        <For each={platformKeys(getShortcutKeys(s.labelKey), isMac)}>
                           {(key) => (
                             <kbd
                               class="mono rounded px-1.5 py-0.5"

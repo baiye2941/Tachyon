@@ -112,7 +112,7 @@ export default function TitleBar() {
 
   return (
     <div
-      class="flex items-center justify-between select-none relative z-50"
+      class="flex items-center justify-between select-none relative z-[var(--z-sticky)]"
       style={{
         height: '36px',
         background: 'var(--color-bg-primary)',

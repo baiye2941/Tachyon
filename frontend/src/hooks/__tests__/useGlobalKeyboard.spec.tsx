@@ -1,48 +1,132 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent } from '@solidjs/testing-library'
-import { useGlobalKeyboard } from '../useGlobalKeyboard'
-import { openNewTaskModal } from '../../stores/ui'
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { render, cleanup, fireEvent } from "@solidjs/testing-library";
+import { useGlobalKeyboard } from "../useGlobalKeyboard";
+import {
+  openNewTaskModal,
+  openCommandPalette,
+  openShortcutHelp,
+  toggleSidebar,
+  openView,
+} from "../../stores/ui";
+import { pauseAll, resumeAll } from "../../stores/batchActions";
+import { resetAllShortcuts } from "../../stores/shortcuts";
 
-vi.mock('../../stores/ui', () => ({
+vi.mock("../../stores/ui", () => ({
   openNewTaskModal: vi.fn(),
-  toggleCommandPalette: vi.fn(),
-  toggleShortcutHelp: vi.fn(),
+  openCommandPalette: vi.fn(),
+  openShortcutHelp: vi.fn(),
   toggleSidebar: vi.fn(),
-}))
+  openView: vi.fn(),
+  $ui: {
+    commandPaletteOpen: () => false,
+    shortcutHelpOpen: () => false,
+  },
+}));
+
+vi.mock("../../stores/batchActions", () => ({
+  pauseAll: vi.fn(),
+  resumeAll: vi.fn(),
+}));
 
 function TestHarness() {
-  useGlobalKeyboard()
-  return <input aria-label="url" />
+  useGlobalKeyboard();
+  return <input aria-label="url" />;
 }
 
-describe('useGlobalKeyboard', () => {
+describe("useGlobalKeyboard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    resetAllShortcuts();
+  });
+
   afterEach(() => {
-    cleanup()
-    vi.clearAllMocks()
-  })
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
-  it('Ctrl+N 打开新建下载', () => {
-    render(() => <TestHarness />)
+  it("Ctrl+N 打开新建下载", () => {
+    render(() => <TestHarness />);
 
-    fireEvent.keyDown(window, { key: 'n', ctrlKey: true })
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
 
-    expect(openNewTaskModal).toHaveBeenCalledTimes(1)
-  })
+    expect(openNewTaskModal).toHaveBeenCalledTimes(1);
+  });
 
-  it('Cmd+N 打开新建下载', () => {
-    render(() => <TestHarness />)
+  it("Cmd+N 在 macOS 下打开新建下载", () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    render(() => <TestHarness />);
 
-    fireEvent.keyDown(window, { key: 'N', metaKey: true })
+    fireEvent.keyDown(window, { key: "N", metaKey: true });
 
-    expect(openNewTaskModal).toHaveBeenCalledTimes(1)
-  })
+    expect(openNewTaskModal).toHaveBeenCalledTimes(1);
+  });
 
-  it('输入框内 Ctrl+N 不拦截编辑行为', () => {
-    render(() => <TestHarness />)
-    const input = document.querySelector('input')!
+  it("输入框内 Ctrl+N 不拦截编辑行为", () => {
+    render(() => <TestHarness />);
+    const input = document.querySelector("input")!;
 
-    fireEvent.keyDown(input, { key: 'n', ctrlKey: true })
+    fireEvent.keyDown(input, { key: "n", ctrlKey: true });
 
-    expect(openNewTaskModal).not.toHaveBeenCalled()
-  })
-})
+    expect(openNewTaskModal).not.toHaveBeenCalled();
+  });
+
+  it("Ctrl+K 打开命令面板", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    expect(openCommandPalette).toHaveBeenCalledTimes(1);
+  });
+
+  it("Windows 平台 Ctrl+K 命中且 Meta+K 不命中", () => {
+    vi.stubGlobal("navigator", { platform: "Win32" });
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(openCommandPalette).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    expect(openCommandPalette).toHaveBeenCalledTimes(1);
+  });
+
+  it("Ctrl+B 切换侧边栏", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+
+    expect(toggleSidebar).toHaveBeenCalledTimes(1);
+  });
+
+  it("Ctrl+Shift+P 暂停全部任务", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true });
+
+    expect(pauseAll).toHaveBeenCalledTimes(1);
+  });
+
+  it("Ctrl+Shift+R 恢复全部任务", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "R", ctrlKey: true, shiftKey: true });
+
+    expect(resumeAll).toHaveBeenCalledTimes(1);
+  });
+
+  it("Ctrl+, 打开设置视图", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    expect(openView).toHaveBeenCalledWith("settings");
+  });
+
+  it("? 打开快捷键帮助", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "?" });
+
+    expect(openShortcutHelp).toHaveBeenCalledTimes(1);
+  });
+});

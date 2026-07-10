@@ -230,7 +230,7 @@ export default function ContextMenu(props: ContextMenuProps) {
   return (
     <Show when={props.visible && props.task}>
       <div
-        class="fixed inset-0 z-[150]"
+        class="fixed inset-0 z-[var(--z-context-menu-backdrop)]"
         style={{ background: "transparent" }}
         onClick={() => props.onClose()}
         aria-hidden="true"
@@ -239,7 +239,7 @@ export default function ContextMenu(props: ContextMenuProps) {
         ref={menuRef}
         role="menu"
         aria-orientation="vertical"
-        class="fixed z-[160]"
+        class="fixed z-[var(--z-context-menu)]"
         style={{
           left: `${adjustedPos().x}px`,
           top: `${adjustedPos().y}px`,

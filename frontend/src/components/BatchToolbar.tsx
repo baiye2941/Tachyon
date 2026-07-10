@@ -1,6 +1,6 @@
 import { Show, onMount, onCleanup } from 'solid-js'
 import { selectedCount, hasSelection, deselectAll, selectAll } from '../stores/selection'
-import { $tasks } from '../stores/downloads'
+import { $taskFilter } from '../stores/taskFilter'
 import { Icon } from '../utils/icons'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
@@ -14,7 +14,7 @@ interface BatchToolbarProps {
 export default function BatchToolbar(props: BatchToolbarProps) {
   const count = () => selectedCount()
   const visible = () => hasSelection()
-  const taskIds = () => $tasks.get().map(t => t.id)
+  const taskIds = () => $taskFilter.filteredTasks().map(t => t.id)
 
   onMount(() => {
     const handler = (e: KeyboardEvent) => {
@@ -42,7 +42,7 @@ export default function BatchToolbar(props: BatchToolbarProps) {
       <div
         role="toolbar"
         aria-label={tr("batch.aria")}
-        class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 px-3 py-2 rounded-lg panel-surface"
+        class="fixed bottom-3 left-1/2 -translate-x-1/2 z-[var(--z-dropdown)] flex items-center gap-1 px-3 py-2 rounded-lg panel-surface"
         style={{
           'box-shadow': 'var(--shadow-lg)',
           animation: 'card-fade-in 200ms var(--ease-emphasized) forwards',

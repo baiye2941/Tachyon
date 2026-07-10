@@ -36,6 +36,7 @@ import { refreshTaskList } from "../stores/downloads";
 import { addToast } from "../stores/toast";
 import { requestConfirm } from "../stores/confirm";
 import { clearTaskHistory } from "../stores/taskSpeedHistory";
+import { Motion } from "@motionone/solid";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -132,11 +133,15 @@ export default function DetailPanel(props: DetailPanelProps) {
     }
   });
 
-  // task 变化时按需加载分片数据(DetailPanel 打开/task 切换)
+  // task 变化时按需加载分片数据(DetailPanel 打开/task 切换/PlanComplete)
+  // 仅当 fragmentsTotal > 0 且 store 中尚无有效数据时拉取,
+  // 避免探测阶段(total=0)缓存空数据导致 PlanComplete 后无法重拉。
   createEffect(() => {
     const task = props.task;
     if (!task) return;
-    if (getTaskFragmentData(task.id)) return; // 已有数据,不重复拉
+    if (task.fragmentsTotal === 0) return;
+    const fragData = getTaskFragmentData(task.id);
+    if (fragData && fragData.total > 0) return; // 已有有效数据,不重复拉
     loadTaskFragments(task.id);
   });
 
@@ -425,29 +430,39 @@ export default function DetailPanel(props: DetailPanelProps) {
           z-70:高于 Toolbar z-2 / BatchToolbar z-50,低于 CommandPalette z-100 与模态遮罩 z-200+ */}
       <Show when={visible()}>
         <div
-          class="absolute inset-0 z-[70] detail-scrim"
+          class="absolute inset-0 z-[var(--z-detail-panel)] detail-scrim"
           onClick={() => props.onClose()}
         />
       </Show>
       {/* 详情面板:覆盖 main 区,从右滑入。z-80:高于遮罩 z-70。
           统一 absolute inset-0(废弃宽屏 grid 列模式),窄屏宽屏同为覆盖式,
           宽屏居中限宽,窄屏全宽。 */}
-      <div
+      <Motion.div
         class="detail-panel"
         classList={{ "detail-panel--narrow": isNarrow() }}
-        style={{
-          transform: visible()
-            ? "translateX(0) scale(1)"
-            : "translateX(100%) scale(0.98)",
-          opacity: visible() ? 1 : 0.92,
-        }}
+        initial={{ opacity: 0.92, x: "100%", scale: 0.98 }}
+        animate={
+          visible()
+            ? { opacity: 1, x: 0, scale: 1 }
+            : { opacity: 0.92, x: "100%", scale: 0.98 }
+        }
+        transition={
+          reducedMotion()
+            ? { duration: 0 }
+            : {
+                type: "spring",
+                stiffness: 300,
+                damping: 30,
+                mass: 0.8,
+              }
+        }
       >
         <div
           ref={panelContentRef}
           role="complementary"
           aria-label={t("detail.aria")}
           tabIndex={isNarrow() ? -1 : undefined}
-          class="detail-panel-content flex flex-col h-full overflow-y-auto overflow-x-hidden"
+          class="detail-panel-content flex flex-col h-full scroll-container overflow-x-hidden"
         >
           <div class="panel-header">
             <div class="flex items-center gap-2 min-w-0 flex-1">
@@ -878,7 +893,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             </Button>
           </div>
         </div>
-      </div>
+      </Motion.div>
     </Show>
   );
 }

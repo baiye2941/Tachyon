@@ -112,7 +112,7 @@ function CategorySection(props: {
             'flex-shrink': 0,
           }}
         >
-          {count()} 个文件
+          {tr("hub.fileTree.fileCount", { count: count() })}
         </span>
       </button>
 

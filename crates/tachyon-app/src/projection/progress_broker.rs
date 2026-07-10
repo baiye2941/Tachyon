@@ -18,6 +18,7 @@ use tokio::sync::watch;
 
 use crate::commands::{ProgressEvent, TaskProgress};
 use crate::repository::TaskRepository;
+use crate::runtime::chunk_reader_pool::ProgressDelta;
 
 /// 聚合扫描间隔（毫秒）
 const AGGREGATOR_INTERVAL_MS: u64 = 250;
@@ -34,12 +35,14 @@ pub struct ProgressBroker {
     task_repository: TaskRepository,
     /// aggregator 是否已 spawn（幂等防护）
     aggregator_spawned: AtomicBool,
-    /// Dirty task IDs — set by ChunkReaderPool when progress changes
+    /// Dirty task IDs - set by ChunkReaderPool when progress changes
     dirty_tasks: Arc<DashSet<String>>,
     /// Notify to wake aggregator
     notify: Arc<Notify>,
     /// 每任务本周期新完成分片索引增量
-    pub(crate) pending_deltas: Arc<DashMap<String, Vec<u32>>>,
+    pub(crate) pending_completed: Arc<DashMap<String, Vec<u32>>>,
+    /// 每任务本周期新开始下载分片索引增量
+    pub(crate) pending_started: Arc<DashMap<String, Vec<u32>>>,
 }
 
 impl ProgressBroker {
@@ -56,7 +59,8 @@ impl ProgressBroker {
             aggregator_spawned: AtomicBool::new(false),
             dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
-            pending_deltas: Arc::new(DashMap::new()),
+            pending_completed: Arc::new(DashMap::new()),
+            pending_started: Arc::new(DashMap::new()),
         }
     }
 
@@ -73,7 +77,8 @@ impl ProgressBroker {
         let task_repository_ref = self.task_repository.clone();
         let dirty_tasks = self.dirty_tasks.clone();
         let notify = self.notify.clone();
-        let pending_deltas = self.pending_deltas.clone();
+        let pending_completed = self.pending_completed.clone();
+        let pending_started = self.pending_started.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
@@ -96,7 +101,11 @@ impl ProgressBroker {
                 // 通过 DashMap 的 get_mut 直接写入,不会触发 TaskRepository::version() 递增,
                 // 因此不能用 version 做短路,否则下载期间的进度更新永远无法广播。
                 // 下游 compute_progress_delta 会按值过滤掉无变化任务,保证前端不会收到冗余数据。
-                let event = build_progress_event(&task_repository_ref, &pending_deltas);
+                let event = build_progress_event(
+                    &task_repository_ref,
+                    &pending_completed,
+                    &pending_started,
+                );
                 let _ = tx.send(event);
 
                 // Clear dirty set after building event
@@ -116,7 +125,8 @@ impl ProgressBroker {
             aggregator_spawned: AtomicBool::new(false),
             dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
-            pending_deltas: Arc::new(DashMap::new()),
+            pending_completed: Arc::new(DashMap::new()),
+            pending_started: Arc::new(DashMap::new()),
         }
     }
 
@@ -127,13 +137,14 @@ impl ProgressBroker {
         self.notify.notify_one();
     }
 
-    /// 标记任务进度变化,并记录新完成的分片索引
-    pub fn mark_dirty_with_delta(&self, task_id: &str, delta_idx: Option<u32>) {
-        if let Some(idx) = delta_idx {
-            self.pending_deltas
-                .entry(task_id.to_string())
-                .or_default()
-                .push(idx);
+    /// 标记任务进度变化,并记录分片状态变更增量(started/completed)
+    pub fn mark_dirty_with_delta(&self, task_id: &str, delta: Option<ProgressDelta>) {
+        if let Some(d) = delta {
+            let (map, idx) = match d {
+                ProgressDelta::Started(idx) => (&self.pending_started, idx),
+                ProgressDelta::Completed(idx) => (&self.pending_completed, idx),
+            };
+            map.entry(task_id.to_string()).or_default().push(idx);
         }
         self.dirty_tasks.insert(task_id.to_string());
         self.notify.notify_one();
@@ -144,7 +155,11 @@ impl ProgressBroker {
     /// 扫描当前所有任务状态，构建全量 ProgressEvent 并立即发送。
     /// 不依赖 aggregator 定时器，确保终态变更被即时传播。
     pub fn broadcast_all(&self) {
-        let event = build_progress_event(&self.task_repository, &self.pending_deltas);
+        let event = build_progress_event(
+            &self.task_repository,
+            &self.pending_completed,
+            &self.pending_started,
+        );
         let _ = self.progress_tx.send(event);
     }
 
@@ -164,14 +179,19 @@ impl ProgressBroker {
 /// 根据任务列表构建全量进度事件
 fn build_progress_event(
     task_repository: &TaskRepository,
-    pending_deltas: &DashMap<String, Vec<u32>>,
+    pending_completed: &DashMap<String, Vec<u32>>,
+    pending_started: &DashMap<String, Vec<u32>>,
 ) -> ProgressEvent {
     task_repository
         .iter()
         .map(|r| {
             let id = r.key();
             let t = r.value();
-            let completed_delta = pending_deltas
+            let completed_delta = pending_completed
+                .get_mut(id)
+                .map(|mut d| std::mem::take(&mut *d))
+                .unwrap_or_default();
+            let started_delta = pending_started
                 .get_mut(id)
                 .map(|mut d| std::mem::take(&mut *d))
                 .unwrap_or_default();
@@ -188,6 +208,7 @@ fn build_progress_event(
                     active_concurrency: t.active_concurrency,
                     file_size: t.file_size,
                     completed_delta,
+                    started_delta,
                 },
             )
         })
@@ -211,8 +232,9 @@ mod tests {
     #[test]
     fn test_build_progress_event_empty() {
         let repository = make_test_repository();
-        let deltas = DashMap::new();
-        let event = build_progress_event(&repository, &deltas);
+        let completed = DashMap::new();
+        let started = DashMap::new();
+        let event = build_progress_event(&repository, &completed, &started);
         assert!(event.is_empty());
     }
 
@@ -262,7 +284,7 @@ mod tests {
             },
         );
 
-        let event = build_progress_event(&repository, &DashMap::new());
+        let event = build_progress_event(&repository, &DashMap::new(), &DashMap::new());
         assert_eq!(event.len(), 2);
 
         let tp1 = event.get("t1").unwrap();

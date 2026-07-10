@@ -1,4 +1,4 @@
-import type { ProgressEvent } from '../types'
+import type { ProgressEvent, SnifferResource, ClipboardUrlDetected } from '../types'
 
 type UnlistenFn = () => void
 
@@ -25,6 +25,32 @@ export async function onRecoveryWarning(
   try {
     const { listen } = await import('@tauri-apps/api/event')
     const unlisten = await listen<RecoveryWarningPayload>('recovery-warning', (e) => handler(e.payload))
+    return unlisten
+  } catch {
+    return () => {}
+  }
+}
+
+/** 监听新嗅探资源事件(手动添加或未来 adapter 注入时触发) */
+export async function onSnifferResourceAdded(
+  handler: (payload: SnifferResource) => void,
+): Promise<UnlistenFn> {
+  try {
+    const { listen } = await import('@tauri-apps/api/event')
+    const unlisten = await listen<SnifferResource>('sniffer://resource-added', (e) => handler(e.payload))
+    return unlisten
+  } catch {
+    return () => {}
+  }
+}
+
+/** 监听剪贴板 URL 检测事件(后端轮询发现可下载 URL 时触发) */
+export async function onClipboardUrlDetected(
+  handler: (payload: ClipboardUrlDetected) => void,
+): Promise<UnlistenFn> {
+  try {
+    const { listen } = await import('@tauri-apps/api/event')
+    const unlisten = await listen<ClipboardUrlDetected>('clipboard://url-detected', (e) => handler(e.payload))
     return unlisten
   } catch {
     return () => {}

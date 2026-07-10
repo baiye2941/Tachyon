@@ -1,0 +1,38 @@
+
+/* ============================================
+   Context Menu(右键菜单 / 更多菜单统一风格)
+   ============================================ */
+.context-menu-item {
+  color: var(--color-text-title);
+  background: transparent;
+  border-radius: 6px;
+  transition:
+    color 150ms ease,
+    background 150ms ease,
+    transform 100ms ease;
+}
+.context-menu-item:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.context-menu-item:focus-visible {
+  outline: none;
+  background: var(--color-accent-soft);
+  color: var(--color-accent-secondary);
+  box-shadow: inset 0 0 0 1px var(--color-accent-glow);
+}
+.context-menu-item:active {
+  transform: scale(0.98);
+}
+.context-menu-item--danger {
+  color: var(--color-status-error);
+}
+.context-menu-item--danger:hover {
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+}
+.context-menu-item--danger:focus-visible {
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-error) 35%, transparent);
+}
+

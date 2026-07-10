@@ -1,6 +1,8 @@
 import { createSignal, Show, For, createMemo, type JSX } from "solid-js";
+import { Motion, Presence } from "@motionone/solid";
 import { Icon } from "../utils/icons";
-import type { ViewName } from "../types";
+import type { ViewName, TaskInfo } from "../types";
+import { useReducedMotion } from "../hooks/useReducedMotion";
 import {
   COMMANDS,
   GROUP_LABEL_KEYS,
@@ -10,19 +12,65 @@ import {
 } from "../commands/registry";
 import { fuzzySearch } from "../utils/fuzzySearch";
 import { tr, type MessageKey } from "../i18n";
+import {
+  $recent,
+  $pinned,
+  addRecentCommand,
+  togglePinnedCommand,
+  isPinned,
+} from "../stores/commandHistory";
+import { getCommandShortcutKeys, getShortcutKeys } from "../stores/shortcuts";
+import { platformKeys } from "../commands/shortcuts";
 
-interface CommandPaletteProps {
+const GROUP_LABEL_KEYS_EXTENDED = {
+  ...GROUP_LABEL_KEYS,
+  pinned: "commandGroup.pinned",
+  recent: "commandGroup.recent",
+} as const satisfies Record<string, MessageKey>;
+
+/** 命令项右侧 shortcut badge:从 shortcuts store 读取当前绑定,并做平台适配 */
+function ShortcutBadge(props: { commandId: string; isMac: boolean }) {
+  const keys = createMemo(() => getCommandShortcutKeys(props.commandId));
+  const displayKeys = createMemo(() =>
+    keys() ? platformKeys(keys()!, props.isMac) : undefined,
+  );
+  return (
+    <Show when={displayKeys()} keyed>
+      {(k) =>
+        k.length > 0 ? (
+          <span class="cmd-item-shortcut">
+            <For each={k}>
+              {(key) => <kbd>{key}</kbd>}
+            </For>
+          </span>
+        ) : null
+      }
+    </Show>
+  );
+}
+
+export interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
   onViewChange: (view: ViewName) => void;
   onNewDownload?: () => void;
   onPauseAll?: () => void;
   onResumeAll?: () => void;
+  onCancelAll?: () => void;
+  onClearCompleted?: () => void;
   onToggleSidebar?: () => void;
   /** 任务搜索数据源(spec 8.6) */
   getTasks?: () => { id: string; fileName: string; url: string }[];
   /** 选中任务后打开详情 */
   onOpenTask?: (taskId: string) => void;
+  /** 当前选中的任务(任务级操作命令上下文) */
+  getSelectedTask?: () => TaskInfo | null;
+  /** 打开选中任务的保存目录 */
+  onOpenTaskFolder?: (taskId: string) => void;
+  /** 重新下载选中任务 */
+  onRedownloadTask?: (taskId: string) => void;
+  /** 复制文本到剪贴板 */
+  onCopyToClipboard?: (text: string) => void;
 }
 
 /** 高亮匹配字符:根据 matchedIndices 在 label 中包裹 <mark> */
@@ -43,21 +91,39 @@ function highlight(text: string, indices: number[]): JSX.Element {
     }
   }
   if (buf) out.push(buf);
-  return out.map((p) =>
-    typeof p === "string" ? p : <mark>{p.mark}</mark>,
-  ) as unknown as JSX.Element;
+  return (
+    <For each={out}>
+      {(p) => (typeof p === "string" ? p : <mark>{p.mark}</mark>)}
+    </For>
+  ) as JSX.Element;
 }
+
+type DisplayItem = {
+  key: string;
+  cmd: Command;
+  indices: number[];
+  taskFileName?: string;
+};
+
+type SectionKey = "pinned" | "recent" | CommandGroup;
+
+type Section = {
+  key: SectionKey;
+  label: MessageKey;
+  items: DisplayItem[];
+};
 
 export default function CommandPalette(props: CommandPaletteProps) {
   let inputRef: HTMLInputElement | undefined;
   let listRef: HTMLDivElement | undefined;
   const t = (key: MessageKey) => tr(key);
+  const reducedMotion = useReducedMotion();
+  const isMac =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad/.test(navigator.platform);
   const [query, setQuery] = createSignal("");
   const [activeIndex, setActiveIndex] = createSignal(0);
 
-  // CommandContext:从 props 注入,registry 命令通过它执行(不捕获 props)。
-  // 用 getter 惰性读取,保持响应式 + 满足 solid/reactivity 规则(props 在
-  // 事件处理器内通过 getter 访问,而非组件体顶层立即求值)。
   const ctx: CommandContext = {
     get onViewChange() {
       return props.onViewChange;
@@ -74,6 +140,12 @@ export default function CommandPalette(props: CommandPaletteProps) {
     get onResumeAll() {
       return props.onResumeAll;
     },
+    get onCancelAll() {
+      return props.onCancelAll;
+    },
+    get onClearCompleted() {
+      return props.onClearCompleted;
+    },
     get onToggleSidebar() {
       return props.onToggleSidebar;
     },
@@ -83,17 +155,30 @@ export default function CommandPalette(props: CommandPaletteProps) {
     get onOpenTask() {
       return props.onOpenTask;
     },
+    get getSelectedTask() {
+      return props.getSelectedTask;
+    },
+    get onOpenTaskFolder() {
+      return props.onOpenTaskFolder;
+    },
+    get onRedownloadTask() {
+      return props.onRedownloadTask;
+    },
+    get onCopyToClipboard() {
+      return props.onCopyToClipboard;
+    },
   };
 
-  // fuzzy 搜索(子序列匹配 + 评分排序),替换原 includes。
-  // 搜索文本用当前语言翻译后的 label/hint,保证用户输入中文可命中。
-  // 任务搜索(spec 8.6):将匹配的任务包装为合成 Command(id 前缀 task-open:),
-  // 归入 task 分组,选中后调用 onOpenTask 打开任务详情。
+  const visibleCommands = createMemo(() =>
+    COMMANDS.filter((c) => (c.visible ? c.visible(ctx) : true)),
+  );
+
   const commandResults = createMemo(() =>
     fuzzySearch(
-      COMMANDS,
+      visibleCommands(),
       query(),
-      (c) => `${t(c.labelKey)} ${c.hintKey ? t(c.hintKey) : ""}`,
+      (c) =>
+        `${t(c.labelKey)} ${c.hintKey ? t(c.hintKey) : ""} ${(c.aliases ?? []).join(" ")}`,
     ).map((r) => ({
       item: r.item,
       score: r.score,
@@ -113,7 +198,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
       const task = r.item;
       const synthetic: Command = {
         id: `task-open:${task.id}`,
-        labelKey: "command.task.openTask" as MessageKey,
+        labelKey: "command.task.openTask",
         group: "task",
         icon: "list-bullet",
         run: (c) => {
@@ -130,44 +215,102 @@ export default function CommandPalette(props: CommandPaletteProps) {
     });
   });
 
-  // 合并命令 + 任务结果,按 score 降序(分数越高越靠前)
-  const results = createMemo(() => {
+  const groupOrder: CommandGroup[] = ["navigation", "task", "action"];
+
+  const sections = createMemo((): Section[] => {
+    if (query().trim().length === 0) {
+      const pinnedIds = new Set($pinned);
+      const recentIds = new Set($recent);
+
+      const pinnedItems: DisplayItem[] = $pinned
+        .map((id) => visibleCommands().find((c) => c.id === id))
+        .filter((c): c is Command => !!c)
+        .map((cmd) => ({ key: `pinned:${cmd.id}`, cmd, indices: [] }));
+
+      const recentItems: DisplayItem[] = $recent
+        .filter((id) => !pinnedIds.has(id))
+        .map((id) => visibleCommands().find((c) => c.id === id))
+        .filter((c): c is Command => !!c)
+        .map((cmd) => ({ key: `recent:${cmd.id}`, cmd, indices: [] }));
+
+      const out: Section[] = [];
+      if (pinnedItems.length > 0) {
+        out.push({
+          key: "pinned",
+          label: GROUP_LABEL_KEYS_EXTENDED.pinned,
+          items: pinnedItems,
+        });
+      }
+      if (recentItems.length > 0) {
+        out.push({
+          key: "recent",
+          label: GROUP_LABEL_KEYS_EXTENDED.recent,
+          items: recentItems,
+        });
+      }
+
+      for (const g of groupOrder) {
+        const items = visibleCommands()
+          .filter((c) => c.group === g && !pinnedIds.has(c.id) && !recentIds.has(c.id))
+          .map((cmd) => ({ key: `${g}:${cmd.id}`, cmd, indices: [] }));
+        if (items.length > 0) {
+          out.push({ key: g, label: GROUP_LABEL_KEYS[g], items });
+        }
+      }
+      return out;
+    }
+
     const merged = [...commandResults(), ...taskResults()];
     merged.sort((a, b) => b.score - a.score);
-    return merged;
-  });
 
-  // 按分组聚合(保持 fuzzy score 排序内的分组)
-  // taskFileName:任务条目用文件名作为可搜索 label(合成 Command 的 labelKey 仅作占位)
-  const grouped = createMemo(() => {
-    const items = results();
-    const byGroup: Record<
-      CommandGroup,
-      { cmd: Command; indices: number[]; taskFileName?: string }[]
-    > = {
+    const byGroup: Record<CommandGroup, DisplayItem[]> = {
       navigation: [],
       action: [],
       task: [],
     };
-    for (const r of items) {
+    for (const r of merged) {
       byGroup[r.item.group].push({
+        key: `${r.item.group}:${r.item.id}:${r.taskFileName ?? ""}`,
         cmd: r.item,
         indices: r.matchedIndices,
         taskFileName: r.taskFileName,
       });
     }
-    return byGroup;
+    return groupOrder
+      .map((g) => ({
+        key: g,
+        label: GROUP_LABEL_KEYS[g],
+        items: byGroup[g],
+      }))
+      .filter((s) => s.items.length > 0);
   });
 
-  const groupOrder: CommandGroup[] = ["navigation", "task", "action"];
+  const flattened = createMemo(() => sections().flatMap((s) => s.items));
 
-  // 执行当前选中项(按扁平 results 的 activeIndex)
-  function executeActive() {
-    const items = results();
-    const idx = activeIndex();
-    if (idx >= 0 && idx < items.length) {
-      items[idx]?.item.run(ctx);
+  const indexByKey = createMemo(() => {
+    const map = new Map<string, number>();
+    flattened().forEach((it, i) => map.set(it.key, i));
+    return map;
+  });
+
+  const easterEgg = createMemo(() => {
+    const q = query().trim().toLowerCase();
+    if (q === "uma") return t("commandPalette.easterEgg.uma");
+    if (q === "tachyon") return t("commandPalette.easterEgg.tachyon");
+    return null;
+  });
+
+  function executeItem(item: DisplayItem) {
+    if (!item.taskFileName) {
+      addRecentCommand(item.cmd.id);
     }
+    item.cmd.run(ctx);
+  }
+
+  function executeActive() {
+    const item = flattened()[activeIndex()];
+    if (!item) return;
+    executeItem(item);
   }
 
   function scrollActiveIntoView() {
@@ -177,6 +320,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
 
   function handleKeyDown(e: KeyboardEvent) {
     if (!props.open) return;
+    const total = flattened().length;
     switch (e.key) {
       case "Escape":
         e.preventDefault();
@@ -184,23 +328,24 @@ export default function CommandPalette(props: CommandPaletteProps) {
         break;
       case "ArrowDown":
         e.preventDefault();
-        setActiveIndex((i) => {
-          const total = results().length;
-          return total === 0 ? 0 : (i + 1) % total;
-        });
+        setActiveIndex((i) => (total === 0 ? 0 : (i + 1) % total));
         scrollActiveIntoView();
         break;
       case "ArrowUp":
         e.preventDefault();
-        setActiveIndex((i) => {
-          const total = results().length;
-          return total === 0 ? 0 : (i - 1 + total) % total;
-        });
+        setActiveIndex((i) => (total === 0 ? 0 : (i - 1 + total) % total));
         scrollActiveIntoView();
         break;
       case "Enter":
         e.preventDefault();
-        executeActive();
+        if (e.shiftKey) {
+          const item = flattened()[activeIndex()];
+          if (item && !item.taskFileName) {
+            togglePinnedCommand(item.cmd.id);
+          }
+        } else {
+          executeActive();
+        }
         break;
     }
   }
@@ -212,155 +357,191 @@ export default function CommandPalette(props: CommandPaletteProps) {
   }
 
   return (
-    <Show when={props.open}>
-      <div
-        class="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh] px-4"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("commandPalette.aria")}
-        style={{
-          background: "var(--color-overlay-scrim)",
-          "backdrop-filter": "blur(8px)",
-        }}
-        onClick={handleOverlayClick}
-        onKeyDown={handleKeyDown}
-        ref={() => {
-          requestAnimationFrame(() => inputRef?.focus());
-        }}
-      >
+    <Presence>
+      <Show when={props.open}>
         <div
-          class="cmd-panel flex flex-col"
-          onClick={(e) => e.stopPropagation()}
+          class="fixed inset-0 z-[var(--z-command-palette)] flex items-start justify-center pt-[15vh] px-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t("commandPalette.aria")}
+          style={{
+            background: "var(--color-overlay-scrim)",
+          }}
+          onClick={handleOverlayClick}
+          onKeyDown={handleKeyDown}
+          ref={() => {
+            requestAnimationFrame(() => inputRef?.focus());
+          }}
         >
-          {/* 搜索输入区 */}
-          <div class="cmd-input-wrap">
-            <span class="cmd-item-icon">
-              <Icon name="magnifying-glass" class="w-5 h-5" />
-            </span>
-            <input
-              ref={inputRef}
-              type="text"
-              role="combobox"
-              aria-expanded="true"
-              aria-controls="cmd-palette-listbox"
-              aria-autocomplete="list"
-              aria-activedescendant={
-                results().length > 0 ? `cmd-opt-${activeIndex()}` : undefined
-              }
-              class="cmd-input"
-              placeholder={t("commandPalette.searchPlaceholder")}
-              value={query()}
-              onInput={(e) => {
-                setQuery(e.currentTarget.value);
-                setActiveIndex(0);
-              }}
-              autofocus
-            />
-            <span class="cmd-esc-hint">Esc</span>
-          </div>
-
-          {/* 结果列表 */}
-          <div
-            ref={listRef}
-            id="cmd-palette-listbox"
-            class="cmd-list flex-1"
-            role="listbox"
-            aria-label={t("commandPalette.listAria")}
+          <Motion.div
+            class="cmd-panel flex flex-col"
+            initial={{ opacity: 0, y: -12, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -8, scale: 0.98 }}
+            transition={
+              reducedMotion()
+                ? { duration: 0 }
+                : {
+                    type: "spring",
+                    stiffness: 400,
+                    damping: 25,
+                  }
+            }
+            onClick={(e: MouseEvent) => e.stopPropagation()}
           >
-            <Show when={results().length === 0}>
-              <div class="cmd-empty">
-                <span class="cmd-empty-icon">
-                  <Icon name="magnifying-glass" class="w-5 h-5" />
-                </span>
-                <span style={{ "font-size": "13px" }}>
-                  {t("commandPalette.noResults")}
-                </span>
+            {/* 搜索输入区 */}
+            <div class="cmd-input-wrap">
+              <span class="cmd-item-icon">
+                <Icon name="magnifying-glass" class="w-5 h-5" />
+              </span>
+              <input
+                ref={inputRef}
+                type="text"
+                role="combobox"
+                aria-expanded="true"
+                aria-controls="cmd-palette-listbox"
+                aria-autocomplete="list"
+                aria-activedescendant={
+                  flattened().length > 0 ? `cmd-opt-${activeIndex()}` : undefined
+                }
+                class="cmd-input"
+                placeholder={t("commandPalette.searchPlaceholder")}
+                value={query()}
+                onInput={(e) => {
+                  setQuery(e.currentTarget.value);
+                  setActiveIndex(0);
+                }}
+                autofocus
+              />
+              <span class="cmd-esc-hint">Esc</span>
+            </div>
+
+            {/* Easter Egg 提示 */}
+            <Show when={easterEgg()}>
+              <div class="cmd-easter-egg">
+                <span class="cmd-easter-egg-icon">✦</span>
+                <span>{easterEgg()}</span>
               </div>
             </Show>
 
-            <For each={groupOrder}>
-              {(gkey) => (
-                <Show when={grouped()[gkey].length > 0}>
-                  <div class="cmd-group-label">{t(GROUP_LABEL_KEYS[gkey])}</div>
-                  <For each={grouped()[gkey]}>
-                    {(entry) => {
-                      const flatIndex = () =>
-                        results().findIndex((r) => r.item.id === entry.cmd.id);
-                      const isActive = () => activeIndex() === flatIndex();
-                      return (
-                        <button
-                          id={`cmd-opt-${flatIndex()}`}
-                          data-cmd-index={flatIndex()}
-                          class="cmd-item"
-                          onClick={() => entry.cmd.run(ctx)}
-                          onMouseEnter={() => setActiveIndex(flatIndex())}
-                          role="option"
-                          aria-selected={isActive()}
-                        >
-                          <span class="cmd-item-icon">
-                            <Icon name={entry.cmd.icon} class="w-5 h-5" />
-                          </span>
-                          <div class="cmd-item-text">
-                            <span class="cmd-item-title cmd-palette-mark">
-                              {entry.taskFileName
-                                ? highlight(entry.taskFileName, entry.indices)
-                                : highlight(
-                                    t(entry.cmd.labelKey),
-                                    entry.indices,
-                                  )}
+            {/* 结果列表 */}
+            <div
+              ref={listRef}
+              id="cmd-palette-listbox"
+              class="cmd-list flex-1 scroll-container"
+              role="listbox"
+              aria-label={t("commandPalette.listAria")}
+            >
+              <Show when={flattened().length === 0}>
+                <div class="cmd-empty">
+                  <span class="cmd-empty-icon">
+                    <Icon name="magnifying-glass" class="w-5 h-5" />
+                  </span>
+                  <span style={{ "font-size": "13px" }}>
+                    {t("commandPalette.noResults")}
+                  </span>
+                </div>
+              </Show>
+
+              <For each={sections()}>
+                {(section) => (
+                  <>
+                    <div class="cmd-group-label">{t(section.label)}</div>
+                    <For each={section.items}>
+                      {(entry) => {
+                        const globalIndex = () =>
+                          indexByKey().get(entry.key)!;
+                        const active = () => activeIndex() === globalIndex();
+                        return (
+                          <div
+                            id={`cmd-opt-${globalIndex()}`}
+                            data-cmd-index={globalIndex()}
+                            class="cmd-item"
+                            onClick={() => executeItem(entry)}
+                            onMouseEnter={() => setActiveIndex(globalIndex())}
+                            role="option"
+                            aria-selected={active()}
+                          >
+                            <span class="cmd-item-icon">
+                              <Icon name={entry.cmd.icon} class="w-5 h-5" />
                             </span>
-                            <Show
-                              when={entry.cmd.hintKey || entry.taskFileName}
-                            >
-                              <span class="cmd-item-hint">
+                            <div class="cmd-item-text">
+                              <span class="cmd-item-title cmd-palette-mark">
                                 {entry.taskFileName
-                                  ? t("command.task.openTask")
-                                  : t(entry.cmd.hintKey!)}
+                                  ? highlight(entry.taskFileName, entry.indices)
+                                  : highlight(t(entry.cmd.labelKey), entry.indices)}
                               </span>
+                              <Show when={entry.cmd.hintKey || entry.taskFileName}>
+                                <span class="cmd-item-hint">
+                                  {entry.taskFileName
+                                    ? t("command.task.openTask")
+                                    : t(entry.cmd.hintKey!)}
+                                </span>
+                              </Show>
+                            </div>
+                            {/* pin 按钮(仅真实命令,任务合成项不显示) */}
+                            <Show when={!entry.taskFileName}>
+                              <button
+                                type="button"
+                                class="cmd-item-pin"
+                                aria-label={
+                                  isPinned(entry.cmd.id)
+                                    ? t("commandPalette.unpinAria")
+                                    : t("commandPalette.pinAria")
+                                }
+                                onClick={(e: MouseEvent) => {
+                                  e.stopPropagation();
+                                  togglePinnedCommand(entry.cmd.id);
+                                }}
+                              >
+                                <Icon
+                                  name={isPinned(entry.cmd.id) ? "pin" : "pin-off"}
+                                  class="w-4 h-4"
+                                />
+                              </button>
                             </Show>
+                            {/* 快捷键提示(从配置读取,list 类无 commandId 不显示) */}
+                            <ShortcutBadge
+                              commandId={entry.cmd.id}
+                              isMac={isMac}
+                            />
                           </div>
-                          {/* 快捷键提示(若有) */}
-                          <Show when={entry.cmd.shortcut}>
-                            <span class="cmd-item-shortcut">
-                              <For each={entry.cmd.shortcut}>
-                                {(key) => <kbd>{key}</kbd>}
-                              </For>
-                            </span>
-                          </Show>
-                        </button>
-                      );
-                    }}
-                  </For>
-                </Show>
-              )}
-            </For>
-          </div>
+                        );
+                      }}
+                    </For>
+                  </>
+                )}
+              </For>
+            </div>
 
-          {/* a11y:屏幕阅读器播报结果计数,视觉隐藏 */}
-          <div aria-live="polite" role="status" class="sr-only">
-            {results().length > 0
-              ? `${results().length} ${t("commandPalette.listAria")}`
-              : t("commandPalette.noResults")}
-          </div>
+            {/* a11y:屏幕阅读器播报结果计数,视觉隐藏 */}
+            <div aria-live="polite" role="status" class="sr-only">
+              {flattened().length > 0
+                ? `${flattened().length} ${t("commandPalette.listAria")}`
+                : t("commandPalette.noResults")}
+            </div>
 
-          {/* 底部提示栏 */}
-          <div class="cmd-footer">
-            <span class="flex items-center gap-1">
-              <kbd>↑</kbd>
-              <kbd>↓</kbd>
-              {t("commandPalette.hintNav")}
-            </span>
-            <span class="flex items-center gap-1">
-              <kbd>Enter</kbd>
-              {t("commandPalette.hintExecute")}
-            </span>
-            <span class="flex items-center gap-1 ml-auto">
-              <kbd>Ctrl+/</kbd>
-              {t("commandPalette.hintAllShortcuts")}
-            </span>
-          </div>
+            {/* 底部提示栏 */}
+            <div class="cmd-footer">
+              <span class="flex items-center gap-1">
+                <kbd>↑</kbd>
+                <kbd>↓</kbd>
+                {t("commandPalette.hintNav")}
+              </span>
+              <span class="flex items-center gap-1">
+                <kbd>Enter</kbd>
+                {t("commandPalette.hintExecute")}
+              </span>
+              <span class="flex items-center gap-1 ml-auto">
+                <For each={platformKeys(getShortcutKeys("shortcut.shortcutHelp"), isMac)}>
+                  {(key) => <kbd>{key}</kbd>}
+                </For>
+                {t("commandPalette.hintAllShortcuts")}
+              </span>
+            </div>
+          </Motion.div>
         </div>
-      </div>
-    </Show>
+      </Show>
+    </Presence>
   );
 }

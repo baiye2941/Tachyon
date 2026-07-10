@@ -1,0 +1,158 @@
+/* ============================================
+   Task Row (premium feel: horizontal hover gradient + selected left 2px bamboo stripe + micro lift)
+   ============================================ */
+.task-row {
+  background: transparent;
+  box-shadow: inset 2px 0 0 transparent;
+  transition:
+    background 180ms var(--ease-standard),
+    box-shadow 180ms var(--ease-standard);
+  contain: layout paint;
+}
+
+.task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.025) 0%,
+    rgba(255, 255, 255, 0.012) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--selected {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 7%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 2%, transparent) 50%,
+    transparent 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
+}
+
+.task-row--selected:hover {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 11%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 4%, transparent) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--multi-selected {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 13%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 5%, transparent) 50%,
+    color-mix(in srgb, var(--color-accent-primary) 1%, transparent) 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
+}
+
+/* Row press: extremely subtle scale for haptic feedback without breaking list layout */
+.task-row:active {
+  transform: scale(0.995);
+}
+
+/* Light theme row hover: dark gradient for restrained visibility */
+[data-theme="light"] .task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.02) 0%,
+    rgba(0, 0, 0, 0.01) 50%,
+    transparent 100%
+  );
+}
+
+.task-row {
+  padding: 12px 16px;
+}
+
+.task-row--compact {
+  padding: 6px 16px;
+}
+
+.task-checkbox {
+  width: 20px;
+  height: 20px;
+}
+
+.task-file-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+}
+
+.task-file-icon--compact {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+
+.task-file-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-title);
+}
+
+.task-file-name--compact {
+  font-size: 13px;
+}
+
+.task-file-meta {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
+.task-col-progress {
+  min-width: 60px;
+  width: 120px;
+  text-align: right;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  font-family: "Geist Mono", monospace;
+}
+
+.task-col-progress--compact {
+  font-size: 12px;
+}
+
+.task-col-speed {
+  min-width: 60px;
+  width: 100px;
+  text-align: right;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  font-family: "Geist Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-col-speed--compact {
+  font-size: 12px;
+}
+
+.task-col-speed--active {
+  color: var(--color-speed-active);
+}
+
+.task-col-status {
+  min-width: 48px;
+  width: 80px;
+}
+
+.task-row-progress {
+  margin-top: 9px;
+}
+
+.task-row-progress--compact {
+  margin-top: 5px;
+}
+
+/* Task Item stagger entry
+   de-AI: removed translateY, pure opacity fade to reduce visual commotion */
+.task-item-enter {
+  animation: task-enter 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--stagger-index, 0) * 40ms);
+}

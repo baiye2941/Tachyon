@@ -65,10 +65,9 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
         {/* 遮罩层 */}
         <div
           data-testid="dialog-overlay"
-          class="fixed inset-0 z-[300]"
+          class="fixed inset-0 z-[var(--z-overlay)]"
           style={{
             background: "var(--color-overlay-scrim)",
-            "backdrop-filter": "blur(4px)",
             animation: "fadeIn 150ms ease forwards",
           }}
           onClick={() => props.onCancel()}
@@ -81,7 +80,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
           aria-modal="true"
           aria-labelledby="confirm-dialog-title"
           aria-describedby="confirm-dialog-desc"
-          class="fixed z-[310] flex flex-col"
+          class="fixed z-[var(--z-panel-content)] flex flex-col"
           style={{
             top: "50%",
             left: "50%",

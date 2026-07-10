@@ -1,0 +1,182 @@
+
+/* ============================================
+   Utility Classes
+   ============================================ */
+
+/* 屏幕阅读器专用: visually hidden but accessible */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* 惯性滚动容器:为主滚动区域提供平滑滚动与触控惯性,不劫持滚轮事件 */
+.scroll-container {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-container {
+    scroll-behavior: auto;
+  }
+}
+
+/* Global focus-visible utility for keyboard navigation - 单层青绿焦点环(去 AI 味:移除双层白光晕) */
+.focus-visible:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* 焦点环工具类:供 Tailwind focus-visible: 覆盖不到的自定义元素使用(如 TaskItem) */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* 搜索高亮:供 TaskItem HighlightedText 的 <mark> 使用 */
+.search-highlight {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-secondary);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* 去 AI 呟:移除玻璃拟态 backdrop-filter,改实色 + 边框分层(Linear "felt not seen") */
+.glass {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+}
+
+/* 面板表面(质感升级:实色底 + 顶部 1px 高光 + 极淡的顶光渐变) */
+.panel-surface {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.015) 0%, transparent 80px),
+    var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+  box-shadow: var(--shadow-inset-top);
+}
+
+
+
+/* ============================================
+   Hover Utility Classes (replace JS hover)
+   ============================================ */
+.hover-light {
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.hover-light:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.hover-accent {
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.hover-accent:hover {
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
+}
+
+.hover-danger {
+  color: var(--color-text-tertiary);
+  background: transparent;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.hover-danger:hover {
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+}
+
+.hover-lift {
+  transition: transform 80ms ease;
+}
+
+.hover-lift-sm {
+  transition: transform 80ms ease;
+}
+
+.hover-row {
+  transition: background 150ms ease;
+}
+
+.hover-row:hover {
+  background: var(--color-bg-hover);
+}
+
+.hover-light:active {
+  background: var(--color-border-strong) !important;
+  transform: scale(0.98);
+}
+
+.hover-accent:active {
+  background: color-mix(in srgb, var(--color-accent-primary) 15%, transparent) !important;
+  transform: scale(0.98);
+}
+
+.hover-danger:active {
+  background: color-mix(in srgb, var(--color-error) 20%, transparent) !important;
+  transform: scale(0.98);
+}
+
+.hover-lift:active {
+  transform: scale(0.97) !important;
+}
+
+.hover-lift-sm:active {
+  transform: scale(0.97) !important;
+}
+
+.hover-row:active {
+  background: var(--color-border-strong) !important;
+}
+
+
+
+/* Custom scrollbar for detail panel */
+.overflow-y-auto {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-scrollbar-thumb) transparent;
+}
+
+.overflow-y-auto:hover {
+  scrollbar-color: var(--color-scrollbar-thumb-hover) transparent;
+}
+
+.overflow-y-auto::-webkit-scrollbar {
+  width: 5px;
+}
+
+.overflow-y-auto::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overflow-y-auto::-webkit-scrollbar-thumb {
+  background: var(--color-scrollbar-thumb);
+  border-radius: 3px;
+}
+
+.overflow-y-auto:hover::-webkit-scrollbar-thumb {
+  background: var(--color-scrollbar-thumb-hover);
+}

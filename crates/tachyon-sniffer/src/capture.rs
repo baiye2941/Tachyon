@@ -1,11 +1,16 @@
-//! 浏览器请求捕获
+//! 资源类型识别与捕获规则
 //!
-//! 通过 Playwright MCP 拦截浏览器网络请求,识别可下载资源。
+//! 基于 URL 扩展名识别可下载资源类型,并提供捕获规则配置(类型白名单、
+//! 最小文件大小、URL 过滤器)。实际流量捕获由上层 adapter 注入,
+//! 本模块只负责"给定 URL/Content-Type,判断是否值得捕获"。
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 /// 可下载资源类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ResourceType {
     Video,
     Audio,
@@ -35,6 +40,8 @@ impl ResourceType {
 }
 
 /// 捕获规则配置
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureConfig {
     /// 启用的资源类型
     pub enabled_types: HashSet<ResourceType>,

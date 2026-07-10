@@ -1,11 +1,53 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, cleanup } from "@solidjs/testing-library";
-import { renderPalette, waitForRaf } from "./commandPaletteTestUtils";
+import type { CommandPaletteProps } from "../../components/CommandPalette";
+import type {
+  addRecentCommand,
+  togglePinnedCommand,
+} from "../../stores/commandHistory";
+import { resetAllShortcuts } from "../../stores/shortcuts";
+import type { TaskInfo } from "../../types";
+
+type RenderResult = ReturnType<typeof import("@solidjs/testing-library").render>;
+
+type TestUtils = {
+  renderPalette: (props?: Partial<CommandPaletteProps>) => RenderResult;
+  waitForRaf: () => Promise<void>;
+  defaultPaletteProps: CommandPaletteProps;
+};
+
+let utils: TestUtils;
+let addRecent: typeof addRecentCommand;
+let togglePinned: typeof togglePinnedCommand;
+
+async function loadUtils() {
+  const mod = await import("./commandPaletteTestUtils");
+  const store = await import("../../stores/commandHistory");
+  utils = {
+    renderPalette: mod.renderPalette,
+    waitForRaf: mod.waitForRaf,
+    defaultPaletteProps: mod.defaultPaletteProps,
+  };
+  addRecent = store.addRecentCommand;
+  togglePinned = store.togglePinnedCommand;
+}
+
+function getOptions(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>('[role="option"]'));
+}
+
+function getGroupLabels(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(".cmd-group-label"));
+}
 
 describe("CommandPalette", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     document.body.focus();
     Element.prototype.scrollIntoView = vi.fn();
+    localStorage.clear();
+    resetAllShortcuts();
+    vi.resetModules();
+    await loadUtils();
   });
 
   afterEach(() => {
@@ -15,13 +57,13 @@ describe("CommandPalette", () => {
 
   describe("渲染基础", () => {
     it('open=false 时不渲染 role="dialog"', () => {
-      const { container } = renderPalette({ open: false });
+      const { container } = utils.renderPalette({ open: false });
       expect(container.querySelector('[role="dialog"]')).toBeNull();
     });
 
     it('open=true 时渲染输入框、role="listbox"、底部提示', async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       expect(container.querySelector('input[type="text"]')).toBeTruthy();
       expect(container.querySelector('[role="listbox"]')).toBeTruthy();
@@ -30,7 +72,7 @@ describe("CommandPalette", () => {
     });
 
     it("初始空 query 渲染全部分组及命令", () => {
-      const { container } = renderPalette();
+      const { container } = utils.renderPalette();
 
       expect(container.textContent).toContain("导航");
       expect(container.textContent).toContain("任务");
@@ -39,11 +81,36 @@ describe("CommandPalette", () => {
       expect(container.textContent).toContain("新建下载");
       expect(container.textContent).toContain("全部暂停");
     });
+
+    it("命令项 shortcut badge 从配置读取", async () => {
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      const shortcuts = Array.from(container.querySelectorAll(".cmd-item-shortcut"));
+      expect(shortcuts.length).toBeGreaterThan(0);
+      // 默认应显示 Ctrl+B（切换侧边栏）等绑定
+      expect(shortcuts.some((s) => s.textContent?.includes("Ctrl"))).toBe(true);
+    });
+
+    it("自定义绑定后命令项 badge 同步更新", async () => {
+      // vi.resetModules() 在 beforeEach 中重置了模块,必须在与组件相同的模块实例上设置覆盖
+      const { setShortcut } = await import("../../stores/shortcuts");
+      setShortcut("shortcut.toggleSidebar", ["Ctrl", "Shift", "B"]);
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      const shortcuts = Array.from(container.querySelectorAll(".cmd-item-shortcut"));
+      const toggleShortcut = shortcuts.find((s) =>
+        s.parentElement?.textContent?.includes("切换侧边栏"),
+      );
+      expect(toggleShortcut?.textContent).toContain("Shift");
+      expect(toggleShortcut?.textContent).toContain("B");
+    });
   });
 
   describe("搜索过滤与排序", () => {
     it('输入"设置"，结果包含"设置"命令', async () => {
-      const { container } = renderPalette();
+      const { container } = utils.renderPalette();
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
@@ -52,17 +119,15 @@ describe("CommandPalette", () => {
         target: { value: "设置" },
         currentTarget: { value: "设置" },
       });
-      await waitForRaf();
+      await utils.waitForRaf();
 
-      const options = container.querySelectorAll('[role="option"]');
+      const options = getOptions(container);
       expect(options.length).toBeGreaterThan(0);
-      expect(
-        Array.from(options).some((o) => o.textContent?.includes("设置")),
-      ).toBe(true);
+      expect(options.some((o) => o.textContent?.includes("设置"))).toBe(true);
     });
 
     it('输入"查看"可命中"下载管理"命令', async () => {
-      const { container } = renderPalette();
+      const { container } = utils.renderPalette();
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
@@ -71,13 +136,13 @@ describe("CommandPalette", () => {
         target: { value: "查看" },
         currentTarget: { value: "查看" },
       });
-      await waitForRaf();
+      await utils.waitForRaf();
 
       expect(container.textContent).toContain("下载管理");
     });
 
     it("匹配字符应渲染为 mark 元素", async () => {
-      const { container } = renderPalette();
+      const { container } = utils.renderPalette();
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
@@ -86,7 +151,7 @@ describe("CommandPalette", () => {
         target: { value: "设置" },
         currentTarget: { value: "设置" },
       });
-      await waitForRaf();
+      await utils.waitForRaf();
 
       const hasMark =
         container.querySelector("mark") !== null ||
@@ -95,7 +160,7 @@ describe("CommandPalette", () => {
     });
 
     it("无匹配 query 显示空状态文本", async () => {
-      const { container } = renderPalette();
+      const { container } = utils.renderPalette();
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
@@ -104,15 +169,47 @@ describe("CommandPalette", () => {
         target: { value: "xyzxyz" },
         currentTarget: { value: "xyzxyz" },
       });
-      await waitForRaf();
+      await utils.waitForRaf();
 
       expect(container.textContent).toContain("未找到匹配的命令");
+    });
+
+    describe("别名搜索", () => {
+      it('输入"bf"命中"资源嗅探"命令', async () => {
+        const { container } = utils.renderPalette();
+        const input = container.querySelector(
+          'input[type="text"]',
+        ) as HTMLInputElement;
+
+        fireEvent.input(input, {
+          target: { value: "bf" },
+          currentTarget: { value: "bf" },
+        });
+        await utils.waitForRaf();
+
+        expect(container.textContent).toContain("资源嗅探");
+      });
+
+      it('输入"sz"命中"设置"命令', async () => {
+        const { container } = utils.renderPalette();
+        const input = container.querySelector(
+          'input[type="text"]',
+        ) as HTMLInputElement;
+
+        fireEvent.input(input, {
+          target: { value: "sz" },
+          currentTarget: { value: "sz" },
+        });
+        await utils.waitForRaf();
+
+        expect(container.textContent).toContain("设置");
+      });
     });
   });
 
   describe("任务搜索", () => {
     it('输入"model"出现"打开任务: model.gguf"且位于 task 分组', async () => {
-      const { container } = renderPalette({
+      const { container } = utils.renderPalette({
         getTasks: () => [
           {
             id: "t1",
@@ -129,14 +226,13 @@ describe("CommandPalette", () => {
         target: { value: "model" },
         currentTarget: { value: "model" },
       });
-      await waitForRaf();
+      await utils.waitForRaf();
 
       const listbox = container.querySelector(
         '[role="listbox"]',
       ) as HTMLElement;
       expect(listbox.textContent).toContain("任务");
-      const options = listbox.querySelectorAll('[role="option"]');
-      const taskOption = Array.from(options).find((o) =>
+      const taskOption = getOptions(listbox).find((o) =>
         o.textContent?.includes("model.gguf"),
       );
       expect(taskOption).toBeTruthy();
@@ -144,11 +240,186 @@ describe("CommandPalette", () => {
     });
   });
 
+  describe("任务级操作命令上下文", () => {
+    const baseTask: TaskInfo = {
+      id: "t1",
+      url: "https://example.com/file.bin",
+      fileName: "file.bin",
+      fileSize: 1024,
+      downloaded: 0,
+      speed: 0,
+      status: "downloading",
+      progress: 0,
+      fragmentsTotal: 1,
+      fragmentsDone: 0,
+      createdAt: "2024-01-01T00:00:00Z",
+      savePath: "",
+    };
+
+    it("选中磁力链接任务时显示 task-copy-magnet", async () => {
+      const { container } = utils.renderPalette({
+        getSelectedTask: () =>
+          ({ ...baseTask, url: "magnet:?xt=urn:btih:abc" }) as TaskInfo,
+      });
+      await utils.waitForRaf();
+
+      expect(container.textContent).toContain("复制磁力链接");
+    });
+
+    it("选中带 savePath 的任务时显示 task-open-folder", async () => {
+      const { container } = utils.renderPalette({
+        getSelectedTask: () =>
+          ({ ...baseTask, savePath: "/tmp/download" }) as TaskInfo,
+      });
+      await utils.waitForRaf();
+
+      expect(container.textContent).toContain("打开保存目录");
+    });
+
+    it("普通任务不显示 task-copy-magnet 和 task-open-folder", async () => {
+      const { container } = utils.renderPalette({
+        getSelectedTask: () => baseTask,
+      });
+      await utils.waitForRaf();
+
+      expect(container.textContent).not.toContain("复制磁力链接");
+      expect(container.textContent).not.toContain("打开保存目录");
+    });
+  });
+
+  describe("Pinned / Recent", () => {
+    it("query 为空时显示 Pinned 分组在最顶部", async () => {
+      togglePinned("nav-settings");
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      expect(container.textContent).toContain("置顶");
+      const groupLabels = getGroupLabels(container);
+      expect(groupLabels[0]?.textContent).toBe("置顶");
+      expect(container.textContent).toContain("设置");
+    });
+
+    it("query 为空时显示 Recent 分组", async () => {
+      addRecent("nav-sniffer");
+      addRecent("nav-downloads");
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      expect(container.textContent).toContain("最近使用");
+      const recentIdx = getGroupLabels(container).findIndex((g) =>
+        g.textContent?.includes("最近使用"),
+      );
+      expect(recentIdx).toBeGreaterThanOrEqual(0);
+    });
+
+    it("Pinned 项不同时出现在 Recent 分组中", async () => {
+      togglePinned("nav-downloads");
+      addRecent("nav-downloads");
+      addRecent("nav-sniffer");
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      const groupLabels = getGroupLabels(container);
+      const pinnedIdx = groupLabels.findIndex((g) => g.textContent === "置顶");
+      const recentIdx = groupLabels.findIndex((g) => g.textContent === "最近使用");
+      expect(pinnedIdx).toBeGreaterThanOrEqual(0);
+      expect(recentIdx).toBeGreaterThanOrEqual(0);
+
+      const recentLabel = groupLabels[recentIdx];
+      let sibling = recentLabel?.nextElementSibling;
+      while (sibling && !sibling.classList.contains("cmd-group-label")) {
+        expect(sibling.textContent).not.toContain("下载管理");
+        sibling = sibling.nextElementSibling;
+      }
+    });
+
+    it("执行命令后将其加入 Recent", async () => {
+      const onViewChange = vi.fn();
+      const { container } = utils.renderPalette({ onViewChange });
+      await utils.waitForRaf();
+
+      const sniffer = getOptions(container).find((o) =>
+        o.textContent?.includes("资源嗅探"),
+      );
+      expect(sniffer).toBeTruthy();
+      fireEvent.click(sniffer!);
+
+      expect(onViewChange).toHaveBeenCalledWith("sniffer");
+
+      const { container: container2 } = utils.renderPalette();
+      await utils.waitForRaf();
+      expect(container2.textContent).toContain("最近使用");
+      expect(container2.textContent).toContain("资源嗅探");
+    });
+
+    it("Recent 去重:同一命令只出现一次", async () => {
+      addRecent("nav-downloads");
+      addRecent("nav-sniffer");
+      addRecent("nav-downloads");
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      const recentLabel = getGroupLabels(container).find(
+        (g) => g.textContent === "最近使用",
+      );
+      let count = 0;
+      let sibling = recentLabel?.nextElementSibling;
+      while (sibling && !sibling.classList.contains("cmd-group-label")) {
+        count++;
+        sibling = sibling.nextElementSibling;
+      }
+      expect(count).toBe(2);
+    });
+  });
+
+  describe("置顶交互", () => {
+    it("Shift+Enter 切换当前选中命令的置顶状态", async () => {
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
+      fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+      await utils.waitForRaf();
+
+      expect(container.textContent).toContain("置顶");
+      const pinned = getOptions(container).find(
+        (o) => o.previousElementSibling?.textContent === "置顶",
+      );
+      expect(pinned?.textContent).toContain("下载管理");
+    });
+
+    it("点击 pin 按钮切换置顶且不执行命令", async () => {
+      const onViewChange = vi.fn();
+      const { container } = utils.renderPalette({ onViewChange });
+      await utils.waitForRaf();
+
+      const sniffer = getOptions(container).find((o) =>
+        o.textContent?.includes("资源嗅探"),
+      );
+      expect(sniffer).toBeTruthy();
+
+      const pinBtn = sniffer!.querySelector(
+        '[aria-label="置顶命令"]',
+      ) as HTMLButtonElement;
+      expect(pinBtn).toBeTruthy();
+      fireEvent.click(pinBtn);
+      await utils.waitForRaf();
+
+      expect(onViewChange).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("置顶");
+      expect(
+        getGroupLabels(container).some((g) => g.textContent === "置顶"),
+      ).toBe(true);
+    });
+  });
+
   describe("键盘导航", () => {
     it("打开后输入框获得焦点", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
@@ -157,32 +428,30 @@ describe("CommandPalette", () => {
     });
 
     it("ArrowDown 切换 aria-selected 到下一项", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "ArrowDown" });
 
-      const options =
-        container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options = getOptions(container);
       expect(options.length).toBeGreaterThan(1);
       expect(options[0]!.getAttribute("aria-selected")).toBe("false");
       expect(options[1]!.getAttribute("aria-selected")).toBe("true");
     });
 
     it("ArrowUp 从首项循环到末项", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
       ) as HTMLInputElement;
       fireEvent.keyDown(input, { key: "ArrowUp" });
 
-      const options =
-        container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options = getOptions(container);
       expect(options.length).toBeGreaterThan(0);
       expect(options[0]!.getAttribute("aria-selected")).toBe("false");
       expect(options[options.length - 1]!.getAttribute("aria-selected")).toBe(
@@ -193,8 +462,8 @@ describe("CommandPalette", () => {
     it("Enter 执行当前选中命令并关闭面板", async () => {
       const onViewChange = vi.fn();
       const onClose = vi.fn();
-      const { container } = renderPalette({ onViewChange, onClose });
-      await waitForRaf();
+      const { container } = utils.renderPalette({ onViewChange, onClose });
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
@@ -207,9 +476,9 @@ describe("CommandPalette", () => {
 
     it("Escape 触发 onClose", async () => {
       const onClose = vi.fn();
-      const { container } = renderPalette({ onClose });
-      await waitForRaf();
-      await waitForRaf();
+      const { container } = utils.renderPalette({ onClose });
+      await utils.waitForRaf();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
@@ -223,15 +492,14 @@ describe("CommandPalette", () => {
 
   describe("鼠标交互", () => {
     it("mouseenter 切换 active 项", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
+      await utils.waitForRaf();
 
-      const options =
-        container.querySelectorAll<HTMLElement>('[role="option"]');
+      const options = getOptions(container);
       expect(options.length).toBeGreaterThan(1);
       fireEvent.mouseEnter(options[1]!);
-      await waitForRaf();
+      await utils.waitForRaf();
 
       expect(options[0]!.getAttribute("aria-selected")).toBe("false");
       expect(options[1]!.getAttribute("aria-selected")).toBe("true");
@@ -240,12 +508,10 @@ describe("CommandPalette", () => {
     it("click 执行命令并关闭面板", async () => {
       const onViewChange = vi.fn();
       const onClose = vi.fn();
-      const { container } = renderPalette({ onViewChange, onClose });
-      await waitForRaf();
+      const { container } = utils.renderPalette({ onViewChange, onClose });
+      await utils.waitForRaf();
 
-      const options =
-        container.querySelectorAll<HTMLElement>('[role="option"]');
-      const target = Array.from(options).find((o) =>
+      const target = getOptions(container).find((o) =>
         o.textContent?.includes("资源嗅探"),
       );
       expect(target).toBeTruthy();
@@ -257,9 +523,9 @@ describe("CommandPalette", () => {
 
     it("点击遮罩关闭面板", async () => {
       const onClose = vi.fn();
-      const { container } = renderPalette({ onClose });
-      await waitForRaf();
-      await waitForRaf();
+      const { container } = utils.renderPalette({ onClose });
+      await utils.waitForRaf();
+      await utils.waitForRaf();
 
       const dialog = container.querySelector('[role="dialog"]') as HTMLElement;
       fireEvent.click(dialog);
@@ -271,8 +537,8 @@ describe("CommandPalette", () => {
 
   describe("a11y 语义", () => {
     it('输入框 role="combobox"', async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
@@ -282,16 +548,15 @@ describe("CommandPalette", () => {
     });
 
     it('选项 role="option"', async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
-      const options = container.querySelectorAll('[role="option"]');
-      expect(options.length).toBeGreaterThan(0);
+      expect(getOptions(container).length).toBeGreaterThan(0);
     });
 
     it("aria-activedescendant 指向当前 option id", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       const input = container.querySelector(
         'input[type="text"]',
@@ -307,8 +572,8 @@ describe("CommandPalette", () => {
     });
 
     it("存在 aria-live 区域", async () => {
-      const { container } = renderPalette();
-      await waitForRaf();
+      const { container } = utils.renderPalette();
+      await utils.waitForRaf();
 
       expect(container.querySelector("[aria-live]")).toBeTruthy();
     });

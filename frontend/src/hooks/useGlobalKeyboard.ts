@@ -1,18 +1,22 @@
 import { onMount, onCleanup } from "solid-js";
 import {
   openNewTaskModal,
-  toggleCommandPalette,
-  toggleShortcutHelp,
+  openCommandPalette,
+  openShortcutHelp,
   toggleSidebar,
+  openView,
+  $ui,
 } from "../stores/ui";
+import { pauseAll, resumeAll } from "../stores/batchActions";
+import { SHORTCUTS } from "../commands/shortcuts";
+import { matchKeyboardEvent } from "../stores/shortcuts";
 
 /**
  * 全局键盘快捷键:
- * - Ctrl/Cmd+K:命令面板
- * - Ctrl/Cmd+/:快捷键帮助
- * - ?(非输入框):快捷键帮助
- * - Ctrl/Cmd+B:切换侧边栏(Iteration 13)
- * - Ctrl/Cmd+N:新建下载
+ * - 所有绑定从 stores/shortcuts.ts 读取,支持用户自定义。
+ * - 在输入框/文本区域内不拦截,保留原生编辑行为。
+ * - 命令面板/快捷键帮助已打开时不拦截,避免重复触发或冲突。
+ * - ?(无修饰键):快捷键帮助别名。
  */
 export function useGlobalKeyboard() {
   function isTextInput(target: EventTarget | null): boolean {
@@ -22,42 +26,68 @@ export function useGlobalKeyboard() {
   }
 
   function handleGlobalKey(e: KeyboardEvent) {
-    // Ctrl+K:命令面板
-    if ((e.ctrlKey || e.metaKey) && e.key === "k") {
-      e.preventDefault();
-      toggleCommandPalette();
-      return;
-    }
+    if (e.repeat) return;
+    if (isTextInput(e.target)) return;
+    if ($ui.commandPaletteOpen() || $ui.shortcutHelpOpen()) return;
 
-    // Ctrl+B:切换侧边栏(Iteration 13)
-    if ((e.ctrlKey || e.metaKey) && e.key === "b") {
-      e.preventDefault();
-      toggleSidebar();
-      return;
-    }
+    for (const s of SHORTCUTS) {
+      if (!matchKeyboardEvent(e, s.labelKey)) continue;
 
-    // Ctrl+N:新建下载。输入框内不拦截,保留浏览器/编辑器原生行为。
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") {
-      if (isTextInput(e.target)) return;
-      e.preventDefault();
-      openNewTaskModal();
-      return;
-    }
-
-    // Ctrl+/ 或 Cmd+/:快捷键帮助
-    if ((e.ctrlKey || e.metaKey) && e.key === "/") {
-      e.preventDefault();
-      toggleShortcutHelp();
-      return;
-    }
-
-    // ?(无修饰键,且非输入框聚焦):快捷键帮助
-    if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      const target = e.target as HTMLElement | null;
-      if (!isTextInput(target)) {
-        e.preventDefault();
-        toggleShortcutHelp();
+      switch (s.labelKey) {
+        case "shortcut.openCommandPalette": {
+          e.preventDefault();
+          openCommandPalette();
+          return;
+        }
+        case "shortcut.shortcutHelp": {
+          e.preventDefault();
+          openShortcutHelp();
+          return;
+        }
+        case "shortcut.toggleSidebar": {
+          e.preventDefault();
+          toggleSidebar();
+          return;
+        }
+        case "shortcut.nav.downloads": {
+          e.preventDefault();
+          openView("downloads");
+          return;
+        }
+        case "shortcut.nav.sniffer": {
+          e.preventDefault();
+          openView("sniffer");
+          return;
+        }
+        case "shortcut.nav.settings": {
+          e.preventDefault();
+          openView("settings");
+          return;
+        }
+        case "shortcut.task.new": {
+          e.preventDefault();
+          openNewTaskModal();
+          return;
+        }
+        case "shortcut.task.pauseAll": {
+          e.preventDefault();
+          pauseAll();
+          return;
+        }
+        case "shortcut.task.resumeAll": {
+          e.preventDefault();
+          resumeAll();
+          return;
+        }
+        default:
+          break;
       }
+    }
+
+    // ?(无修饰键,且非输入框聚焦):快捷键帮助别名
+    if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      openShortcutHelp();
     }
   }
 

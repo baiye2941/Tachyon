@@ -1,0 +1,285 @@
+
+:root {
+  --cmd-panel-width: 560px;
+  --cmd-panel-max-height: 420px;
+}
+
+/* ============================================
+   Command Palette(Ctrl+K)
+   参考 Raycast/Linear 风格:紧凑、圆角、强焦点、少边框
+   ============================================ */
+.cmd-panel {
+  width: min(var(--cmd-panel-width), calc(100vw - 32px));
+  max-height: min(var(--cmd-panel-max-height), calc(100vh - 160px));
+  border-radius: 18px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+  box-shadow:
+    0 24px 48px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  overflow: hidden;
+}
+
+.cmd-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.cmd-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 16px;
+  font-weight: 450;
+  color: var(--color-text-primary);
+  letter-spacing: -0.01em;
+}
+.cmd-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.cmd-esc-hint {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--color-bg-hover);
+}
+
+.cmd-list {
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.cmd-group-label {
+  padding: 6px 10px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-text-tertiary);
+  user-select: none;
+}
+
+.cmd-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 2px;
+  border-radius: 10px;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    transform 80ms ease;
+  cursor: pointer;
+}
+.cmd-item:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.cmd-item:active {
+  transform: scale(0.97);
+}
+.cmd-item[aria-selected="true"] {
+  background: var(--color-accent-primary);
+  color: var(--color-accent-foreground);
+}
+.cmd-item[aria-selected="true"]:active {
+  transform: scale(0.97);
+}
+.cmd-item[aria-selected="true"] .cmd-item-icon {
+  color: var(--color-accent-foreground);
+}
+.cmd-item[aria-selected="true"] .cmd-item-hint {
+  color: color-mix(in srgb, var(--color-accent-foreground) 72%, transparent);
+}
+.cmd-item[aria-selected="true"] .cmd-palette-mark mark {
+  color: var(--color-accent-foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cmd-item[aria-selected="true"] .cmd-item-shortcut kbd {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--color-accent-foreground);
+  border-color: transparent;
+}
+
+.cmd-item-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  color: var(--color-text-tertiary);
+  transition: color 120ms ease;
+}
+.cmd-item[aria-selected="true"]:hover .cmd-item-icon,
+.cmd-item:hover .cmd-item-icon {
+  color: var(--color-text-primary);
+}
+
+.cmd-item-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cmd-item-title {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmd-item-hint {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 120ms ease;
+}
+
+.cmd-item-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background 120ms ease;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.cmd-item:hover .cmd-item-pin,
+.cmd-item[aria-selected="true"] .cmd-item-pin {
+  opacity: 1;
+}
+.cmd-item-pin:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.cmd-item[aria-selected="true"] .cmd-item-pin,
+.cmd-item[aria-selected="true"] .cmd-item-pin:hover {
+  color: var(--color-accent-foreground);
+}
+.cmd-item[aria-selected="true"] .cmd-item-pin:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.cmd-item-shortcut {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.cmd-item-shortcut kbd {
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--color-bg-hover);
+  color: var(--color-text-tertiary);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.cmd-palette-mark mark {
+  color: var(--color-accent-primary);
+  background: transparent;
+  font-weight: 600;
+}
+
+.cmd-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 20px;
+  color: var(--color-text-tertiary);
+}
+.cmd-empty-icon {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--color-bg-hover);
+  color: var(--color-text-tertiary);
+}
+
+.cmd-footer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-secondary);
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.cmd-footer kbd {
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--color-bg-hover);
+  border: 1px solid var(--color-border-subtle);
+}
+
+/* Easter Egg:输入 uma / tachyon 触发趣味提示 */
+.cmd-easter-egg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  font-size: 12px;
+  color: var(--color-brand-teal);
+  background: var(--color-brand-teal-soft);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.cmd-easter-egg-icon {
+  font-size: 13px;
+  line-height: 1;
+  animation: easter-egg-pulse 2s ease-in-out infinite;
+}
+
+@keyframes easter-egg-pulse {
+  0%,
+  100% {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmd-easter-egg-icon {
+    animation: none;
+  }
+}
+

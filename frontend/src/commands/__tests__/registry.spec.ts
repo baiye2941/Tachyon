@@ -36,6 +36,11 @@ describe('命令注册表(Iteration 07 DI-1)', () => {
     expect(ids).toContain('task-new')
     expect(ids).toContain('act-pause-all')
     expect(ids).toContain('act-resume-all')
+    expect(ids).toContain('act-cancel-all')
+    expect(ids).toContain('act-clear-completed')
+    expect(ids).toContain('task-copy-magnet')
+    expect(ids).toContain('task-open-folder')
+    expect(ids).toContain('task-redownload')
   })
 
   it('getCommand 按 id 查找', () => {
@@ -59,19 +64,60 @@ describe('命令注册表(Iteration 07 DI-1)', () => {
     expect(ctx.onClose).toHaveBeenCalled()
   })
 
-  it('操作命令 run 调用 pause/resume 回调', () => {
+  it('操作命令 run 调用 pause/resume/cancel/clear 回调', () => {
     const onPauseAll = vi.fn()
     const onResumeAll = vi.fn()
+    const onCancelAll = vi.fn()
+    const onClearCompleted = vi.fn()
     getCommand('act-pause-all')!.run(makeCtx({ onPauseAll }))
     getCommand('act-resume-all')!.run(makeCtx({ onResumeAll }))
+    getCommand('act-cancel-all')!.run(makeCtx({ onCancelAll }))
+    getCommand('act-clear-completed')!.run(makeCtx({ onClearCompleted }))
     expect(onPauseAll).toHaveBeenCalled()
     expect(onResumeAll).toHaveBeenCalled()
+    expect(onCancelAll).toHaveBeenCalled()
+    expect(onClearCompleted).toHaveBeenCalled()
   })
 
   it('可选回调缺失时不抛错(防御 undefined)', () => {
     const ctx = makeCtx() // 无 onNewDownload/onPauseAll/onResumeAll
     expect(() => getCommand('task-new')!.run(ctx)).not.toThrow()
     expect(() => getCommand('act-pause-all')!.run(ctx)).not.toThrow()
+    expect(() => getCommand('act-cancel-all')!.run(ctx)).not.toThrow()
+    expect(() => getCommand('task-redownload')!.run(ctx)).not.toThrow()
+  })
+
+  it('任务级命令 visible 依赖选中任务上下文', () => {
+    const noTask = makeCtx()
+    expect(getCommand('task-copy-magnet')!.visible?.(noTask)).toBe(false)
+    expect(getCommand('task-open-folder')!.visible?.(noTask)).toBe(false)
+    expect(getCommand('task-redownload')!.visible?.(noTask)).toBe(false)
+
+    const httpTask = makeCtx({ getSelectedTask: () => ({ id: 't1', url: 'https://example.com/f', savePath: '/tmp/f' }) as unknown as import('../../types').TaskInfo })
+    expect(getCommand('task-copy-magnet')!.visible?.(httpTask)).toBe(false)
+    expect(getCommand('task-open-folder')!.visible?.(httpTask)).toBe(true)
+    expect(getCommand('task-redownload')!.visible?.(httpTask)).toBe(true)
+
+    const magnetTask = makeCtx({ getSelectedTask: () => ({ id: 't2', url: 'magnet:?xt=urn:btih:abc', savePath: '' }) as unknown as import('../../types').TaskInfo })
+    expect(getCommand('task-copy-magnet')!.visible?.(magnetTask)).toBe(true)
+    expect(getCommand('task-open-folder')!.visible?.(magnetTask)).toBe(false)
+  })
+
+  it('任务级命令 run 调用对应回调', () => {
+    const onCopyToClipboard = vi.fn()
+    const onOpenTaskFolder = vi.fn()
+    const onRedownloadTask = vi.fn()
+    const task = { id: 't1', url: 'magnet:?xt=urn:btih:abc', savePath: '/tmp/f' } as unknown as import('../../types').TaskInfo
+    const ctx = makeCtx({ getSelectedTask: () => task, onCopyToClipboard, onOpenTaskFolder, onRedownloadTask })
+
+    getCommand('task-copy-magnet')!.run(ctx)
+    expect(onCopyToClipboard).toHaveBeenCalledWith(task.url)
+
+    getCommand('task-open-folder')!.run(ctx)
+    expect(onOpenTaskFolder).toHaveBeenCalledWith(task.id)
+
+    getCommand('task-redownload')!.run(ctx)
+    expect(onRedownloadTask).toHaveBeenCalledWith(task.id)
   })
 
   it('有 shortcut 的命令格式正确(字符串数组)', () => {

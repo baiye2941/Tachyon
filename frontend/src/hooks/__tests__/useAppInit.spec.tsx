@@ -24,6 +24,8 @@ vi.mock('../../stores/downloads', () => ({
 
 vi.mock('../../api/events', () => ({
   onRecoveryWarning: vi.fn(() => Promise.resolve(() => {})),
+  onSnifferResourceAdded: vi.fn(() => Promise.resolve(() => {})),
+  onClipboardUrlDetected: vi.fn(() => Promise.resolve(() => {})),
 }))
 
 vi.mock('../../stores/speedHistory', () => ({
@@ -36,7 +38,7 @@ vi.mock('../useTauriEvent', () => ({
 }))
 
 function TestApp() {
-  useAppInit(() => undefined)
+  useAppInit(() => undefined, () => undefined)
   return <div>app</div>
 }
 

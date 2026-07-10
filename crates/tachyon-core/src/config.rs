@@ -648,6 +648,46 @@ pub struct HubConfig {
     pub token: Option<String>,
 }
 
+/// 剪贴板监听配置
+///
+/// 控制是否启用剪贴板 URL 自动检测。启用后后端轮询剪贴板,
+/// 检测到可下载 URL 时向前端推送事件,前端弹 Toast 让用户确认下载。
+/// 默认关闭(隐私尊重),用户需在设置中主动开启。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardConfig {
+    /// 是否启用剪贴板监听,默认 false
+    #[serde(default)]
+    pub enable_watch: bool,
+    /// 轮询间隔(毫秒),默认 1000
+    #[serde(default = "default_clipboard_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_clipboard_poll_interval_ms() -> u64 {
+    1000
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enable_watch: false,
+            poll_interval_ms: default_clipboard_poll_interval_ms(),
+        }
+    }
+}
+
+impl ClipboardConfig {
+    /// 校验配置值
+    pub fn validate(&self) -> crate::DownloadResult<()> {
+        let e = |msg: &str| crate::DownloadError::Config(msg.into());
+        if self.poll_interval_ms == 0 {
+            return Err(e("poll_interval_ms 必须 >= 1"));
+        }
+        Ok(())
+    }
+}
+
 impl MagnetConfig {
     /// 校验配置值
     pub fn validate(&self) -> crate::DownloadResult<()> {
@@ -1023,6 +1063,29 @@ pub struct ConfigPatch {
     /// HuggingFace Hub 配置补丁
     #[serde(default)]
     pub hub: Option<HubPatch>,
+    /// 剪贴板监听配置补丁
+    #[serde(default)]
+    pub clipboard: Option<ClipboardPatch>,
+}
+
+/// 剪贴板监听配置补丁
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardPatch {
+    pub enable_watch: Option<bool>,
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl ClipboardPatch {
+    /// 将剪贴板补丁应用到现有 ClipboardConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut ClipboardConfig) {
+        if let Some(v) = self.enable_watch {
+            base.enable_watch = v;
+        }
+        if let Some(v) = self.poll_interval_ms {
+            base.poll_interval_ms = v;
+        }
+    }
 }
 
 /// 下载配置白名单补丁
@@ -1195,6 +1258,9 @@ impl ConfigPatch {
         if let Some(patch) = &self.hub {
             patch.apply_to(&mut result.hub);
         }
+        if let Some(patch) = &self.clipboard {
+            patch.apply_to(&mut result.clipboard);
+        }
         result
     }
 }
@@ -1303,6 +1369,9 @@ pub struct AppConfig {
     /// HuggingFace Hub 配置
     #[serde(default)]
     pub hub: HubConfig,
+    /// 剪贴板监听配置
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
 }
 
 impl AppConfig {
@@ -1321,6 +1390,7 @@ impl Default for AppConfig {
             scheduler: SchedulerConfig::default(),
             magnet: MagnetConfig::default(),
             hub: HubConfig::default(),
+            clipboard: ClipboardConfig::default(),
         }
     }
 }
@@ -2236,6 +2306,7 @@ mod tests {
             }),
             scheduler: None,
             hub: None,
+            clipboard: None,
         };
         let result = patch.apply_to(&base);
 
@@ -2244,6 +2315,59 @@ mod tests {
         // 其余字段不变
         assert_eq!(result.max_concurrent_tasks, base.max_concurrent_tasks);
         assert_eq!(result.download.download_dir, base.download.download_dir);
+    }
+
+    #[test]
+    fn test_clipboard_config_default() {
+        let cfg = ClipboardConfig::default();
+        assert!(!cfg.enable_watch, "默认应关闭剪贴板监听");
+        assert_eq!(cfg.poll_interval_ms, 1000);
+    }
+
+    #[test]
+    fn test_clipboard_patch_applies() {
+        let mut cfg = ClipboardConfig::default();
+        let patch = ClipboardPatch {
+            enable_watch: Some(true),
+            poll_interval_ms: Some(500),
+        };
+        patch.apply_to(&mut cfg);
+        assert!(cfg.enable_watch);
+        assert_eq!(cfg.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn test_clipboard_patch_none_preserves() {
+        let mut cfg = ClipboardConfig {
+            enable_watch: true,
+            poll_interval_ms: 2000,
+        };
+        let patch = ClipboardPatch::default();
+        patch.apply_to(&mut cfg);
+        assert!(cfg.enable_watch);
+        assert_eq!(cfg.poll_interval_ms, 2000);
+    }
+
+    #[test]
+    fn test_config_patch_with_clipboard() {
+        let base = AppConfig::default();
+        assert!(!base.clipboard.enable_watch);
+
+        let patch = ConfigPatch {
+            max_concurrent_tasks: None,
+            download: None,
+            connection: None,
+            magnet: None,
+            scheduler: None,
+            hub: None,
+            clipboard: Some(ClipboardPatch {
+                enable_watch: Some(true),
+                poll_interval_ms: Some(2000),
+            }),
+        };
+        let result = patch.apply_to(&base);
+        assert!(result.clipboard.enable_watch);
+        assert_eq!(result.clipboard.poll_interval_ms, 2000);
     }
 
     #[test]
@@ -3373,6 +3497,7 @@ mod tests {
             magnet: None,
             scheduler: None,
             hub: None,
+            clipboard: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, 10);
@@ -3396,6 +3521,7 @@ mod tests {
             magnet: None,
             scheduler: None,
             hub: None,
+            clipboard: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.download.download_dir, "/patched");
@@ -3434,6 +3560,7 @@ mod tests {
                     HfSourceMode::Official
                 }),
             }),
+            clipboard: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, 8);
@@ -3454,6 +3581,7 @@ mod tests {
             magnet: None,
             scheduler: None,
             hub: None,
+            clipboard: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, base.max_concurrent_tasks);
@@ -3897,6 +4025,7 @@ mod proptests {
                 magnet: None,
                 scheduler: None,
                 hub: None,
+                clipboard: None,
             };
 
             let patched = patch.apply_to(&base);

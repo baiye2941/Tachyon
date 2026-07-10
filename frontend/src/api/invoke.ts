@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask } from '../stores/mockData'
@@ -137,6 +137,14 @@ export const api = {
   getSnifferResources: () => invoke<SnifferResource[]>('get_sniffer_resources'),
   /** 添加嗅探过滤规则 */
   addSnifferFilter: (filter: string) => invoke<void>('add_sniffer_filter', { filter }),
+  /** 手动添加嗅探资源 URL */
+  addSnifferResource: (url: string) => invoke<void>('add_sniffer_resource', { url }),
+  /** 清空所有嗅探资源 */
+  clearSnifferResources: () => invoke<void>('clear_sniffer_resources'),
+  /** 获取嗅探捕获配置 */
+  getSnifferCaptureConfig: () => invoke<CaptureConfig>('get_sniffer_capture_config'),
+  /** 更新嗅探捕获配置 */
+  setSnifferCaptureConfig: (config: CaptureConfig) => invoke<void>('set_sniffer_capture_config', { config }),
   /** 列出 HuggingFace 仓库文件 */
   listRepoFiles: (repoId: string, revision?: string) => invoke<HubFileInfo[]>('list_repo_files', { repoId, revision }),
   /** 获取 HuggingFace 文件下载 URL */

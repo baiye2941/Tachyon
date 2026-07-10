@@ -59,6 +59,13 @@ export interface NormalizedError {
  * retryable/retryAfterSecs/status 字段;非 Core 变体回退到 AppError 级别。
  */
 export function parseAppError(e: unknown): NormalizedError {
+  // 情况 2:Error 实例(优先检查,因为 Error 是 object,
+  // 若放在 object 分支之后会因 Error 的 message 不可枚举而走到 JSON.stringify 兜底,
+  // 返回 "{}" 丢失真实错误信息)
+  if (e instanceof Error) {
+    return { message: e.message, type: 'Unknown', retryable: true, raw: e }
+  }
+
   // 情况 1:后端 AppError 序列化对象
   if (typeof e === 'object' && e !== null) {
     const appErr = e as Partial<AppErrorShape>
@@ -88,11 +95,6 @@ export function parseAppError(e: unknown): NormalizedError {
     // 对象但无 type/message 字段(异常情况):兜底 JSON.stringify
     const fallback = safeStringify(e)
     return { message: fallback, type: 'Unknown', retryable: true, raw: e }
-  }
-
-  // 情况 2:Error 实例
-  if (e instanceof Error) {
-    return { message: e.message, type: 'Unknown', retryable: true, raw: e }
   }
 
   // 情况 3:字符串/其他

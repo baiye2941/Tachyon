@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { toggleSort, clearSort, sortTasks, $taskSort } from '../taskSort'
+import {
+  toggleSort,
+  clearSort,
+  sortTasks,
+  sortGroupTasks,
+  $taskSort,
+} from '../taskSort'
 import type { TaskInfo } from '../../types'
 
 const task = (overrides: Partial<TaskInfo> = {}): TaskInfo => ({
@@ -112,6 +118,56 @@ describe('sortTasks 排序', () => {
 
   it('空列表安全', () => {
     expect(sortTasks([], { key: 'speed', dir: 'desc' })).toEqual([])
+  })
+})
+
+describe('sortGroupTasks 分组视图组内排序', () => {
+  it('使用 progress/speed/status 等全局排序 key 时，与 sortTasks 语义一致', () => {
+    const tasks: TaskInfo[] = [
+      task({ id: '1', fileName: 'b', progress: 0.5 }),
+      task({ id: '2', fileName: 'a', progress: 0.9 }),
+      task({ id: '3', fileName: 'c', progress: 0.1 }),
+    ]
+    const r = sortGroupTasks(tasks, { key: 'progress', dir: 'desc' })
+    expect(r.map((t) => t.progress)).toEqual([0.9, 0.5, 0.1])
+  })
+
+  it('无排序 key 时按 createdAt 降序 → fileName 升序稳定排序', () => {
+    const tasks: TaskInfo[] = [
+      task({ id: '1', fileName: 'b', createdAt: '2026-01-01T00:00:00Z' }),
+      task({ id: '2', fileName: 'a', createdAt: '2026-01-03T00:00:00Z' }),
+      task({ id: '3', fileName: 'c', createdAt: '2026-01-02T00:00:00Z' }),
+    ]
+    const r = sortGroupTasks(tasks, { key: null, dir: 'desc' })
+    expect(r.map((t) => t.id)).toEqual(['2', '3', '1'])
+  })
+
+  it('name 列不参与排序，同样回退到 createdAt 降序', () => {
+    const tasks: TaskInfo[] = [
+      task({ id: '1', fileName: 'a', createdAt: '2026-01-01T00:00:00Z' }),
+      task({ id: '2', fileName: 'b', createdAt: '2026-01-02T00:00:00Z' }),
+    ]
+    const r = sortGroupTasks(tasks, { key: 'name', dir: 'asc' })
+    expect(r.map((t) => t.id)).toEqual(['2', '1'])
+  })
+
+  it('createdAt 相同则按 fileName 升序稳定', () => {
+    const tasks: TaskInfo[] = [
+      task({ id: '1', fileName: 'zebra', createdAt: '2026-01-01T00:00:00Z' }),
+      task({ id: '2', fileName: 'apple', createdAt: '2026-01-01T00:00:00Z' }),
+    ]
+    const r = sortGroupTasks(tasks, { key: null, dir: 'desc' })
+    expect(r.map((t) => t.fileName)).toEqual(['apple', 'zebra'])
+  })
+
+  it('不修改原数组', () => {
+    const tasks: TaskInfo[] = [
+      task({ id: '1', fileName: 'b', createdAt: '2026-01-01T00:00:00Z' }),
+      task({ id: '2', fileName: 'a', createdAt: '2026-01-02T00:00:00Z' }),
+    ]
+    const original = [...tasks]
+    sortGroupTasks(tasks, { key: null, dir: 'desc' })
+    expect(tasks).toEqual(original)
   })
 })
 

@@ -1,0 +1,349 @@
+/* 可排序列头:hover 反馈，提示可点击排序 */
+.task-list-col--sortable:hover {
+  color: var(--color-text-primary);
+}
+
+.task-list-header {
+  height: 36px;
+  padding: 0 16px;
+  background: var(--color-bg-elevated);
+  border-bottom: 1px solid var(--color-border-subtle);
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.task-list-col {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  border-radius: 4px;
+  user-select: none;
+}
+
+.task-list-col--align-left {
+  text-align: left;
+  justify-content: flex-start;
+}
+
+.task-list-col--align-right {
+  text-align: right;
+  justify-content: flex-end;
+}
+
+.task-list-col--sortable {
+  cursor: pointer;
+}
+
+.task-sort-indicator {
+  font-size: 9px;
+  color: var(--color-text-tertiary);
+  opacity: 0.4;
+}
+
+.task-sort-indicator--active {
+  color: var(--color-accent-primary);
+  opacity: 1;
+}
+
+/* 列宽拖拽手柄 */
+.task-list-col-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  border-radius: 2px;
+  transition: background 150ms var(--ease-standard);
+  z-index: 10;
+}
+
+.task-list-col-resize-handle:hover,
+.task-list-col-resize-handle--dragging {
+  background: var(--color-accent-primary);
+}
+
+/* 列设置按钮 */
+.task-list-settings-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition:
+    color 150ms var(--ease-standard),
+    background 150ms var(--ease-standard);
+}
+
+.task-list-settings-button:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+/* ============================================
+   Task Group Header（分组视图）
+   ============================================ */
+.task-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  height: 72px;
+  background: var(--color-bg-elevated);
+  border-bottom: 1px solid var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background 180ms var(--ease-standard),
+    color 180ms var(--ease-standard);
+}
+
+.task-group-header:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.task-group-header:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--color-accent-glow);
+}
+
+.task-group-header--active {
+  color: var(--color-accent-primary);
+  background: color-mix(in srgb, var(--color-accent-primary) 5%, var(--color-bg-elevated));
+}
+
+.task-group-header__chevron {
+  color: var(--color-text-tertiary);
+  transition: transform 180ms var(--ease-standard);
+}
+
+.task-group-header__chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.task-group-header__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-group-header__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+}
+
+/* 列设置下拉面板 */
+.column-settings-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 180px;
+  max-height: 360px;
+  overflow-y: auto;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  z-index: 50;
+}
+
+.column-settings-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  padding: 4px 8px;
+  margin-bottom: 4px;
+}
+
+.column-settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.column-settings-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+
+.column-settings-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.column-settings-item--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.column-settings-reset {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  cursor: pointer;
+  transition:
+    color 150ms var(--ease-standard),
+    background 150ms var(--ease-standard);
+}
+
+.column-settings-reset:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+/* ============================================
+   Task Row（高级感：hover 横向背景渐变 + 选中态左侧 2px 竹纹 + 微 lift）
+   ============================================ */
+.task-row {
+  background: transparent;
+  box-shadow: inset 2px 0 0 transparent;
+  transition:
+    background 180ms var(--ease-standard),
+    box-shadow 180ms var(--ease-standard);
+  contain: layout paint;
+}
+
+.task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.025) 0%,
+    rgba(255, 255, 255, 0.012) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--selected {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 7%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 2%, transparent) 50%,
+    transparent 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
+}
+
+.task-row--selected:hover {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 11%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 4%, transparent) 50%,
+    transparent 100%
+  );
+}
+
+.task-row--multi-selected {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent-primary) 13%, transparent) 0%,
+    color-mix(in srgb, var(--color-accent-primary) 5%, transparent) 50%,
+    color-mix(in srgb, var(--color-accent-primary) 1%, transparent) 100%
+  );
+  box-shadow: inset 2px 0 0 var(--color-accent-primary);
+}
+
+/* 行按下：极轻微的 scale，提供触觉反馈且不破坏列表布局 */
+.task-row:active {
+  transform: scale(0.995);
+}
+
+/* 浅色主题下行 hover 用黑渐变，保持克制可见 */
+[data-theme="light"] .task-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.02) 0%,
+    rgba(0, 0, 0, 0.01) 50%,
+    transparent 100%
+  );
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+}
+
+.task-row--compact {
+  padding: 6px 16px;
+}
+
+/* 任务行单元格 */
+.task-list-cell {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-list-cell--align-left {
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.task-list-cell--align-right {
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.task-list-cell-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  font-family: "Geist Mono", monospace;
+}
+
+.task-list-cell--compact .task-list-cell-text {
+  font-size: 12px;
+}
+
+.task-list-cell--active-speed .task-list-cell-text {
+  color: var(--color-speed-active);
+}
+
+.task-row-progress {
+  margin-top: 9px;
+}
+
+.task-row-progress--compact {
+  margin-top: 5px;
+}

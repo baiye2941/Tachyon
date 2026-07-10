@@ -3,6 +3,7 @@ import type { ToastMessage } from '../types'
 import { XIcon } from './icons'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
+import { useReducedMotion } from '../hooks/useReducedMotion'
 
 const [toasts, setToasts] = createSignal<ToastMessage[]>([])
 
@@ -18,6 +19,10 @@ export function addToast(toast: Omit<ToastMessage, 'id'>) {
   }, newToast.duration)
 
   return () => clearTimeout(timer)
+}
+
+export function dismissToast(id: string) {
+  setToasts(prev => prev.map(t => t.id === id ? { ...t, closing: true } : t))
 }
 
 export function removeToast(id: string) {
@@ -37,7 +42,7 @@ export default function ToastContainer() {
       style={{
         top: '48px',
         right: '16px',
-        'z-index': 100,
+        'z-index': 'var(--z-toast)',
         'max-width': '360px',
       }}
     >
@@ -51,21 +56,54 @@ export default function ToastContainer() {
 }
 
 function ToastItem(props: { toast: ToastMessage }) {
-  let timer: number | null = null
+  const reducedMotion = useReducedMotion()
+  const [exiting, setExiting] = createSignal(false)
+  let durationTimer: number | null = null
+  let exitTimer: number | null = null
+
+  const clearTimers = () => {
+    if (durationTimer !== null) {
+      clearTimeout(durationTimer)
+      durationTimer = null
+    }
+    if (exitTimer !== null) {
+      clearTimeout(exitTimer)
+      exitTimer = null
+    }
+  }
+
+  const startExit = () => {
+    if (exiting()) return
+    clearTimers()
+    if (reducedMotion()) {
+      removeToast(props.toast.id)
+      return
+    }
+    setExiting(true)
+    // eslint-disable-next-line solid/reactivity
+    exitTimer = window.setTimeout(() => {
+      exitTimer = null
+      removeToast(props.toast.id)
+    }, 200)
+  }
 
   const startTimer = () => {
-    const { id, duration } = props.toast
-    timer = window.setTimeout(() => {
-      removeToast(id)
+    const { duration } = props.toast
+    // eslint-disable-next-line solid/reactivity
+    durationTimer = window.setTimeout(() => {
+      durationTimer = null
+      startExit()
     }, duration)
   }
 
-  const clearTimer = () => {
-    if (timer) clearTimeout(timer)
-  }
-
-  onMount(startTimer)
-  onCleanup(() => clearTimer())
+  onMount(() => {
+    if (props.toast.closing) {
+      startExit()
+    } else {
+      startTimer()
+    }
+  })
+  onCleanup(() => clearTimers())
 
   const indicatorColor = () => {
     switch (props.toast.type) {
@@ -79,7 +117,8 @@ function ToastItem(props: { toast: ToastMessage }) {
 
   return (
     <div
-      class="pointer-events-auto"
+      class="pointer-events-auto toast-item"
+      classList={{ 'toast--exiting': exiting() }}
       style={{
         background: 'var(--color-bg-elevated)',
         border: '1px solid var(--color-border-default)',
@@ -89,13 +128,12 @@ function ToastItem(props: { toast: ToastMessage }) {
         display: 'flex',
         gap: '12px',
         overflow: 'hidden',
-        animation: 'toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1)',
       }}
       onMouseEnter={() => {
-        clearTimer()
+        if (!exiting()) clearTimers()
       }}
       onMouseLeave={() => {
-        startTimer()
+        if (!exiting()) startTimer()
       }}
     >
       {/* Indicator */}
@@ -142,7 +180,7 @@ function ToastItem(props: { toast: ToastMessage }) {
                   style={{ 'font-size': '12px', padding: '0 4px' }}
                   onClick={() => {
                     action.onClick()
-                    removeToast(props.toast.id)
+                    startExit()
                   }}
                 >
                   {action.label}
@@ -158,7 +196,7 @@ function ToastItem(props: { toast: ToastMessage }) {
         variant="ghost"
         shape="icon-sm"
         aria-label={tr("toast.aria.closeNotification")}
-        onClick={() => removeToast(props.toast.id)}
+        onClick={() => startExit()}
       >
         <XIcon />
       </Button>

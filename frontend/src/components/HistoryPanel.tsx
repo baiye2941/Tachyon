@@ -248,7 +248,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
         </div>
       </div>
 
-      <div class="flex-1 overflow-y-auto" style={{ padding: "20px" }}>
+      <div class="flex-1 scroll-container" style={{ padding: "20px" }}>
         {/* Stats Grid */}
         <div
           style={{

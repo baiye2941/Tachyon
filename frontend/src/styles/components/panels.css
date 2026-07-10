@@ -1,0 +1,49 @@
+
+/* Panel overlay */
+.panel-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: var(--color-overlay-scrim);
+  animation: fadeIn 200ms ease forwards;
+}
+
+/* Slide panel (right side, fixed) */
+.slide-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100%;
+  z-index: var(--z-slide-panel);
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-elevated);
+  border-left: 1px solid var(--color-border-subtle);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.3);
+  transition: transform 300ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Panel header */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+/* Panel title */
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+

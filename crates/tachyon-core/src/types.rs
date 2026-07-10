@@ -354,7 +354,8 @@ pub struct DownloadStateChange {
 /// 分片进度事件
 ///
 /// 通过 `progress_tx` 通道发送给上层(tachyon-app)。
-/// 两变体:控制帧(PlanComplete,一次性可靠)、数据帧(Chunk,高频可丢)。
+/// 三变体:控制帧(PlanComplete,一次性可靠)、开始帧(Started,低频可丢)、
+/// 数据帧(Chunk,高频可丢)。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FragmentProgress {
@@ -378,6 +379,11 @@ pub enum FragmentProgress {
         completed: bool,
         fragment_downloaded: u64,
     },
+    /// worker 实际开始下载分片(`download_single_fragment` 入口,获取信号量后)
+    ///
+    /// 用 `try_send`(可丢):丢失仅导致该分片短暂不在 downloading_set,
+    /// 不影响正确性。重试时重复发送,app 层 `mark_downloading` 幂等吸收。
+    Started { fragment_index: u32 },
 }
 
 #[cfg(test)]
@@ -846,7 +852,9 @@ mod tests {
                 assert_eq!(completed_indices, vec![0, 1, 2]);
                 assert_eq!(initial_concurrency, 4);
             }
-            FragmentProgress::Chunk { .. } => panic!("应为 PlanComplete"),
+            FragmentProgress::Chunk { .. } | FragmentProgress::Started { .. } => {
+                panic!("应为 PlanComplete")
+            }
         }
     }
 
@@ -869,7 +877,28 @@ mod tests {
                 assert!(completed);
                 assert_eq!(fragment_downloaded, 1024);
             }
-            FragmentProgress::PlanComplete { .. } => panic!("应为 Chunk"),
+            FragmentProgress::PlanComplete { .. } | FragmentProgress::Started { .. } => {
+                panic!("应为 Chunk")
+            }
+        }
+    }
+
+    #[test]
+    fn test_fragment_progress_started_serialization() {
+        let progress = FragmentProgress::Started { fragment_index: 7 };
+        let json = serde_json::to_string(&progress).unwrap();
+        // camelCase rename_all 在 enum 上只对变体名生效,字段保持 snake_case
+        // (与 PlanComplete/Chunk 变体约定一致)
+        assert!(json.contains("\"started\""));
+        assert!(json.contains("\"fragment_index\":7"));
+        let de: FragmentProgress = serde_json::from_str(&json).unwrap();
+        match de {
+            FragmentProgress::Started { fragment_index } => {
+                assert_eq!(fragment_index, 7);
+            }
+            FragmentProgress::PlanComplete { .. } | FragmentProgress::Chunk { .. } => {
+                panic!("应为 Started")
+            }
         }
     }
 

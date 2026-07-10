@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use tachyon_core::safety::extract_filename_from_url;
-use tachyon_sniffer::capture::identify_resource;
+use tachyon_sniffer::capture::{CaptureConfig, identify_resource, should_capture};
 use tachyon_sniffer::{SnifferResource, redact_sensitive_params};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::commands::{AppError, resource_type_to_string};
@@ -20,15 +20,15 @@ use crate::commands::{AppError, resource_type_to_string};
 ///
 /// 负责嗅探器相关的业务逻辑：
 /// - 资源管理：添加资源（去重、限数量、脱敏）
-/// - 过滤器管理：添加过滤规则（去重、限长、限数量）
+/// - 捕获配置：类型白名单、最小文件大小、URL 过滤器（含去重/限长/限数量校验）
 /// - 查询：获取资源列表
 ///
 /// 由 Tauri command 层调用，command 层只负责参数解析和错误序列化。
 pub struct SnifferService {
     /// 已捕获的资源列表
     resources: Arc<Mutex<Vec<SnifferResource>>>,
-    /// 过滤规则列表
-    filters: Arc<Mutex<Vec<String>>>,
+    /// 捕获规则配置(类型白名单、min_size、url_filters)
+    capture_config: RwLock<CaptureConfig>,
 }
 
 impl SnifferService {
@@ -36,8 +36,18 @@ impl SnifferService {
     pub fn new() -> Self {
         Self {
             resources: Arc::new(Mutex::new(Vec::new())),
-            filters: Arc::new(Mutex::new(Vec::new())),
+            capture_config: RwLock::new(CaptureConfig::default()),
         }
+    }
+
+    /// 获取当前捕获配置的克隆
+    pub async fn capture_config(&self) -> CaptureConfig {
+        self.capture_config.read().await.clone()
+    }
+
+    /// 更新捕获配置
+    pub async fn set_capture_config(&self, config: CaptureConfig) {
+        *self.capture_config.write().await = config;
     }
 
     /// 获取所有资源（按发现时间倒序）
@@ -49,16 +59,19 @@ impl SnifferService {
     /// 添加嗅探器资源
     ///
     /// 业务规则：
-    /// - URL 必须匹配至少一条过滤规则（若过滤器非空）
+    /// - URL 必须通过 `should_capture`（类型白名单 + URL 过滤器子串匹配）
     /// - 去重：已存在的 URL 不重复添加
     /// - 限数量：超过 MAX_SNIFFER_RESOURCES 时移除最早的资源
     /// - URL 脱敏后存储
-    pub async fn add_resource(&self, url: String) {
-        let filters = self.filters.lock().await;
-        if !filters.is_empty() && !filters.iter().any(|f| url.contains(f.as_str())) {
-            return;
+    ///
+    /// 返回值：成功添加时返回 `Some(资源)`；被过滤或去重时返回 `None`，
+    /// 供 command 层决定是否 emit 事件。
+    pub async fn add_resource(&self, url: String) -> Option<SnifferResource> {
+        let config = self.capture_config.read().await;
+        if !should_capture(&url, &config) {
+            return None;
         }
-        drop(filters);
+        drop(config);
 
         let resource_type = identify_resource(&url);
         let file_name = extract_filename_from_url(&url);
@@ -82,7 +95,7 @@ impl SnifferService {
         let mut store = self.resources.lock().await;
 
         if store.iter().any(|r| r.url == redacted_url) {
-            return;
+            return None;
         }
 
         const MAX_SNIFFER_RESOURCES: usize = 1000;
@@ -91,7 +104,8 @@ impl SnifferService {
         }
 
         tracing::info!(url = %tachyon_core::redact_url_for_log(&url), resource_type = %resource.resource_type, "捕获新资源");
-        store.push(resource);
+        store.push(resource.clone());
+        Some(resource)
     }
 
     /// 添加过滤规则
@@ -101,6 +115,8 @@ impl SnifferService {
     /// - 规则长度不能超过 MAX_FILTER_LENGTH
     /// - 规则数量不能超过 MAX_FILTER_COUNT
     /// - 规则不能重复
+    ///
+    /// 规则存入 `CaptureConfig.url_filters`,`add_resource` 经 `should_capture` 使用。
     pub async fn add_filter(&self, filter: String) -> Result<(), AppError> {
         if filter.is_empty() {
             return Err(AppError::Config("过滤规则不能为空".to_string()));
@@ -111,18 +127,18 @@ impl SnifferService {
                 "过滤规则长度不能超过 {MAX_FILTER_LENGTH} 字符"
             )));
         }
-        let mut filters = self.filters.lock().await;
+        let mut config = self.capture_config.write().await;
         const MAX_FILTER_COUNT: usize = 100;
-        if filters.len() >= MAX_FILTER_COUNT {
+        if config.url_filters.len() >= MAX_FILTER_COUNT {
             return Err(AppError::Config(format!(
                 "过滤规则数量已达上限 {MAX_FILTER_COUNT}"
             )));
         }
-        if filters.contains(&filter) {
+        if config.url_filters.contains(&filter) {
             return Err(AppError::Config("过滤规则已存在".to_string()));
         }
         tracing::info!(filter = %filter, "添加嗅探过滤规则");
-        filters.push(filter);
+        config.url_filters.push(filter);
         Ok(())
     }
 
@@ -246,5 +262,68 @@ mod tests {
         assert_eq!(service.get_resources().await.len(), 1);
         service.clear_resources().await;
         assert!(service.get_resources().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_resource_returns_added_resource() {
+        let service = SnifferService::new();
+        let added = service
+            .add_resource("http://example.com/movie.mp4".to_string())
+            .await;
+        assert!(added.is_some(), "新增资源应返回 Some");
+        let res = added.unwrap();
+        assert_eq!(res.file_name, "movie.mp4");
+        assert_eq!(res.resource_type, "video");
+    }
+
+    #[tokio::test]
+    async fn test_add_resource_returns_none_on_duplicate() {
+        let service = SnifferService::new();
+        let first = service
+            .add_resource("http://example.com/file.zip".to_string())
+            .await;
+        let second = service
+            .add_resource("http://example.com/file.zip".to_string())
+            .await;
+        assert!(first.is_some(), "首次添加应返回 Some");
+        assert!(second.is_none(), "重复 URL 应返回 None");
+    }
+
+    #[tokio::test]
+    async fn test_add_resource_returns_none_when_filtered_out() {
+        let service = SnifferService::new();
+        service
+            .add_filter("cdn.example.com".to_string())
+            .await
+            .unwrap();
+        let rejected = service
+            .add_resource("http://other.com/video.mp4".to_string())
+            .await;
+        assert!(rejected.is_none(), "被过滤器拦截的 URL 应返回 None");
+    }
+
+    #[tokio::test]
+    async fn test_add_resource_respects_disabled_type() {
+        let service = SnifferService::new();
+        // 禁用 Video 类型后,视频 URL 不应被捕获
+        let mut cfg = service.capture_config().await;
+        cfg.enabled_types
+            .remove(&tachyon_sniffer::capture::ResourceType::Video);
+        service.set_capture_config(cfg).await;
+        let result = service
+            .add_resource("http://example.com/movie.mp4".to_string())
+            .await;
+        assert!(result.is_none(), "禁用 Video 类型后不应捕获视频");
+        assert!(service.get_resources().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_resource_allows_enabled_type() {
+        let service = SnifferService::new();
+        // 默认配置启用 Video,视频应被捕获
+        let result = service
+            .add_resource("http://example.com/movie.mp4".to_string())
+            .await;
+        assert!(result.is_some(), "默认配置应捕获视频");
     }
 }

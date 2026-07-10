@@ -22,6 +22,8 @@ export interface TaskInfo {
   fragmentsDone: number
   createdAt: string
   savePath: string
+  /** 当前活跃并发分片数。后端 ProgressPayload 高频同步,可选以兼容旧版快照 */
+  activeConcurrency?: number
   /** 失败原因原文(仅 status='failed' 时有值),后端 TaskInfo.error_reason */
   errorReason?: string
   /** 任务级重试计数(保留字段,当前恒为 0) */
@@ -186,6 +188,22 @@ export interface SnifferResource {
   sourcePage?: string
 }
 
+/** 嗅探捕获配置(与后端 CaptureConfig 对齐,camelCase) */
+export interface CaptureConfig {
+  /** 启用的资源类型(小写字符串集合) */
+  enabledTypes: SnifferResourceType[]
+  /** 最小文件大小(字节),低于此值不捕获 */
+  minSize: number
+  /** URL 过滤关键词 */
+  urlFilters: string[]
+}
+
+/** 剪贴板 URL 检测事件 payload(与后端 ClipboardUrlDetected 对齐,camelCase) */
+export interface ClipboardUrlDetected {
+  url: string
+  resourceType: string
+}
+
 export interface ProgressPayload {
   id: string
   progress: number
@@ -198,14 +216,17 @@ export interface ProgressPayload {
   /** 文件总大小,探测完成后由后端通过进度事件同步,避免详情页显示 0B */
   fileSize?: number | null
   completedDelta?: number[]
+  /** 本周期新开始下载的分片索引增量(后端 Started 事件累积) */
+  startedDelta?: number[]
 }
 
 export type ProgressEvent = Record<string, ProgressPayload>
 
-/** get_task_fragments 返回:真实分片总数 + 已完成分片索引 */
+/** get_task_fragments 返回:真实分片总数 + 已完成分片索引 + 正在下载分片索引 */
 export interface TaskFragmentsView {
   total: number
   doneIndices: number[]
+  downloadingIndices: number[]
 }
 
 export type ViewName = 'downloads' | 'sniffer' | 'settings' | 'history' | 'hub' | 'stats'
@@ -227,6 +248,7 @@ export interface ToastMessage {
   description?: string
   actions?: { label: string; onClick: () => void }[]
   duration?: number
+  closing?: boolean
 }
 
 export interface HfLfsInfo {

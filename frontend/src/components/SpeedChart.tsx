@@ -1,8 +1,8 @@
 import {
   createMemo,
-  onMount,
   onCleanup,
   createSignal,
+  createEffect,
   For,
   Show,
 } from "solid-js";
@@ -28,16 +28,33 @@ export default function SpeedChart(props: SpeedChartProps) {
   const [tick, setTick] = createSignal(0);
   let timerId: number | undefined;
 
-  onMount(() => {
+  const startTimer = () => {
+    if (timerId !== undefined) return;
     const loop = () => {
       setTick((t) => t + 1);
       timerId = window.setTimeout(loop, 1000);
     };
     timerId = window.setTimeout(loop, 1000);
+  };
+
+  const stopTimer = () => {
+    if (timerId !== undefined) {
+      clearTimeout(timerId);
+      timerId = undefined;
+    }
+  };
+
+  // 只在下载态才更新图表;完成/暂停/失败后停止轮询
+  createEffect(() => {
+    if (props.task.status === "downloading") {
+      startTimer();
+    } else {
+      stopTimer();
+    }
   });
 
   onCleanup(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
+    stopTimer();
   });
 
   const data = createMemo(() => {

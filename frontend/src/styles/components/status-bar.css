@@ -1,0 +1,127 @@
+
+
+/* ============================================
+   Chunk 网格材质:完成格保持静态,下载中格低调脉冲
+   ============================================ */
+
+/* 实时速度读数呼吸(参考稿 speed-breathe) */
+
+.speed-breathe {
+  animation: speed-breathe 1.6s ease-in-out infinite;
+}
+
+
+/* ============================================
+   Status Indicator (Refined Breathing)
+   ============================================ */
+
+
+.status-indicator-active {
+  animation: status-breathe 2.5s ease-in-out infinite;
+}
+
+/* Status Badge — 质感:per-status 背景 + 顶部 1px inset 高光 */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  line-height: 1.4;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  font-feature-settings: "ss01", "tnum";
+}
+
+.status-badge-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.9;
+}
+
+.status-badge-icon svg {
+  flex-shrink: 0;
+}
+.status-badge--downloading {
+  color: var(--color-status-downloading);
+  background: var(--color-accent-soft);
+  border-color: color-mix(in srgb, var(--color-accent-primary) 18%, transparent);
+  /* 下载中脉冲(spec 8.1):subtle opacity 呼吸 */
+  animation: status-pulse 1.8s ease-in-out infinite;
+}
+.status-badge--connecting,
+.status-badge--resuming,
+.status-badge--verifying {
+  color: var(--color-status-connecting);
+  background: var(--color-info-soft);
+  border-color: color-mix(in srgb, var(--color-info) 18%, transparent);
+}
+.status-badge--completed {
+  color: var(--color-status-completed);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-success) 18%, transparent);
+}
+.status-badge--paused {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-subtle);
+}
+.status-badge--failed {
+  color: var(--color-status-error);
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-error) 18%, transparent);
+}
+.status-badge--pending,
+.status-badge--cancelled {
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-subtle);
+}
+
+
+/* ============================================
+   Status Badge Dot — 状态 pill 前的小指示灯
+   ============================================ */
+.status-badge-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  margin-right: 5px;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.status-badge-dot--downloading {
+  background: var(--color-status-downloading);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent-primary) 22%, transparent);
+  animation: status-dot-pulse 1.8s ease-in-out infinite;
+}
+
+.status-badge-dot--connecting,
+.status-badge-dot--resuming,
+.status-badge-dot--verifying {
+  background: var(--color-status-connecting);
+  animation: status-dot-pulse 1.8s ease-in-out infinite;
+}
+
+.status-badge-dot--completed {
+  background: var(--color-status-completed);
+}
+
+.status-badge-dot--failed {
+  background: var(--color-status-error);
+}
+
+.status-badge-dot--paused,
+.status-badge-dot--pending,
+.status-badge-dot--cancelled {
+  background: var(--color-text-tertiary);
+}
+

@@ -1,0 +1,432 @@
+/* Tachyon Design System - Global Styles */
+/* Tailwind CSS v4 - Vite Plugin Mode */
+/* Brand: Tachyon - 深空操作台 / 赛马娘青绿速度轴 / 电青读数 / 粉星光点缀
+   设计取向:Linear 克制留白 + FluxDown 分片密度,去 AI 味(去饱和/去辉光/去玻璃拟态) */
+
+@import "tailwindcss";
+
+
+/* ============================================
+    第一层:Primitive Tokens(原始色板,不直接使用)
+   ============================================ */
+
+@theme {
+  /* ===== Near Black 基底(深空冷蓝灰阶,Linear #08090A 系,纯灰阶无暖偏)===== */
+  --black-0: #050608;
+  --black-1: #08090c;
+  --black-2: #0a0b0f;
+  --black-3: #0d0e13;
+  --black-4: #111319;
+  --black-5: #16181f;
+
+  /* ===== Graphite / Gunmetal / Charcoal 中性阶(冷灰蓝调)===== */
+  --graphite-1: #1a1d24;
+  --graphite-2: #23262e;
+  --graphite-3: #2c3038;
+  --gunmetal: #3a3f48;
+  --charcoal: #4a4f59;
+  --ash: #6b7280;
+  --silver: #9aa0ac;
+  --platinum: #c9cdd6;
+  --porcelain: #edeff3;
+  --white-pure: #f7f8fa;
+
+  /* ===== Tachyon Teal(主强调,赛马娘赛道青绿,去饱和档)
+     原始赛马娘 #00C7B1 饱和度过高,降一档到 teal-500 #14b8a6,
+     对应 LCH 饱和约 38%(去 AI 味:避免荧光绿感),冷调贴合"快子"速度语义。 ===== */
+  --teal-300: #5eead4;
+  --teal-400: #2dd4bf;
+  --teal-500: #14b8a6;
+  --teal-600: #0d9488;
+  --teal-700: #0f766e;
+
+  /* ===== Rose Sparkle(完成态静态点缀,赛马娘星光粉,去饱和档)
+     仅用于完成态的静态星点/图例,禁动画。原 #ff79d0 降到 #f472b6。 ===== */
+  --rose-300: #f9a8d4;
+  --rose-400: #f472b6;
+  --rose-500: #ec4899;
+
+  /* ===== Violet(历史主强调,降权保留:primitive 仍定义但 semantic 不再绑定主强调)
+     保留是为避免破坏性引用,后续渐进迁移清理。仅 file-audio 等次要分类色沿用。 ===== */
+  --violet-300: #c4b5fd;
+  --violet-400: #a78bfa;
+  --violet-500: #8b5cf6;
+  --violet-600: #7c3aed;
+  --violet-700: #6d28d9;
+
+  /* ===== Electric Purple(次强调,关键操作高亮,降权)===== */
+  --purple-400: #c084fc;
+  --purple-500: #a855f7;
+
+  /* ===== Tachyon Velocity(主强调,冷电青,参考稿 oklch 0.82 0.13 198)
+     取自 docs/Front 参考稿,经 OKLab→sRGB 矩阵精确换算。
+     hue=198 是偏蓝的青(非绿青 teal),冷调贴合"快子"速度语义。
+     不复用 --cyan-*/--teal-*,避免污染"速度专用"/"赛马娘青绿"既有语义。 ===== */
+  --accent-vel-400: #35dde2; /* 主色,= oklch(0.82 0.13 198) */
+  --accent-vel-500: #00e5ff; /* 亮档,hover/高亮/进度前缘 */
+  --accent-vel-600: #40b1b7; /* dim,= oklch(0.7 0.1 200),次要强调 */
+  --accent-vel-fg: #010f18; /* 前景文字色,= oklch(0.16 0.03 230),电青上的深蓝黑 */
+
+  /* ===== Neon Cyan(实时下载速度专用,能量隐喻,严格限制使用范围)===== */
+  --cyan-400: #22d3ee;
+  --cyan-500: #00e5ff;
+
+  /* ===== 状态色(对齐参考稿精确 hex,克制饱和度,保持冷静)
+     danger=橙红 oklch(0.66 0.2 35)、ok=青绿 oklch(0.78 0.14 165)、warn=琥珀 oklch(0.82 0.13 85)
+     hue 对比:198 蓝青(accent) / 165 绿青(ok) / 35 橙红(danger) —— 色盲可区分 ===== */
+  --emerald-500: #49d3a1; /* ok,青绿(参考稿) */
+  --amber-500: #ebbd57; /* warn,琥珀(参考稿) */
+  --red-400: #f87171;
+  --red-500: #dc2626; /* danger,橙红→纯红提深,白字前景 → 4.83:1(WCAG AA ✅)。原 #f3562e 仅 3.40:1。 */
+  --red-600: #b91c1c;
+
+  /* ===== 字号阶梯(下载器高密度;rem 以浏览器默认 16px 为基准,WCAG 1.4.4 缩放友好)===== */
+  --text-xs: 0.6875rem; /* 11px */
+  --text-sm: 0.75rem; /* 12px */
+  --text-base: 0.8125rem; /* 13px */
+  --text-md: 0.875rem; /* 14px */
+  --text-lg: 1rem; /* 16px */
+  --text-xl: 1.25rem; /* 20px */
+  --text-2xl: 1.75rem; /* 28px */
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+}
+
+
+/* ============================================
+    第二层:Semantic Tokens(语义层,组件使用这层)
+   ============================================ */
+
+@theme {
+  /* 背景层级(elevation) */
+  --color-bg-void: var(--black-0);
+  --color-bg-primary: var(--black-2);
+  --color-bg-secondary: var(--black-3);
+  --color-bg-tertiary: var(--graphite-1);
+  --color-bg-elevated: var(--black-5);
+  --color-bg-raised: var(--graphite-2);
+  --color-bg-overlay: var(--graphite-1);
+  --color-bg-hover: rgba(255, 255, 255, 0.04);
+  /* 滚动条拇指色(light 主题覆盖为黑色 rgba,保证浅底可见) */
+  --color-scrollbar-thumb: rgba(255, 255, 255, 0.08);
+  --color-scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
+  /* Modal/弹窗遮罩 scrim(Iteration 06:统一原散落的 rgba(0,0,0,0.4~0.6)) */
+  --color-overlay-scrim: rgba(0, 0, 0, 0.55);
+  /* 比 accent-soft 更淡的强调底色(细微 hover 高亮) */
+  --color-accent-faint: rgba(53, 221, 226, 0.04);
+
+  /* 兼容旧引用:bg-secondary 在 DetailPanel 中仍被引用 */
+  --color-bg-card: var(--graphite-1);
+
+  /* 边框 / 分隔 */
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-border-default: rgba(255, 255, 255, 0.1);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+
+  /* 文本层级 */
+  --color-text-primary: var(--platinum);
+  --color-text-secondary: var(--silver);
+  --color-text-tertiary: var(--ash);
+  --color-text-disabled: var(--charcoal);
+  --color-text-inverse: var(--black-2);
+  /* 兼容旧引用 */
+  --color-text-title: var(--porcelain);
+
+  /* 强调色(严格控制使用频率,去 AI 味:辉光 alpha 大幅降低)
+     spec 6.2:max 1 accent。主强调切到冷电青 accent-vel-400(参考稿 oklch 0.82 0.13 198),
+     hue=198 偏蓝的青,冷调中性,避免"AI 紫"荧光感。辉光/软底 alpha 统一压到 0.04-0.10。 */
+  /* Tailwind v4 会裁剪未被源码直接引用的 --accent-vel-400,导致 var() 失效,
+     因此主色直接写死值而不是引用 primitive token。 */
+  --color-accent-primary: #35dde2;
+  --color-accent-primary-hover: #5ce1e5;
+  --color-accent-primary-active: #00c5cc;
+  --color-accent-secondary: var(--accent-vel-500);
+  --color-accent-tertiary: var(--accent-vel-600);
+  --color-accent-foreground: var(--accent-vel-fg);
+  --color-accent-glow: rgba(53, 221, 226, 0.10);
+  --color-accent-glow-strong: rgba(53, 221, 226, 0.20);
+  --color-accent-soft: rgba(53, 221, 226, 0.08);
+  /* 粉星光:完成态静态点缀专用,不参与交互态 */
+  --color-sparkle: var(--rose-400);
+  --color-sparkle-soft: rgba(244, 114, 182, 0.10);
+  /* danger 软底:破坏性操作图标/容器背景(对齐参考稿 WarningCircle 底色)。rgb 同步 --red-500 #dc2626。 */
+  --color-danger-soft: rgba(220, 38, 38, 0.15);
+  /* inset 暗阴影:active 态下沉/键帽内阴影(中性黑 alpha,非颜色语义) */
+  --color-inset-dark: rgba(0, 0, 0, 0.25);
+  --color-inset-light: rgba(255, 255, 255, 0.06);
+
+  /* 速度指示(Neon Cyan,仅实时下载速度数字与 sparkline) */
+  --color-speed-active: var(--cyan-500);
+  --color-speed-soft: rgba(0, 229, 255, 0.10);
+  /* 信息/警告的柔和底色(筛选激活态) */
+  --color-info-soft: rgba(34, 211, 238, 0.24);
+  --color-warning-soft: rgba(245, 158, 11, 0.24);
+
+  /* 状态语义:电青(下载中,品牌绑定活跃态)/ 灰(暂停)/ 青绿(完成)/ 琥珀(警告)/ 橙红(错误) */
+  --color-success: var(--emerald-500);
+  --color-warning: var(--amber-500);
+  --color-error: var(--red-500);
+  --color-error-hover: var(--red-400);
+  --color-error-active: var(--red-600);
+  --color-info: var(--cyan-400);
+
+  --color-status-downloading: #35dde2; /* 直接写值,Tailwind v4 会裁剪 --accent-vel-400 */
+  --color-status-paused: var(--ash);
+  --color-status-completed: var(--color-brand-teal);
+  --color-status-warning: var(--amber-500);
+  --color-status-error: var(--red-500);
+  --color-status-pending: var(--charcoal);
+  --color-status-connecting: var(--cyan-400);
+  --color-status-verifying: var(--cyan-400);
+  --color-status-resuming: var(--accent-vel-500);
+
+  /* File Type Colors(保留功能性分类色,降低饱和度) */
+  --color-file-video: var(--amber-500);
+  --color-file-audio: var(--violet-500);
+  --color-file-document: #3b82f6;
+  --color-file-image: var(--emerald-500);
+  --color-file-archive: #f97316;
+  --color-file-executable: var(--ash);
+  --color-file-model: var(--purple-500);
+  --color-file-other: var(--ash);
+
+  /* Spacing */
+  --spacing-1: 4px;
+  --spacing-2: 8px;
+  --spacing-3: 12px;
+  --spacing-4: 16px;
+  --spacing-5: 20px;
+  --spacing-6: 24px;
+  --spacing-8: 32px;
+  --spacing-10: 40px;
+  --spacing-12: 48px;
+
+  /* Border Radius — 参考稿阶梯(更紧致,贴合工具型下载器) */
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Shadows - 多层复合(环境散射 + 直接光),模拟物理材质感 */
+  --shadow-sm:
+    0 1px 1px rgba(0, 0, 0, 0.25),
+    0 1px 2px rgba(0, 0, 0, 0.18);
+  --shadow-md:
+    0 2px 4px rgba(0, 0, 0, 0.28),
+    0 8px 16px rgba(0, 0, 0, 0.32);
+  --shadow-lg:
+    0 4px 8px rgba(0, 0, 0, 0.3),
+    0 16px 32px rgba(0, 0, 0, 0.4);
+  --shadow-xl:
+    0 8px 16px rgba(0, 0, 0, 0.35),
+    0 24px 56px rgba(0, 0, 0, 0.5);
+  /* inset 高光:模拟从上方光源照射的边缘高光,关键质感细节 */
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --shadow-glow: 0 0 20px rgba(53, 221, 226, 0.10);
+  --shadow-accent: 0 0 0 1px var(--color-accent-glow);
+  /* 材质 token(参考稿 press-button/file-icon 质感) */
+  --shadow-inset-bevel:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.4),
+    0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-press: 0 1px 2px 0 rgba(0, 0, 0, 0.7) inset;
+  --shadow-raised:
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    0 1px 2px 0 rgba(0, 0, 0, 0.6);
+
+  /* Typography */
+  --font-sans:
+    "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "SF Mono", "Fira Code", monospace;
+
+  /* Transitions */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Motion Token: micro/meso/macro */
+  --duration-instant: 80ms;
+  --duration-fast: 150ms;
+  --duration-normal: 200ms;
+  --duration-slow: 300ms;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-decelerated: cubic-bezier(0, 0, 0.2, 1);
+}
+
+/* ============================================
+   Animations
+   ============================================ */
+
+/* ============================================
+   响应式面板宽度 CSS 变量 + 断点 token(Iteration 13)
+   ============================================ */
+
+:root {
+  /* 断点 token:统一管理,避免散落硬编码 */
+  --bp-sm: 640px;   /* 手机/极窄窗 */
+  --bp-md: 768px;   /* 平板/窄桌面(侧边栏强制轨道、DetailPanel 全屏) */
+  --bp-lg: 1024px;  /* 标准桌面 */
+  --bp-xl: 1280px;  /* 宽屏 */
+
+  --panel-detail-width: 400px;
+  --panel-modal-width: 480px;
+  --panel-sniffer-width: 380px;
+
+  /* z-index token 体系:避免组件中散落硬编码层级 */
+  --z-base: 0;
+  --z-sidebar-edge: 5;
+  --z-cell-selected: 10;
+  --z-dropdown: 50;
+  --z-sticky: 60;
+  --z-detail-scrim: 70;
+  --z-detail-panel: 80;
+  --z-slide-panel: 90;
+  --z-modal: 100;
+  --z-command-palette: 150;
+  --z-context-menu-backdrop: 155;
+  --z-context-menu: 160;
+  --z-toast: 200;
+  --z-overlay: 250;
+  --z-panel-content: 260;
+  --z-drag: 300;
+
+  /* 品牌 token:赛马娘青绿(teal)作为品牌标识,与速度强调色(accent-vel/cyan)解耦
+     dark 主题用 teal-500,light 主题用 teal-700 保证浅底对比度 */
+  --color-brand-teal: var(--teal-500);
+  --color-brand-teal-soft: rgba(20, 184, 166, 0.08);
+  --color-brand-teal-hover: var(--teal-400);
+  --color-brand-teal-active: var(--teal-600);
+}
+
+@media (max-width: 768px) {
+  :root {
+    --panel-detail-width: min(400px, calc(100vw - 32px));
+    --panel-modal-width: min(480px, calc(100vw - 32px));
+    --panel-sniffer-width: min(380px, calc(100vw - 32px));
+  }
+}
+
+[data-theme="light"] {
+  /* 背景层级:反转为浅冷灰白(Linear 浅底系,非纯白) */
+  --black-0: #f4f5f7;
+  --black-1: #eceef1;
+  --black-2: #fafafa;
+  --black-3: #f4f5f7;
+  --black-4: #eceef1;
+  --black-5: #ffffff;
+  --graphite-1: #e4e7eb;
+  --graphite-2: #d8dce2;
+  --graphite-3: #c8cdd5;
+  --gunmetal: #9ca3af;
+  --charcoal: #6b7280;
+  --ash: #6b7280; /* text-tertiary:浅底 #6b7280 on #fafafa → 4.63:1(WCAG AA ✅)。原 #9ca3af 仅 2.43:1。 */
+  --silver: #6b7280;
+  --platinum: #3a3f48;
+  --porcelain: #1a1d24;
+  --white-pure: #0a0b0f;
+
+  /* 边框:反转为深色 rgba(浅底下用黑色低透明度) */
+  --color-bg-hover: rgba(0, 0, 0, 0.04);
+  --color-scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --color-scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+
+  /* 文本:反转为深灰(非纯黑) */
+  --color-text-primary: var(--platinum);
+  --color-text-secondary: var(--silver);
+  --color-text-tertiary: var(--ash);
+  --color-text-disabled: var(--gunmetal);
+  --color-text-inverse: var(--black-2);
+  --color-text-title: var(--porcelain);
+
+  /* 强调色:浅底用 teal-700 #0f766e 作 primary,白字前景 → 5.47:1(WCAG AA ✅)。
+     原 accent-vel-600 #40b1b7 配白字仅 2.56:1,对比度不达标。 */
+  --color-accent-primary: var(--teal-700);
+  --color-accent-primary-hover: #0b5c56;
+  --color-accent-primary-active: #084d48;
+  --color-accent-secondary: var(--accent-vel-400);
+  --color-accent-tertiary: #0891b2;
+  --color-accent-foreground: #ffffff;
+  --color-accent-glow: rgba(64, 177, 183, 0.08);
+  --color-accent-glow-strong: rgba(64, 177, 183, 0.16);
+  --color-accent-soft: rgba(64, 177, 183, 0.06);
+  --color-accent-faint: rgba(64, 177, 183, 0.03);
+
+  /* 速度色:浅底下用 cyan-600 提亮 */
+  --color-speed-active: #0891b2;
+  --color-speed-soft: rgba(8, 145, 178, 0.08);
+  --color-info-soft: rgba(8, 145, 178, 0.16);
+  --color-warning-soft: rgba(217, 119, 6, 0.16);
+
+  /* 状态色:浅底提亮一档保证对比 */
+  --color-success: #0d9488;
+  --color-error: #dc2626;
+  --color-error-hover: #ef4444;
+  --color-error-active: #b91c1c;
+  --color-info: #0891b2;
+  --color-status-downloading: #40b1b7; /* 直接写值,避免 --accent-vel-600 被裁剪 */
+  --color-status-paused: var(--ash);
+  --color-status-completed: var(--color-brand-teal);
+  --color-status-warning: #d97706;
+  --color-status-error: #dc2626;
+  --color-status-pending: var(--gunmetal);
+  --color-status-connecting: #0891b2;
+  --color-status-verifying: #0891b2;
+  --color-status-resuming: var(--accent-vel-500);
+
+  /* 遮罩:浅底下用深色 scrim */
+  --color-overlay-scrim: rgba(15, 23, 42, 0.4);
+
+  /* 阴影:浅底下阴影更柔和但可见 */
+  --shadow-sm:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-md:
+    0 2px 4px rgba(15, 23, 42, 0.08),
+    0 8px 16px rgba(15, 23, 42, 0.10);
+  --shadow-lg:
+    0 4px 8px rgba(15, 23, 42, 0.10),
+    0 16px 32px rgba(15, 23, 42, 0.14);
+  --shadow-xl:
+    0 8px 16px rgba(15, 23, 42, 0.12),
+    0 24px 56px rgba(15, 23, 42, 0.18);
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --shadow-glow: 0 0 20px rgba(64, 177, 183, 0.08);
+
+  /* 品牌色:浅底用更深 teal 保证对比度 */
+  --color-brand-teal: var(--teal-700);
+  --color-brand-teal-soft: rgba(15, 118, 110, 0.08);
+  --color-brand-teal-hover: #0b5c56;
+  --color-brand-teal-active: #084d48;
+}
+
+/* Light 主题下的组件微调:边框/玻璃类跟随浅底 */
+[data-theme="light"] .glass {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+}
+
+/* Light 主题:基础组件类已改用 --color-bg-hover / --color-border-* token,
+   这些 token 在本块已覆盖为黑色 rgba,故无需组件级镜像。仅保留少量特殊处理。 */
+
+/* toggle 关态:浅底下白拇指浮浅灰轨道对比不足,改深色拇指 + 轨道边框 */
+[data-theme="light"] .toggle {
+  background: var(--graphite-3);
+  border: 1px solid var(--color-border-default);
+}
+
+[data-theme="light"] .toggle-thumb {
+  background: var(--color-bg-elevated);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2);
+}
+
+/* 滚动条已通过 --color-scrollbar-thumb token 自动覆盖,无需组件级镜像 */

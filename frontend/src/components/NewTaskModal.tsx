@@ -280,13 +280,12 @@ export default function NewTaskModal(props: NewTaskModalProps) {
 
   return (
     <div
-      class="fixed inset-0 z-[200] flex items-center justify-center"
+      class="fixed inset-0 z-[var(--z-overlay)] flex items-center justify-center"
       role="dialog"
       aria-modal="true"
       aria-labelledby="new-task-modal-title"
       style={{
         background: "var(--color-overlay-scrim)",
-        "backdrop-filter": "blur(4px)",
       }}
       onClick={() => props.onClose()}
       onKeyDown={handleKeyDown}

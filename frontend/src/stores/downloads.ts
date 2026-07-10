@@ -260,23 +260,32 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           fragmentsDone: newFragmentsDone,
           fragmentsTotal: newFragmentsTotal,
           fileSize: newSize,
+          activeConcurrency: newConcurrency,
         });
       }
 
       // 合并分片 delta 到 fragment store
-      if (p.completedDelta && p.completedDelta.length > 0) {
-        mergeFragmentDelta(id, p.completedDelta, newConcurrency);
+      const hasCompleted = p.completedDelta && p.completedDelta.length > 0;
+      const hasStarted = p.startedDelta && p.startedDelta.length > 0;
+      if (hasCompleted || hasStarted) {
+        mergeFragmentDelta(
+          id,
+          p.completedDelta ?? [],
+          p.startedDelta ?? [],
+          newConcurrency,
+        );
       } else if (newConcurrency > 0) {
-        mergeFragmentDelta(id, [], newConcurrency);
+        mergeFragmentDelta(id, [], [], newConcurrency);
       }
 
-      // fragmentsTotal 从 0 变非 0:PlanComplete 到达,DetailPanel 若已打开需重拉
-      if (
-        task.fragmentsTotal === 0 &&
-        newFragmentsTotal > 0 &&
-        getTaskFragmentData(id) === undefined
-      ) {
-        loadTaskFragments(id);
+      // fragmentsTotal 从 0 变非 0:PlanComplete 到达,DetailPanel 若已打开需重拉。
+      // 兼容 DetailPanel 在探测阶段提前打开的情况:此时 store 中可能尚无数据,
+      // 或仅有无效空数据(已通过在 total=0 时不写入 store 避免),直接触发首拉。
+      if (task.fragmentsTotal === 0 && newFragmentsTotal > 0) {
+        const fragData = getTaskFragmentData(id);
+        if (!fragData || fragData.total === 0) {
+          loadTaskFragments(id);
+        }
       }
 
       // 状态转 terminal：只在 status 真正变化到 terminal 时触发

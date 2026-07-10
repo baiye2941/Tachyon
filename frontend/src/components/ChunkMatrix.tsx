@@ -64,13 +64,15 @@ export function buildBlocks(
   progress: number,
   doneSet: Set<number>,
   concurrency: number,
+  downloadingSet: Set<number>,
 ): ChunkBlock[] {
   if (total <= 0) return [];
   const blockCount = Math.min(total, AGGREGATE_BLOCKS);
-  // 活跃带宽度:基于真实并发度推算,从 maxDoneIdx 后取 min(concurrency, remaining)
-  const maxDoneIdx = doneSet.size > 0 ? Math.max(...doneSet) : -1;
-  const remaining = total - done;
-  const band = Math.min(Math.max(1, concurrency), Math.max(1, remaining));
+  // 真实活跃分片由 downloadingSet 决定(后端 Started 事件驱动),
+  // 不再依赖 maxDoneIdx + band 位置启发式
+  void done;
+  void progress;
+  void concurrency;
   const blocks: ChunkBlock[] = [];
   for (let i = 0; i < blockCount; i++) {
     const start = Math.floor((i * total) / blockCount);
@@ -81,7 +83,7 @@ export function buildBlocks(
     for (let f = start; f < end; f++) {
       if (doneSet.has(f)) {
         blockDone++;
-      } else if (f > maxDoneIdx && f <= maxDoneIdx + band && progress < 1) {
+      } else if (downloadingSet.has(f)) {
         blockDownloading++;
       }
     }
@@ -238,6 +240,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   onCleanup(() => {
     if (rafId !== null) cancelAnimationFrame(rafId);
     if (resizeObs !== null) resizeObs.disconnect();
+    if (hideHoverTimer !== null) clearTimeout(hideHoverTimer);
   });
 
   const shouldAggregate = createMemo(
@@ -249,21 +252,12 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   const chunks = createMemo(() => {
     if (props.fragmentsTotal > AGGREGATE_THRESHOLD) return [];
     const data = fragData();
-    // 无 store 数据时回退到旧推算(store 未加载完成期间)
+    // 无 store 数据时回退到空集合(store 未加载完成期间)
     const doneSet = data?.doneSet ?? new Set<number>();
-    const concurrency = data?.concurrency || Math.max(2, Math.round(props.fragmentsTotal / 8));
-    const done = props.fragmentsDone;
-    const maxDoneIdx = doneSet.size > 0 ? Math.max(...doneSet) : -1;
-    const remaining = props.fragmentsTotal - done;
-    const band = Math.min(Math.max(1, concurrency), Math.max(1, remaining));
-    // 在 memo 作用域内预先读取响应式值,避免在 Array.from 回调(非追踪作用域)
-    // 内读取 props.progress 触发 solid/reactivity 警告(变化会被忽略)。
-    const progressLt1 = props.progress < 1;
+    const downloadingSet = data?.downloadingSet ?? new Set<number>();
     return Array.from({ length: props.fragmentsTotal }, (_, i) => {
       const isDone = doneSet.has(i);
-      // 已知折中:maxDoneIdx 之前未完成的分片(如重试中)显示为 pending
-      const isDownloading =
-        !isDone && i > maxDoneIdx && i <= maxDoneIdx + band && progressLt1;
+      const isDownloading = !isDone && downloadingSet.has(i);
       const status: ChunkBlock["status"] = isDone
         ? "done"
         : isDownloading
@@ -281,14 +275,15 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
   const blocks = createMemo(() => {
     const data = fragData();
     const doneSet = data?.doneSet ?? new Set<number>();
+    const downloadingSet = data?.downloadingSet ?? new Set<number>();
     const concurrency = data?.concurrency || Math.max(2, Math.round(props.fragmentsTotal / 8));
-    return buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress, doneSet, concurrency);
+    return buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress, doneSet, concurrency, downloadingSet);
   });
 
   // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
   createEffect(() => {
     if (props.progress >= 1 && fragData() && fragData()!.doneSet.size === 0) {
-      mergeFragmentDelta(props.taskId, [0], 0);
+      mergeFragmentDelta(props.taskId, [0], [], 0);
     }
   });
 
@@ -343,109 +338,84 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const selected = selectedIndex();
     const hasMotion = !prefersReducedMotion();
     const accentColor = resolveToken("--color-accent-primary");
+    const sweepPhase = hasMotion ? (phase * 2) % 1 : 0;
+    const topHighlightRadii: [number, number, number, number] = [
+      Math.max(1, radius - 1),
+      Math.max(1, radius - 1),
+      1,
+      1,
+    ];
 
-    // 阶段1:下载中块外发光(统一 shadow 状态)
-    if (hasMotion) {
-      ctx.save();
-      ctx.shadowBlur = 8 + 4 * pulse;
-      ctx.globalAlpha = 0.18 + 0.14 * pulse;
-      for (let i = 0; i < blockList.length; i++) {
-        const block = blockList[i]!;
-        if (block.status !== "downloading") continue;
-        const { x, y } = blockCoords(i, perRow);
-        const fillColor = getStatusFill(block.status);
+    // 单次遍历:每个块依次绘制 7 个效果,减少循环次数与 save/restore
+    for (let i = 0; i < blockList.length; i++) {
+      const block = blockList[i]!;
+      const { x, y } = blockCoords(i, perRow);
+      const fillColor = getStatusFill(block.status);
+
+      // 1) 下载中块外发光
+      if (block.status === "downloading" && hasMotion) {
+        ctx.shadowBlur = 8 + 4 * pulse;
         ctx.shadowColor = fillColor;
+        ctx.globalAlpha = 0.18 + 0.14 * pulse;
         ctx.fillStyle = fillColor;
         ctx.beginPath();
         ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
         ctx.fill();
+        ctx.shadowBlur = 0;
       }
-      ctx.restore();
-    }
 
-    // 阶段2:所有块底色
-    for (let i = 0; i < blockList.length; i++) {
-      const block = blockList[i]!;
-      const { x, y } = blockCoords(i, perRow);
+      // 2) 块底色
+      ctx.globalAlpha =
+        block.status === "downloading" && hasMotion
+          ? 0.85 + 0.15 * pulse
+          : 1;
+      ctx.fillStyle = fillColor;
       ctx.beginPath();
       ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
-      if (block.status === "downloading" && hasMotion) {
-        ctx.globalAlpha = 0.85 + 0.15 * pulse;
-      }
-      ctx.fillStyle = getStatusFill(block.status);
       ctx.fill();
       ctx.globalAlpha = 1;
-    }
 
-    // 阶段3:完成态内发光 + 顶部高光
-    for (let i = 0; i < blockList.length; i++) {
-      const block = blockList[i]!;
-      if (block.status !== "done") continue;
-      const { x, y } = blockCoords(i, perRow);
-      const fillColor = getStatusFill(block.status);
+      // 3) 完成态内发光 + 顶部高光
+      if (block.status === "done") {
+        ctx.shadowColor = fillColor;
+        ctx.shadowBlur = 5;
+        ctx.strokeStyle = fillColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
 
-      ctx.save();
-      ctx.shadowColor = fillColor;
-      ctx.shadowBlur = 5;
-      ctx.strokeStyle = fillColor;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
-      ctx.stroke();
-      ctx.restore();
+        ctx.fillStyle = "rgba(255,255,255,0.12)";
+        ctx.beginPath();
+        ctx.roundRect(
+          x + 1,
+          y + 1,
+          BLOCK_SIZE - 2,
+          BLOCK_SIZE * 0.45,
+          topHighlightRadii,
+        );
+        ctx.fill();
+      }
 
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(x + 1, y + 1, BLOCK_SIZE - 2, BLOCK_SIZE * 0.45, [
-        Math.max(1, radius - 1),
-        Math.max(1, radius - 1),
-        1,
-        1,
-      ]);
-      ctx.fillStyle = "rgba(255,255,255,0.12)";
-      ctx.fill();
-      ctx.restore();
-    }
-
-    // 阶段4:等待态点阵纹理
-    ctx.fillStyle = "rgba(255,255,255,0.05)";
-    for (let i = 0; i < blockList.length; i++) {
-      const block = blockList[i]!;
-      if (block.status !== "pending") continue;
-      const { x, y } = blockCoords(i, perRow);
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(x + 1, y + 1, BLOCK_SIZE - 2, BLOCK_SIZE - 2, radius - 1);
-      ctx.clip();
-      for (let px = x + 2; px < x + BLOCK_SIZE; px += 4) {
-        for (let py = y + 2; py < y + BLOCK_SIZE; py += 4) {
-          ctx.fillRect(px - 0.6, py - 0.6, 1.2, 1.2);
+      // 4) 等待态点阵纹理
+      if (block.status === "pending") {
+        ctx.fillStyle = "rgba(255,255,255,0.05)";
+        for (let px = x + 2; px < x + BLOCK_SIZE; px += 4) {
+          for (let py = y + 2; py < y + BLOCK_SIZE; py += 4) {
+            ctx.fillRect(px - 0.6, py - 0.6, 1.2, 1.2);
+          }
         }
       }
-      ctx.restore();
-    }
 
-    // 阶段5:统一顶部高光 + 底部暗边
-    for (let i = 0; i < blockList.length; i++) {
-      const { x, y } = blockCoords(i, perRow);
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
-      ctx.clip();
+      // 5) 统一顶部高光 + 底部暗边
       ctx.fillStyle = "rgba(255,255,255,0.08)";
       ctx.fillRect(x, y, BLOCK_SIZE, 1);
       ctx.fillStyle = "rgba(0,0,0,0.35)";
       ctx.fillRect(x, y + BLOCK_SIZE - 1, BLOCK_SIZE, 1);
-      ctx.restore();
-    }
 
-    // 阶段6:下载中扫描光带
-    if (hasMotion) {
-      const sweepPhase = (phase * 2) % 1;
-      for (let i = 0; i < blockList.length; i++) {
-        const block = blockList[i]!;
-        if (block.status !== "downloading") continue;
-        const { x, y } = blockCoords(i, perRow);
+      // 6) 下载中扫描光带
+      if (block.status === "downloading" && hasMotion) {
         const sweepX = x - 18 + sweepPhase * (BLOCK_SIZE + 18);
         const grad = ctx.createLinearGradient(sweepX, y, sweepX + 14, y);
         grad.addColorStop(0, "rgba(255,255,255,0)");
@@ -453,7 +423,13 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
         grad.addColorStop(1, "rgba(255,255,255,0)");
         ctx.save();
         ctx.beginPath();
-        ctx.roundRect(x + 1, y + 1, BLOCK_SIZE - 2, BLOCK_SIZE - 2, radius - 1);
+        ctx.roundRect(
+          x + 1,
+          y + 1,
+          BLOCK_SIZE - 2,
+          BLOCK_SIZE - 2,
+          radius - 1,
+        );
         ctx.clip();
         ctx.fillStyle = grad;
         ctx.fillRect(sweepX, y, 14, BLOCK_SIZE);
@@ -461,20 +437,23 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       }
     }
 
-    // 阶段7:选中态外环
+    // 7) 选中态外环(在单次遍历后绘制,确保阴影覆盖相邻块)
     if (selected !== null) {
+      const { x, y } = blockCoords(selected, perRow);
       ctx.save();
       ctx.shadowColor = accentColor;
       ctx.shadowBlur = 6;
       ctx.strokeStyle = accentColor;
       ctx.lineWidth = 2;
-      for (let i = 0; i < blockList.length; i++) {
-        if (selected !== i) continue;
-        const { x, y } = blockCoords(i, perRow);
-        ctx.beginPath();
-        ctx.roundRect(x - 2, y - 2, BLOCK_SIZE + 4, BLOCK_SIZE + 4, radius + 1);
-        ctx.stroke();
-      }
+      ctx.beginPath();
+      ctx.roundRect(
+        x - 2,
+        y - 2,
+        BLOCK_SIZE + 4,
+        BLOCK_SIZE + 4,
+        radius + 1,
+      );
+      ctx.stroke();
       ctx.restore();
     }
   };

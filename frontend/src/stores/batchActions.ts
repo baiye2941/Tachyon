@@ -10,7 +10,24 @@ export async function pauseSelected(): Promise<void> {
   const ids = Array.from($selectedIds.get());
   if (ids.length === 0) return;
 
-  await Promise.allSettled(ids.map((id) => api.pauseTask(id)));
+  const results = await Promise.allSettled(ids.map((id) => api.pauseTask(id)));
+  const failures = results.filter(
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = ids.length - failures.length;
+
+  if (successes > 0) {
+    addToast(tr("toast.pauseBatchSuccess", { count: successes }), "success");
+  }
+  if (failures.length > 0) {
+    addToast(
+      tr("toast.pauseBatchPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
+  }
   deselectAll();
   await refreshTaskList();
 }
@@ -19,7 +36,24 @@ export async function resumeSelected(): Promise<void> {
   const ids = Array.from($selectedIds.get());
   if (ids.length === 0) return;
 
-  await Promise.allSettled(ids.map((id) => api.resumeTask(id)));
+  const results = await Promise.allSettled(ids.map((id) => api.resumeTask(id)));
+  const failures = results.filter(
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = ids.length - failures.length;
+
+  if (successes > 0) {
+    addToast(tr("toast.resumeBatchSuccess", { count: successes }), "success");
+  }
+  if (failures.length > 0) {
+    addToast(
+      tr("toast.resumeBatchPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
+  }
   deselectAll();
   await refreshTaskList();
 }
@@ -44,8 +78,13 @@ export async function cancelSelected(): Promise<void> {
 
   const results = await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
   const failures = results.filter(
-    (r) => r.status === "rejected",
-  ) as PromiseRejectedResult[];
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = ids.length - failures.length;
+
+  if (successes > 0) {
+    addToast(tr("toast.cancelBatchSuccess", { count: successes }), "success");
+  }
   if (failures.length > 0) {
     addToast(
       tr("toast.cancelBatchPartialFailed", {
@@ -91,8 +130,13 @@ export async function deleteSelected(): Promise<void> {
     ),
   );
   const failures = results.filter(
-    (r) => r.status === "rejected",
-  ) as PromiseRejectedResult[];
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = ids.length - failures.length;
+
+  if (successes > 0) {
+    addToast(tr("toast.deleteBatchSuccess", { count: successes }), "success");
+  }
   if (failures.length > 0) {
     addToast(
       tr("toast.deleteBatchPartialFailed", {
@@ -172,5 +216,61 @@ export async function cancelAll(): Promise<void> {
   if (!result.ok) return;
 
   await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
+  await refreshTaskList();
+}
+
+/**
+ * 删除所有已完成任务记录
+ *
+ * 与 deleteSelected 一致:单次应用内确认(danger tone),每个 deleteTask
+ * 传 skipConfirm:true 跳过 invoke 内置 window.confirm。
+ */
+export async function clearCompleted(): Promise<void> {
+  const ids = $tasks
+    .get()
+    .filter((t) => t.status === "completed")
+    .map((t) => t.id);
+
+  if (ids.length === 0) {
+    addToast(tr("toast.noTasksToClear"), "info");
+    return;
+  }
+
+  const result = await requestConfirm({
+    title: tr("confirm.clearCompleted.title"),
+    message: tr("confirm.clearCompleted.message", { count: ids.length }),
+    confirmLabel: tr("confirm.clearCompleted.confirmLabel"),
+    tone: "danger",
+    showDeleteLocalFileOption: true,
+    deleteLocalFileDefault: false,
+  });
+  if (!result.ok) return;
+
+  const results = await Promise.allSettled(
+    ids.map((id) =>
+      api.deleteTask(id, {
+        skipConfirm: true,
+        deleteLocalFile: result.deleteLocalFile,
+      }),
+    ),
+  );
+  const failures = results.filter(
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = ids.length - failures.length;
+
+  if (successes > 0) {
+    addToast(tr("toast.clearCompletedSuccess", { count: successes }), "success");
+  }
+  if (failures.length > 0) {
+    addToast(
+      tr("toast.clearCompletedPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
+  }
+  ids.forEach((id) => clearTaskHistory(id));
   await refreshTaskList();
 }

@@ -393,7 +393,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
       {/* Panel(Iteration 06 DI-4:移除玻璃拟态,实色 + token 化) */}
       <div
-        class="fixed z-[210] flex flex-col hf-panel"
+        class="fixed z-[var(--z-panel-content)] flex flex-col hf-panel"
         role="dialog"
         aria-modal="true"
         aria-label={tr("hub.aria")}
@@ -456,7 +456,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
         </div>
 
         {/* 内容区 */}
-        <div class="flex-1 overflow-y-auto" style={{ padding: '8px 12px' }}>
+        <div class="flex-1 scroll-container" style={{ padding: '8px 12px' }}>
           {/* 空状态 */}
           <Show when={!browsed() && !loading() && !error()}>
             <div class="flex flex-col items-center justify-center gap-4" style={{ padding: '80px 20px' }}>

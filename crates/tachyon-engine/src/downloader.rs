@@ -1861,6 +1861,14 @@ impl DownloadTask {
             "开始下载分片"
         );
 
+        // 通知 app 层该分片开始下载(用于 ChunkMatrix 真实状态显示)
+        // try_send 非阻塞:channel 满时丢弃,该分片短暂不显示 downloading,不影响正确性
+        if let Some(tx) = progress_tx {
+            let _ = tx.try_send(FragmentProgress::Started {
+                fragment_index: frag_index,
+            });
+        }
+
         let actual_start = frag_start + resume_offset;
         let stream = if let Some(rx) = control_rx.as_mut() {
             tokio::select! {

@@ -108,6 +108,7 @@ fn build_initial_progress_event(
                     active_concurrency: t.active_concurrency,
                     file_size: t.file_size,
                     completed_delta: vec![],
+                    started_delta: vec![],
                 },
             )
         })
@@ -271,6 +272,7 @@ mod tests {
             active_concurrency: 0,
             file_size: None,
             completed_delta: vec![],
+            started_delta: vec![],
         };
         let mut last = HashMap::new();
         last.insert("t1".to_string(), tp.clone());
@@ -296,6 +298,7 @@ mod tests {
                 active_concurrency: 0,
                 file_size: None,
                 completed_delta: vec![],
+                started_delta: vec![],
             },
         );
         last.insert(
@@ -311,6 +314,7 @@ mod tests {
                 active_concurrency: 0,
                 file_size: None,
                 completed_delta: vec![],
+                started_delta: vec![],
             },
         );
 
@@ -346,6 +350,7 @@ mod tests {
                 active_concurrency: 0,
                 file_size: None,
                 completed_delta: vec![],
+                started_delta: vec![],
             },
         );
 
@@ -375,6 +380,7 @@ mod tests {
                 active_concurrency: 0,
                 file_size: None,
                 completed_delta: vec![],
+                started_delta: vec![],
             },
         );
 

@@ -159,9 +159,6 @@ export default function Sidebar() {
     );
   };
 
-  // 占位宽度:collapsed 仅留轨道;展开 = 面板宽度
-  const placeholderWidth = () => (effectiveCollapsed() ? RAIL_WIDTH : width());
-
   const handleDragStart = (e: MouseEvent) => {
     if (isNarrow()) return; // 窄屏不可调宽
     e.preventDefault();
@@ -201,8 +198,22 @@ export default function Sidebar() {
   // 动效:reducedMotion 时即时,否则平滑过渡
   const transitionStyle = () =>
     reducedMotion() ? "none" : "transform 200ms cubic-bezier(0.32, 0.72, 0, 1)";
-  const widthTransitionStyle = () =>
-    reducedMotion() ? "none" : "width 220ms cubic-bezier(0.32, 0.72, 0, 1)";
+
+  // 占位容器:宽度跟随实际可见宽度(collapsed 时只留轨道),避免在 collapsed
+  // 态占用 MAX_WIDTH 导致主内容区出现大片空档。width 过渡会带来主内容区
+  // reflow,但相比永久空档更可接受;面板本身仍用 transform 做 GPU 合成。
+  const placeholderStyle = () => {
+    const visibleW = effectiveCollapsed()
+      ? RAIL_WIDTH
+      : Math.max(width(), MIN_EXPANDED_WIDTH);
+    return {
+      width: `${visibleW}px`,
+      transition: reducedMotion()
+        ? "none"
+        : "width 220ms cubic-bezier(0.32, 0.72, 0, 1)",
+      "will-change": "width",
+    } as const;
+  };
 
   // 轨道图标列表(collapsed 态可见)
   const railEntries = createMemo(() => [
@@ -241,20 +252,16 @@ export default function Sidebar() {
       {/* Edge trigger zone — 仅 collapsed 且非 pinned 且非窄屏时 */}
       <Show when={!effectivePinned() && effectiveCollapsed() && !isNarrow()}>
         <div
-          class="fixed left-0 top-0 bottom-0 z-[5]"
+          class="fixed left-0 top-0 bottom-0 z-[var(--z-sidebar-edge)]"
           style={{ width: `${EDGE_ZONE_WIDTH}px` }}
           onMouseEnter={expand}
         />
       </Show>
 
-      {/* 占位容器:宽度过渡是唯一 reflow 源 */}
+      {/* 占位容器:固定宽度 + clip-path,消除 width 过渡 reflow */}
       <div
         class="relative flex-shrink-0 h-full overflow-hidden"
-        style={{
-          width: `${placeholderWidth()}px`,
-          transition: widthTransitionStyle(),
-          "will-change": "width",
-        }}
+        style={placeholderStyle()}
         onMouseEnter={expand}
         onMouseLeave={scheduleCollapse}
       >

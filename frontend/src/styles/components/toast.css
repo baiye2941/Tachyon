@@ -1,0 +1,7 @@
+.toast-item {
+  animation: toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.toast--exiting {
+  animation: toast-out 200ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}

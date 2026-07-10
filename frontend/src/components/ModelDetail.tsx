@@ -157,7 +157,7 @@ export default function ModelDetail(props: ModelDetailProps) {
   }
 
   const handleDeleteLocal = async () => {
-    addToast('删除本地文件功能待实现', 'info')
+    addToast(tr("toast.deleteLocalNotImplemented"), "info")
   }
 
   const handleRedownload = async () => {
@@ -259,7 +259,7 @@ export default function ModelDetail(props: ModelDetailProps) {
       </div>
 
       {/* Content */}
-      <div class="flex-1 overflow-y-auto" style={{ padding: '16px' }}>
+      <div class="flex-1 scroll-container" style={{ padding: '16px' }}>
         {/* Empty state */}
         <Show when={!props.model}>
           <div

@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@solidjs/testing-library'
-import SettingsPanel from '../SettingsPanel'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@solidjs/testing-library'
+import SettingsPanel from '../settings/SettingsPanel'
 import type { ConfigPatch, VerifyStrategy, IoStrategy } from '../../types'
 import { setConfig, setLoading } from '../../stores/settings'
 import { api } from '../../api/invoke'
 import { addToast } from '../../stores/toast'
+import { setShortcut, resetAllShortcuts } from '../../stores/shortcuts'
 
 vi.mock('../../api/invoke', () => ({
   api: {
@@ -78,6 +79,8 @@ describe('SettingsPanel', () => {
   beforeEach(() => {
     setConfig(null)
     setLoading(true)
+    resetAllShortcuts()
+    localStorage.clear()
     vi.mocked(api.getConfig).mockReset()
     vi.mocked(api.updateConfig).mockReset()
     vi.mocked(api.getSupportedProtocols).mockReset()
@@ -440,6 +443,116 @@ describe('SettingsPanel', () => {
     })
     // 只读 User-Agent 展示后端值
     expect(screen.getByText('Tachyon/1.0')).toBeDefined()
+  })
+
+  // --- 快捷键设置页 ---
+  it('点击 shortcuts tab 进入快捷键设置页', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('快捷键'))
+    expect(screen.getByText('部分组合键可能被浏览器或系统拦截')).toBeDefined()
+    expect(screen.getByText('打开命令面板')).toBeDefined()
+  })
+
+  it('录制快捷键后保存,绑定更新', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('快捷键'))
+
+    const editBtn = screen.getByLabelText('修改 打开命令面板 的快捷键')
+    fireEvent.click(editBtn)
+
+    fireEvent.keyDown(window, { key: 'X', ctrlKey: true })
+
+    await waitFor(() => {
+      expect(screen.getByText('X')).toBeDefined()
+    })
+
+    fireEvent.click(screen.getByText('保存'))
+
+    await waitFor(() => {
+      const row = screen.getByText('打开命令面板').closest('.flex.items-center.justify-between') as HTMLElement
+      expect(row.textContent).toContain('Ctrl')
+      expect(row.textContent).toContain('X')
+    })
+  })
+
+  it('录制冲突快捷键时禁用保存并提示冲突', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('快捷键'))
+
+    const editBtn = screen.getByLabelText('修改 打开命令面板 的快捷键')
+    fireEvent.click(editBtn)
+
+    // Ctrl+B 是切换侧边栏的默认绑定,与打开命令面板冲突
+    fireEvent.keyDown(window, { key: 'B', ctrlKey: true })
+
+    await waitFor(() => {
+      expect(screen.getByText(/已被/)).toBeDefined()
+    })
+
+    const saveBtn = screen.getByText('保存') as HTMLButtonElement
+    expect(saveBtn.disabled).toBe(true)
+  })
+
+  it('单条重置恢复默认绑定', async () => {
+    setShortcut('shortcut.openCommandPalette', ['Ctrl', 'Shift', 'X'])
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('快捷键'))
+
+    const row = screen.getByText('打开命令面板').closest('.flex.items-center.justify-between') as HTMLElement
+    const resetBtn = within(row).getByText('恢复默认')
+    fireEvent.click(resetBtn)
+
+    await waitFor(() => {
+      expect(row.textContent).toContain('Ctrl')
+      expect(row.textContent).toContain('K')
+      expect(row.textContent).not.toContain('X')
+    })
+  })
+
+  it('全部重置恢复所有默认绑定', async () => {
+    setShortcut('shortcut.openCommandPalette', ['Ctrl', 'Shift', 'X'])
+    setShortcut('shortcut.toggleSidebar', ['Ctrl', 'Shift', 'B'])
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('快捷键'))
+
+    fireEvent.click(screen.getByText('恢复全部默认'))
+
+    await waitFor(() => {
+      const paletteRow = screen.getByText('打开命令面板').closest('.flex.items-center.justify-between') as HTMLElement
+      expect(paletteRow.textContent).toContain('Ctrl')
+      expect(paletteRow.textContent).toContain('K')
+      expect(paletteRow.textContent).not.toContain('X')
+    })
   })
 })
 

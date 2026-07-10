@@ -4,7 +4,7 @@
  * 单一数据源:快捷键帮助页(ShortcutHelp)和命令面板(prompt 提示)
  * 都从本模块派生。加新快捷键只需在此追加一条。
  *
- * 实际键绑定在 App.tsx 的 handleGlobalKey 中实现,本表用于显示与文档化。
+ * 实际键绑定从 stores/shortcuts.ts 读取,支持用户自定义覆盖。
  * Platform 字段在渲染时把 'Ctrl' 替换为 'Cmd'(macOS)。
  */
 
@@ -18,6 +18,8 @@ export interface Shortcut {
   /** i18n key(渲染时翻译) */
   labelKey: MessageKey
   group: ShortcutGroup
+  /** 关联的命令 id(命令面板 badge 与全局动作映射用) */
+  commandId?: string
 }
 
 export const GROUP_LABEL_KEYS: Record<ShortcutGroup, MessageKey> = {
@@ -32,15 +34,15 @@ export const SHORTCUTS: Shortcut[] = [
   // 全局
   { keys: ['Ctrl', 'K'], labelKey: 'shortcut.openCommandPalette', group: 'global' },
   { keys: ['Ctrl', '/'], labelKey: 'shortcut.shortcutHelp', group: 'global' },
-  { keys: ['Ctrl', 'B'], labelKey: 'shortcut.toggleSidebar', group: 'global' },
+  { keys: ['Ctrl', 'B'], labelKey: 'shortcut.toggleSidebar', group: 'global', commandId: 'act-toggle-sidebar' },
   // 导航
-  { keys: ['Ctrl', '1'], labelKey: 'shortcut.nav.downloads', group: 'navigation' },
-  { keys: ['Ctrl', '2'], labelKey: 'shortcut.nav.sniffer', group: 'navigation' },
-  { keys: ['Ctrl', ','], labelKey: 'shortcut.nav.settings', group: 'navigation' },
+  { keys: ['Ctrl', '1'], labelKey: 'shortcut.nav.downloads', group: 'navigation', commandId: 'nav-downloads' },
+  { keys: ['Ctrl', '2'], labelKey: 'shortcut.nav.sniffer', group: 'navigation', commandId: 'nav-sniffer' },
+  { keys: ['Ctrl', ','], labelKey: 'shortcut.nav.settings', group: 'navigation', commandId: 'nav-settings' },
   // 任务
-  { keys: ['Ctrl', 'N'], labelKey: 'shortcut.task.new', group: 'task' },
-  { keys: ['Ctrl', 'Shift', 'P'], labelKey: 'shortcut.task.pauseAll', group: 'task' },
-  { keys: ['Ctrl', 'Shift', 'R'], labelKey: 'shortcut.task.resumeAll', group: 'task' },
+  { keys: ['Ctrl', 'N'], labelKey: 'shortcut.task.new', group: 'task', commandId: 'task-new' },
+  { keys: ['Ctrl', 'Shift', 'P'], labelKey: 'shortcut.task.pauseAll', group: 'task', commandId: 'act-pause-all' },
+  { keys: ['Ctrl', 'Shift', 'R'], labelKey: 'shortcut.task.resumeAll', group: 'task', commandId: 'act-resume-all' },
   // 列表
   { keys: ['Enter'], labelKey: 'shortcut.list.openDetail', group: 'list' },
   { keys: ['Space'], labelKey: 'shortcut.list.togglePause', group: 'list' },

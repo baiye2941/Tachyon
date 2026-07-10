@@ -1,0 +1,729 @@
+/* ============================================
+   Miscellaneous Component Helpers
+   ============================================ */
+
+/* Stat item */
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.stat-value {
+  font-size: 14px;
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  margin-top: 4px;
+}
+
+.stat-value-highlight {
+  color: var(--color-accent-primary);
+}
+
+/* Section label */
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Honest hint question mark next to chunk distribution (explains color semantics) */
+.chunk-info-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border-default);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-tertiary);
+  cursor: help;
+  text-transform: none;
+  flex-shrink: 0;
+  transition:
+    color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+.chunk-info-hint:hover {
+  color: var(--color-text-secondary);
+  border-color: var(--color-border-default);
+  background: var(--color-bg-elevated);
+}
+
+/* ============================================
+   File Icon Material Plate (reference file-icon.tsx: plate + top-light + hue tint)
+   currentColor driven by parent color(--color-file-*); color-mix derives light/dark shades.
+   ============================================ */
+.file-icon-plate {
+  position: relative;
+  /* Material gradient: from light shade to dark shade (simulates top-left light source) */
+  background: linear-gradient(
+    160deg,
+    color-mix(in srgb, currentColor 35%, var(--color-bg-tertiary)) 0%,
+    color-mix(in srgb, currentColor 22%, var(--color-bg-secondary)) 55%,
+    color-mix(in srgb, currentColor 14%, var(--color-bg-void)) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.4),
+    0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+/* Top sheen (plate catch-light) */
+.file-icon-plate::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: 2px;
+  height: 33%;
+  border-radius: inherit;
+  background: linear-gradient(rgba(255, 255, 255, 0.12), transparent);
+  pointer-events: none;
+}
+
+.file-icon-plate > svg {
+  position: relative;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.5));
+}
+
+/* DetailPanel hero file icon: type-color glow behind for stronger header visual weight */
+.file-icon-plate--hero {
+  box-shadow:
+    0 0 28px var(--file-glow, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.5);
+  transition: box-shadow 300ms ease;
+}
+
+.file-icon-plate--hero:hover {
+  box-shadow:
+    0 0 36px var(--file-glow, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.45),
+    0 3px 8px rgba(0, 0, 0, 0.55);
+}
+
+/* ============================================
+   Button click ripple (haptic feedback, reference physical interaction)
+   .ripple-container click spawns .ripple-wave ripple expansion
+   ============================================ */
+.ripple-wave {
+  position: absolute;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.38);
+  pointer-events: none;
+  transform: scale(0);
+  opacity: 0.42;
+  animation: ripple-wave 0.55s ease-out forwards;
+  mix-blend-mode: overlay;
+}
+
+/* Empty-state icon light breath to avoid dead page */
+.empty-state-icon {
+  animation: empty-icon-pulse 3.2s ease-in-out infinite;
+}
+
+.kbd {
+  display: inline-grid;
+  place-items: center;
+  height: 20px;
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-tertiary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.4), 0 1px 0 rgba(255, 255, 255, 0.04);
+  line-height: 1;
+}
+
+/* ============================================
+   Metric Cards — Detail panel 2x2 metric cards
+   ============================================ */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.metric-card {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02) 0%, transparent 40px),
+    var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-inset-top), var(--shadow-sm);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms var(--ease-spring);
+  min-width: 0;
+  contain: layout paint;
+}
+
+.metric-card:hover {
+  border-color: var(--color-border-default);
+  box-shadow: var(--shadow-inset-top), var(--shadow-md);
+}
+
+.metric-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.metric-card-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.metric-card-icon {
+  color: var(--color-text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.metric-card-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.metric-card-value {
+  font-size: 15px;
+  color: var(--color-text-primary);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.metric-card-value--highlight {
+  color: var(--color-accent-primary);
+}
+
+.metric-card-value--pulse {
+  animation: metric-value-pop 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .metric-card-value--pulse {
+    animation: none;
+  }
+}
+
+/* ============================================
+   Animated Number — Flip / odometer effect
+   ============================================ */
+.animated-number {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: baseline;
+  /* Tabular nums prevent width jitter during scroll */
+  font-variant-numeric: tabular-nums;
+}
+
+.animated-number-char {
+  display: inline-block;
+  white-space: pre;
+  vertical-align: middle;
+}
+
+.animated-digit {
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: middle;
+  height: 1em;
+  line-height: 1;
+  contain: layout paint;
+}
+
+.animated-digit-strip {
+  display: block;
+  transform: translateY(0%);
+  transition: transform 520ms cubic-bezier(0.32, 0.72, 0, 1);
+  will-change: transform;
+  backface-visibility: hidden;
+}
+
+.animated-digit-number {
+  display: block;
+  height: 1em;
+  line-height: 1;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animated-digit-strip {
+    transition: none !important;
+  }
+}
+
+/* ============================================
+   Error Shake — failure diagnostics card entrance shake
+   ============================================ */
+.error-shake {
+  animation: error-shake-in 0.45s ease-in-out;
+}
+
+.error-shake--reduced {
+  animation: none;
+}
+
+/* ============================================
+   Speed Chart — Refined
+   ============================================ */
+.speed-chart {
+  position: relative;
+  padding: 16px;
+  border-radius: 12px;
+  contain: layout paint;
+}
+
+.speed-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.speed-chart-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.speed-chart-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-speed-active);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-speed-active) 25%, transparent);
+  animation: speed-live-blink 2s ease-in-out infinite;
+}
+
+.speed-chart-live {
+  font-size: 12px;
+  color: var(--color-speed-active);
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-speed-active) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-speed-active) 18%, transparent);
+}
+
+.speed-chart-body {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  height: 120px;
+}
+
+.speed-chart-y-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 4px 0;
+  font-size: 9px;
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  flex-shrink: 0;
+  min-width: 36px;
+}
+
+.speed-chart-y-label {
+  display: block;
+  white-space: nowrap;
+}
+
+.speed-chart-canvas {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+.speed-chart-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.speed-chart-grid {
+  stroke: var(--color-border-subtle);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+  opacity: 0.5;
+}
+
+.speed-chart-line {
+  /* Static stroke glow handled by stroke and gradient; avoid per-frame SVG path drop-shadow recalc */
+}
+
+.speed-chart-pulse-ring {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: speed-pulse-ring 1.8s ease-out infinite;
+}
+
+.speed-chart-empty-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.speed-chart-x-axis {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+  padding-left: 44px;
+  font-size: 9px;
+  color: var(--color-text-tertiary);
+  line-height: 1;
+}
+
+.speed-chart-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.speed-chart-stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.speed-chart-stat-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-text-tertiary);
+}
+
+.speed-chart-stat-dot--peak {
+  background: var(--color-speed-active);
+}
+
+.speed-chart-stat-label {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+.speed-chart-stat-value {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  font-weight: 600;
+}
+
+.speed-chart-stat-value--peak {
+  color: var(--color-speed-active);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .speed-chart-live-dot,
+  .speed-chart-pulse-ring {
+    animation: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * HuggingFace Browser (Iteration 06)
+ * All semantic tokens, zero hardcoded colors. Removed original glassmorphism (backdrop-filter).
+ * ───────────────────────────────────────────────────────────── */
+
+/* Panel container: solid + elevation, no backdrop-filter */
+.hf-panel {
+  width: min(680px, calc(100vw - 32px));
+  height: min(560px, calc(100dvh - 64px));
+  background: var(--color-bg-elevated);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-xl);
+  overflow: hidden;
+  animation: fadeIn 150ms ease forwards;
+}
+
+/* Quantization tags (tier differentiated, VL-2) */
+.quant-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.quant-tag-balanced {
+  /* Recommended balance: accent primary */
+  color: var(--color-accent-secondary);
+  background: var(--color-accent-soft);
+}
+
+.quant-tag-tiny {
+  /* Low quality small size: neutral gray */
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-tertiary);
+}
+
+.quant-tag-large {
+  /* High precision large size: accent secondary */
+  color: var(--color-accent-secondary);
+  background: var(--color-accent-soft);
+}
+
+/* LFS tag */
+.lfs-tag {
+  font-size: 10px;
+  color: var(--color-accent-primary);
+  background: var(--color-accent-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* Tree row: focus ring + filtered dim opacity */
+.hf-tree-row:focus-visible {
+  background: var(--color-bg-tertiary);
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: -2px;
+}
+
+.hf-tree-row-dimmed {
+  opacity: 0.3;
+}
+
+/* Expand chevron: rotate animation (class replaces inline style) */
+.hf-chevron {
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+  color: var(--color-text-tertiary);
+}
+
+.hf-chevron-expanded {
+  transform: rotate(0deg);
+}
+
+/* File icon: softened (original opacity 0.5) */
+.hf-file-icon {
+  opacity: 0.5;
+  color: var(--color-text-tertiary);
+}
+
+/* Skeleton placeholder */
+.hf-skeleton {
+  height: 32px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  animation: shimmer 1.5s infinite linear;
+}
+
+/* Filter tabs (radiogroup) */
+.hf-filter-tab {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition:
+    background 100ms ease,
+    color 100ms ease;
+  white-space: nowrap;
+}
+
+.hf-filter-tab:hover:not(:disabled) {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+
+.hf-filter-tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.hf-filter-tab-active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-secondary);
+}
+
+.hf-filter-count {
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.hf-filter-tab-active .hf-filter-count {
+  color: var(--color-accent-secondary);
+}
+
+/* Filter search input */
+.hf-filter-search {
+  flex: 1;
+  font-size: 12px;
+  background: transparent;
+  color: var(--color-text-primary);
+  border: none;
+  outline: none;
+  min-width: 0;
+}
+
+.hf-filter-search::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+/* ============================================
+   Light Theme (light theme overrides via data-theme="light")
+   Principle: complete mirror of dark token system, no pure white #fff / no pure black #000,
+   backgrounds use light cool gray-white, text uses dark gray, primary accent teal brightened
+   one step on light bg to maintain WCAG AA (body ≥4.5:1).
+   Glow alpha further reduced on light bg (transparent overlays are weaker on light).
+   ============================================ */
+[data-theme="light"] {
+  /* Background levels: inverted to light cool gray-white (Linear light family, not pure white) */
+  --black-0: #f4f5f7;
+  --black-1: #eceef1;
+  --black-2: #fafafa;
+  --black-3: #f4f5f7;
+  --black-4: #eceef1;
+  --black-5: #ffffff;
+  --graphite-1: #e4e7eb;
+  --graphite-2: #d8dce2;
+  --graphite-3: #c8cdd5;
+  --gunmetal: #9ca3af;
+  --charcoal: #6b7280;
+  --ash: #6b7280; /* text-tertiary: #6b7280 on #fafafa → 4.63:1 (WCAG AA ✅). Original #9ca3af only 2.43:1. */
+  --silver: #6b7280;
+  --platinum: #3a3f48;
+  --porcelain: #1a1d24;
+  --white-pure: #0a0b0f;
+
+  /* Borders: inverted to dark rgba (black low alpha on light bg) */
+  --color-bg-hover: rgba(0, 0, 0, 0.04);
+  --color-scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --color-scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+
+  /* Text: inverted to dark gray (not pure black) */
+  --color-text-primary: var(--platinum);
+  --color-text-secondary: var(--silver);
+  --color-text-tertiary: var(--ash);
+  --color-text-disabled: var(--gunmetal);
+  --color-text-inverse: var(--black-2);
+  --color-text-title: var(--porcelain);
+
+  /* Accent: light bg uses teal-700 #0f766e as primary, white foreground → 5.47:1 (WCAG AA ✅).
+     Original accent-vel-600 #40b1b7 with white only 2.56:1, contrast fails. */
+  --color-accent-primary: var(--teal-700);
+  --color-accent-primary-hover: #0b5c56;
+  --color-accent-primary-active: #084d48;
+  --color-accent-secondary: var(--accent-vel-400);
+  --color-accent-tertiary: #0891b2;
+  --color-accent-foreground: #ffffff;
+  --color-accent-glow: rgba(64, 177, 183, 0.08);
+  --color-accent-glow-strong: rgba(64, 177, 183, 0.16);
+  --color-accent-soft: rgba(64, 177, 183, 0.06);
+  --color-accent-faint: rgba(64, 177, 183, 0.03);
+
+  /* Speed color: light bg uses cyan-600 brightened */
+  --color-speed-active: #0891b2;
+  --color-speed-soft: rgba(8, 145, 178, 0.08);
+  --color-info-soft: rgba(8, 145, 178, 0.16);
+  --color-warning-soft: rgba(217, 119, 6, 0.16);
+
+  /* State colors: light bg brightened one step for contrast */
+  --color-success: #0d9488;
+  --color-error: #dc2626;
+  --color-error-hover: #ef4444;
+  --color-error-active: #b91c1c;
+  --color-info: #0891b2;
+  --color-status-downloading: #40b1b7; /* hardcoded so --accent-vel-600 is not pruned */
+  --color-status-paused: var(--ash);
+  --color-status-completed: #0d9488;
+  --color-status-warning: #d97706;
+  --color-status-error: #dc2626;
+  --color-status-pending: var(--gunmetal);
+  --color-status-connecting: #0891b2;
+  --color-status-verifying: #0891b2;
+  --color-status-resuming: var(--accent-vel-500);
+
+  /* Scrim: dark scrim on light bg */
+  --color-overlay-scrim: rgba(15, 23, 42, 0.4);
+
+  /* Shadows: softer but visible on light bg */
+  --shadow-sm:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-md:
+    0 2px 4px rgba(15, 23, 42, 0.08),
+    0 8px 16px rgba(15, 23, 42, 0.10);
+  --shadow-lg:
+    0 4px 8px rgba(15, 23, 42, 0.10),
+    0 16px 32px rgba(15, 23, 42, 0.14);
+  --shadow-xl:
+    0 8px 16px rgba(15, 23, 42, 0.12),
+    0 24px 56px rgba(15, 23, 42, 0.18);
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --shadow-inset-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --shadow-glow: 0 0 20px rgba(64, 177, 183, 0.08);
+}
+
+/* Light theme component tweaks: border/glass classes follow light bg */
+[data-theme="light"] .glass {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+}
+
+/* Light theme: base component classes already use --color-bg-hover / --color-border-* tokens,
+   which are overridden to black rgba in this block, so component-level mirroring is unnecessary.
+   Only a few special cases remain. */
+
+/* Toggle off state: white thumb on light gray track lacks contrast; use dark thumb + track border */
+[data-theme="light"] .toggle {
+  background: var(--graphite-3);
+  border: 1px solid var(--color-border-default);
+}
+
+[data-theme="light"] .toggle-thumb {
+  background: var(--color-bg-elevated);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2);
+}
+
+/* Scrollbar is automatically overridden via --color-scrollbar-thumb token; no component-level mirroring needed */

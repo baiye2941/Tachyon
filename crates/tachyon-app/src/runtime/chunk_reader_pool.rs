@@ -14,8 +14,17 @@ use tokio::sync::{mpsc, oneshot};
 
 use tachyon_core::FragmentProgress;
 
-/// 进度变化回调:参数为 (task_id, 新完成分片 index),None 表示非完成事件
-pub type ProgressCallback = Arc<dyn Fn(&str, Option<u32>) + Send + Sync>;
+/// 进度变化增量类型(传给 ProgressBroker,用于区分 started/completed delta)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProgressDelta {
+    /// 分片开始下载(Started 事件)
+    Started(u32),
+    /// 分片完成(Chunk{completed:true} 事件)
+    Completed(u32),
+}
+
+/// 进度变化回调:参数为 (task_id, delta),None 表示非状态变更事件(增量字节进度)
+pub type ProgressCallback = Arc<dyn Fn(&str, Option<ProgressDelta>) + Send + Sync>;
 
 use crate::repository::TaskRepository;
 use crate::task_store::TaskStore;
@@ -229,6 +238,14 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     "PlanComplete 已处理"
                 );
             }
+            FragmentProgress::Started { fragment_index } => {
+                // 标记分片开始下载(写入 FragmentStateStore.downloading_set)
+                fragment_state_store.mark_downloading(&task_id, fragment_index);
+                // 通知 broker 产生了 started delta,由 aggregator 推送给前端
+                if let Some(ref callback) = on_progress {
+                    callback(&task_id, Some(ProgressDelta::Started(fragment_index)));
+                }
+            }
             FragmentProgress::Chunk {
                 fragment_index,
                 completed: chunk_completed,
@@ -238,7 +255,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 if chunk_completed {
                     completed.insert(fragment_index);
                     pending_completed.push(fragment_index);
-                    // 更新 FragmentStateStore.done_set
+                    // 更新 FragmentStateStore.done_set(内部同时清除 downloading_set)
                     fragment_state_store.mark_done(&task_id, fragment_index);
                 }
                 // 增量更新:先 insert 取出旧值计算差量,再按需清理 partial map。
@@ -306,7 +323,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     callback(
                         &task_id,
                         if chunk_completed {
-                            Some(fragment_index)
+                            Some(ProgressDelta::Completed(fragment_index))
                         } else {
                             None
                         },
@@ -654,5 +671,93 @@ mod tests {
             assert_eq!(task.fragments_done, 1, "任务 {task_id} 应有 1 个分片完成");
             assert_eq!(task.downloaded, 256, "任务 {task_id} 应已下载 256 字节");
         }
+    }
+
+    /// 验证 Started 事件正确写入 FragmentStateStore.downloading_set,
+    /// 且后续 Chunk{completed:true} 事件将分片从 downloading_set 移到 done_set。
+    #[tokio::test]
+    async fn test_started_event_populates_downloading_set() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "test-started".to_string();
+
+        task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.bin".to_string(),
+                file_name: "file.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 4,
+                fragments_done: 0,
+                active_concurrency: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
+                hf_meta: None,
+            },
+        );
+
+        let fragment_state_store = crate::projection::FragmentStateStore::new();
+        // 先用 PlanComplete 初始化 fragment state
+        fragment_state_store.init(
+            &task_id,
+            crate::projection::TaskFragmentState::from_plan(4, vec![]),
+        );
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: fragment_state_store.clone(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        // 发送 Started 事件:分片 0、1 开始下载
+        progress_tx
+            .send(FragmentProgress::Started { fragment_index: 0 })
+            .await
+            .unwrap();
+        progress_tx
+            .send(FragmentProgress::Started { fragment_index: 1 })
+            .await
+            .unwrap();
+        // 分片 0 完成:应从 downloading_set 移到 done_set
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 512,
+                completed: true,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        // 验证:分片 0 在 done_set,分片 1 仍在 downloading_set
+        let state = fragment_state_store.get(&task_id).expect("应存在");
+        assert!(state.done_set.contains(&0), "分片 0 完成后应在 done_set");
+        assert!(
+            !state.downloading_set.contains(&0),
+            "分片 0 完成后不应在 downloading_set"
+        );
+        assert!(
+            state.downloading_set.contains(&1),
+            "分片 1 仍在下载,应在 downloading_set"
+        );
     }
 }

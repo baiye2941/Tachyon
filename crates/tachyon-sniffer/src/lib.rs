@@ -1,10 +1,11 @@
-//! Tachyon 嗅探层:浏览器资源拦截与解析
+//! Tachyon 嗅探层:资源识别与列表管理
 //!
-//! 通过 Playwright MCP 拦截浏览器流量:
-//! - 请求拦截与资源类型识别
-//! - 下载链接提取
-//! - 媒体资源捕获
-//! - 嗅探资源管理
+//! 提供:
+//! - 基于 URL 扩展名 / Content-Type 的资源类型识别
+//! - 嗅探资源列表的增删查、去重、敏感参数脱敏
+//! - 捕获规则配置(类型白名单、最小文件大小、URL 过滤器)
+//!
+//! 浏览器流量捕获(代理 / CDP / WebView 注入)为未来工作,本 crate 不依赖任何网络栈。
 
 pub mod capture;
 pub mod filter;
@@ -15,7 +16,7 @@ pub use resources::{ResourceManager, SnifferResource, redact_sensitive_params};
 
 #[cfg(test)]
 #[test]
-/// 测试 WebView 嗅探:资源识别与捕获过滤逻辑
+/// 测试资源识别与捕获过滤逻辑
 fn webview_sniff() {
     use capture::{CaptureConfig, ResourceType, identify_resource, should_capture};
 

@@ -1,0 +1,185 @@
+/* ============================================
+   Progress Bar — Linear + macOS native
+   方向:Linear 极简数字派 + Raycast/macOS 下凹轨道。
+   无光泽/无扫描线/无呼吸纹理;靠细比例、材质凹陷、纯色状态、弹性完成态取胜。
+   ============================================ */
+
+/* ---------- 轨道:macOS 下凹沟槽 ---------- */
+.progress-track-inset {
+  position: relative;
+  background: var(--color-bg-void);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+/* ---------- 状态填充:纯色 + 极淡顶光 + 微凸 ---------- */
+.progress-fill--waiting {
+  background: var(--color-accent-primary);
+  opacity: 0.45;
+}
+
+.progress-fill--paused {
+  background: var(--color-status-paused);
+  opacity: 0.6;
+}
+
+.progress-fill--completed {
+  background: var(--color-status-completed);
+  animation: progress-completed-settle 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.progress-fill--failed {
+  background: var(--color-status-error);
+}
+
+.progress-bar-active,
+.progress-fill--downloading {
+  background: var(--color-status-downloading) !important;
+  opacity: 1 !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+/* 极淡顶光:让填充条看起来像被上方光源照亮的实体材质 */
+.progress-fill--downloading::after,
+.progress-fill--completed::after,
+.progress-fill--failed::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.1) 0%,
+    rgba(255, 255, 255, 0) 40%
+  );
+  pointer-events: none;
+}
+
+/* ---------- 完成态 settle 动画 ---------- */
+
+
+/* ---------- 等待/连接/恢复中:短梭子 ---------- */
+.progress-track--waiting::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 8%;
+  width: 22%;
+  border-radius: inherit;
+  background: var(--color-accent-primary);
+  opacity: 0.35;
+  animation: progress-waiting-shuttle 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  pointer-events: none;
+}
+
+
+
+/* ============================================
+   Liquid Progress — Linear + macOS native
+   完成态:颜色过渡 + 微弹 settle + icon 弹性弹出;错误态:颜色过渡 + icon 弹出。
+   去闪光/去抖动/去重光泽,仅保留材质顶光与完成功能反馈。
+   ============================================ */
+
+/* ---------- 完成/失败状态 icon ---------- */
+.progress-state-icon {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  animation: progress-icon-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.progress-state-icon--success {
+  color: var(--color-status-completed);
+  background: color-mix(in srgb, var(--color-success) 10%, transparent);
+}
+
+.progress-state-icon--error {
+  color: var(--color-status-error);
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+}
+
+/* ---------- 完成态 sparkle:进度条右端一次极短星点绽放 ---------- */
+.progress-sparkle {
+  position: absolute;
+  right: -4px;
+  top: -9px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  transform-origin: center center;
+  transform: scale(0) rotate(-15deg);
+  animation: progress-sparkle-pop 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.progress-sparkle svg {
+  width: 100%;
+  height: 100%;
+}
+
+
+
+
+
+/* ---------- Reduced Motion:进度条动画降级 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .progress-track--waiting::before,
+  .progress-fill--completed,
+  .progress-sparkle {
+    animation: none;
+  }
+
+  .progress-state-icon {
+    animation: none;
+  }
+}
+
+
+/* ============================================
+   Progress Celebration — 完成时粒子爆发
+   ============================================ */
+.progress-celebration {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.progress-celebration-check {
+  color: var(--color-status-completed);
+  z-index: 1;
+  animation: celebration-check-in 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.progress-celebration-particle {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--color-status-completed);
+  opacity: 0;
+  left: 50%;
+  top: 50%;
+  margin-left: -2px;
+  margin-top: -2px;
+  animation: celebration-particle 0.55s ease-out forwards;
+  animation-delay: var(--pc-delay, 0ms);
+}

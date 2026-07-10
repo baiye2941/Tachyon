@@ -243,7 +243,7 @@ export default function ModelLibrary() {
             overflow: 'hidden',
           }}
         >
-          <div class="flex-1 overflow-y-auto" style={{ padding: '12px' }}>
+          <div class="flex-1 scroll-container" style={{ padding: '12px' }}>
             {/* Loading state */}
             <Show when={scanning() || searching()}>
               <div
@@ -388,7 +388,10 @@ export default function ModelLibrary() {
             }}
           >
             <span>
-              {totalCount()} 模型 · {formatSize(totalSize())}
+              {tr("hub.library.summary", {
+                count: totalCount(),
+                size: formatSize(totalSize()),
+              })}
             </span>
           </div>
         </div>

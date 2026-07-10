@@ -79,6 +79,7 @@ describe('batchActions store', () => {
     expect(mockPauseTask).toHaveBeenCalledWith('t2')
     expect(mockPauseTask).not.toHaveBeenCalledWith('t3')
     expect(selectionModule.$selectedIds.get().size).toBe(0)
+    expect(mockAddToast).toHaveBeenCalledWith('已暂停 2 个任务', 'success')
   })
 
   it('resumeSelected 恢复选中任务', async () => {
@@ -94,6 +95,7 @@ describe('batchActions store', () => {
 
     expect(mockResumeTask).toHaveBeenCalledWith('t1')
     expect(mockResumeTask).toHaveBeenCalledWith('t2')
+    expect(mockAddToast).toHaveBeenCalledWith('已恢复 2 个任务', 'success')
   })
 
   it('deleteSelected 确认后删除并透传 skipConfirm:true', async () => {
@@ -149,6 +151,43 @@ describe('batchActions store', () => {
     ids.forEach(id => {
       expect(mockDeleteTask).toHaveBeenCalledWith(id, { skipConfirm: true, deleteLocalFile: false })
     })
+    expect(mockAddToast).toHaveBeenCalledWith('已删除 10 个任务记录', 'success')
+  })
+
+  it('pauseSelected 部分失败时显示成功与失败汇总', async () => {
+    downloadsModule.setTasks([makeTask('t1'), makeTask('t2'), makeTask('t3')])
+    selectionModule.selectAll(['t1', 't2', 't3'])
+    mockPauseTask
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('busy'))
+      .mockResolvedValueOnce(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.pauseSelected()
+
+    expect(mockAddToast).toHaveBeenCalledWith('已暂停 2 个任务', 'success')
+    expect(mockAddToast).toHaveBeenCalledWith(
+      expect.stringContaining('1 个任务暂停失败'),
+      'error',
+    )
+  })
+
+  it('resumeSelected 部分失败时显示成功与失败汇总', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { status: 'paused' }),
+      makeTask('t2', { status: 'paused' }),
+    ])
+    selectionModule.selectAll(['t1', 't2'])
+    mockResumeTask.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('gone'))
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.resumeSelected()
+
+    expect(mockAddToast).toHaveBeenCalledWith('已恢复 1 个任务', 'success')
+    expect(mockAddToast).toHaveBeenCalledWith(
+      expect.stringContaining('1 个任务恢复失败'),
+      'error',
+    )
   })
 
   it('pauseAll 暂停所有活跃任务', async () => {
@@ -224,6 +263,7 @@ describe('batchActions store', () => {
     )
     expect(mockCancelTask).toHaveBeenCalledWith('t1')
     expect(selectionModule.$selectedIds.get().size).toBe(0)
+    expect(mockAddToast).toHaveBeenCalledWith('已取消 1 个任务', 'success')
   })
 
   it('cancelSelected 用户取消时不执行', async () => {

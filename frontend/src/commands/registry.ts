@@ -11,7 +11,7 @@
  * - 可单测:命令 id 唯一性、分组完整、run 行为(mock ctx)。
  */
 
-import type { ViewName } from '../types'
+import type { ViewName, TaskInfo } from '../types'
 import type { MessageKey } from '../i18n'
 
 export type CommandGroup = 'navigation' | 'action' | 'task'
@@ -23,11 +23,21 @@ export interface CommandContext {
   onNewDownload?: () => void
   onPauseAll?: () => void
   onResumeAll?: () => void
+  onCancelAll?: () => void
+  onClearCompleted?: () => void
   onToggleSidebar?: () => void
   /** 任务搜索:返回当前任务列表(CommandPalette 任务搜索用) */
   getTasks?: () => { id: string; fileName: string; url: string }[]
   /** 打开指定任务详情(选中任务) */
   onOpenTask?: (taskId: string) => void
+  /** 当前选中的任务(用于任务级操作命令) */
+  getSelectedTask?: () => TaskInfo | null
+  /** 打开指定任务的保存目录 */
+  onOpenTaskFolder?: (taskId: string) => void
+  /** 重新下载指定任务 */
+  onRedownloadTask?: (taskId: string) => void
+  /** 复制文本到剪贴板 */
+  onCopyToClipboard?: (text: string) => void
 }
 
 export interface Command {
@@ -41,6 +51,10 @@ export interface Command {
   icon: string
   /** 关联快捷键(显示用,键绑定在 shortcuts.ts) */
   shortcut?: string[]
+  /** 搜索别名(拼音首字母 / 英文等),用于 CommandPalette fuzzy 搜索 */
+  aliases?: string[]
+  /** 是否在当前上下文中可见;省略则始终显示 */
+  visible?: (ctx: CommandContext) => boolean
   /** 执行命令,通过 ctx 解耦运行时依赖 */
   run: (ctx: CommandContext) => void
 }
@@ -62,6 +76,7 @@ export const COMMANDS: Command[] = [
     group: 'navigation',
     icon: 'list-bullet',
     shortcut: ['Ctrl', '1'],
+    aliases: ['xz', 'downloads'],
     run: (c) => {
       c.onViewChange('downloads')
       c.onClose()
@@ -74,6 +89,7 @@ export const COMMANDS: Command[] = [
     group: 'navigation',
     icon: 'magnifying-glass',
     shortcut: ['Ctrl', '2'],
+    aliases: ['bf', 'xt', 'sniffer'],
     run: (c) => {
       c.onViewChange('sniffer')
       c.onClose()
@@ -85,6 +101,7 @@ export const COMMANDS: Command[] = [
     hintKey: 'command.nav.history.hint',
     group: 'navigation',
     icon: 'clock',
+    aliases: ['ls', 'history'],
     run: (c) => {
       c.onViewChange('history')
       c.onClose()
@@ -96,6 +113,7 @@ export const COMMANDS: Command[] = [
     hintKey: 'command.nav.stats.hint',
     group: 'navigation',
     icon: 'chart-bar',
+    aliases: ['tj', 'stats'],
     run: (c) => {
       c.onViewChange('stats')
       c.onClose()
@@ -108,6 +126,7 @@ export const COMMANDS: Command[] = [
     group: 'navigation',
     icon: 'cog-6-tooth',
     shortcut: ['Ctrl', ','],
+    aliases: ['sz', 'settings', 'config'],
     run: (c) => {
       c.onViewChange('settings')
       c.onClose()
@@ -121,6 +140,7 @@ export const COMMANDS: Command[] = [
     group: 'task',
     icon: 'plus',
     shortcut: ['Ctrl', 'N'],
+    aliases: ['new', 'xj'],
     run: (c) => {
       c.onNewDownload?.()
       c.onClose()
@@ -134,6 +154,7 @@ export const COMMANDS: Command[] = [
     group: 'action',
     icon: 'pause-circle',
     shortcut: ['Ctrl', 'Shift', 'P'],
+    aliases: ['pause', 'zt'],
     run: (c) => {
       c.onPauseAll?.()
       c.onClose()
@@ -146,6 +167,7 @@ export const COMMANDS: Command[] = [
     group: 'action',
     icon: 'play',
     shortcut: ['Ctrl', 'Shift', 'R'],
+    aliases: ['resume', 'hf'],
     run: (c) => {
       c.onResumeAll?.()
       c.onClose()
@@ -158,8 +180,88 @@ export const COMMANDS: Command[] = [
     group: 'action',
     icon: 'list-bullet',
     shortcut: ['Ctrl', 'B'],
+    aliases: ['sidebar', 'ce'],
     run: (c) => {
       c.onToggleSidebar?.()
+      c.onClose()
+    },
+  },
+  {
+    id: 'act-cancel-all',
+    labelKey: 'command.act.cancelAll.label',
+    hintKey: 'command.act.cancelAll.hint',
+    group: 'action',
+    icon: 'cancel',
+    aliases: ['cancel', 'qx'],
+    run: (c) => {
+      c.onCancelAll?.()
+      c.onClose()
+    },
+  },
+  {
+    id: 'act-clear-completed',
+    labelKey: 'command.act.clearCompleted.label',
+    hintKey: 'command.act.clearCompleted.hint',
+    group: 'action',
+    icon: 'trash',
+    aliases: ['clear', 'qk'],
+    run: (c) => {
+      c.onClearCompleted?.()
+      c.onClose()
+    },
+  },
+  // 任务级操作(依赖当前选中任务,CommandPalette 通过 visible 控制显示)
+  {
+    id: 'task-copy-magnet',
+    labelKey: 'command.task.copyMagnet.label',
+    hintKey: 'command.task.copyMagnet.hint',
+    group: 'task',
+    icon: 'copy',
+    aliases: ['cp', 'copy', 'magnet'],
+    visible: (c) => {
+      const task = c.getSelectedTask?.()
+      return !!task && task.url.startsWith('magnet:')
+    },
+    run: (c) => {
+      const task = c.getSelectedTask?.()
+      if (task) {
+        c.onCopyToClipboard?.(task.url)
+      }
+      c.onClose()
+    },
+  },
+  {
+    id: 'task-open-folder',
+    labelKey: 'command.task.openFolder.label',
+    hintKey: 'command.task.openFolder.hint',
+    group: 'task',
+    icon: 'folder-open',
+    aliases: ['open', 'folder'],
+    visible: (c) => {
+      const task = c.getSelectedTask?.()
+      return !!task?.savePath
+    },
+    run: (c) => {
+      const task = c.getSelectedTask?.()
+      if (task) {
+        c.onOpenTaskFolder?.(task.id)
+      }
+      c.onClose()
+    },
+  },
+  {
+    id: 'task-redownload',
+    labelKey: 'command.task.redownload.label',
+    hintKey: 'command.task.redownload.hint',
+    group: 'task',
+    icon: 'refresh',
+    aliases: ['re', 'redownload', 'cx'],
+    visible: (c) => !!c.getSelectedTask?.(),
+    run: (c) => {
+      const task = c.getSelectedTask?.()
+      if (task) {
+        c.onRedownloadTask?.(task.id)
+      }
       c.onClose()
     },
   },
