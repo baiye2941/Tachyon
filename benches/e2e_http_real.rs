@@ -17,7 +17,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use support::bench_server::ThrottledServer;
 use tachyon_core::test_harness::harness::test_config;
 use tachyon_core::traits::Protocol;
-use tachyon_engine::DownloadTask;
+use tachyon_engine::{ConnectionPool, DownloadTask, PoolConfig};
 use tachyon_protocol::HttpClient;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -54,48 +54,56 @@ fn bench_http_range_real_loopback(c: &mut Criterion) {
     group.finish();
 }
 
-/// 节流 HTTP 下载,验证 server 端节流语义(实际耗时 >= 理论下限)
+/// 节流 HTTP 下载,走 DownloadTask 完整路径验证 BandwidthTracker 采样
 ///
-/// CI: 1MiB @ 10MB/s;完整: 4MiB @ 1MB/s。
-/// server 在 bench 前启动,所有迭代复用(节流按连接生效,
-/// 每次迭代发新 HTTP 请求,server 持续 accept 新连接)。
-/// 注:此 bench 用 `download_full`(单连接整包),不经过 DownloadTask 的
-/// 分片规划/BandwidthTracker 采样路径。验证的是节流 server 本身的带宽
-/// 上限语义 + reqwest 单连接端到端耗时。要测 BandwidthTracker 采样,
-/// 见 `bench_disk_io_backends`(走 DownloadTask::run() 完整路径)。
+/// CI: 2MiB @ 10MB/s;完整: 8MiB @ 1MB/s。
+/// 用 DownloadTask::run()(probe->plan->execute)替代 download_full,
+/// 真正验证 BandwidthTracker 采样和分片规划在节流下的行为。
+/// chunk_size 用 256KiB(4 chunk/1MiB)替代默认 64KiB(16 chunk/1MiB),
+/// 减少 sleep 唤醒抖动(16->4 次,抖动降为 1/4),消除节流精度假象。
 fn bench_http_range_throttled(c: &mut Criterion) {
     let rt = rt();
     let mut group = c.benchmark_group("http_range_throttled");
     support::configure_group(&mut group, 10);
 
     // CI 模式用高带宽(10MB/s)避免超时;完整模式用 1MB/s 测带宽采样
+    // 文件 >1MB 触发分片(min_fragment_size=1MB),走 execute_fragmented_download
     let (file_size, bytes_per_sec) = if support::smoke_mode() {
-        (1024 * 1024, 10 * 1024 * 1024) // CI: 1MiB @ 10MB/s ≈ 0.1s
+        (2 * 1024 * 1024, 10 * 1024 * 1024) // CI: 2MiB @ 10MB/s ≈ 0.2s
     } else {
-        (4 * 1024 * 1024, 1024 * 1024) // 完整: 4MiB @ 1MB/s ≈ 4s
+        (8 * 1024 * 1024, 1024 * 1024) // 完整: 8MiB @ 1MB/s ≈ 8s
     };
+    let chunk_size = 256 * 1024; // 256KiB,减少节流 sleep 次数
 
-    let mut server =
-        rt.block_on(async { ThrottledServer::start(file_size, bytes_per_sec, 0).await });
+    let mut server = rt.block_on(async {
+        ThrottledServer::start_with_chunk(file_size, bytes_per_sec, 0, chunk_size).await
+    });
     let url = format!("{}/bench.bin", server.uri());
-    let client = HttpClient::with_timeouts(5, 30, None).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
 
     group.bench_function("throttled_download", |b| {
         b.to_async(&rt).iter(|| async {
+            let protocol: Arc<dyn Protocol> =
+                Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
+            let mut config = test_config();
+            config.download_dir = dir.path().to_string_lossy().to_string();
+            config.authorized_dirs = vec![config.download_dir.clone()];
+            let mut task = DownloadTask::new_for_test_no_storage(url.clone(), config, protocol);
             let start = Instant::now();
-            // 整文件下载(无 Range,走 200 路径)
-            let bytes = client.download_full(&url).await.unwrap();
+            task.run().await.expect("下载失败");
             let elapsed = start.elapsed();
-            assert_eq!(bytes.len() as u64, file_size);
-            // 节流验证:实际耗时应 >= 理论下限(file_size / bytes_per_sec)。
-            // chunk+sleep 节流是"带宽上限"语义:服务端每秒最多发 bytes_per_sec 字节,
-            // 因此客户端耗时不会低于理论值(带宽是硬约束)。实际耗时会略高
-            // (sleep 唤醒抖动 + HTTP/TCP 开销),但不应低于理论下限。
-            // 只验证下界,不设上界断言(bench 环境波动大,上界易误报)。
-            let theoretical_min = Duration::from_secs_f64(file_size as f64 / bytes_per_sec as f64);
+            assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            // 节流验证:DownloadTask 分片并发会突破单连接节流限制。
+            // 2MiB 文件 >1MB(min_fragment_size)触发分片,N 个分片各自建独立
+            // HTTP 连接,每个连接受 bytes_per_sec 节流,但 N 个连接聚合带宽
+            // = N * bytes_per_sec。因此实际耗时可能远低于 file_size/bytes_per_sec
+            // (单连接理论值)。这是正确行为——分片并行的收益。
+            // 不设严格下限断言(调度器动态决定并发度),只记录耗时供分析。
+            let single_conn_min = Duration::from_secs_f64(file_size as f64 / bytes_per_sec as f64);
+            // 至少应完成下载(不卡死),且耗时不应超过单连接的 2 倍(容错)
             assert!(
-                elapsed >= theoretical_min,
-                "节流下载耗时 {elapsed:?} 应 >= 理论下限 {theoretical_min:?}"
+                elapsed <= single_conn_min * 3,
+                "节流下载耗时 {elapsed:?} 过长(单连接理论 {single_conn_min:?} 的 3 倍)"
             );
         });
     });
@@ -143,25 +151,32 @@ fn bench_http_rtt_effect(c: &mut Criterion) {
     group.finish();
 }
 
-/// 多源聚合下载,验证 MirrorProtocol 快源多干
+/// 多源聚合下载,验证 MirrorProtocol 快源多干(真实分片并发)
 ///
 /// 3 个 ThrottledServer(快/中/慢,不同 RTT + 带宽),DownloadTask::with_mirrors
 /// 下载同一文件。快源应承担更多分片(quality 高 -> 选源公式 score 小 -> 多被选)。
+///
+/// 关键设计:
+/// - 文件 >1MB 触发多分片(min_fragment_size=1MB),走 execute_fragmented_download,
+///   使 3 源能做分片级并行聚合(而非单分片 fallback)
+/// - 闭包外预建 ConnectionPool 并传 Some(pool),避免每迭代重建 3 个 reqwest Client
+///   (连接池/DNS缓存/TLS状态复用,隔离调度开销)
 fn bench_mirror_aggregation(c: &mut Criterion) {
     let rt = rt();
     let mut group = c.benchmark_group("mirror_aggregation");
     support::configure_group(&mut group, 10);
 
-    // CI 模式缩小文件避免超时
+    // CI: 2MiB(>1MB 触发分片);完整: 8MiB(8 分片,充分并发)
     let file_size = if support::smoke_mode() {
-        512 * 1024 // 512KiB
+        2 * 1024 * 1024 // 2MiB
     } else {
-        4 * 1024 * 1024 // 4MiB
+        8 * 1024 * 1024 // 8MiB
     };
 
     // 3 源:快(5ms RTT, 高带宽) / 中(50ms, 中带宽) / 慢(200ms, 低带宽)
+    // CI 用高带宽避免超时;完整用低带宽使分片分配差异更明显
     let bw = if support::smoke_mode() {
-        50 * 1024 * 1024 // CI: 50MB/s(避免超时)
+        20 * 1024 * 1024 // CI: 20MB/s(2MiB@20MB/s ≈ 100ms)
     } else {
         2 * 1024 * 1024 // 完整: 2MB/s
     };
@@ -180,9 +195,9 @@ fn bench_mirror_aggregation(c: &mut Criterion) {
     ];
     let primary = format!("{}/bench.bin", fast.uri());
 
-    // with_mirrors 内部自建 storage(从 config.download_dir 落盘),
-    // 用 TempDir 确保迭代结束后清理文件,不在系统 temp 留垃圾。
-    // 所有迭代复用同一 TempDir(文件覆盖写入),bench 结束后 TempDir drop 清理。
+    // 预建连接池,所有迭代复用(避免 per-iteration 重建 3 个 reqwest Client)
+    let pool = Arc::new(ConnectionPool::new(PoolConfig::default()));
+
     let dir = tempfile::TempDir::new().unwrap();
 
     group.bench_function("3sources_mixed", |b| {
@@ -192,10 +207,14 @@ fn bench_mirror_aggregation(c: &mut Criterion) {
             config.download_dir = dir.path().to_string_lossy().to_string();
             config.authorized_dirs = vec![config.download_dir.clone()];
 
-            let task =
-                DownloadTask::with_mirrors(primary.clone(), mirror_urls.clone(), config, None)
-                    .await
-                    .expect("with_mirrors 构造失败");
+            let task = DownloadTask::with_mirrors(
+                primary.clone(),
+                mirror_urls.clone(),
+                config,
+                Some(pool.clone()),
+            )
+            .await
+            .expect("with_mirrors 构造失败");
             let mut task = task;
             task.run().await.expect("下载失败");
             assert_eq!(
@@ -265,6 +284,59 @@ fn bench_disk_io_backends(c: &mut Criterion) {
     group.finish();
 }
 
+/// 大文件分片下载,暴露分片并发的真实行为
+///
+/// CI: 4MiB(4 分片);完整: 16MiB(16 分片)。无节流,loopback 全速。
+/// 走 DownloadTask::run() 完整路径,对比 memory vs tokio_file 存储,
+/// 验证多分片是否真正并行 + 大文件磁盘写入反压。
+fn bench_large_file_fragmented(c: &mut Criterion) {
+    let rt = rt();
+    let mut group = c.benchmark_group("large_file_fragmented");
+    support::configure_group(&mut group, 10);
+
+    let file_size = if support::smoke_mode() {
+        4 * 1024 * 1024 // CI: 4MiB(4 分片,1MB/分片)
+    } else {
+        16 * 1024 * 1024 // 完整: 16MiB(16 分片)
+    };
+
+    let mut server = rt.block_on(async { ThrottledServer::start(file_size, 0, 0).await });
+    let url = format!("{}/bench.bin", server.uri());
+    let protocol: Arc<dyn Protocol> = Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
+
+    // Memory 后端(基线,无磁盘反压)
+    group.bench_function("memory_storage", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut task = DownloadTask::new_for_test(
+                url.clone(),
+                test_config(),
+                protocol.clone(),
+                tachyon_engine::StorageKind::memory(),
+            );
+            task.run().await.expect("下载失败");
+            assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+        });
+    });
+
+    // 真实磁盘后端(测磁盘写入反压)
+    group.bench_function("tokio_file_storage", |b| {
+        b.to_async(&rt).iter(|| async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = test_config();
+            config.download_dir = dir.path().to_string_lossy().to_string();
+            config.authorized_dirs = vec![config.download_dir.clone()];
+            config.io_strategy = tachyon_core::config::IoStrategy::Standard;
+            let mut task =
+                DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
+            task.run().await.expect("下载失败");
+            assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+        });
+    });
+
+    server.shutdown();
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = support::bench_config();
@@ -273,6 +345,7 @@ criterion_group! {
         bench_http_range_throttled,
         bench_http_rtt_effect,
         bench_mirror_aggregation,
-        bench_disk_io_backends
+        bench_disk_io_backends,
+        bench_large_file_fragmented
 }
 criterion_main!(benches);

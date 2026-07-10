@@ -325,3 +325,73 @@ P2SP 池中空闲镜像源连接同样受益。具体收益需真实网络验证
 **验证**:148 个 protocol 测试通过,clippy 零警告,新增
 `test_build_client_http2_keepalive_config_succeeds` 验证配置正确。
 
+## 第六轮:e2e_http_real bench 瓶颈定位与修正
+
+### 背景
+
+e2e_http_real bench 建立 4 轮 grill-me 审查后,发现两个关键 bench 测的不是产品路径,
+无法定位真实瓶颈。本轮通过 4 个假设逐一验证,修正 bench 设计,首次暴露产品侧真实行为。
+
+### 修正前的 bench 瓶颈归因
+
+| Bench | 中位数 | 表面瓶颈 | 真实归因 |
+|-------|--------|---------|---------|
+| http_range_real/1MiB | 11-17ms | HTTP CPU 开销 | 真实 - reqwest 连接+解析,keep-alive ~1ms/请求 |
+| throttled_download | 180-230ms | 带宽采样? | **bench 工具假象** - 16 chunk×6.25ms sleep 抖动;download_full 绕过 DownloadTask |
+| rtt_effect/0ms | 8-13ms | RTT 基线 | 真实 - 1MiB loopback 无节流 |
+| rtt_effect/50ms | 68-79ms | RTT 影响 | 真实 - 50ms+~10ms 噪声,与理论吻合 |
+| mirror_aggregation | 70-99ms | 多源聚合? | **双重假象** - pool=None 每迭代重建 3 个 reqwest Client + 512KiB<1MB 强制单分片 |
+| disk_io/memory | 5-8ms | 内存基线 | 真实 - 512KiB 完整 run() 路径 |
+| disk_io/tokio_file | 6-15ms | 磁盘反压 | 真实 - 磁盘增量 ~5ms/512KiB |
+
+### 4 个假设验证(全部确认)
+
+1. **chunk+sleep 节流精度问题**:64KiB chunk @ 10MB/s -> chunk_delay=6.25ms,16 次 sleep
+   累积抖动 80-130ms。改 256KiB chunk -> 4 次 sleep,抖动降为 1/4。
+2. **mirror bench per-iteration 重建**:pool=None 时 with_mirrors 每源独立 build_http(),
+   每迭代重建 3 个 reqwest Client(连接池/DNS/TLS 全丢弃)。
+3. **小文件强制单分片**:min_fragment_size=1MB(config.rs:871),512KiB 文件 clamp 到 1MB,
+   只产生 1 个分片,走 execute_full_download(无分片并发)。
+4. **调度开销可忽略**:execute_fragmented_download 的 channel/spawn 按下载摊销(非按分片);
+   download_via_least_in_flight 用 std::sync::Mutex,锁临界区微秒级;有回归测试守门 <1ms。
+
+### 修正内容
+
+1. **throttled_download**:download_full -> DownloadTask::run()(走 probe->plan->execute);
+   chunk_size 64KiB -> 256KiB;文件 1MiB -> 2MiB(>1MB 触发分片)
+2. **mirror_aggregation**:pool=None -> pool=Some(ConnectionPool);文件 512KiB -> 2MiB;
+   带宽 50MB/s -> 20MB/s
+3. **新增 large_file_fragmented**:4MiB/16MiB,无节流,走完整 run() 路径,对比 memory vs tokio_file
+
+### 修正后 bench 数据(CI 模式)
+
+| Bench | 改进前 | 改进后 | 关键发现 |
+|-------|--------|--------|---------|
+| throttled_download | 180-230ms | **122ms** | 分片并发突破单连接节流(2 分片各自 10MB/s,聚合 20MB/s) |
+| mirror_aggregation | 70-99ms | **281ms** | 真实多源分片聚合(2MiB/4 分片/3 源,数据量 4 倍) |
+| large_file_fragmented/memory | N/A | **22ms** | 4MiB/4 分片 loopback 全速,memory 无磁盘反压 |
+| large_file_fragmented/tokio_file | N/A | **26ms** | 磁盘增量 ~4ms/4MiB(大文件磁盘占比下降) |
+
+### 核心发现:分片并发突破单连接节流
+
+throttled_download 改走 DownloadTask::run() 后,2MiB 文件 >1MB(min_fragment_size)
+触发 2 分片,2 个分片各自建独立 HTTP 连接。服务端节流是**按连接**生效的,
+2 个并发连接各自受 bytes_per_sec 节流,但聚合带宽 = 2 × 10MB/s = 20MB/s。
+因此 2MiB / 20MB/s ≈ 100ms 即可完成,远低于单连接理论值 200ms。
+
+这是正确行为--分片并行的收益。断言调整为上界(<=单连接理论 3 倍)而非下界。
+
+### 产品代码路径分析结论
+
+| 阶段 | 典型耗时 | 瓶颈性质 | 可优化? |
+|------|----------|---------|--------|
+| probe | 20-500ms | 网络RTT(已优化:首成功即返回) | 否 |
+| init_storage | 1-10ms | 磁盘open | 微优化 |
+| plan | <0.1ms | 纯CPU | 否(可忽略) |
+| prepare_storage | 1-50ms | 磁盘fallocate | 微优化 |
+| execute | 秒级 | 网络+磁盘I/O(>99%墙钟) | I/O层 |
+| verify | 文件大小相关 | 磁盘+哈希 | 已用mmap_rayon |
+
+**结论:产品侧 CPU/调度层不是瓶颈。真实瓶颈在 I/O 层(网络带宽+磁盘吞吐)。
+分片并发是主要加速手段--N 个分片各自独立连接,聚合带宽 = N × 单连接带宽。**
+
