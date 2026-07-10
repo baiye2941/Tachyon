@@ -395,3 +395,103 @@ throttled_download 改走 DownloadTask::run() 后,2MiB 文件 >1MB(min_fragment_
 **结论:产品侧 CPU/调度层不是瓶颈。真实瓶颈在 I/O 层(网络带宽+磁盘吞吐)。
 分片并发是主要加速手段--N 个分片各自独立连接,聚合带宽 = N × 单连接带宽。**
 
+## 第七轮:论文搜索与优化方案
+
+### 论文搜索结果(2023-2026 arXiv)
+
+搜索了 5 个方向 17 篇论文,以下按"Tachyon 适用性"排序,仅保留中-高适用性方案:
+
+| 论文 | 来源 | 核心观点 | 适用性 |
+|------|------|---------|--------|
+| DBPP | arXiv 2607.05596 | disk-backed parallel pull,分片直接 pwrite 到字节偏移 | 高(已实现,write_all_at 零拷贝) |
+| FedFetch | arXiv 2504.15366 | 多源动态权重分片分配,快源拿更多分片 | 高(与 MirrorProtocol 互补) |
+| 2BRobust/BISCAY | arXiv 2601.05665 | 安全带宽探测,小幅扰动而非倍增 | 高(指导并发度爬坡) |
+| SafeSABR | arXiv 2605.23560 | safe-capacity 下界估计(P10 分位) | 高(改进 confidence/recommend) |
+| XRootD BBR | arXiv 2603.09568 | BBR 大文件 +40-60%,小文件 -10-15% | 高(按文件大小决策策略) |
+| DBMS io_uring | arXiv 2025 | fixed buffers + SQPOLL + 批量 SQE | 高(IoUringConfig 调优) |
+| IPFS ABR | arXiv 2606.29574 | 无状态选择,历史信息按时间衰减 | 高(改进 SourceStats 衰减) |
+
+### 交叉验证:过时方案排除
+
+以下方案经代码验证后发现已修复或不适用:
+
+| 方案 | 审查报告声称 | 代码实际 | 结论 |
+|------|-------------|---------|------|
+| write_all_at_mut freeze() | 违背设计意图 | 已改为 #[cfg(test)] 仅测试,生产走 write_all_at(Bytes) 零拷贝 | **已修复,跳过** |
+| sync()+close() 双重 fsync | 终态双重 fsync | downloader.rs 未显式调 sync/close,由 Drop 处理 | **不存在,跳过** |
+| BufferPool 未接入 | P0-03 未使用 | 需进一步确认(搜索 BufferPool 在 downloader 的引用) | 待验证 |
+
+### 优化方案(按优先级排序)
+
+#### P0:并发度爬坡替代公式跳变(2BRobust/BISCAY 思路)
+
+**问题**:`recommend()` 当前用公式一次性算出并发度,冷启动时 predicted_bw 不准会导致
+并发度跳变(如从 1 直接跳到 16),在浅缓冲 CDN(S3 兼容)上瞬间打满缓冲导致丢包重传。
+
+**方案**:并发度爬坡策略--任务启动从保守并发(4)开始,每完成一轮分片后若
+BandwidthTracker 显示利用率 <80% 则 +2,而非直接按公式跳到 16。
+
+**位置**:`crates/tachyon-scheduler/src/download_scheduler.rs` recommend() + downloader.rs execute
+**预估收益**:减少 startup 阶段 20-30% 丢包重传
+**风险**:低,纯调度逻辑改动,有 bench 守门
+
+#### P1:带宽下界估计(SafeSABR 思路)
+
+**问题**:`HoltLinearPredictor::confidence()` 仅反映样本数置信度(n>=30 -> 1.0),
+不反映带宽稳定性。在高抖动链路(移动网络/跨洲 CDN)下,中位数预测过于乐观,
+导致过度分配并发,全部分片同时降速。
+
+**方案**:在 `predict()` 输出 predicted_bw 的同时,计算 safe_bw(最近 N 样本 P10 分位
+或 mean - 2*std),`recommend()` 用 safe_bw 而非 predicted_bw 算 BDP。
+confidence < 0.5 时并发 * 0.7。
+
+**位置**:`crates/tachyon-scheduler/src/predictor.rs` predict() + confidence()
+**预估收益**:高抖动链路下减少 30-50% 过度分配
+**风险**:中,需维护样本历史窗口(内存开销增加)
+
+#### P2:SourceStats 历史衰减(IPFS ABR 思路)
+
+**问题**:`MirrorProtocol::SourceStats::quality()` 维护 stability(历史成功率)和
+bandwidth_score(历史带宽),但**永久累积不衰减**--CDN 节点降级后历史高分仍残留,
+导致继续选已降级的源。
+
+**方案**:stability/bandwidth_score 按时间指数衰减(半衰期 5 分钟),
+使镜像降级时能快速遗忘历史高分。SOFT_CIRCUIT_BREAKER_THRESHOLD 从"连续 5 次失败"
+改为"近期(滑动窗口 30s)失败率 >50%"。
+
+**位置**:`crates/tachyon-engine/src/mirror.rs` SourceStats + record_success/record_failure
+**预估收益**:镜像降级场景下减少 50% 错误选源
+**风险**:低,纯统计逻辑改动
+
+#### P3:IoUringConfig SQPOLL 选项(DBMS io_uring 经验)
+
+**问题**:IoUringConfig 的 sqpoll=false,sq_depth=256 但未批量提交 SQE。
+在持续高吞吐下载(>500MB/s)场景下每次 submit 的 syscall 成为瓶颈。
+
+**方案**:增加 sqpoll: Option<bool> 按场景开关(大文件高速下载开,零散小文件关);
+buffer_count 从 16 提升到 64-128(当前仅 1MB 总缓冲,Gbps 下只缓存 8ms);
+实现批量 SQE 提交(io_uring_submit_and_wait(n))。
+
+**位置**:`crates/tachyon-io/src/iouring.rs` IoUringConfig + 提交逻辑
+**预估收益**:Linux 高吞吐场景 30-50% syscall 减少
+**风险**:中,SQPOLL 需 root,跨平台兼容性
+**注意**:仅 Linux 5.4+,Windows 无 io_uring
+
+#### P4:MirrorProtocol 多源权重分片(FedFetch 思路)
+
+**问题**:当前 MirrorProtocol 是"二选一源选择"(每个分片绑定一个源),
+FedFetch 的"按权重切分分片给多源"可进一步优化:大文件让多个源同时贡献不同分片。
+
+**方案**:对大文件,不再每个分片独立选源,而是按源 quality 比例预分配分片子集,
+各源并行下载各自子集。解决 dispatcher+per-worker-channel 的 HOL blocking
+(慢源阻塞 channel 后续分片)。
+
+**位置**:`crates/tachyon-engine/src/mirror.rs` download_via_least_in_flight
+**预估收益**:大文件多源场景减少 20-40% 尾延迟
+**风险**:高,涉及调度模型重构
+
+### 实施路线图
+
+1. **立即实施(低成本高收益)**:P0 并发度爬坡 + P2 SourceStats 衰减
+2. **中期实施(算法层)**:P1 带宽下界估计
+3. **长期探索(架构层)**:P3 IoUringConfig SQPOLL + P4 多源权重分片
