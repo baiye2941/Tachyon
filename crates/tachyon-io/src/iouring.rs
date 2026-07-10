@@ -52,7 +52,9 @@ use crate::storage::AsyncStorage;
 /// io_uring 引擎配置
 ///
 /// 控制提交队列深度、完成队列深度、fixed buffer 参数和 SQPOLL 行为。
-/// 默认配置适合中等吞吐量场景(64KB buffer x 16 个 = 1MB 总量)。
+/// 默认配置适合高吞吐量下载场景(256KB buffer x 16 个 = 4MB 总量)。
+/// buffer_size 与引擎 WRITE_BATCH_BYTES(256KB)对齐,确保对齐快速路径
+/// 能直接处理引擎产出的写入批,无需降级到非对齐 RMW 慢速路径。
 pub struct IoUringConfig {
     /// SQ 深度(提交队列大小),必须为 2 的幂
     pub sq_depth: u32,
@@ -79,9 +81,9 @@ impl Default for IoUringConfig {
         Self {
             sq_depth: 256,
             cq_depth: 512,
-            buffer_size: 64 * 1024, // 64KB per buffer
-            buffer_count: 16,       // 16 个 fixed buffer = 1MB 总量
-            sqpoll: false,          // 默认关闭(需要 CAP_SYS_ADMIN)
+            buffer_size: 256 * 1024, // 256KB per buffer,与 WRITE_BATCH_BYTES 对齐
+            buffer_count: 16,        // 16 个 fixed buffer = 4MB 总量
+            sqpoll: false,           // 默认关闭(需要 CAP_SYS_ADMIN)
             sqpoll_idle_ms: 1000,
         }
     }
@@ -1628,7 +1630,7 @@ mod tests {
         let config = IoUringConfig::default();
         assert_eq!(config.sq_depth, 256);
         assert_eq!(config.cq_depth, 512);
-        assert_eq!(config.buffer_size, 64 * 1024);
+        assert_eq!(config.buffer_size, 256 * 1024);
         assert_eq!(config.buffer_count, 16);
         assert!(!config.sqpoll);
         assert_eq!(config.sqpoll_idle_ms, 1000);
@@ -1638,7 +1640,7 @@ mod tests {
     fn test_default_config_buffer_total() {
         let config = IoUringConfig::default();
         let total = config.buffer_size * config.buffer_count;
-        assert_eq!(total, 1024 * 1024, "默认总 buffer 应为 1MB");
+        assert_eq!(total, 4 * 1024 * 1024, "默认总 buffer 应为 4MB");
     }
 
     #[test]
@@ -1801,6 +1803,26 @@ mod tests {
         validate_fixed_buffer_write_len(4096, 4096).expect("等于 fixed buffer 大小时应允许写入");
     }
 
+    /// 回归测试:默认 IoUringConfig.buffer_size 必须能容纳引擎的 WRITE_BATCH_BYTES,
+    /// 否则 Linux 默认 io_uring 后端的对齐快速路径会拒绝 256KB 写入批。
+    /// 历史缺陷:buffer_size 曾为 64KB < WRITE_BATCH_BYTES 256KB,导致
+    /// validate_fixed_buffer_write_len 必然返回 InvalidInput 错误。
+    #[test]
+    fn test_default_buffer_size_covers_write_batch_bytes() {
+        let config = IoUringConfig::default();
+        let batch = tachyon_core::config::WRITE_BATCH_BYTES;
+        assert!(
+            config.buffer_size >= batch,
+            "默认 buffer_size {} 必须 >= WRITE_BATCH_BYTES {},\
+             否则引擎产出的写入批会被 io_uring 对齐快速路径拒绝",
+            config.buffer_size,
+            batch
+        );
+        // 等于 batch 大小时应通过校验(对齐快速路径的边界)
+        validate_fixed_buffer_write_len(batch, config.buffer_size)
+            .expect("默认 buffer_size 应能容纳等于 WRITE_BATCH_BYTES 的对齐写入");
+    }
+
     #[test]
     fn test_fixed_buffer_write_len_rejects_oversized_payload() {
         let err = validate_fixed_buffer_write_len(4097, 4096)
@@ -1910,8 +1932,8 @@ mod tests {
         assert_eq!((4096usize + 4095) & !4095, 4096);
         assert_eq!((512usize + 511) & !511, 512);
 
-        // 默认 buffer_size 64KB 也应是 4096 的倍数
-        let default_size = 64 * 1024usize;
+        // 默认 buffer_size 256KB 也应是 4096 的倍数
+        let default_size = 256 * 1024usize;
         assert!(
             default_size.is_multiple_of(4096),
             "默认 buffer_size 应为 4096 对齐"
