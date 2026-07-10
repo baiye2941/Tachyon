@@ -16,6 +16,10 @@
 //! 非工业级(无 token bucket),但 bench 场景够用:chunk 大小和 sleep 间隔可控,
 //! 便于测 BandwidthTracker 的带宽采样周期。
 
+// 本模块所有公开 API 仅被 bench binary 引用,criterion_main! 覆盖了 test harness,
+// 编译器无法识别"已被 bench 函数调用"因此报 dead_code。模块级统一放行。
+#![allow(dead_code)]
+
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,12 +39,10 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 /// 默认 chunk 大小(64KiB,覆盖 TCP 典型 16-64KiB chunk)
-#[allow(dead_code)]
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// 节流流式 HTTP server 配置
 #[derive(Clone)]
-#[allow(dead_code)]
 struct ServerConfig {
     /// 模拟文件总大小(字节)
     file_size: u64,
@@ -60,7 +62,6 @@ struct ServerConfig {
 ///
 /// 使用 OS 分配端口而非固定端口:nextest 将 criterion bench 拆分为独立进程并行运行,
 /// 固定端口会导致多进程同时绑定同一端口而冲突。OS 分配端口零冲突。
-#[allow(dead_code)]
 pub struct ThrottledServer {
     uri: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -68,7 +69,6 @@ pub struct ThrottledServer {
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
 impl ThrottledServer {
     /// 创建并启动节流 server(OS 分配端口)
     ///
@@ -140,7 +140,7 @@ impl ThrottledServer {
         }
     }
 
-    /// 返回 server URI(如 `http://127.0.0.1:18080`)
+    /// 返回 server URI(如 `http://127.0.0.1:54321`,端口由 OS 分配)
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -158,12 +158,7 @@ impl ThrottledServer {
 
 impl Drop for ThrottledServer {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(join) = self.join.take() {
-            join.abort();
-        }
+        self.shutdown();
     }
 }
 
@@ -171,7 +166,6 @@ impl Drop for ThrottledServer {
 ///
 /// 支持 `bytes=start-end` 和 `bytes=start-`(到文件末尾)。
 /// 越界或格式错误返回 None。
-#[allow(dead_code)]
 fn parse_range(range_header: &str, total: u64) -> Option<(u64, u64)> {
     let s = range_header.strip_prefix("bytes=")?;
     let (start_s, end_s) = s.split_once('-')?;
@@ -188,7 +182,6 @@ fn parse_range(range_header: &str, total: u64) -> Option<(u64, u64)> {
 }
 
 /// 把任意 Body 归一化为 BoxBody<Bytes, std::io::Error>
-#[allow(dead_code)]
 fn box_body<B>(body: B) -> BoxBody<Bytes, std::io::Error>
 where
     B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
@@ -203,7 +196,6 @@ where
 /// `bytes_per_sec`: 0 表示不限速(无 sleep)
 /// `rtt`: 首字节前延迟(模拟 TTFB)
 /// `chunk_size`: 节流粒度
-#[allow(dead_code)]
 fn throttled_stream(
     data: Bytes,
     bytes_per_sec: u64,
@@ -249,11 +241,11 @@ fn throttled_stream(
         .boxed()
 }
 
-/// 生成确定性文件内容(避免大文件分配真实内存)
+/// 生成确定性文件内容(按请求范围分配,range 之外的字节不分配)
 ///
-/// 用重复填充模式,按需生成指定范围的字节。range 之外的字节不分配。
-/// 返回的 Bytes 持有实际数据(copy_from_slice)。
-#[allow(dead_code)]
+/// 用确定性填充模式(abs % 251),不依赖随机数。返回的 Bytes 持有完整范围数据。
+/// 注意:大范围请求(如完整模式 4MiB)会全量分配内存 + throttled_stream 内再
+/// 按 chunk_size 切片复制,峰值内存约为 range 大小的 2 倍。bench 场景可接受。
 fn make_file_data(start: u64, end: u64) -> Bytes {
     let len = (end - start + 1) as usize;
     let mut buf = vec![0u8; len];
@@ -266,7 +258,6 @@ fn make_file_data(start: u64, end: u64) -> Bytes {
 }
 
 /// 请求处理器
-#[allow(dead_code)]
 async fn handle(
     req: Request<Incoming>,
     config: Arc<ServerConfig>,

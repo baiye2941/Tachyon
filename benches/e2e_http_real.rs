@@ -74,10 +74,10 @@ fn bench_http_range_throttled(c: &mut Criterion) {
     let mut server =
         rt.block_on(async { ThrottledServer::start(file_size, bytes_per_sec, 0).await });
     let url = format!("{}/bench.bin", server.uri());
+    let client = HttpClient::with_timeouts(5, 30, None).unwrap();
 
     group.bench_function("throttled_download", |b| {
         b.to_async(&rt).iter(|| async {
-            let client = HttpClient::with_timeouts(5, 30, None).unwrap();
             let start = Instant::now();
             // 整文件下载(无 Range,走 200 路径)
             let bytes = client.download_full(&url).await.unwrap();
@@ -176,10 +176,17 @@ fn bench_mirror_aggregation(c: &mut Criterion) {
     ];
     let primary = format!("{}/bench.bin", fast.uri());
 
+    // with_mirrors 内部自建 storage(从 config.download_dir 落盘),
+    // 用 TempDir 确保迭代结束后清理文件,不在系统 temp 留垃圾。
+    // 所有迭代复用同一 TempDir(文件覆盖写入),bench 结束后 TempDir drop 清理。
+    let dir = tempfile::TempDir::new().unwrap();
+
     group.bench_function("3sources_mixed", |b| {
         b.to_async(&rt).iter(|| async {
             let mut config = test_config();
             config.max_concurrent_fragments = 8;
+            config.download_dir = dir.path().to_string_lossy().to_string();
+            config.authorized_dirs = vec![config.download_dir.clone()];
 
             let task =
                 DownloadTask::with_mirrors(primary.clone(), mirror_urls.clone(), config, None)
@@ -219,14 +226,13 @@ fn bench_disk_io_backends(c: &mut Criterion) {
     let url = format!("{}/bench.bin", server.uri());
 
     // Memory 后端(基线)
+    let protocol: Arc<dyn Protocol> = Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
     group.bench_function("memory_storage", |b| {
         b.to_async(&rt).iter(|| async {
-            let protocol: Arc<dyn Protocol> =
-                Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
             let mut task = DownloadTask::new_for_test(
                 url.clone(),
                 test_config(),
-                protocol,
+                protocol.clone(),
                 tachyon_engine::StorageKind::memory(),
             );
             task.run().await.expect("下载失败");
@@ -234,19 +240,20 @@ fn bench_disk_io_backends(c: &mut Criterion) {
         });
     });
 
-    // 真实磁盘后端(TokioFile)
+    // 真实磁盘后端(TokioFile)。每次迭代创建新 TempDir,迭代结束时 TempDir drop
+    // 自动清理文件(不留垃圾)。protocol 复用同一连接池(测磁盘 IO 非连接建立)。
     group.bench_function("tokio_file_storage", |b| {
         b.to_async(&rt).iter(|| async {
             let dir = tempfile::TempDir::new().unwrap();
-            let protocol: Arc<dyn Protocol> =
-                Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
             let mut config = test_config();
             config.download_dir = dir.path().to_string_lossy().to_string();
             config.authorized_dirs = vec![config.download_dir.clone()];
             config.io_strategy = tachyon_core::config::IoStrategy::Standard;
-            let mut task = DownloadTask::new_for_test_no_storage(url.clone(), config, protocol);
+            let mut task =
+                DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
             task.run().await.expect("下载失败");
             assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            // dir 在此 drop,自动删除临时文件
         });
     });
 
