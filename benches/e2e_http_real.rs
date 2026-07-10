@@ -280,6 +280,23 @@ fn bench_disk_io_backends(c: &mut Criterion) {
         });
     });
 
+    // IOCP 后端(Windows 默认)/ io_uring(Linux 默认)。
+    // 与 TokioFile 对比,验证默认后端的对齐快速路径(无 write_lock 串行化)是否更优。
+    // 非 Windows 且非 Linux io_uring 时回退到 Standard,此时与 tokio_file 相同。
+    group.bench_function("default_io_strategy", |b| {
+        b.to_async(&rt).iter(|| async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = test_config();
+            config.download_dir = dir.path().to_string_lossy().to_string();
+            config.authorized_dirs = vec![config.download_dir.clone()];
+            config.io_strategy = tachyon_core::config::IoStrategy::default();
+            let mut task =
+                DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
+            task.run().await.expect("下载失败");
+            assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+        });
+    });
+
     server.shutdown();
     group.finish();
 }
@@ -326,6 +343,22 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
             config.download_dir = dir.path().to_string_lossy().to_string();
             config.authorized_dirs = vec![config.download_dir.clone()];
             config.io_strategy = tachyon_core::config::IoStrategy::Standard;
+            let mut task =
+                DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
+            task.run().await.expect("下载失败");
+            assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+        });
+    });
+
+    // IOCP 后端(Windows 默认)/ io_uring(Linux 默认)。
+    // 大文件分片并发下,对比 TokioFile 的 write_lock 串行化与默认后端的真异步写入。
+    group.bench_function("default_io_strategy", |b| {
+        b.to_async(&rt).iter(|| async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = test_config();
+            config.download_dir = dir.path().to_string_lossy().to_string();
+            config.authorized_dirs = vec![config.download_dir.clone()];
+            config.io_strategy = tachyon_core::config::IoStrategy::default();
             let mut task =
                 DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
             task.run().await.expect("下载失败");
