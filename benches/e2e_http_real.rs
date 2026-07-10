@@ -24,10 +24,10 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
-/// 真实 HTTP loopback 下载(无节流),对比 MockProtocol 2ms 基线
+/// 真实 HTTP loopback 下载(无节流)
 ///
-/// 测 reqwest 连接建立 + HTTP 解析 + bytes_stream 分块的真实 CPU 开销。
-/// server 在 bench 前启动一次,所有迭代复用(测下载性能,非 server 启停)。
+/// 测 reqwest 连接建立 + HTTP 解析 + bytes_stream 分块的真实 CPU 开销
+/// (4 × 256KiB 串行 download_range)。server 在 bench 前启动一次,所有迭代复用。
 fn bench_http_range_real_loopback(c: &mut Criterion) {
     let rt = rt();
     let mut group = c.benchmark_group("http_range_real");
@@ -54,11 +54,15 @@ fn bench_http_range_real_loopback(c: &mut Criterion) {
     group.finish();
 }
 
-/// 节流 HTTP 下载,验证带宽采样和分片规划
+/// 节流 HTTP 下载,验证 server 端节流语义(实际耗时 >= 理论下限)
 ///
 /// CI: 1MiB @ 10MB/s;完整: 4MiB @ 1MB/s。
 /// server 在 bench 前启动,所有迭代复用(节流按连接生效,
 /// 每次迭代发新 HTTP 请求,server 持续 accept 新连接)。
+/// 注:此 bench 用 `download_full`(单连接整包),不经过 DownloadTask 的
+/// 分片规划/BandwidthTracker 采样路径。验证的是节流 server 本身的带宽
+/// 上限语义 + reqwest 单连接端到端耗时。要测 BandwidthTracker 采样,
+/// 见 `bench_disk_io_backends`(走 DownloadTask::run() 完整路径)。
 fn bench_http_range_throttled(c: &mut Criterion) {
     let rt = rt();
     let mut group = c.benchmark_group("http_range_throttled");

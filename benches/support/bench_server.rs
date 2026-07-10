@@ -42,7 +42,6 @@ use tokio::time::sleep;
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// 节流流式 HTTP server 配置
-#[derive(Clone)]
 struct ServerConfig {
     /// 模拟文件总大小(字节)
     file_size: u64,
@@ -58,7 +57,9 @@ struct ServerConfig {
 ///
 /// 启动后绑定 `127.0.0.1:0`(OS 分配端口),处理 HEAD(返回元数据)和
 /// GET Range(返回节流 StreamBody)。`uri()` 返回实际 URI 供 HttpClient 使用。
-/// `shutdown()` 或 Drop 时关闭(通过 shutdown 信号 + abort server task 确保端口释放)。
+/// `shutdown()` 或 Drop 时关闭:发送 shutdown 信号中断 accept loop,再 abort
+/// server task(释放端口)。已 accept 的连接 task 不主动 abort——bench 场景下
+/// 迭代已结束,无在途请求;即使 panic 中途退出,runtime drop 会回收残留 task。
 ///
 /// 使用 OS 分配端口而非固定端口:nextest 将 criterion bench 拆分为独立进程并行运行,
 /// 固定端口会导致多进程同时绑定同一端口而冲突。OS 分配端口零冲突。
@@ -196,6 +197,10 @@ where
 /// `bytes_per_sec`: 0 表示不限速(无 sleep)
 /// `rtt`: 首字节前延迟(模拟 TTFB)
 /// `chunk_size`: 节流粒度
+///
+/// 节流时序:第一个 chunk 前 sleep(rtt)(模拟 TTFB),后续每个 chunk 前
+/// sleep(chunk_delay)(模拟传输时间)。这是"突发-等待"模式而非平滑流,
+/// TTFB = RTT,但 chunk 间有微小空闲(hyper 写缓冲在 sleep 期间空转)。
 fn throttled_stream(
     data: Bytes,
     bytes_per_sec: u64,
@@ -214,10 +219,11 @@ fn throttled_stream(
 
     let chunk_size = chunk_size.max(1);
 
-    // 先收集所有 chunk(避免 data 借用与 stream 生命期冲突)
+    // 零拷贝切片:slice_ref 共享底层 buffer,避免 copy_from_slice 的逐 chunk 拷贝。
+    // data 在 collect 后仍被 chunks 中的 Bytes 引用(引用计数),不会提前 drop。
     let chunks: Vec<Bytes> = data
         .chunks(chunk_size)
-        .map(Bytes::copy_from_slice)
+        .map(|slice| data.slice_ref(slice))
         .collect();
 
     let stream = stream::iter(chunks.into_iter().enumerate().map(move |(i, chunk)| {
@@ -287,15 +293,20 @@ async fn handle(
             .unwrap());
     }
 
-    // 解析 Range header
-    let (status, start, end) = match req
-        .headers()
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|r| parse_range(r, total))
-    {
-        Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e),
+    // 解析 Range header:区分无 Range(200 全文)、合法 Range(206)、错误 Range(416)
+    let (status, start, end) = match req.headers().get(header::RANGE) {
         None => (StatusCode::OK, 0, total.saturating_sub(1)),
+        Some(v) => match v.to_str().ok().and_then(|r| parse_range(r, total)) {
+            Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e),
+            None => {
+                // 格式错误或越界:RFC 7233 要求返回 416 + Content-Range: bytes */{total}
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                    .body(box_body(Full::new(Bytes::new())))
+                    .unwrap());
+            }
+        },
     };
 
     let body_len = end - start + 1;
