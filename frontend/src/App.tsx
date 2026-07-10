@@ -59,6 +59,7 @@ import ContextMenu from "./components/ContextMenu";
 import BatchToolbar from "./components/BatchToolbar";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ErrorPage from "./components/ErrorPage";
+import Skeleton from "./shared/ui/Skeleton";
 import { $confirm, requestConfirm, resolveConfirm } from "./stores/confirm";
 import { clearTaskHistory } from "./stores/taskSpeedHistory";
 import { tr } from "./i18n";
@@ -231,20 +232,28 @@ function AppContent() {
       );
   };
 
-  const handleDeleteRecord = async (taskId: string) => {
+  const handleDeleteRecord = async (
+    taskId: string,
+    opts?: { skipConfirm?: boolean; deleteLocalFile?: boolean },
+  ) => {
     // 历史记录删除同样走应用层 ConfirmDialog(Iteration 11)
     const task = $tasks.get().find((t) => t.id === taskId);
     const record = getRecordById(taskId);
     const fileName = task?.fileName ?? record?.fileName ?? taskId;
-    const result = await requestConfirm({
-      title: tr("confirm.deleteHistory.title"),
-      message: tr("confirm.deleteHistory.message", { name: fileName }),
-      confirmLabel: tr("confirm.deleteHistory.confirmLabel"),
-      tone: "danger",
-      showDeleteLocalFileOption: true,
-      deleteLocalFileDefault: false,
-    });
-    if (!result.ok) return;
+
+    let deleteLocalFile = opts?.deleteLocalFile ?? false;
+    if (!opts?.skipConfirm) {
+      const result = await requestConfirm({
+        title: tr("confirm.deleteHistory.title"),
+        message: tr("confirm.deleteHistory.message", { name: fileName }),
+        confirmLabel: tr("confirm.deleteHistory.confirmLabel"),
+        tone: "danger",
+        showDeleteLocalFileOption: true,
+        deleteLocalFileDefault: false,
+      });
+      if (!result.ok) return;
+      deleteLocalFile = result.deleteLocalFile;
+    }
 
     // 先移除本地历史记录与速度采样,保证 UI 即时响应;后端删除失败也不影响本地清理
     deleteHistoryRecord(taskId);
@@ -254,10 +263,13 @@ function AppContent() {
       try {
         await api.deleteTask(taskId, {
           skipConfirm: true,
-          deleteLocalFile: result.deleteLocalFile,
+          deleteLocalFile,
         });
       } catch (e) {
-        addToast(tr("toast.deleteRecordFailed", { error: errorMessage(e) }), "error");
+        addToast(
+          tr("toast.deleteRecordFailed", { error: errorMessage(e) }),
+          "error",
+        );
       }
     }
     await refreshTaskList();
@@ -449,9 +461,7 @@ function AppContent() {
       />
 
       <Show when={$ui.newTaskModalOpen()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="dialog" />}>
           <NewTaskModal onClose={$ui.closeNewTaskModal} />
         </Suspense>
       </Show>
@@ -510,9 +520,7 @@ function AppContent() {
 
       {/* Panels */}
       <Show when={$ui.snifferVisible()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="panel" />}>
           <SnifferPanel
             visible={$ui.snifferVisible()}
             resources={snifferResources()}
@@ -527,9 +535,7 @@ function AppContent() {
       </Show>
 
       <Show when={$ui.historyVisible()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="panel" />}>
           <HistoryPanel
             visible={$ui.historyVisible()}
             tasks={$tasks.get()}
@@ -552,9 +558,7 @@ function AppContent() {
       </Show>
 
       <Show when={$ui.settingsVisible()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="panel" />}>
           <SettingsPanel
             visible={$ui.settingsVisible()}
             initialTab={$ui.settingsInitialTab() ?? undefined}
@@ -564,17 +568,13 @@ function AppContent() {
       </Show>
 
       <Show when={$ui.hubVisible()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="panel" />}>
           <HfBrowserPanel visible={$ui.hubVisible()} onClose={$ui.closeHub} />
         </Suspense>
       </Show>
 
       <Show when={$ui.commandPaletteOpen()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="list" />}>
           <CommandPalette
             open={$ui.commandPaletteOpen()}
             onClose={$ui.closeCommandPalette}
@@ -608,9 +608,7 @@ function AppContent() {
       </Show>
 
       <Show when={$ui.shortcutHelpOpen()}>
-        <Suspense
-          fallback={<div class="animate-pulse bg-white/5 rounded-lg h-full" />}
-        >
+        <Suspense fallback={<Skeleton variant="dialog" />}>
           <ShortcutHelp
             visible={$ui.shortcutHelpOpen()}
             onClose={closeShortcutHelp}

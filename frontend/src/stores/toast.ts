@@ -8,7 +8,7 @@ import {
   removeToast as removeRichToast,
 } from '../components/ToastContainer'
 
-export type ToastType = 'info' | 'success' | 'error'
+export type ToastType = 'info' | 'success' | 'error' | 'warning'
 
 export interface Toast {
   id: string
@@ -28,10 +28,10 @@ export function removeToast(id: string) {
 }
 
 export function toasts(): Toast[] {
-  return getRichToasts().map(toast => ({
+  return getRichToasts().map((toast) => ({
     id: toast.id,
     message: toast.title,
     msg: toast.title,
-    type: toast.type === 'warning' ? 'info' : toast.type,
+    type: toast.type as ToastType,
   }))
 }

@@ -21,6 +21,7 @@
    cascade so that specificity ties resolve consistently. */
 @import "./styles/components/task-list.css";
 @import "./styles/components/empty-state.css";
+@import "./styles/components/skeleton.css";
 @import "./styles/components/detail-panel.css";
 @import "./styles/components/chunk-matrix.css";
 @import "./styles/components/toast.css";

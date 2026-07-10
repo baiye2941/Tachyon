@@ -28,7 +28,11 @@ interface HistoryPanelProps {
   /** 打开所在文件夹,直接接收保存路径(非任务 id) */
   onOpenFolder: (savePath: string) => void;
   onRedownload: (task: TaskInfo) => void;
-  onDeleteRecord: (taskId: string) => void;
+  /** 删除单条历史记录；批量删除时可传入选项跳过二次确认 */
+  onDeleteRecord: (
+    taskId: string,
+    opts?: { skipConfirm?: boolean; deleteLocalFile?: boolean },
+  ) => void | Promise<void>;
 }
 
 function recordToTaskInfo(record: HistoryRecord): TaskInfo {
@@ -163,7 +167,8 @@ export default function HistoryPanel(props: HistoryPanelProps) {
     if (wasBatch) setSelectedIds(new Set<string>());
   };
 
-  // 批量删除选中历史记录:纯前端 localStorage 操作,无后端调用
+  // 批量删除选中历史记录：单次 ConfirmDialog 确认，并允许选择是否同时删除本地文件。
+  // 确认后逐条调用 onDeleteRecord 并跳过二次确认。
   const handleDeleteSelected = async () => {
     const ids = Array.from(selectedIds());
     if (ids.length === 0) return;
@@ -173,14 +178,18 @@ export default function HistoryPanel(props: HistoryPanelProps) {
       message: t("confirm.deleteHistoryBatch.message", { count: ids.length }),
       confirmLabel: t("confirm.delete.confirmLabel"),
       tone: "danger",
+      showDeleteLocalFileOption: true,
+      deleteLocalFileDefault: false,
     });
     if (!result.ok) return;
 
     let failed = 0;
     for (const id of ids) {
-      // onDeleteRecord 处理单条删除(同步到后端/清理内存),这里逐条调用
       try {
-        props.onDeleteRecord(id);
+        await props.onDeleteRecord(id, {
+          skipConfirm: true,
+          deleteLocalFile: result.deleteLocalFile,
+        });
       } catch {
         failed++;
       }
@@ -259,7 +268,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           }}
         >
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -287,7 +296,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             </div>
           </div>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -315,7 +324,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             </div>
           </div>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -343,7 +352,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             </div>
           </div>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -371,7 +380,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             </div>
           </div>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -401,7 +410,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             </div>
           </div>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "16px",
               "border-radius": "10px",
@@ -434,7 +443,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
 
         {/* Trend Chart */}
         <div
-          class="glass"
+          class="panel-surface"
           style={{
             padding: "16px",
             "border-radius": "10px",
@@ -489,7 +498,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
         {/* Fun Facts */}
         <Show when={stats().maxFile}>
           <div
-            class="glass"
+            class="panel-surface"
             style={{
               padding: "14px",
               "border-radius": "8px",

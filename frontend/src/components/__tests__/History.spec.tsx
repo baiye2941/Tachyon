@@ -166,15 +166,52 @@ describe("HistoryPanel 历史记录面板", () => {
     fireEvent.click(screen.getByLabelText("批量选择"));
     fireEvent.click(screen.getByText("全选"));
     fireEvent.click(screen.getByText("删除选中"));
-    // 确认对话框应被调用
+    // 确认对话框应被调用，并携带删除本地文件选项
     await vi.waitFor(() => {
-      expect(mockRequestConfirm).toHaveBeenCalled();
+      expect(mockRequestConfirm).toHaveBeenCalledWith(
+        expect.objectContaining({ showDeleteLocalFileOption: true }),
+      );
     });
-    // 确认后逐条删除
+    // 确认后逐条删除，且跳过二次确认
     await vi.waitFor(() => {
       expect(onDeleteRecord).toHaveBeenCalledTimes(2);
     });
+    expect(onDeleteRecord).toHaveBeenCalledWith("a", {
+      skipConfirm: true,
+      deleteLocalFile: false,
+    });
+    expect(onDeleteRecord).toHaveBeenCalledWith("b", {
+      skipConfirm: true,
+      deleteLocalFile: false,
+    });
     mockRequestConfirm.mockReset();
+  });
+
+  it("批量模式:删除选中可传递 deleteLocalFile=true", async () => {
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: true });
+    const onDeleteRecord = vi.fn();
+    await renderPanel({ onDeleteRecord }, [
+      makeRecord({ id: "a", fileName: "a.zip" }),
+    ]);
+    fireEvent.click(screen.getByLabelText("批量选择"));
+    fireEvent.click(screen.getByLabelText("选择记录 a.zip"));
+    fireEvent.click(screen.getByText("删除选中"));
+    await vi.waitFor(() => {
+      expect(onDeleteRecord).toHaveBeenCalledWith("a", {
+        skipConfirm: true,
+        deleteLocalFile: true,
+      });
+    });
+    mockRequestConfirm.mockReset();
+  });
+
+  it("统计卡片使用 panel-surface 而非 glass", async () => {
+    const { container } = await renderPanel({}, [
+      makeRecord({ fileName: "a.zip" }),
+    ]);
+    const panels = container.querySelectorAll(".panel-surface");
+    expect(panels.length).toBeGreaterThan(0);
+    expect(container.querySelectorAll(".glass").length).toBe(0);
   });
 
   it("没有历史记录时显示空状态", async () => {

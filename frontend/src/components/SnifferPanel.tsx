@@ -8,6 +8,8 @@ import {
 import { formatSize } from '../utils/format'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
+import { addToast } from '../stores/toast'
+import { requestConfirm } from '../stores/confirm'
 
 const typeColors: Record<string, string> = {
   video: 'var(--color-file-video)',
@@ -94,16 +96,22 @@ export default function SnifferPanel(props: SnifferPanelProps) {
     if (!url) return
     // 简单校验 http(s) 前缀
     if (!/^https?:\/\//i.test(url)) {
-      window.alert(tr('sniffer.invalidUrl'))
+      addToast(tr('sniffer.invalidUrl'), 'warning')
       return
     }
     props.onAddResource(url)
     setUrlInput('')
   }
 
-  const handleClear = () => {
+  const handleClear = async () => {
     if (props.resources.length === 0) return
-    if (window.confirm(tr('sniffer.clearConfirm'))) {
+    const result = await requestConfirm({
+      title: tr('sniffer.clearConfirmTitle'),
+      message: tr('sniffer.clearConfirm'),
+      confirmLabel: tr('sniffer.clearConfirmLabel'),
+      tone: 'danger',
+    })
+    if (result.ok) {
       props.onClearResources()
     }
   }

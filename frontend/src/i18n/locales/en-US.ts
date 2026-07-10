@@ -580,6 +580,8 @@ const enUS = {
   "sniffer.addUrlButton": "Add",
   "sniffer.clear": "Clear",
   "sniffer.clearConfirm": "Clear all sniffed resources?",
+  "sniffer.clearConfirmTitle": "Clear sniffed resources",
+  "sniffer.clearConfirmLabel": "Clear",
   "sniffer.empty": "No resources yet. Paste a URL to add manually",
   "sniffer.invalidUrl": "Please enter a valid http(s) URL",
   "sniffer.config": "Capture config",

@@ -561,6 +561,8 @@ const zhCN = {
   "sniffer.addUrlButton": "添加",
   "sniffer.clear": "清空",
   "sniffer.clearConfirm": "确定清空所有嗅探资源?",
+  "sniffer.clearConfirmTitle": "清空嗅探资源",
+  "sniffer.clearConfirmLabel": "清空",
   "sniffer.empty": "暂无嗅探资源,粘贴 URL 手动添加",
   "sniffer.invalidUrl": "请输入有效的 http(s) URL",
   "sniffer.config": "捕获配置",
