@@ -17,10 +17,12 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
+use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use tachyon_core::config::{DownloadConfig, SchedulerConfig};
@@ -1174,6 +1176,16 @@ impl DownloadTask {
         );
 
         let semaphore = Arc::new(Semaphore::new(effective_concurrency));
+        // 动态并发度:跟踪当前目标并发数。interval 分支周期性 re-recommend,
+        // 若新值 > 当前值则 add_permits 提升(Semaphore permits 即真实并发上限,
+        // spawn-per-fragment 模型下 add_permits 后下次 acquire 即可 spawn 新 task)。
+        // 只升不降:permits 不可回收,降并发靠 task 自然完成不 spawn 新 task。
+        let target_concurrency = Arc::new(AtomicUsize::new(effective_concurrency));
+        let max_concurrent_fragments = self.config.max_concurrent_fragments;
+        // 周期性 re-recommend 间隔:用 sampling_interval_secs(默认 5s),
+        // 最小 2s 避免频繁 re-recommend 抖动。
+        let reschedule_interval =
+            Duration::from_secs(self.scheduler_config.sampling_interval_secs.max(2));
         let url = self.url.clone();
         let storage = self
             .storage
@@ -1290,8 +1302,31 @@ impl DownloadTask {
         // 使 completed_rx 在所有 task 完成后能返回 None 触发主循环退出。
         let mut completed_tx = Some(completed_tx);
 
+        // 动态并发度 re-recommend 定时器
+        let mut reschedule_timer = interval(reschedule_interval);
+        // 跳过首次立即触发(首次 tick 会立即返回),等下一个周期才 re-recommend
+        reschedule_timer.tick().await;
+
         loop {
             tokio::select! {
+                // 动态并发度:周期性 re-recommend,带宽变化时提升并发度
+                _ = reschedule_timer.tick() => {
+                    let rec = self.scheduler.recommend(file_size, max_concurrent_fragments);
+                    let new_target = rec.concurrency.min(max_concurrent_fragments).max(1) as usize;
+                    let old = target_concurrency.load(Ordering::Acquire);
+                    if new_target > old {
+                        let delta = new_target - old;
+                        semaphore.add_permits(delta);
+                        target_concurrency.store(new_target, Ordering::Release);
+                        info!(
+                            old_concurrency = old,
+                            new_concurrency = new_target,
+                            added_permits = delta,
+                            confidence = rec.confidence,
+                            "动态并发度提升"
+                        );
+                    }
+                }
                 // dispatcher:从中央队列拉取分片,acquire permit 后 spawn task
                 spec = frag_rx.recv() => {
                     match spec {

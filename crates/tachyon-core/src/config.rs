@@ -818,11 +818,12 @@ pub struct SchedulerConfig {
     pub min_fragment_size: u64,
     /// 最大分片大小(字节)
     pub max_fragment_size: u64,
-    /// 带宽采样间隔(秒)—— **当前未生效**(保留字段,向后兼容)
+    /// 动态并发度 re-recommend 间隔(秒)
     ///
-    /// 带宽采样实际由"每分片完成"驱动(见 `downloader.rs` execute_fragmented_download
-    /// 的 join 循环),而非定时器。此字段保留是为了不破坏已序列化的配置文件,
-    /// 未来若改为定时采样则会启用。修改采样行为不应调整此值。
+    /// `execute_fragmented_download` 主循环的 `interval` 分支按此周期调用
+    /// `scheduler.recommend()`,带宽变化时通过 `Semaphore::add_permits` 提升
+    /// 并发度(只升不降)。带宽采样仍由"每分片完成"驱动(`observe_bandwidth`),
+    /// 此字段控制的是"多久检查一次是否应提升并发度"。最小 2s 避免抖动。
     #[serde(default = "default_sampling_interval_secs")]
     pub sampling_interval_secs: u64,
     /// EWMA 平滑因子(0.0 ~ 1.0)
