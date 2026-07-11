@@ -8804,4 +8804,142 @@ mod tests {
             "P6: 读盘循环中取消应返回 Cancelled,实际: {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // AlignedBuf 路径测试:write_stream_to_storage_with_fallback 的 4 条写入路径
+    // (大 chunk 直写 / 容量不足预刷写 / 正常累积批量刷写 / 循环后残余刷写)
+    // -----------------------------------------------------------------------
+
+    /// 辅助函数:构造带 MemoryStorage 的 DownloadTask 并返回 (task, storage_arc)。
+    ///
+    /// `write_stream_to_storage_with_fallback` 读 `self.storage`(必须 Some)、
+    /// `self.control_rx`(默认 None -> 走无中断竞速的 else 分支)、
+    /// `self.config.pause_timeout_secs`(`test_config()` 已设置)。返回 storage 的
+    /// Arc 克隆,使测试在 task.storage 被借检后仍能读取写入结果。
+    #[cfg(feature = "magnet")]
+    fn make_bt_fallback_task(capacity: usize) -> (DownloadTask, Arc<StorageSet>) {
+        let storage = StorageKind::memory_with_capacity(capacity);
+        let storage_set = Arc::new(StorageSet::single(storage));
+        let task = DownloadTask::new_for_test(
+            "http://example.com/file.bin".into(),
+            test_config(),
+            Arc::new(MockProto::new(test_metadata("data.bin", 0))),
+            // new_for_test 内部会 wrap 为 StorageSet::single;但我们手动重设以拿到
+            // 同一个 Arc 引用(便于断言)。先传 memory 占位,再覆盖。
+            StorageKind::memory(),
+        );
+        // 覆盖为同一个 Arc,使测试侧持有引用可读回数据
+        let mut task = task;
+        task.storage = Some(Arc::clone(&storage_set));
+        (task, storage_set)
+    }
+
+    /// 辅助函数:从 chunk 字节序列构造 ByteStream(逐块产出 Ok(Bytes))。
+    #[cfg(feature = "magnet")]
+    fn make_byte_stream(chunks: Vec<bytes::Bytes>) -> ByteStream {
+        Box::pin(futures::stream::iter(
+            chunks.into_iter().map(Ok::<_, DownloadError>),
+        ))
+    }
+
+    /// 辅助函数:断言 storage 从 offset 0 起的数据与期望完全一致。
+    #[cfg(feature = "magnet")]
+    async fn assert_storage_content(storage: &StorageSet, expected: &[u8]) {
+        let mut buf = vec![0u8; expected.len()];
+        let read = storage.read_at(0, &mut buf).await.expect("读 storage 失败");
+        assert_eq!(
+            read,
+            expected.len(),
+            "读回字节数应等于期望长度(读到 {read},期望 {})",
+            expected.len()
+        );
+        assert_eq!(buf, expected, "storage 数据应与期望完全一致");
+    }
+
+    /// 覆盖 write_stream_to_storage_with_fallback 的大 chunk 直写路径:
+    /// 单个 chunk >= WRITE_BATCH_BYTES(256KiB)时,直接写入不经过 AlignedBuf 聚合。
+    ///
+    /// 构造单个 512KiB chunk(> 256KiB 阈值),验证:
+    ///   1. 循环内 `if chunk.len() >= WRITE_BATCH_BYTES` 分支命中(此时 write_buf 为空,
+    ///      残余刷写分支 `!write_buf.is_empty()` 短路跳过,仅直接写入 chunk 本身);
+    ///   2. 循环后 `write_buf.is_empty()` 为 true,残余刷写分支跳过;
+    ///   3. storage 中 512KiB 数据与输入完全一致。
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_bt_fallback_large_chunk_direct_write() {
+        let chunk_size = WRITE_BATCH_BYTES * 2; // 512KiB > 256KiB 阈值
+        let content: Vec<u8> = (0..chunk_size).map(|i| (i % 251) as u8).collect();
+        let stream = make_byte_stream(vec![Bytes::from(content.clone())]);
+
+        let (mut task, storage) = make_bt_fallback_task(chunk_size);
+        task.write_stream_to_storage_with_fallback(stream)
+            .await
+            .expect("大 chunk 直写应成功");
+
+        assert_storage_content(&storage, &content).await;
+    }
+
+    /// 覆盖容量不足预刷写路径:
+    /// 两个 200KiB chunk(总和 400KiB > 256KiB),第二个触发预刷写。
+    ///
+    /// 流程:
+    ///   1. 第一个 200KiB chunk(< 256KiB):`extend_from_slice` 累积到 write_buf,
+    ///      `write_buf.len() < WRITE_BATCH_BYTES` 不触发批量刷写;
+    ///   2. 第二个 200KiB chunk:进入 `!write_buf.is_empty() && write_buf.len()
+    ///      + chunk.len() > WRITE_BATCH_BYTES` 分支(200+200=400 > 256),
+    ///      先刷写 write_buf 中的 200KiB,再 `extend_from_slice` 第二个 chunk,
+    ///      `write_buf.len()=200 < 256` 不触发批量刷写;
+    ///   3. 循环后残余刷写第二个 chunk 的 200KiB。
+    ///
+    /// 验证 storage 中 400KiB 数据与两 chunk 拼接后完全一致。
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_bt_fallback_capacity_preflush() {
+        let chunk_size = 200 * 1024; // 200KiB,两块共 400KiB > 256KiB
+        let chunk_a: Vec<u8> = (0..chunk_size).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..chunk_size).map(|i| ((i + 1) % 251) as u8).collect();
+        let expected: Vec<u8> = chunk_a.iter().chain(chunk_b.iter()).copied().collect();
+        let stream = make_byte_stream(vec![Bytes::from(chunk_a), Bytes::from(chunk_b)]);
+
+        let (mut task, storage) = make_bt_fallback_task(chunk_size * 2);
+        task.write_stream_to_storage_with_fallback(stream)
+            .await
+            .expect("容量不足预刷写应成功");
+
+        assert_storage_content(&storage, &expected).await;
+    }
+
+    /// 覆盖正常累积 + 批量刷写 + 尾部残余:
+    /// 5 个 64KiB chunk(总 320KiB),前 4 个累积到 256KiB 触发批量刷写,
+    /// 第 5 个 64KiB 作为尾部残余在循环后刷写。
+    ///
+    /// 流程:
+    ///   1. chunk 1~3(64KiB × 3 = 192KiB):累积,`write_buf.len() < 256KiB` 不刷写;
+    ///   2. chunk 4(第 4 个 64KiB):累积到 256KiB,`write_buf.len() >= WRITE_BATCH_BYTES`
+    ///      触发批量刷写,write_buf 清空;
+    ///   3. chunk 5(第 5 个 64KiB):累积到 64KiB,不足 256KiB 不刷写;
+    ///   4. 循环后残余刷写 64KiB。
+    ///
+    /// 验证 storage 中 320KiB 数据与 5 chunk 拼接后完全一致。
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_bt_fallback_multi_chunk_accumulate_and_residual() {
+        let chunk_size = 64 * 1024; // 64KiB,5 块共 320KiB
+        let chunks: Vec<Vec<u8>> = (0..5)
+            .map(|n| {
+                (0..chunk_size)
+                    .map(|i| ((i + n * 17) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let stream = make_byte_stream(chunks.into_iter().map(Bytes::from).collect());
+
+        let (mut task, storage) = make_bt_fallback_task(chunk_size * 5);
+        task.write_stream_to_storage_with_fallback(stream)
+            .await
+            .expect("多 chunk 累积 + 残余刷写应成功");
+
+        assert_storage_content(&storage, &expected).await;
+    }
 }

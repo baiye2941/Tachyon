@@ -34,6 +34,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tachyon_core::{DownloadError, DownloadResult};
 
+// NO_BUFFERING 三向扇区对齐检查的纯函数(跨平台,详见 aligned_buf 模块)。
+// iocp.rs 的 write_at/write_at_mut 内联检查由此函数承担,逻辑等价(德摩根律)。
+#[cfg(target_os = "windows")]
+use crate::aligned_buf::satisfies_no_buffering_alignment;
+
 /// pending 写入上下文。
 ///
 /// `data` 必须由完成 slot 持有到内核完成通知抵达,避免调用方取消
@@ -466,9 +471,6 @@ impl IoCpStorage {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// NO_BUFFERING 模式扇区对齐常量
-    const IOCP_SECTOR_SIZE: u64 = 512;
 
     /// 惰性获取 buffered fallback 句柄,用于非对齐 I/O
     ///
@@ -992,12 +994,10 @@ impl crate::storage::AsyncStorage for IoCpStorage {
             // NO_BUFFERING 三重对齐要求(任一不满足都会返回 ERROR_INVALID_PARAMETER):
             // 1. 文件偏移按扇区对齐
             // 2. 写入长度按扇区对齐
-            // 3. 缓冲区指针(内存地址)按扇区对齐 — 堆分配通常仅 16B 对齐,
+            // 3. 缓冲区指针(内存地址)按扇区对齐 - 堆分配通常仅 16B 对齐,
             //    bytes::Bytes 内部 Vec<u8> 不保证 512B 对齐,需显式校验。
-            let buf_addr = data.as_ptr() as usize as u64;
-            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
+            // 等价于 !satisfies_no_buffering_alignment(offset, &data)(德摩根律)。
+            let needs_fallback = !satisfies_no_buffering_alignment(offset, &data);
             if needs_fallback {
                 let fallback_file = self.get_or_init_fallback()?;
                 // B1-iocp 修复:fallback 的 seek_write 非原子(共享 per-handle 文件指针),
@@ -1188,11 +1188,9 @@ impl crate::storage::AsyncStorage for IoCpStorage {
                     "IOCP 存储引擎未初始化",
                 )));
             }
-            // NO_BUFFERING 三重对齐要求(同 write_at):offset/length/buffer pointer
-            let buf_addr = data.as_ptr() as usize as u64;
-            let needs_fallback = !offset.is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !(data.len() as u64).is_multiple_of(Self::IOCP_SECTOR_SIZE)
-                || !buf_addr.is_multiple_of(Self::IOCP_SECTOR_SIZE);
+            // NO_BUFFERING 三重对齐要求(同 write_at):offset/length/buffer pointer。
+            // 等价于旧内联检查 !A || !B || !C == !(A && B && C)(德摩根律)。
+            let needs_fallback = !satisfies_no_buffering_alignment(offset, data);
             if needs_fallback {
                 let fallback_file = self.get_or_init_fallback()?;
                 // CRITICAL 修复:复制成 owned Bytes move 进 spawn_blocking,消除裸指针 UAF

@@ -209,6 +209,58 @@ impl HttpClient {
         Self { client }
     }
 
+    /// 创建 h2c prior-knowledge 客户端(明文 HTTP/2,不发 H1 Upgrade)
+    ///
+    /// 明文连接(非 TLS)上 reqwest 默认走 HTTP/1.1。此构造函数调用 reqwest 的
+    /// `http2_prior_knowledge()`,使客户端直接发送 H2 连接 preface(不做 ALPN 协商),
+    /// 用于 bench 环境验证 H2 多路复用与产品 H2 参数的互操作性。
+    ///
+    /// H2 参数与 `build_client(enable_http2=true)` 完全一致(流窗口 1MiB / 连接窗口
+    /// 16MiB / 最大帧 1MiB / keepalive 30s/10s / keep_alive_while_idle)。
+    /// 仅用于测试/bench,生产代码用 `with_connection_config`(TLS 下经 ALPN 协商 H2)。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn h2c_prior_knowledge(
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<&str>,
+    ) -> DownloadResult<Self> {
+        let mut builder = Client::builder()
+            .user_agent(tachyon_core::config::USER_AGENT)
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(90))
+            .tcp_nodelay(true)
+            .http2_initial_stream_window_size(1024 * 1024)
+            .http2_initial_connection_window_size(16 * 1024 * 1024)
+            .http2_max_frame_size(1 << 20)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .http2_prior_knowledge();
+
+        if let Some(proxy_url) = proxy {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+                DownloadError::Config(format!(
+                    "无效的代理 URL '{}': {}",
+                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    e
+                ))
+            })?;
+            builder = builder.proxy(proxy);
+        }
+        if connect_secs > 0 {
+            builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
+        }
+        if read_secs > 0 {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_secs));
+        }
+
+        let client = builder
+            .build()
+            .map_err(|e| DownloadError::Network(format!("创建 h2c 客户端失败: {e}")))?;
+        Ok(Self { client })
+    }
+
     /// 发送 GET 请求并返回响应文本
     ///
     /// # 参数

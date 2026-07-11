@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use support::bench_server::ThrottledServer;
+use support::bench_server::{BenchProtocol, DEFAULT_CHUNK_SIZE, ThrottledServer};
 use tachyon_core::test_harness::harness::test_config;
 use tachyon_core::traits::Protocol;
 use tachyon_engine::{ConnectionPool, DownloadTask, PoolConfig};
@@ -380,6 +380,125 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
     group.finish();
 }
 
+/// HTTP/2 多路复用 vs HTTP/1.1 对比,验证 H2 在高 RTT 下的多路复用收益
+///
+/// 4 个并发 Range 请求(分片下载),人工 RTT 50ms 放大连接建立成本。
+/// H2: 4 个请求复用 1 个 TCP 连接(省 3 个连接握手 RTT)
+/// H1: 4 个请求各建独立 TCP 连接(4 × 握手 RTT)
+///
+/// 明文 loopback 上 reqwest 默认走 H1。H2 子 bench 通过 `http2_prior_knowledge()`
+/// 强制 h2c(H2 over cleartext,客户端直接发 H2 preface),server 用 `auto::Builder`
+/// 检测 H2 preface 自动切换到 H2。这验证了产品激进 H2 参数(1MiB 流窗口 /
+/// 16MiB 连接窗口 / 1MiB 帧)与 H2 server 的互操作性。
+///
+/// 不声称 loopback 上 H2 吞吐更快(帧开销在小数据量上可能抵消收益),
+/// 只验证 H2 互操作性 + 高 RTT 下多路复用省连接握手 RTT 的收益。
+fn bench_http2_vs_http1_multiplexing(c: &mut Criterion) {
+    let rt = rt();
+    let mut group = c.benchmark_group("http2_vs_http1_multiplexing");
+    support::configure_group(&mut group, 10);
+
+    // CI 模式用小文件(512KiB)避免超时;完整模式用 2MiB(>1MB 触发分片)
+    let file_size = if support::smoke_mode() {
+        512 * 1024 // CI: 512KiB
+    } else {
+        2 * 1024 * 1024 // 完整: 2MiB
+    };
+    // 人工 RTT 50ms 放大连接建立成本,使 H2 多路复用收益可见
+    let rtt_ms = 50;
+
+    // H2 子 bench:auto server(支持 H1/H2 自动协商),HttpClient 用 h2c_prior_knowledge
+    // 强制 h2c。明文 loopback 上 reqwest 默认不发 H2 preface,需 prior_knowledge 强制。
+    // 用 HttpClient::h2c_prior_knowledge 注入 h2c client(仍走 tachyon-protocol 层,
+    // 不绕过),H2 参数与产品 build_client 完全一致。
+    let mut h2_server = rt.block_on(async {
+        ThrottledServer::start_with_protocol(
+            file_size,
+            0,
+            rtt_ms,
+            DEFAULT_CHUNK_SIZE,
+            BenchProtocol::Auto,
+        )
+        .await
+    });
+    let h2_url = format!("{}/bench.bin", h2_server.uri());
+    let h2_client = Arc::new(HttpClient::h2c_prior_knowledge(5, 30, None).unwrap());
+
+    group.bench_function("h2_multiplexed", |b| {
+        b.to_async(&rt).iter(|| {
+            let h2_client = h2_client.clone();
+            let h2_url = h2_url.clone();
+            async move {
+                // 4 个分片并发,模拟分片下载。H2 下复用单 TCP 连接(多路复用)。
+                let futures: Vec<_> = (0..4u64)
+                    .map(|i| {
+                        let start = i * (file_size / 4);
+                        let end = if i == 3 {
+                            file_size - 1
+                        } else {
+                            start + file_size / 4 - 1
+                        };
+                        let url = h2_url.clone();
+                        let client = h2_client.clone();
+                        async move {
+                            let bytes = client.download_range(&url, start, end).await.unwrap();
+                            assert_eq!(bytes.len() as u64, end - start + 1);
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(futures).await;
+            }
+        });
+    });
+
+    h2_server.shutdown();
+
+    // H1 子 bench:Http1Only server,HttpClient 禁用 H2(with_timeouts)。
+    // 4 个 Range 请求各建独立 TCP 连接(4 × 握手 RTT)。
+    let mut h1_server = rt.block_on(async {
+        ThrottledServer::start_with_protocol(
+            file_size,
+            0,
+            rtt_ms,
+            DEFAULT_CHUNK_SIZE,
+            BenchProtocol::Http1Only,
+        )
+        .await
+    });
+    let h1_url = format!("{}/bench.bin", h1_server.uri());
+    let h1_client = Arc::new(HttpClient::with_timeouts(5, 30, None).unwrap());
+
+    group.bench_function("h1_multiple_connections", |b| {
+        b.to_async(&rt).iter(|| {
+            let h1_client = h1_client.clone();
+            let h1_url = h1_url.clone();
+            async move {
+                // 4 个分片并发,H1 下各建独立连接(4 × 握手 RTT)
+                let futures: Vec<_> = (0..4u64)
+                    .map(|i| {
+                        let start = i * (file_size / 4);
+                        let end = if i == 3 {
+                            file_size - 1
+                        } else {
+                            start + file_size / 4 - 1
+                        };
+                        let url = h1_url.clone();
+                        let client = h1_client.clone();
+                        async move {
+                            let bytes = client.download_range(&url, start, end).await.unwrap();
+                            assert_eq!(bytes.len() as u64, end - start + 1);
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(futures).await;
+            }
+        });
+    });
+
+    h1_server.shutdown();
+    group.finish();
+}
+
 /// 真实网络下载基准测试
 ///
 /// 通过环境变量 `TACHYON_REAL_URL` 指定真实下载 URL(HTTPS,支持 HTTP/2 协商)。
@@ -464,6 +583,7 @@ criterion_group! {
         bench_mirror_aggregation,
         bench_disk_io_backends,
         bench_large_file_fragmented,
+        bench_http2_vs_http1_multiplexing,
         bench_real_network
 }
 criterion_main!(benches);

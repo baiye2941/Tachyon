@@ -30,16 +30,30 @@ use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header;
-use hyper::server::conn::http1::Builder;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 /// 默认 chunk 大小(64KiB,覆盖 TCP 典型 16-64KiB chunk)
-const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+
+/// bench server 使用的 HTTP 协议模式
+///
+/// 用于 H2 vs H1 多路复用对比 bench。连接级配置(非请求级),在
+/// `ThrottledServer::start_with_protocol` 时确定,影响该 server 所有连接。
+#[derive(Clone, Copy, Debug)]
+pub enum BenchProtocol {
+    /// 自动协商 H1/H2(默认,支持 H2 prior-knowledge)
+    Auto,
+    /// 仅 HTTP/2(H2 prior-knowledge,不回退 H1)
+    Http2Only,
+    /// 仅 HTTP/1.1(旧行为,用于对比)
+    Http1Only,
+}
 
 /// 节流流式 HTTP server 配置
 struct ServerConfig {
@@ -87,6 +101,29 @@ impl ThrottledServer {
         rtt_ms: u64,
         chunk_size: usize,
     ) -> Self {
+        Self::start_with_protocol(
+            file_size,
+            bytes_per_sec,
+            rtt_ms,
+            chunk_size,
+            BenchProtocol::Auto,
+        )
+        .await
+    }
+
+    /// 创建并启动 server(指定 HTTP 协议模式,OS 分配端口)
+    ///
+    /// - `protocol`: HTTP 协议模式(Auto / Http2Only / Http1Only)
+    ///
+    /// H2 参数镜像产品客户端配置(`crates/tachyon-protocol/src/http.rs`):
+    /// 初始流窗口 1MiB、连接窗口 16MiB、最大帧 1MiB、保活 30s/超时 10s。
+    pub async fn start_with_protocol(
+        file_size: u64,
+        bytes_per_sec: u64,
+        rtt_ms: u64,
+        chunk_size: usize,
+        protocol: BenchProtocol,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("端口绑定失败");
@@ -111,17 +148,41 @@ impl ThrottledServer {
                             Err(_) => continue,
                         };
                         let cfg = Arc::clone(&config);
+                        // protocol 是 Copy,可直接 move 进 task(避免借用 listener 作用域)
+                        let proto = protocol;
                         tokio::spawn(async move {
                             let io = TokioIo::new(io);
                             let svc = service_fn(move |req| {
                                 let cfg = Arc::clone(&cfg);
                                 async move { handle(req, cfg).await }
                             });
-                            if let Err(e) = Builder::new()
-                                .keep_alive(true)
-                                .serve_connection(io, svc)
-                                .await
-                            {
+                            // auto::Builder 支持 H1/H2 自动协商;按协议模式切换。
+                            // H2 参数镜像产品客户端(http.rs):1MiB 流窗口 / 16MiB
+                            // 连接窗口 / 1MiB 帧 / 30s 保活 / 10s 超时。
+                            // TokioExecutor 在闭包内创建(每次连接独立,无跨连接共享)。
+                            // timer(TokioTimer)必需:H2 keepalive PING 需要定时器驱动,
+                            // 缺失时 hyper panic("You must supply a timer")。
+                            let mut builder = auto::Builder::new(TokioExecutor::new());
+                            builder.http1().keep_alive(true).timer(TokioTimer::new());
+                            builder
+                                .http2()
+                                .timer(TokioTimer::new())
+                                .initial_stream_window_size(1024 * 1024)
+                                .initial_connection_window_size(16 * 1024 * 1024)
+                                .max_frame_size(1 << 20)
+                                .keep_alive_interval(Duration::from_secs(30))
+                                .keep_alive_timeout(Duration::from_secs(10))
+                                .max_concurrent_streams(100);
+                            match proto {
+                                BenchProtocol::Auto => {}
+                                BenchProtocol::Http2Only => {
+                                    builder = builder.http2_only();
+                                }
+                                BenchProtocol::Http1Only => {
+                                    builder = builder.http1_only();
+                                }
+                            }
+                            if let Err(e) = builder.serve_connection(io, svc).await {
                                 eprintln!("bench server conn error: {e}");
                             }
                         });

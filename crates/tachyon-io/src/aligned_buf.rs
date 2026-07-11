@@ -27,6 +27,38 @@ use bytes::Bytes;
 /// IOCP / WinFile NO_BUFFERING 的扇区对齐要求（字节）
 pub const SECTOR_ALIGN: usize = 512;
 
+/// 检查给定 offset 和 data 是否满足 NO_BUFFERING 三向扇区对齐契约。
+///
+/// IOCP(`FILE_FLAG_NO_BUFFERING`)和 WinFile 要求写入的:
+/// - 文件偏移(offset)是扇区大小(512 字节)的倍数
+/// - 写入长度(len)是扇区大小的倍数
+/// - buffer 指针地址是扇区大小的倍数
+///
+/// 三者全部满足时返回 true(IOCP 真异步快速路径可触发),
+/// 任一不满足返回 false(退化到 fallback 串行化路径)。
+///
+/// 此函数为纯函数,不依赖任何平台特定类型,可在任意平台测试。
+/// IOCP/WinFile 的 `write_at`/`write_at_mut` 内联检查与此函数逻辑完全等价。
+///
+/// # 等价性说明
+///
+/// iocp.rs 旧内联检查(`IOCP_SECTOR_SIZE: u64 = 512`):
+/// ```text
+/// let buf_addr = data.as_ptr() as usize as u64;
+/// let needs_fallback = !offset.is_multiple_of(IOCP_SECTOR_SIZE)
+///     || !(data.len() as u64).is_multiple_of(IOCP_SECTOR_SIZE)
+///     || !buf_addr.is_multiple_of(IOCP_SECTOR_SIZE);
+/// ```
+/// 由德摩根律 `!A || !B || !C == !(A && B && C)`,故
+/// `needs_fallback = !satisfies_no_buffering_alignment(offset, &data)`。
+/// 三个操作数均为 `u64`(offset 本身 u64、len as u64、ptr as u64),
+/// 本函数对三向均以 `SECTOR_ALIGN as u64` 做模运算,位级等价。
+pub fn satisfies_no_buffering_alignment(offset: u64, data: &[u8]) -> bool {
+    offset.is_multiple_of(SECTOR_ALIGN as u64)
+        && (data.len() as u64).is_multiple_of(SECTOR_ALIGN as u64)
+        && (data.as_ptr() as usize as u64).is_multiple_of(SECTOR_ALIGN as u64)
+}
+
 /// 底层对齐分配，由 Arc 共享以支持零拷贝 split
 struct AlignedAlloc {
     /// 对齐分配的内存起始指针
@@ -276,7 +308,7 @@ mod tests {
         let buf = AlignedBuf::new(4096).unwrap();
         let ptr = buf.as_ptr() as usize;
         assert!(
-            ptr % SECTOR_ALIGN == 0,
+            ptr.is_multiple_of(SECTOR_ALIGN),
             "指针 {ptr} 未按 {SECTOR_ALIGN} 对齐"
         );
     }
@@ -327,7 +359,7 @@ mod tests {
         // split 出的 buf 指针仍对齐
         let ptr = split.as_ptr() as usize;
         assert!(
-            ptr % SECTOR_ALIGN == 0,
+            ptr.is_multiple_of(SECTOR_ALIGN),
             "split 后指针 {ptr} 未按 {SECTOR_ALIGN} 对齐"
         );
         assert_eq!(split.len(), SECTOR_ALIGN);
@@ -340,7 +372,7 @@ mod tests {
         let bytes = buf.freeze();
         let ptr = bytes.as_ptr() as usize;
         assert!(
-            ptr % SECTOR_ALIGN == 0,
+            ptr.is_multiple_of(SECTOR_ALIGN),
             "freeze 后 Bytes 指针 {ptr} 未按 {SECTOR_ALIGN} 对齐"
         );
         assert_eq!(bytes.len(), SECTOR_ALIGN);
@@ -355,7 +387,7 @@ mod tests {
         let batch = buf.split().freeze();
         let ptr = batch.as_ptr() as usize;
         assert!(
-            ptr % SECTOR_ALIGN == 0,
+            ptr.is_multiple_of(SECTOR_ALIGN),
             "split+freeze 后 Bytes 指针 {ptr} 未按 {SECTOR_ALIGN} 对齐"
         );
         assert_eq!(batch.len(), WRITE_BATCH_BYTES);
@@ -377,8 +409,49 @@ mod tests {
         // 测试 WRITE_BATCH_BYTES（256KB）大小的分配对齐
         let buf = AlignedBuf::new(WRITE_BATCH_BYTES).unwrap();
         let ptr = buf.as_ptr() as usize;
-        assert!(ptr % SECTOR_ALIGN == 0);
+        assert!(ptr.is_multiple_of(SECTOR_ALIGN));
         assert_eq!(buf.capacity(), WRITE_BATCH_BYTES);
+    }
+
+    /// AlignedBuf freeze 产出的 Bytes 满足 NO_BUFFERING 三向对齐契约:
+    /// offset(0)、len(512 倍数)、ptr(512 对齐)均通过。
+    /// 这是 AlignedBuf 与 IOCP/WinFile 对齐快速路径的端到端契约验证。
+    #[test]
+    fn test_aligned_buf_satisfies_no_buffering_alignment() {
+        let mut buf = AlignedBuf::new(WRITE_BATCH_BYTES).unwrap();
+        buf.extend_from_slice(&[0u8; WRITE_BATCH_BYTES]);
+        let bytes = buf.freeze();
+        assert!(satisfies_no_buffering_alignment(0, &bytes));
+    }
+
+    /// offset 非扇区对齐时返回 false(即使 buffer 指针对齐)。
+    #[test]
+    fn test_unaligned_offset_returns_false() {
+        let mut buf = AlignedBuf::new(512).unwrap();
+        buf.extend_from_slice(&[0u8; 512]);
+        let bytes = buf.freeze();
+        // offset=1 不是 512 的倍数
+        assert!(!satisfies_no_buffering_alignment(1, &bytes));
+    }
+
+    /// 长度非扇区对齐时返回 false(即使 offset 和指针对齐)。
+    #[test]
+    fn test_unaligned_length_returns_false() {
+        let mut buf = AlignedBuf::new(512).unwrap();
+        buf.extend_from_slice(&[0u8; 100]); // 100 不是 512 的倍数
+        let bytes = buf.freeze();
+        assert!(!satisfies_no_buffering_alignment(0, &bytes));
+    }
+
+    /// AlignedBuf split 后产出的 Bytes 在 split 边界(512 倍数)仍满足对齐契约。
+    /// 这验证了 downloader 的 WRITE_BATCH_BYTES(256KiB,512 的倍数)split 场景。
+    #[test]
+    fn test_split_preserves_no_buffering_alignment() {
+        let mut buf = AlignedBuf::new(512 * 1024).unwrap();
+        buf.extend_from_slice(&[0u8; 512 * 1024]);
+        let split = buf.split();
+        let bytes = split.freeze();
+        assert!(satisfies_no_buffering_alignment(0, &bytes));
     }
 
     use tachyon_core::config::WRITE_BATCH_BYTES;
