@@ -1,6 +1,6 @@
 import { errorMessage } from "./utils/appError";
 import { createSignal, createEffect, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
-import type { ListDensity, SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
+import type { SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
 import { api } from "./api/invoke";
 import {
   $activeCount,
@@ -34,6 +34,7 @@ import {
   removeSearchFilter,
 } from "./stores/taskFilter";
 import { $taskListView, toggleGroupBy } from "./stores/taskListView";
+import { $listDensity, toggleListDensity } from "./stores/listDensity";
 import { deleteHistoryRecord, getRecordById } from "./stores/history";
 import {
   pauseSelected,
@@ -77,8 +78,6 @@ const HfBrowserPanel = lazy(() => import("./components/HfBrowserPanel"));
 const ShortcutHelp = lazy(() => import("./components/ShortcutHelp"));
 
 function AppContent() {
-  const [listDensity, setListDensity] =
-    createSignal<ListDensity>("comfortable");
   const [isMultiSelectMode, setIsMultiSelectMode] = createSignal(false);
   const [snifferResources, setSnifferResources] = createSignal<
     SnifferResource[]
@@ -406,12 +405,8 @@ function AppContent() {
               deselectAll();
               $selectedId.set(null);
             }}
-            listDensity={listDensity()}
-            onToggleDensity={() =>
-              setListDensity((d) =>
-                d === "comfortable" ? "compact" : "comfortable",
-              )
-            }
+            listDensity={$listDensity.density()}
+            onToggleDensity={toggleListDensity}
             onNewTask={openNewTaskModal}
             onOpenSettings={$ui.openSettings}
             onPauseAll={pauseAll}
@@ -430,7 +425,7 @@ function AppContent() {
               onTaskContextMenu={openContextMenu}
               isMultiSelectMode={isMultiSelectMode()}
               selectedTaskIds={$selectedIds.get()}
-              density={listDensity()}
+              density={$listDensity.density()}
               searchQuery={$taskFilter.searchQuery()}
               onNewTask={openNewTaskModal}
               keyboardHandlers={{
