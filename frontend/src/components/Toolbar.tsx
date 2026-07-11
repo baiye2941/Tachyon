@@ -19,11 +19,16 @@ export interface ToolbarProps {
   isMultiSelectMode: boolean;
   onToggleMultiSelect: () => void;
   selectedCount: number;
+  totalCount: number;
   onSelectAll: () => void;
   onPauseSelected: () => void;
   onResumeSelected: () => void;
   onCancelSelected: () => void;
   onDeleteSelected: () => void;
+  onOpenSelectedFolders: () => void;
+  onCopySelectedLinks: () => void;
+  onRedownloadSelected: () => void;
+  onClearSelection: () => void;
   onExitMultiSelect: () => void;
   listDensity: "comfortable" | "compact";
   onToggleDensity: () => void;

@@ -1,4 +1,5 @@
 import { api } from "../api/invoke";
+import { errorMessage } from "../utils/appError";
 import { $tasks, refreshTaskList } from "./downloads";
 import { $selectedIds, deselectAll } from "./selection";
 import { addToast } from "./toast";
@@ -272,5 +273,132 @@ export async function clearCompleted(): Promise<void> {
     );
   }
   ids.forEach((id) => clearTaskHistory(id));
+  await refreshTaskList();
+}
+
+/**
+ * 批量打开选中任务的保存目录
+ *
+ * 对 completed / failed / cancelled 等终态任务,savePath 通常已确定;
+ * 对尚未开始或探测中的任务可能无路径,此时跳过并提示。
+ */
+export async function openSelectedFolders(): Promise<void> {
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
+
+  const tasks = $tasks.get();
+  let opened = 0;
+  let missing = 0;
+  const failures: string[] = [];
+
+  await Promise.allSettled(
+    ids.map(async (id) => {
+      const task = tasks.find((t) => t.id === id);
+      if (!task?.savePath) {
+        missing++;
+        return;
+      }
+      try {
+        await api.openFolder(task.savePath);
+        opened++;
+      } catch (e) {
+        failures.push(errorMessage(e));
+      }
+    }),
+  );
+
+  if (opened > 0) {
+    addToast(tr("toast.openFolderBatchSuccess", { count: opened }), "success");
+  }
+  if (missing > 0) {
+    addToast(tr("toast.openFolderBatchNoPath", { count: missing }), "info");
+  }
+  if (failures.length > 0) {
+    addToast(
+      tr("toast.openFolderBatchFailed", {
+        count: failures.length,
+        error: failures[0] ?? "",
+      }),
+      "error",
+    );
+  }
+}
+
+/**
+ * 批量复制选中任务的下载链接到剪贴板
+ *
+ * 多个 URL 以换行分隔;复制是非破坏性操作,保持选中状态以便用户继续操作。
+ */
+export async function copySelectedLinks(): Promise<void> {
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
+
+  const tasks = $tasks.get();
+  const urls = ids
+    .map((id) => tasks.find((t) => t.id === id)?.url)
+    .filter((url): url is string => Boolean(url));
+
+  if (urls.length === 0) {
+    addToast(tr("toast.copyLinkBatchNoUrl"), "info");
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(urls.join("\n"));
+    addToast(
+      tr("toast.copyLinkBatchSuccess", { count: urls.length }),
+      "success",
+    );
+  } catch (e) {
+    addToast(
+      tr("toast.copyLinkBatchFailed", { error: errorMessage(e) }),
+      "error",
+    );
+  }
+}
+
+/**
+ * 批量重新下载选中任务
+ *
+ * 为每个选中任务的 url 创建新任务;创建完成后清空选择并刷新列表。
+ */
+export async function redownloadSelected(): Promise<void> {
+  const ids = Array.from($selectedIds.get());
+  if (ids.length === 0) return;
+
+  const tasks = $tasks.get();
+  const urls = ids
+    .map((id) => tasks.find((t) => t.id === id)?.url)
+    .filter((url): url is string => Boolean(url));
+
+  if (urls.length === 0) {
+    addToast(tr("toast.redownloadBatchNoUrl"), "info");
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    urls.map((url) => api.createTask(url)),
+  );
+  const failures = results.filter(
+    (r): r is PromiseRejectedResult => r.status === "rejected",
+  );
+  const successes = results.length - failures.length;
+
+  if (successes > 0) {
+    addToast(
+      tr("toast.redownloadBatchSuccess", { count: successes }),
+      "success",
+    );
+  }
+  if (failures.length > 0) {
+    addToast(
+      tr("toast.redownloadBatchPartialFailed", {
+        count: failures.length,
+        error: failures[0]?.reason ?? "",
+      }),
+      "error",
+    );
+  }
+  deselectAll();
   await refreshTaskList();
 }

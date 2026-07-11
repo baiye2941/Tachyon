@@ -60,19 +60,13 @@ export interface ChunkBlock {
 
 export function buildBlocks(
   total: number,
-  done: number,
-  progress: number,
   doneSet: Set<number>,
-  concurrency: number,
   downloadingSet: Set<number>,
 ): ChunkBlock[] {
   if (total <= 0) return [];
   const blockCount = Math.min(total, AGGREGATE_BLOCKS);
   // 真实活跃分片由 downloadingSet 决定(后端 Started 事件驱动),
   // 不再依赖 maxDoneIdx + band 位置启发式
-  void done;
-  void progress;
-  void concurrency;
   const blocks: ChunkBlock[] = [];
   for (let i = 0; i < blockCount; i++) {
     const start = Math.floor((i * total) / blockCount);
@@ -276,14 +270,13 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const data = fragData();
     const doneSet = data?.doneSet ?? new Set<number>();
     const downloadingSet = data?.downloadingSet ?? new Set<number>();
-    const concurrency = data?.concurrency || Math.max(2, Math.round(props.fragmentsTotal / 8));
-    return buildBlocks(props.fragmentsTotal, props.fragmentsDone, props.progress, doneSet, concurrency, downloadingSet);
+    return buildBlocks(props.fragmentsTotal, doneSet, downloadingSet);
   });
 
   // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
   createEffect(() => {
     if (props.progress >= 1 && fragData() && fragData()!.doneSet.size === 0) {
-      mergeFragmentDelta(props.taskId, [0], [], 0);
+      mergeFragmentDelta(props.taskId, [0], []);
     }
   });
 

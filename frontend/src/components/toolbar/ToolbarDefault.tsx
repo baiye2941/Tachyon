@@ -10,6 +10,7 @@ import {
   CancelIcon,
   StackIcon,
   ListBulletsIcon,
+  GridFourIcon,
 } from "../icons";
 import Button from "../../shared/ui/Button";
 import { useI18n } from "../../i18n";
@@ -168,6 +169,33 @@ export default function ToolbarDefault(props: ToolbarProps) {
         onClick={props.onOpenSettings}
       >
         <SettingsIcon />
+      </Button>
+
+      <Button
+        variant="ghost"
+        shape="icon"
+        title={
+          i18n.t(
+            props.listDensity === "comfortable"
+              ? "toolbar.densityComfortable"
+              : "toolbar.densityCompact",
+          ) as string
+        }
+        aria-label={
+          i18n.t(
+            props.listDensity === "comfortable"
+              ? "toolbar.densityComfortable"
+              : "toolbar.densityCompact",
+          ) as string
+        }
+        onClick={props.onToggleDensity}
+      >
+        <Show
+          when={props.listDensity === "comfortable"}
+          fallback={<GridFourIcon />}
+        >
+          <ListBulletsIcon />
+        </Show>
       </Button>
 
       <Button

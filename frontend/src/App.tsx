@@ -20,8 +20,8 @@ import {
   getLastSelectedAnchorId,
   setLastSelectedAnchorId,
   hasSelection,
-} from "./stores/selection";
-import {
+  intersectSelection,
+} from "./stores/selection";import {
   $ui,
   openView,
   openNewTaskModal,
@@ -43,6 +43,9 @@ import {
   resumeAll,
   cancelAll,
   clearCompleted,
+  openSelectedFolders,
+  copySelectedLinks,
+  redownloadSelected,
 } from "./stores/batchActions";
 import { useAppInit } from "./hooks/useAppInit";
 import { useGlobalKeyboard } from "./hooks/useGlobalKeyboard";
@@ -56,7 +59,6 @@ import DetailPanel from "./components/DetailPanel";
 import StatusBar from "./components/StatusBar";
 import ToastContainer from "./components/ToastContainer";
 import ContextMenu from "./components/ContextMenu";
-import BatchToolbar from "./components/BatchToolbar";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ErrorPage from "./components/ErrorPage";
 import Skeleton from "./shared/ui/Skeleton";
@@ -165,6 +167,17 @@ function AppContent() {
       selectAll(allIds);
     }
   };
+
+  const handleClearSelection = () => {
+    deselectAll();
+  };
+
+  // 选择集与过滤列表同步:过滤条件变化后,自动移除已被隐藏的已选任务,
+  // 保证 "已选 N 项" 与批量操作范围始终对应用户当前可见的任务。
+  createEffect(() => {
+    const filteredIds = new Set($taskFilter.filteredTasks().map((t) => t.id));
+    intersectSelection(filteredIds);
+  });
 
   const handleViewChange = (view: ViewName) => {
     openView(view);
@@ -375,11 +388,16 @@ function AppContent() {
               $selectedId.set(null);
             }}
             selectedCount={$selectedIds.get().size}
+            totalCount={$taskFilter.filteredTasks().length}
             onSelectAll={handleSelectAll}
             onPauseSelected={pauseSelected}
             onResumeSelected={resumeSelected}
             onCancelSelected={cancelSelected}
             onDeleteSelected={deleteSelected}
+            onOpenSelectedFolders={openSelectedFolders}
+            onCopySelectedLinks={copySelectedLinks}
+            onRedownloadSelected={redownloadSelected}
+            onClearSelection={handleClearSelection}
             onExitMultiSelect={() => {
               setIsMultiSelectMode(false);
               deselectAll();
@@ -615,12 +633,6 @@ function AppContent() {
           />
         </Suspense>
       </Show>
-
-      <BatchToolbar
-        onPauseAll={pauseSelected}
-        onResumeAll={resumeSelected}
-        onDeleteAll={deleteSelected}
-      />
     </div>
   );
 }

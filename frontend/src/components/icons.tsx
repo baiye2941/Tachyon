@@ -190,7 +190,11 @@ export const StatusDot = (props: { class?: string; active?: boolean }) => (
  * 保留 24-viewBox + checkmark path d="M9 12l2 2 4-4"(HfBrowserPanel.spec 断言此值,
  * 不可改)。checked 时实心 + 白勾,未 checked 时空心框。
  */
-export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
+export const CheckboxIcon = (props: {
+  class?: string;
+  checked?: boolean;
+  indeterminate?: boolean;
+}) => (
   <svg
     class={props.class}
     width="16"
@@ -204,7 +208,7 @@ export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
     xmlns="http://www.w3.org/2000/svg"
     aria-hidden="true"
   >
-    {props.checked ? (
+    {props.checked || props.indeterminate ? (
       <>
         <rect
           x="3"
@@ -215,7 +219,11 @@ export const CheckboxIcon = (props: { class?: string; checked?: boolean }) => (
           fill="currentColor"
           stroke="none"
         />
-        <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" />
+        {props.indeterminate ? (
+          <path d="M7 12h10" stroke="white" stroke-width="2" />
+        ) : (
+          <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" />
+        )}
       </>
     ) : (
       <rect x="3" y="3" width="18" height="18" rx="2" />

@@ -8,8 +8,9 @@ import {
   toggleSidebar,
   openView,
 } from "../../stores/ui";
-import { pauseAll, resumeAll } from "../../stores/batchActions";
+import { pauseAll, resumeAll, deleteSelected } from "../../stores/batchActions";
 import { resetAllShortcuts } from "../../stores/shortcuts";
+import { selectAll, deselectAll, selectedCount } from "../../stores/selection";
 
 vi.mock("../../stores/ui", () => ({
   openNewTaskModal: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock("../../stores/ui", () => ({
 vi.mock("../../stores/batchActions", () => ({
   pauseAll: vi.fn(),
   resumeAll: vi.fn(),
+  deleteSelected: vi.fn(),
 }));
 
 function TestHarness() {
@@ -38,6 +40,7 @@ describe("useGlobalKeyboard", () => {
     vi.clearAllMocks();
     localStorage.clear();
     resetAllShortcuts();
+    deselectAll();
   });
 
   afterEach(() => {
@@ -128,5 +131,32 @@ describe("useGlobalKeyboard", () => {
     fireEvent.keyDown(window, { key: "?" });
 
     expect(openShortcutHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("Delete 键调用 deleteSelected", () => {
+    selectAll(["task-1"]);
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "Delete" });
+
+    expect(deleteSelected).toHaveBeenCalledTimes(1);
+  });
+
+  it("无选中时 Delete 键不调用 deleteSelected", () => {
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "Delete" });
+
+    expect(deleteSelected).not.toHaveBeenCalled();
+  });
+
+  it("Ctrl+A 切换全选/取消全选", () => {
+    selectAll(["task-1"]);
+    render(() => <TestHarness />);
+
+    fireEvent.keyDown(window, { key: "A", ctrlKey: true });
+
+    // 测试环境 $taskFilter 为空,Ctrl+A 会取消全选
+    expect(selectedCount()).toBe(0);
   });
 });

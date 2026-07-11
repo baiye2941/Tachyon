@@ -4,6 +4,7 @@ import {
   selectAll,
   deselectAll,
   selectRange,
+  intersectSelection,
   isSelected,
   selectedCount,
   getLastSelectedAnchorId,
@@ -74,5 +75,29 @@ describe('selection store', () => {
     expect(selectedCount()).toBe(1)
     selectRange('a', 'x', ['a', 'b', 'c'])
     expect(selectedCount()).toBe(1)
+  })
+
+  it('intersectSelection 移除不可见的已选任务', () => {
+    selectAll(['a', 'b', 'c', 'd'])
+    intersectSelection(new Set(['b', 'd']))
+    expect(isSelected('a')).toBe(false)
+    expect(isSelected('b')).toBe(true)
+    expect(isSelected('c')).toBe(false)
+    expect(isSelected('d')).toBe(true)
+    expect(selectedCount()).toBe(2)
+  })
+
+  it('intersectSelection 保留全部可见任务时不产生新对象', () => {
+    selectAll(['a', 'b'])
+    intersectSelection(new Set(['a', 'b', 'c']))
+    expect(selectedCount()).toBe(2)
+    expect(isSelected('a')).toBe(true)
+    expect(isSelected('b')).toBe(true)
+  })
+
+  it('intersectSelection 空可见集时清空选择', () => {
+    selectAll(['a', 'b'])
+    intersectSelection(new Set())
+    expect(selectedCount()).toBe(0)
   })
 })

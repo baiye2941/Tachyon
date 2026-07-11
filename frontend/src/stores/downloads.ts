@@ -11,7 +11,12 @@ import { api } from "../api/invoke";
 import { addToast } from "./toast";
 import { addHistoryRecord } from "./history";
 import { pushTaskSpeed } from "./taskSpeedHistory";
-import { mergeFragmentDelta, getTaskFragmentData, loadTaskFragments } from "./taskFragments";
+import {
+  mergeFragmentDelta,
+  getTaskFragmentData,
+  loadTaskFragments,
+  clearTaskFragmentDownloading,
+} from "./taskFragments";
 import { createRootMemo } from "../utils/reactive";
 import { tr } from "../i18n";
 
@@ -268,14 +273,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       const hasCompleted = p.completedDelta && p.completedDelta.length > 0;
       const hasStarted = p.startedDelta && p.startedDelta.length > 0;
       if (hasCompleted || hasStarted) {
-        mergeFragmentDelta(
-          id,
-          p.completedDelta ?? [],
-          p.startedDelta ?? [],
-          newConcurrency,
-        );
-      } else if (newConcurrency > 0) {
-        mergeFragmentDelta(id, [], [], newConcurrency);
+        mergeFragmentDelta(id, p.completedDelta ?? [], p.startedDelta ?? []);
       }
 
       // fragmentsTotal 从 0 变非 0:PlanComplete 到达,DetailPanel 若已打开需重拉。
@@ -310,6 +308,10 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           avgSpeed,
           savePath: updatedTask.savePath || "",
         });
+
+        // 终态清理:清空 downloadingSet,避免残留 downloading 色格子
+        // (后端 cleanup_runtime 已移除 fragment_state_store,前端需显式清空)
+        clearTaskFragmentDownloading(id);
       }
     }
 

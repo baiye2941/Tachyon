@@ -7,7 +7,14 @@ import {
   openView,
   $ui,
 } from "../stores/ui";
-import { pauseAll, resumeAll } from "../stores/batchActions";
+import { pauseAll, resumeAll, deleteSelected } from "../stores/batchActions";
+import {
+  $selectedIds,
+  hasSelection,
+  selectAll,
+  deselectAll,
+} from "../stores/selection";
+import { $taskFilter } from "../stores/taskFilter";
 import { SHORTCUTS } from "../commands/shortcuts";
 import { matchKeyboardEvent } from "../stores/shortcuts";
 
@@ -29,6 +36,28 @@ export function useGlobalKeyboard() {
     if (e.repeat) return;
     if (isTextInput(e.target)) return;
     if ($ui.commandPaletteOpen() || $ui.shortcutHelpOpen()) return;
+
+    // Delete: 全局删除当前选中任务(原 BatchToolbar 职责,合并后保留)
+    if (e.key === "Delete" && hasSelection()) {
+      e.preventDefault();
+      deleteSelected();
+      return;
+    }
+
+    // Ctrl+A / Cmd+A: 全选/取消全选当前过滤列表(与 TaskList 内行为一致)
+    if (
+      (e.key === "a" || e.key === "A") &&
+      (e.ctrlKey || e.metaKey)
+    ) {
+      e.preventDefault();
+      const allIds = $taskFilter.filteredTasks().map((t) => t.id);
+      if ($selectedIds.get().size === allIds.length) {
+        deselectAll();
+      } else {
+        selectAll(allIds);
+      }
+      return;
+    }
 
     for (const s of SHORTCUTS) {
       if (!matchKeyboardEvent(e, s.labelKey)) continue;

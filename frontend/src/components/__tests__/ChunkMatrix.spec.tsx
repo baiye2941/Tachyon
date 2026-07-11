@@ -82,24 +82,24 @@ describe("ChunkMatrix 分片矩阵", () => {
 
   describe("buildBlocks 聚合逻辑", () => {
     it("total <= 0 时返回空数组", () => {
-      expect(buildBlocks(0, 0, 0, new Set(), 4, new Set())).toEqual([]);
-      expect(buildBlocks(-1, 0, 0, new Set(), 4, new Set())).toEqual([]);
+      expect(buildBlocks(0, new Set(), new Set())).toEqual([]);
+      expect(buildBlocks(-1, new Set(), new Set())).toEqual([]);
     });
 
     it("total 较小时返回与总数相同的块数", () => {
-      const blocks = buildBlocks(10, 5, 0.5, new Set([0, 1, 2, 3, 4]), 4, new Set());
+      const blocks = buildBlocks(10, new Set([0, 1, 2, 3, 4]), new Set());
       expect(blocks.length).toBe(10);
       expect(blocks[0]!.start).toBe(0);
       expect(blocks[9]!.end).toBe(10);
     });
 
     it("total 较大时固定为 100 块", () => {
-      const blocks = buildBlocks(1000, 500, 0.5, new Set(Array.from({ length: 500 }, (_, i) => i)), 4, new Set());
+      const blocks = buildBlocks(1000, new Set(Array.from({ length: 500 }, (_, i) => i)), new Set());
       expect(blocks.length).toBe(100);
     });
 
     it("块范围覆盖全部分片且不重叠", () => {
-      const blocks = buildBlocks(1000, 500, 0.5, new Set(Array.from({ length: 500 }, (_, i) => i)), 4, new Set());
+      const blocks = buildBlocks(1000, new Set(Array.from({ length: 500 }, (_, i) => i)), new Set());
       expect(blocks[0]!.start).toBe(0);
       expect(blocks[blocks.length - 1]!.end).toBe(1000);
       for (let i = 1; i < blocks.length; i++) {
@@ -108,12 +108,12 @@ describe("ChunkMatrix 分片矩阵", () => {
     });
 
     it("已完成分片占多数时块状态为 done", () => {
-      const blocks = buildBlocks(100, 60, 0.5, new Set(Array.from({ length: 60 }, (_, i) => i)), 4, new Set());
+      const blocks = buildBlocks(100, new Set(Array.from({ length: 60 }, (_, i) => i)), new Set());
       expect(blocks[0]!.status).toBe("done");
     });
 
     it("等待中分片占多数时块状态为 pending", () => {
-      const blocks = buildBlocks(100, 10, 0.5, new Set(Array.from({ length: 10 }, (_, i) => i)), 4, new Set());
+      const blocks = buildBlocks(100, new Set(Array.from({ length: 10 }, (_, i) => i)), new Set());
       expect(blocks[90]!.status).toBe("pending");
     });
 
@@ -122,10 +122,7 @@ describe("ChunkMatrix 分片矩阵", () => {
       const downloadingSet = new Set([60, 61, 62, 63]);
       const blocks = buildBlocks(
         100,
-        10,
-        0.5,
         new Set(Array.from({ length: 10 }, (_, i) => i)),
-        4,
         downloadingSet,
       );
       const downloadingBlock = blocks.find((b) => b.status === "downloading");
@@ -135,21 +132,14 @@ describe("ChunkMatrix 分片矩阵", () => {
 
     it("downloadingSet 与 doneSet 互斥时优先 done", () => {
       // 分片 5 同时在 doneSet 和 downloadingSet(防御竞态),应算作 done
-      const blocks = buildBlocks(
-        10,
-        1,
-        0.5,
-        new Set([5]),
-        4,
-        new Set([5]),
-      );
+      const blocks = buildBlocks(10, new Set([5]), new Set([5]));
       const block = blocks.find((b) => b.start <= 5 && b.end > 5);
       expect(block).toBeDefined();
       expect(block!.done).toBe(1);
     });
 
     it("块颜色按状态着色,不再使用线程彩虹色", () => {
-      const blocks = buildBlocks(120, 60, 0.5, new Set(Array.from({ length: 60 }, (_, i) => i)), 4, new Set());
+      const blocks = buildBlocks(120, new Set(Array.from({ length: 60 }, (_, i) => i)), new Set());
       const doneBlock = blocks.find((b) => b.status === "done");
       const pendingBlock = blocks.find((b) => b.status === "pending");
       expect(doneBlock).toBeDefined();
@@ -193,9 +183,9 @@ describe("ChunkMatrix 分片矩阵", () => {
       // 索引 8-11 在 downloadingSet(正在下载)。
       vi.mocked(getTaskFragmentData).mockReturnValue({
         total: 20,
-        concurrency: 4,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        finalized: false,
       });
       render(() => (
         <ChunkMatrix taskId="test-task" fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
@@ -220,9 +210,9 @@ describe("ChunkMatrix 分片矩阵", () => {
     it("DOM 下载中分片保留 shine 动画且无级联延迟", () => {
       vi.mocked(getTaskFragmentData).mockReturnValue({
         total: 20,
-        concurrency: 4,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        finalized: false,
       });
       render(() => (
         <ChunkMatrix taskId="test-task" fragmentsTotal={20} fragmentsDone={8} progress={0.4} />
@@ -241,9 +231,9 @@ describe("ChunkMatrix 分片矩阵", () => {
       mockMatchMedia(true);
       vi.mocked(getTaskFragmentData).mockReturnValue({
         total: 20,
-        concurrency: 4,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        finalized: false,
       });
       render(() => (
         <ChunkMatrix taskId="test-task" fragmentsTotal={20} fragmentsDone={8} progress={0.4} />

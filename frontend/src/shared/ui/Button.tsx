@@ -48,6 +48,7 @@ export interface ButtonProps {
   class?: string
   style?: JSX.CSSProperties
   'aria-label'?: string
+  'aria-pressed'?: boolean | string
   title?: string
   type?: 'button' | 'submit' | 'reset'
   /** 标记为焦点陷阱自动聚焦元素(useFocusTrap 读取 hasAttribute("data-autofocus")) */
@@ -135,6 +136,7 @@ const Button: Component<ButtonProps> = (rawProps) => {
       disabled={props.disabled || props.loading}
       aria-busy={props.loading || undefined}
       aria-label={props['aria-label']}
+      aria-pressed={props['aria-pressed']}
       title={props.title}
       type={props.as === 'button' ? props.type : undefined}
       data-autofocus={props['data-autofocus'] ? 'true' : undefined}

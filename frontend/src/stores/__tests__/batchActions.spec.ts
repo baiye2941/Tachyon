@@ -5,6 +5,8 @@ const mockResumeTask = vi.fn()
 const mockCancelTask = vi.fn()
 const mockDeleteTask = vi.fn()
 const mockGetTaskList = vi.fn()
+const mockOpenFolder = vi.fn()
+const mockCreateTask = vi.fn()
 const mockRequestConfirm = vi.fn()
 const mockAddToast = vi.fn()
 
@@ -17,6 +19,8 @@ vi.mock('../../api/invoke', () => ({
     cancelTask: (...args: unknown[]) => mockCancelTask(...args),
     deleteTask: (...args: unknown[]) => mockDeleteTask(...args),
     getTaskList: (...args: unknown[]) => mockGetTaskList(...args),
+    openFolder: (...args: unknown[]) => mockOpenFolder(...args),
+    createTask: (...args: unknown[]) => mockCreateTask(...args),
   },
 }))
 
@@ -57,6 +61,8 @@ beforeEach(async () => {
   mockCancelTask.mockReset()
   mockDeleteTask.mockReset()
   mockGetTaskList.mockReset()
+  mockOpenFolder.mockReset()
+  mockCreateTask.mockReset()
   mockRequestConfirm.mockReset()
   mockAddToast.mockReset()
 
@@ -306,5 +312,80 @@ describe('batchActions store', () => {
 
     expect(mockCancelTask).not.toHaveBeenCalled()
     expect(mockAddToast).toHaveBeenCalledWith('没有可取消的任务', 'info')
+  })
+
+  it('openSelectedFolders 打开选中任务目录并提示结果', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { savePath: '/downloads/a' }),
+      makeTask('t2', { savePath: '/downloads/b' }),
+      makeTask('t3', { savePath: '' }),
+    ])
+    selectionModule.selectAll(['t1', 't2', 't3'])
+    mockOpenFolder.mockResolvedValue(undefined)
+
+    await batchActionsModule.openSelectedFolders()
+
+    expect(mockOpenFolder).toHaveBeenCalledWith('/downloads/a')
+    expect(mockOpenFolder).toHaveBeenCalledWith('/downloads/b')
+    expect(mockOpenFolder).not.toHaveBeenCalledWith('')
+    expect(mockAddToast).toHaveBeenCalledWith('已打开 2 个文件夹', 'success')
+    expect(mockAddToast).toHaveBeenCalledWith('1 个任务暂无保存路径', 'info')
+  })
+
+  it('copySelectedLinks 将选中任务 URL 复制到剪贴板', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText },
+    })
+
+    downloadsModule.setTasks([
+      makeTask('t1', { url: 'https://example.com/a.bin' }),
+      makeTask('t2', { url: 'https://example.com/b.bin' }),
+    ])
+    selectionModule.selectAll(['t1', 't2'])
+
+    await batchActionsModule.copySelectedLinks()
+
+    expect(writeText).toHaveBeenCalledWith('https://example.com/a.bin\nhttps://example.com/b.bin')
+    expect(mockAddToast).toHaveBeenCalledWith('已复制 2 个链接', 'success')
+    vi.unstubAllGlobals()
+  })
+
+  it('redownloadSelected 为选中任务创建新任务并清空选择', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { url: 'https://example.com/a.bin' }),
+      makeTask('t2', { url: 'https://example.com/b.bin' }),
+    ])
+    selectionModule.selectAll(['t1', 't2'])
+    mockCreateTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.redownloadSelected()
+
+    expect(mockCreateTask).toHaveBeenCalledWith('https://example.com/a.bin')
+    expect(mockCreateTask).toHaveBeenCalledWith('https://example.com/b.bin')
+    expect(selectionModule.$selectedIds.get().size).toBe(0)
+    expect(mockAddToast).toHaveBeenCalledWith('已重新下载 2 个任务', 'success')
+  })
+
+  it('redownloadSelected 部分失败时显示成功与失败汇总', async () => {
+    downloadsModule.setTasks([
+      makeTask('t1', { url: 'https://example.com/a.bin' }),
+      makeTask('t2', { url: 'https://example.com/b.bin' }),
+    ])
+    selectionModule.selectAll(['t1', 't2'])
+    mockCreateTask
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('invalid'))
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.redownloadSelected()
+
+    expect(mockAddToast).toHaveBeenCalledWith('已重新下载 1 个任务', 'success')
+    expect(mockAddToast).toHaveBeenCalledWith(
+      expect.stringContaining('1 个任务重新下载失败'),
+      'error',
+    )
   })
 })

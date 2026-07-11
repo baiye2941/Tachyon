@@ -318,6 +318,7 @@ export default function TaskList(props: TaskListProps) {
 
     if (matchKeyboardEvent(e, "shortcut.list.delete")) {
       e.preventDefault();
+      e.stopPropagation();
       props.keyboardHandlers.onDeleteSelected();
       return;
     }
@@ -375,6 +376,7 @@ export default function TaskList(props: TaskListProps) {
       case "A": {
         if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
+          e.stopPropagation();
           clearRangeAnchor();
           props.keyboardHandlers.onSelectAll();
         }

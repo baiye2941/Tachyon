@@ -21,8 +21,6 @@ import {
 import {
   CloseIcon,
   FileIcon,
-  OpenFileIcon,
-  MoreIcon,
   CopyIcon,
   FolderOpenIcon,
   RefreshIcon,
@@ -79,7 +77,6 @@ export default function DetailPanel(props: DetailPanelProps) {
   const [displayTask, setDisplayTask] = createSignal<TaskInfo | null>(null);
   const [shouldRender, setShouldRender] = createSignal(false);
   const [visible, setVisible] = createSignal(false);
-  const [menuOpen, setMenuOpen] = createSignal(false);
   const [copied, setCopied] = createSignal<string | null>(null);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = createSignal(false);
   const [metadataExpanded, setMetadataExpanded] = createSignal(false);
@@ -93,8 +90,6 @@ export default function DetailPanel(props: DetailPanelProps) {
 
   let closeTimer: number | null = null;
   let copiedTimer: number | null = null;
-  let menuRef: HTMLDivElement | undefined;
-  let menuTriggerRef: HTMLButtonElement | undefined;
   let panelContentRef: HTMLDivElement | undefined;
 
   const cancelCloseTimer = () => {
@@ -109,7 +104,6 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (task) {
       cancelCloseTimer();
       setDisplayTask(task);
-      setMenuOpen(false);
       setDiagnosticsExpanded(false);
       setMetadataExpanded(false);
       if (!shouldRender()) {
@@ -151,58 +145,6 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (task) clearTaskFragments(task.id);
   });
 
-  // Click outside to close menu
-  createEffect(() => {
-    if (!menuOpen()) return;
-    const handler = (e: MouseEvent) => {
-      if (menuRef && !menuRef.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    onCleanup(() => document.removeEventListener("mousedown", handler));
-  });
-
-  // 更多菜单:打开时聚焦首项,关闭时还原焦点到触发按钮(Iteration 15)
-  createEffect(() => {
-    if (!menuOpen()) return;
-    const raf = requestAnimationFrame(() => {
-      const first =
-        menuRef?.querySelector<HTMLButtonElement>(".detail-menu-item");
-      first?.focus();
-    });
-    const handler = (e: KeyboardEvent) => {
-      if (!menuRef) return;
-      const items = Array.from(
-        menuRef.querySelectorAll<HTMLButtonElement>(".detail-menu-item"),
-      ).filter((el) => !el.disabled);
-      if (items.length === 0) return;
-      const idx = items.findIndex((el) => el === document.activeElement);
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setMenuOpen(false);
-        menuTriggerRef?.focus();
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault();
-        items[(idx + 1) % items.length]!.focus();
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        items[(idx - 1 + items.length) % items.length]!.focus();
-      } else if (e.key === "Home") {
-        e.preventDefault();
-        items[0]!.focus();
-      } else if (e.key === "End") {
-        e.preventDefault();
-        items[items.length - 1]!.focus();
-      }
-    };
-    document.addEventListener("keydown", handler);
-    onCleanup(() => {
-      cancelAnimationFrame(raf);
-      document.removeEventListener("keydown", handler);
-    });
-  });
-
   // 详情覆盖式:focus trap 在 visible 时统一激活(宽屏也 trap,因列表被遮罩盖住)
   useFocusTrap({
     active: () => visible(),
@@ -214,7 +156,7 @@ export default function DetailPanel(props: DetailPanelProps) {
   createEffect(() => {
     if (!visible()) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !menuOpen()) {
+      if (e.key === "Escape") {
         e.preventDefault();
         handleClose();
       }
@@ -255,6 +197,11 @@ export default function DetailPanel(props: DetailPanelProps) {
     );
   });
 
+  const isActive = createMemo(() => {
+    const s = task()?.status;
+    return s === "downloading" || s === "connecting" || s === "resuming";
+  });
+
   // 失败诊断:优先用后端 errorReason,回退到启发式推断(诚实降级)
   const failureInsight = createMemo(() => {
     const t = task();
@@ -269,6 +216,11 @@ export default function DetailPanel(props: DetailPanelProps) {
     return formatETA(t.speed, remaining);
   });
 
+  const concurrencyValue = createMemo(() => {
+    const value = task()?.activeConcurrency;
+    return value && value > 0 ? String(value) : "—";
+  });
+
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
     setCopied(label);
@@ -280,6 +232,11 @@ export default function DetailPanel(props: DetailPanelProps) {
   };
 
   const currentTask = () => task();
+
+  const handleCopyLink = () => {
+    const url = currentTask()?.url;
+    if (url) copyToClipboard(url, "url");
+  };
 
   const handlePause = async () => {
     const t2 = currentTask();
@@ -476,69 +433,48 @@ export default function DetailPanel(props: DetailPanelProps) {
               >
                 <ArrowLeftIcon />
               </Button>
-              <Show when={isCompleted()}>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={handleOpenFolder}
-                >
-                  <OpenFileIcon />
-                  <span>{t("detail.action.open")}</span>
-                </Button>
-              </Show>
-            </div>
-            <div class="flex items-center gap-1">
-              <div style={{ position: "relative" }}>
+
+              {/* 快捷操作:复制链接 / 打开文件夹 / 重新下载
+                  与右键菜单动作保持一致,不再只藏在「更多」菜单内 */}
+              <div class="detail-quick-actions">
                 <Button
                   variant="ghost"
                   shape="icon-sm"
-                  aria-label={t("detail.moreActions")}
-                  aria-haspopup="menu"
-                  aria-expanded={menuOpen()}
-                  ref={menuTriggerRef}
-                  onClick={() => setMenuOpen((v) => !v)}
+                  aria-label={t("detail.copyLink")}
+                  title={t("detail.copyLink")}
+                  onClick={handleCopyLink}
                 >
-                  <MoreIcon />
+                  <CopyIcon />
                 </Button>
-                <Show when={menuOpen()}>
-                  <div class="detail-menu" ref={menuRef}>
-                    <button
-                      class="detail-menu-item"
-                      onClick={() => {
-                        copyToClipboard(task()?.url || "", "url");
-                        setMenuOpen(false);
-                      }}
-                    >
-                      <CopyIcon />
-                      <span>{t("detail.copyLink")}</span>
-                    </button>
-                    <button
-                      class="detail-menu-item"
-                      onClick={() => {
-                        handleOpenFolder();
-                        setMenuOpen(false);
-                      }}
-                    >
-                      <FolderOpenIcon />
-                      <span>{t("detail.openFolder")}</span>
-                    </button>
-                    <button
-                      class="detail-menu-item"
-                      onClick={() => {
-                        handleRedownload();
-                        setMenuOpen(false);
-                      }}
-                    >
-                      <RefreshIcon />
-                      <span>{t("detail.redownload")}</span>
-                    </button>
-                  </div>
+                <Show when={task()?.savePath}>
+                  <Button
+                    variant="ghost"
+                    shape="icon-sm"
+                    aria-label={t("detail.openFolder")}
+                    title={t("detail.openFolder")}
+                    onClick={handleOpenFolder}
+                  >
+                    <FolderOpenIcon />
+                  </Button>
                 </Show>
+                <Button
+                  variant="ghost"
+                  shape="icon-sm"
+                  aria-label={t("detail.redownload")}
+                  title={t("detail.redownload")}
+                  disabled={retrying() || mirrorRetrying()}
+                  onClick={handleRedownload}
+                >
+                  <RefreshIcon />
+                </Button>
               </div>
+            </div>
+            <div class="flex items-center gap-1">
               <Button
                 variant="ghost"
                 shape="icon-sm"
                 aria-label={t("detail.closeAria")}
+                title={t("detail.closeAria")}
                 onClick={handleClose}
               >
                 <CloseIcon />
@@ -621,6 +557,24 @@ export default function DetailPanel(props: DetailPanelProps) {
                 </span>
               </Show>
             </div>
+          </div>
+
+          {/* Primary Metadata — URL / 保存路径默认可见,不再折叠 */}
+          <div class="detail-section">
+            <InfoRow
+              label={t("detail.label.url")}
+              value={task()?.url || ""}
+              copyable
+              copied={copied() === "url"}
+              onCopy={() => copyToClipboard(task()?.url || "", "url")}
+            />
+            <InfoRow
+              label={t("detail.label.savePath")}
+              value={task()?.savePath || t("detail.savePathPending")}
+              copyable
+              copied={copied() === "path"}
+              onCopy={() => copyToClipboard(task()?.savePath || "", "path")}
+            />
           </div>
 
           {/* 失败诊断 — 可展开:分类徽标 + 标题常驻;展开显示完整 hint + 后端原文(Iteration 15)
@@ -740,36 +694,20 @@ export default function DetailPanel(props: DetailPanelProps) {
             )}
           </Show>
 
-          {/* Activity Metrics — 2x2 bento cards */}
-          <Show
-            when={
-              isDownloading() ||
-              task()?.status === "paused" ||
-              task()?.status === "connecting" ||
-              task()?.status === "resuming"
-            }
-          >
+          {/* Activity Metrics — 仅保留不重复的信息:剩余时间 + 并发分片 */}
+          <Show when={isActive()}>
             <div class="detail-section">
               <div class="metric-grid">
                 <MetricCard
-                  label={t("detail.label.speed")}
-                  value={formatSpeed(task()?.speed || 0)}
+                  label={t("detail.label.eta")}
+                  value={eta()}
                   highlight={isDownloading()}
                   icon={<ArrowDownIcon aria-hidden="true" />}
                 />
                 <MetricCard
-                  label={t("detail.label.remaining")}
-                  value={eta()}
-                  highlight={isDownloading()}
-                />
-                <MetricCard
-                  label={t("detail.label.fragments")}
-                  value={`${task()?.fragmentsDone || 0}/${task()?.fragmentsTotal || 0}`}
-                />
-                <MetricCard
-                  label={t("detail.label.threads")}
-                  value="—"
-                  hint={t("detail.label.threads")}
+                  label={t("detail.label.concurrency")}
+                  value={concurrencyValue()}
+                  hint={t("detail.label.concurrency")}
                 />
               </div>
             </div>
@@ -801,20 +739,6 @@ export default function DetailPanel(props: DetailPanelProps) {
                       ? formatSize(task()!.fileSize!)
                       : t("common.unknown")
                   }
-                />
-                <InfoRow
-                  label={t("detail.label.savePath")}
-                  value={task()?.savePath || t("detail.savePathPending")}
-                  copyable
-                  copied={copied() === "path"}
-                  onCopy={() => copyToClipboard(task()?.savePath || "", "path")}
-                />
-                <InfoRow
-                  label={t("detail.label.url")}
-                  value={task()?.url || ""}
-                  copyable
-                  copied={copied() === "url"}
-                  onCopy={() => copyToClipboard(task()?.url || "", "url")}
                 />
                 <InfoRow
                   label={t("detail.label.createdAt")}

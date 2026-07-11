@@ -133,7 +133,7 @@ describe("TaskItem", () => {
     expect(container.querySelector(".status-badge--failed")).toBeTruthy();
   });
 
-  it("按列配置渲染新增列（大小、分片、线程、创建时间）", () => {
+  it("按列配置渲染新增列（大小、分片、并发分片、创建时间）", () => {
     $taskColumns.toggleVisibility("size");
     $taskColumns.toggleVisibility("fragments");
     $taskColumns.toggleVisibility("threads");
@@ -154,7 +154,7 @@ describe("TaskItem", () => {
     const text = container.textContent;
     expect(text).toContain("24.6 MB"); // size
     expect(text).toContain("12/12"); // fragments
-    expect(text).toContain("8"); // threads
+    expect(text).toContain("8"); // concurrency
     expect(text).toContain("2026-06-25"); // createdAt
   });
 

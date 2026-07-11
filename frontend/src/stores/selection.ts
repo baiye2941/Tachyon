@@ -44,6 +44,30 @@ export function deselectAll() {
   setLastSelectedAnchorId(null)
 }
 
+/**
+ * 将当前选择集与可见任务 ID 取交集。
+ * 当过滤条件变化导致某些已选任务被隐藏时,调用此函数可保持
+ * "已选 N 项" 与批量操作范围始终与当前可见列表一致。
+ */
+export function intersectSelection(visibleIds: Set<string>): void {
+  setSelectedIds((prev) => {
+    let changed = false
+    for (const id of prev) {
+      if (!visibleIds.has(id)) {
+        changed = true
+        break
+      }
+    }
+    if (!changed) return prev
+
+    const next = new Set<string>()
+    for (const id of prev) {
+      if (visibleIds.has(id)) next.add(id)
+    }
+    return next
+  })
+}
+
 export function isSelected(id: string): boolean {
   return selectedIds().has(id)
 }

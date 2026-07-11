@@ -117,7 +117,7 @@ export const ALL_COLUMNS: ColumnDef[] = [
   },
   {
     key: "threads",
-    labelKey: "taskList.column.threads",
+    labelKey: "taskList.column.concurrency",
     defaultWidth: 80,
     minWidth: 48,
     align: "right",

@@ -139,6 +139,13 @@
   border-top: 1px solid var(--color-border-subtle);
 }
 
+.detail-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 4px;
+}
+
 /* ============================================
    Detail Panel — Stats, Info, Menu, Diagnostics
    ============================================ */

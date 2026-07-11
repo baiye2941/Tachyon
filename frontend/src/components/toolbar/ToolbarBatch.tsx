@@ -6,6 +6,10 @@ import {
   CancelIcon,
   TrashIcon,
   XIcon,
+  ArrowLeftIcon,
+  FolderOpenIcon,
+  LinkIcon,
+  RefreshIcon,
 } from "../icons";
 import Button from "../../shared/ui/Button";
 import { useI18n } from "../../i18n";
@@ -16,18 +20,31 @@ export default function ToolbarBatch(props: ToolbarProps) {
   const i18n = useI18n();
   const isNarrow = useIsNarrowScreen();
 
+  const isAllSelected = () =>
+    props.totalCount > 0 && props.selectedCount === props.totalCount;
+  const isPartialSelected = () =>
+    props.selectedCount > 0 && props.selectedCount < props.totalCount;
+  const selectLabel = () =>
+    isAllSelected()
+      ? (i18n.t("toolbar.deselectAll") as string)
+      : (i18n.t("toolbar.selectAll") as string);
+
   return (
     <div class="flex items-center gap-2 flex-1 min-w-0">
       <Button
         variant="ghost"
         size="md"
         onClick={props.onSelectAll}
-        aria-label={i18n.t("toolbar.selectAll") as string}
-        title={i18n.t("toolbar.selectAll") as string}
+        aria-label={selectLabel()}
+        title={selectLabel()}
+        aria-pressed={isAllSelected()}
       >
-        <CheckboxIcon checked={props.selectedCount > 0} />
+        <CheckboxIcon
+          checked={isAllSelected()}
+          indeterminate={isPartialSelected()}
+        />
         <Show when={!isNarrow()}>
-          <span>{i18n.t("toolbar.selectAll")}</span>
+          <span>{selectLabel()}</span>
         </Show>
       </Button>
 
@@ -83,6 +100,63 @@ export default function ToolbarBatch(props: ToolbarProps) {
         </Show>
       </Button>
 
+      <div
+        style={{
+          width: "1px",
+          height: "18px",
+          background: "var(--color-border-subtle)",
+          margin: "0 2px",
+        }}
+      />
+
+      <Button
+        variant="ghost"
+        size="md"
+        onClick={props.onOpenSelectedFolders}
+        aria-label={i18n.t("toolbar.openFolder") as string}
+        title={i18n.t("toolbar.openFolder") as string}
+      >
+        <FolderOpenIcon />
+        <Show when={!isNarrow()}>
+          <span>{i18n.t("toolbar.openFolder")}</span>
+        </Show>
+      </Button>
+
+      <Button
+        variant="ghost"
+        size="md"
+        onClick={props.onCopySelectedLinks}
+        aria-label={i18n.t("toolbar.copyLink") as string}
+        title={i18n.t("toolbar.copyLink") as string}
+      >
+        <LinkIcon />
+        <Show when={!isNarrow()}>
+          <span>{i18n.t("toolbar.copyLink")}</span>
+        </Show>
+      </Button>
+
+      <Button
+        variant="ghost"
+        size="md"
+        onClick={props.onRedownloadSelected}
+        aria-label={i18n.t("toolbar.redownload") as string}
+        title={i18n.t("toolbar.redownload") as string}
+      >
+        <RefreshIcon />
+        <Show when={!isNarrow()}>
+          <span>{i18n.t("toolbar.redownload")}</span>
+        </Show>
+      </Button>
+
+      <div
+        style={{
+          width: "1px",
+          height: "18px",
+          background: "var(--color-border-subtle)",
+          margin: "0 2px",
+        }}
+      />
+
       <Button
         variant="danger"
         size="md"
@@ -99,13 +173,26 @@ export default function ToolbarBatch(props: ToolbarProps) {
       <Button
         variant="ghost"
         size="md"
-        onClick={props.onExitMultiSelect}
-        aria-label={i18n.t("toolbar.exit") as string}
-        title={i18n.t("toolbar.exit") as string}
+        onClick={props.onClearSelection}
+        aria-label={i18n.t("toolbar.clearSelection") as string}
+        title={i18n.t("toolbar.clearSelection") as string}
       >
         <XIcon />
         <Show when={!isNarrow()}>
-          <span>{i18n.t("toolbar.exit")}</span>
+          <span>{i18n.t("toolbar.clearSelection")}</span>
+        </Show>
+      </Button>
+
+      <Button
+        variant="ghost"
+        size="md"
+        onClick={props.onExitMultiSelect}
+        aria-label={i18n.t("toolbar.exitMultiSelect") as string}
+        title={i18n.t("toolbar.exitMultiSelect") as string}
+      >
+        <ArrowLeftIcon />
+        <Show when={!isNarrow()}>
+          <span>{i18n.t("toolbar.exitMultiSelect")}</span>
         </Show>
       </Button>
     </div>

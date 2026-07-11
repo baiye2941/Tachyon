@@ -19,8 +19,11 @@ function makeResource(overrides: Partial<SnifferResource> = {}): SnifferResource
   return {
     id: "r1",
     url: "https://example.com/video.mp4",
+    downloadUrl: "https://example.com/video.mp4",
+    name: "video.mp4",
     type: "video",
     size: 1024 * 1024,
+    discoveredAt: Date.now(),
     ...overrides,
   };
 }
