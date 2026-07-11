@@ -261,6 +261,51 @@ impl HttpClient {
         Ok(Self { client })
     }
 
+    /// 创建 HTTP/1.1 only 客户端(禁用 H2,用于 bench H1 vs H2 对比)
+    ///
+    /// 明文连接上 reqwest 默认即 HTTP/1.1,但此构造函数显式调用
+    /// `http1_only()` 确保 H2 被完全禁用,并支持 `pool_max_idle_per_host(0)`
+    /// 强制禁用空闲连接池(每请求新建 TCP 连接),用于 H1 最坏场景 bench。
+    ///
+    /// 仅用于测试/bench。生产代码用 `with_connection_config`。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn h1c_only(
+        connect_secs: u64,
+        read_secs: u64,
+        pool_max_idle_per_host: usize,
+        proxy: Option<&str>,
+    ) -> DownloadResult<Self> {
+        let mut builder = Client::builder()
+            .user_agent(tachyon_core::config::USER_AGENT)
+            .pool_max_idle_per_host(pool_max_idle_per_host)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(90))
+            .tcp_nodelay(true)
+            .http1_only();
+
+        if let Some(proxy_url) = proxy {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+                DownloadError::Config(format!(
+                    "无效的代理 URL '{}': {}",
+                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    e
+                ))
+            })?;
+            builder = builder.proxy(proxy);
+        }
+        if connect_secs > 0 {
+            builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
+        }
+        if read_secs > 0 {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_secs));
+        }
+
+        let client = builder
+            .build()
+            .map_err(|e| DownloadError::Network(format!("创建 h1c 客户端失败: {e}")))?;
+        Ok(Self { client })
+    }
+
     /// 发送 GET 请求并返回响应文本
     ///
     /// # 参数

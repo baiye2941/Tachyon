@@ -22,6 +22,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -65,6 +66,14 @@ struct ServerConfig {
     rtt: Duration,
     /// chunk 大小(节流粒度)
     chunk_size: usize,
+    /// 连接级握手延迟(每连接 sleep 一次,模拟 TCP+TLS 握手 RTT)
+    ///
+    /// 在 `serve_connection` 开始处注入(服务任何请求前)。loopback 上 TCP
+    /// 握手由内核完成(`accept()` 返回时已完成),此延迟模拟"应用层接受
+    /// 连接到开始处理首字节"的等待,等价于高 RTT 网络的握手墙钟成本。
+    /// 用于 H2 多路复用 bench:H1 每个并发分片建独立连接各付一次握手,
+    /// H2 所有分片复用单连接只付一次握手。
+    handshake_rtt: Duration,
 }
 
 /// 节流流式 HTTP server
@@ -82,6 +91,8 @@ pub struct ThrottledServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// server loop 的 JoinHandle,shutdown 后 abort 确保端口释放
     join: Option<tokio::task::JoinHandle<()>>,
+    /// 已 accept 的连接数(供 H2 多路复用 bench 断言 H1=4 / H2=1)
+    accept_count: Arc<AtomicUsize>,
 }
 
 impl ThrottledServer {
@@ -114,6 +125,7 @@ impl ThrottledServer {
     /// 创建并启动 server(指定 HTTP 协议模式,OS 分配端口)
     ///
     /// - `protocol`: HTTP 协议模式(Auto / Http2Only / Http1Only)
+    /// - `handshake_rtt`: 连接级握手延迟(每连接 sleep 一次,0=无延迟)
     ///
     /// H2 参数镜像产品客户端配置(`crates/tachyon-protocol/src/http.rs`):
     /// 初始流窗口 1MiB、连接窗口 16MiB、最大帧 1MiB、保活 30s/超时 10s。
@@ -121,6 +133,23 @@ impl ThrottledServer {
         file_size: u64,
         bytes_per_sec: u64,
         rtt_ms: u64,
+        chunk_size: usize,
+        protocol: BenchProtocol,
+    ) -> Self {
+        Self::start_with_handshake(file_size, bytes_per_sec, rtt_ms, 0, chunk_size, protocol).await
+    }
+
+    /// 创建并启动 server(指定协议模式 + 连接级握手延迟,OS 分配端口)
+    ///
+    /// - `handshake_rtt_ms`: 每连接握手延迟(毫秒),0=无延迟
+    ///
+    /// 用于 H2 多路复用 bench:在 `serve_connection` 开始处注入延迟,模拟高 RTT
+    /// 网络的握手墙钟成本。H1 每个并发分片各付一次,H2 所有分片复用单连接只付一次。
+    pub async fn start_with_handshake(
+        file_size: u64,
+        bytes_per_sec: u64,
+        rtt_ms: u64,
+        handshake_rtt_ms: u64,
         chunk_size: usize,
         protocol: BenchProtocol,
     ) -> Self {
@@ -133,10 +162,13 @@ impl ThrottledServer {
             bytes_per_sec,
             rtt: Duration::from_millis(rtt_ms),
             chunk_size,
+            handshake_rtt: Duration::from_millis(handshake_rtt_ms),
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let accept_count = Arc::new(AtomicUsize::new(0));
 
         let uri = format!("http://127.0.0.1:{actual_port}");
+        let accept_count_clone = Arc::clone(&accept_count);
 
         let join = tokio::spawn(async move {
             let mut shutdown_rx = std::pin::pin!(shutdown_rx);
@@ -147,10 +179,18 @@ impl ThrottledServer {
                             Ok(conn) => conn,
                             Err(_) => continue,
                         };
+                        // 计数 accept(供 H2 bench 断言连接数)
+                        accept_count_clone.fetch_add(1, Ordering::Relaxed);
                         let cfg = Arc::clone(&config);
                         // protocol 是 Copy,可直接 move 进 task(避免借用 listener 作用域)
                         let proto = protocol;
                         tokio::spawn(async move {
+                            // 连接级握手延迟:在服务任何请求前注入,模拟高 RTT 网络的
+                            // TCP+TLS 握手墙钟成本。loopback 上 TCP 握手由内核完成,
+                            // 此 sleep 等价于"应用层接受连接到开始处理首字节"的延迟。
+                            if !cfg.handshake_rtt.is_zero() {
+                                sleep(cfg.handshake_rtt).await;
+                            }
                             let io = TokioIo::new(io);
                             let svc = service_fn(move |req| {
                                 let cfg = Arc::clone(&cfg);
@@ -199,12 +239,23 @@ impl ThrottledServer {
             uri,
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
+            accept_count,
         }
     }
 
     /// 返回 server URI(如 `http://127.0.0.1:54321`,端口由 OS 分配)
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// 返回已 accept 的连接数(供 H2 bench 断言 H1=4 / H2=1)
+    pub fn accept_count(&self) -> usize {
+        self.accept_count.load(Ordering::Relaxed)
+    }
+
+    /// 重置连接计数器(在每轮 bench 迭代后重置以精确计量单次迭代连接数)
+    pub fn reset_accept_count(&self) {
+        self.accept_count.store(0, Ordering::Relaxed);
     }
 
     /// 关闭:发送 shutdown 信号并 abort server task(确保端口释放)
