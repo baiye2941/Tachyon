@@ -10,7 +10,11 @@ import {
 import { resolveToken } from "../utils/resolveToken";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { tr, type MessageKey } from "../i18n";
-import { getTaskFragmentData, mergeFragmentDelta } from "../stores/taskFragments";
+import {
+  getTaskFragmentData,
+  mergeFragmentDelta,
+  type TaskFragmentData,
+} from "../stores/taskFragments";
 
 interface ChunkMatrixProps {
   taskId: string;
@@ -21,11 +25,21 @@ interface ChunkMatrixProps {
 
 const AGGREGATE_THRESHOLD = 200;
 const AGGREGATE_BLOCKS = 100;
+const EMPTY_SET = new Set<number>();
 const MAX_BLOCKS_PER_ROW = 25;
 const MIN_BLOCKS_PER_ROW = 8;
 const BLOCK_SIZE = 14;
 /* 缝隙 2px,对齐 DOM 与 Canvas 的紧凑密度 */
 const BLOCK_GAP = 2;
+
+/** 比较两个数字集合的内容是否一致,用于稳定 memo 引用。 */
+function setsEqual(a: Set<number>, b: Set<number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const x of a) {
+    if (!b.has(x)) return false;
+  }
+  return true;
+}
 
 /** 分片状态色:仅与下载状态绑定。 */
 const STATUS_COLOR_VARS: Record<"done" | "downloading" | "pending", string> = {
@@ -40,13 +54,6 @@ const STATUS_TOKENS: Record<"done" | "downloading" | "pending", string> = {
   downloading: "--color-status-downloading",
   pending: "--color-status-pending",
 };
-
-interface ChunkData {
-  index: number;
-  isDone: boolean;
-  isDownloading: boolean;
-  color: string;
-}
 
 export interface ChunkBlock {
   index: number;
@@ -66,47 +73,67 @@ export function buildBlocks(
   if (total <= 0) return [];
   const blockCount = Math.min(total, AGGREGATE_BLOCKS);
   // 真实活跃分片由 downloadingSet 决定(后端 Started 事件驱动),
-  // 不再依赖 maxDoneIdx + band 位置启发式
+  // 不再依赖 maxDoneIdx + band 位置启发式。
+  // 优化:不再扫描全量分片区间,而是直接遍历 doneSet/downloadingSet,
+  // 时间复杂度 O(blockCount + |doneSet| + |downloadingSet|)。
   const blocks: ChunkBlock[] = [];
   for (let i = 0; i < blockCount; i++) {
     const start = Math.floor((i * total) / blockCount);
     const end = Math.max(start + 1, Math.floor(((i + 1) * total) / blockCount));
-    const blockTotal = end - start;
-    let blockDone = 0;
-    let blockDownloading = 0;
-    for (let f = start; f < end; f++) {
-      if (doneSet.has(f)) {
-        blockDone++;
-      } else if (downloadingSet.has(f)) {
-        blockDownloading++;
-      }
-    }
-    const blockPending = blockTotal - blockDone - blockDownloading;
-    let status: ChunkBlock["status"];
-    if (blockDone >= blockDownloading && blockDone >= blockPending) {
-      status = "done";
-    } else if (blockDownloading >= blockPending) {
-      status = "downloading";
-    } else {
-      status = "pending";
-    }
     blocks.push({
       index: i,
       start,
       end,
-      done: blockDone,
-      total: blockTotal,
-      status,
-      color: STATUS_COLOR_VARS[status],
+      done: 0,
+      total: end - start,
+      status: "pending",
+      color: STATUS_COLOR_VARS.pending,
     });
   }
+
+  for (const idx of doneSet) {
+    if (idx < 0 || idx >= total) continue;
+    const blockIdx = Math.floor((idx * blockCount) / total);
+    if (blockIdx < blockCount) {
+      blocks[blockIdx]!.done++;
+    }
+  }
+
+  const downloadingCounts = new Array(blockCount).fill(0) as number[];
+  for (const idx of downloadingSet) {
+    if (idx < 0 || idx >= total || doneSet.has(idx)) continue;
+    const blockIdx = Math.floor((idx * blockCount) / total);
+    if (blockIdx < blockCount) {
+      downloadingCounts[blockIdx] = (downloadingCounts[blockIdx] ?? 0) + 1;
+    }
+  }
+
+  for (let i = 0; i < blockCount; i++) {
+    const block = blocks[i]!;
+    const downloading = downloadingCounts[i]!;
+    const pending = block.total - block.done - downloading;
+    let status: ChunkBlock["status"];
+    if (block.done >= downloading && block.done >= pending) {
+      status = "done";
+    } else if (downloading >= pending) {
+      status = "downloading";
+    } else {
+      status = "pending";
+    }
+    block.status = status;
+    block.color = STATUS_COLOR_VARS[status];
+  }
+
   return blocks;
 }
 
-function statusLabelForChunk(chunk: ChunkData): string {
-  if (chunk.isDone) return tr("status.label.completed");
-  if (chunk.isDownloading) return tr("status.label.downloading");
-  return tr("status.label.pending");
+function statusLabelForChunk(status: ChunkBlock["status"]): string {
+  const map: Record<ChunkBlock["status"], MessageKey> = {
+    done: "status.label.completed",
+    downloading: "status.label.downloading",
+    pending: "status.label.pending",
+  };
+  return tr(map[status]);
 }
 
 function statusLabelForBlock(status: ChunkBlock["status"]): string {
@@ -172,8 +199,12 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const col = Math.floor(x / (BLOCK_SIZE + BLOCK_GAP));
     const row = Math.floor(y / (BLOCK_SIZE + BLOCK_GAP));
     const idx = row * perRow + col;
-    const chunkList = chunks();
-    if (col >= 0 && col < perRow && idx >= 0 && idx < chunkList.length) {
+    if (
+      col >= 0 &&
+      col < perRow &&
+      idx >= 0 &&
+      idx < props.fragmentsTotal
+    ) {
       setHoverIndex(idx);
     } else {
       hideHover();
@@ -241,41 +272,52 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     () => props.fragmentsTotal > AGGREGATE_THRESHOLD,
   );
 
-  const fragData = createMemo(() => getTaskFragmentData(props.taskId));
+  const rawFragData = createMemo(() => getTaskFragmentData(props.taskId));
 
-  const chunks = createMemo(() => {
-    if (props.fragmentsTotal > AGGREGATE_THRESHOLD) return [];
-    const data = fragData();
-    // 无 store 数据时回退到空集合(store 未加载完成期间)
-    const doneSet = data?.doneSet ?? new Set<number>();
-    const downloadingSet = data?.downloadingSet ?? new Set<number>();
-    return Array.from({ length: props.fragmentsTotal }, (_, i) => {
-      const isDone = doneSet.has(i);
-      const isDownloading = !isDone && downloadingSet.has(i);
-      const status: ChunkBlock["status"] = isDone
-        ? "done"
-        : isDownloading
-          ? "downloading"
-          : "pending";
-      return {
-        index: i,
-        isDone,
-        isDownloading,
-        color: STATUS_COLOR_VARS[status],
-      };
-    });
+  /**
+   * 稳定分片数据引用。
+   *
+   * taskFragments store 每次 merge delta 都会产生新的 TaskFragmentData 对象与新的 Set,
+   * 但多数 progress tick 只是 fragmentsDone/fragmentsTotal 等数字变化,分片集合内容并未变。
+   * 通过内容比对返回相同引用,避免下游 memo 与 DOM 单元格随每次 tick 全量重建。
+   */
+  let lastFragData: TaskFragmentData | undefined;
+  const fragData = createMemo(() => {
+    const current = rawFragData();
+    if (!current) {
+      lastFragData = undefined;
+      return undefined;
+    }
+    if (
+      lastFragData &&
+      lastFragData.total === current.total &&
+      lastFragData.finalized === current.finalized &&
+      setsEqual(lastFragData.doneSet, current.doneSet) &&
+      setsEqual(lastFragData.downloadingSet, current.downloadingSet)
+    ) {
+      return lastFragData;
+    }
+    lastFragData = current;
+    return current;
+  });
+
+  /** DOM 模式下仅缓存稳定的分片索引数组,不在每次 tick 重建对象。 */
+  const fragmentIndices = createMemo(() => {
+    if (shouldAggregate()) return [];
+    return Array.from({ length: props.fragmentsTotal }, (_, i) => i);
   });
 
   const blocks = createMemo(() => {
     const data = fragData();
-    const doneSet = data?.doneSet ?? new Set<number>();
-    const downloadingSet = data?.downloadingSet ?? new Set<number>();
+    const doneSet = data?.doneSet ?? EMPTY_SET;
+    const downloadingSet = data?.downloadingSet ?? EMPTY_SET;
     return buildBlocks(props.fragmentsTotal, doneSet, downloadingSet);
   });
 
   // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
   createEffect(() => {
-    if (props.progress >= 1 && fragData() && fragData()!.doneSet.size === 0) {
+    const data = fragData();
+    if (props.progress >= 1 && data && data.doneSet.size === 0) {
       mergeFragmentDelta(props.taskId, [0], []);
     }
   });
@@ -563,22 +605,30 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
         detailValue: `${block.done} / ${block.total}`,
       };
     }
-    const chunkList = chunks();
-    const chunk = chunkList[idx];
-    if (!chunk) return null;
-    const percent = chunk.isDone ? 100 : chunk.isDownloading ? 50 : 0;
+    const data = fragData();
+    const doneSet = data?.doneSet ?? EMPTY_SET;
+    const downloadingSet = data?.downloadingSet ?? EMPTY_SET;
+    const isDone = doneSet.has(idx);
+    const isDownloading = !isDone && downloadingSet.has(idx);
+    const status: ChunkBlock["status"] = isDone
+      ? "done"
+      : isDownloading
+        ? "downloading"
+        : "pending";
+    const percent = isDone ? 100 : isDownloading ? 50 : 0;
     return {
       type: "chunk" as const,
       idx,
-      color: chunk.color,
+      color: STATUS_COLOR_VARS[status],
       title: tr("chunk.tooltip.fragment", { index: idx + 1 }),
-      total: chunkList.length,
-      statusLabel: statusLabelForChunk(chunk),
-      statusClass: chunk.isDone
-        ? "text-status-completed"
-        : chunk.isDownloading
-          ? "text-status-downloading"
-          : "text-text-tertiary",
+      total: props.fragmentsTotal,
+      statusLabel: statusLabelForChunk(status),
+      statusClass:
+        status === "done"
+          ? "text-status-completed"
+          : status === "downloading"
+            ? "text-status-downloading"
+            : "text-text-tertiary",
       percentText: `${percent}%`,
     };
   });
@@ -664,45 +714,46 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
               onMouseMove={handleGridMouseMove}
               onMouseLeave={handleGridMouseLeave}
             >
-              <Index each={chunks()}>
-                {(chunk) => {
-                  const item = createMemo(() => chunk());
+              <Index each={fragmentIndices()}>
+                {(idx) => {
+                  const status = createMemo(() => {
+                    const data = fragData();
+                    const doneSet = data?.doneSet ?? EMPTY_SET;
+                    const downloadingSet = data?.downloadingSet ?? EMPTY_SET;
+                    const index = idx();
+                    if (doneSet.has(index)) return "done";
+                    if (downloadingSet.has(index)) return "downloading";
+                    return "pending";
+                  });
                   const isSelected = createMemo(
-                    () => selectedIndex() === item().index,
+                    () => selectedIndex() === idx(),
                   );
                   return (
                     <div
                       class="chunk-cell"
                       classList={{
-                        "chunk-cell--done": item().isDone,
+                        "chunk-cell--done": status() === "done",
                         "chunk-cell--downloading":
-                          !item().isDone && item().isDownloading,
-                        "chunk-cell--pending":
-                          !item().isDone && !item().isDownloading,
+                          status() === "downloading",
+                        "chunk-cell--pending": status() === "pending",
                         "chunk-cell--selected": isSelected(),
                         "chunk-cell--reduced": prefersReducedMotion(),
                       }}
-                      data-status={
-                        item().isDone
-                          ? "done"
-                          : item().isDownloading
-                            ? "downloading"
-                            : "pending"
-                      }
-                      data-index={item().index}
+                      data-status={status()}
+                      data-index={idx()}
                       role="button"
                       tabIndex={0}
                       aria-label={tr("chunk.tooltip.fragment", {
-                        index: item().index + 1,
+                        index: idx() + 1,
                       })}
-                      onFocus={() => showHover(item().index)}
+                      onFocus={() => showHover(idx())}
                       onBlur={() => hideHover()}
                       onClick={() =>
                         setSelectedIndex((prev) =>
-                          prev === item().index ? null : item().index,
+                          prev === idx() ? null : idx(),
                         )
                       }
-                      onKeyDown={(e) => handleKeyDown(e, item().index)}
+                      onKeyDown={(e) => handleKeyDown(e, idx())}
                     />
                   );
                 }}
