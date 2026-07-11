@@ -1312,13 +1312,18 @@ impl DownloadTask {
 
         // 动态并发度 re-recommend 定时器
         let mut reschedule_timer = interval(reschedule_interval);
-        // 跳过首次立即触发(首次 tick 会立即返回),等下一个周期才 re-recommend
-        reschedule_timer.tick().await;
+        // 跳过首次立即触发(tokio interval 首次 tick 立即返回),
+        // 但不用 .tick().await(会阻塞到下一个 tick,sampling_interval_secs=3600 时死锁)。
+        // 改用 poll_tick 在 select! 中非阻塞跳过首次。
+        // 实际上 interval 首次 tick 在 select! 中会立即 Ready,我们在分支内不处理
+        // 首次(直接 re-recommend 也无害),所以不需要显式跳过。
 
         loop {
             tokio::select! {
                 // 动态并发度:周期性 re-recommend,带宽变化时提升并发度
-                _ = reschedule_timer.tick() => {
+                // guard !handles.is_empty():只在有在途 task 时才 poll,
+                // 所有 task 完成后此分支 disable,使 else => break 能正确触发
+                _ = reschedule_timer.tick(), if !handles.is_empty() => {
                     let rec = self.scheduler.recommend(file_size, max_concurrent_fragments);
                     let new_target = rec.concurrency.min(max_concurrent_fragments).max(1) as usize;
                     let old = target_concurrency.load(Ordering::Acquire);
@@ -1574,8 +1579,15 @@ impl DownloadTask {
                 }
                 else => break,
             }
-            // 退出条件:frag_rx 已空 + handles 已空(所有 task 已完成)
-            if frag_rx.is_empty() && handles.is_empty() {
+            // 退出条件:所有分片已入队(frag_tx 已 drop)+ 所有 task 已完成(handles 空)。
+            // 此时 completed_rx 中的滞后结果已被上面的 select! 消费完(else => break
+            // 在 completed_rx 返回 None 时触发)。但 interval 分支的 guard 使 else 可能
+            // 不触发(interval Pending 时 completed_rx 的 Some 消息已消费但下一轮
+            // completed_rx 返回 None 的 disable 判定可能被 interval Pending 阻塞)。
+            // 底部 break 作为安全退出:frag_tx 已 drop(入队完成) + handles 空(所有 task join)。
+            // 此时 completed_rx 中的消息必已在 select! 的 completed_rx.recv() 分支消费
+            // (select! 公平 poll,completed_rx 有消息时优先 Ready)。
+            if handles.is_empty() && frag_rx.is_empty() {
                 break;
             }
         }
