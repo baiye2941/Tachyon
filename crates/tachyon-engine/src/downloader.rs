@@ -1220,291 +1220,31 @@ impl DownloadTask {
             })
             .collect();
 
-        // ── dispatcher + per-worker channel model ─────────────────────
-        // 不再让所有 worker 争抢同一个 Arc<Mutex<Receiver>> 锁,
-        // 改为一个 dispatcher 从中央队列读取,round-robin 派发到每个 worker 的
-        // 独立 channel,彻底消除锁争用;同时通过 completed_tx 报告分片完成,
-        // 避免 abort_all 时丢失已完成的碎片状态。
-        let worker_count = effective_concurrency
-            .max(1)
-            .min(fragment_specs.len().max(1));
-        let (frag_tx, mut frag_rx) = mpsc::channel::<FragmentSpec>(worker_count * 2);
+        // ── spawn-per-fragment 模型 ────────────────────────────────────
+        // dispatcher 逻辑内联到主循环:从 frag_rx 拉取 spec → semaphore.acquire_owned →
+        // handles.spawn(download_single_fragment)。Semaphore 自然限制并发,
+        // add_permits 后下次 acquire 成功即可 spawn 新 task(动态并发基础)。
+        //
+        // 相比旧 per-worker channel 模型的优势:
+        // 1. 消除 dispatcher round-robin try-send 逻辑(无 per-worker channel)
+        // 2. Semaphore permits 即真实并发上限(add_permits 可运行时提升)
+        // 3. 每个 fragment task 独立 spawn,无固定 worker 数量限制
+        let (frag_tx, mut frag_rx) = mpsc::channel::<FragmentSpec>(effective_concurrency * 2);
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<FragmentTaskResult>();
 
-        let mut worker_txs: Vec<mpsc::Sender<FragmentSpec>> = Vec::with_capacity(worker_count);
-        let mut worker_rxs: Vec<mpsc::Receiver<FragmentSpec>> = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            // per-worker 容量=2:配合 try-send 跳过策略,减少 dispatcher 阻塞概率。
-            // 容量过大会使慢 worker 积压过多分片(导致其他 worker 空闲);
-            // 容量为 1 时 try-send 几乎总是失败( dispatcher 被迫阻塞),退化为旧模型。
-            let (tx, rx) = mpsc::channel::<FragmentSpec>(2);
-            worker_txs.push(tx);
-            worker_rxs.push(rx);
-        }
-
-        // 入队前检查暂停/取消信号,避免在暂停状态下无意义地启动 worker
+        // 入队前检查暂停/取消信号,避免在暂停状态下无意义地启动
         if let Some(ref rx) = control_rx {
             let mut check_rx = rx.clone();
             Self::wait_control_rx(&mut check_rx, pause_timeout).await?;
         }
 
-        // 启动 dispatcher,将中央队列分片派发给 worker
-        // 使用 try-send + skip-to-next-idle 策略避免 HOL blocking:
-        // 1. 优先 try_send 到目标 worker(非阻塞)
-        // 2. try_send 失败时跳到下一个 worker(寻找空闲 worker)
-        // 3. 所有 worker 都满时回退到 send().await(保持反压)
-        let dispatcher_handle = tokio::spawn(async move {
-            let mut next_worker = 0usize;
-            let mut closed = 0usize;
-            while let Some(spec) = frag_rx.recv().await {
-                // 第一轮:try_send 非阻塞扫描,寻找可立即接收的 worker
-                let mut dispatched = false;
-                for i in 0..worker_count {
-                    let idx = (next_worker + i) % worker_count;
-                    match worker_txs[idx].try_send(spec) {
-                        Ok(()) => {
-                            next_worker = (idx + 1) % worker_count;
-                            dispatched = true;
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            closed += 1;
-                            if closed >= worker_count {
-                                break;
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // 跳过满 worker,继续扫描
-                        }
-                    }
-                }
-                if closed >= worker_count {
-                    break;
-                }
-                if dispatched {
-                    continue;
-                }
-
-                // 第二轮:所有 worker 都满,回退到阻塞等待(保持反压)
-                // 从 next_worker 开始,等待任意 worker 消费后腾出空间
-                loop {
-                    if closed >= worker_count {
-                        break;
-                    }
-                    if worker_txs[next_worker].send(spec).await.is_ok() {
-                        next_worker = (next_worker + 1) % worker_count;
-                        break;
-                    }
-                    closed += 1;
-                    next_worker = (next_worker + 1) % worker_count;
-                }
-                if closed >= worker_count {
-                    break;
-                }
-            }
-            // worker_txs 在此 drop,worker 接收端正常结束
-        });
-
-        // 启动 worker
-        for (worker_id, mut work_rx) in worker_rxs.into_iter().enumerate() {
-            let frag_url = url.clone();
-            let frag_storage = storage.clone();
-            let frag_protocol = protocol.clone();
-            let frag_semaphore = semaphore.clone();
-            // P1:镜像路径下 engine 层跳过主 host 的 pool.acquire,
-            // 改由 MirrorProtocol(已注入同一 pool)按真实命中镜像 host acquire,
-            // 使各镜像能各自占满自己的 per-host 配额。单源路径保持 engine 层 acquire。
-            let frag_pool = if self.has_mirrors { None } else { pool.clone() };
-            let frag_buffer_pool = buffer_pool.clone();
-            let frag_host = host.clone();
-            let frag_limiter = rate_limiter.clone();
-            let frag_control_rx = control_rx.clone();
-            let frag_progress_tx = progress_tx.clone();
-            let frag_metrics = metrics.clone();
-            let frag_circuit_breakers = circuit_breakers.clone();
-            // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
-            // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
-            let frag_has_mirrors = self.has_mirrors;
-            let frag_verifier = self.verifier.clone();
-            let completed_tx = completed_tx.clone();
-
-            handles.spawn(async move {
-                // 跨分片复用的写入缓冲区:优先从 BufferPool 异步分配,容量耗尽时阻塞反压;
-                // 未配置 pool 时回退到直接分配。Some 分支使用 `BufferGuard`(RAII),
-                // worker 被 `abort_all` 取消(future 在 await 点被丢弃)时,
-                // `BufferGuard::drop` 自动归还 buffer,避免池许可泄漏。
-                let mut write_buf = match frag_buffer_pool {
-                    Some(ref bp) => WriteBuf::Guard(bp.alloc_guarded().await),
-                    None => WriteBuf::Owned(
-                        AlignedBuf::new(WRITE_BATCH_BYTES).expect("AlignedBuf 分配失败(内存不足)"),
-                    ),
-                };
-
-                let worker_result: FragmentTaskResult = loop {
-                    // 从专属 channel 拉取下一个分片
-                    let spec = match work_rx.recv().await {
-                        Some(s) => s,
-                        None => {
-                            let _ = completed_tx.send(Ok((0, 0, Duration::ZERO, None)));
-                            break Ok((0, 0, Duration::ZERO, None));
-                        }
-                    };
-                    let (frag_index, frag_start, frag_end, resume_offset, compute_hash) = spec;
-
-                    // spawn 内部重试循环:单次尝试失败后指数退避重试,
-                    // 最多重试 max_retries 次(总尝试次数 max_retries + 1)。
-                    let mut attempt: u32 = 0;
-                    let frag_result: FragmentTaskResult = loop {
-                        // 熔断器检查:若源已被熔断,直接跳过本次尝试
-                        // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
-                        // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
-                        if !frag_has_mirrors && !frag_circuit_breakers.allow(&frag_url) {
-                            if attempt >= max_retries {
-                                break Err((
-                                    frag_index,
-                                    DownloadError::Network(format!(
-                                        "源 {frag_url} 已被熔断,跳过重试"
-                                    )),
-                                ));
-                            }
-                            warn!(
-                                index = frag_index,
-                                attempt = attempt + 1,
-                                source = %frag_url,
-                                worker_id,
-                                "源处于熔断状态,跳过本次尝试"
-                            );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            attempt += 1;
-                            continue;
-                        }
-
-                        let permit = match frag_semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                break Err((
-                                    frag_index,
-                                    DownloadError::Other(format!("信号量获取失败: {e}").into()),
-                                ));
-                            }
-                        };
-                        write_buf.as_mut().clear(); // 保留 allocation,仅清空内容(跨分片复用)
-                        let result = Self::download_single_fragment(
-                            &frag_protocol,
-                            &frag_storage,
-                            &frag_pool,
-                            &frag_host,
-                            &frag_url,
-                            frag_index,
-                            frag_start,
-                            frag_end,
-                            resume_offset,
-                            pause_timeout,
-                            frag_limiter.clone(),
-                            &frag_control_rx,
-                            &frag_progress_tx,
-                            &frag_verifier,
-                            compute_hash,
-                            write_buf.as_mut(),
-                        )
-                        .await;
-                        drop(permit);
-
-                        match result {
-                            Ok((downloaded, duration, computed_hash)) => {
-                                // B5:镜像路径不调用 engine 熔断器(MirrorProtocol stats 接管)
-                                if !frag_has_mirrors {
-                                    frag_circuit_breakers.record_success(&frag_url);
-                                }
-                                break Ok((frag_index, downloaded, duration, computed_hash));
-                            }
-                            Err(e) => {
-                                // 不可重试的错误(取消、超时、权限、校验等)直接上报
-                                if !e.is_retryable() {
-                                    if let Some(ref m) = frag_metrics {
-                                        m.inc_error();
-                                    }
-                                    // B5:镜像路径不调用 engine 熔断器
-                                    if !frag_has_mirrors {
-                                        frag_circuit_breakers.record_failure(&frag_url);
-                                    }
-                                    break Err((frag_index, e));
-                                }
-                                if attempt >= max_retries {
-                                    if let Some(ref m) = frag_metrics {
-                                        m.inc_error();
-                                    }
-                                    // B5:镜像路径不调用 engine 熔断器
-                                    if !frag_has_mirrors {
-                                        frag_circuit_breakers.record_failure(&frag_url);
-                                    }
-                                    break Err((frag_index, e));
-                                }
-                                // 退避时间:服务端限流(429/503)若给出 Retry-After 则优先采用,
-                                // 否则回退到 Full Jitter 指数退避,避免多分片同源失败时惊群
-                                let backoff = match &e {
-                                    DownloadError::Throttled {
-                                        retry_after_secs: Some(secs),
-                                    } => Duration::from_secs((*secs).min(1024)),
-                                    _ => {
-                                        let base_secs = 1u64 << attempt.min(10);
-                                        if base_secs <= 1 {
-                                            Duration::from_secs(1)
-                                        } else {
-                                            let seed = (frag_index as u64)
-                                                .wrapping_mul(0x9E3779B97F4A7C15)
-                                                .wrapping_add(attempt as u64);
-                                            let log2 = base_secs.trailing_zeros();
-                                            let hash = seed.wrapping_mul(0x517cc1b727220a95);
-                                            let jitter = hash >> (64 - log2);
-                                            Duration::from_secs(
-                                                base_secs.saturating_sub(jitter).max(1),
-                                            )
-                                        }
-                                    }
-                                };
-                                warn!(
-                                    index = frag_index,
-                                    attempt = attempt + 1,
-                                    max_retries,
-                                    backoff_secs = backoff.as_secs(),
-                                    error = %e,
-                                    worker_id,
-                                    "分片下载失败,退避后重试"
-                                );
-                                // B5:镜像路径不调用 engine 熔断器
-                                if !frag_has_mirrors {
-                                    frag_circuit_breakers.record_failure(&frag_url);
-                                }
-                                // 重试前清除已选中的镜像源,触发下次尝试重新竞速
-                                frag_protocol.clear_selected().await;
-                                tokio::time::sleep(backoff).await;
-                                attempt += 1;
-                            }
-                        }
-                    };
-
-                    // 仅上报成功结果:
-                    // 即使外层因其他 worker 失败而 abort_all,已完成分片的状态也不会丢失
-                    if let Ok(tuple) = frag_result {
-                        let _ = completed_tx.send(Ok(tuple));
-                        // 成功,继续拉取下一个分片
-                        continue;
-                    }
-                    // 失败由 JoinSet 返回,保留原始 DownloadError 所有权
-                    break frag_result;
-                };
-
-                // worker 退出(正常或被 abort_all 取消)时 `write_buf` 析构自动归还:
-                // Guard 变体经 `BufferGuard::drop` 归还到池并恢复许可;
-                // Owned 变体的 `AlignedBuf` 正常释放内存。无需手动 release。
-                worker_result
-            });
-        }
-        // 所有 worker 已持有发送端,释放原始端使 completed_rx 能在结束时关闭
-        drop(completed_tx);
-
-        // 将所有待下载分片入队(dispatcher 已 spawn,可消费 frag_rx,不会死锁)
+        // 在独立 task 中入队所有分片:frag_tx.send().await 在 channel 满时阻塞,
+        // 必须与主循环(从 frag_rx 拉取并 spawn task)并发执行,否则 channel 容量 <
+        // 分片数时死锁。入队 task 持有 frag_tx,完成后 drop 使 frag_rx 返回 None。
+        //
+        // start_download / inc_fragment 需在入队前同步执行(修改 self.fragments),
+        // 仅 send 入队异步化。将已标记 start_download 的 spec 收集后 spawn 入队。
+        let mut pending_specs: Vec<FragmentSpec> = Vec::with_capacity(fragment_specs.len());
         for spec in &fragment_specs {
             let frag_index = spec.0;
             if frag_index as usize >= self.fragments.len() {
@@ -1514,19 +1254,220 @@ impl DownloadTask {
             if let Some(ref m) = metrics {
                 m.inc_fragment();
             }
-            if frag_tx.send(*spec).await.is_err() {
-                // worker 全部退出,后续入队无意义
-                break;
-            }
+            pending_specs.push(*spec);
         }
-        // 释放发送端,dispatcher 在消费完所有分片后自动退出
-        drop(frag_tx);
+        let enqueue_handle = tokio::spawn(async move {
+            for spec in pending_specs {
+                if frag_tx.send(spec).await.is_err() {
+                    break; // 主循环退出,frag_rx 已 drop
+                }
+            }
+            // frag_tx 在此 drop,frag_rx.recv() 在消费完后返回 None
+        });
+
+        // 主循环:同时充当 dispatcher(从 frag_rx 拉取 spec + spawn task)和结果收集器
+        let frag_url = url.clone();
+        let frag_storage = storage.clone();
+        let frag_protocol = protocol.clone();
+        let frag_semaphore = semaphore.clone();
+        // P1:镜像路径下 engine 层跳过主 host 的 pool.acquire,
+        // 改由 MirrorProtocol(已注入同一 pool)按真实命中镜像 host acquire,
+        // 使各镜像能各自占满自己的 per-host 配额。单源路径保持 engine 层 acquire。
+        let frag_pool = if self.has_mirrors { None } else { pool.clone() };
+        let frag_buffer_pool = buffer_pool.clone();
+        let frag_host = host.clone();
+        let frag_limiter = rate_limiter.clone();
+        let frag_control_rx = control_rx.clone();
+        let frag_progress_tx = progress_tx.clone();
+        let frag_metrics = metrics.clone();
+        let frag_circuit_breakers = circuit_breakers.clone();
+        // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
+        // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
+        let frag_has_mirrors = self.has_mirrors;
+        let frag_verifier = self.verifier.clone();
+
+        // completed_tx 包装为 Option:所有分片 spawn 完成后(frag_rx 返回 None)take+drop,
+        // 使 completed_rx 在所有 task 完成后能返回 None 触发主循环退出。
+        let mut completed_tx = Some(completed_tx);
 
         loop {
             tokio::select! {
+                // dispatcher:从中央队列拉取分片,acquire permit 后 spawn task
+                spec = frag_rx.recv() => {
+                    match spec {
+                        Some((frag_index, frag_start, frag_end, resume_offset, compute_hash)) => {
+                            // acquire permit(阻塞直到有可用许可)
+                            // permit 的 RAII 保证:task 完成/drop/abort 时自动归还
+                            let permit = match frag_semaphore.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    Self::abort_remaining_fragment_tasks(&mut handles).await;
+                                    Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
+                                    self.state = DownloadState::Failed;
+                                    return Err(DownloadError::Other(
+                                        format!("信号量获取失败: {e}").into(),
+                                    ));
+                                }
+                            };
+                            // 每个 task 独立分配 write_buf(从 BufferPool 或直接分配)
+                            let mut write_buf = match &frag_buffer_pool {
+                                Some(bp) => WriteBuf::Guard(bp.alloc_guarded().await),
+                                None => WriteBuf::Owned(
+                                    AlignedBuf::new(WRITE_BATCH_BYTES)
+                                        .expect("AlignedBuf 分配失败(内存不足)"),
+                                ),
+                            };
+                            write_buf.as_mut().clear();
+
+                            let frag_protocol = frag_protocol.clone();
+                            let frag_storage = frag_storage.clone();
+                            let frag_pool = frag_pool.clone();
+                            let frag_url = frag_url.clone();
+                            let frag_host = frag_host.clone();
+                            let frag_limiter = frag_limiter.clone();
+                            let frag_control_rx = frag_control_rx.clone();
+                            let frag_progress_tx = frag_progress_tx.clone();
+                            let frag_verifier = frag_verifier.clone();
+                            let frag_metrics = frag_metrics.clone();
+                            let frag_circuit_breakers = frag_circuit_breakers.clone();
+                            // completed_tx 在 frag_rx 为空前持续 clone 给 task
+                            let task_completed_tx = completed_tx.as_ref().unwrap().clone();
+
+                            handles.spawn(async move {
+                                let _permit = permit; // RAII:完成/drop 即归还
+
+                                // 单次尝试 + 指数退避重试
+                                let mut attempt: u32 = 0;
+                                let frag_result: FragmentTaskResult = loop {
+                                    // 熔断器检查
+                                    if !frag_has_mirrors && !frag_circuit_breakers.allow(&frag_url) {
+                                        if attempt >= max_retries {
+                                            break Err((
+                                                frag_index,
+                                                DownloadError::Network(format!(
+                                                    "源 {frag_url} 已被熔断,跳过重试"
+                                                )),
+                                            ));
+                                        }
+                                        warn!(
+                                            index = frag_index,
+                                            attempt = attempt + 1,
+                                            source = %frag_url,
+                                            "源处于熔断状态,跳过本次尝试"
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                        attempt += 1;
+                                        continue;
+                                    }
+
+                                    let result = Self::download_single_fragment(
+                                        &frag_protocol,
+                                        &frag_storage,
+                                        &frag_pool,
+                                        &frag_host,
+                                        &frag_url,
+                                        frag_index,
+                                        frag_start,
+                                        frag_end,
+                                        resume_offset,
+                                        pause_timeout,
+                                        frag_limiter.clone(),
+                                        &frag_control_rx,
+                                        &frag_progress_tx,
+                                        &frag_verifier,
+                                        compute_hash,
+                                        write_buf.as_mut(),
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok((downloaded, duration, computed_hash)) => {
+                                            if !frag_has_mirrors {
+                                                frag_circuit_breakers.record_success(&frag_url);
+                                            }
+                                            break Ok((frag_index, downloaded, duration, computed_hash));
+                                        }
+                                        Err(e) => {
+                                            if !e.is_retryable() || attempt >= max_retries {
+                                                if let Some(ref m) = frag_metrics {
+                                                    m.inc_error();
+                                                }
+                                                if !frag_has_mirrors {
+                                                    frag_circuit_breakers.record_failure(&frag_url);
+                                                }
+                                                break Err((frag_index, e));
+                                            }
+                                            // 退避:429/503 优先 Retry-After,否则 Full Jitter 指数退避
+                                            let backoff = match &e {
+                                                DownloadError::Throttled {
+                                                    retry_after_secs: Some(secs),
+                                                } => Duration::from_secs((*secs).min(1024)),
+                                                _ => {
+                                                    let base_secs = 1u64 << attempt.min(10);
+                                                    if base_secs <= 1 {
+                                                        Duration::from_secs(1)
+                                                    } else {
+                                                        let seed = (frag_index as u64)
+                                                            .wrapping_mul(0x9E3779B97F4A7C15)
+                                                            .wrapping_add(attempt as u64);
+                                                        let log2 = base_secs.trailing_zeros();
+                                                        let hash = seed.wrapping_mul(0x517cc1b727220a95);
+                                                        let jitter = hash >> (64 - log2);
+                                                        Duration::from_secs(
+                                                            base_secs.saturating_sub(jitter).max(1),
+                                                        )
+                                                    }
+                                                }
+                                            };
+                                            warn!(
+                                                index = frag_index,
+                                                attempt = attempt + 1,
+                                                max_retries,
+                                                backoff_secs = backoff.as_secs(),
+                                                error = %e,
+                                                "分片下载失败,退避后重试"
+                                            );
+                                            if !frag_has_mirrors {
+                                                frag_circuit_breakers.record_failure(&frag_url);
+                                            }
+                                            frag_protocol.clear_selected().await;
+                                            tokio::time::sleep(backoff).await;
+                                            attempt += 1;
+                                        }
+                                    }
+                                };
+
+                                // 上报结果:成功经 completed_tx(主循环处理),JoinSet 返回虚拟信号;
+                                // 失败不经 completed_tx,由 JoinSet 直接返回(主循环处理错误)。
+                                // 这与旧 per-worker 模型一致:避免成功结果被 completed_rx 和
+                                // join_next 双重处理导致 record_completed_fragment 重复调用。
+                                match frag_result {
+                                    Ok(tuple) => {
+                                        let _ = task_completed_tx.send(Ok(tuple));
+                                        Ok((0, 0, Duration::ZERO, None)) // 虚拟信号:join_next 忽略
+                                    }
+                                    Err(e) => Err(e),
+                                }
+
+                                // write_buf 在 task 结束时析构:
+                                // Guard 变体经 BufferGuard::drop 归还到池并恢复许可;
+                                // Owned 变体的 AlignedBuf 正常释放内存。
+                            });
+                        }
+                        None => {
+                            // 中央队列已空,所有分片已 spawn。
+                            // 释放原始 completed_tx,使 completed_rx 在所有 task 完成后能返回 None。
+                            completed_tx.take();
+                            // 继续等待已完成的结果(completed_rx / join_next 分支)。
+                        }
+                    }
+                }
+                // 结果收集:completed_rx 始终 poll(无 guard),确保成功结果不丢失。
+                // 退出依赖:completed_tx 原始端在 frag_rx 耗尽后 take+drop,所有 task 的
+                // clone 在 task 结束时 drop,completed_rx.recv() 返回 None 触发 else => break。
                 Some(result) = completed_rx.recv() => {
                     match result {
-                        // worker 正常退出(队列已空),跳过虚拟结果
+                        // task 正常退出(虚拟信号),跳过
                         Ok((0, 0, _, _)) => continue,
                         Ok((index, downloaded, duration, computed_hash)) => {
                             self.record_completed_fragment(
@@ -1538,7 +1479,6 @@ impl DownloadTask {
                         }
                         Err((failed_index, e)) => {
                             Self::abort_remaining_fragment_tasks(&mut handles).await;
-                            dispatcher_handle.abort();
                             Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
                             if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
                                 frag.force_fail();
@@ -1551,23 +1491,25 @@ impl DownloadTask {
                 Some(joined) = handles.join_next() => {
                     match joined {
                         Ok(result) => {
-                            // 实际完成结果已由 completed_rx 处理,此处仅作 worker 退出信号
+                            // 成功结果已由 completed_tx 处理(返回虚拟 (0,0,..)),
+                            // 失败不经 completed_tx 由 JoinSet 直接返回
                             match result {
                                 Ok((0, 0, _, _)) => {}
                                 Ok((index, downloaded, duration, computed_hash)) => {
-                                    // 防御性处理:若 completed_tx 未成功发送,仍从 join 结果补录
+                                    // 防御性:若 completed_tx 发送失败(如 channel 已关闭),
+                                    // 仍从 join 结果补录(此时不会重复——record_completed_fragment
+                                    // 的状态机会拒绝 Done->Done,但补录路径在正常流程不应触发)
                                     if index != 0 || downloaded != 0 {
-                                        self.record_completed_fragment(
+                                        let _ = self.record_completed_fragment(
                                             index,
                                             downloaded,
                                             duration,
                                             computed_hash,
-                                        )?;
+                                        );
                                     }
                                 }
                                 Err((failed_index, e)) => {
                                     Self::abort_remaining_fragment_tasks(&mut handles).await;
-                                    dispatcher_handle.abort();
                                     Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
                                     if let Some(frag) = self.fragments.get_mut(failed_index as usize) {
                                         frag.force_fail();
@@ -1579,7 +1521,6 @@ impl DownloadTask {
                         }
                         Err(error) => {
                             Self::abort_remaining_fragment_tasks(&mut handles).await;
-                            dispatcher_handle.abort();
                             Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
                             self.state = DownloadState::Failed;
                             return Err(DownloadError::Other(
@@ -1590,10 +1531,14 @@ impl DownloadTask {
                 }
                 else => break,
             }
+            // 退出条件:frag_rx 已空 + handles 已空(所有 task 已完成)
+            if frag_rx.is_empty() && handles.is_empty() {
+                break;
+            }
         }
 
-        // dispatcher 在中央队列关闭后自然退出
-        let _ = dispatcher_handle.await;
+        // 入队 task 在所有分片已 send 后自然完成(或被 abort)
+        enqueue_handle.abort();
 
         // 显式关闭存储后端,close() 内部已调用 sync_data() 保证数据落盘,
         // 无需额外 sync() 避免双重 fsync 导致的 Flush Storm
