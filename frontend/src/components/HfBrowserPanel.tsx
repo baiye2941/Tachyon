@@ -6,7 +6,7 @@ import { addToast } from '../stores/toast'
 import { refreshTaskList } from '../stores/downloads'
 import type { HubFileInfo } from '../types'
 import { CloseIcon, SearchIcon, CheckboxIcon, ArrowDownIcon, ChevronDownIcon, FileIcon } from './icons'
-import { detectQuant, isModelWeight, isLargeFile, type QuantLevel } from '../utils/modelMeta'
+import { detectFormat, detectQuant, isModelWeight, isLargeFile, type QuantLevel } from '../utils/modelMeta'
 import { buildTree, countByType, type TreeNode } from '../utils/hfTree'
 import { buildHfMirrorUrl } from '../utils/hfMirror'
 import Button from '../shared/ui/Button'
@@ -298,7 +298,29 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     const stFiles = modelFiles.filter((f: HubFileInfo) => f.path.endsWith('.safetensors'))
     if (stFiles.length > 0) {
       setSelectedPaths(new Set(stFiles.map((f: HubFileInfo) => f.path)))
-      addToast(tr('toast.hubSelectedSafetensors', { count: stFiles.length }), 'success')
+      // 检查是否有被跳过的 .bin/.pt/.pth 文件(走 xet CDN 慢速)
+      const skippedBin = modelFiles.filter(
+        (f: HubFileInfo) =>
+          !f.path.endsWith('.safetensors') && detectFormat(f.path) === 'pytorch',
+      )
+      if (skippedBin.length > 0) {
+        addToast(
+          tr('toast.hubSelectedSafetensorsSkippedBin', { count: stFiles.length, skipped: skippedBin.length }),
+          'success',
+        )
+      } else {
+        addToast(tr('toast.hubSelectedSafetensors', { count: stFiles.length }), 'success')
+      }
+      return
+    }
+    // 无 safetensors 但有 .bin/.pt/.pth:提示用户这些文件可能走 xet CDN 慢速
+    const pytorchFiles = modelFiles.filter(
+      (f: HubFileInfo) => detectFormat(f.path) === 'pytorch',
+    )
+    if (pytorchFiles.length > 0) {
+      setSelectedPaths(new Set(pytorchFiles.map((f: HubFileInfo) => f.path)))
+      addToast(tr('toast.hubSelectedPytorchNoSafetensors', { count: pytorchFiles.length }), 'warning')
+      return
     }
   }
 

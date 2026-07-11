@@ -373,6 +373,8 @@ const zhCN = {
   "toast.hubNoWeights": "未发现模型权重文件",
   "toast.hubSmartSelect": "智能选择: {path}",
   "toast.hubSelectedSafetensors": "已选择 {count} 个 safetensors 文件",
+  "toast.hubSelectedSafetensorsSkippedBin": "已选择 {count} 个 safetensors 文件(跳过 {skipped} 个 PyTorch .bin 文件,避免 xet CDN 慢速)",
+  "toast.hubSelectedPytorchNoSafetensors": "已选择 {count} 个 PyTorch 文件(无 safetensors 格式,可能走 xet CDN 慢速)",
   "toast.hubSelectFilesFirst": "请先勾选要下载的文件",
   "toast.hubUrlMissing": "无法获取 {path} 的下载链接",
   "toast.hubMirrorCreated": "已通过 hf-mirror 镜像创建 {count} 个下载任务",

@@ -385,6 +385,8 @@ const enUS = {
   "toast.hubNoWeights": "No model weight files found",
   "toast.hubSmartSelect": "Smart select: {path}",
   "toast.hubSelectedSafetensors": "Selected {count} safetensors files",
+  "toast.hubSelectedSafetensorsSkippedBin": "Selected {count} safetensors files (skipped {skipped} PyTorch .bin files to avoid slow xet CDN)",
+  "toast.hubSelectedPytorchNoSafetensors": "Selected {count} PyTorch files (no safetensors format, may use slow xet CDN)",
   "toast.hubSelectFilesFirst": "Please select files to download first",
   "toast.hubUrlMissing": "Cannot get download URL for {path}",
   "toast.hubMirrorCreated": "Created {count} download tasks via hf-mirror",
