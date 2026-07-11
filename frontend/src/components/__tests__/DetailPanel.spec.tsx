@@ -203,14 +203,14 @@ describe("DetailPanel", () => {
     );
   });
 
-  it("点击打开文件夹应调用 api.openFolder", async () => {
+  it("点击打开文件夹应调用 api.openFolder 并传入父目录", async () => {
     renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "打开文件夹" }));
 
     expect(mockApi.openFolder).toHaveBeenCalledWith(
-      "D:\\Downloads\\model.gguf",
+      "D:\\Downloads",
     );
   });
 

@@ -1,5 +1,6 @@
 import { api } from "../api/invoke";
 import { errorMessage } from "../utils/appError";
+import { getParentDirectory } from "../utils/path";
 import { $tasks, refreshTaskList } from "./downloads";
 import { $selectedIds, deselectAll } from "./selection";
 import { addToast } from "./toast";
@@ -299,7 +300,7 @@ export async function openSelectedFolders(): Promise<void> {
         return;
       }
       try {
-        await api.openFolder(task.savePath);
+        await api.openFolder(getParentDirectory(task.savePath));
         opened++;
       } catch (e) {
         failures.push(errorMessage(e));

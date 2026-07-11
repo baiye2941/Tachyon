@@ -112,7 +112,7 @@ describe("HistoryPanel 历史记录面板", () => {
     );
   });
 
-  it("点击打开目录触发 onOpenFolder 并传回 savePath", async () => {
+  it("点击打开目录触发 onOpenFolder 并传回父目录", async () => {
     const onOpenFolder = vi.fn();
     await renderPanel({ onOpenFolder }, [
       makeRecord({
@@ -122,7 +122,7 @@ describe("HistoryPanel 历史记录面板", () => {
       }),
     ]);
     fireEvent.click(screen.getByLabelText("打开目录 a.zip"));
-    expect(onOpenFolder).toHaveBeenCalledWith("D:\\downloads\\a.zip");
+    expect(onOpenFolder).toHaveBeenCalledWith("D:\\downloads");
   });
 
   it("savePath 为空时点击打开目录传回空字符串", async () => {

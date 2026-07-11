@@ -316,8 +316,8 @@ describe('batchActions store', () => {
 
   it('openSelectedFolders 打开选中任务目录并提示结果', async () => {
     downloadsModule.setTasks([
-      makeTask('t1', { savePath: '/downloads/a' }),
-      makeTask('t2', { savePath: '/downloads/b' }),
+      makeTask('t1', { savePath: '/downloads/a/' }),
+      makeTask('t2', { savePath: '/downloads/b/' }),
       makeTask('t3', { savePath: '' }),
     ])
     selectionModule.selectAll(['t1', 't2', 't3'])

@@ -6,6 +6,7 @@ import type {
   ModelFavorite,
   ModelSourceFilter,
 } from '../types'
+import { getParentDirectory } from "../utils/path"
 import { CloseIcon, FolderOpenIcon, RefreshIcon, TrashIcon } from './icons'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
@@ -179,7 +180,7 @@ export default function ModelDetail(props: ModelDetailProps) {
   const handleOpenDir = async () => {
     if (isLocalModel(props.model)) {
       try {
-        await api.openFolder((props.model as LocalModel).localPath)
+        await api.openFolder(getParentDirectory((props.model as LocalModel).localPath))
       } catch {
         addToast(tr('toast.openFolderFailed'), 'error')
       }

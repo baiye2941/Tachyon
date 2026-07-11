@@ -10,6 +10,7 @@ import {
   Suspense,
 } from "solid-js";
 import type { TaskInfo } from "../types";
+import { getParentDirectory } from "../utils/path";
 import { loadTaskFragments, clearTaskFragments, getTaskFragmentData } from "../stores/taskFragments";
 import {
   formatSize,
@@ -409,7 +410,7 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (!t2) return;
     if (t2.savePath) {
       try {
-        await api.openFolder(t2.savePath);
+        await api.openFolder(getParentDirectory(t2.savePath));
       } catch {
         addToast(tr("toast.openFolderFailed"), "error");
       }
