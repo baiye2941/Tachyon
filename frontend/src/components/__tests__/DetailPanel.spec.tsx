@@ -7,7 +7,6 @@ import {
 } from "@solidjs/testing-library";
 import { I18nProvider, i18n } from "../../i18n";
 import type { TaskInfo } from "../../types";
-import DetailPanel from "../DetailPanel";
 
 const mockApi = vi.hoisted(() => ({
   pauseTask: vi.fn(),
@@ -100,11 +99,12 @@ function waitForRaf() {
   });
 }
 
-function renderWithI18n(
+async function renderWithI18n(
   task: TaskInfo | null,
   onClose = () => {},
   variant: "overlay" | "side" = "overlay",
 ) {
+  const { default: DetailPanel } = await import("../DetailPanel");
   return render(() => (
     <I18nProvider i18n={i18n}>
       <DetailPanel task={task} onClose={onClose} variant={variant} />
@@ -114,6 +114,9 @@ function renderWithI18n(
 
 describe("DetailPanel", () => {
   beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+
     Object.assign(navigator, {
       clipboard: {
         writeText: vi.fn(),
@@ -127,7 +130,7 @@ describe("DetailPanel", () => {
   });
 
   it("应渲染文件名、大百分比进度和状态徽标", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const text = document.body.textContent;
@@ -137,7 +140,7 @@ describe("DetailPanel", () => {
   });
 
   it("活动指标应显示真实并发分片数而非占位符", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const cards = document.querySelectorAll(".metric-card");
@@ -151,7 +154,7 @@ describe("DetailPanel", () => {
   });
 
   it("并发分片为 0 时应显示占位符", async () => {
-    renderWithI18n({ ...baseTask, activeConcurrency: 0 });
+    await renderWithI18n({ ...baseTask, activeConcurrency: 0 });
     await waitForRaf();
 
     const cards = Array.from(document.querySelectorAll(".metric-card"));
@@ -162,7 +165,7 @@ describe("DetailPanel", () => {
   });
 
   it("下载中任务底部应显示暂停按钮", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const pauseBtn = screen.getByRole("button", { name: /暂停下载/ });
@@ -173,7 +176,7 @@ describe("DetailPanel", () => {
   });
 
   it("已暂停任务底部应显示恢复按钮", async () => {
-    renderWithI18n({ ...baseTask, status: "paused", speed: 0 });
+    await renderWithI18n({ ...baseTask, status: "paused", speed: 0 });
     await waitForRaf();
 
     const resumeBtn = screen.getByRole("button", { name: /恢复下载/ });
@@ -184,7 +187,7 @@ describe("DetailPanel", () => {
   });
 
   it("头部快捷操作应包含复制链接、打开文件夹、重新下载", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     expect(screen.getByRole("button", { name: "复制链接" })).toBeTruthy();
@@ -193,7 +196,7 @@ describe("DetailPanel", () => {
   });
 
   it("点击复制链接应写入剪贴板", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "复制链接" }));
@@ -204,7 +207,7 @@ describe("DetailPanel", () => {
   });
 
   it("点击打开文件夹应调用 api.openFolder 并传入父目录", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "打开文件夹" }));
@@ -215,7 +218,7 @@ describe("DetailPanel", () => {
   });
 
   it("无保存路径时不显示打开文件夹按钮", async () => {
-    renderWithI18n({ ...baseTask, savePath: "" });
+    await renderWithI18n({ ...baseTask, savePath: "" });
     await waitForRaf();
 
     expect(
@@ -225,7 +228,7 @@ describe("DetailPanel", () => {
 
   it("点击重新下载应创建新任务", async () => {
     mockApi.createTask.mockResolvedValue("task-2");
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "重新下载" }));
@@ -243,7 +246,7 @@ describe("DetailPanel", () => {
       speed: 0,
       errorReason: "connection timeout",
     };
-    renderWithI18n(failedTask);
+    await renderWithI18n(failedTask);
     await waitForRaf();
 
     expect(screen.getByRole("alert")).toBeTruthy();
@@ -256,7 +259,7 @@ describe("DetailPanel", () => {
   });
 
   it("URL 和保存路径默认可见", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     expect(screen.getByText("下载链接")).toBeTruthy();
@@ -267,7 +270,7 @@ describe("DetailPanel", () => {
 
   it("删除任务应弹出确认并调用 api.deleteTask", async () => {
     const { requestConfirm } = await import("../../stores/confirm");
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "删除任务" }));
@@ -282,7 +285,7 @@ describe("DetailPanel", () => {
 
   it("关闭按钮应触发 onClose", async () => {
     const onClose = vi.fn();
-    renderWithI18n(baseTask, onClose);
+    await renderWithI18n(baseTask, onClose);
     await waitForRaf();
 
     const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
@@ -295,7 +298,7 @@ describe("DetailPanel", () => {
 
   describe("宽屏侧栏模式", () => {
     it("侧栏变体应渲染为侧栏样式并带有默认宽度", async () => {
-      renderWithI18n(baseTask, () => {}, "side");
+      await renderWithI18n(baseTask, () => {}, "side");
       await waitForRaf();
 
       const panel = document.querySelector(".detail-panel");
@@ -304,8 +307,17 @@ describe("DetailPanel", () => {
       expect(panel!.getAttribute("style")).toMatch(/width:\s*360px/);
     });
 
+    it("侧栏变体打开时应使用 localStorage 中保存的宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(400));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*400px/);
+    });
+
     it("侧栏变体左侧应显示可访问性拖拽手柄", async () => {
-      renderWithI18n(baseTask, () => {}, "side");
+      await renderWithI18n(baseTask, () => {}, "side");
       await waitForRaf();
 
       const handle = screen.getByRole("separator", {
@@ -316,7 +328,7 @@ describe("DetailPanel", () => {
     });
 
     it("覆盖式变体不应显示拖拽手柄", async () => {
-      renderWithI18n(baseTask, () => {}, "overlay");
+      await renderWithI18n(baseTask, () => {}, "overlay");
       await waitForRaf();
 
       expect(
@@ -325,7 +337,7 @@ describe("DetailPanel", () => {
     });
 
     it("拖拽手柄应实时调整宽度并在释放后保持", async () => {
-      renderWithI18n(baseTask, () => {}, "side");
+      await renderWithI18n(baseTask, () => {}, "side");
       await waitForRaf();
 
       const handle = screen.getByRole("separator", {
@@ -344,10 +356,13 @@ describe("DetailPanel", () => {
 
       // 释放后保持新宽度
       expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(460),
+      );
     });
 
     it("宽度不应小于最小值 280px", async () => {
-      renderWithI18n(baseTask, () => {}, "side");
+      await renderWithI18n(baseTask, () => {}, "side");
       await waitForRaf();
 
       const handle = screen.getByRole("separator", {
@@ -367,7 +382,7 @@ describe("DetailPanel", () => {
     });
 
     it("宽度不应超过最大值 600px", async () => {
-      renderWithI18n(baseTask, () => {}, "side");
+      await renderWithI18n(baseTask, () => {}, "side");
       await waitForRaf();
 
       const handle = screen.getByRole("separator", {
@@ -387,7 +402,7 @@ describe("DetailPanel", () => {
 
     it("侧栏模式下关闭按钮仍触发 onClose", async () => {
       const onClose = vi.fn();
-      renderWithI18n(baseTask, onClose, "side");
+      await renderWithI18n(baseTask, onClose, "side");
       await waitForRaf();
 
       const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });

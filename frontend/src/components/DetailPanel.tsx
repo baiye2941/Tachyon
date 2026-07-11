@@ -10,6 +10,11 @@ import {
   Suspense,
 } from "solid-js";
 import type { TaskInfo } from "../types";
+import {
+  $detailPanel,
+  MIN_WIDTH,
+  MAX_WIDTH,
+} from "../stores/detailPanel";
 import { getParentDirectory } from "../utils/path";
 import { loadTaskFragments, clearTaskFragments, getTaskFragmentData } from "../stores/taskFragments";
 import {
@@ -73,10 +78,6 @@ interface DetailPanelProps {
   variant?: "overlay" | "side";
 }
 
-const DEFAULT_WIDTH = 360;
-const MIN_WIDTH = 280;
-const MAX_WIDTH = 600;
-
 export default function DetailPanel(props: DetailPanelProps) {
   const t = (key: MessageKey, values?: Record<string, string | number>) =>
     tr(key, values as Record<string, string | number | unknown>);
@@ -89,9 +90,6 @@ export default function DetailPanel(props: DetailPanelProps) {
   // 重试 loading 态:防止重复点击(Iteration 16)
   const [retrying, setRetrying] = createSignal(false);
   const [mirrorRetrying, setMirrorRetrying] = createSignal(false);
-
-  // 侧栏宽度状态:默认 360px,最小 280px,最大 600px
-  const [panelWidth, setPanelWidth] = createSignal(DEFAULT_WIDTH);
 
   // 响应式 + 动效偏好(Iteration 13)
   const isNarrow = useIsNarrowScreen();
@@ -191,7 +189,7 @@ export default function DetailPanel(props: DetailPanelProps) {
     e.preventDefault();
     const handle = e.currentTarget as HTMLDivElement;
     const startX = e.clientX;
-    const startWidth = panelWidth();
+    const startWidth = $detailPanel.width();
 
     try {
       handle.setPointerCapture(e.pointerId);
@@ -205,7 +203,7 @@ export default function DetailPanel(props: DetailPanelProps) {
         MAX_WIDTH,
         Math.max(MIN_WIDTH, Math.round(startWidth + delta)),
       );
-      setPanelWidth(nextWidth);
+      $detailPanel.setWidth(nextWidth);
     };
 
     const onPointerUp = (ev: PointerEvent) => {
@@ -876,14 +874,14 @@ export default function DetailPanel(props: DetailPanelProps) {
         {/* 侧栏模式:与列表并列的固定右侧面板,宽度可拖拽调整 */}
         <div
           class="detail-panel detail-panel--side"
-          style={{ width: `${panelWidth()}px` }}
+          style={{ width: `${$detailPanel.width()}px` }}
         >
           <div
             class="detail-panel-resize-handle"
             role="separator"
             aria-orientation="vertical"
             aria-label={t("detail.resizeHandleAria")}
-            aria-valuenow={panelWidth()}
+            aria-valuenow={$detailPanel.width()}
             aria-valuemin={MIN_WIDTH}
             aria-valuemax={MAX_WIDTH}
             onPointerDown={handleResizePointerDown}
