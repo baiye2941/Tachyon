@@ -263,6 +263,7 @@ const enUS = {
   "detail.retryWithMirrorHint": "Redownload via hf-mirror.com",
   "detail.copy.aria": "Copy",
   "detail.copied.aria": "Copied",
+  "detail.resizeHandleAria": "Resize detail panel width",
   "detail.section.diagnostics": "Failure diagnostics",
   "detail.diagnostics.expand": "Expand diagnostics",
   "detail.diagnostics.collapse": "Collapse diagnostics",

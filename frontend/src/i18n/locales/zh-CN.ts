@@ -259,6 +259,7 @@ const zhCN = {
   "detail.retryWithMirrorHint": "通过 hf-mirror.com 镜像重新下载",
   "detail.copy.aria": "复制",
   "detail.copied.aria": "已复制",
+  "detail.resizeHandleAria": "调整详情面板宽度",
   "detail.section.diagnostics": "失败诊断",
   "detail.diagnostics.expand": "展开诊断",
   "detail.diagnostics.collapse": "收起诊断",

@@ -21,7 +21,8 @@ import {
   setLastSelectedAnchorId,
   hasSelection,
   intersectSelection,
-} from "./stores/selection";import {
+} from "./stores/selection";
+import {
   $ui,
   openView,
   openNewTaskModal,
@@ -49,6 +50,7 @@ import {
 } from "./stores/batchActions";
 import { useAppInit } from "./hooks/useAppInit";
 import { useGlobalKeyboard } from "./hooks/useGlobalKeyboard";
+import { useIsWideScreen } from "./hooks/useMediaQuery";
 import { useContextMenu } from "./hooks/useContextMenu";
 import { useDragDrop } from "./hooks/useDragDrop";
 import TitleBar from "./components/TitleBar";
@@ -91,6 +93,7 @@ function AppContent() {
     ),
   );
   useGlobalKeyboard();
+  const isWideScreen = useIsWideScreen();
   const {
     contextMenu,
     open: openContextMenu,
@@ -441,6 +444,7 @@ function AppContent() {
             <DetailPanel
               task={$selectedTask.get()}
               onClose={handleDetailClose}
+              variant={isWideScreen() ? "side" : "overlay"}
             />
           </div>
         </div>

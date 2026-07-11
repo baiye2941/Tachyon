@@ -100,10 +100,14 @@ function waitForRaf() {
   });
 }
 
-function renderWithI18n(task: TaskInfo | null, onClose = () => {}) {
+function renderWithI18n(
+  task: TaskInfo | null,
+  onClose = () => {},
+  variant: "overlay" | "side" = "overlay",
+) {
   return render(() => (
     <I18nProvider i18n={i18n}>
-      <DetailPanel task={task} onClose={onClose} />
+      <DetailPanel task={task} onClose={onClose} variant={variant} />
     </I18nProvider>
   ));
 }
@@ -287,5 +291,110 @@ describe("DetailPanel", () => {
     // 关闭有过渡动画,等待 350ms 后断言回调
     await new Promise((r) => setTimeout(r, 350));
     expect(onClose).toHaveBeenCalled();
+  });
+
+  describe("宽屏侧栏模式", () => {
+    it("侧栏变体应渲染为侧栏样式并带有默认宽度", async () => {
+      renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel).toBeTruthy();
+      expect(panel!.classList.contains("detail-panel--side")).toBe(true);
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*360px/);
+    });
+
+    it("侧栏变体左侧应显示可访问性拖拽手柄", async () => {
+      renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      expect(handle).toBeTruthy();
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+    });
+
+    it("覆盖式变体不应显示拖拽手柄", async () => {
+      renderWithI18n(baseTask, () => {}, "overlay");
+      await waitForRaf();
+
+      expect(
+        screen.queryByRole("separator", { name: "调整详情面板宽度" }),
+      ).toBeNull();
+    });
+
+    it("拖拽手柄应实时调整宽度并在释放后保持", async () => {
+      renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+      expect(panel).toBeTruthy();
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: 400, pointerId: 1 });
+
+      // 向左拖动 100px,默认 360px 变为 460px
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      // 释放后保持新宽度
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+    });
+
+    it("宽度不应小于最小值 280px", async () => {
+      renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: 900, pointerId: 1 });
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      // 向右拖动 400px 会超过容器,但至少应被限制为 280px
+      const style = panel!.getAttribute("style") ?? "";
+      const widthMatch = style.match(/width:\s*(\d+)px/);
+      expect(widthMatch).toBeTruthy();
+      expect(Number(widthMatch![1])).toBeGreaterThanOrEqual(280);
+    });
+
+    it("宽度不应超过最大值 600px", async () => {
+      renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: -200, pointerId: 1 });
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      const style = panel!.getAttribute("style") ?? "";
+      const widthMatch = style.match(/width:\s*(\d+)px/);
+      expect(widthMatch).toBeTruthy();
+      expect(Number(widthMatch![1])).toBeLessThanOrEqual(600);
+    });
+
+    it("侧栏模式下关闭按钮仍触发 onClose", async () => {
+      const onClose = vi.fn();
+      renderWithI18n(baseTask, onClose, "side");
+      await waitForRaf();
+
+      const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
+      fireEvent.click(closeBtns[0]!);
+
+      await new Promise((r) => setTimeout(r, 350));
+      expect(onClose).toHaveBeenCalled();
+    });
   });
 });
