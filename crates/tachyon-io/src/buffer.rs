@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bytes::BytesMut;
+use crate::AlignedBuf;
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
@@ -20,11 +20,14 @@ use tokio::sync::Semaphore;
 /// 控制最大并发 buffer 数。信号量许可数等于池容量,`alloc()` 在许可耗尽
 /// 时阻塞,`release()` 归还许可。
 ///
+/// 池中存储的 `AlignedBuf` 用 512 字节对齐分配,使 IOCP/WinFile 的
+/// NO_BUFFERING 对齐快速路径生效（详见 `aligned_buf` 模块文档）。
+///
 /// 不变量: `semaphore.available_permits() + outstanding == capacity`
 pub struct BufferPool {
     buffer_size: usize,
     capacity: usize,
-    pool: Arc<ArrayQueue<BytesMut>>,
+    pool: Arc<ArrayQueue<AlignedBuf>>,
     /// 信号量许可数等于 capacity,用于控制最大并发 buffer 数
     semaphore: Arc<Semaphore>,
     /// 当前已分配出去(未归还)的 buffer 数量
@@ -58,7 +61,9 @@ impl BufferPool {
         // 预填充: 将所有 buffer 推入池中,但不消耗信号量许可。
         // alloc() 取出 buffer 时消耗许可,release() 归还时恢复许可。
         for _ in 0..capacity {
-            let _ = pool.push(BytesMut::with_capacity(buffer_size));
+            if let Ok(buf) = AlignedBuf::new(buffer_size) {
+                let _ = pool.push(buf);
+            }
         }
         Self {
             buffer_size,
@@ -84,7 +89,7 @@ impl BufferPool {
     /// 当所有许可都被占用(已有 capacity 个 buffer 在外使用)时,
     /// 此方法会阻塞等待,直到有 buffer 被归还。这是反压的核心机制:
     /// 磁盘慢 -> buffer 归还慢 -> alloc 阻塞 -> 网络写入自动限速。
-    pub async fn alloc(&self) -> BytesMut {
+    pub async fn alloc(&self) -> AlignedBuf {
         // 获取信号量许可,许可耗尽时阻塞
         let permit = self
             .semaphore
@@ -97,9 +102,9 @@ impl BufferPool {
         self.outstanding.fetch_add(1, Ordering::AcqRel);
 
         // 从队列中取出复用 buffer,或新建一个
-        self.pool
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(self.buffer_size))
+        self.pool.pop().unwrap_or_else(|| {
+            AlignedBuf::new(self.buffer_size).expect("AlignedBuf 分配失败(内存不足或参数无效)")
+        })
     }
 
     /// 归还 buffer 到池中
@@ -108,7 +113,7 @@ impl BufferPool {
     /// 如果队列已满,buffer 会被丢弃(释放内存),但许可仍然归还。
     ///
     /// 维护不变量: `permits + outstanding == capacity`
-    pub fn release(&self, mut buf: BytesMut) {
+    pub fn release(&self, mut buf: AlignedBuf) {
         self.outstanding.fetch_sub(1, Ordering::AcqRel);
         buf.clear();
         // 归还 buffer:成功则复用,队列已满则丢弃。无论哪种情况,
@@ -143,7 +148,9 @@ impl BufferPool {
             if self.pool.is_full() {
                 break;
             }
-            let _ = self.pool.push(BytesMut::with_capacity(self.buffer_size));
+            if let Ok(buf) = AlignedBuf::new(self.buffer_size) {
+                let _ = self.pool.push(buf);
+            }
         }
     }
 
@@ -197,16 +204,16 @@ impl Clone for BufferPool {
 /// 使用 `BufferPool::alloc_guarded()` 获取,确保即使发生提前返回或
 /// panic 也能正确归还 buffer,避免资源泄漏。
 pub struct BufferGuard {
-    buf: Option<BytesMut>,
+    buf: Option<AlignedBuf>,
     pool: BufferPool,
 }
 
 impl BufferGuard {
-    pub fn buf(&self) -> &BytesMut {
+    pub fn buf(&self) -> &AlignedBuf {
         self.buf.as_ref().expect("BufferGuard 不应在被 drop 后访问")
     }
 
-    pub fn buf_mut(&mut self) -> &mut BytesMut {
+    pub fn buf_mut(&mut self) -> &mut AlignedBuf {
         self.buf.as_mut().expect("BufferGuard 不应在被 drop 后访问")
     }
 }
@@ -220,7 +227,7 @@ impl Drop for BufferGuard {
 }
 
 impl std::ops::Deref for BufferGuard {
-    type Target = BytesMut;
+    type Target = AlignedBuf;
     fn deref(&self) -> &Self::Target {
         self.buf()
     }
@@ -500,6 +507,6 @@ mod tests {
         let pool = BufferPool::new(4096, 2);
         let mut guard = pool.alloc_guarded().await;
         guard.extend_from_slice(b"hello");
-        assert_eq!(&guard[..5], b"hello");
+        assert_eq!(&guard.as_slice()[..5], b"hello");
     }
 }

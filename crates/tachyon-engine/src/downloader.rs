@@ -36,6 +36,7 @@ use tachyon_scheduler::AdaptiveDownloadScheduler;
 use crate::circuit_breaker::SourceCircuitBreakers;
 use crate::mirror::MirrorProtocol;
 use crate::storage_adapter::{DynStorage, StorageSet, check_disk_space};
+use tachyon_io::AlignedBuf;
 use tachyon_io::buffer::{BufferGuard, BufferPool};
 
 /// 类型擦除的校验器,通过 Arc<dyn Verifier> 实现动态分发。
@@ -164,17 +165,20 @@ pub struct DownloadTask {
 
 /// 跨分片复用的写入缓冲区包装。
 ///
-/// 统一池化(`BufferGuard`,RAII,Drop 自动归还)与非池化(`BytesMut`,Drop 释放内存)
+/// 统一池化(`BufferGuard`,RAII,Drop 自动归还)与非池化(`AlignedBuf`,Drop 释放内存)
 /// 两条路径,使 worker 在被 `abort_all` 取消(future 在 await 点被丢弃)时,
 /// `Guard` 变体仍能通过 `BufferGuard::drop` 正确归还 buffer,避免池许可泄漏。
+///
+/// 两条路径的底层缓冲区都是 512 字节对齐的 `AlignedBuf`,使 IOCP/WinFile
+/// 的 NO_BUFFERING 对齐快速路径生效。
 enum WriteBuf {
     Guard(BufferGuard),
-    Owned(bytes::BytesMut),
+    Owned(AlignedBuf),
 }
 
 impl WriteBuf {
-    /// 以 `&mut BytesMut` 暴露内部缓冲区,供 `download_single_fragment` 使用。
-    fn as_mut(&mut self) -> &mut bytes::BytesMut {
+    /// 以 `&mut AlignedBuf` 暴露内部缓冲区,供 `download_single_fragment` 使用。
+    fn as_mut(&mut self) -> &mut AlignedBuf {
         match self {
             WriteBuf::Guard(g) => g.buf_mut(),
             WriteBuf::Owned(b) => b,
@@ -1331,7 +1335,9 @@ impl DownloadTask {
                 // `BufferGuard::drop` 自动归还 buffer,避免池许可泄漏。
                 let mut write_buf = match frag_buffer_pool {
                     Some(ref bp) => WriteBuf::Guard(bp.alloc_guarded().await),
-                    None => WriteBuf::Owned(bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES)),
+                    None => WriteBuf::Owned(
+                        AlignedBuf::new(WRITE_BATCH_BYTES).expect("AlignedBuf 分配失败(内存不足)"),
+                    ),
                 };
 
                 let worker_result: FragmentTaskResult = loop {
@@ -1837,7 +1843,7 @@ impl DownloadTask {
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
         verifier: &VerifierKind,
         compute_hash: bool,
-        write_buf: &mut bytes::BytesMut,
+        write_buf: &mut AlignedBuf,
     ) -> DownloadResult<(u64, Duration, Option<String>)> {
         let mut control_rx = control_rx.clone();
 
@@ -1938,8 +1944,27 @@ impl DownloadTask {
                 control_check_countdown -= 1;
             }
             let chunk = chunk_result?;
-            // 零拷贝优化: 大 chunk 直接写入,跳过 BytesMut 聚合
-            if chunk.len() >= WRITE_BATCH_BYTES && write_buf.is_empty() {
+            // 零拷贝优化: 大 chunk 直接写入,跳过 AlignedBuf 聚合
+            if chunk.len() >= WRITE_BATCH_BYTES {
+                // 先刷写 write_buf 中累积的残余数据(可能因小 chunk 累积未满阈值)
+                if !write_buf.is_empty() {
+                    let batch = write_buf.split().freeze();
+                    let (new_pos, w) = Self::flush_batch(
+                        storage,
+                        pos,
+                        batch,
+                        &mut hasher,
+                        frag_index,
+                        total_written,
+                        expected_len,
+                        &rate_limiter,
+                        &mut control_rx,
+                        pause_timeout,
+                    )
+                    .await?;
+                    pos = new_pos;
+                    total_written += w;
+                }
                 // chunk 本就是 owned Bytes,直接传入 flush_batch,消除
                 // 旧路径 BytesMut::from(chunk) 的 256KiB memcpy + 堆分配。
                 let (new_pos, w) = Self::flush_batch(
@@ -1963,6 +1988,25 @@ impl DownloadTask {
                     progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
                 }
                 continue;
+            }
+            // 容量不足时先刷写已有数据(AlignedBuf 固定容量不自动扩容,与 BytesMut 不同)
+            if !write_buf.is_empty() && write_buf.len() + chunk.len() > WRITE_BATCH_BYTES {
+                let batch = write_buf.split().freeze();
+                let (new_pos, w) = Self::flush_batch(
+                    storage,
+                    pos,
+                    batch,
+                    &mut hasher,
+                    frag_index,
+                    total_written,
+                    expected_len,
+                    &rate_limiter,
+                    &mut control_rx,
+                    pause_timeout,
+                )
+                .await?;
+                pos = new_pos;
+                total_written += w;
             }
             write_buf.extend_from_slice(&chunk);
             progress_report_countdown = progress_report_countdown.saturating_sub(1);
@@ -2494,7 +2538,8 @@ impl DownloadTask {
 
         tokio::pin!(stream);
         let mut pos: u64 = 0;
-        let mut write_buf = bytes::BytesMut::with_capacity(WRITE_BATCH_BYTES);
+        let mut write_buf =
+            AlignedBuf::new(WRITE_BATCH_BYTES).expect("AlignedBuf 分配失败(内存不足)");
 
         loop {
             // 流读取与取消信号竞速(与 download_single_fragment 的 select! 同构):
@@ -2518,6 +2563,46 @@ impl DownloadTask {
                 }
             };
             let chunk = chunk_result?;
+            // 大 chunk(>= WRITE_BATCH_BYTES)直接写入,不经过 AlignedBuf 聚合
+            if chunk.len() >= WRITE_BATCH_BYTES {
+                // 先刷写 write_buf 中累积的残余数据
+                if !write_buf.is_empty() {
+                    let written = Self::write_all_at(
+                        &storage,
+                        pos,
+                        write_buf.split().freeze(),
+                        &mut self.control_rx,
+                        pause_timeout,
+                    )
+                    .await?;
+                    pos = pos.checked_add(written).ok_or_else(|| {
+                        DownloadError::Other(
+                            format!("BT fallback 偏移溢出: {pos}+{written}").into(),
+                        )
+                    })?;
+                }
+                let written =
+                    Self::write_all_at(&storage, pos, chunk, &mut self.control_rx, pause_timeout)
+                        .await?;
+                pos = pos.checked_add(written).ok_or_else(|| {
+                    DownloadError::Other(format!("BT fallback 偏移溢出: {pos}+{written}").into())
+                })?;
+                continue;
+            }
+            // 容量不足时先刷写已有数据(AlignedBuf 固定容量不自动扩容)
+            if !write_buf.is_empty() && write_buf.len() + chunk.len() > WRITE_BATCH_BYTES {
+                let written = Self::write_all_at(
+                    &storage,
+                    pos,
+                    write_buf.split().freeze(),
+                    &mut self.control_rx,
+                    pause_timeout,
+                )
+                .await?;
+                pos = pos.checked_add(written).ok_or_else(|| {
+                    DownloadError::Other(format!("BT fallback 偏移溢出: {pos}+{written}").into())
+                })?;
+            }
             write_buf.extend_from_slice(&chunk);
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 let written = Self::write_all_at(

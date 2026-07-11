@@ -281,8 +281,12 @@ fn bench_disk_io_backends(c: &mut Criterion) {
     });
 
     // IOCP 后端(Windows 默认)/ io_uring(Linux 默认)。
-    // 与 TokioFile 对比,验证默认后端的对齐快速路径(无 write_lock 串行化)是否更优。
-    // 非 Windows 且非 Linux io_uring 时回退到 Standard,此时与 tokio_file 相同。
+    // 注入对齐 BufferPool(512B 对齐),使 IOCP/WinFile 的 NO_BUFFERING 对齐快速路径生效。
+    // 未注入时 Vec<u8> 堆分配仅 16B 对齐,needs_fallback 必然 true,退化为 TokioFile 等价。
+    let aligned_pool = Arc::new(tachyon_io::BufferPool::with_prefill(
+        tachyon_core::config::WRITE_BATCH_BYTES,
+        16, // max_concurrent_fragments=4(test_config),16 足够
+    ));
     group.bench_function("default_io_strategy", |b| {
         b.to_async(&rt).iter(|| async {
             let dir = tempfile::TempDir::new().unwrap();
@@ -292,6 +296,7 @@ fn bench_disk_io_backends(c: &mut Criterion) {
             config.io_strategy = tachyon_core::config::IoStrategy::default();
             let mut task =
                 DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
+            task.set_buffer_pool(aligned_pool.clone());
             task.run().await.expect("下载失败");
             assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
         });
@@ -351,7 +356,11 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
     });
 
     // IOCP 后端(Windows 默认)/ io_uring(Linux 默认)。
-    // 大文件分片并发下,对比 TokioFile 的 write_lock 串行化与默认后端的真异步写入。
+    // 注入对齐 BufferPool 使 IOCP NO_BUFFERING 对齐快速路径生效(无锁真异步)。
+    let aligned_pool = Arc::new(tachyon_io::BufferPool::with_prefill(
+        tachyon_core::config::WRITE_BATCH_BYTES,
+        16,
+    ));
     group.bench_function("default_io_strategy", |b| {
         b.to_async(&rt).iter(|| async {
             let dir = tempfile::TempDir::new().unwrap();
@@ -361,6 +370,7 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
             config.io_strategy = tachyon_core::config::IoStrategy::default();
             let mut task =
                 DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
+            task.set_buffer_pool(aligned_pool.clone());
             task.run().await.expect("下载失败");
             assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
         });

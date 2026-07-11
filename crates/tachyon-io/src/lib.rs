@@ -12,6 +12,7 @@
 //! 粒度承担;且 `write_pipeline` bench 全程直连 `TokioFile`,不经真实下载路径,
 //! 无法证明接入收益。如需重新引入,应先补跨文件接入与 >10% 收益的 bench 证据。
 
+pub mod aligned_buf;
 pub mod buffer;
 pub mod iocp;
 pub mod iouring;
@@ -19,6 +20,7 @@ pub mod storage;
 pub mod tokio_file;
 pub mod winio;
 
+pub use aligned_buf::AlignedBuf;
 pub use buffer::{BufferGuard, BufferPool, BufferPoolStats};
 pub use iocp::IoCpStorage;
 pub use iouring::{IoUringConfig, IoUringState, IoUringStorage};
