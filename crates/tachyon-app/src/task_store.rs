@@ -114,6 +114,7 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
             .hf_meta
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        display_order: snapshot.display_order,
     }
 }
 
@@ -160,6 +161,7 @@ pub fn task_info_to_snapshot(
             .as_ref()
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .filter(|v| !v.is_null()),
+        display_order: task.display_order,
     }
 }
 
@@ -190,6 +192,7 @@ mod tests {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
 
         let task = snapshot_to_task_info(&snapshot);
@@ -223,6 +226,7 @@ mod tests {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
 
         store.save_snapshot(&snapshot).unwrap();
@@ -259,6 +263,7 @@ mod tests {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
         store.save_snapshot(&good).unwrap();
 
@@ -329,6 +334,7 @@ mod tests {
             error_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
 
         let snapshot = task_info_to_snapshot(

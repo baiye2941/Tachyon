@@ -2433,6 +2433,7 @@ mod tests {
             scheduler: None,
             hub: None,
             clipboard: None,
+            notifications: None,
         };
         let result = patch.apply_to(&base);
 
@@ -2490,6 +2491,7 @@ mod tests {
                 enable_watch: Some(true),
                 poll_interval_ms: Some(2000),
             }),
+            notifications: None,
         };
         let result = patch.apply_to(&base);
         assert!(result.clipboard.enable_watch);
@@ -3624,6 +3626,7 @@ mod tests {
             scheduler: None,
             hub: None,
             clipboard: None,
+            notifications: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, 10);
@@ -3648,6 +3651,7 @@ mod tests {
             scheduler: None,
             hub: None,
             clipboard: None,
+            notifications: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.download.download_dir, "/patched");
@@ -3687,6 +3691,7 @@ mod tests {
                 }),
             }),
             clipboard: None,
+            notifications: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, 8);
@@ -3708,6 +3713,7 @@ mod tests {
             scheduler: None,
             hub: None,
             clipboard: None,
+            notifications: None,
         };
         let result = patch.apply_to(&base);
         assert_eq!(result.max_concurrent_tasks, base.max_concurrent_tasks);
@@ -4152,7 +4158,8 @@ mod proptests {
                 scheduler: None,
                 hub: None,
                 clipboard: None,
-            };
+            notifications: None,
+        };
 
             let patched = patch.apply_to(&base);
             // 仅验证不 panic;由于随机 dir 可能含非法字符,不强制 Ok

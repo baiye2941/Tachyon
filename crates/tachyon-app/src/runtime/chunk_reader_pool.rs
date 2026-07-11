@@ -463,6 +463,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -548,6 +549,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -628,6 +630,7 @@ mod tests {
                     error_reason: None,
                     retry_count: 0,
                     hf_meta: None,
+                    display_order: 0,
                 },
             );
 
@@ -702,6 +705,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 

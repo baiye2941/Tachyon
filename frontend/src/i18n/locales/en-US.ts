@@ -158,9 +158,14 @@ const enUS = {
   "confirm.updateConfig.message":
     "Changing downloader configuration may affect security-related fields (download directory, authorized paths, etc.). Please confirm to continue.",
   "confirm.updateConfig.confirmLabel": "Confirm Save",
+  "confirm.importBackup.title": "Import Configuration",
+  "confirm.importBackup.message":
+    "Importing will overwrite the current configuration. This action cannot be undone. Continue?",
+  "confirm.importBackup.confirmLabel": "Import",
   "confirm.destructive.deleteTask": "Delete this download task record",
   "confirm.destructive.updateConfig":
     "Modify downloader configuration (including security-related fields)",
+  "confirm.destructive.importBackup": "Overwrite current configuration from backup file",
   "confirm.destructive.default": "This action cannot be undone",
   "confirm.destructive.prompt": "Confirm this action?\n\n{description}",
 
@@ -376,11 +381,16 @@ const enUS = {
   "toast.clipboardUrlIgnore": "Ignore",
   "toast.clipboardUrlDownloadFailed": "Failed to create download task: {error}",
   "toast.refreshTasksFailed": "Failed to refresh task list: {error}",
+  "toast.reorderTasksFailed": "Failed to reorder tasks: {error}",
   "toast.noTasksToPause": "No tasks to pause",
   "toast.noTasksToResume": "No tasks to resume",
   "toast.configSaved": "Configuration saved",
   "toast.configSaveFailed": "Failed to save configuration: {error}",
   "toast.configLoadFailed": "Failed to load configuration: {error}",
+  "toast.exportBackupSuccess": "Configuration exported",
+  "toast.exportBackupFailed": "Failed to export configuration: {error}",
+  "toast.importBackupSuccess": "Configuration imported",
+  "toast.importBackupFailed": "Failed to import configuration: {error}",
   "toast.openDirPickerFailed": "Cannot open directory picker: {error}",
   "toast.historySaveFailed": "Failed to save history, storage may be full",
   "toast.hubListFailed": "Failed to list repository files: {error}",
@@ -530,6 +540,8 @@ const enUS = {
   "settings.about.headersCount": "{n} entries",
   "settings.about.securityHint":
     "These fields are protected by backend security policy and cannot be edited here (headers carry CRLF injection risk; user_agent should not be overridden by the frontend).",
+  "settings.exportBackup": "Export",
+  "settings.importBackup": "Import",
   "settings.save": "Save",
 
   // —— History panel ——

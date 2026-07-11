@@ -156,6 +156,8 @@ pub fn run() {
             delete_task,
             undo_cancel_task,
             undo_delete_task,
+            reorder_tasks,
+            move_task,
             get_task_list,
             get_task_detail,
             // 进度查询
@@ -172,6 +174,8 @@ pub fn run() {
             // 配置管理
             get_config,
             update_config,
+            export_backup,
+            import_backup,
             // HuggingFace Hub
             list_repo_files,
             get_hf_download_url,
@@ -218,6 +222,7 @@ async fn any_fragment() {
         error_reason: None,
         retry_count: 0,
         hf_meta: None,
+        display_order: 0,
     };
     state.domain.task_repository.insert(task_id.clone(), task);
 
@@ -268,6 +273,7 @@ async fn max_concurrent() {
                     error_reason: None,
                     retry_count: 0,
                     hf_meta: None,
+                    display_order: 0,
                 },
             );
         }

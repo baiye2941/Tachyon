@@ -47,6 +47,7 @@ describe('commandRisk (P1-11a)', () => {
         'add_model_favorite',
         'remove_model_favorite',
         'batch_create_hf_tasks',
+        'export_backup',
       ]
       for (const cmd of expected) {
         expect(mutate).toContain(cmd)
@@ -59,6 +60,7 @@ describe('commandRisk (P1-11a)', () => {
         .map(([cmd]) => cmd)
       expect(destructive).toContain('delete_task')
       expect(destructive).toContain('update_config')
+      expect(destructive).toContain('import_backup')
     })
 
     it('风险表至少覆盖 15 个命令(无遗漏)', () => {
@@ -153,6 +155,15 @@ describe('commandRisk (P1-11a)', () => {
       expect(firstCall).toBeDefined()
       const callArg = firstCall![0] as string
       expect(callArg).toContain('配置')
+    })
+
+    it('import_backup 确认对话框含"覆盖"描述', async () => {
+      vi.stubGlobal('confirm', vi.fn(() => true))
+      await confirmDestructive('import_backup')
+      const firstCall = (window.confirm as Mock).mock.calls[0]
+      expect(firstCall).toBeDefined()
+      const callArg = firstCall![0] as string
+      expect(callArg).toContain('覆盖')
     })
 
     it('未登记命令视为 destructive,弹确认', async () => {

@@ -192,6 +192,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
 
   const [saving, setSaving] = createSignal(false);
   const [confirmOpen, setConfirmOpen] = createSignal(false);
+  const [importConfirmOpen, setImportConfirmOpen] = createSignal(false);
+  const [exporting, setExporting] = createSignal(false);
+  const [importing, setImporting] = createSignal(false);
   // About 标签:支持协议列表 + 应用版本(只读,来自后端)
   const [protocols, setProtocols] = createSignal<string[]>([]);
   const [appVersion, setAppVersion] = createSignal<string>("");
@@ -342,6 +345,46 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       }
     } catch (e) {
       addToast(tr("toast.openDirPickerFailed", { error: errorMessage(e) }), "error");
+    }
+  };
+
+  const handleExportBackup = async () => {
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        defaultPath: "tachyon-config-backup.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      setExporting(true);
+      await api.exportBackup(path);
+      addToast(tr("toast.exportBackupSuccess"), "success");
+    } catch (e) {
+      addToast(tr("toast.exportBackupFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleImportBackup = async () => {
+    setImportConfirmOpen(false);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        multiple: false,
+      });
+      if (typeof selected !== "string") return;
+      setImporting(true);
+      await api.importBackup(selected);
+      const fresh = await api.getConfig();
+      $config.set(fresh);
+      applyConfig(fresh);
+      addToast(tr("toast.importBackupSuccess"), "success");
+    } catch (e) {
+      addToast(tr("toast.importBackupFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -505,27 +548,47 @@ export default function SettingsPanel(props: SettingsPanelProps) {
           </div>
 
           <div
-            class="flex items-center justify-end gap-2"
+            class="flex items-center justify-between gap-2"
             style={{
               padding: "12px 20px",
               "border-top": "1px solid var(--color-border-subtle)",
             }}
           >
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => props.onClose()}
-            >
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="brand"
-              size="sm"
-              loading={$configLoading.get() || saving()}
-              onClick={handleSave}
-            >
-              {saving() ? t("common.saving") : t("settings.save")}
-            </Button>
+            <div class="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={exporting()}
+                onClick={handleExportBackup}
+              >
+                {t("settings.exportBackup")}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={importing()}
+                onClick={() => setImportConfirmOpen(true)}
+              >
+                {t("settings.importBackup")}
+              </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => props.onClose()}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant="brand"
+                size="sm"
+                loading={$configLoading.get() || saving()}
+                onClick={handleSave}
+              >
+                {saving() ? t("common.saving") : t("settings.save")}
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -539,6 +602,17 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         loading={saving()}
         onConfirm={handleConfirmSave}
         onCancel={() => setConfirmOpen(false)}
+      />
+
+      {/* 配置导入确认对话框:覆盖当前配置属于破坏性操作 */}
+      <ConfirmDialog
+        open={importConfirmOpen()}
+        title={t("confirm.importBackup.title")}
+        message={t("confirm.importBackup.message")}
+        confirmLabel={t("confirm.importBackup.confirmLabel")}
+        loading={importing()}
+        onConfirm={handleImportBackup}
+        onCancel={() => setImportConfirmOpen(false)}
       />
     </Show>
   );

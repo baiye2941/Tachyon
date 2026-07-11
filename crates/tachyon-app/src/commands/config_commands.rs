@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use tachyon_core::config::{AppConfig, ConfigPatch};
+use tachyon_core::config::{
+    AppConfig, ClipboardPatch, ConfigPatch, ConnectionPatch, DownloadPatch, HubPatch, MagnetPatch,
+    NotificationsPatch, SchedulerPatch,
+};
 
 use super::{AppError, AppState};
 
@@ -33,6 +36,37 @@ pub async fn update_config(
         }
     }
     update_config_inner(&state, patch).await
+}
+
+#[tauri::command]
+pub async fn export_backup(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), AppError> {
+    export_backup_inner(&state, path).await
+}
+
+#[tauri::command]
+pub async fn import_backup(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    confirmation_token: Option<String>,
+) -> Result<(), AppError> {
+    // P1-11b: 覆盖当前配置属于破坏性操作，复用 update_config 的确认令牌校验
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "update_config")?;
+        }
+        None => {
+            return Err(super::AppError::Config(
+                "导入配置需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    import_backup_inner(&state, path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +154,101 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     }
 
     Ok(())
+}
+
+async fn export_backup_inner(state: &AppState, path: String) -> Result<(), AppError> {
+    let cfg = state.domain.config.lock().await.clone();
+    let path = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || {
+        let json = serde_json::to_string_pretty(&cfg)
+            .map_err(|e| AppError::Config(format!("序列化配置失败: {e}")))?;
+        std::fs::write(&path, json)
+            .map_err(|e| AppError::Config(format!("写入备份文件失败: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("导出备份任务失败: {e}")))?
+}
+
+async fn import_backup_inner(state: &AppState, path: String) -> Result<(), AppError> {
+    let path = std::path::PathBuf::from(path);
+    let imported: AppConfig = tokio::task::spawn_blocking(move || {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| AppError::Config(format!("读取备份文件失败: {e}")))?;
+        serde_json::from_str::<AppConfig>(&json)
+            .map_err(|e| AppError::Config(format!("解析备份文件失败: {e}")))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("导入备份任务失败: {e}")))??;
+
+    // 先校验导入文件本身的完整性与安全边界
+    validate_config(&imported)?;
+    // 将完整配置转换为全量补丁，通过已有 update_config_inner 应用并持久化
+    let patch = app_config_to_patch(&imported);
+    update_config_inner(state, patch).await
+}
+
+/// 将完整 AppConfig 转换为全量 ConfigPatch。
+///
+/// 用于导入备份:备份文件保存完整配置(便于人工审阅与调试),
+/// 导入时仅应用允许前端修改的字段,安全字段(user_agent/headers/authorized_dirs 等)
+/// 由后端保留原值,不会被覆盖。
+fn app_config_to_patch(cfg: &AppConfig) -> ConfigPatch {
+    ConfigPatch {
+        max_concurrent_tasks: Some(cfg.max_concurrent_tasks),
+        download: Some(DownloadPatch {
+            download_dir: Some(cfg.download.download_dir.clone()),
+            max_concurrent_fragments: Some(cfg.download.max_concurrent_fragments),
+            max_retries: Some(cfg.download.max_retries),
+            request_timeout_secs: Some(cfg.download.request_timeout_secs),
+            connect_timeout_secs: Some(cfg.download.connect_timeout_secs),
+            verify_checksum: Some(cfg.download.verify_checksum),
+            pause_timeout_secs: Some(cfg.download.pause_timeout_secs),
+            rate_limit_bytes_per_sec: Some(cfg.download.rate_limit_bytes_per_sec),
+            io_strategy: Some(cfg.download.io_strategy),
+            proxy: Some(cfg.download.proxy.clone()),
+        }),
+        connection: Some(ConnectionPatch {
+            max_connections_per_host: Some(cfg.connection.max_connections_per_host),
+            max_global_connections: Some(cfg.connection.max_global_connections),
+            keep_alive_timeout_secs: Some(cfg.connection.keep_alive_timeout_secs),
+            connect_timeout_secs: Some(cfg.connection.connect_timeout_secs),
+            enable_http2: Some(cfg.connection.enable_http2),
+            enable_quic: Some(cfg.connection.enable_quic),
+        }),
+        scheduler: Some(SchedulerPatch {
+            min_fragment_size: Some(cfg.scheduler.min_fragment_size),
+            max_fragment_size: Some(cfg.scheduler.max_fragment_size),
+            ewma_alpha: Some(cfg.scheduler.ewma_alpha),
+        }),
+        magnet: Some(MagnetPatch {
+            metadata_timeout_secs: Some(cfg.magnet.metadata_timeout_secs),
+            download_timeout_secs: Some(cfg.magnet.download_timeout_secs),
+            enable_dht: Some(cfg.magnet.enable_dht),
+            enable_upnp: Some(cfg.magnet.enable_upnp),
+            trackers: Some(cfg.magnet.trackers.clone()),
+            stall_timeout_secs: Some(cfg.magnet.stall_timeout_secs),
+            disable_dht_persistence: Some(cfg.magnet.disable_dht_persistence),
+            peer_wait_timeout_secs: Some(cfg.magnet.peer_wait_timeout_secs),
+            socks_proxy_url: Some(cfg.magnet.socks_proxy_url.clone()),
+            peer_connect_timeout_secs: Some(cfg.magnet.peer_connect_timeout_secs),
+            peer_read_write_timeout_secs: Some(cfg.magnet.peer_read_write_timeout_secs),
+            force_tracker_interval_secs: Some(cfg.magnet.force_tracker_interval_secs),
+            defer_writes_up_to_mb: Some(cfg.magnet.defer_writes_up_to_mb),
+            disable_dht_when_socks: Some(cfg.magnet.disable_dht_when_socks),
+            peer_addrs: Some(cfg.magnet.peer_addrs.clone()),
+        }),
+        hub: Some(HubPatch {
+            source_mode: Some(cfg.hub.source_mode),
+        }),
+        clipboard: Some(ClipboardPatch {
+            enable_watch: Some(cfg.clipboard.enable_watch),
+            poll_interval_ms: Some(cfg.clipboard.poll_interval_ms),
+        }),
+        notifications: Some(NotificationsPatch {
+            enabled: Some(cfg.notifications.enabled),
+        }),
+    }
 }
 
 /// 连接配置逐字段相等性比较。
@@ -887,6 +1016,7 @@ mod tests {
             error_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
         state
             .domain
@@ -1409,5 +1539,68 @@ mod tests {
         assert!(!is_forbidden_authorized_root(std::path::Path::new(
             "/home/user/downloads"
         )));
+    }
+
+    #[tokio::test]
+    async fn test_export_backup_writes_pretty_json() {
+        let state = test_state();
+        let file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        export_backup_inner(&state, path.clone()).await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("maxConcurrentTasks"));
+        // pretty 输出应包含换行
+        assert!(content.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["maxConcurrentTasks"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_import_backup_applies_config_and_persists() {
+        let state = test_state();
+        // 构造一个可序列化的备份配置,修改 max_concurrent_tasks 为 7
+        let mut backup = {
+            let cfg = state.domain.config.lock().await.clone();
+            cfg
+        };
+        backup.max_concurrent_tasks = 7;
+
+        let file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        std::fs::write(&path, serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+
+        import_backup_inner(&state, path).await.unwrap();
+
+        let cfg = state.domain.config.lock().await;
+        assert_eq!(cfg.max_concurrent_tasks, 7);
+    }
+
+    #[tokio::test]
+    async fn test_import_backup_rejects_invalid_json() {
+        let state = test_state();
+        let file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        std::fs::write(&path, "not json").unwrap();
+
+        let err = import_backup_inner(&state, path).await.unwrap_err();
+        assert!(err.to_string().contains("解析备份文件失败"));
+    }
+
+    #[tokio::test]
+    async fn test_import_backup_rejects_out_of_range_values() {
+        let state = test_state();
+        let mut backup = {
+            let cfg = state.domain.config.lock().await.clone();
+            cfg
+        };
+        backup.max_concurrent_tasks = 9999;
+
+        let file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        std::fs::write(&path, serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+
+        let err = import_backup_inner(&state, path).await.unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_tasks"));
     }
 }

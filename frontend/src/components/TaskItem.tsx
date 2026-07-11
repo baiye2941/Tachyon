@@ -1,6 +1,6 @@
 import { createMemo, For, Show } from "solid-js";
 import type { TaskInfo, ListDensity } from "../types";
-import { CheckboxIcon } from "./icons";
+import { CheckboxIcon, DragHandleIcon } from "./icons";
 import {
   COLUMN_CELL_RENDERERS,
   type ColumnDef,
@@ -32,6 +32,11 @@ interface TaskItemProps {
   staggerIndex?: number;
   /** 拖拽期间由 TaskList 注入的实时列宽，未提供时回退 store */
   columnWidths?: (key: ColumnKey) => number | "flex-1";
+  /** 是否可拖拽排序。为 true 时左侧显示拖拽手柄 */
+  isDraggable?: boolean;
+  onDragStart?: (e: DragEvent) => void;
+  onDragEnd?: (e: DragEvent) => void;
+  classList?: { [k: string]: boolean | undefined };
 }
 
 /**
@@ -117,11 +122,13 @@ export default function TaskItem(props: TaskItemProps) {
       aria-selected={
         role() === "option" ? props.isSelected || props.isMultiSelected : undefined
       }
+      data-task-id={props.task.id}
       class="task-row cursor-pointer task-item-enter focus:outline-none focus-visible:focus-ring"
       classList={{
         "task-row--selected": props.isSelected && !props.isMultiSelected,
         "task-row--multi-selected": props.isMultiSelected,
         "task-row--compact": isCompact(),
+        ...props.classList,
       }}
       style={{
         position: "relative",
@@ -146,6 +153,21 @@ export default function TaskItem(props: TaskItemProps) {
           >
             {col.key === "name" ? (
               <div class="flex items-center gap-3 w-full min-w-0">
+                <Show when={props.isDraggable}>
+                  <div
+                    class="task-drag-handle flex items-center justify-center flex-shrink-0"
+                    draggable
+                    aria-hidden="true"
+                    onClick={(e) => e.stopPropagation()}
+                    onDragStart={props.onDragStart}
+                    onDragEnd={props.onDragEnd}
+                  >
+                    <DragHandleIcon
+                      size={14}
+                      class="text-text-tertiary"
+                    />
+                  </div>
+                </Show>
                 <Show when={props.isMultiSelectMode}>
                   <div
                     class="task-checkbox flex items-center justify-center flex-shrink-0"

@@ -7,7 +7,7 @@ pub mod states;
 pub mod task_commands;
 
 // Re-exports: Tauri commands and public types
-pub use self::config_commands::{get_config, update_config};
+pub use self::config_commands::{export_backup, get_config, import_backup, update_config};
 pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{
     add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info,
@@ -20,8 +20,8 @@ pub use self::sniffer_commands::{
     get_sniffer_resources, set_sniffer_capture_config,
 };
 pub use self::task_commands::{
-    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
-    probe_filename, resume_task, undo_cancel_task, undo_delete_task,
+    cancel_task, create_task, delete_task, get_task_detail, get_task_list, move_task, pause_task,
+    probe_filename, reorder_tasks, resume_task, undo_cancel_task, undo_delete_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,6 +146,9 @@ pub struct TaskInfo {
     /// HF 任务元数据（仅 HF 来源的下载任务有值）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_meta: Option<HfTaskMeta>,
+    /// 任务在列表中的显示顺序，越小越靠前。
+    #[serde(default)]
+    pub display_order: i64,
 }
 
 /// 序列化 URL 时脱敏，前端只看到不含敏感参数的 URL
@@ -896,6 +899,7 @@ pub(crate) mod tests {
             error_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();

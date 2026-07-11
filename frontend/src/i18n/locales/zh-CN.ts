@@ -156,8 +156,12 @@ const zhCN = {
   "confirm.updateConfig.message":
     "修改下载器配置可能影响安全相关字段（如下载目录、授权路径等），请确认是否继续？",
   "confirm.updateConfig.confirmLabel": "确认保存",
+  "confirm.importBackup.title": "导入配置",
+  "confirm.importBackup.message": "导入将覆盖当前配置,此操作不可撤销,是否继续?",
+  "confirm.importBackup.confirmLabel": "导入",
   "confirm.destructive.deleteTask": "删除该下载任务记录",
   "confirm.destructive.updateConfig": "修改下载器配置(含安全相关字段)",
+  "confirm.destructive.importBackup": "从备份文件覆盖当前配置",
   "confirm.destructive.default": "该操作不可撤销",
   "confirm.destructive.prompt": "确认执行此操作?\n\n{description}",
 
@@ -364,11 +368,16 @@ const zhCN = {
   "toast.clipboardUrlIgnore": "忽略",
   "toast.clipboardUrlDownloadFailed": "创建下载任务失败: {error}",
   "toast.refreshTasksFailed": "刷新任务列表失败: {error}",
+  "toast.reorderTasksFailed": "调整任务顺序失败: {error}",
   "toast.noTasksToPause": "没有可暂停的任务",
   "toast.noTasksToResume": "没有可恢复的任务",
   "toast.configSaved": "配置已保存",
   "toast.configSaveFailed": "保存配置失败: {error}",
   "toast.configLoadFailed": "加载配置失败: {error}",
+  "toast.exportBackupSuccess": "配置已导出",
+  "toast.exportBackupFailed": "导出配置失败: {error}",
+  "toast.importBackupSuccess": "配置已导入",
+  "toast.importBackupFailed": "导入配置失败: {error}",
   "toast.openDirPickerFailed": "无法打开目录选择器: {error}",
   "toast.historySaveFailed": "历史记录保存失败,可能存储空间不足",
   "toast.hubListFailed": "获取仓库文件列表失败: {error}",
@@ -511,6 +520,8 @@ const zhCN = {
   "settings.about.headersCount": "{n} 项",
   "settings.about.securityHint":
     "以上字段受后端安全策略保护,不可在此修改(headers 有 CRLF 注入风险,user_agent 不应被前端覆盖)。",
+  "settings.exportBackup": "导出配置",
+  "settings.importBackup": "导入配置",
   "settings.save": "保存配置",
 
   // —— 历史面板 ——

@@ -716,7 +716,107 @@ fn make_task(id: &str, file_name: &str, save_path: String) -> TaskInfo {
         error_reason: None,
         retry_count: 0,
         hf_meta: None,
+        display_order: 0,
     }
+}
+
+#[tokio::test]
+async fn test_get_task_list_sorted_by_display_order() {
+    let (service, _tmp) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        TaskInfo {
+            display_order: 200,
+            ..make_task("t1", "a.bin", "/tmp/a.bin".to_string())
+        },
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        TaskInfo {
+            display_order: 100,
+            ..make_task("t2", "b.bin", "/tmp/b.bin".to_string())
+        },
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        TaskInfo {
+            display_order: 200,
+            created_at: "2026-01-02T00:00:00Z".to_string(),
+            ..make_task("t3", "c.bin", "/tmp/c.bin".to_string())
+        },
+    );
+
+    let list = service.get_task_list();
+    let ids: Vec<_> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t2", "t3", "t1"]);
+}
+
+#[tokio::test]
+async fn test_reorder_tasks_updates_display_order() {
+    let (service, _tmp) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task("t1", "a.bin", "/tmp/a.bin".to_string()),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task("t2", "b.bin", "/tmp/b.bin".to_string()),
+    );
+
+    service
+        .reorder_tasks(vec!["t2".to_string(), "t1".to_string()])
+        .await
+        .unwrap();
+
+    let t2 = service.task_repository.get("t2").unwrap();
+    assert_eq!(t2.display_order, 0);
+    let t1 = service.task_repository.get("t1").unwrap();
+    assert_eq!(t1.display_order, 1000);
+}
+
+#[tokio::test]
+async fn test_move_task_inserts_before_target() {
+    let (service, _tmp) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        TaskInfo {
+            display_order: 0,
+            ..make_task("t1", "a.bin", "/tmp/a.bin".to_string())
+        },
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        TaskInfo {
+            display_order: 1000,
+            ..make_task("t2", "b.bin", "/tmp/b.bin".to_string())
+        },
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        TaskInfo {
+            display_order: 2000,
+            ..make_task("t3", "c.bin", "/tmp/c.bin".to_string())
+        },
+    );
+
+    service
+        .move_task("t3".to_string(), Some("t1".to_string()))
+        .await
+        .unwrap();
+
+    let list = service.get_task_list();
+    let ids: Vec<_> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t3", "t1", "t2"]);
+}
+
+#[tokio::test]
+async fn test_reorder_tasks_rejects_unknown_id() {
+    let (service, _tmp) = make_service();
+    let err = service
+        .reorder_tasks(vec!["missing".to_string()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::TaskNotFound(_)));
 }
 
 fn empty_snapshot() -> TaskSnapshot {
@@ -741,5 +841,6 @@ fn empty_snapshot() -> TaskSnapshot {
         fail_reason: None,
         retry_count: 0,
         hf_meta: None,
+        display_order: 0,
     }
 }

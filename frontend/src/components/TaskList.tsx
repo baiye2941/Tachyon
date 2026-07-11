@@ -23,6 +23,7 @@ import { useI18n } from "../i18n";
 import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { matchKeyboardEvent } from "../stores/shortcuts";
 import { openNewTaskModal } from "../stores/ui";
+import { moveTask } from "../stores/downloads";
 import { $onboarding, completeOnboarding } from "../stores/onboarding";
 import ColumnSettings from "./ColumnSettings";
 import type { ColumnDef, ColumnKey } from "./taskColumns";
@@ -85,6 +86,10 @@ export default function TaskList(props: TaskListProps) {
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [draggingKey, setDraggingKey] = createSignal<string | null>(null);
 
+  // ── Drag-and-drop reorder state ────────────────────────────────
+  const [draggingId, setDraggingId] = createSignal<string | null>(null);
+  const [dropTargetId, setDropTargetId] = createSignal<string | null>(null);
+
   // ── Column resize local state (dragging) ───────────────────────
   /** 拖拽期间暂存列宽，避免每帧写 store 触发持久化/全列表重渲染 */
   const [resizingWidths, setResizingWidths] = createSignal<
@@ -106,6 +111,10 @@ export default function TaskList(props: TaskListProps) {
   const itemHeight = createMemo(() => ITEM_HEIGHTS[props.density]);
 
   const groupByMode = createMemo(() => props.groupBy ?? "none");
+
+  const isDraggable = createMemo(
+    () => groupByMode() === "none" && $taskSort.state().key === null,
+  );
 
   // ── Sorting / flat list abstraction ────────────────────────────
   const sortedTasks = createMemo(() =>
@@ -474,6 +483,53 @@ export default function TaskList(props: TaskListProps) {
     return `task-item-${item.task.id}`;
   };
 
+  // ── Drag-and-drop handlers ─────────────────────────────────────
+  const handleDragStart = (taskId: string) => (e: DragEvent) => {
+    e.dataTransfer?.setData("text/task-id", taskId);
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+    }
+    setDraggingId(taskId);
+  };
+
+  const handleDragEnd = () => {
+    setDraggingId(null);
+    setDropTargetId(null);
+  };
+
+  const targetTaskIdFromEvent = (e: DragEvent): string | null => {
+    const target = (e.target as HTMLElement | null)?.closest(
+      "[data-task-id]",
+    ) as HTMLElement | null;
+    return target?.dataset.taskId ?? null;
+  };
+
+  const handleDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    if (!draggingId()) return;
+    const overId = targetTaskIdFromEvent(e);
+    if (overId && overId !== draggingId()) {
+      setDropTargetId(overId);
+    } else {
+      setDropTargetId(null);
+    }
+  };
+
+  const handleDragLeave = () => {
+    setDropTargetId(null);
+  };
+
+  const handleDrop = async (e: DragEvent) => {
+    e.preventDefault();
+    const draggedId = draggingId();
+    if (!draggedId) return;
+    const overId = targetTaskIdFromEvent(e);
+    const beforeId = overId === draggedId ? undefined : overId ?? undefined;
+    setDraggingId(null);
+    setDropTargetId(null);
+    await moveTask(draggedId, beforeId);
+  };
+
   return (
     <div
       class="flex-1 flex flex-col min-w-0 overflow-hidden"
@@ -579,7 +635,11 @@ export default function TaskList(props: TaskListProps) {
         aria-label={i18n.t("taskList.aria.listbox") as string}
         aria-activedescendant={activeDescendantId()}
         class="flex-1 scroll-container focus:outline-none focus-visible:focus-ring"
+        classList={{ "task-list--dragging": !!draggingId() }}
         onKeyDown={handleListKeyDown}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
       >
         <Show
           when={props.tasks.length > 0}
@@ -724,6 +784,13 @@ export default function TaskList(props: TaskListProps) {
                               it.task.id,
                             )}
                             isMultiSelectMode={props.isMultiSelectMode}
+                            isDraggable={isDraggable()}
+                            onDragStart={handleDragStart(it.task.id)}
+                            onDragEnd={handleDragEnd}
+                            classList={{
+                              "task-row--drop-target":
+                                dropTargetId() === it.task.id,
+                            }}
                             onClick={(shiftKey) => {
                               setActiveIndex(virtualRow.index);
                               if (!shiftKey) clearRangeAnchor();

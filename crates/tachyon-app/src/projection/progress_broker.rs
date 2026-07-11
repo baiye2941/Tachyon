@@ -400,6 +400,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
         repository.insert(
@@ -421,6 +422,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -463,6 +465,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -517,6 +520,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -555,6 +559,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -620,6 +625,7 @@ mod tests {
                 error_reason: None,
                 retry_count: 0,
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -674,6 +680,7 @@ mod tests {
             error_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         }
     }
 
@@ -695,6 +702,7 @@ mod tests {
             error_reason: error_reason.map(String::from),
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         }
     }
 

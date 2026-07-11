@@ -381,6 +381,7 @@ impl TaskService {
             error_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性
@@ -730,11 +731,99 @@ impl TaskService {
     }
 
     /// 获取任务列表
+    ///
+    /// 返回结果按 `display_order` 升序排列；`display_order` 相同时按
+    /// `created_at` 降序(新创建在前)作为稳定回退。
     pub fn get_task_list(&self) -> Vec<TaskInfo> {
-        self.task_repository
+        let mut tasks: Vec<TaskInfo> = self
+            .task_repository
             .iter()
             .map(|r| r.value().clone())
-            .collect()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.display_order
+                .cmp(&b.display_order)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        tasks
+    }
+
+    /// 重排任务顺序
+    ///
+    /// `ordered_ids` 为期望的新顺序(从前到后)。服务层会按
+    /// `index * 1000` 分配 `display_order`,保留未来插入空位。
+    /// 所有 ID 必须对应现存任务,否则返回 `TaskNotFound`。
+    pub async fn reorder_tasks(&self, ordered_ids: Vec<String>) -> Result<(), AppError> {
+        if ordered_ids.is_empty() {
+            return Ok(());
+        }
+
+        // 预检:所有 ID 必须存在,避免部分写入导致顺序不一致
+        for id in &ordered_ids {
+            if self.task_repository.get(id).is_none() {
+                return Err(AppError::TaskNotFound(id.clone()));
+            }
+        }
+
+        // 更新内存中的显示顺序
+        for (index, id) in ordered_ids.iter().enumerate() {
+            let order = (index as i64).saturating_mul(1000);
+            if let Some(mut task) = self.task_repository.get_mut(id) {
+                task.display_order = order;
+            }
+        }
+
+        // 持久化每个受影响任务的快照,保持 order 与磁盘一致
+        for id in &ordered_ids {
+            self.persist_snapshot(id, None).await;
+        }
+
+        tracing::info!(count = ordered_ids.len(), "已重排任务顺序");
+        Ok(())
+    }
+
+    /// 将任务移动到指定任务之前
+    ///
+    /// `before_id` 为 `None` 时表示移动到末尾。内部基于当前任务列表
+    /// 重新构建顺序并调用 [`Self::reorder_tasks`]。
+    pub async fn move_task(
+        &self,
+        task_id: String,
+        before_id: Option<String>,
+    ) -> Result<(), AppError> {
+        if self.task_repository.get(&task_id).is_none() {
+            return Err(AppError::TaskNotFound(task_id));
+        }
+        if let Some(ref before) = before_id {
+            if self.task_repository.get(before).is_none() {
+                return Err(AppError::TaskNotFound(before.clone()));
+            }
+        }
+
+        let mut ordered_ids: Vec<String> = self
+            .task_repository
+            .iter()
+            .map(|r| r.key().clone())
+            .filter(|id| id != &task_id)
+            .collect();
+        ordered_ids.sort_by_key(|id| {
+            self.task_repository
+                .get(id)
+                .map(|r| (r.display_order, r.created_at.clone()))
+                .unwrap_or((0, String::new()))
+        });
+
+        if let Some(before) = before_id {
+            let pos = ordered_ids
+                .iter()
+                .position(|id| id == &before)
+                .unwrap_or(ordered_ids.len());
+            ordered_ids.insert(pos, task_id);
+        } else {
+            ordered_ids.push(task_id);
+        }
+
+        self.reorder_tasks(ordered_ids).await
     }
 
     /// 获取任务详情

@@ -30,6 +30,8 @@ export interface TaskInfo {
   retryCount?: number
   /** HF 任务元数据(HuggingFace 模型下载任务特有) */
   hfMeta?: HfTaskMeta
+  /** 任务在列表中的显示顺序,越小越靠前。手动拖拽排序后由后端写入 */
+  displayOrder?: number
 }
 
 export interface DownloadConfig {

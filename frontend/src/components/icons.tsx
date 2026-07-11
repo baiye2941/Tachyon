@@ -138,6 +138,9 @@ export const HubIcon = makeRegular("stack", 20);
  * Phosphor 无精确 move,用 grid-four 占位语义保持导出契约 */
 export const MoveIcon = makeRegular("gridFour", 16);
 
+/** 拖拽排序手柄(三横线) */
+export const DragHandleIcon = makeRegular("list", 16);
+
 /* ===== 特殊保留图标(非 Phosphor,保持原规约)===== */
 
 /** Tachyon Logo:快子几何标识(品牌,保留自绘) */

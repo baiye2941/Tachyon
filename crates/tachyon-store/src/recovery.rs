@@ -14,7 +14,7 @@ use crate::kv::KvStore;
 /// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
 /// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
 /// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// 下载任务快照（用于断点续传）
 ///
@@ -65,6 +65,10 @@ pub struct TaskSnapshot {
     pub retry_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_meta: Option<serde_json::Value>,
+    /// 任务在列表中的显示顺序,越小越靠前。
+    /// 旧版快照无此字段时默认 0,保持与创建时间降序的兼容排序。
+    #[serde(default)]
+    pub display_order: i64,
 }
 
 /// 下载任务持久化记录（旧接口，保持向后兼容）
@@ -130,6 +134,7 @@ impl From<TaskRecord> for TaskSnapshot {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         }
     }
 }
@@ -373,6 +378,7 @@ mod tests {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         }
     }
 
@@ -564,6 +570,7 @@ mod tests {
             fail_reason: None,
             retry_count: 0,
             hf_meta: None,
+            display_order: 0,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
