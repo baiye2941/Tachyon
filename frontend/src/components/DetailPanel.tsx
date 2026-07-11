@@ -185,6 +185,37 @@ export default function DetailPanel(props: DetailPanelProps) {
   };
 
   // 侧栏宽度拖拽:左侧手柄,实时更新,释放后保持
+  const handleResizeKeyDown = (e: KeyboardEvent) => {
+    const { key, shiftKey } = e;
+    if (
+      key !== "ArrowLeft" &&
+      key !== "ArrowRight" &&
+      key !== "Home" &&
+      key !== "End"
+    ) {
+      return;
+    }
+
+    e.preventDefault();
+    const current = $detailPanel.width();
+    const step = shiftKey ? 100 : 20;
+
+    switch (key) {
+      case "ArrowLeft":
+        $detailPanel.setWidth(current - step);
+        break;
+      case "ArrowRight":
+        $detailPanel.setWidth(current + step);
+        break;
+      case "Home":
+        $detailPanel.setWidth(MIN_WIDTH);
+        break;
+      case "End":
+        $detailPanel.setWidth(MAX_WIDTH);
+        break;
+    }
+  };
+
   const handleResizePointerDown = (e: PointerEvent) => {
     e.preventDefault();
     const handle = e.currentTarget as HTMLDivElement;
@@ -879,12 +910,14 @@ export default function DetailPanel(props: DetailPanelProps) {
           <div
             class="detail-panel-resize-handle"
             role="separator"
+            tabIndex={0}
             aria-orientation="vertical"
             aria-label={t("detail.resizeHandleAria")}
             aria-valuenow={$detailPanel.width()}
             aria-valuemin={MIN_WIDTH}
             aria-valuemax={MAX_WIDTH}
             onPointerDown={handleResizePointerDown}
+            onKeyDown={handleResizeKeyDown}
           />
           <PanelContent />
         </div>

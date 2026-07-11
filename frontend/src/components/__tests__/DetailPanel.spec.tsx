@@ -400,6 +400,143 @@ describe("DetailPanel", () => {
       expect(Number(widthMatch![1])).toBeLessThanOrEqual(600);
     });
 
+    it("拖拽手柄应可聚焦", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      expect(handle.getAttribute("tabindex")).toBe("0");
+    });
+
+    it("ArrowLeft 应减小宽度 20px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*340px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(340),
+      );
+    });
+
+    it("ArrowRight 应增加宽度 20px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*380px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(380),
+      );
+    });
+
+    it("Shift+ArrowLeft 应减小宽度 100px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+    });
+
+    it("Shift+ArrowRight 应增加宽度 100px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+    });
+
+    it("Home 应跳到最小宽度", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "Home" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(280),
+      );
+    });
+
+    it("End 应跳到最大宽度", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "End" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*600px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(600),
+      );
+    });
+
+    it("键盘调整不应低于最小宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(290));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+    });
+
+    it("键盘调整不应超过最大宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(590));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*600px/);
+    });
+
+    it("覆盖式变体下手柄不可聚焦", async () => {
+      await renderWithI18n(baseTask, () => {}, "overlay");
+      await waitForRaf();
+
+      expect(
+        screen.queryByRole("separator", { name: "调整详情面板宽度" }),
+      ).toBeNull();
+    });
+
     it("侧栏模式下关闭按钮仍触发 onClose", async () => {
       const onClose = vi.fn();
       await renderWithI18n(baseTask, onClose, "side");
