@@ -770,3 +770,64 @@ with `Layout::from_size_align(size, 512)`),或引入 `aligned-vec` crate。
 这样传入 `write_at` 的 `Bytes` buffer 指针满足 512 对齐,IOCP 真异步路径生效。
 需补 bench 证明修复后 IOCP vs TokioFile 收益 >10%。
 
+#### 第五轮:AlignedBuf 修复落地 + 真实网络验证 + 深度反思
+
+**AlignedBuf 修复已落地**(提交 c43f772):
+- 新建 `aligned_buf.rs`,`AlignedBuf` 用 `std::alloc::alloc(Layout::from_size_align(size, 512))`
+  分配 512 对齐内存,通过 `Bytes::from_owner` 零拷贝产出对齐 `Bytes`
+- `BufferPool`/`BufferGuard`/`WriteBuf` 全部改用 `AlignedBuf` 替代 `BytesMut`
+- Arc 共享底层分配,`split()` 零拷贝,`freeze()` 零拷贝转 `Bytes`
+- loopback bench 改善 17.5%(IOCP 61.80ms vs TokioFile 74.91ms)
+
+**真实网络 bench 数据**(2.5MB Cloudflare CDN .ts 分片):
+- IOCP 7.93s vs TokioFile 7.26s,CI 完全重叠,**无显著差异**
+- 结论:真实网络下网络瓶颈(~300KB/s 带宽)完全淹没磁盘 I/O 差异
+
+**已验证不可行的优化**:
+- 增大 WRITE_BATCH_BYTES 256KB->1MB:退化 15-20%(cache 压力 + SSD 队列深度不友好)
+- 提高并发度 4->16:慢 2.7 倍(loopback+NVMe 下 4 并发已饱和)
+
+**深度反思:7 个进一步优化方向的误判纠正**(Explore Agent 逐行验证):
+
+1. **HTTP/2 多路复用--部分误判**:
+   - 小文件(2.5MB/2分片)收益主要来自省 TCP+TLS 握手(1-2 RTT),非多路复用吞吐
+   - 大文件(1GB/16分片)配置合理:16 流 × 1MB 流窗口 = 16MB 恰好打满连接窗口
+   - **当前配置无副作用,无需调整**
+
+2. **多源聚合--无误判,可行**:
+   - 乘性选源公式 `score=(in_flight+1)/quality` 有自平衡机制
+   - 快源 quality=1.0 需 in_flight 达到 10 才被慢源 quality=0.1 超过
+   - 慢源不会被完全饿死,消尾延迟有效
+   - 带宽叠加前提:两源链路独立(HF CloudFront vs hf-mirror 国内 CDN),通常成立
+
+3. **HF 镜像竞速--无误判,已正确实现**:
+   - 真并发竞速(probe 阶段 JoinSet 并行 + 下载阶段 least-in-flight),非顺序尝试
+   - 触发条件:HfSourceMode::Race 且 URL 含 huggingface.co 或 hf-mirror.com
+
+4. **io_uring 尾部 padding--有隐患**:
+   - RMW 已规避覆盖邻近数据(读回真实旧数据再覆盖用户区间)
+   - **但文件尾部 padding 零会导致文件略大于实际内容,未见 truncate 调用**
+   - io_uring 当前全平台返回 Unsupported(未启用),启用前必须补 truncate
+
+5. **写入并行化--无误判,真正可行**:
+   - 当前 `flush_batch` 串行了哈希(`hasher.update`)和写入(`write_all_at`)
+   - 解耦方案:串行 `hasher.update` -> 并行 `submit write_at`
+   - blake3 ~1GB/s 远超磁盘写入速度,串行哈希不会成为瓶颈
+   - **这是最明确的可行优化方向**
+
+6. **真实网络 bench 局限--无误判**:
+   - 2.5MB 太小(2 分片),7-8 秒主要是 RTT + 带宽
+   - 不支持 HF_TOKEN 认证,无法测大文件
+   - 需公开大文件或自建服务器验证 I/O 层真实网络收益
+
+7. **AlignedBuf 产品行为--无误判**:
+   - `std::alloc::alloc(Layout::from_size_align(cap, 512))` 在 Windows 上
+     由 Rust 标准库过对齐机制保证(align > MEMORY_ALLOCATION_ALIGNMENT 时手动 over-align)
+   - 惰性分配 + 产品代码已注入 BufferPool,所有路径对齐
+
+**最终结论**:
+- IOCP 优化已达当前环境(loopback + NVMe)性能上限
+- 剩余差距 ~50% 不可压缩(NO_BUFFERING 直写 vs 内存写)
+- 真实网络下网络层是瓶颈,I/O 层优化收益被淹没
+- **唯一明确可行的进一步优化:写入并行化解耦哈希(Q5)**
+- 多源聚合(Q2)在真实多源场景有收益,但需真实网络验证
