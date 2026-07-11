@@ -99,6 +99,10 @@ export interface MagnetConfig {
   peerAddrs: string[]
 }
 
+export interface NotificationsConfig {
+  enabled: boolean
+}
+
 export interface AppConfig {
   maxConcurrentTasks: number
   download: DownloadConfig
@@ -106,6 +110,7 @@ export interface AppConfig {
   scheduler: SchedulerConfig
   magnet: MagnetConfig
   hub: HubConfig
+  notifications: NotificationsConfig
 }
 
 /** 配置白名单补丁 — 仅包含允许前端修改的字段 */
@@ -116,6 +121,12 @@ export interface ConfigPatch {
   magnet?: MagnetPatch
   scheduler?: SchedulerPatch
   hub?: HubPatch
+  notifications?: NotificationsPatch
+}
+
+/** 系统通知配置白名单补丁 */
+export interface NotificationsPatch {
+  enabled?: boolean
 }
 
 /** 下载配置白名单补丁 */

@@ -669,6 +669,7 @@ mod tests {
             magnet: tachyon_core::config::MagnetConfig::default(),
             hub: tachyon_core::config::HubConfig::default(),
             clipboard: tachyon_core::config::ClipboardConfig::default(),
+            notifications: tachyon_core::config::NotificationsConfig::default(),
         }
     }
 
@@ -949,6 +950,7 @@ mod tests {
             magnet: tachyon_core::config::MagnetConfig::default(),
             hub: tachyon_core::config::HubConfig::default(),
             clipboard: tachyon_core::config::ClipboardConfig::default(),
+            notifications: tachyon_core::config::NotificationsConfig::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();

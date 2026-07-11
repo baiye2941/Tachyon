@@ -688,6 +688,37 @@ impl ClipboardConfig {
     }
 }
 
+/// 系统通知配置
+///
+/// 控制任务进入 Completed/Failed 终态时是否向前端推送 `task-notification` 事件。
+/// 实际是否显示原生通知由前端根据此开关决定(尊重用户偏好、避免未授权弹窗)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationsConfig {
+    /// 是否启用任务终态系统通知,默认 true
+    #[serde(default = "default_notifications_enabled")]
+    pub enabled: bool,
+}
+
+fn default_notifications_enabled() -> bool {
+    true
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_notifications_enabled(),
+        }
+    }
+}
+
+impl NotificationsConfig {
+    /// 校验配置值(当前仅 bool,无需额外约束)
+    pub fn validate(&self) -> crate::DownloadResult<()> {
+        Ok(())
+    }
+}
+
 impl MagnetConfig {
     /// 校验配置值
     pub fn validate(&self) -> crate::DownloadResult<()> {
@@ -1066,6 +1097,9 @@ pub struct ConfigPatch {
     /// 剪贴板监听配置补丁
     #[serde(default)]
     pub clipboard: Option<ClipboardPatch>,
+    /// 系统通知配置补丁
+    #[serde(default)]
+    pub notifications: Option<NotificationsPatch>,
 }
 
 /// 剪贴板监听配置补丁
@@ -1084,6 +1118,22 @@ impl ClipboardPatch {
         }
         if let Some(v) = self.poll_interval_ms {
             base.poll_interval_ms = v;
+        }
+    }
+}
+
+/// 系统通知配置补丁
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationsPatch {
+    pub enabled: Option<bool>,
+}
+
+impl NotificationsPatch {
+    /// 将通知补丁应用到现有 NotificationsConfig,仅更新 Some 字段
+    pub fn apply_to(&self, base: &mut NotificationsConfig) {
+        if let Some(v) = self.enabled {
+            base.enabled = v;
         }
     }
 }
@@ -1261,6 +1311,9 @@ impl ConfigPatch {
         if let Some(patch) = &self.clipboard {
             patch.apply_to(&mut result.clipboard);
         }
+        if let Some(patch) = &self.notifications {
+            patch.apply_to(&mut result.notifications);
+        }
         result
     }
 }
@@ -1342,6 +1395,7 @@ impl AppConfig {
         self.connection.validate()?;
         self.scheduler.validate()?;
         self.magnet.validate()?;
+        self.notifications.validate()?;
         Ok(())
     }
 }
@@ -1372,6 +1426,9 @@ pub struct AppConfig {
     /// 剪贴板监听配置
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// 系统通知配置
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 impl AppConfig {
@@ -1391,6 +1448,7 @@ impl Default for AppConfig {
             magnet: MagnetConfig::default(),
             hub: HubConfig::default(),
             clipboard: ClipboardConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -1440,6 +1498,74 @@ mod tests {
             dir.contains("Downloads") || dir.contains("tachyon-downloads"),
             "unexpected download_dir: {dir}"
         );
+    }
+
+    #[test]
+    fn test_notifications_config_default_enabled() {
+        let config = NotificationsConfig::default();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_notifications_patch_apply_to() {
+        let mut config = NotificationsConfig::default();
+        assert!(config.enabled);
+        NotificationsPatch {
+            enabled: Some(false),
+        }
+        .apply_to(&mut config);
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_app_config_deserializes_missing_notifications_as_default() {
+        let json = r#"{
+            "maxConcurrentTasks": 3,
+            "download": {
+                "downloadDir": "/tmp",
+                "maxConcurrentFragments": 8,
+                "maxRetries": 3,
+                "requestTimeoutSecs": 30,
+                "connectTimeoutSecs": 10,
+                "verifyChecksum": false,
+                "userAgent": "Tachyon/1.0",
+                "headers": {},
+                "pauseTimeoutSecs": 300,
+                "authorizedDirs": ["/tmp"]
+            },
+            "connection": {
+                "maxConnectionsPerHost": 4,
+                "maxGlobalConnections": 256,
+                "keepAliveTimeoutSecs": 30,
+                "connectTimeoutSecs": 10,
+                "enableHttp2": true,
+                "enableQuic": true
+            },
+            "scheduler": {
+                "minFragmentSize": 1048576,
+                "maxFragmentSize": 5242880,
+                "samplingIntervalSecs": 5,
+                "ewmaAlpha": 0.3
+            },
+            "magnet": {
+                "metadataTimeoutSecs": 30,
+                "downloadTimeoutSecs": 60,
+                "enableDht": true,
+                "enableUpnp": true,
+                "trackers": [],
+                "disableDhtPersistence": false,
+                "peerWaitTimeoutSecs": 300
+            },
+            "hub": {
+                "sourceMode": "mirror"
+            },
+            "clipboard": {
+                "enableWatch": false,
+                "pollIntervalMs": 1000
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.notifications.enabled);
     }
 
     #[test]

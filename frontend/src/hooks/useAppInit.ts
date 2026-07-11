@@ -11,10 +11,12 @@ import { addToast } from "../stores/toast";
 import { addToast as addRichToast } from "../components/ToastContainer";
 import * as speedHistory from "../stores/speedHistory";
 import { isBrowserDev, startMockData } from "../stores/mockData";
+import { $config } from "../stores/settings";
 import type { SnifferResource } from "../types";
 import { tr } from "../i18n";
 import { useProgressListener } from "./useTauriEvent";
 import { useRafThrottle } from "./useRafThrottle";
+import { useTaskNotifications } from "./useTaskNotifications";
 import { loadShortcuts } from "../stores/shortcuts";
 
 /**
@@ -35,6 +37,8 @@ export function useAppInit(
 
   // 真实数据订阅(Tauri 环境生效)
   useProgressListener();
+  // 任务终态系统通知(仅在 Tauri 环境且设置开启时生效)
+  useTaskNotifications();
 
   onMount(() => {
     // 先加载快捷键覆盖配置,确保全局键盘监听使用最新绑定
@@ -46,6 +50,12 @@ export function useAppInit(
     }
 
     refreshTaskList();
+
+    // 预加载应用配置,确保通知等依赖配置的模块在启动时即可读取用户偏好
+    api
+      .getConfig()
+      .then((cfg) => $config.set(cfg))
+      .catch((e) => addToast(tr("toast.configLoadFailed", { error: errorMessage(e) }), "error"));
 
     api
       .subscribeProgress()

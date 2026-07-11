@@ -1,5 +1,6 @@
 import type { SetStoreFunction } from "solid-js/store";
 import Button from "../../../shared/ui/Button";
+import ToggleItem from "../items/ToggleItem";
 import { tr } from "../../../i18n";
 import type { ConfigDraft } from "../SettingsPanel";
 
@@ -45,6 +46,21 @@ export default function GeneralTab(props: GeneralTabProps) {
             {t("common.browse")}
           </Button>
         </div>
+      </div>
+
+      <ToggleItem
+        label={t("settings.notifications.enabled")}
+        value={props.draft.notifications.enabled}
+        onChange={(v) => props.setDraft("notifications", "enabled", v)}
+      />
+      <div
+        style={{
+          "font-size": "11px",
+          color: "var(--color-text-tertiary)",
+          "margin-top": "-12px",
+        }}
+      >
+        {t("settings.notifications.enabledHint")}
       </div>
     </div>
   );

@@ -55,8 +55,10 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   add_model_favorite: 'mutate',
   remove_model_favorite: 'mutate',
   batch_create_hf_tasks: 'mutate',
-  // 破坏性:数据删除 / 安全策略变更
+  // 破坏性:数据删除 / 安全策略变更 / 撤销类恢复
   delete_task: 'destructive',
+  undo_cancel_task: 'destructive',
+  undo_delete_task: 'destructive',
   update_config: 'destructive',
 }
 

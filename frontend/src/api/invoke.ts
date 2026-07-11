@@ -121,6 +121,10 @@ export const api = {
     }
     return invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm)
   },
+  /** 撤销取消任务(破坏性操作,需确认令牌) */
+  undoCancelTask: (taskId: string) => invoke<void>('undo_cancel_task', { taskId }),
+  /** 撤销删除任务(破坏性操作,需确认令牌) */
+  undoDeleteTask: (taskId: string) => invoke<void>('undo_delete_task', { taskId }),
   /** 打开文件夹 */
   openFolder: (path: string) => openPath(path),
   /** 获取下载进度详情 */

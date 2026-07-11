@@ -21,7 +21,7 @@ pub use self::sniffer_commands::{
 };
 pub use self::task_commands::{
     cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
-    probe_filename, resume_task,
+    probe_filename, resume_task, undo_cancel_task, undo_delete_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -752,6 +752,7 @@ pub(crate) mod tests {
             magnet: Default::default(),
             hub: Default::default(),
             clipboard: Default::default(),
+            notifications: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
         // favorites_store 必须使用独立临时目录,不能与 task_store 共用同一目录:

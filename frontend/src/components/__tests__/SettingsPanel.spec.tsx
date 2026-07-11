@@ -73,6 +73,9 @@ const mockConfig = {
   hub: {
     sourceMode: 'mirror' as const,
   },
+  notifications: {
+    enabled: true,
+  },
 }
 
 describe('SettingsPanel', () => {
@@ -446,6 +449,38 @@ describe('SettingsPanel', () => {
   })
 
   // --- 快捷键设置页 ---
+  it('General 标签页渲染通知开关且可切换', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    // 默认在 General 标签,通知开关应可见
+    expect(screen.getByText('任务完成/失败时显示系统通知')).toBeDefined()
+
+    // 点击开关切换
+    const toggleLabel = screen.getByText('任务完成/失败时显示系统通知')
+    const toggleBtn = toggleLabel.closest('.flex.items-center.justify-between')!.querySelector('button')!
+    fireEvent.click(toggleBtn)
+
+    // 保存后 patch 应携带翻转后的通知设置
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.notifications).toBeDefined()
+    expect(calledWith.notifications!.enabled).toBe(false)
+  })
+
   it('点击 shortcuts tab 进入快捷键设置页', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     renderSettingsPanel()

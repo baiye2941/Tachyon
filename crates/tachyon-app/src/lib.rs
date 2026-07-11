@@ -79,6 +79,11 @@ pub fn run() {
             let state = app.state::<AppState>();
             let handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
+                // 注入 AppHandle 使 ProgressBroker 能发送任务终态系统通知
+                state
+                    .runtime
+                    .progress_broker
+                    .set_notification_emitter(Arc::new(handle.clone()));
                 // 在 reactor 上下文中启动 progress aggregator
                 // （构造期间不能 spawn,此时 reactor 尚未就绪）
                 state.runtime.progress_broker.spawn_aggregator();
@@ -149,6 +154,8 @@ pub fn run() {
             resume_task,
             cancel_task,
             delete_task,
+            undo_cancel_task,
+            undo_delete_task,
             get_task_list,
             get_task_detail,
             // 进度查询

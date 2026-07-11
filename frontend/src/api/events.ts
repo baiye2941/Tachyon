@@ -56,3 +56,24 @@ export async function onClipboardUrlDetected(
     return () => {}
   }
 }
+
+/** 任务终态通知事件 payload */
+export interface TaskNotificationPayload {
+  taskId: string
+  title: string
+  body: string
+  type: 'completed' | 'failed'
+}
+
+/** 监听任务终态通知事件(Completed/Failed) */
+export async function onTaskNotification(
+  handler: (payload: TaskNotificationPayload) => void,
+): Promise<UnlistenFn> {
+  try {
+    const { listen } = await import('@tauri-apps/api/event')
+    const unlisten = await listen<TaskNotificationPayload>('task-notification', (e) => handler(e.payload))
+    return unlisten
+  } catch {
+    return () => {}
+  }
+}

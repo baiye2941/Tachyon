@@ -82,6 +82,9 @@ export interface ConfigDraft {
   hub: {
     sourceMode: HfSourceMode;
   };
+  notifications: {
+    enabled: boolean;
+  };
 }
 
 const tabs: { id: SettingsTab; labelKey: MessageKey }[] = [
@@ -182,6 +185,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     hub: {
       sourceMode: "mirror",
     },
+    notifications: {
+      enabled: true,
+    },
   });
 
   const [saving, setSaving] = createSignal(false);
@@ -229,6 +235,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       },
       hub: {
         sourceMode: cfg.hub?.sourceMode ?? "mirror",
+      },
+      notifications: {
+        enabled: cfg.notifications?.enabled ?? true,
       },
     });
   };
@@ -295,6 +304,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       },
       hub: {
         sourceMode: draft.hub.sourceMode,
+      },
+      notifications: {
+        enabled: draft.notifications.enabled,
       },
     };
   };

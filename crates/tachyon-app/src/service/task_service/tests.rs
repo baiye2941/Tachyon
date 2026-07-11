@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tachyon_core::config::AppConfig;
 use tachyon_core::types::DownloadState;
@@ -71,7 +72,7 @@ fn test_local_delete_candidates_includes_suffixes() {
     let base = PathBuf::from("dl").join("model.bin");
     let candidates = local_delete_candidates("task-1", &base);
     // 用 PathBuf 比较避免跨平台路径分隔符差异
-    let has = |expected: PathBuf| candidates.iter().any(|p| *p == expected);
+    let has = |expected: PathBuf| candidates.contains(&expected);
 
     // 主文件
     assert!(has(base.clone()), "应包含主文件");
@@ -150,9 +151,7 @@ fn test_validate_local_delete_path_rejects_unauthorized_dir() {
 fn test_validate_delete_candidate_rejects_symlink() {
     // Windows 创建符号链接需管理员权限,测试仅 Unix 验证
     #[cfg(not(unix))]
-    {
-        return;
-    }
+    {}
     #[cfg(unix)]
     {
         let dir = TempDir::new().unwrap();
@@ -488,6 +487,213 @@ async fn test_create_task_sanitizes_filename() {
     assert!(!name.contains(".."), "sanitize 后不应含路径遍历: {name}");
     assert!(!name.contains('/'), "sanitize 后不应含路径分隔符: {name}");
     assert!(!name.is_empty(), "sanitize 不应产生空名");
+}
+
+// ── 撤销操作测试 ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_undo_cancel_restores_previous_status() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+    service
+        .task_repository
+        .update_status("t1", DownloadState::Downloading);
+
+    service.cancel_task("t1").await.unwrap();
+    assert_eq!(
+        service.get_task_detail("t1").unwrap().status,
+        DownloadState::Cancelled
+    );
+
+    let restored = service.undo_cancel_task("t1").await.unwrap();
+    assert_eq!(restored, DownloadState::Downloading);
+    assert_eq!(
+        service.get_task_detail("t1").unwrap().status,
+        DownloadState::Downloading
+    );
+}
+
+#[tokio::test]
+async fn test_undo_cancel_from_paused_restores_paused() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+    service
+        .task_repository
+        .update_status("t1", DownloadState::Paused);
+
+    service.cancel_task("t1").await.unwrap();
+    let restored = service.undo_cancel_task("t1").await.unwrap();
+    assert_eq!(restored, DownloadState::Paused);
+    assert_eq!(
+        service.get_task_detail("t1").unwrap().status,
+        DownloadState::Paused
+    );
+}
+
+#[tokio::test]
+async fn test_undo_cancel_timeout_fails() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+    service
+        .task_repository
+        .update_status("t1", DownloadState::Downloading);
+
+    service.cancel_task("t1").await.unwrap();
+    // 直接插入过期记录模拟超时
+    service.undo_records.insert(
+        "t1".to_string(),
+        super::UndoRecord::Cancel {
+            previous_status: DownloadState::Downloading,
+            timestamp: Instant::now() - Duration::from_secs(31),
+        },
+    );
+
+    let result = service.undo_cancel_task("t1").await;
+    assert!(result.is_err(), "撤销窗口超时后应返回错误");
+    assert!(
+        result.unwrap_err().to_string().contains("撤销窗口已过期"),
+        "错误信息应提示撤销窗口过期"
+    );
+}
+
+#[tokio::test]
+async fn test_undo_cancel_repeat_fails() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+    service
+        .task_repository
+        .update_status("t1", DownloadState::Downloading);
+
+    service.cancel_task("t1").await.unwrap();
+    service.undo_cancel_task("t1").await.unwrap();
+
+    let result = service.undo_cancel_task("t1").await;
+    assert!(result.is_err(), "重复撤销应失败");
+    assert!(
+        result.unwrap_err().to_string().contains("无可用撤销记录"),
+        "错误信息应提示无撤销记录"
+    );
+}
+
+#[tokio::test]
+async fn test_undo_delete_restores_task_and_snapshot() {
+    let (service, dir) = make_service();
+    let task = make_task("t1", "f.bin", dir.path().to_string_lossy().to_string());
+    service
+        .task_repository
+        .insert("t1".to_string(), task.clone());
+
+    // 预存快照
+    let snapshot = task_info_to_snapshot(
+        &task,
+        dir.path().join("f.bin").to_string_lossy().to_string(),
+        256,
+        vec![],
+        std::collections::HashMap::new(),
+        None,
+        None,
+    );
+    service.task_store.save_snapshot(&snapshot).unwrap();
+    assert!(service.task_store.load_snapshot("t1").unwrap().is_some());
+
+    service.delete_task("t1", false).await.unwrap();
+    assert!(!service.task_repository.contains_key("t1"));
+    assert!(
+        service.task_store.load_snapshot("t1").unwrap().is_none(),
+        "删除任务时应清理快照"
+    );
+
+    service.undo_delete_task("t1").await.unwrap();
+    assert!(service.task_repository.contains_key("t1"));
+    assert_eq!(service.get_task_detail("t1").unwrap().file_name, "f.bin");
+    assert!(
+        service.task_store.load_snapshot("t1").unwrap().is_some(),
+        "撤销删除时应恢复快照"
+    );
+}
+
+#[tokio::test]
+async fn test_undo_delete_timeout_fails() {
+    let (service, dir) = make_service();
+    let task = make_task("t1", "f.bin", dir.path().to_string_lossy().to_string());
+    service
+        .task_repository
+        .insert("t1".to_string(), task.clone());
+    service
+        .task_store
+        .save_snapshot(&task_info_to_snapshot(
+            &task,
+            dir.path().join("f.bin").to_string_lossy().to_string(),
+            256,
+            vec![],
+            std::collections::HashMap::new(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    service.delete_task("t1", false).await.unwrap();
+    // 直接插入过期记录模拟超时
+    service.undo_records.insert(
+        "t1".to_string(),
+        super::UndoRecord::Delete {
+            task: Box::new(task),
+            snapshot: Box::new(None),
+            timestamp: Instant::now() - Duration::from_secs(31),
+        },
+    );
+
+    let result = service.undo_delete_task("t1").await;
+    assert!(result.is_err(), "撤销窗口超时后应返回错误");
+    assert!(
+        result.unwrap_err().to_string().contains("撤销窗口已过期"),
+        "错误信息应提示撤销窗口过期"
+    );
+}
+
+#[tokio::test]
+async fn test_undo_delete_repeat_fails() {
+    let (service, dir) = make_service();
+    let task = make_task("t1", "f.bin", dir.path().to_string_lossy().to_string());
+    service.task_repository.insert("t1".to_string(), task);
+
+    service.delete_task("t1", false).await.unwrap();
+    service.undo_delete_task("t1").await.unwrap();
+
+    let result = service.undo_delete_task("t1").await;
+    assert!(result.is_err(), "重复撤销删除应失败");
+    assert!(
+        result.unwrap_err().to_string().contains("无可用撤销记录"),
+        "错误信息应提示无撤销记录"
+    );
+}
+
+#[tokio::test]
+async fn test_undo_delete_ignores_missing_local_file() {
+    let (service, dir) = make_service();
+    let task = make_task("t1", "f.bin", dir.path().to_string_lossy().to_string());
+    service.task_repository.insert("t1".to_string(), task);
+
+    // 创建本地文件,删除任务但不删文件,再外部删除文件
+    let file_path = dir.path().join("f.bin");
+    std::fs::write(&file_path, b"data").unwrap();
+
+    service.delete_task("t1", false).await.unwrap();
+    std::fs::remove_file(&file_path).unwrap();
+    assert!(!file_path.exists(), "前置条件:外部已删除文件");
+
+    // 撤销删除应成功,仅恢复记录
+    service.undo_delete_task("t1").await.unwrap();
+    assert!(service.task_repository.contains_key("t1"));
+    assert!(!file_path.exists(), "撤销删除不应恢复本地文件");
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────
