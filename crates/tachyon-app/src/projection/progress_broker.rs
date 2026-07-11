@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use tokio::sync::Notify;
 
 use tokio::sync::watch;
@@ -35,8 +35,6 @@ pub struct ProgressBroker {
     task_repository: TaskRepository,
     /// aggregator 是否已 spawn（幂等防护）
     aggregator_spawned: AtomicBool,
-    /// Dirty task IDs - set by ChunkReaderPool when progress changes
-    dirty_tasks: Arc<DashSet<String>>,
     /// Notify to wake aggregator
     notify: Arc<Notify>,
     /// 每任务本周期新完成分片索引增量
@@ -57,7 +55,6 @@ impl ProgressBroker {
             progress_tx,
             task_repository,
             aggregator_spawned: AtomicBool::new(false),
-            dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
@@ -75,7 +72,6 @@ impl ProgressBroker {
         }
         let tx = self.progress_tx.clone();
         let task_repository_ref = self.task_repository.clone();
-        let dirty_tasks = self.dirty_tasks.clone();
         let notify = self.notify.clone();
         let pending_completed = self.pending_completed.clone();
         let pending_started = self.pending_started.clone();
@@ -107,9 +103,6 @@ impl ProgressBroker {
                     &pending_started,
                 );
                 let _ = tx.send(event);
-
-                // Clear dirty set after building event
-                dirty_tasks.clear();
             }
         });
     }
@@ -123,30 +116,42 @@ impl ProgressBroker {
             progress_tx,
             task_repository,
             aggregator_spawned: AtomicBool::new(false),
-            dirty_tasks: Arc::new(DashSet::new()),
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
         }
     }
 
-    /// Mark a task as having changed progress data.
-    /// Called by ChunkReaderPool after updating TaskRepository.
-    pub fn mark_dirty(&self, task_id: &str) {
-        self.dirty_tasks.insert(task_id.to_string());
+    /// 唤醒 aggregator(无 delta,仅通知有变化)
+    pub fn mark_dirty(&self, _task_id: &str) {
         self.notify.notify_one();
     }
 
     /// 标记任务进度变化,并记录分片状态变更增量(started/completed)
+    ///
+    /// 竞态消除:当 Completed(idx) 到达时,从 pending_started 中移除 idx(若存在),
+    /// 避免同一分片的 Started 增量在跨窗口场景下被推送给前端导致"幽灵 downloading"。
     pub fn mark_dirty_with_delta(&self, task_id: &str, delta: Option<ProgressDelta>) {
         if let Some(d) = delta {
-            let (map, idx) = match d {
-                ProgressDelta::Started(idx) => (&self.pending_started, idx),
-                ProgressDelta::Completed(idx) => (&self.pending_completed, idx),
-            };
-            map.entry(task_id.to_string()).or_default().push(idx);
+            match d {
+                ProgressDelta::Started(idx) => {
+                    self.pending_started
+                        .entry(task_id.to_string())
+                        .or_default()
+                        .push(idx);
+                }
+                ProgressDelta::Completed(idx) => {
+                    // 后端侧竞态消除:从 pending_started 移除 idx(若存在)
+                    if let Some(mut started) = self.pending_started.get_mut(task_id) {
+                        started.retain(|&x| x != idx);
+                    }
+                    self.pending_completed
+                        .entry(task_id.to_string())
+                        .or_default()
+                        .push(idx);
+                }
+            }
         }
-        self.dirty_tasks.insert(task_id.to_string());
         self.notify.notify_one();
     }
 

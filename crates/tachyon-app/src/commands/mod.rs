@@ -601,6 +601,9 @@ pub(crate) fn update_task_status(
 pub(crate) fn cleanup_runtime(state: &AppState, task_id: &str) {
     state.runtime.supervisor.cleanup(task_id);
     state.fragment_state_store.remove(task_id);
+    // 终态广播:确保所有终态路径(Completed/Cancelled/Failed)都触发一次
+    // ProgressEvent 推送,让前端收到终态 status 以清理 downloadingSet
+    state.runtime.progress_broker.broadcast_all();
 }
 
 pub(crate) async fn persist_task_snapshot(

@@ -90,6 +90,7 @@ impl DownloadSession {
                     task_id,
                     tachyon_core::types::DownloadState::Cancelled,
                 );
+                // cleanup_runtime 内部会调 broadcast_all,确保前端收到终态
                 cleanup_runtime(state, task_id);
                 false
             }
@@ -107,6 +108,7 @@ impl DownloadSession {
                             task_id,
                             tachyon_core::types::DownloadState::Cancelled,
                         );
+                        // cleanup_runtime 内部会调 broadcast_all,确保前端收到终态
                         cleanup_runtime(state, task_id);
                         false
                     }
@@ -302,9 +304,8 @@ impl DownloadSession {
         // 10. 等待 chunk reader 完成
         let _ = wait_chunk_reader_done(done_rx, &self.task_id).await;
 
-        // 终态即时广播:先广播再清理,确保 fragment_state_store 仍在,
-        // downloading_set 被正确序列化到最后一次 ProgressEvent
-        self.state.runtime.progress_broker.broadcast_all();
+        // cleanup_runtime 内部调 broadcast_all,确保前端收到终态 status
+        // 以触发 clearTaskFragmentDownloading 清理残留 downloading 格子
         cleanup_runtime(&self.state, &self.task_id);
 
         // 11. 持久化最终快照
