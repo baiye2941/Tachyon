@@ -61,7 +61,8 @@ struct ServerConfig {
     /// 模拟文件总大小(字节)
     file_size: u64,
     /// 带宽上限(bytes/sec);0 表示不限速(loopback 全速)
-    bytes_per_sec: u64,
+    /// 用 Arc<AtomicU64> 支持运行时动态调整(动态并发度 bench 用)
+    bytes_per_sec: Arc<std::sync::atomic::AtomicU64>,
     /// 模拟 RTT(首字节前延迟);0 表示无延迟
     rtt: Duration,
     /// chunk 大小(节流粒度)
@@ -93,6 +94,8 @@ pub struct ThrottledServer {
     join: Option<tokio::task::JoinHandle<()>>,
     /// 已 accept 的连接数(供 H2 多路复用 bench 断言 H1=4 / H2=1)
     accept_count: Arc<AtomicUsize>,
+    /// 带宽控制(运行时可调,供动态并发度 bench 模拟带宽变化)
+    bandwidth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ThrottledServer {
@@ -159,13 +162,14 @@ impl ThrottledServer {
         let actual_port = listener.local_addr().expect("获取端口失败").port();
         let config = Arc::new(ServerConfig {
             file_size,
-            bytes_per_sec,
+            bytes_per_sec: Arc::new(std::sync::atomic::AtomicU64::new(bytes_per_sec)),
             rtt: Duration::from_millis(rtt_ms),
             chunk_size,
             handshake_rtt: Duration::from_millis(handshake_rtt_ms),
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let accept_count = Arc::new(AtomicUsize::new(0));
+        let bandwidth = Arc::clone(&config.bytes_per_sec);
 
         let uri = format!("http://127.0.0.1:{actual_port}");
         let accept_count_clone = Arc::clone(&accept_count);
@@ -240,12 +244,19 @@ impl ThrottledServer {
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
             accept_count,
+            bandwidth,
         }
     }
 
     /// 返回 server URI(如 `http://127.0.0.1:54321`,端口由 OS 分配)
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// 运行时调整带宽(bytes/sec),供动态并发度 bench 模拟带宽变化
+    pub fn set_bandwidth(&self, bytes_per_sec: u64) {
+        self.bandwidth
+            .store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 返回已 accept 的连接数(供 H2 bench 断言 H1=4 / H2=1)
@@ -306,28 +317,22 @@ where
 /// 生成节流流式 body:按 chunk_size 切片,每片后 sleep(节流)
 ///
 /// `data`: 已切好范围的 Bytes
-/// `bytes_per_sec`: 0 表示不限速(无 sleep)
+/// `bytes_per_sec`: Arc<AtomicU64> 支持运行时动态调整;0 表示不限速(无 sleep)
 /// `rtt`: 首字节前延迟(模拟 TTFB)
 /// `chunk_size`: 节流粒度
 ///
 /// 节流时序:第一个 chunk 前 sleep(rtt)(模拟 TTFB),后续每个 chunk 前
 /// sleep(chunk_delay)(模拟传输时间)。这是"突发-等待"模式而非平滑流,
 /// TTFB = RTT,但 chunk 间有微小空闲(hyper 写缓冲在 sleep 期间空转)。
+/// 每 chunk 读取当前 bytes_per_sec(支持运行时动态调整带宽)。
 fn throttled_stream(
     data: Bytes,
-    bytes_per_sec: u64,
+    bytes_per_sec: Arc<std::sync::atomic::AtomicU64>,
     rtt: Duration,
     chunk_size: usize,
 ) -> BoxBody<Bytes, std::io::Error> {
     // 首字节 RTT 延迟(在第一个 chunk 前注入)
     let first_chunk_delay = rtt;
-
-    // 每 chunk 的 sleep 间隔:chunk_size / bytes_per_sec
-    let chunk_delay = (chunk_size as u64)
-        .checked_mul(1_000_000)
-        .and_then(|micros| micros.checked_div(bytes_per_sec))
-        .filter(|_| bytes_per_sec > 0)
-        .map_or(Duration::ZERO, Duration::from_micros);
 
     let chunk_size = chunk_size.max(1);
 
@@ -342,7 +347,13 @@ fn throttled_stream(
         let delay = if i == 0 {
             first_chunk_delay
         } else {
-            chunk_delay
+            // 每 chunk 读取当前带宽(支持动态调整)
+            let bps = bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed);
+            (chunk_size as u64)
+                .checked_mul(1_000_000)
+                .and_then(|micros| micros.checked_div(bps))
+                .filter(|_| bps > 0)
+                .map_or(Duration::ZERO, Duration::from_micros)
         };
         let frame: Result<Frame<Bytes>, std::io::Error> = Ok(Frame::data(chunk));
         (delay, frame)
@@ -424,7 +435,12 @@ async fn handle(
     let body_len = end - start + 1;
     let data = make_file_data(start, end);
 
-    let body = throttled_stream(data, config.bytes_per_sec, config.rtt, config.chunk_size);
+    let body = throttled_stream(
+        data,
+        Arc::clone(&config.bytes_per_sec),
+        config.rtt,
+        config.chunk_size,
+    );
 
     let mut builder = Response::builder()
         .status(status)

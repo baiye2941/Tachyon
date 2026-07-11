@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, criterion_group, criterion_main};
 use support::bench_server::{BenchProtocol, DEFAULT_CHUNK_SIZE, ThrottledServer};
 use tachyon_core::test_harness::harness::test_config;
-use tachyon_core::traits::Protocol;
+use tachyon_core::traits::{DownloadScheduler, Protocol};
 use tachyon_engine::{ConnectionPool, DownloadTask, PoolConfig};
 use tachyon_protocol::HttpClient;
 
@@ -633,6 +633,115 @@ fn bench_real_network(c: &mut Criterion) {
     group.finish();
 }
 
+/// 动态并发度 vs 固定并发度对比,验证带宽变化时动态提升并发的收益
+///
+/// 模拟"带宽先低后高"场景:
+/// 1. 注入 1MB/s 低带宽样本到调度器(observe_bandwidth),使 recommend 算出低并发度
+/// 2. 大文件以低并发启动,2s 后带宽提升到 10MB/s
+/// 3. 固定并发:低并发贯穿全程,带宽提升后无法扩容
+/// 4. 动态并发:interval re-recommend 发现带宽提升,add_permits 扩容并发
+///
+/// 关键:通过 with_pool_and_scheduler 注入预置样本的调度器,
+/// 绕过冷启动 recommend 回退到 max_concurrency 的问题。
+fn bench_dynamic_concurrency(c: &mut Criterion) {
+    let rt = rt();
+    let mut group = c.benchmark_group("dynamic_concurrency");
+    support::configure_group(&mut group, 10);
+
+    let file_size = if support::smoke_mode() {
+        4 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let initial_bw = 1024 * 1024u64; // 1MB/s 初始低带宽样本
+    let boosted_bw = 10 * 1024 * 1024u64; // 10MB/s 提升后
+    let chunk_size = 256 * 1024;
+
+    // --- 固定并发(禁用动态并发:sampling_interval_secs 设很大) ---
+    let fixed_server = Arc::new(rt.block_on(async {
+        ThrottledServer::start_with_chunk(file_size, initial_bw, 0, chunk_size).await
+    }));
+    let fixed_url = format!("{}/bench.bin", fixed_server.uri());
+
+    group.bench_function("fixed_concurrency", |b| {
+        b.to_async(&rt).iter(|| {
+            let url = fixed_url.clone();
+            let server = fixed_server.clone();
+            async move {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = test_config();
+                config.download_dir = dir.path().to_string_lossy().to_string();
+                config.authorized_dirs = vec![config.download_dir.clone()];
+                config.max_concurrent_fragments = 8;
+                // 注入预置低带宽样本的调度器:recommend 会算出低并发度
+                let scheduler = tachyon_scheduler::AdaptiveDownloadScheduler::default_config();
+                let scheduler: Arc<dyn tachyon_core::traits::DownloadScheduler> =
+                    Arc::new(scheduler);
+                scheduler.observe_bandwidth(initial_bw);
+                let mut task =
+                    DownloadTask::with_pool_and_scheduler(url, config, None, scheduler, None)
+                        .await
+                        .expect("构造失败");
+                task.set_scheduler_config(tachyon_core::config::SchedulerConfig {
+                    sampling_interval_secs: 3600, // 禁用动态并发
+                    ..Default::default()
+                });
+                let bw_handle = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    server.set_bandwidth(boosted_bw);
+                });
+                task.run().await.expect("下载失败");
+                bw_handle.await.unwrap();
+                assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            }
+        });
+    });
+
+    drop(fixed_server);
+
+    // --- 动态并发(sampling_interval_secs=2,带宽提升后自动扩容) ---
+    let dynamic_server = Arc::new(rt.block_on(async {
+        ThrottledServer::start_with_chunk(file_size, initial_bw, 0, chunk_size).await
+    }));
+    let dynamic_url = format!("{}/bench.bin", dynamic_server.uri());
+
+    group.bench_function("dynamic_concurrency", |b| {
+        b.to_async(&rt).iter(|| {
+            let url = dynamic_url.clone();
+            let server = dynamic_server.clone();
+            async move {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = test_config();
+                config.download_dir = dir.path().to_string_lossy().to_string();
+                config.authorized_dirs = vec![config.download_dir.clone()];
+                config.max_concurrent_fragments = 8;
+                let scheduler = tachyon_scheduler::AdaptiveDownloadScheduler::default_config();
+                scheduler.observe_bandwidth(initial_bw);
+                let scheduler: Arc<dyn tachyon_core::traits::DownloadScheduler> =
+                    Arc::new(scheduler);
+                let mut task =
+                    DownloadTask::with_pool_and_scheduler(url, config, None, scheduler, None)
+                        .await
+                        .expect("构造失败");
+                task.set_scheduler_config(tachyon_core::config::SchedulerConfig {
+                    sampling_interval_secs: 2, // 启用动态并发:2s 间隔 re-recommend
+                    ..Default::default()
+                });
+                let bw_handle = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    server.set_bandwidth(boosted_bw);
+                });
+                task.run().await.expect("下载失败");
+                bw_handle.await.unwrap();
+                assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            }
+        });
+    });
+
+    drop(dynamic_server);
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = support::bench_config();
@@ -644,6 +753,7 @@ criterion_group! {
         bench_disk_io_backends,
         bench_large_file_fragmented,
         bench_http2_vs_http1_multiplexing,
+        bench_dynamic_concurrency,
         bench_real_network
 }
 criterion_main!(benches);

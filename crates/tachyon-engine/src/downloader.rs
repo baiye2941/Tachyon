@@ -650,6 +650,14 @@ impl DownloadTask {
         self.partial_fragments = partial;
     }
 
+    /// 设置调度器配置(供 bench 调整 sampling_interval_secs 等参数)
+    ///
+    /// 必须在 `run()` 之前调用。生产代码从 DownloadConfig 构造时使用默认值。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn set_scheduler_config(&mut self, config: SchedulerConfig) {
+        self.scheduler_config = config;
+    }
+
     async fn wait_control_rx(
         rx: &mut watch::Receiver<TaskCommand>,
         pause_timeout: Duration,
