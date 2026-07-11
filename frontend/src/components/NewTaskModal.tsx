@@ -189,22 +189,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
 
       // 批量创建,共享 savePath/mirrors;allSettled 部分失败不阻断
       const results = await Promise.allSettled(
-        urls.map((u) => api.createTask(u, dir, mirrorList, name)),
+        urls.map((u) => api.createTask(u, dir, mirrorList, name, autoStart())),
       );
-
-      // autoStart 过渡容错:后端创建即启动,取消自动开始时延迟 pause 消除竞态
-      // TODO: 后端 create_task 添加 auto_start 参数后,改为直接传入,移除此 hack
-      if (!autoStart()) {
-        results.forEach((r) => {
-          if (r.status === "fulfilled") {
-            window.setTimeout(() => {
-              api.pauseTask(r.value).catch(() => {
-                /* 容错:pause 失败则任务继续下载(可接受降级) */
-              });
-            }, 500);
-          }
-        });
-      }
 
       const failed = results.filter((r) => r.status === "rejected");
       if (failed.length === 0) {

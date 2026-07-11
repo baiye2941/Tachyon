@@ -93,8 +93,8 @@ export const api = {
   /** 获取支持的协议列表 */
   getSupportedProtocols: () => invoke<string[]>('supported_protocols'),
   /** 创建下载任务 */
-  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string) =>
-    invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName }),
+  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string, autoStart?: boolean) =>
+    invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName, autoStart }),
   /** 探测真实文件名(HEAD 请求获取 Content-Disposition / DHT 查询种子元数据) */
   probeFilename: (url: string) => invoke<string>('probe_filename', { url }),
   /** 获取任务列表 */

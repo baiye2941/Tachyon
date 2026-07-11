@@ -5,7 +5,6 @@ import NewTaskModal from "../NewTaskModal";
 vi.mock("../../api/invoke", () => ({
   api: {
     createTask: vi.fn(),
-    pauseTask: vi.fn(),
     probeFilename: vi.fn(),
   },
 }));
@@ -267,6 +266,55 @@ describe("NewTaskModal", () => {
       // 单 URL 时探测按钮应 enabled(与批量 disabled 对称)
       const probeBtn = screen.getByRole("button", { name: /探测/ });
       expect((probeBtn as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  describe("自动开始参数", () => {
+    it("默认勾选自动开始时,createTask 第 5 参数为 true", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.createTask as ReturnType<typeof vi.fn>).mockResolvedValue("task-1");
+
+      render(() => <NewTaskModal onClose={() => {}} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: "https://example.com/model" },
+        currentTarget: { value: "https://example.com/model" },
+      });
+
+      const submitBtn = screen.getByRole("button", { name: /开始/ });
+      await fireEvent.click(submitBtn);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(api.createTask).toHaveBeenCalledTimes(1);
+      const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock
+        .calls[0]!;
+      expect(callArgs[4]).toBe(true);
+    });
+
+    it("取消勾选自动开始时,createTask 第 5 参数为 false", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.createTask as ReturnType<typeof vi.fn>).mockResolvedValue("task-1");
+
+      render(() => <NewTaskModal onClose={() => {}} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: "https://example.com/model" },
+        currentTarget: { value: "https://example.com/model" },
+      });
+
+      const autoStartCheckbox = screen.getByRole("checkbox");
+      fireEvent.click(autoStartCheckbox);
+
+      const submitBtn = screen.getByRole("button", { name: /开始/ });
+      await fireEvent.click(submitBtn);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(api.createTask).toHaveBeenCalledTimes(1);
+      const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock
+        .calls[0]!;
+      expect(callArgs[4]).toBe(false);
     });
   });
 });
