@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, cleanup } from "@solidjs/testing-library";
-import { renderPalette, waitForRaf } from "./commandPaletteTestUtils";
+import { renderPalette, waitForRaf, waitForDebounce } from "./commandPaletteTestUtils";
 import {
   addRecentCommand,
   togglePinnedCommand,
@@ -8,6 +8,12 @@ import {
 } from "../../stores/commandHistory";
 import { resetAllShortcuts, setShortcut } from "../../stores/shortcuts";
 import type { TaskInfo } from "../../types";
+import { fuzzySearch } from "../../utils/fuzzySearch";
+
+vi.mock("../../utils/fuzzySearch", async (importOriginal) => {
+  const mod = (await importOriginal()) as typeof import("../../utils/fuzzySearch");
+  return { ...mod, fuzzySearch: vi.fn(mod.fuzzySearch) };
+});
 
 function getOptions(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>('[role="option"]'));
@@ -15,6 +21,30 @@ function getOptions(container: HTMLElement): HTMLElement[] {
 
 function getGroupLabels(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(".cmd-group-label"));
+}
+
+function mockMatchMedia(matches: boolean) {
+  const listeners: ((e: MediaQueryListEvent) => void)[] = [];
+  const mql = {
+    matches,
+    media: "",
+    onchange: null,
+    addEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => listeners.push(listener),
+    removeEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => {
+      const i = listeners.indexOf(listener);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    dispatchEvent: () => true,
+    addListener: () => {},
+    removeListener: () => {},
+  };
+  vi.stubGlobal("matchMedia", () => mql);
 }
 
 describe("CommandPalette", () => {
@@ -93,7 +123,7 @@ describe("CommandPalette", () => {
         target: { value: "设置" },
         currentTarget: { value: "设置" },
       });
-      await waitForRaf();
+      await waitForDebounce();
 
       const options = getOptions(container);
       expect(options.length).toBeGreaterThan(0);
@@ -110,7 +140,7 @@ describe("CommandPalette", () => {
         target: { value: "查看" },
         currentTarget: { value: "查看" },
       });
-      await waitForRaf();
+      await waitForDebounce();
 
       expect(container.textContent).toContain("下载管理");
     });
@@ -125,7 +155,7 @@ describe("CommandPalette", () => {
         target: { value: "设置" },
         currentTarget: { value: "设置" },
       });
-      await waitForRaf();
+      await waitForDebounce();
 
       const hasMark =
         container.querySelector("mark") !== null ||
@@ -143,7 +173,7 @@ describe("CommandPalette", () => {
         target: { value: "xyzxyz" },
         currentTarget: { value: "xyzxyz" },
       });
-      await waitForRaf();
+      await waitForDebounce();
 
       expect(container.textContent).toContain("未找到匹配的命令");
     });
@@ -159,7 +189,7 @@ describe("CommandPalette", () => {
           target: { value: "bf" },
           currentTarget: { value: "bf" },
         });
-        await waitForRaf();
+        await waitForDebounce();
 
         expect(container.textContent).toContain("资源嗅探");
       });
@@ -174,7 +204,7 @@ describe("CommandPalette", () => {
           target: { value: "sz" },
           currentTarget: { value: "sz" },
         });
-        await waitForRaf();
+        await waitForDebounce();
 
         expect(container.textContent).toContain("设置");
       });
@@ -200,7 +230,7 @@ describe("CommandPalette", () => {
         target: { value: "model" },
         currentTarget: { value: "model" },
       });
-      await waitForRaf();
+      await waitForDebounce();
 
       const listbox = container.querySelector(
         '[role="listbox"]',
@@ -550,6 +580,99 @@ describe("CommandPalette", () => {
       await waitForRaf();
 
       expect(container.querySelector("[aria-live]")).toBeTruthy();
+    });
+  });
+
+  describe("性能优化", () => {
+    beforeEach(() => {
+      vi.mocked(fuzzySearch).mockClear();
+    });
+
+    it("搜索输入防抖:连续按键只触发一次过滤", async () => {
+      const { container } = renderPalette({
+        debounceMs: 100,
+        getTasks: () => [
+          { id: "t1", fileName: "model.gguf", url: "https://example.com/m" },
+        ],
+      });
+      await waitForRaf();
+
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
+      // 确保测量前 mock 计数归零,避免并行/异步初始化导致基线不一致
+      vi.mocked(fuzzySearch).mockClear();
+      const callsBefore = vi.mocked(fuzzySearch).mock.calls.length;
+
+      fireEvent.input(input, {
+        target: { value: "a" },
+        currentTarget: { value: "a" },
+      });
+      await waitForDebounce();
+      fireEvent.input(input, {
+        target: { value: "ab" },
+        currentTarget: { value: "ab" },
+      });
+      await waitForDebounce();
+      fireEvent.input(input, {
+        target: { value: "abc" },
+        currentTarget: { value: "abc" },
+      });
+      await waitForDebounce();
+
+      // 防抖结束前不应执行新的过滤
+      expect(vi.mocked(fuzzySearch).mock.calls.length).toBe(callsBefore);
+
+      // 等待最后一次防抖到期
+      await new Promise<void>((resolve) => setTimeout(resolve, 120));
+
+      // 最终只按最终 query 多执行一轮命令+任务过滤
+      expect(vi.mocked(fuzzySearch).mock.calls.length).toBe(callsBefore + 2);
+      const lastCall = vi.mocked(fuzzySearch).mock.calls.at(-1);
+      expect(lastCall?.[1]).toBe("abc");
+    });
+
+    it("activeIndex 变化不应重新执行过滤", async () => {
+      const { container } = renderPalette({ debounceMs: 0 });
+      await waitForDebounce();
+
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
+
+      fireEvent.input(input, {
+        target: { value: "设置" },
+        currentTarget: { value: "设置" },
+      });
+      await waitForDebounce();
+
+      const callsAfterFilter = vi.mocked(fuzzySearch).mock.calls.length;
+
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      fireEvent.keyDown(input, { key: "ArrowUp" });
+      await waitForRaf();
+
+      expect(vi.mocked(fuzzySearch).mock.calls.length).toBe(callsAfterFilter);
+    });
+  });
+
+  describe("移动端窄屏适配", () => {
+    beforeEach(() => {
+      mockMatchMedia(true);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("小屏下命令面板添加 cmd-panel--narrow 类", async () => {
+      const { container } = renderPalette();
+      await waitForRaf();
+
+      const panel = container.querySelector(".cmd-panel");
+      expect(panel).toBeTruthy();
+      expect(panel!.classList.contains("cmd-panel--narrow")).toBe(true);
     });
   });
 });

@@ -21,6 +21,7 @@ import { requestConfirm } from "../stores/confirm";
 import { addToast } from "../stores/toast";
 import { tr, type MessageKey } from "../i18n";
 import Button from "../shared/ui/Button";
+import EmptyState from "../shared/ui/EmptyState";
 
 interface HistoryPanelProps {
   visible: boolean;
@@ -584,9 +585,12 @@ export default function HistoryPanel(props: HistoryPanelProps) {
         <Show
           when={filteredRecords().length > 0}
           fallback={
-            <div style={{ color: "var(--color-text-tertiary)", "font-size": "13px" }}>
-              {t("history.empty")}
-            </div>
+            <EmptyState
+              compact
+              icon={<HistoryIcon />}
+              title={t("history.empty")}
+              description={t("history.emptyHint")}
+            />
           }
         >
           <For each={filteredRecords()}>

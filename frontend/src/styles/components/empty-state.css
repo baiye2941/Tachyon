@@ -1,5 +1,30 @@
 .empty-state {
-  /* 仅作布局容器,子元素样式下放 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.empty-state--compact {
+  gap: 12px;
+  padding: 32px 16px;
+}
+
+.empty-state--compact .empty-state-icon {
+  width: 48px;
+  height: 48px;
+}
+
+.empty-state--compact .empty-state-title {
+  font-size: 14px;
+}
+
+.empty-state--compact .empty-state-desc {
+  font-size: 12px;
+  margin-bottom: 12px;
 }
 
 .empty-state-icon {
@@ -10,6 +35,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  animation: empty-icon-pulse 3.2s ease-in-out infinite;
 }
 
 .empty-state-icon--brand {
@@ -50,11 +76,82 @@
   color: var(--color-border-strong);
 }
 
+/* ========== Error state 统一错误占位 ========== */
 
-
-/* 空态图标轻量呼吸,避免页面死寂 */
-
-.empty-state-icon {
-  animation: empty-icon-pulse 3.2s ease-in-out infinite;
+.error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 40px 20px;
+  text-align: center;
 }
 
+.error-state--compact {
+  gap: 12px;
+  padding: 32px 16px;
+}
+
+.error-state--compact .error-state-icon {
+  width: 40px;
+  height: 40px;
+}
+
+.error-state--compact .error-state-title {
+  font-size: 14px;
+}
+
+.error-state--compact .error-state-message,
+.error-state--compact .error-state-detail {
+  font-size: 12px;
+}
+
+.error-state-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--color-danger-soft);
+  color: var(--color-error);
+}
+
+.error-state-body {
+  text-align: center;
+  max-width: 360px;
+}
+
+.error-state-title {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+}
+
+.error-state-message {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.error-state-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-void);
+  border: 1px solid var(--color-border-subtle);
+  margin-bottom: 16px;
+  word-break: break-word;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .empty-state-icon {
+    animation: none;
+  }
+}

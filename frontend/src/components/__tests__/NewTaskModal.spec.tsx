@@ -1,6 +1,30 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@solidjs/testing-library";
 import NewTaskModal from "../NewTaskModal";
+
+function mockMatchMedia(matches: boolean) {
+  const listeners: ((e: MediaQueryListEvent) => void)[] = [];
+  const mql = {
+    matches,
+    media: "",
+    onchange: null,
+    addEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => listeners.push(listener),
+    removeEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => {
+      const i = listeners.indexOf(listener);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    dispatchEvent: () => true,
+    addListener: () => {},
+    removeListener: () => {},
+  };
+  vi.stubGlobal("matchMedia", () => mql);
+}
 
 vi.mock("../../api/invoke", () => ({
   api: {
@@ -315,6 +339,25 @@ describe("NewTaskModal", () => {
       const callArgs = (api.createTask as ReturnType<typeof vi.fn>).mock
         .calls[0]!;
       expect(callArgs[4]).toBe(false);
+    });
+  });
+
+  describe("移动端窄屏适配", () => {
+    beforeEach(() => {
+      mockMatchMedia(true);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("小屏下弹窗添加 new-task-modal--narrow 类并减少内边距", () => {
+      const { container } = render(() => <NewTaskModal onClose={() => {}} />);
+
+      const panel = container.querySelector(".panel-surface");
+      expect(panel).toBeTruthy();
+      expect(panel!.classList.contains("new-task-modal--narrow")).toBe(true);
+      expect(panel!.getAttribute("style")).toContain("padding: 16px");
     });
   });
 });

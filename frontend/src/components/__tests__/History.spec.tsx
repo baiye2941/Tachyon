@@ -6,6 +6,7 @@ import {
   loadHistoryRecords,
   type HistoryRecord,
 } from "../../stores/history";
+import * as historyStore from "../../stores/history";
 
 // mock confirm store:批量删除测试需要控制 requestConfirm 返回值
 const mockRequestConfirm = vi.fn();
@@ -284,5 +285,44 @@ describe("HistoryPanel 历史记录面板", () => {
       }),
     ]);
     expect(screen.getByText("下载量趋势")).toBeDefined();
+  });
+
+  describe("性能优化", () => {
+    it("批量模式切换不触发统计重算", async () => {
+      const spy = vi.spyOn(historyStore, "getHistoryStatsForRecords");
+      await renderPanel({}, [
+        makeRecord({ id: "a", fileName: "a.zip" }),
+        makeRecord({ id: "b", fileName: "b.zip" }),
+      ]);
+      spy.mockClear();
+
+      fireEvent.click(screen.getByLabelText("批量选择"));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it("列表使用 keyed For：前置记录后原有行节点保持不变", async () => {
+      const a = makeRecord({ id: "a", fileName: "a.zip" });
+      const b = makeRecord({ id: "b", fileName: "b.zip" });
+      const { container } = await renderPanel({}, [a, b]);
+
+      const aElement = screen.getByText("a.zip");
+      const bElement = screen.getByText("b.zip");
+
+      const c = makeRecord({ id: "c", fileName: "c.zip" });
+      loadHistoryRecords([c, a, b]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const rows = container.querySelectorAll(".hover-row");
+      expect(rows.length).toBe(3);
+      expect(rows[0]?.textContent).toContain("c.zip");
+      expect(rows[1]?.textContent).toContain("a.zip");
+      expect(rows[2]?.textContent).toContain("b.zip");
+
+      expect(screen.getByText("a.zip")).toBe(aElement);
+      expect(screen.getByText("b.zip")).toBe(bElement);
+    });
   });
 });

@@ -130,6 +130,8 @@ const zhCN = {
   "toolbar.densityCompact": "紧凑列表",
   "toolbar.settings": "设置",
   "toolbar.multiSelect": "多选模式",
+  "toolbar.more": "更多",
+  "toolbar.moreActions": "更多操作",
   "toolbar.removeFilter": "移除筛选 {filter}",
 
   // —— 确认对话框 ——
@@ -163,6 +165,7 @@ const zhCN = {
   "commandPalette.aria": "命令面板",
   "commandPalette.searchPlaceholder": "搜索命令或导航...",
   "commandPalette.noResults": "未找到匹配的命令",
+  "commandPalette.emptyHint": "换个关键词试试",
   "commandPalette.listAria": "命令列表",
   "commandPalette.hintNav": "导航",
   "commandPalette.hintExecute": "执行",
@@ -517,6 +520,7 @@ const zhCN = {
   "history.records": "历史记录",
   "history.searchPlaceholder": "搜索历史记录...",
   "history.empty": "暂无历史记录",
+  "history.emptyHint": "已完成的下载任务会出现在这里",
   "history.aria.openFolder": "打开目录 {name}",
   "history.aria.redownload": "重新下载 {name}",
   "history.aria.delete": "删除记录 {name}",

@@ -132,6 +132,8 @@ const enUS = {
   "toolbar.densityCompact": "Compact List",
   "toolbar.settings": "Settings",
   "toolbar.multiSelect": "Multi-Select",
+  "toolbar.more": "More",
+  "toolbar.moreActions": "More actions",
   "toolbar.removeFilter": "Remove filter {filter}",
 
   // —— Confirm dialogs ——
@@ -166,6 +168,7 @@ const enUS = {
   "commandPalette.aria": "Command palette",
   "commandPalette.searchPlaceholder": "Search commands or navigation...",
   "commandPalette.noResults": "No matching commands found",
+  "commandPalette.emptyHint": "Try a different keyword",
   "commandPalette.listAria": "Command list",
   "commandPalette.hintNav": "Navigate",
   "commandPalette.hintExecute": "Execute",
@@ -536,6 +539,7 @@ const enUS = {
   "history.records": "Records",
   "history.searchPlaceholder": "Search history...",
   "history.empty": "No history records",
+  "history.emptyHint": "Completed downloads will appear here",
   "history.aria.openFolder": "Open folder {name}",
   "history.aria.redownload": "Redownload {name}",
   "history.aria.delete": "Delete record {name}",

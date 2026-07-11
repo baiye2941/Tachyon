@@ -470,7 +470,7 @@ export default function DetailPanel(props: DetailPanelProps) {
               <Show when={isOverlay()}>
                 <Button
                   variant="ghost"
-                  shape="icon-sm"
+                  shape={isNarrow() ? "icon" : "icon-sm"}
                   aria-label={t("detail.closeAria")}
                   title={t("detail.closeAria")}
                   onClick={handleClose}
@@ -517,7 +517,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div class="flex items-center gap-1">
               <Button
                 variant="ghost"
-                shape="icon-sm"
+                shape={isNarrow() ? "icon" : "icon-sm"}
                 aria-label={t("detail.closeAria")}
                 title={t("detail.closeAria")}
                 onClick={handleClose}

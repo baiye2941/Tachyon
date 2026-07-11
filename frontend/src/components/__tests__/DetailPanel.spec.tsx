@@ -51,6 +51,7 @@ vi.mock("../../hooks/useReducedMotion", () => ({
 
 vi.mock("../../hooks/useMediaQuery", () => ({
   useIsNarrowScreen: () => () => false,
+  useIsSmallScreen: () => () => false,
 }));
 
 vi.mock("../../hooks/useFocusTrap", () => ({

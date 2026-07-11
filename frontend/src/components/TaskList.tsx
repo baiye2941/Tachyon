@@ -19,8 +19,9 @@ import {
   clearSort,
 } from "../stores/taskSort";
 import { PlusIcon, GearIcon } from "./icons";
-import Button from "../shared/ui/Button";
+import EmptyState from "../shared/ui/EmptyState";
 import { useI18n } from "../i18n";
+import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { matchKeyboardEvent } from "../stores/shortcuts";
 import ColumnSettings from "./ColumnSettings";
 import type { ColumnDef, ColumnKey } from "./taskColumns";
@@ -75,6 +76,7 @@ interface TaskListProps {
 
 export default function TaskList(props: TaskListProps) {
   const i18n = useI18n();
+  const isSmall = useIsSmallScreen();
 
   let scrollContainerRef: HTMLDivElement | undefined;
   let rafId: number | null = null;
@@ -536,7 +538,10 @@ export default function TaskList(props: TaskListProps) {
   };
 
   return (
-    <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div
+      class="flex-1 flex flex-col min-w-0 overflow-hidden"
+      classList={{ "task-list--narrow": isSmall() }}
+    >
       {/* List Header */}
       <div class="flex items-center flex-shrink-0 task-list-header">
         <For each={$taskColumns.visibleColumns()}>
@@ -642,111 +647,104 @@ export default function TaskList(props: TaskListProps) {
         <Show
           when={props.tasks.length > 0}
           fallback={
-            <div class="flex flex-col items-center justify-center h-full gap-5 empty-state">
-              {/* 品牌抽象图形：速度粒子轨道，无渐变，纯单色调 */}
-              <div
-                class="empty-state-icon empty-state-icon--brand"
-                aria-hidden="true"
-              >
-                <svg
-                  width="80"
-                  height="80"
-                  viewBox="0 0 80 80"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                >
-                  {/* 速度线 */}
-                  <line
-                    x1="6"
-                    y1="32"
-                    x2="74"
-                    y2="32"
-                    stroke-dasharray="2 8"
-                    opacity="0.2"
-                  />
-                  <line
-                    x1="10"
-                    y1="40"
-                    x2="70"
-                    y2="40"
-                    stroke-dasharray="4 4"
-                    opacity="0.3"
-                  />
-                  <line
-                    x1="6"
-                    y1="48"
-                    x2="74"
-                    y2="48"
-                    stroke-dasharray="2 8"
-                    opacity="0.2"
-                  />
-                  {/* 起点闸门立柱 */}
-                  <path d="M26 18 L26 62" opacity="0.3" />
-                  <path d="M54 18 L54 62" opacity="0.3" />
-                  <path d="M26 20 L54 20" opacity="0.2" />
-                  <path d="M26 60 L54 60" opacity="0.2" />
-                  {/* 中心粒子 */}
-                  <circle
-                    cx="40"
-                    cy="40"
-                    r="5"
-                    fill="var(--color-accent-primary)"
-                    stroke="none"
-                    opacity="0.9"
-                  />
-                  {/* 粒子尾迹 */}
-                  <path
-                    d="M33 40 L20 40"
-                    stroke="var(--color-accent-primary)"
-                    stroke-width="2"
-                    opacity="0.45"
-                  />
-                  <path
-                    d="M31 35 L21 32"
-                    stroke="var(--color-brand-teal)"
+            <EmptyState
+              class="h-full"
+              brand
+              icon={
+                  <svg
+                    width="80"
+                    height="80"
+                    viewBox="0 0 80 80"
+                    fill="none"
+                    stroke="currentColor"
                     stroke-width="1.5"
-                    opacity="0.35"
-                  />
-                  <path
-                    d="M31 45 L21 48"
-                    stroke="var(--color-brand-teal)"
-                    stroke-width="1.5"
-                    opacity="0.35"
-                  />
-                </svg>
-              </div>
-              <div class="empty-state-body">
-                <p class="empty-state-title">
-                  {i18n.t("taskList.emptyTitle") as string}
-                </p>
-                <p class="empty-state-desc">
-                  {i18n.t("taskList.emptyDesc") as string}
-                </p>
-                <Show when={props.onNewTask}>
-                  <Button
-                    variant="primary"
-                    size="lg"
-                    aria-label={i18n.t("taskList.emptyNewTaskAria") as string}
-                    onClick={props.onNewTask}
+                    stroke-linecap="round"
+                    aria-hidden="true"
                   >
-                    <PlusIcon />
-                    <span>{i18n.t("taskList.emptyNewTask") as string}</span>
-                  </Button>
-                </Show>
-              </div>
-              <div class="empty-state-hints">
-                <span class="kbd">N</span>
-                <span>{i18n.t("taskList.hintNewTask") as string}</span>
-                <span class="empty-state-hint-sep">·</span>
-                <span class="kbd">⌘</span>
-                <span class="kbd">V</span>
-                <span>{i18n.t("taskList.hintPasteLink") as string}</span>
-                <span class="empty-state-hint-sep">·</span>
-                <span>{i18n.t("taskList.hintDragFile") as string}</span>
-              </div>
-            </div>
+                    {/* 速度线 */}
+                    <line
+                      x1="6"
+                      y1="32"
+                      x2="74"
+                      y2="32"
+                      stroke-dasharray="2 8"
+                      opacity="0.2"
+                    />
+                    <line
+                      x1="10"
+                      y1="40"
+                      x2="70"
+                      y2="40"
+                      stroke-dasharray="4 4"
+                      opacity="0.3"
+                    />
+                    <line
+                      x1="6"
+                      y1="48"
+                      x2="74"
+                      y2="48"
+                      stroke-dasharray="2 8"
+                      opacity="0.2"
+                    />
+                    {/* 起点闸门立柱 */}
+                    <path d="M26 18 L26 62" opacity="0.3" />
+                    <path d="M54 18 L54 62" opacity="0.3" />
+                    <path d="M26 20 L54 20" opacity="0.2" />
+                    <path d="M26 60 L54 60" opacity="0.2" />
+                    {/* 中心粒子 */}
+                    <circle
+                      cx="40"
+                      cy="40"
+                      r="5"
+                      fill="var(--color-accent-primary)"
+                      stroke="none"
+                      opacity="0.9"
+                    />
+                    {/* 粒子尾迹 */}
+                    <path
+                      d="M33 40 L20 40"
+                      stroke="var(--color-accent-primary)"
+                      stroke-width="2"
+                      opacity="0.45"
+                    />
+                    <path
+                      d="M31 35 L21 32"
+                      stroke="var(--color-brand-teal)"
+                      stroke-width="1.5"
+                      opacity="0.35"
+                    />
+                    <path
+                      d="M31 45 L21 48"
+                      stroke="var(--color-brand-teal)"
+                      stroke-width="1.5"
+                      opacity="0.35"
+                    />
+                  </svg>
+                }
+                title={i18n.t("taskList.emptyTitle") as string}
+                description={i18n.t("taskList.emptyDesc") as string}
+                action={
+                  props.onNewTask
+                    ? {
+                        label: i18n.t("taskList.emptyNewTask") as string,
+                        onClick: props.onNewTask,
+                        icon: <PlusIcon />,
+                        ariaLabel: i18n.t("taskList.emptyNewTaskAria") as string,
+                      }
+                    : undefined
+                }
+              >
+                <div class="empty-state-hints">
+                  <span class="kbd">N</span>
+                  <span>{i18n.t("taskList.hintNewTask") as string}</span>
+                  <span class="empty-state-hint-sep">·</span>
+                  <span class="kbd">⌘</span>
+                  <span class="kbd">V</span>
+                  <span>{i18n.t("taskList.hintPasteLink") as string}</span>
+                  <span class="empty-state-hint-sep">·</span>
+                  <span>{i18n.t("taskList.hintDragFile") as string}</span>
+                </div>
+            </EmptyState>
           }
         >
           {/* Outer wrapper: sets total scrollable height via spacer */}

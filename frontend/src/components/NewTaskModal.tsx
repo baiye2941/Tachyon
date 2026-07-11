@@ -8,6 +8,7 @@ import Button from "../shared/ui/Button";
 import { parseUrlLines, validateUrl, extractSuggestedFileName } from "../utils/urlValidation";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { tr } from "../i18n";
 import { parseHfUrl } from "../utils/hfUrl";
 import { getModelInfo } from "../stores/hub";
@@ -19,6 +20,8 @@ interface NewTaskModalProps {
 }
 
 export default function NewTaskModal(props: NewTaskModalProps) {
+  const isSmall = useIsSmallScreen();
+
   // 多行 URL 输入(textarea,支持批量粘贴)
   const [urlText, setUrlText] = createSignal("");
   // 镜像源动态行
@@ -279,10 +282,11 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       <div
         ref={panelRef}
         class="panel-surface"
+        classList={{ "new-task-modal--narrow": isSmall() }}
         style={{
           width: "var(--panel-modal-width, 480px)",
           "border-radius": "16px",
-          padding: "24px",
+          padding: isSmall() ? "16px" : "24px",
           /* 去 AI 味:实色 + shadow,移除 inset 装饰高光 */
           "box-shadow": "var(--shadow-xl)",
           animation: "toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1)",

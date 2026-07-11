@@ -7,6 +7,30 @@ import type { TaskInfo } from "../../types";
 import { $taskColumns } from "../../stores/taskColumnsConfig";
 import { toggleSort, clearSort } from "../../stores/taskSort";
 
+function mockMatchMedia(matches: boolean) {
+  const listeners: ((e: MediaQueryListEvent) => void)[] = [];
+  const mql = {
+    matches,
+    media: "",
+    onchange: null,
+    addEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => listeners.push(listener),
+    removeEventListener: (
+      _type: string,
+      listener: (e: MediaQueryListEvent) => void,
+    ) => {
+      const i = listeners.indexOf(listener);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    dispatchEvent: () => true,
+    addListener: () => {},
+    removeListener: () => {},
+  };
+  vi.stubGlobal("matchMedia", () => mql);
+}
+
 const renderWithI18n = (ui: () => JSX.Element) =>
   render(() => <I18nProvider i18n={i18n}>{ui()}</I18nProvider>);
 
@@ -620,6 +644,34 @@ describe("TaskList 空状态与交互", () => {
       // 再 Shift + ArrowDown，应跳过 completed header 跳到 t2 并扩展选择
       fireEvent.keyDown(listbox, { key: "ArrowDown", shiftKey: true });
       expect(handlers.onSelectRange).toHaveBeenCalledWith(0, 1, ["t1", "t2"]);
+    });
+  });
+
+  describe("移动端窄屏适配", () => {
+    beforeEach(() => {
+      mockMatchMedia(true);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("小屏下根容器添加 task-list--narrow 类", () => {
+      const { container } = renderWithI18n(() => (
+        <TaskList
+          tasks={[makeTask("t1")]}
+          selectedTaskId={null}
+          onTaskClick={noopTaskClick}
+          isMultiSelectMode={false}
+          selectedTaskIds={new Set()}
+          density="comfortable"
+          keyboardHandlers={noopHandlers()}
+        />
+      ));
+
+      const root = container.firstElementChild;
+      expect(root).toBeTruthy();
+      expect(root!.classList.contains("task-list--narrow")).toBe(true);
     });
   });
 });

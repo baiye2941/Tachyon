@@ -20,6 +20,46 @@
   overflow: hidden;
 }
 
+/* 移动端/超窄屏:接近全屏,便于触控与阅读 */
+.cmd-panel--narrow {
+  width: calc(100vw - 16px);
+  max-height: calc(100vh - 32px);
+  border-radius: 14px;
+}
+
+@media (max-width: 640px) {
+  .cmd-panel {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 32px);
+    border-radius: 14px;
+  }
+
+  .cmd-input-wrap {
+    padding: 14px 16px;
+  }
+
+  .cmd-input {
+    font-size: 17px;
+  }
+
+  .cmd-list {
+    padding: 6px;
+  }
+
+  .cmd-item {
+    padding: 10px 12px;
+    border-radius: 12px;
+  }
+
+  .cmd-item-title {
+    font-size: 15px;
+  }
+
+  .cmd-footer {
+    display: none;
+  }
+}
+
 .cmd-input-wrap {
   display: flex;
   align-items: center;

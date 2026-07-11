@@ -32,6 +32,26 @@
   width: 100%;
 }
 
+.detail-panel--narrow .panel-header {
+  padding: 12px 16px;
+}
+
+.detail-panel--narrow .detail-file-info {
+  padding: 12px 16px;
+}
+
+.detail-panel--narrow .detail-progress-theater {
+  padding: 14px 16px 12px;
+}
+
+.detail-panel--narrow .detail-section {
+  padding: 0 16px 12px;
+}
+
+.detail-panel--narrow .detail-actions {
+  padding: 12px 16px 16px;
+}
+
 .detail-panel--side {
   position: relative;
   flex: 0 0 auto;
