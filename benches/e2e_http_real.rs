@@ -380,6 +380,80 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
     group.finish();
 }
 
+/// 真实网络下载基准测试
+///
+/// 通过环境变量 `TACHYON_REAL_URL` 指定真实下载 URL(HTTPS,支持 HTTP/2 协商)。
+/// 未设置时跳过整个 bench。设置时测真实 RTT、HTTP/2 多路复用、真实带宽限制、
+/// 真实磁盘写入反压等 loopback 无法覆盖的场景。
+///
+/// 用法:
+/// ```bash
+/// TACHYON_REAL_URL="https://huggingface.co/.../resolve/main/model.bin" cargo bench --bench e2e_http_real -- "real_network"
+/// ```
+///
+/// 可选环境变量:
+/// - `TACHYON_REAL_DOWNLOAD_DIR`: 下载目录(默认每次迭代用 TempDir 自动清理)
+fn bench_real_network(c: &mut Criterion) {
+    let url = match std::env::var("TACHYON_REAL_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            // 未设置 URL 时跳过,不注册任何 benchmark
+            return;
+        }
+    };
+
+    let rt = rt();
+    let mut group = c.benchmark_group("real_network");
+    support::configure_group(&mut group, 10);
+
+    // 默认 IOCP(Windows)/io_uring(Linux)+ 对齐 BufferPool
+    let aligned_pool = Arc::new(tachyon_io::BufferPool::with_prefill(
+        tachyon_core::config::WRITE_BATCH_BYTES,
+        32,
+    ));
+
+    group.bench_function("default_strategy", |b| {
+        b.to_async(&rt).iter(|| {
+            let url = url.clone();
+            let pool = aligned_pool.clone();
+            async move {
+                // 每次迭代用 TempDir,迭代结束时自动清理(与 loopback bench 一致)
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = tachyon_core::config::DownloadConfig::default();
+                config.download_dir = dir.path().to_string_lossy().to_string();
+                config.authorized_dirs = vec![config.download_dir.clone()];
+                config.verify_checksum = false;
+                let mut task = DownloadTask::new(url, config).await.unwrap();
+                task.set_buffer_pool(pool);
+                task.run().await.expect("下载失败");
+                assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            }
+        });
+    });
+
+    // 对比:TokioFile(回退路径,write_lock 串行化)
+    group.bench_function("tokio_file", |b| {
+        b.to_async(&rt).iter(|| {
+            let url = url.clone();
+            let pool = aligned_pool.clone();
+            async move {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = tachyon_core::config::DownloadConfig::default();
+                config.download_dir = dir.path().to_string_lossy().to_string();
+                config.authorized_dirs = vec![config.download_dir.clone()];
+                config.verify_checksum = false;
+                config.io_strategy = tachyon_core::config::IoStrategy::Standard;
+                let mut task = DownloadTask::new(url, config).await.unwrap();
+                task.set_buffer_pool(pool);
+                task.run().await.expect("下载失败");
+                assert_eq!(task.state(), tachyon_core::DownloadState::Completed);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = support::bench_config();
@@ -389,6 +463,7 @@ criterion_group! {
         bench_http_rtt_effect,
         bench_mirror_aggregation,
         bench_disk_io_backends,
-        bench_large_file_fragmented
+        bench_large_file_fragmented,
+        bench_real_network
 }
 criterion_main!(benches);

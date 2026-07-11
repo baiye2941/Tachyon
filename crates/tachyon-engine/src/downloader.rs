@@ -1497,7 +1497,7 @@ impl DownloadTask {
 
                 // worker 退出(正常或被 abort_all 取消)时 `write_buf` 析构自动归还:
                 // Guard 变体经 `BufferGuard::drop` 归还到池并恢复许可;
-                // Owned 变体的 `BytesMut` 正常释放内存。无需手动 release。
+                // Owned 变体的 `AlignedBuf` 正常释放内存。无需手动 release。
                 worker_result
             });
         }

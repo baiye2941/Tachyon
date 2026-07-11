@@ -101,10 +101,12 @@ impl BufferPool {
 
         self.outstanding.fetch_add(1, Ordering::AcqRel);
 
-        // 从队列中取出复用 buffer,或新建一个
-        self.pool.pop().unwrap_or_else(|| {
-            AlignedBuf::new(self.buffer_size).expect("AlignedBuf 分配失败(内存不足或参数无效)")
-        })
+        // 从队列中取出复用 buffer,或新建一个。
+        // OOM 时 panic(与旧 BytesMut::with_capacity 的 abort 语义一致,
+        // Rust 全局分配器在 OOM 时默认 abort,此处 expect 不会比 Vec 更早崩溃)。
+        self.pool
+            .pop()
+            .unwrap_or_else(|| AlignedBuf::new(self.buffer_size).expect("AlignedBuf 分配失败(OOM)"))
     }
 
     /// 归还 buffer 到池中

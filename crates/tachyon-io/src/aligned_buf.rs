@@ -120,6 +120,7 @@ impl AlignedBuf {
     /// 分配指定容量和对齐的缓冲区
     ///
     /// `align` 必须是 2 的幂。`cap` 必须为正数。
+    #[allow(dead_code)] // 预留 API,未来可能支持非 512 对齐场景
     pub fn with_align(cap: usize, align: usize) -> io::Result<Self> {
         if cap == 0 {
             return Err(io::Error::new(
@@ -138,13 +139,27 @@ impl AlignedBuf {
 
     /// 数据起始指针（512 对齐）
     pub fn as_ptr(&self) -> *const u8 {
-        // SAFETY: alloc.ptr 有效，offset <= alloc.cap（不变量）
+        debug_assert!(
+            self.offset + self.cap <= self.alloc.layout.size(),
+            "AlignedBuf 不变量违反: offset({}) + cap({}) > alloc_size({})",
+            self.offset,
+            self.cap,
+            self.alloc.layout.size()
+        );
+        // SAFETY: alloc.ptr 有效，offset + cap <= alloc.layout.size()（debug_assert 兜底）
         unsafe { self.alloc.ptr.as_ptr().add(self.offset) }
     }
 
     /// 可变数据起始指针（512 对齐）
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        // SAFETY: alloc.ptr 有效，offset <= alloc.cap（不变量）。&mut self 保证独占。
+        debug_assert!(
+            self.offset + self.cap <= self.alloc.layout.size(),
+            "AlignedBuf 不变量违反: offset({}) + cap({}) > alloc_size({})",
+            self.offset,
+            self.cap,
+            self.alloc.layout.size()
+        );
+        // SAFETY: alloc.ptr 有效，offset + cap <= alloc.layout.size()。&mut self 保证独占。
         unsafe { self.alloc.ptr.as_ptr().add(self.offset) }
     }
 
@@ -245,6 +260,7 @@ impl AsRef<[u8]> for AlignedBuf {
     }
 }
 
+#[allow(dead_code)] // 预留 trait impl,未来可能被外部代码使用
 impl AsMut<[u8]> for AlignedBuf {
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_mut_slice()
