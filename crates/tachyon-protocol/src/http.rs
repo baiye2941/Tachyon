@@ -159,10 +159,13 @@ impl HttpClient {
         }
         if enable_http2 {
             builder = builder
-                // 初始流窗口 1MB:高 BDP 网络下避免流级饥饿
-                // (默认 64KB 在 100Mbps×50ms RTT 下成为瓶颈)
-                .http2_initial_stream_window_size(1024 * 1024)
-                // 初始连接窗口 16MB:聚合多流吞吐
+                // 初始流窗口 4MB:高 BDP 网络下避免流级饥饿
+                // BDP = bandwidth × RTT:千兆宽带(125MB/s)×100ms RTT = 12.5MB,
+                // 单分片需多并发填满管道,但单流窗口至少不被 1MB 窒息。
+                // 4MB 覆盖 320Mbps×100ms RTT 的单流在途数据需求,
+                // 配合 16MB 连接窗口(4 并发流各 4MB = 16MB)聚合多流吞吐。
+                .http2_initial_stream_window_size(4 * 1024 * 1024)
+                // 初始连接窗口 16MB:聚合多流吞吐(4 流 × 4MB = 16MB)
                 .http2_initial_connection_window_size(16 * 1024 * 1024)
                 // 最大帧 1MB:减少大载荷的帧切分开销 (默认 16KB)
                 .http2_max_frame_size(1 << 20)
@@ -177,7 +180,7 @@ impl HttpClient {
             // 注:不启用 http2_adaptive_window。adaptive_window 会在运行时动态调整
             // 接收窗口并覆盖上方固定的 initial_stream/connection_window_size 设置
             // (见 reqwest 与 hyper 文档),使固定窗口成为无效配置。下载器场景为高 BDP
-            // 大文件传输,采用显式固定大窗口(1MB 流 / 16MB 连接)比 adaptive 的动态
+            // 大文件传输,采用显式固定大窗口(4MB 流 / 16MB 连接)比 adaptive 的动态
             // 试探更可控:后者面向通用 Web 浏览优化,可能在小请求上引入额外往返而
             // 拖慢首字节。
         }
@@ -230,7 +233,7 @@ impl HttpClient {
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(90))
             .tcp_nodelay(true)
-            .http2_initial_stream_window_size(1024 * 1024)
+            .http2_initial_stream_window_size(4 * 1024 * 1024)
             .http2_initial_connection_window_size(16 * 1024 * 1024)
             .http2_max_frame_size(1 << 20)
             .http2_keep_alive_interval(std::time::Duration::from_secs(30))

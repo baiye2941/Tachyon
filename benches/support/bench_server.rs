@@ -207,7 +207,7 @@ impl ThrottledServer {
                             builder
                                 .http2()
                                 .timer(TokioTimer::new())
-                                .initial_stream_window_size(1024 * 1024)
+                                .initial_stream_window_size(4 * 1024 * 1024)
                                 .initial_connection_window_size(16 * 1024 * 1024)
                                 .max_frame_size(1 << 20)
                                 .keep_alive_interval(Duration::from_secs(30))
