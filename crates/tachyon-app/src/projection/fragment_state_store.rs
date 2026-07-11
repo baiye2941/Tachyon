@@ -91,6 +91,16 @@ impl FragmentStateStore {
         self.0.get(task_id)
     }
 
+    /// 返回指定任务当前正在下载的分片数
+    ///
+    /// 用于实时更新 TaskInfo.active_concurrency,让前端看到当前真实并发。
+    pub fn active_downloading_count(&self, task_id: &str) -> u32 {
+        self.0
+            .get(task_id)
+            .map(|s| s.downloading_set.len() as u32)
+            .unwrap_or(0)
+    }
+
     /// 移除任务分片状态(cleanup_runtime 调用)
     pub fn remove(&self, task_id: &str) {
         self.0.remove(task_id);

@@ -912,6 +912,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1005,6 +1006,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1015,6 +1017,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1025,6 +1028,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await;
@@ -1221,6 +1225,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1254,6 +1259,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await

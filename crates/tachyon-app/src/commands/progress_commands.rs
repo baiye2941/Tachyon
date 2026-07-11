@@ -186,6 +186,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -238,6 +239,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -248,6 +250,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await

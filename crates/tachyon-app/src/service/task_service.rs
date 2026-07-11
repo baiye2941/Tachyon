@@ -37,6 +37,9 @@ pub struct TaskCreation {
     /// 仅当用户传入非空 file_name 时为 `Some`,否则保持 `None`,
     /// 走协议层探测得到的原始文件名。
     pub preferred_file_name: Option<String>,
+    /// 创建后是否立即启动下载。
+    /// 由 Tauri command 透传,CLI/测试可按需设为 false 以保持 Pending。
+    pub auto_start: bool,
 }
 
 /// 任务应用服务
@@ -248,6 +251,7 @@ impl TaskService {
         download_dir: Option<&str>,
         mirror_urls: Option<&[String]>,
         file_name: Option<&str>,
+        auto_start: bool,
     ) -> Result<TaskCreation, AppError> {
         validate_download_url(url)?;
 
@@ -428,6 +432,7 @@ impl TaskService {
             download_config,
             mirror_urls: mirror_urls.map(|v| v.to_vec()),
             preferred_file_name,
+            auto_start,
         })
     }
 

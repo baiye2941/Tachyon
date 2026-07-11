@@ -526,6 +526,7 @@ pub async fn batch_create_hf_tasks(
             download_dir.clone(),
             None,
             None,
+            true,
             Some(hf_meta),
         )
         .await?;

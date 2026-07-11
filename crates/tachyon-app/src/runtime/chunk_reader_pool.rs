@@ -241,6 +241,11 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
             FragmentProgress::Started { fragment_index } => {
                 // 标记分片开始下载(写入 FragmentStateStore.downloading_set)
                 fragment_state_store.mark_downloading(&task_id, fragment_index);
+                // 实时更新当前活跃并发数
+                if let Some(mut task) = task_repository.get_mut(&task_id) {
+                    task.active_concurrency =
+                        fragment_state_store.active_downloading_count(&task_id);
+                }
                 // 通知 broker 产生了 started delta,由 aggregator 推送给前端
                 if let Some(ref callback) = on_progress {
                     callback(&task_id, Some(ProgressDelta::Started(fragment_index)));
@@ -257,6 +262,11 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     pending_completed.push(fragment_index);
                     // 更新 FragmentStateStore.done_set(内部同时清除 downloading_set)
                     fragment_state_store.mark_done(&task_id, fragment_index);
+                    // 实时更新当前活跃并发数
+                    if let Some(mut task) = task_repository.get_mut(&task_id) {
+                        task.active_concurrency =
+                            fragment_state_store.active_downloading_count(&task_id);
+                    }
                 }
                 // 增量更新:先 insert 取出旧值计算差量,再按需清理 partial map。
                 // 注意:完成事件必须在 insert 之后 remove。若先 remove 则 insert
@@ -759,5 +769,118 @@ mod tests {
             state.downloading_set.contains(&1),
             "分片 1 仍在下载,应在 downloading_set"
         );
+    }
+
+    /// 验证运行中 active_concurrency 基于真实 downloading_set 实时更新。
+    #[tokio::test]
+    async fn test_active_concurrency_tracks_downloading_set() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "test-active-concurrency".to_string();
+
+        task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.bin".to_string(),
+                file_name: "file.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 4,
+                fragments_done: 0,
+                active_concurrency: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
+                hf_meta: None,
+            },
+        );
+
+        let fragment_state_store = crate::projection::FragmentStateStore::new();
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: fragment_state_store.clone(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        const INITIAL_CONCURRENCY: u32 = 3;
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![],
+                initial_concurrency: INITIAL_CONCURRENCY,
+            })
+            .await
+            .unwrap();
+        // PlanComplete 后 active_concurrency 应等于 initial_concurrency
+        wait_for_active_concurrency(&task_repository, &task_id, INITIAL_CONCURRENCY).await;
+
+        // 启动两个分片
+        progress_tx
+            .send(FragmentProgress::Started { fragment_index: 0 })
+            .await
+            .unwrap();
+        progress_tx
+            .send(FragmentProgress::Started { fragment_index: 1 })
+            .await
+            .unwrap();
+        wait_for_active_concurrency(&task_repository, &task_id, 2).await;
+
+        // 分片 0 完成后应剩 1 个
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 512,
+                completed: true,
+            })
+            .await
+            .unwrap();
+        wait_for_active_concurrency(&task_repository, &task_id, 1).await;
+
+        // 分片 1 完成后应为 0
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                fragment_downloaded: 512,
+                completed: true,
+            })
+            .await
+            .unwrap();
+        wait_for_active_concurrency(&task_repository, &task_id, 0).await;
+
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+    }
+
+    async fn wait_for_active_concurrency(
+        task_repository: &TaskRepository,
+        task_id: &str,
+        expected: u32,
+    ) {
+        for _ in 0..50 {
+            if task_repository.get(task_id).map(|t| t.active_concurrency) == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let actual = task_repository
+            .get(task_id)
+            .map(|t| t.active_concurrency)
+            .unwrap_or(u32::MAX);
+        panic!("active_concurrency 未在预期时间内达到 {expected}, 实际 {actual}");
     }
 }

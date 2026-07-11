@@ -71,7 +71,7 @@ fn test_local_delete_candidates_includes_suffixes() {
     let base = PathBuf::from("dl").join("model.bin");
     let candidates = local_delete_candidates("task-1", &base);
     // 用 PathBuf 比较避免跨平台路径分隔符差异
-    let has = |expected: PathBuf| candidates.iter().any(|p| *p == expected);
+    let has = |expected: PathBuf| candidates.contains(&expected);
 
     // 主文件
     assert!(has(base.clone()), "应包含主文件");
@@ -149,10 +149,6 @@ fn test_validate_local_delete_path_rejects_unauthorized_dir() {
 #[test]
 fn test_validate_delete_candidate_rejects_symlink() {
     // Windows 创建符号链接需管理员权限,测试仅 Unix 验证
-    #[cfg(not(unix))]
-    {
-        return;
-    }
     #[cfg(unix)]
     {
         let dir = TempDir::new().unwrap();
@@ -413,7 +409,7 @@ async fn test_update_cached_download_dir() {
 async fn test_create_task_success() {
     let (service, dir) = make_service();
     let url = "https://example.com/file.bin";
-    let result = service.create_task(url, None, None, None).await;
+    let result = service.create_task(url, None, None, None, true).await;
     assert!(result.is_ok(), "创建任务应成功: {:?}", result.err());
     let creation = result.unwrap();
     assert!(!creation.task_id.is_empty());
@@ -437,10 +433,13 @@ async fn test_create_task_success() {
 async fn test_create_task_dedup_same_url() {
     let (service, _dir) = make_service();
     let url = "https://example.com/file.bin";
-    service.create_task(url, None, None, None).await.unwrap();
+    service
+        .create_task(url, None, None, None, true)
+        .await
+        .unwrap();
 
     // 同 URL 再次创建应失败(去重)
-    let result = service.create_task(url, None, None, None).await;
+    let result = service.create_task(url, None, None, None, true).await;
     assert!(result.is_err(), "相同 URL 应去重拒绝");
     let err = result.unwrap_err();
     assert!(
@@ -452,7 +451,9 @@ async fn test_create_task_dedup_same_url() {
 #[tokio::test]
 async fn test_create_task_invalid_url() {
     let (service, _dir) = make_service();
-    let result = service.create_task("not-a-url", None, None, None).await;
+    let result = service
+        .create_task("not-a-url", None, None, None, true)
+        .await;
     assert!(result.is_err(), "非法 URL 应被拒绝");
 }
 
@@ -461,7 +462,7 @@ async fn test_create_task_with_preferred_filename() {
     let (service, _dir) = make_service();
     let url = "https://example.com/file.bin";
     let result = service
-        .create_task(url, None, None, Some("custom-name.bin"))
+        .create_task(url, None, None, Some("custom-name.bin"), true)
         .await;
     assert!(result.is_ok());
     let creation = result.unwrap();
@@ -480,7 +481,7 @@ async fn test_create_task_sanitizes_filename() {
     let url = "https://example.com/file.bin";
     // 含路径遍历字符的文件名应被 sanitize
     let result = service
-        .create_task(url, None, None, Some("../../etc/passwd"))
+        .create_task(url, None, None, Some("../../etc/passwd"), true)
         .await;
     assert!(result.is_ok());
     let creation = result.unwrap();

@@ -591,8 +591,18 @@ pub async fn create_task(
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
     file_name: Option<String>,
+    auto_start: Option<bool>,
 ) -> Result<String, AppError> {
-    create_task_inner(&state, url, download_dir, mirror_urls, file_name, None).await
+    create_task_inner(
+        &state,
+        url,
+        download_dir,
+        mirror_urls,
+        file_name,
+        auto_start.unwrap_or(true),
+        None,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -790,6 +800,7 @@ pub(crate) async fn create_task_inner(
     download_dir: Option<String>,
     mirror_urls: Option<Vec<String>>,
     file_name: Option<String>,
+    auto_start: bool,
     hf_meta: Option<super::HfTaskMeta>,
 ) -> Result<String, AppError> {
     let creation = state
@@ -800,6 +811,7 @@ pub(crate) async fn create_task_inner(
             download_dir.as_deref(),
             mirror_urls.as_deref(),
             file_name.as_deref(),
+            auto_start,
         )
         .await?;
 
@@ -810,16 +822,19 @@ pub(crate) async fn create_task_inner(
         task.hf_meta = Some(meta);
     }
 
-    let state_arc = Arc::new(state.clone_for_task());
-    state.runtime.supervisor.start_download(
-        state_arc,
-        &creation.task_id,
-        creation.url,
-        creation.download_dir,
-        creation.download_config,
-        creation.mirror_urls,
-        creation.preferred_file_name,
-    );
+    // auto_start=false 时保持 Pending,不激活下载;后续可调用 resume_task 启动
+    if creation.auto_start {
+        let state_arc = Arc::new(state.clone_for_task());
+        state.runtime.supervisor.start_download(
+            state_arc,
+            &creation.task_id,
+            creation.url,
+            creation.download_dir,
+            creation.download_config,
+            creation.mirror_urls,
+            creation.preferred_file_name,
+        );
+    }
 
     Ok(creation.task_id)
 }
@@ -1039,6 +1054,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1055,6 +1071,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1072,6 +1089,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1081,6 +1099,68 @@ mod tests {
         assert_eq!(task.downloaded, 0);
         assert_eq!(task.speed, 0);
         assert!((task.progress - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_create_task_auto_start_true_starts_download() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/auto-start-true.bin".to_string(),
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 创建后先为 Pending,随后 supervisor 启动 task_fn
+        let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
+        assert_eq!(task.status, DownloadState::Pending);
+
+        // 等待 supervisor 注册运行中的任务
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state.runtime.supervisor.has_running_task(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "auto_start=true 时 supervisor 应启动下载任务"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_auto_start_false_keeps_pending() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/auto-start-false.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let task = get_task_detail_inner(&state, id.clone()).await.unwrap();
+        assert_eq!(task.status, DownloadState::Pending);
+        assert!(
+            !state.runtime.supervisor.has_running_task(&id),
+            "auto_start=false 时 supervisor 不应有运行中的任务"
+        );
+
+        // 稍等片刻再次确认未自动启动
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !state.runtime.supervisor.has_running_task(&id),
+            "auto_start=false 时任务应保持 Pending,不应被自动启动"
+        );
     }
 
     #[tokio::test]
@@ -1102,6 +1182,7 @@ mod tests {
             Some(sub_dir.clone()),
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1119,6 +1200,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1129,6 +1211,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await;
@@ -1148,7 +1231,7 @@ mod tests {
         for _ in 0..10 {
             let state = state.clone();
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url.to_string(), None, None, None, None).await
+                create_task_inner(&state, url.to_string(), None, None, None, true, None).await
             }));
         }
 
@@ -1195,7 +1278,7 @@ mod tests {
             let state = state.clone();
             let url = format!("https://stress.example.com/file-{i}.bin");
             handles.push(tokio::spawn(async move {
-                create_task_inner(&state, url, None, None, None, None).await
+                create_task_inner(&state, url, None, None, None, true, None).await
             }));
         }
 
@@ -1251,6 +1334,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1270,6 +1354,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1289,6 +1374,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1311,6 +1397,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1330,6 +1417,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1354,6 +1442,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1372,6 +1461,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1391,6 +1481,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1409,6 +1500,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1467,6 +1559,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1538,6 +1631,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1590,6 +1684,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1626,6 +1721,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1645,6 +1741,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1664,6 +1761,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1674,6 +1772,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1708,6 +1807,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1770,6 +1870,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1780,6 +1881,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -1790,6 +1892,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await;
@@ -1813,6 +1916,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await;
@@ -1837,6 +1941,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
                 None,
             )
             .await
@@ -1901,6 +2006,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
                 None,
             )
             .await
@@ -1920,6 +2026,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    true,
                     None,
                 )
                 .await
@@ -1964,6 +2071,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -2004,6 +2112,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -2034,6 +2143,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -2057,6 +2167,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -2147,6 +2258,7 @@ mod tests {
             None,
             None,
             Some("my_model.bin".to_string()),
+            true,
             None,
         )
         .await
@@ -2164,6 +2276,7 @@ mod tests {
             None,
             None,
             Some("../../etc/passwd".to_string()),
+            true,
             None,
         )
         .await
@@ -2181,6 +2294,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             None,
         )
         .await
@@ -2198,6 +2312,7 @@ mod tests {
             None,
             None,
             Some("   ".to_string()),
+            true,
             None,
         )
         .await
