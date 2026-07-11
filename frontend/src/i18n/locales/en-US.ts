@@ -37,9 +37,9 @@ const enUS = {
   "taskList.emptyDesc": "Click New to let data fly in",
   "taskList.emptyNewTask": "New Download",
   "taskList.emptyNewTaskAria": "Create new download task (shortcut N)",
-  "taskList.hintNewTask": "New task",
-  "taskList.hintPasteLink": "Paste link",
-  "taskList.hintDragFile": "Drag .txt link file",
+  "taskList.empty.hintDragDrop": "Drag files to the window",
+  "taskList.empty.hintHub": "Browse HuggingFace",
+  "taskList.empty.hintClipboard": "Detect clipboard URL",
   "taskList.column.name": "File name",
   "taskList.column.progress": "Progress",
   "taskList.column.speed": "Speed",
@@ -585,6 +585,12 @@ const enUS = {
   "speedChart.live": "Current speed",
   "speedChart.now": "Now",
   "speedChart.ago": "{seconds}s ago",
+
+  // —— Bandwidth sparkline ——
+  "bandwidthSparkline.title": "Speed Trend",
+  "bandwidthSparkline.waiting": "Waiting for speed data...",
+  "bandwidthSparkline.expand": "Expand speed trend",
+  "bandwidthSparkline.collapse": "Collapse speed trend",
 
   // —— Chunk matrix ——
   "chunk.sectionLabel": "Fragment Distribution",

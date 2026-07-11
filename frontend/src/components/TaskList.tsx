@@ -4,9 +4,8 @@ import {
   createSignal,
   createMemo,
   createEffect,
-  onMount,
-  onCleanup,
 } from "solid-js";
+import { createVirtualizer } from "@tanstack/solid-virtual";
 import type { TaskInfo, ListDensity } from "../types";
 import TaskItem from "./TaskItem";
 import TaskGroupHeader from "./TaskGroupHeader";
@@ -18,11 +17,13 @@ import {
   sortGroupTasks,
   clearSort,
 } from "../stores/taskSort";
-import { PlusIcon, GearIcon } from "./icons";
+import { PlusIcon, GearIcon, DownloadSimpleIcon, HubIcon, LinkIcon } from "./icons";
 import EmptyState from "../shared/ui/EmptyState";
 import { useI18n } from "../i18n";
 import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { matchKeyboardEvent } from "../stores/shortcuts";
+import { openNewTaskModal } from "../stores/ui";
+import { $onboarding, completeOnboarding } from "../stores/onboarding";
 import ColumnSettings from "./ColumnSettings";
 import type { ColumnDef, ColumnKey } from "./taskColumns";
 import type { GroupKey } from "./taskGroups";
@@ -79,11 +80,6 @@ export default function TaskList(props: TaskListProps) {
   const isSmall = useIsSmallScreen();
 
   let scrollContainerRef: HTMLDivElement | undefined;
-  let rafId: number | null = null;
-
-  // ── Virtual-scroll reactive state ──────────────────────────────
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [containerHeight, setContainerHeight] = createSignal(500);
 
   // ── Column settings dropdown ───────────────────────────────────
   const [settingsOpen, setSettingsOpen] = createSignal(false);
@@ -228,16 +224,7 @@ export default function TaskList(props: TaskListProps) {
   });
 
   const scrollToIndex = (idx: number) => {
-    if (!scrollContainerRef) return;
-    const top = idx * itemHeight();
-    const bottom = top + itemHeight();
-    const viewTop = scrollContainerRef.scrollTop;
-    const viewBottom = viewTop + scrollContainerRef.clientHeight;
-    if (top < viewTop) {
-      scrollContainerRef.scrollTop = top;
-    } else if (bottom > viewBottom) {
-      scrollContainerRef.scrollTop = bottom - scrollContainerRef.clientHeight;
-    }
+    virtualizer.scrollToIndex(idx, { align: "auto" });
   };
 
   const clearRangeAnchor = () => setRangeAnchorIndex(null);
@@ -401,65 +388,15 @@ export default function TaskList(props: TaskListProps) {
     });
   };
 
-  const totalHeight = createMemo(() => listItems().length * itemHeight());
-
-  /** How many items fit in the visible viewport */
-  const visibleCount = createMemo(
-    () => Math.ceil(containerHeight() / itemHeight()) + 1,
-  );
-
-  /** First index in the render window (including buffer) */
-  const startIndex = createMemo(() => {
-    const raw = Math.floor(scrollTop() / itemHeight()) - BUFFER_COUNT;
-    return Math.max(0, raw);
-  });
-
-  /** Last index (exclusive) in the render window (including buffer) */
-  const endIndex = createMemo(() => {
-    const raw =
-      Math.floor(scrollTop() / itemHeight()) + visibleCount() + BUFFER_COUNT;
-    return Math.min(listItems().length, raw);
-  });
-
-  /** Y-offset for the inner positioning container */
-  const offsetY = createMemo(() => startIndex() * itemHeight());
-
-  /** The subset of items currently rendered (<For> reconciles by identity) */
-  const visibleItems = createMemo(() =>
-    listItems().slice(startIndex(), endIndex()),
-  );
-
-  // ── Scroll handler (RAF-throttled) ─────────────────────────────
-  const handleScroll = () => {
-    if (rafId !== null) return;
-    rafId = requestAnimationFrame(() => {
-      rafId = null;
-      if (scrollContainerRef) {
-        setScrollTop(scrollContainerRef.scrollTop);
-      }
-    });
-  };
-
-  // ── Measure viewport height ────────────────────────────────────
-  const measureHeight = () => {
-    if (scrollContainerRef && scrollContainerRef.clientHeight > 0) {
-      setContainerHeight(scrollContainerRef.clientHeight);
-    }
-  };
-
-  let resizeObserver: ResizeObserver | undefined;
-
-  onMount(() => {
-    measureHeight();
-    if (scrollContainerRef) {
-      resizeObserver = new ResizeObserver(measureHeight);
-      resizeObserver.observe(scrollContainerRef);
-    }
-  });
-
-  onCleanup(() => {
-    if (rafId !== null) cancelAnimationFrame(rafId);
-    resizeObserver?.disconnect();
+  // ── Virtualizer (TanStack Solid Virtual) ───────────────────────
+  // 使用固定行高 + overscan,保持分组/平铺视图统一高度,简化键盘导航坐标映射。
+  const virtualizer = createVirtualizer({
+    get count() {
+      return listItems().length;
+    },
+    getScrollElement: () => scrollContainerRef ?? null,
+    estimateSize: () => itemHeight(),
+    overscan: BUFFER_COUNT,
   });
 
   // Auto-scroll when the externally-selected task changes
@@ -557,6 +494,7 @@ export default function TaskList(props: TaskListProps) {
             return (
               <div
                 role="columnheader"
+                {...{ scope: "col" }}
                 aria-sort={ariaSort()}
                 class={`task-list-col task-list-col--align-${col.align}`}
                 classList={{
@@ -641,7 +579,6 @@ export default function TaskList(props: TaskListProps) {
         aria-label={i18n.t("taskList.aria.listbox") as string}
         aria-activedescendant={activeDescendantId()}
         class="flex-1 scroll-container focus:outline-none focus-visible:focus-ring"
-        onScroll={handleScroll}
         onKeyDown={handleListKeyDown}
       >
         <Show
@@ -723,94 +660,104 @@ export default function TaskList(props: TaskListProps) {
                 }
                 title={i18n.t("taskList.emptyTitle") as string}
                 description={i18n.t("taskList.emptyDesc") as string}
-                action={
-                  props.onNewTask
-                    ? {
-                        label: i18n.t("taskList.emptyNewTask") as string,
-                        onClick: props.onNewTask,
-                        icon: <PlusIcon />,
-                        ariaLabel: i18n.t("taskList.emptyNewTaskAria") as string,
-                      }
-                    : undefined
-                }
+                actionHighlight={!$onboarding.isCompleted()}
+                action={{
+                  label: i18n.t("taskList.emptyNewTask") as string,
+                  onClick: () => {
+                    completeOnboarding();
+                    openNewTaskModal();
+                    props.onNewTask?.();
+                  },
+                  icon: <PlusIcon />,
+                  ariaLabel: i18n.t("taskList.emptyNewTaskAria") as string,
+                }}
               >
-                <div class="empty-state-hints">
-                  <span class="kbd">N</span>
-                  <span>{i18n.t("taskList.hintNewTask") as string}</span>
-                  <span class="empty-state-hint-sep">·</span>
-                  <span class="kbd">⌘</span>
-                  <span class="kbd">V</span>
-                  <span>{i18n.t("taskList.hintPasteLink") as string}</span>
-                  <span class="empty-state-hint-sep">·</span>
-                  <span>{i18n.t("taskList.hintDragFile") as string}</span>
+                <div class="empty-state-onboarding">
+                  <div class="empty-state-onboarding-hint">
+                    <DownloadSimpleIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintDragDrop") as string}</span>
+                  </div>
+                  <div class="empty-state-onboarding-hint">
+                    <HubIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintHub") as string}</span>
+                  </div>
+                  <div class="empty-state-onboarding-hint">
+                    <LinkIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintClipboard") as string}</span>
+                  </div>
                 </div>
             </EmptyState>
           }
         >
           {/* Outer wrapper: sets total scrollable height via spacer */}
-          <div style={{ position: "relative", height: `${totalHeight()}px` }}>
-            {/* Inner wrapper: offset to the visible window */}
-            <div
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                right: 0,
-                transform: `translateY(${offsetY()}px)`,
+          <div
+            style={{
+              position: "relative",
+              height: `${virtualizer.getTotalSize()}px`,
+            }}
+          >
+            <For each={virtualizer.getVirtualItems()}>
+              {(virtualRow, visibleIndex) => {
+                const item = createMemo(() => listItems()[virtualRow.index]);
+                return (
+                  <Show when={item()} keyed>
+                    {(it) => (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: 0,
+                          left: 0,
+                          right: 0,
+                          height: `${virtualRow.size}px`,
+                          transform: `translateY(${virtualRow.start}px)`,
+                        }}
+                      >
+                        {it.type === "task" ? (
+                          <TaskItem
+                            id={`task-item-${it.task.id}`}
+                            task={it.task}
+                            index={virtualRow.index}
+                            role="option"
+                            tabIndex={-1}
+                            isSelected={props.selectedTaskId === it.task.id}
+                            isMultiSelected={props.selectedTaskIds.has(
+                              it.task.id,
+                            )}
+                            isMultiSelectMode={props.isMultiSelectMode}
+                            onClick={(shiftKey) => {
+                              setActiveIndex(virtualRow.index);
+                              if (!shiftKey) clearRangeAnchor();
+                              props.onTaskClick(
+                                it.task.id,
+                                virtualRow.index,
+                                shiftKey,
+                                orderedTaskIds(),
+                              );
+                            }}
+                            onContextMenu={(e) =>
+                              props.onTaskContextMenu?.(e, it.task.id)
+                            }
+                            density={props.density}
+                            searchQuery={props.searchQuery}
+                            staggerIndex={visibleIndex()}
+                            columnWidths={getColumnWidth}
+                          />
+                        ) : (
+                          <TaskGroupHeader
+                            group={it.group}
+                            count={it.count}
+                            collapsed={collapsedGroups().has(it.group)}
+                            isActive={activeIndex() === virtualRow.index}
+                            height={itemHeight()}
+                            onToggle={() => toggleGroupCollapsed(it.group)}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </Show>
+                );
               }}
-            >
-              <For each={visibleItems()}>
-                {(item, visibleIndex) => {
-                  const actualIndex = createMemo(
-                    () => startIndex() + visibleIndex(),
-                  );
-                  return (
-                    <>
-                      {item.type === "task" ? (
-                        <TaskItem
-                          id={`task-item-${item.task.id}`}
-                          task={item.task}
-                          index={actualIndex()}
-                          role="option"
-                          tabIndex={-1}
-                          isSelected={props.selectedTaskId === item.task.id}
-                          isMultiSelected={props.selectedTaskIds.has(
-                            item.task.id,
-                          )}
-                          isMultiSelectMode={props.isMultiSelectMode}
-                          onClick={(shiftKey) => {
-                            setActiveIndex(actualIndex());
-                            if (!shiftKey) clearRangeAnchor();
-                            props.onTaskClick(
-                              item.task.id,
-                              actualIndex(),
-                              shiftKey,
-                              orderedTaskIds(),
-                            );
-                          }}
-                          onContextMenu={(e) =>
-                            props.onTaskContextMenu?.(e, item.task.id)
-                          }
-                          density={props.density}
-                          searchQuery={props.searchQuery}
-                          staggerIndex={visibleIndex()}
-                          columnWidths={getColumnWidth}
-                        />
-                      ) : (
-                        <TaskGroupHeader
-                          group={item.group}
-                          count={item.count}
-                          collapsed={collapsedGroups().has(item.group)}
-                          isActive={activeIndex() === actualIndex()}
-                          height={itemHeight()}
-                          onToggle={() => toggleGroupCollapsed(item.group)}
-                        />
-                      )}
-                    </>
-                  );
-                }}
-              </For>
-            </div>
+            </For>
           </div>
         </Show>
       </div>

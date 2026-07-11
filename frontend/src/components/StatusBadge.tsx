@@ -39,10 +39,14 @@ export default function StatusBadge(props: StatusBadgeProps) {
   const sizeClass = () => `status-badge status-badge--${props.status}`;
   const iconSize = () => ICON_SIZE[props.size ?? "sm"];
 
+  const label = () => props.title ?? getStatusLabel(props.status);
+
   return (
     <span
       class={sizeClass()}
-      title={props.title ?? getStatusLabel(props.status)}
+      role="status"
+      aria-label={label()}
+      title={label()}
     >
       <span
         class="status-badge-dot"

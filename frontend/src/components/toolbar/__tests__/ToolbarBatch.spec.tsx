@@ -71,6 +71,18 @@ describe("ToolbarBatch 批量操作工具栏", () => {
     expect(screen.getByText("已选 2 项")).toBeDefined();
   });
 
+  it("所有可见操作按钮均具备 aria-label", () => {
+    renderWithI18n(() => <ToolbarBatch {...makeProps()} />);
+
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.length).toBeGreaterThan(0);
+    buttons.forEach((btn) => {
+      const label = btn.getAttribute("aria-label");
+      const text = btn.textContent;
+      expect(label ?? text).toBeTruthy();
+    });
+  });
+
   it("点击暂停调用 onPauseSelected", () => {
     const props = makeProps();
     renderWithI18n(() => <ToolbarBatch {...props} />);

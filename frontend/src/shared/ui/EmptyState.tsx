@@ -15,6 +15,8 @@ export interface EmptyStateProps {
   /** 使用品牌强调色图标(不透明度更高),默认 false */
   brand?: boolean;
   action?: EmptyStateAction;
+  /** 高亮操作按钮(首次使用 onboarding) */
+  actionHighlight?: boolean;
   children?: JSX.Element;
   class?: string;
   /** 紧凑模式,用于命令面板等较小容器 */
@@ -54,6 +56,7 @@ export default function EmptyState(props: EmptyStateProps) {
               size={props.compact ? "md" : "lg"}
               aria-label={action().ariaLabel ?? action().label}
               onClick={action().onClick}
+              data-highlight={props.actionHighlight}
             >
               {action().icon}
               <span>{action().label}</span>

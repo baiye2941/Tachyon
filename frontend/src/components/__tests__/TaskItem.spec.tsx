@@ -176,4 +176,57 @@ describe("TaskItem", () => {
     );
     expect(activeSpeedCell).not.toBeNull();
   });
+
+  it("作为 listbox option 时，选中行应设置 aria-selected=true", () => {
+    renderWithI18n(() => (
+      <TaskItem
+        task={task}
+        index={0}
+        isSelected={true}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+        role="option"
+      />
+    ));
+
+    const row = screen.getByRole("option");
+    expect(row.getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("作为 listbox option 时，多选选中行也应设置 aria-selected=true", () => {
+    renderWithI18n(() => (
+      <TaskItem
+        task={task}
+        index={0}
+        isSelected={false}
+        isMultiSelected={true}
+        isMultiSelectMode={true}
+        onClick={() => {}}
+        density="comfortable"
+        role="option"
+      />
+    ));
+
+    const row = screen.getByRole("option");
+    expect(row.getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("role=button 时不应设置 aria-selected", () => {
+    renderWithI18n(() => (
+      <TaskItem
+        task={task}
+        index={0}
+        isSelected={true}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    const row = screen.getByRole("button");
+    expect(row.getAttribute("aria-selected")).toBeNull();
+  });
 });

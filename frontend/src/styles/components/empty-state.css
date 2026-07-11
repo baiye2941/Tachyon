@@ -61,19 +61,51 @@
   margin-bottom: 16px;
 }
 
-.empty-state-hints {
+.empty-state-onboarding {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 8px;
-  flex-wrap: wrap;
-  justify-content: center;
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-  margin-top: 4px;
+  margin-top: 8px;
+  text-align: left;
 }
 
-.empty-state-hint-sep {
-  color: var(--color-border-strong);
+.empty-state-onboarding-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+}
+
+.empty-state-onboarding-hint svg {
+  flex-shrink: 0;
+  color: var(--color-text-tertiary);
+  opacity: 0.7;
+}
+
+/* 首次使用高亮引导:柔和脉冲环 */
+[data-highlight="true"] {
+  animation: onboarding-highlight 2s ease-in-out infinite;
+}
+
+@keyframes onboarding-highlight {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--color-accent-glow);
+  }
+
+  50% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-highlight="true"] {
+    animation: none;
+    box-shadow: 0 0 0 2px var(--color-accent-glow);
+  }
 }
 
 /* ========== Error state 统一错误占位 ========== */

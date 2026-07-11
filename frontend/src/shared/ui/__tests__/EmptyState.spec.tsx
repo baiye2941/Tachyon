@@ -98,4 +98,22 @@ describe("EmptyState", () => {
       container.querySelector(".empty-state-icon.empty-state-icon--brand"),
     ).toBeDefined();
   });
+
+  it("actionHighlight 为操作按钮添加 data-highlight", () => {
+    const { container } = renderWithI18n(() => (
+      <EmptyState
+        icon={<span data-testid="icon" />}
+        title="高亮测试"
+        action={{
+          label: "去创建",
+          onClick: () => {},
+          ariaLabel: "创建新任务",
+        }}
+        actionHighlight
+      />
+    ));
+
+    const btn = container.querySelector("button[data-highlight='true']");
+    expect(btn).not.toBeNull();
+  });
 });

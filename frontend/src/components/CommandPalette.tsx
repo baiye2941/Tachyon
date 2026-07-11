@@ -12,6 +12,7 @@ import { Icon } from "../utils/icons";
 import type { ViewName, TaskInfo } from "../types";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 import { useIsSmallScreen } from "../hooks/useMediaQuery";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import {
   COMMANDS,
   GROUP_LABEL_KEYS,
@@ -127,9 +128,15 @@ type Section = {
 export default function CommandPalette(props: CommandPaletteProps) {
   let inputRef: HTMLInputElement | undefined;
   let listRef: HTMLDivElement | undefined;
+  let trapContainerRef: HTMLDivElement | undefined;
   const t = (key: MessageKey) => tr(key);
   const reducedMotion = useReducedMotion();
   const isSmall = useIsSmallScreen();
+  useFocusTrap({
+    active: () => props.open,
+    container: () => trapContainerRef,
+    // Escape 仍由当前组件的 onKeyDown 处理；focus trap 只负责 Tab 循环与焦点恢复。
+  });
   const isMac =
     typeof navigator !== "undefined" &&
     /Mac|iPhone|iPad/.test(navigator.platform);
@@ -415,6 +422,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
             }
             onClick={(e: MouseEvent) => e.stopPropagation()}
           >
+            <div ref={trapContainerRef} class="contents">
             {/* 搜索输入区 */}
             <div class="cmd-input-wrap">
               <span class="cmd-item-icon">
@@ -559,6 +567,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                 </For>
                 {t("commandPalette.hintAllShortcuts")}
               </span>
+            </div>
             </div>
           </Motion.div>
         </div>

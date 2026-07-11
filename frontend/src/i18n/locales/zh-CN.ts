@@ -37,9 +37,9 @@ const zhCN = {
   "taskList.emptyDesc": "点击新建，让数据飞奔而来",
   "taskList.emptyNewTask": "新建下载",
   "taskList.emptyNewTaskAria": "新建下载任务 (快捷键 N)",
-  "taskList.hintNewTask": "新建任务",
-  "taskList.hintPasteLink": "粘贴链接",
-  "taskList.hintDragFile": "拖拽 .txt 链接文件",
+  "taskList.empty.hintDragDrop": "拖拽文件到窗口",
+  "taskList.empty.hintHub": "从 HuggingFace 浏览",
+  "taskList.empty.hintClipboard": "识别剪贴板 URL",
   "taskList.column.name": "文件名",
   "taskList.column.progress": "进度",
   "taskList.column.speed": "速度",
@@ -566,6 +566,12 @@ const zhCN = {
   "speedChart.live": "当前速度",
   "speedChart.now": "现在",
   "speedChart.ago": "{seconds}秒前",
+
+  // —— 带宽迷你曲线 ——
+  "bandwidthSparkline.title": "速度趋势",
+  "bandwidthSparkline.waiting": "等待速度数据...",
+  "bandwidthSparkline.expand": "展开速度趋势",
+  "bandwidthSparkline.collapse": "收起速度趋势",
 
   // —— 分片矩阵 ——
   "chunk.sectionLabel": "分片分布",

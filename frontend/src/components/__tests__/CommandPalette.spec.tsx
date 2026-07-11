@@ -10,6 +10,10 @@ import { resetAllShortcuts, setShortcut } from "../../stores/shortcuts";
 import type { TaskInfo } from "../../types";
 import { fuzzySearch } from "../../utils/fuzzySearch";
 
+vi.mock("../../hooks/useFocusTrap", () => ({
+  useFocusTrap: () => {},
+}));
+
 vi.mock("../../utils/fuzzySearch", async (importOriginal) => {
   const mod = (await importOriginal()) as typeof import("../../utils/fuzzySearch");
   return { ...mod, fuzzySearch: vi.fn(mod.fuzzySearch) };
@@ -580,6 +584,36 @@ describe("CommandPalette", () => {
       await waitForRaf();
 
       expect(container.querySelector("[aria-live]")).toBeTruthy();
+    });
+
+    it("搜索结果变化后 aria-live 区域播报结果数量", async () => {
+      const { container } = renderPalette();
+      await waitForRaf();
+
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
+      fireEvent.input(input, {
+        target: { value: "设置" },
+        currentTarget: { value: "设置" },
+      });
+      await waitForDebounce();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const liveRegion = container.querySelector('[aria-live="polite"]');
+      expect(liveRegion).not.toBeNull();
+      expect(liveRegion?.textContent).toContain("命令列表");
+    });
+
+    it("打开命令面板后输入框应自动获得焦点", async () => {
+      const { container } = renderPalette();
+      await waitForRaf();
+      await waitForRaf();
+
+      const input = container.querySelector(
+        'input[type="text"]',
+      ) as HTMLInputElement;
+      expect(document.activeElement).toBe(input);
     });
   });
 

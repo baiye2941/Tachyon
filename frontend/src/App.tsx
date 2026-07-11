@@ -62,6 +62,7 @@ import TaskList from "./components/TaskList";
 import DetailPanel from "./components/DetailPanel";
 import StatusBar from "./components/StatusBar";
 import ToastContainer from "./components/ToastContainer";
+import Announcer from "./components/Announcer";
 import ContextMenu from "./components/ContextMenu";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ErrorPage from "./components/ErrorPage";
@@ -455,6 +456,7 @@ function AppContent() {
       />
 
       <ToastContainer />
+      <Announcer />
 
       {/* 全局应用内确认对话框(Iteration 11):
           所有破坏性操作(单/批量删除)走 requestConfirm,统一品牌视觉,

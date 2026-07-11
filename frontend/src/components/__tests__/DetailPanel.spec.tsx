@@ -43,6 +43,7 @@ vi.mock("../../stores/confirm", () => ({
 
 vi.mock("../../stores/taskSpeedHistory", () => ({
   clearTaskHistory: vi.fn(),
+  getTaskHistory: vi.fn(() => []),
 }));
 
 vi.mock("../../hooks/useReducedMotion", () => ({
@@ -549,5 +550,26 @@ describe("DetailPanel", () => {
       await new Promise((r) => setTimeout(r, 350));
       expect(onClose).toHaveBeenCalled();
     });
+  });
+
+  it("关闭按钮应可 Tab 聚焦", async () => {
+    await renderWithI18n(baseTask);
+    await waitForRaf();
+
+    const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
+    expect(closeBtns.length).toBeGreaterThan(0);
+    closeBtns.forEach((btn) => {
+      expect(btn.getAttribute("tabindex")).not.toBe("-1");
+    });
+  });
+
+  it("状态徽章应具有 role=status 与 aria-label", async () => {
+    await renderWithI18n(baseTask);
+    await waitForRaf();
+
+    const badge = document.querySelector(".status-badge");
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("role")).toBe("status");
+    expect(badge?.getAttribute("aria-label")).toBeTruthy();
   });
 });

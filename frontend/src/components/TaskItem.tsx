@@ -114,7 +114,9 @@ export default function TaskItem(props: TaskItemProps) {
       role={role()}
       tabindex={tabIndex()}
       aria-label={ariaLabel()}
-      aria-selected={role() === "option" ? props.isMultiSelected : undefined}
+      aria-selected={
+        role() === "option" ? props.isSelected || props.isMultiSelected : undefined
+      }
       class="task-row cursor-pointer task-item-enter focus:outline-none focus-visible:focus-ring"
       classList={{
         "task-row--selected": props.isSelected && !props.isMultiSelected,

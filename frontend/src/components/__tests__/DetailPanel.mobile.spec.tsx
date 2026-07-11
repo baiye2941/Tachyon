@@ -38,6 +38,7 @@ vi.mock("../../stores/confirm", () => ({
 
 vi.mock("../../stores/taskSpeedHistory", () => ({
   clearTaskHistory: vi.fn(),
+  getTaskHistory: vi.fn(() => []),
 }));
 
 vi.mock("../../hooks/useReducedMotion", () => ({

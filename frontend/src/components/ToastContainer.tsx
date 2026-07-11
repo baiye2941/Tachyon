@@ -33,6 +33,8 @@ export function getToasts() {
   return toasts()
 }
 
+export { toasts }
+
 export default function ToastContainer() {
   return (
     <div

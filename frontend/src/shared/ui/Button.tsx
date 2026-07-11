@@ -53,6 +53,8 @@ export interface ButtonProps {
   type?: 'button' | 'submit' | 'reset'
   /** 标记为焦点陷阱自动聚焦元素(useFocusTrap 读取 hasAttribute("data-autofocus")) */
   'data-autofocus'?: boolean
+  /** 高亮引导(空列表 onboarding 用) */
+  'data-highlight'?: boolean
   children?: JSX.Element
   onClick?: (e: MouseEvent) => void
   onFocus?: (e: FocusEvent) => void
@@ -140,6 +142,7 @@ const Button: Component<ButtonProps> = (rawProps) => {
       title={props.title}
       type={props.as === 'button' ? props.type : undefined}
       data-autofocus={props['data-autofocus'] ? 'true' : undefined}
+      data-highlight={props['data-highlight'] ? 'true' : undefined}
       onClick={(e: MouseEvent) => {
         handleRipple(e)
         if (props.disabled || props.loading) return
