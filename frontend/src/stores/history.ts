@@ -210,6 +210,15 @@ export function clearHistory(): void {
   saveToStorage([]);
 }
 
+/**
+ * 直接加载一组历史记录到 store 并持久化。
+ * 主要用于测试隔离,也可用于未来导入历史记录功能。
+ */
+export function loadHistoryRecords(records: HistoryRecord[]): void {
+  setHistoryRecords(records);
+  saveToStorage(records);
+}
+
 export function getRecordById(id: string): HistoryRecord | undefined {
   const records = untrack(() => historyRecords);
   return records.find((r) => r.id === id);

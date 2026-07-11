@@ -1,8 +1,11 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@solidjs/testing-library";
-import type { HistoryRecord } from "../../stores/history";
-
-const STORAGE_KEY = "tachyon:download_history";
+import HistoryPanel from "../HistoryPanel";
+import {
+  clearHistory,
+  loadHistoryRecords,
+  type HistoryRecord,
+} from "../../stores/history";
 
 // mock confirm store:批量删除测试需要控制 requestConfirm 返回值
 const mockRequestConfirm = vi.fn();
@@ -25,13 +28,11 @@ function makeRecord(overrides: Partial<HistoryRecord> = {}): HistoryRecord {
   };
 }
 
-async function renderPanel(
+function renderPanel(
   overrides: Record<string, unknown> = {},
   records: HistoryRecord[] = [],
 ) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
-  vi.resetModules();
-  const { default: HistoryPanel } = await import("../HistoryPanel");
+  loadHistoryRecords(records);
   return render(() => (
     <HistoryPanel
       visible={true}
@@ -48,7 +49,7 @@ async function renderPanel(
 describe("HistoryPanel 历史记录面板", () => {
   beforeEach(() => {
     localStorage.clear();
-    vi.resetModules();
+    clearHistory();
     mockRequestConfirm.mockReset();
   });
 
