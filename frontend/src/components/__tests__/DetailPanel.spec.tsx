@@ -7,7 +7,6 @@ import {
 } from "@solidjs/testing-library";
 import { I18nProvider, i18n } from "../../i18n";
 import type { TaskInfo } from "../../types";
-import DetailPanel from "../DetailPanel";
 import { refreshTaskList } from "../../stores/downloads";
 
 const mockApi = vi.hoisted(() => ({
@@ -608,6 +607,5 @@ describe("DetailPanel", () => {
     expect(badge).not.toBeNull();
     expect(badge?.getAttribute("role")).toBe("status");
     expect(badge?.getAttribute("aria-label")).toBeTruthy();
-  });
   });
 });

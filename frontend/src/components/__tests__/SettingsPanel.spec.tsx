@@ -713,62 +713,6 @@ describe('SettingsPanel', () => {
       expect(addToast).toHaveBeenCalledWith(expect.stringContaining('导出备份失败'), 'error')
     })
   })
-
-  // --- phase4: 简单导出/导入按钮行为(不同按钮文案与确认流程) ---
-  it('点击导出配置按钮应打开保存对话框并调用 exportBackup', async () => {
-    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
-    vi.mocked(save).mockResolvedValue('/backup/tachyon.json')
-    vi.mocked(api.exportBackup).mockResolvedValue(undefined)
-
-    renderSettingsPanel()
-    await waitFor(() => {
-      expect(screen.queryByText('加载配置中...')).toBeNull()
-    })
-
-    fireEvent.click(screen.getByText('导出配置'))
-
-    await waitFor(() => {
-      expect(save).toHaveBeenCalledWith(expect.objectContaining({
-        defaultPath: 'tachyon-config-backup.json',
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      }))
-      expect(api.exportBackup).toHaveBeenCalledWith('/backup/tachyon.json')
-      expect(addToast).toHaveBeenCalledWith('配置已导出', 'success')
-    })
-  })
-
-  it('点击导入配置按钮应确认后打开选择对话框并调用 importBackup', async () => {
-    const importedConfig = { ...mockConfig, maxConcurrentTasks: 7 }
-    vi.mocked(api.getConfig)
-      .mockResolvedValueOnce(mockConfig)
-      .mockResolvedValueOnce(importedConfig)
-    vi.mocked(open).mockResolvedValue('/backup/tachyon.json')
-    vi.mocked(api.importBackup).mockResolvedValue(undefined)
-
-    renderSettingsPanel()
-    await waitFor(() => {
-      expect(screen.queryByText('加载配置中...')).toBeNull()
-    })
-
-    const importButton = screen.getByRole('button', { name: '导入配置' })
-    fireEvent.click(importButton)
-
-    await waitFor(() => {
-      expect(screen.getByText('导入将覆盖当前配置,此操作不可撤销,是否继续?')).toBeTruthy()
-    })
-
-    const confirmButton = screen.getByRole('button', { name: '导入' })
-    fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      expect(open).toHaveBeenCalledWith(expect.objectContaining({
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-        multiple: false,
-      }))
-      expect(api.importBackup).toHaveBeenCalledWith('/backup/tachyon.json')
-      expect(addToast).toHaveBeenCalledWith('配置已导入', 'success')
-    })
-  })
 })
 
 // --- P3-9: 前后端 DownloadConfig schema 对齐测试 ---

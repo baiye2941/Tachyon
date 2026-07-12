@@ -147,10 +147,6 @@ export const api = {
   getConfig: () => invoke<AppConfig>('get_config'),
   /** 更新应用配置(破坏性操作,需确认令牌。SettingsPanel 已自行确认,跳过 invoke 内 window.confirm) */
   updateConfig: (patch: ConfigPatch) => invoke<void>('update_config', { patch }, true),
-  /** 导出当前配置到指定路径(JSON) */
-  exportBackup: (path: string) => invoke<void>('export_backup', { path }),
-  /** 从指定路径导入配置并覆盖当前配置(破坏性操作,调用方已自行确认,跳过 invoke 内 window.confirm) */
-  importBackup: (path: string) => invoke<void>('import_backup', { path }, true),
   /** 获取嗅探资源列表 */
   getSnifferResources: () => invoke<SnifferResource[]>('get_sniffer_resources'),
   /** 添加嗅探过滤规则 */
