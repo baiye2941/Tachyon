@@ -336,3 +336,40 @@ export async function refreshTaskList() {
     addToast(tr("toast.refreshTasksFailed", { error: errorMessage(e) }), "error");
   }
 }
+
+/**
+ * 手动重排任务顺序。
+ *
+ * 先乐观更新本地 store 以立即反馈,再异步调用后端持久化,
+ * 失败时通过刷新回退到服务端状态。
+ */
+export async function reorderTasks(orderedIds: string[]) {
+  const prev = tasks.slice();
+  const idSet = new Set(orderedIds);
+  const tail = tasks.filter((t) => !idSet.has(t.id));
+  const sorted = [
+    ...orderedIds.map((id) => tasks.find((t) => t.id === id)!),
+    ...tail,
+  ];
+  setTasks(sorted);
+  try {
+    await api.reorderTasks(orderedIds);
+  } catch (e) {
+    setTasks(prev);
+    addToast(tr("toast.reorderTasksFailed", { error: errorMessage(e) }), "error");
+  }
+}
+
+/**
+ * 将单个任务移动到指定任务之前。
+ *
+ * beforeId 为空时移动到列表末尾。
+ */
+export async function moveTask(taskId: string, beforeId?: string) {
+  try {
+    await api.moveTask(taskId, beforeId);
+    await refreshTaskList();
+  } catch (e) {
+    addToast(tr("toast.reorderTasksFailed", { error: errorMessage(e) }), "error");
+  }
+}

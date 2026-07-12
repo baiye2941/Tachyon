@@ -47,6 +47,7 @@ vi.mock("../../stores/confirm", () => ({
 
 vi.mock("../../stores/taskSpeedHistory", () => ({
   clearTaskHistory: vi.fn(),
+  getTaskHistory: vi.fn(() => []),
 }));
 
 vi.mock("../../hooks/useReducedMotion", () => ({
@@ -55,6 +56,7 @@ vi.mock("../../hooks/useReducedMotion", () => ({
 
 vi.mock("../../hooks/useMediaQuery", () => ({
   useIsNarrowScreen: () => () => false,
+  useIsSmallScreen: () => () => false,
 }));
 
 vi.mock("../../hooks/useFocusTrap", () => ({
@@ -103,16 +105,24 @@ function waitForRaf() {
   });
 }
 
-function renderWithI18n(task: TaskInfo | null, onClose = () => {}) {
+async function renderWithI18n(
+  task: TaskInfo | null,
+  onClose = () => {},
+  variant: "overlay" | "side" = "overlay",
+) {
+  const { default: DetailPanel } = await import("../DetailPanel");
   return render(() => (
     <I18nProvider i18n={i18n}>
-      <DetailPanel task={task} onClose={onClose} />
+      <DetailPanel task={task} onClose={onClose} variant={variant} />
     </I18nProvider>
   ));
 }
 
 describe("DetailPanel", () => {
   beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+
     Object.assign(navigator, {
       clipboard: {
         writeText: vi.fn(),
@@ -126,7 +136,7 @@ describe("DetailPanel", () => {
   });
 
   it("应渲染文件名、大百分比进度和状态徽标", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const text = document.body.textContent;
@@ -136,7 +146,7 @@ describe("DetailPanel", () => {
   });
 
   it("活动指标应显示真实并发分片数而非占位符", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const cards = document.querySelectorAll(".metric-card");
@@ -150,7 +160,7 @@ describe("DetailPanel", () => {
   });
 
   it("并发分片为 0 时应显示占位符", async () => {
-    renderWithI18n({ ...baseTask, activeConcurrency: 0 });
+    await renderWithI18n({ ...baseTask, activeConcurrency: 0 });
     await waitForRaf();
 
     const cards = Array.from(document.querySelectorAll(".metric-card"));
@@ -161,7 +171,7 @@ describe("DetailPanel", () => {
   });
 
   it("下载中任务底部应显示暂停按钮", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const pauseBtn = screen.getByRole("button", { name: /暂停下载/ });
@@ -172,7 +182,7 @@ describe("DetailPanel", () => {
   });
 
   it("已暂停任务底部应显示恢复按钮", async () => {
-    renderWithI18n({ ...baseTask, status: "paused", speed: 0 });
+    await renderWithI18n({ ...baseTask, status: "paused", speed: 0 });
     await waitForRaf();
 
     const resumeBtn = screen.getByRole("button", { name: /恢复下载/ });
@@ -183,7 +193,7 @@ describe("DetailPanel", () => {
   });
 
   it("头部快捷操作应包含复制链接、打开文件夹、重新下载", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     expect(screen.getByRole("button", { name: "复制链接" })).toBeTruthy();
@@ -192,7 +202,7 @@ describe("DetailPanel", () => {
   });
 
   it("点击复制链接应写入剪贴板", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "复制链接" }));
@@ -202,19 +212,19 @@ describe("DetailPanel", () => {
     );
   });
 
-  it("点击打开文件夹应调用 api.openFolder", async () => {
-    renderWithI18n(baseTask);
+  it("点击打开文件夹应调用 api.openFolder 并传入父目录", async () => {
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "打开文件夹" }));
 
     expect(mockApi.openFolder).toHaveBeenCalledWith(
-      "D:\\Downloads\\model.gguf",
+      "D:\\Downloads",
     );
   });
 
   it("无保存路径时不显示打开文件夹按钮", async () => {
-    renderWithI18n({ ...baseTask, savePath: "" });
+    await renderWithI18n({ ...baseTask, savePath: "" });
     await waitForRaf();
 
     expect(
@@ -224,7 +234,7 @@ describe("DetailPanel", () => {
 
   it("点击重新下载应创建新任务", async () => {
     mockApi.createTask.mockResolvedValue("task-2");
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "重新下载" }));
@@ -242,7 +252,7 @@ describe("DetailPanel", () => {
       speed: 0,
       errorReason: "connection timeout",
     };
-    renderWithI18n(failedTask);
+    await renderWithI18n(failedTask);
     await waitForRaf();
 
     expect(screen.getByRole("alert")).toBeTruthy();
@@ -255,7 +265,7 @@ describe("DetailPanel", () => {
   });
 
   it("URL 和保存路径默认可见", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     expect(screen.getByText("下载链接")).toBeTruthy();
@@ -266,7 +276,7 @@ describe("DetailPanel", () => {
 
   it("删除任务应弹出确认并调用 api.deleteTask", async () => {
     const { requestConfirm } = await import("../../stores/confirm");
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "删除任务" }));
@@ -281,7 +291,7 @@ describe("DetailPanel", () => {
 
   it("关闭按钮应触发 onClose", async () => {
     const onClose = vi.fn();
-    renderWithI18n(baseTask, onClose);
+    await renderWithI18n(baseTask, onClose);
     await waitForRaf();
 
     const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
@@ -293,7 +303,7 @@ describe("DetailPanel", () => {
   });
 
   it("应渲染任务标签", async () => {
-    renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
+    await renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
     await waitForRaf();
 
     expect(screen.getByText("标签")).toBeTruthy();
@@ -302,7 +312,7 @@ describe("DetailPanel", () => {
   });
 
   it("输入标签并回车应调用 api.addTaskTag 并刷新列表", async () => {
-    renderWithI18n(baseTask);
+    await renderWithI18n(baseTask);
     await waitForRaf();
 
     const input = screen.getByPlaceholderText("输入标签,回车添加");
@@ -315,7 +325,7 @@ describe("DetailPanel", () => {
   });
 
   it("点击标签移除按钮应调用 api.removeTaskTag 并刷新列表", async () => {
-    renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
+    await renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "移除标签 ai" }));
@@ -323,5 +333,281 @@ describe("DetailPanel", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(mockApi.removeTaskTag).toHaveBeenCalledWith("task-1", "ai");
     expect(refreshTaskList).toHaveBeenCalled();
+  });
+
+  describe("宽屏侧栏模式", () => {
+    it("侧栏变体应渲染为侧栏样式并带有默认宽度", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel).toBeTruthy();
+      expect(panel!.classList.contains("detail-panel--side")).toBe(true);
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*360px/);
+    });
+
+    it("侧栏变体打开时应使用 localStorage 中保存的宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(400));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*400px/);
+    });
+
+    it("侧栏变体左侧应显示可访问性拖拽手柄", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      expect(handle).toBeTruthy();
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+    });
+
+    it("覆盖式变体不应显示拖拽手柄", async () => {
+      await renderWithI18n(baseTask, () => {}, "overlay");
+      await waitForRaf();
+
+      expect(
+        screen.queryByRole("separator", { name: "调整详情面板宽度" }),
+      ).toBeNull();
+    });
+
+    it("拖拽手柄应实时调整宽度并在释放后保持", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+      expect(panel).toBeTruthy();
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: 400, pointerId: 1 });
+
+      // 向左拖动 100px,默认 360px 变为 460px
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      // 释放后保持新宽度
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(460),
+      );
+    });
+
+    it("宽度不应小于最小值 280px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: 900, pointerId: 1 });
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      // 向右拖动 400px 会超过容器,但至少应被限制为 280px
+      const style = panel!.getAttribute("style") ?? "";
+      const widthMatch = style.match(/width:\s*(\d+)px/);
+      expect(widthMatch).toBeTruthy();
+      expect(Number(widthMatch![1])).toBeGreaterThanOrEqual(280);
+    });
+
+    it("宽度不应超过最大值 600px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      const panel = document.querySelector(".detail-panel");
+
+      fireEvent.pointerDown(handle, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(handle, { clientX: -200, pointerId: 1 });
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+
+      const style = panel!.getAttribute("style") ?? "";
+      const widthMatch = style.match(/width:\s*(\d+)px/);
+      expect(widthMatch).toBeTruthy();
+      expect(Number(widthMatch![1])).toBeLessThanOrEqual(600);
+    });
+
+    it("拖拽手柄应可聚焦", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      expect(handle.getAttribute("tabindex")).toBe("0");
+    });
+
+    it("ArrowLeft 应减小宽度 20px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*340px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(340),
+      );
+    });
+
+    it("ArrowRight 应增加宽度 20px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*380px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(380),
+      );
+    });
+
+    it("Shift+ArrowLeft 应减小宽度 100px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+    });
+
+    it("Shift+ArrowRight 应增加宽度 100px", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*460px/);
+    });
+
+    it("Home 应跳到最小宽度", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "Home" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(280),
+      );
+    });
+
+    it("End 应跳到最大宽度", async () => {
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "End" });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*600px/);
+      expect(localStorage.getItem("tachyon.detailPanel.width")).toBe(
+        JSON.stringify(600),
+      );
+    });
+
+    it("键盘调整不应低于最小宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(290));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*280px/);
+    });
+
+    it("键盘调整不应超过最大宽度", async () => {
+      localStorage.setItem("tachyon.detailPanel.width", JSON.stringify(590));
+      await renderWithI18n(baseTask, () => {}, "side");
+      await waitForRaf();
+
+      const handle = screen.getByRole("separator", {
+        name: "调整详情面板宽度",
+      });
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+
+      const panel = document.querySelector(".detail-panel");
+      expect(panel!.getAttribute("style")).toMatch(/width:\s*600px/);
+    });
+
+    it("覆盖式变体下手柄不可聚焦", async () => {
+      await renderWithI18n(baseTask, () => {}, "overlay");
+      await waitForRaf();
+
+      expect(
+        screen.queryByRole("separator", { name: "调整详情面板宽度" }),
+      ).toBeNull();
+    });
+
+    it("侧栏模式下关闭按钮仍触发 onClose", async () => {
+      const onClose = vi.fn();
+      await renderWithI18n(baseTask, onClose, "side");
+      await waitForRaf();
+
+      const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
+      fireEvent.click(closeBtns[0]!);
+
+      await new Promise((r) => setTimeout(r, 350));
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+
+  it("关闭按钮应可 Tab 聚焦", async () => {
+    await renderWithI18n(baseTask);
+    await waitForRaf();
+
+    const closeBtns = screen.getAllByRole("button", { name: "关闭详情" });
+    expect(closeBtns.length).toBeGreaterThan(0);
+    closeBtns.forEach((btn) => {
+      expect(btn.getAttribute("tabindex")).not.toBe("-1");
+    });
+  });
+
+  it("状态徽章应具有 role=status 与 aria-label", async () => {
+    await renderWithI18n(baseTask);
+    await waitForRaf();
+
+    const badge = document.querySelector(".status-badge");
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute("role")).toBe("status");
+    expect(badge?.getAttribute("aria-label")).toBeTruthy();
+  });
   });
 });

@@ -1,8 +1,18 @@
-import { createSignal, Show, For, createMemo, type JSX } from "solid-js";
+import {
+  createSignal,
+  Show,
+  For,
+  createMemo,
+  onCleanup,
+  type JSX,
+} from "solid-js";
+import EmptyState from "../shared/ui/EmptyState";
 import { Motion, Presence } from "@motionone/solid";
 import { Icon } from "../utils/icons";
 import type { ViewName, TaskInfo } from "../types";
 import { useReducedMotion } from "../hooks/useReducedMotion";
+import { useIsSmallScreen } from "../hooks/useMediaQuery";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import {
   COMMANDS,
   GROUP_LABEL_KEYS,
@@ -71,6 +81,8 @@ export interface CommandPaletteProps {
   onRedownloadTask?: (taskId: string) => void;
   /** 复制文本到剪贴板 */
   onCopyToClipboard?: (text: string) => void;
+  /** 搜索防抖延迟(ms),默认 100ms */
+  debounceMs?: number;
 }
 
 /** 高亮匹配字符:根据 matchedIndices 在 label 中包裹 <mark> */
@@ -116,13 +128,33 @@ type Section = {
 export default function CommandPalette(props: CommandPaletteProps) {
   let inputRef: HTMLInputElement | undefined;
   let listRef: HTMLDivElement | undefined;
+  let trapContainerRef: HTMLDivElement | undefined;
   const t = (key: MessageKey) => tr(key);
   const reducedMotion = useReducedMotion();
+  const isSmall = useIsSmallScreen();
+  useFocusTrap({
+    active: () => props.open,
+    container: () => trapContainerRef,
+    // Escape 仍由当前组件的 onKeyDown 处理；focus trap 只负责 Tab 循环与焦点恢复。
+  });
   const isMac =
     typeof navigator !== "undefined" &&
     /Mac|iPhone|iPad/.test(navigator.platform);
+  const [inputQuery, setInputQuery] = createSignal("");
   const [query, setQuery] = createSignal("");
   const [activeIndex, setActiveIndex] = createSignal(0);
+
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  const setDebouncedQuery = (value: string) => {
+    setInputQuery(value);
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      setQuery(value);
+      setActiveIndex(0);
+    }, props.debounceMs ?? 100);
+  };
+
+  onCleanup(() => clearTimeout(debounceTimer));
 
   const ctx: CommandContext = {
     get onViewChange() {
@@ -375,6 +407,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
         >
           <Motion.div
             class="cmd-panel flex flex-col"
+            classList={{ "cmd-panel--narrow": isSmall() }}
             initial={{ opacity: 0, y: -12, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -8, scale: 0.98 }}
@@ -389,6 +422,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
             }
             onClick={(e: MouseEvent) => e.stopPropagation()}
           >
+            <div ref={trapContainerRef} class="contents">
             {/* 搜索输入区 */}
             <div class="cmd-input-wrap">
               <span class="cmd-item-icon">
@@ -406,11 +440,8 @@ export default function CommandPalette(props: CommandPaletteProps) {
                 }
                 class="cmd-input"
                 placeholder={t("commandPalette.searchPlaceholder")}
-                value={query()}
-                onInput={(e) => {
-                  setQuery(e.currentTarget.value);
-                  setActiveIndex(0);
-                }}
+                value={inputQuery()}
+                onInput={(e) => setDebouncedQuery(e.currentTarget.value)}
                 autofocus
               />
               <span class="cmd-esc-hint">Esc</span>
@@ -433,14 +464,12 @@ export default function CommandPalette(props: CommandPaletteProps) {
               aria-label={t("commandPalette.listAria")}
             >
               <Show when={flattened().length === 0}>
-                <div class="cmd-empty">
-                  <span class="cmd-empty-icon">
-                    <Icon name="magnifying-glass" class="w-5 h-5" />
-                  </span>
-                  <span style={{ "font-size": "13px" }}>
-                    {t("commandPalette.noResults")}
-                  </span>
-                </div>
+                <EmptyState
+                  compact
+                  icon={<Icon name="magnifying-glass" class="w-6 h-6" />}
+                  title={t("commandPalette.noResults")}
+                  description={t("commandPalette.emptyHint")}
+                />
               </Show>
 
               <For each={sections()}>
@@ -538,6 +567,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
                 </For>
                 {t("commandPalette.hintAllShortcuts")}
               </span>
+            </div>
             </div>
           </Motion.div>
         </div>

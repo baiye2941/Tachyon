@@ -696,12 +696,80 @@ pub async fn remove_task_tag(
     remove_task_tag_inner(&state, task_id, tag).await
 }
 
+/// 撤销取消任务
+///
+/// 破坏性操作,需确认令牌。将任务恢复为取消前的状态,
+/// 若原状态为 Downloading 则重新启动下载。
+#[tauri::command]
+pub async fn undo_cancel_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    confirmation_token: Option<String>,
+) -> Result<(), AppError> {
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "undo_cancel_task")?;
+        }
+        None => {
+            return Err(super::AppError::Config(
+                "撤销取消任务需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    undo_cancel_task_inner(&state, task_id).await
+}
+
+/// 撤销删除任务
+///
+/// 破坏性操作,需确认令牌。仅恢复任务记录和断点续传快照,
+/// 不恢复本地文件,也不重新启动下载。
+#[tauri::command]
+pub async fn undo_delete_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    confirmation_token: Option<String>,
+) -> Result<(), AppError> {
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "undo_delete_task")?;
+        }
+        None => {
+            return Err(super::AppError::Config(
+                "撤销删除任务需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    undo_delete_task_inner(&state, task_id).await
+}
+
+/// 重排任务顺序
+///
+/// `ordered_ids` 为任务 ID 的期望顺序(从前到后)。服务层会验证所有 ID
+/// 存在后更新 `display_order` 并持久化快照。
 #[tauri::command]
 pub async fn reorder_tasks(
     state: tauri::State<'_, AppState>,
     ordered_ids: Vec<String>,
 ) -> Result<(), AppError> {
     reorder_tasks_inner(&state, ordered_ids).await
+}
+
+/// 将任务移动到指定任务之前
+///
+/// `before_id` 为 `None` 时移动到列表末尾。
+#[tauri::command]
+pub async fn move_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    before_id: Option<String>,
+) -> Result<(), AppError> {
+    move_task_inner(&state, task_id, before_id).await
 }
 
 /// 探测文件真实名称(HEAD 请求 / DHT 查询种子元数据)
@@ -1027,6 +1095,33 @@ pub(crate) async fn remove_task_tag_inner(
         .await
 }
 
+pub(crate) async fn undo_cancel_task_inner(
+    state: &AppState,
+    task_id: String,
+) -> Result<(), AppError> {
+    let previous_status = state
+        .service
+        .task_service
+        .undo_cancel_task(&task_id)
+        .await?;
+
+    // 原状态为 Downloading 时,取消后 task_fn 已退出,
+    // 需要重新启动下载(与 resume_task_inner 无运行 task_fn 的路径一致)。
+    if previous_status == DownloadState::Downloading {
+        restart_download(state, &task_id).await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn undo_delete_task_inner(
+    state: &AppState,
+    task_id: String,
+) -> Result<(), AppError> {
+    // 撤销删除仅恢复记录和快照,不恢复本地文件,也不重新启动下载。
+    state.service.task_service.undo_delete_task(&task_id).await
+}
+
 pub(crate) async fn reorder_tasks_inner(
     state: &AppState,
     ordered_ids: Vec<String>,
@@ -1218,6 +1313,18 @@ pub(crate) async fn import_backup_inner(
     }
 
     Ok(imported)
+}
+
+pub(crate) async fn move_task_inner(
+    state: &AppState,
+    task_id: String,
+    before_id: Option<String>,
+) -> Result<(), AppError> {
+    state
+        .service
+        .task_service
+        .move_task(task_id, before_id)
+        .await
 }
 
 // ---------------------------------------------------------------------------

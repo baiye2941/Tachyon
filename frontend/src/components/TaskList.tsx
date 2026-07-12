@@ -4,9 +4,8 @@ import {
   createSignal,
   createMemo,
   createEffect,
-  onMount,
-  onCleanup,
 } from "solid-js";
+import { createVirtualizer } from "@tanstack/solid-virtual";
 import type { TaskInfo, ListDensity } from "../types";
 import TaskItem from "./TaskItem";
 import TaskGroupHeader from "./TaskGroupHeader";
@@ -18,10 +17,14 @@ import {
   sortGroupTasks,
   clearSort,
 } from "../stores/taskSort";
-import { PlusIcon, GearIcon } from "./icons";
-import Button from "../shared/ui/Button";
+import { PlusIcon, GearIcon, DownloadSimpleIcon, HubIcon, LinkIcon } from "./icons";
+import EmptyState from "../shared/ui/EmptyState";
 import { useI18n } from "../i18n";
+import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { matchKeyboardEvent } from "../stores/shortcuts";
+import { openNewTaskModal } from "../stores/ui";
+import { moveTask } from "../stores/downloads";
+import { $onboarding, completeOnboarding } from "../stores/onboarding";
 import ColumnSettings from "./ColumnSettings";
 import type { ColumnDef, ColumnKey } from "./taskColumns";
 import type { GroupKey } from "./taskGroups";
@@ -75,17 +78,17 @@ interface TaskListProps {
 
 export default function TaskList(props: TaskListProps) {
   const i18n = useI18n();
+  const isSmall = useIsSmallScreen();
 
   let scrollContainerRef: HTMLDivElement | undefined;
-  let rafId: number | null = null;
-
-  // ── Virtual-scroll reactive state ──────────────────────────────
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [containerHeight, setContainerHeight] = createSignal(500);
 
   // ── Column settings dropdown ───────────────────────────────────
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [draggingKey, setDraggingKey] = createSignal<string | null>(null);
+
+  // ── Drag-and-drop reorder state ────────────────────────────────
+  const [draggingId, setDraggingId] = createSignal<string | null>(null);
+  const [dropTargetId, setDropTargetId] = createSignal<string | null>(null);
 
   // ── Column resize local state (dragging) ───────────────────────
   /** 拖拽期间暂存列宽，避免每帧写 store 触发持久化/全列表重渲染 */
@@ -108,6 +111,10 @@ export default function TaskList(props: TaskListProps) {
   const itemHeight = createMemo(() => ITEM_HEIGHTS[props.density]);
 
   const groupByMode = createMemo(() => props.groupBy ?? "none");
+
+  const isDraggable = createMemo(
+    () => groupByMode() === "none" && $taskSort.state().key === null,
+  );
 
   // ── Sorting / flat list abstraction ────────────────────────────
   const sortedTasks = createMemo(() =>
@@ -226,16 +233,7 @@ export default function TaskList(props: TaskListProps) {
   });
 
   const scrollToIndex = (idx: number) => {
-    if (!scrollContainerRef) return;
-    const top = idx * itemHeight();
-    const bottom = top + itemHeight();
-    const viewTop = scrollContainerRef.scrollTop;
-    const viewBottom = viewTop + scrollContainerRef.clientHeight;
-    if (top < viewTop) {
-      scrollContainerRef.scrollTop = top;
-    } else if (bottom > viewBottom) {
-      scrollContainerRef.scrollTop = bottom - scrollContainerRef.clientHeight;
-    }
+    virtualizer.scrollToIndex(idx, { align: "auto" });
   };
 
   const clearRangeAnchor = () => setRangeAnchorIndex(null);
@@ -399,65 +397,15 @@ export default function TaskList(props: TaskListProps) {
     });
   };
 
-  const totalHeight = createMemo(() => listItems().length * itemHeight());
-
-  /** How many items fit in the visible viewport */
-  const visibleCount = createMemo(
-    () => Math.ceil(containerHeight() / itemHeight()) + 1,
-  );
-
-  /** First index in the render window (including buffer) */
-  const startIndex = createMemo(() => {
-    const raw = Math.floor(scrollTop() / itemHeight()) - BUFFER_COUNT;
-    return Math.max(0, raw);
-  });
-
-  /** Last index (exclusive) in the render window (including buffer) */
-  const endIndex = createMemo(() => {
-    const raw =
-      Math.floor(scrollTop() / itemHeight()) + visibleCount() + BUFFER_COUNT;
-    return Math.min(listItems().length, raw);
-  });
-
-  /** Y-offset for the inner positioning container */
-  const offsetY = createMemo(() => startIndex() * itemHeight());
-
-  /** The subset of items currently rendered (<For> reconciles by identity) */
-  const visibleItems = createMemo(() =>
-    listItems().slice(startIndex(), endIndex()),
-  );
-
-  // ── Scroll handler (RAF-throttled) ─────────────────────────────
-  const handleScroll = () => {
-    if (rafId !== null) return;
-    rafId = requestAnimationFrame(() => {
-      rafId = null;
-      if (scrollContainerRef) {
-        setScrollTop(scrollContainerRef.scrollTop);
-      }
-    });
-  };
-
-  // ── Measure viewport height ────────────────────────────────────
-  const measureHeight = () => {
-    if (scrollContainerRef && scrollContainerRef.clientHeight > 0) {
-      setContainerHeight(scrollContainerRef.clientHeight);
-    }
-  };
-
-  let resizeObserver: ResizeObserver | undefined;
-
-  onMount(() => {
-    measureHeight();
-    if (scrollContainerRef) {
-      resizeObserver = new ResizeObserver(measureHeight);
-      resizeObserver.observe(scrollContainerRef);
-    }
-  });
-
-  onCleanup(() => {
-    if (rafId !== null) cancelAnimationFrame(rafId);
-    resizeObserver?.disconnect();
+  // ── Virtualizer (TanStack Solid Virtual) ───────────────────────
+  // 使用固定行高 + overscan,保持分组/平铺视图统一高度,简化键盘导航坐标映射。
+  const virtualizer = createVirtualizer({
+    get count() {
+      return listItems().length;
+    },
+    getScrollElement: () => scrollContainerRef ?? null,
+    estimateSize: () => itemHeight(),
+    overscan: BUFFER_COUNT,
   });
 
   // Auto-scroll when the externally-selected task changes
@@ -535,8 +483,58 @@ export default function TaskList(props: TaskListProps) {
     return `task-item-${item.task.id}`;
   };
 
+  // ── Drag-and-drop handlers ─────────────────────────────────────
+  const handleDragStart = (taskId: string) => (e: DragEvent) => {
+    e.dataTransfer?.setData("text/task-id", taskId);
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+    }
+    setDraggingId(taskId);
+  };
+
+  const handleDragEnd = () => {
+    setDraggingId(null);
+    setDropTargetId(null);
+  };
+
+  const targetTaskIdFromEvent = (e: DragEvent): string | null => {
+    const target = (e.target as HTMLElement | null)?.closest(
+      "[data-task-id]",
+    ) as HTMLElement | null;
+    return target?.dataset.taskId ?? null;
+  };
+
+  const handleDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    if (!draggingId()) return;
+    const overId = targetTaskIdFromEvent(e);
+    if (overId && overId !== draggingId()) {
+      setDropTargetId(overId);
+    } else {
+      setDropTargetId(null);
+    }
+  };
+
+  const handleDragLeave = () => {
+    setDropTargetId(null);
+  };
+
+  const handleDrop = async (e: DragEvent) => {
+    e.preventDefault();
+    const draggedId = draggingId();
+    if (!draggedId) return;
+    const overId = targetTaskIdFromEvent(e);
+    const beforeId = overId === draggedId ? undefined : overId ?? undefined;
+    setDraggingId(null);
+    setDropTargetId(null);
+    await moveTask(draggedId, beforeId);
+  };
+
   return (
-    <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div
+      class="flex-1 flex flex-col min-w-0 overflow-hidden"
+      classList={{ "task-list--narrow": isSmall() }}
+    >
       {/* List Header */}
       <div class="flex items-center flex-shrink-0 task-list-header">
         <For each={$taskColumns.visibleColumns()}>
@@ -552,6 +550,7 @@ export default function TaskList(props: TaskListProps) {
             return (
               <div
                 role="columnheader"
+                {...{ scope: "col" }}
                 aria-sort={ariaSort()}
                 class={`task-list-col task-list-col--align-${col.align}`}
                 classList={{
@@ -636,183 +635,196 @@ export default function TaskList(props: TaskListProps) {
         aria-label={i18n.t("taskList.aria.listbox") as string}
         aria-activedescendant={activeDescendantId()}
         class="flex-1 scroll-container focus:outline-none focus-visible:focus-ring"
-        onScroll={handleScroll}
+        classList={{ "task-list--dragging": !!draggingId() }}
         onKeyDown={handleListKeyDown}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
       >
         <Show
           when={props.tasks.length > 0}
           fallback={
-            <div class="flex flex-col items-center justify-center h-full gap-5 empty-state">
-              {/* 品牌抽象图形：速度粒子轨道，无渐变，纯单色调 */}
-              <div
-                class="empty-state-icon empty-state-icon--brand"
-                aria-hidden="true"
-              >
-                <svg
-                  width="80"
-                  height="80"
-                  viewBox="0 0 80 80"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                >
-                  {/* 速度线 */}
-                  <line
-                    x1="6"
-                    y1="32"
-                    x2="74"
-                    y2="32"
-                    stroke-dasharray="2 8"
-                    opacity="0.2"
-                  />
-                  <line
-                    x1="10"
-                    y1="40"
-                    x2="70"
-                    y2="40"
-                    stroke-dasharray="4 4"
-                    opacity="0.3"
-                  />
-                  <line
-                    x1="6"
-                    y1="48"
-                    x2="74"
-                    y2="48"
-                    stroke-dasharray="2 8"
-                    opacity="0.2"
-                  />
-                  {/* 起点闸门立柱 */}
-                  <path d="M26 18 L26 62" opacity="0.3" />
-                  <path d="M54 18 L54 62" opacity="0.3" />
-                  <path d="M26 20 L54 20" opacity="0.2" />
-                  <path d="M26 60 L54 60" opacity="0.2" />
-                  {/* 中心粒子 */}
-                  <circle
-                    cx="40"
-                    cy="40"
-                    r="5"
-                    fill="var(--color-accent-primary)"
-                    stroke="none"
-                    opacity="0.9"
-                  />
-                  {/* 粒子尾迹 */}
-                  <path
-                    d="M33 40 L20 40"
-                    stroke="var(--color-accent-primary)"
-                    stroke-width="2"
-                    opacity="0.45"
-                  />
-                  <path
-                    d="M31 35 L21 32"
-                    stroke="var(--color-brand-teal)"
+            <EmptyState
+              class="h-full"
+              brand
+              icon={
+                  <svg
+                    width="80"
+                    height="80"
+                    viewBox="0 0 80 80"
+                    fill="none"
+                    stroke="currentColor"
                     stroke-width="1.5"
-                    opacity="0.35"
-                  />
-                  <path
-                    d="M31 45 L21 48"
-                    stroke="var(--color-brand-teal)"
-                    stroke-width="1.5"
-                    opacity="0.35"
-                  />
-                </svg>
-              </div>
-              <div class="empty-state-body">
-                <p class="empty-state-title">
-                  {i18n.t("taskList.emptyTitle") as string}
-                </p>
-                <p class="empty-state-desc">
-                  {i18n.t("taskList.emptyDesc") as string}
-                </p>
-                <Show when={props.onNewTask}>
-                  <Button
-                    variant="primary"
-                    size="lg"
-                    aria-label={i18n.t("taskList.emptyNewTaskAria") as string}
-                    onClick={props.onNewTask}
+                    stroke-linecap="round"
+                    aria-hidden="true"
                   >
-                    <PlusIcon />
-                    <span>{i18n.t("taskList.emptyNewTask") as string}</span>
-                  </Button>
-                </Show>
-              </div>
-              <div class="empty-state-hints">
-                <span class="kbd">N</span>
-                <span>{i18n.t("taskList.hintNewTask") as string}</span>
-                <span class="empty-state-hint-sep">·</span>
-                <span class="kbd">⌘</span>
-                <span class="kbd">V</span>
-                <span>{i18n.t("taskList.hintPasteLink") as string}</span>
-                <span class="empty-state-hint-sep">·</span>
-                <span>{i18n.t("taskList.hintDragFile") as string}</span>
-              </div>
-            </div>
+                    {/* 速度线 */}
+                    <line
+                      x1="6"
+                      y1="32"
+                      x2="74"
+                      y2="32"
+                      stroke-dasharray="2 8"
+                      opacity="0.2"
+                    />
+                    <line
+                      x1="10"
+                      y1="40"
+                      x2="70"
+                      y2="40"
+                      stroke-dasharray="4 4"
+                      opacity="0.3"
+                    />
+                    <line
+                      x1="6"
+                      y1="48"
+                      x2="74"
+                      y2="48"
+                      stroke-dasharray="2 8"
+                      opacity="0.2"
+                    />
+                    {/* 起点闸门立柱 */}
+                    <path d="M26 18 L26 62" opacity="0.3" />
+                    <path d="M54 18 L54 62" opacity="0.3" />
+                    <path d="M26 20 L54 20" opacity="0.2" />
+                    <path d="M26 60 L54 60" opacity="0.2" />
+                    {/* 中心粒子 */}
+                    <circle
+                      cx="40"
+                      cy="40"
+                      r="5"
+                      fill="var(--color-accent-primary)"
+                      stroke="none"
+                      opacity="0.9"
+                    />
+                    {/* 粒子尾迹 */}
+                    <path
+                      d="M33 40 L20 40"
+                      stroke="var(--color-accent-primary)"
+                      stroke-width="2"
+                      opacity="0.45"
+                    />
+                    <path
+                      d="M31 35 L21 32"
+                      stroke="var(--color-brand-teal)"
+                      stroke-width="1.5"
+                      opacity="0.35"
+                    />
+                    <path
+                      d="M31 45 L21 48"
+                      stroke="var(--color-brand-teal)"
+                      stroke-width="1.5"
+                      opacity="0.35"
+                    />
+                  </svg>
+                }
+                title={i18n.t("taskList.emptyTitle") as string}
+                description={i18n.t("taskList.emptyDesc") as string}
+                actionHighlight={!$onboarding.isCompleted()}
+                action={{
+                  label: i18n.t("taskList.emptyNewTask") as string,
+                  onClick: () => {
+                    completeOnboarding();
+                    openNewTaskModal();
+                    props.onNewTask?.();
+                  },
+                  icon: <PlusIcon />,
+                  ariaLabel: i18n.t("taskList.emptyNewTaskAria") as string,
+                }}
+              >
+                <div class="empty-state-onboarding">
+                  <div class="empty-state-onboarding-hint">
+                    <DownloadSimpleIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintDragDrop") as string}</span>
+                  </div>
+                  <div class="empty-state-onboarding-hint">
+                    <HubIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintHub") as string}</span>
+                  </div>
+                  <div class="empty-state-onboarding-hint">
+                    <LinkIcon size={16} />
+                    <span>{i18n.t("taskList.empty.hintClipboard") as string}</span>
+                  </div>
+                </div>
+            </EmptyState>
           }
         >
           {/* Outer wrapper: sets total scrollable height via spacer */}
-          <div style={{ position: "relative", height: `${totalHeight()}px` }}>
-            {/* Inner wrapper: offset to the visible window */}
-            <div
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                right: 0,
-                transform: `translateY(${offsetY()}px)`,
+          <div
+            style={{
+              position: "relative",
+              height: `${virtualizer.getTotalSize()}px`,
+            }}
+          >
+            <For each={virtualizer.getVirtualItems()}>
+              {(virtualRow, visibleIndex) => {
+                const item = createMemo(() => listItems()[virtualRow.index]);
+                return (
+                  <Show when={item()} keyed>
+                    {(it) => (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: 0,
+                          left: 0,
+                          right: 0,
+                          height: `${virtualRow.size}px`,
+                          transform: `translateY(${virtualRow.start}px)`,
+                        }}
+                      >
+                        {it.type === "task" ? (
+                          <TaskItem
+                            id={`task-item-${it.task.id}`}
+                            task={it.task}
+                            index={virtualRow.index}
+                            role="option"
+                            tabIndex={-1}
+                            isSelected={props.selectedTaskId === it.task.id}
+                            isMultiSelected={props.selectedTaskIds.has(
+                              it.task.id,
+                            )}
+                            isMultiSelectMode={props.isMultiSelectMode}
+                            isDraggable={isDraggable()}
+                            onDragStart={handleDragStart(it.task.id)}
+                            onDragEnd={handleDragEnd}
+                            classList={{
+                              "task-row--drop-target":
+                                dropTargetId() === it.task.id,
+                            }}
+                            onClick={(shiftKey) => {
+                              setActiveIndex(virtualRow.index);
+                              if (!shiftKey) clearRangeAnchor();
+                              props.onTaskClick(
+                                it.task.id,
+                                virtualRow.index,
+                                shiftKey,
+                                orderedTaskIds(),
+                              );
+                            }}
+                            onContextMenu={(e) =>
+                              props.onTaskContextMenu?.(e, it.task.id)
+                            }
+                            density={props.density}
+                            searchQuery={props.searchQuery}
+                            staggerIndex={visibleIndex()}
+                            columnWidths={getColumnWidth}
+                          />
+                        ) : (
+                          <TaskGroupHeader
+                            group={it.group}
+                            count={it.count}
+                            collapsed={collapsedGroups().has(it.group)}
+                            isActive={activeIndex() === virtualRow.index}
+                            height={itemHeight()}
+                            onToggle={() => toggleGroupCollapsed(it.group)}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </Show>
+                );
               }}
-            >
-              <For each={visibleItems()}>
-                {(item, visibleIndex) => {
-                  const actualIndex = createMemo(
-                    () => startIndex() + visibleIndex(),
-                  );
-                  return (
-                    <>
-                      {item.type === "task" ? (
-                        <TaskItem
-                          id={`task-item-${item.task.id}`}
-                          task={item.task}
-                          index={actualIndex()}
-                          role="option"
-                          tabIndex={-1}
-                          isSelected={props.selectedTaskId === item.task.id}
-                          isMultiSelected={props.selectedTaskIds.has(
-                            item.task.id,
-                          )}
-                          isMultiSelectMode={props.isMultiSelectMode}
-                          onClick={(shiftKey) => {
-                            setActiveIndex(actualIndex());
-                            if (!shiftKey) clearRangeAnchor();
-                            props.onTaskClick(
-                              item.task.id,
-                              actualIndex(),
-                              shiftKey,
-                              orderedTaskIds(),
-                            );
-                          }}
-                          onContextMenu={(e) =>
-                            props.onTaskContextMenu?.(e, item.task.id)
-                          }
-                          density={props.density}
-                          searchQuery={props.searchQuery}
-                          staggerIndex={visibleIndex()}
-                          columnWidths={getColumnWidth}
-                        />
-                      ) : (
-                        <TaskGroupHeader
-                          group={item.group}
-                          count={item.count}
-                          collapsed={collapsedGroups().has(item.group)}
-                          isActive={activeIndex() === actualIndex()}
-                          height={itemHeight()}
-                          onToggle={() => toggleGroupCollapsed(item.group)}
-                        />
-                      )}
-                    </>
-                  );
-                }}
-              </For>
-            </div>
+            </For>
           </div>
         </Show>
       </div>

@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use tachyon_core::config::{AppConfig, ConfigPatch};
+use tachyon_core::config::{
+    AppConfig, ClipboardPatch, ConfigPatch, ConnectionPatch, DownloadPatch, HubPatch, MagnetPatch,
+    NotificationsPatch, SchedulerPatch,
+};
 
 use super::{AppError, AppState};
 
@@ -669,6 +672,7 @@ mod tests {
             magnet: tachyon_core::config::MagnetConfig::default(),
             hub: tachyon_core::config::HubConfig::default(),
             clipboard: tachyon_core::config::ClipboardConfig::default(),
+            notifications: tachyon_core::config::NotificationsConfig::default(),
         }
     }
 
@@ -951,6 +955,7 @@ mod tests {
             magnet: tachyon_core::config::MagnetConfig::default(),
             hub: tachyon_core::config::HubConfig::default(),
             clipboard: tachyon_core::config::ClipboardConfig::default(),
+            notifications: tachyon_core::config::NotificationsConfig::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();

@@ -5,11 +5,13 @@ import { $hub, listRepoFiles, clearRepoFiles } from '../stores/hub'
 import { addToast } from '../stores/toast'
 import { refreshTaskList } from '../stores/downloads'
 import type { HubFileInfo } from '../types'
-import { CloseIcon, SearchIcon, CheckboxIcon, ArrowDownIcon, ChevronDownIcon, FileIcon } from './icons'
+import { CloseIcon, SearchIcon, CheckboxIcon, ArrowDownIcon, ChevronDownIcon, FileIcon, HubIcon } from './icons'
 import { detectFormat, detectQuant, isModelWeight, isLargeFile, type QuantLevel } from '../utils/modelMeta'
 import { buildTree, countByType, type TreeNode } from '../utils/hfTree'
 import { buildHfMirrorUrl } from '../utils/hfMirror'
 import Button from '../shared/ui/Button'
+import EmptyState from '../shared/ui/EmptyState'
+import ErrorState from '../shared/ui/ErrorState'
 import { tr } from '../i18n'
 
 interface HfBrowserPanelProps {
@@ -481,17 +483,11 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
         <div class="flex-1 scroll-container" style={{ padding: '8px 12px' }}>
           {/* 空状态 */}
           <Show when={!browsed() && !loading() && !error()}>
-            <div class="flex flex-col items-center justify-center gap-4" style={{ padding: '80px 20px' }}>
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-tertiary)" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" />
-              </svg>
-              <div style={{ 'font-size': '14px', color: 'var(--color-text-tertiary)' }}>
-                {tr("hub.empty")}
-              </div>
-              <div style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', opacity: 0.6 }}>
-                {tr("hub.emptyHint")}
-              </div>
-            </div>
+            <EmptyState
+              icon={<HubIcon size={48} />}
+              title={tr("hub.empty")}
+              description={tr("hub.emptyHint")}
+            />
           </Show>
 
           {/* 加载状态 */}
@@ -505,22 +501,13 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
           {/* 错误状态 */}
           <Show when={!loading() && error()}>
-            <div class="flex flex-col items-center justify-center gap-3" style={{ padding: '60px 20px' }}>
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--color-error)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <div style={{ 'font-size': '14px', color: 'var(--color-error)' }}>
-                {tr("hub.loadFailed")}
-              </div>
-              <div class="mono" style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)' }}>
-                {error()}
-              </div>
-              <Button variant="secondary" size="sm" onClick={handleRetry}>
-                {tr("hub.retry")}
-              </Button>
-            </div>
+            <ErrorState
+              compact
+              title={tr("hub.loadFailed")}
+              detail={error()}
+              onRetry={handleRetry}
+              retryLabel={tr("hub.retry")}
+            />
           </Show>
 
           {/* 文件树 */}
@@ -595,11 +582,11 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
           {/* 空仓库 */}
           <Show when={!loading() && !error() && browsed() && (repoFiles() ?? []).length === 0}>
-            <div class="flex flex-col items-center justify-center gap-3" style={{ padding: '60px 20px' }}>
-              <div style={{ 'font-size': '14px', color: 'var(--color-text-tertiary)' }}>
-                {tr("hub.emptyRepo")}
-              </div>
-            </div>
+            <EmptyState
+              compact
+              icon={<FileIcon size={48} />}
+              title={tr("hub.emptyRepo")}
+            />
           </Show>
         </div>
 

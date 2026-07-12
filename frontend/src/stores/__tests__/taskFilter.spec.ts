@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createRoot } from "solid-js";
 import type { TaskInfo } from "../../types";
 
@@ -46,11 +46,15 @@ function read<T>(fn: () => T): T {
 
 beforeEach(async () => {
   vi.resetModules();
+  localStorage.clear();
   mockGetTaskList.mockReset();
   mockAddToast.mockReset();
   downloadsModule = await import("../downloads");
   taskFilterModule = await import("../taskFilter");
-  taskFilterModule.resetFilters();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("taskFilter store", () => {
@@ -59,7 +63,7 @@ describe("taskFilter store", () => {
     expect(state.searchQuery).toBe("");
     expect(state.sidebarFilter).toBe("all");
     expect(state.fileTypeFilter).toBe("all");
-    expect(state.tagFilter).toEqual([]);
+    expect(read(() => taskFilterModule.$taskFilter.tagFilter())).toEqual([]);
   });
 
   it("setSearchQuery 更新搜索词", () => {
@@ -254,7 +258,7 @@ describe("taskFilter store", () => {
     expect(state.searchQuery).toBe("");
     expect(state.sidebarFilter).toBe("all");
     expect(state.fileTypeFilter).toBe("all");
-    expect(state.tagFilter).toEqual([]);
+    expect(read(() => taskFilterModule.$taskFilter.tagFilter())).toEqual([]);
   });
 
   it("tagFilter 按标签过滤任务(交集,大小写不敏感)", () => {
@@ -311,5 +315,142 @@ describe("taskFilter store", () => {
       "model",
       "video",
     ]);
+  });
+});
+
+describe("taskFilter view persistence", () => {
+  const STORAGE_KEY = "tachyon.tasklist.view";
+
+  async function loadStore() {
+    vi.resetModules();
+    return import("../taskFilter");
+  }
+
+  it("默认视图状态并持久化到 localStorage", async () => {
+    const mod = await loadStore();
+    const state = mod.readTaskFilterState();
+    expect(state).toEqual({
+      searchQuery: "",
+      sidebarFilter: "all",
+      fileTypeFilter: "all",
+    });
+    expect(read(() => mod.sortState())).toEqual({ key: null, dir: "desc" });
+
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(saved).toMatchObject({
+      searchQuery: "",
+      sidebarFilter: "all",
+      fileTypeFilter: "all",
+      sort: { key: null, dir: "desc" },
+    });
+  });
+
+  it("读取 localStorage 中的合法视图值", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        searchQuery: "report",
+        sidebarFilter: "completed",
+        fileTypeFilter: "video",
+        sort: { key: "speed", dir: "asc" },
+      }),
+    );
+    const mod = await loadStore();
+    const state = mod.readTaskFilterState();
+    expect(state).toEqual({
+      searchQuery: "report",
+      sidebarFilter: "completed",
+      fileTypeFilter: "video",
+    });
+    expect(read(() => mod.sortState())).toEqual({ key: "speed", dir: "asc" });
+  });
+
+  it("非法 localStorage 值回退到默认值", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        searchQuery: 123,
+        sidebarFilter: "done",
+        fileTypeFilter: "binary",
+        sort: { key: "priority", dir: "up" },
+      }),
+    );
+    const mod = await loadStore();
+    const state = mod.readTaskFilterState();
+    expect(state).toEqual({
+      searchQuery: "",
+      sidebarFilter: "all",
+      fileTypeFilter: "all",
+    });
+    expect(read(() => mod.sortState())).toEqual({ key: null, dir: "desc" });
+  });
+
+  it("损坏的 JSON 回退到默认值", async () => {
+    localStorage.setItem(STORAGE_KEY, "{not json");
+    const mod = await loadStore();
+    expect(read(() => mod.sortState())).toEqual({ key: null, dir: "desc" });
+    expect(mod.readTaskFilterState().searchQuery).toBe("");
+  });
+
+  it("localStorage 读取异常时回退到默认值", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("storage disabled");
+    });
+    const mod = await loadStore();
+    expect(read(() => mod.sortState())).toEqual({ key: null, dir: "desc" });
+    expect(mod.readTaskFilterState().searchQuery).toBe("");
+  });
+
+  it("修改搜索词后持久化", async () => {
+    const mod = await loadStore();
+    mod.setSearchQuery("hello");
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(saved.searchQuery).toBe("hello");
+    expect(saved.sidebarFilter).toBe("all");
+    expect(saved.sort).toEqual({ key: null, dir: "desc" });
+  });
+
+  it("修改 sidebarFilter 后持久化", async () => {
+    const mod = await loadStore();
+    mod.setSidebarFilter("failed");
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(saved.sidebarFilter).toBe("failed");
+  });
+
+  it("修改 fileTypeFilter 后持久化", async () => {
+    const mod = await loadStore();
+    mod.setFileTypeFilter("archive");
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(saved.fileTypeFilter).toBe("archive");
+  });
+
+  it("修改排序状态后持久化", async () => {
+    const mod = await loadStore();
+    mod.setSortState({ key: "progress", dir: "desc" });
+    expect(read(() => mod.sortState())).toEqual({ key: "progress", dir: "desc" });
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(saved.sort).toEqual({ key: "progress", dir: "desc" });
+  });
+
+  it("resetFilters 重置过滤器但不重置排序", async () => {
+    const mod = await loadStore();
+    mod.setSearchQuery("foo");
+    mod.setSidebarFilter("paused");
+    mod.setSortState({ key: "speed", dir: "asc" });
+    mod.resetFilters();
+    expect(mod.readTaskFilterState()).toEqual({
+      searchQuery: "",
+      sidebarFilter: "all",
+      fileTypeFilter: "all",
+    });
+    expect(read(() => mod.sortState())).toEqual({ key: "speed", dir: "asc" });
+  });
+
+  it("localStorage 写入异常时不抛错", async () => {
+    const mod = await loadStore();
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage full");
+    });
+    expect(() => mod.setSearchQuery("boom")).not.toThrow();
   });
 });

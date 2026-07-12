@@ -8,10 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::sync::Notify;
 
 use tokio::sync::watch;
@@ -19,6 +21,43 @@ use tokio::sync::watch;
 use crate::commands::{ProgressEvent, TaskProgress};
 use crate::repository::TaskRepository;
 use crate::runtime::chunk_reader_pool::ProgressDelta;
+use tachyon_core::types::DownloadState;
+
+/// 任务终态通知 payload
+///
+/// 与前端 `useTaskNotifications` 约定字段:taskId/title/body/type。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNotificationPayload {
+    pub task_id: String,
+    pub title: String,
+    pub body: String,
+    #[serde(rename = "type")]
+    pub notification_type: NotificationType,
+}
+
+/// 任务终态通知类型
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationType {
+    Completed,
+    Failed,
+}
+
+/// 任务终态通知发射器抽象
+///
+/// 生产环境使用 `tauri::AppHandle` 向前端推送 `task-notification` 事件;
+/// 测试环境可注入通道/向量实现以捕获事件。
+pub trait NotificationEmitter: Send + Sync + 'static {
+    fn emit_task_notification(&self, payload: TaskNotificationPayload);
+}
+
+impl NotificationEmitter for tauri::AppHandle {
+    fn emit_task_notification(&self, payload: TaskNotificationPayload) {
+        use tauri::Emitter;
+        let _ = self.emit("task-notification", &payload);
+    }
+}
 
 /// 聚合扫描间隔（毫秒）
 const AGGREGATOR_INTERVAL_MS: u64 = 250;
@@ -41,6 +80,10 @@ pub struct ProgressBroker {
     pub(crate) pending_completed: Arc<DashMap<String, Vec<u32>>>,
     /// 每任务本周期新开始下载分片索引增量
     pub(crate) pending_started: Arc<DashMap<String, Vec<u32>>>,
+    /// 任务终态通知发射器(在 Tauri setup 中注入)
+    notification_emitter: Arc<Mutex<Option<Arc<dyn NotificationEmitter>>>>,
+    /// 已发送通知的任务终态,用于同一任务同一终态去重
+    notified_states: Arc<DashMap<String, DownloadState>>,
 }
 
 impl ProgressBroker {
@@ -58,6 +101,8 @@ impl ProgressBroker {
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
+            notification_emitter: Arc::new(Mutex::new(None)),
+            notified_states: Arc::new(DashMap::new()),
         }
     }
 
@@ -75,6 +120,8 @@ impl ProgressBroker {
         let notify = self.notify.clone();
         let pending_completed = self.pending_completed.clone();
         let pending_started = self.pending_started.clone();
+        let notification_emitter = self.notification_emitter.clone();
+        let notified_states = self.notified_states.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
@@ -103,6 +150,13 @@ impl ProgressBroker {
                     &pending_started,
                 );
                 let _ = tx.send(event);
+
+                // 扫描终态任务并触发 `task-notification` 事件(去重)
+                emit_terminal_notifications(
+                    &task_repository_ref,
+                    &notified_states,
+                    &notification_emitter,
+                );
             }
         });
     }
@@ -119,7 +173,26 @@ impl ProgressBroker {
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
+            notification_emitter: Arc::new(Mutex::new(None)),
+            notified_states: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 注入任务终态通知发射器并在注入时完成已存在终态的去重种子
+    ///
+    /// 在 Tauri `setup` 钩子中调用,避免启动前已 Completed/Failed 的任务触发旧通知。
+    pub fn set_notification_emitter(&self, emitter: Arc<dyn NotificationEmitter>) {
+        // 预填充当前已处于终态的任务,防止启动时广播旧通知
+        for r in self.task_repository.iter() {
+            let status = r.value().status;
+            if matches!(status, DownloadState::Completed | DownloadState::Failed) {
+                self.notified_states.insert(r.key().clone(), status);
+            }
+        }
+        *self
+            .notification_emitter
+            .lock()
+            .expect("notification_emitter 锁不应中毒") = Some(emitter);
     }
 
     /// 唤醒 aggregator(无 delta,仅通知有变化)
@@ -166,6 +239,13 @@ impl ProgressBroker {
             &self.pending_started,
         );
         let _ = self.progress_tx.send(event);
+
+        // 终态特殊时刻同步触发通知,避免等待 aggregator 下一个 tick
+        emit_terminal_notifications(
+            &self.task_repository,
+            &self.notified_states,
+            &self.notification_emitter,
+        );
     }
 
     /// 获取订阅 receiver
@@ -218,6 +298,61 @@ fn build_progress_event(
             )
         })
         .collect()
+}
+
+/// 扫描任务列表,为首次进入 Completed/Failed 终态的任务发送通知
+///
+/// - 同一任务同一终态只通知一次(`notified_states` 去重)。
+/// - 发射器未注入时(测试/初始化阶段)静默跳过。
+fn emit_terminal_notifications(
+    task_repository: &TaskRepository,
+    notified_states: &DashMap<String, DownloadState>,
+    notification_emitter: &Mutex<Option<Arc<dyn NotificationEmitter>>>,
+) {
+    let emitter = match notification_emitter.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return,
+    };
+    let Some(emitter) = emitter else {
+        return;
+    };
+
+    for r in task_repository.iter() {
+        let task_id = r.key();
+        let task = r.value();
+        let status = task.status;
+        if !matches!(status, DownloadState::Completed | DownloadState::Failed) {
+            continue;
+        }
+        // 去重:同一任务同一终态只通知一次
+        if notified_states.get(task_id).is_some_and(|s| *s == status) {
+            continue;
+        }
+        notified_states.insert(task_id.clone(), status);
+
+        let (title, body, notification_type) = match status {
+            DownloadState::Completed => (
+                format!("下载完成: {}", task.file_name),
+                format!("{} 已下载完成", task.file_name),
+                NotificationType::Completed,
+            ),
+            DownloadState::Failed => (
+                format!("下载失败: {}", task.file_name),
+                task.error_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("{} 下载失败", task.file_name)),
+                NotificationType::Failed,
+            ),
+            _ => continue,
+        };
+
+        emitter.emit_task_notification(TaskNotificationPayload {
+            task_id: task_id.clone(),
+            title,
+            body,
+            notification_type,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,5 +646,169 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "aggregator_spawned 标志应为 true"
         );
+    }
+
+    /// 测试用通知发射器,通过标准通道捕获事件
+    #[derive(Clone)]
+    struct TestEmitter {
+        tx: std::sync::mpsc::Sender<TaskNotificationPayload>,
+    }
+
+    impl NotificationEmitter for TestEmitter {
+        fn emit_task_notification(&self, payload: TaskNotificationPayload) {
+            let _ = self.tx.send(payload);
+        }
+    }
+
+    fn make_test_emitter() -> (
+        TestEmitter,
+        std::sync::mpsc::Receiver<TaskNotificationPayload>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (TestEmitter { tx }, rx)
+    }
+
+    fn make_completed_task(id: &str, file_name: &str) -> TaskInfo {
+        TaskInfo {
+            id: id.to_string(),
+            url: "https://example.com/a.bin".to_string(),
+            file_name: file_name.to_string(),
+            file_size: Some(1024),
+            downloaded: 1024,
+            speed: 0,
+            status: DownloadState::Completed,
+            progress: 1.0,
+            fragments_total: 1,
+            fragments_done: 1,
+            active_concurrency: 0,
+            created_at: "2025-01-01T00:00:00+08:00".to_string(),
+            save_path: String::new(),
+            error_reason: None,
+            retry_count: 0,
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
+
+    fn make_failed_task(id: &str, file_name: &str, error_reason: Option<&str>) -> TaskInfo {
+        TaskInfo {
+            id: id.to_string(),
+            url: "https://example.com/a.bin".to_string(),
+            file_name: file_name.to_string(),
+            file_size: Some(1024),
+            downloaded: 512,
+            speed: 0,
+            status: DownloadState::Failed,
+            progress: 0.5,
+            fragments_total: 2,
+            fragments_done: 1,
+            active_concurrency: 0,
+            created_at: "2025-01-01T00:00:00+08:00".to_string(),
+            save_path: String::new(),
+            error_reason: error_reason.map(String::from),
+            retry_count: 0,
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
+
+    #[test]
+    fn test_emit_terminal_notifications_completed() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let (emitter, rx) = make_test_emitter();
+        broker.set_notification_emitter(Arc::new(emitter));
+
+        repository.insert("t1".to_string(), make_completed_task("t1", "model.gguf"));
+        broker.broadcast_all();
+
+        let payload = rx.recv().expect("应收到 Completed 通知");
+        assert_eq!(payload.task_id, "t1");
+        assert!(matches!(
+            payload.notification_type,
+            NotificationType::Completed
+        ));
+        assert_eq!(payload.title, "下载完成: model.gguf");
+        assert_eq!(payload.body, "model.gguf 已下载完成");
+    }
+
+    #[test]
+    fn test_emit_terminal_notifications_failed() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let (emitter, rx) = make_test_emitter();
+        broker.set_notification_emitter(Arc::new(emitter));
+
+        repository.insert(
+            "t2".to_string(),
+            make_failed_task("t2", "data.zip", Some("connection reset")),
+        );
+        broker.broadcast_all();
+
+        let payload = rx.recv().expect("应收到 Failed 通知");
+        assert_eq!(payload.task_id, "t2");
+        assert!(matches!(
+            payload.notification_type,
+            NotificationType::Failed
+        ));
+        assert_eq!(payload.title, "下载失败: data.zip");
+        assert_eq!(payload.body, "connection reset");
+    }
+
+    #[test]
+    fn test_terminal_notification_deduplicated_per_state() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let (emitter, rx) = make_test_emitter();
+        broker.set_notification_emitter(Arc::new(emitter));
+
+        repository.insert("t3".to_string(), make_completed_task("t3", "file.bin"));
+        broker.broadcast_all();
+        assert!(rx.recv().is_ok(), "首次 Completed 应触发通知");
+
+        // 再次 broadcast,同一任务同一终态不应重复通知
+        broker.broadcast_all();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "同一终态不应重复通知"
+        );
+
+        // 状态变为 Failed 后应再次触发(不同终态)
+        if let Some(mut task) = repository.get_mut("t3") {
+            task.status = DownloadState::Failed;
+            task.error_reason = Some("verify failed".to_string());
+        }
+        broker.broadcast_all();
+        let payload = rx.recv().expect("状态变更后应再次通知");
+        assert!(matches!(
+            payload.notification_type,
+            NotificationType::Failed
+        ));
+    }
+
+    #[test]
+    fn test_set_emitter_seeds_existing_terminal_states() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        repository.insert("t4".to_string(), make_completed_task("t4", "old.bin"));
+
+        let (emitter, rx) = make_test_emitter();
+        // 注入 emitter 时应将已存在的 Completed 任务标记为已通知
+        broker.set_notification_emitter(Arc::new(emitter));
+
+        broker.broadcast_all();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "注入前已存在的终态任务不应触发旧通知"
+        );
+    }
+
+    #[test]
+    fn test_no_emitter_no_panic() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        repository.insert("t5".to_string(), make_completed_task("t5", "x.bin"));
+        // 未注入 emitter 时 broadcast 不应 panic
+        broker.broadcast_all();
     }
 }

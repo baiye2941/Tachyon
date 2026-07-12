@@ -86,6 +86,9 @@ const mockConfig = {
   hub: {
     sourceMode: 'mirror' as const,
   },
+  notifications: {
+    enabled: true,
+  },
 }
 
 describe('SettingsPanel', () => {
@@ -464,6 +467,38 @@ describe('SettingsPanel', () => {
   })
 
   // --- 快捷键设置页 ---
+  it('General 标签页渲染通知开关且可切换', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    // 默认在 General 标签,通知开关应可见
+    expect(screen.getByText('任务完成/失败时显示系统通知')).toBeDefined()
+
+    // 点击开关切换
+    const toggleLabel = screen.getByText('任务完成/失败时显示系统通知')
+    const toggleBtn = toggleLabel.closest('.flex.items-center.justify-between')!.querySelector('button')!
+    fireEvent.click(toggleBtn)
+
+    // 保存后 patch 应携带翻转后的通知设置
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(screen.getByText('确认保存')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('确认保存'))
+
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.notifications).toBeDefined()
+    expect(calledWith.notifications!.enabled).toBe(false)
+  })
+
   it('点击 shortcuts tab 进入快捷键设置页', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     renderSettingsPanel()
@@ -676,6 +711,62 @@ describe('SettingsPanel', () => {
 
     await waitFor(() => {
       expect(addToast).toHaveBeenCalledWith(expect.stringContaining('导出备份失败'), 'error')
+    })
+  })
+
+  // --- phase4: 简单导出/导入按钮行为(不同按钮文案与确认流程) ---
+  it('点击导出配置按钮应打开保存对话框并调用 exportBackup', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(save).mockResolvedValue('/backup/tachyon.json')
+    vi.mocked(api.exportBackup).mockResolvedValue(undefined)
+
+    renderSettingsPanel()
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('导出配置'))
+
+    await waitFor(() => {
+      expect(save).toHaveBeenCalledWith(expect.objectContaining({
+        defaultPath: 'tachyon-config-backup.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      }))
+      expect(api.exportBackup).toHaveBeenCalledWith('/backup/tachyon.json')
+      expect(addToast).toHaveBeenCalledWith('配置已导出', 'success')
+    })
+  })
+
+  it('点击导入配置按钮应确认后打开选择对话框并调用 importBackup', async () => {
+    const importedConfig = { ...mockConfig, maxConcurrentTasks: 7 }
+    vi.mocked(api.getConfig)
+      .mockResolvedValueOnce(mockConfig)
+      .mockResolvedValueOnce(importedConfig)
+    vi.mocked(open).mockResolvedValue('/backup/tachyon.json')
+    vi.mocked(api.importBackup).mockResolvedValue(undefined)
+
+    renderSettingsPanel()
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    const importButton = screen.getByRole('button', { name: '导入配置' })
+    fireEvent.click(importButton)
+
+    await waitFor(() => {
+      expect(screen.getByText('导入将覆盖当前配置,此操作不可撤销,是否继续?')).toBeTruthy()
+    })
+
+    const confirmButton = screen.getByRole('button', { name: '导入' })
+    fireEvent.click(confirmButton)
+
+    await waitFor(() => {
+      expect(open).toHaveBeenCalledWith(expect.objectContaining({
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        multiple: false,
+      }))
+      expect(api.importBackup).toHaveBeenCalledWith('/backup/tachyon.json')
+      expect(addToast).toHaveBeenCalledWith('配置已导入', 'success')
     })
   })
 })

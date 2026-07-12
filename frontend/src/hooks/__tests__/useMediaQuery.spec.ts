@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { renderHook } from "@solidjs/testing-library";
-import { useMediaQuery, useIsNarrowScreen, BREAKPOINTS } from "../useMediaQuery";
+import {
+  useMediaQuery,
+  useIsNarrowScreen,
+  useIsSmallScreen,
+  BREAKPOINTS,
+} from "../useMediaQuery";
 
 // matchMedia mock
 function mockMatchMedia(matches: boolean) {
@@ -60,6 +65,12 @@ describe("useMediaQuery", () => {
   it("useIsNarrowScreen 使用 md 断点", () => {
     mockMatchMedia(true);
     const { result } = renderHook(() => useIsNarrowScreen());
+    expect(result()).toBe(true);
+  });
+
+  it("useIsSmallScreen 使用 sm 断点", () => {
+    mockMatchMedia(true);
+    const { result } = renderHook(() => useIsSmallScreen());
     expect(result()).toBe(true);
   });
 });

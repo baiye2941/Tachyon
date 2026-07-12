@@ -3,12 +3,16 @@ import { createRoot, createEffect } from 'solid-js'
 import type { TaskInfo } from '../../types'
 
 const mockGetTaskList = vi.fn()
+const mockReorderTasks = vi.fn()
+const mockMoveTask = vi.fn()
 const mockAddToast = vi.fn()
 const mockAddHistoryRecord = vi.fn()
 
 vi.mock('../../api/invoke', () => ({
   api: {
     getTaskList: (...args: unknown[]) => mockGetTaskList(...args),
+    reorderTasks: (...args: unknown[]) => mockReorderTasks(...args),
+    moveTask: (...args: unknown[]) => mockMoveTask(...args),
   },
 }))
 
@@ -42,6 +46,8 @@ describe('downloads store', () => {
   beforeEach(async () => {
     vi.resetModules()
     mockGetTaskList.mockReset()
+    mockReorderTasks.mockReset()
+    mockMoveTask.mockReset()
     mockAddToast.mockReset()
     mockAddHistoryRecord.mockReset()
     downloadsModule = await import('../downloads')
@@ -273,5 +279,41 @@ describe('downloads store', () => {
     await downloadsModule.refreshTaskList()
 
     expect(mockAddToast).toHaveBeenCalledWith(expect.stringContaining('刷新任务列表失败'), 'error')
+  })
+
+  it('reorderTasks 乐观更新本地顺序并调用后端', async () => {
+    downloadsModule.setTasks([makeTask('t1'), makeTask('t2'), makeTask('t3')])
+    mockReorderTasks.mockResolvedValue(undefined)
+
+    await downloadsModule.reorderTasks(['t3', 't1', 't2'])
+
+    expect(downloadsModule.$tasks.get()[0]?.id).toBe('t3')
+    expect(downloadsModule.$tasks.get()[1]?.id).toBe('t1')
+    expect(downloadsModule.$tasks.get()[2]?.id).toBe('t2')
+    expect(mockReorderTasks).toHaveBeenCalledWith(['t3', 't1', 't2'])
+  })
+
+  it('reorderTasks 失败时回退到之前顺序', async () => {
+    downloadsModule.setTasks([makeTask('t1'), makeTask('t2'), makeTask('t3')])
+    mockReorderTasks.mockRejectedValue(new Error('backend failed'))
+
+    await downloadsModule.reorderTasks(['t3', 't1', 't2'])
+
+    expect(downloadsModule.$tasks.get()[0]?.id).toBe('t1')
+    expect(downloadsModule.$tasks.get()[1]?.id).toBe('t2')
+    expect(downloadsModule.$tasks.get()[2]?.id).toBe('t3')
+    expect(mockAddToast).toHaveBeenCalledWith(expect.stringContaining('调整任务顺序失败'), 'error')
+  })
+
+  it('moveTask 调用后端并刷新列表', async () => {
+    downloadsModule.setTasks([makeTask('t1'), makeTask('t2')])
+    mockMoveTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([makeTask('t2'), makeTask('t1')])
+
+    await downloadsModule.moveTask('t1', 't2')
+
+    expect(mockMoveTask).toHaveBeenCalledWith('t1', 't2')
+    expect(mockGetTaskList).toHaveBeenCalled()
+    expect(downloadsModule.$tasks.get()[0]?.id).toBe('t2')
   })
 })

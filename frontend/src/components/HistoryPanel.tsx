@@ -11,6 +11,7 @@ import {
   CheckboxIcon,
 } from "./icons";
 import { formatSize, formatSpeed, getStatusLabel } from "../utils/format";
+import { getParentDirectory } from "../utils/path";
 import {
   historyRecords,
   getHistoryStatsForRecords,
@@ -20,13 +21,14 @@ import { requestConfirm } from "../stores/confirm";
 import { addToast } from "../stores/toast";
 import { tr, type MessageKey } from "../i18n";
 import Button from "../shared/ui/Button";
+import EmptyState from "../shared/ui/EmptyState";
 
 interface HistoryPanelProps {
   visible: boolean;
   tasks: TaskInfo[];
   onClose: () => void;
-  /** 打开所在文件夹,直接接收保存路径(非任务 id) */
-  onOpenFolder: (savePath: string) => void;
+  /** 打开文件夹,接收的是已转换好的文件夹路径(非原始 savePath,非任务 id) */
+  onOpenFolder: (folderPath: string) => void;
   onRedownload: (task: TaskInfo) => void;
   /** 删除单条历史记录；批量删除时可传入选项跳过二次确认 */
   onDeleteRecord: (
@@ -583,9 +585,12 @@ export default function HistoryPanel(props: HistoryPanelProps) {
         <Show
           when={filteredRecords().length > 0}
           fallback={
-            <div style={{ color: "var(--color-text-tertiary)", "font-size": "13px" }}>
-              {t("history.empty")}
-            </div>
+            <EmptyState
+              compact
+              icon={<HistoryIcon />}
+              title={t("history.empty")}
+              description={t("history.emptyHint")}
+            />
           }
         >
           <For each={filteredRecords()}>
@@ -658,10 +663,10 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                     <div class="flex items-center gap-1">
                       <button
                         class="icon-btn-sm hover-light"
-                        // 问题2修复:直接用 record.savePath 打开,不再按 id 查 $tasks
+                        // 问题2修复:不再按 id 查 $tasks,直接取 record.savePath 的父目录打开
                         onClick={(e) => {
                           e.stopPropagation();
-                          props.onOpenFolder(record.savePath || "");
+                          props.onOpenFolder(getParentDirectory(record.savePath || ""));
                         }}
                         aria-label={t("history.aria.openFolder", { name: record.fileName })}
                       >

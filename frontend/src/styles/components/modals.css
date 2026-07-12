@@ -6,3 +6,13 @@
    the global stylesheet. This file is reserved for modal-specific styles when
    they are introduced.
    ============================================ */
+
+/* ============================================
+   NewTaskModal — 移动端窄屏适配
+   ============================================ */
+@media (max-width: 640px) {
+  .new-task-modal--narrow {
+    width: calc(100vw - 16px) !important;
+    padding: 16px !important;
+  }
+}

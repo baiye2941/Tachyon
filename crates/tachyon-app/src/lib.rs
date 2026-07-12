@@ -79,6 +79,11 @@ pub fn run() {
             let state = app.state::<AppState>();
             let handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
+                // 注入 AppHandle 使 ProgressBroker 能发送任务终态系统通知
+                state
+                    .runtime
+                    .progress_broker
+                    .set_notification_emitter(Arc::new(handle.clone()));
                 // 在 reactor 上下文中启动 progress aggregator
                 // （构造期间不能 spawn,此时 reactor 尚未就绪）
                 state.runtime.progress_broker.spawn_aggregator();
@@ -144,19 +149,20 @@ pub fn run() {
             request_confirmation,
             // 任务管理
             create_task,
-            export_backup,
-            import_backup,
             probe_filename,
             pause_task,
             resume_task,
             cancel_task,
             delete_task,
+            undo_cancel_task,
+            undo_delete_task,
+            reorder_tasks,
+            move_task,
             get_task_list,
             get_task_detail,
             set_task_tags,
             add_task_tag,
             remove_task_tag,
-            reorder_tasks,
             // 进度查询
             get_download_progress,
             subscribe_progress,
@@ -171,6 +177,8 @@ pub fn run() {
             // 配置管理
             get_config,
             update_config,
+            export_backup,
+            import_backup,
             // HuggingFace Hub
             list_repo_files,
             get_hf_download_url,

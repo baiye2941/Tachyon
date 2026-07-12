@@ -8,6 +8,7 @@ import Button from "../shared/ui/Button";
 import { parseUrlLines, validateUrl, extractSuggestedFileName } from "../utils/urlValidation";
 import { parseDroppedFiles } from "../utils/dragDrop";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { useIsSmallScreen } from "../hooks/useMediaQuery";
 import { tr } from "../i18n";
 import { parseHfUrl } from "../utils/hfUrl";
 import { getModelInfo } from "../stores/hub";
@@ -19,6 +20,8 @@ interface NewTaskModalProps {
 }
 
 export default function NewTaskModal(props: NewTaskModalProps) {
+  const isSmall = useIsSmallScreen();
+
   // 多行 URL 输入(textarea,支持批量粘贴)
   const [urlText, setUrlText] = createSignal("");
   // 镜像源动态行
@@ -189,22 +192,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
 
       // 批量创建,共享 savePath/mirrors;allSettled 部分失败不阻断
       const results = await Promise.allSettled(
-        urls.map((u) => api.createTask(u, dir, mirrorList, name)),
+        urls.map((u) => api.createTask(u, dir, mirrorList, name, autoStart())),
       );
-
-      // autoStart 过渡容错:后端创建即启动,取消自动开始时延迟 pause 消除竞态
-      // TODO: 后端 create_task 添加 auto_start 参数后,改为直接传入,移除此 hack
-      if (!autoStart()) {
-        results.forEach((r) => {
-          if (r.status === "fulfilled") {
-            window.setTimeout(() => {
-              api.pauseTask(r.value).catch(() => {
-                /* 容错:pause 失败则任务继续下载(可接受降级) */
-              });
-            }, 500);
-          }
-        });
-      }
 
       const failed = results.filter((r) => r.status === "rejected");
       if (failed.length === 0) {
@@ -293,10 +282,11 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       <div
         ref={panelRef}
         class="panel-surface"
+        classList={{ "new-task-modal--narrow": isSmall() }}
         style={{
           width: "var(--panel-modal-width, 480px)",
           "border-radius": "16px",
-          padding: "24px",
+          padding: isSmall() ? "16px" : "24px",
           /* 去 AI 味:实色 + shadow,移除 inset 装饰高光 */
           "box-shadow": "var(--shadow-xl)",
           animation: "toast-in 300ms cubic-bezier(0.32, 0.72, 0, 1)",

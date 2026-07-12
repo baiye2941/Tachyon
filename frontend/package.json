@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@motionone/solid": "^10.16.4",
+    "@tanstack/solid-virtual": "^3.13.6",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-notification": "^2.3.3",

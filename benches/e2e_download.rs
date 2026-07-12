@@ -40,6 +40,7 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
         updated_at: String::new(),
         fail_reason: None,
         retry_count: 0,
+        tags: vec![],
         hf_meta: None,
         display_order: 0,
     }

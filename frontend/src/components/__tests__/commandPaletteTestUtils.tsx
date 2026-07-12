@@ -19,6 +19,7 @@ export const defaultPaletteProps: CommandPaletteProps = {
   onOpenTaskFolder: vi.fn(),
   onRedownloadTask: vi.fn(),
   onCopyToClipboard: vi.fn(),
+  debounceMs: 0,
 }
 
 export function renderPalette(props: Partial<CommandPaletteProps> = {}) {
@@ -31,4 +32,8 @@ export function renderPalette(props: Partial<CommandPaletteProps> = {}) {
 
 export async function waitForRaf() {
   return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+export async function waitForDebounce() {
+  return new Promise<void>((resolve) => setTimeout(() => resolve(), 0))
 }

@@ -3,10 +3,12 @@ import { render, waitFor } from '@solidjs/testing-library'
 import { useAppInit } from '../useAppInit'
 import { api } from '../../api/invoke'
 import { addToast } from '../../stores/toast'
+import type { AppConfig } from '../../types'
 
 vi.mock('../../api/invoke', () => ({
   api: {
     getTaskList: vi.fn(),
+    getConfig: vi.fn(),
     subscribeProgress: vi.fn(),
     getSnifferResources: vi.fn(),
   },
@@ -26,6 +28,7 @@ vi.mock('../../api/events', () => ({
   onRecoveryWarning: vi.fn(() => Promise.resolve(() => {})),
   onSnifferResourceAdded: vi.fn(() => Promise.resolve(() => {})),
   onClipboardUrlDetected: vi.fn(() => Promise.resolve(() => {})),
+  onTaskNotification: vi.fn(() => Promise.resolve(() => {})),
 }))
 
 vi.mock('../../stores/speedHistory', () => ({
@@ -37,6 +40,12 @@ vi.mock('../useTauriEvent', () => ({
   useProgressListener: vi.fn(),
 }))
 
+vi.mock('@tauri-apps/plugin-notification', () => ({
+  isPermissionGranted: vi.fn(() => Promise.resolve(false)),
+  requestPermission: vi.fn(() => Promise.resolve('denied')),
+  sendNotification: vi.fn(),
+}))
+
 function TestApp() {
   useAppInit(() => undefined, () => undefined)
   return <div>app</div>
@@ -44,9 +53,14 @@ function TestApp() {
 
 describe('useAppInit', () => {
   beforeEach(() => {
+    vi.mocked(api.getConfig).mockReset()
     vi.mocked(api.subscribeProgress).mockReset()
     vi.mocked(api.getSnifferResources).mockReset()
     vi.mocked(addToast).mockReset()
+    vi.mocked(api.getConfig).mockResolvedValue({
+      maxConcurrentTasks: 3,
+      notifications: { enabled: false },
+    } as AppConfig)
   })
 
   it('启动时调用 subscribeProgress 和 getSnifferResources', async () => {

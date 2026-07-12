@@ -1,8 +1,10 @@
 import { api } from "../api/invoke";
 import { errorMessage } from "../utils/appError";
+import { getParentDirectory } from "../utils/path";
 import { $tasks, refreshTaskList } from "./downloads";
 import { $selectedIds, deselectAll } from "./selection";
 import { addToast } from "./toast";
+import { addToast as addToastWithActions } from "../components/ToastContainer";
 import { requestConfirm } from "./confirm";
 import { clearTaskHistory } from "./taskSpeedHistory";
 import { tr } from "../i18n";
@@ -78,13 +80,68 @@ export async function cancelSelected(): Promise<void> {
   if (!result.ok) return;
 
   const results = await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
-  const failures = results.filter(
-    (r): r is PromiseRejectedResult => r.status === "rejected",
-  );
-  const successes = ids.length - failures.length;
+  const successfulIds: string[] = [];
+  const failures: PromiseRejectedResult[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      successfulIds.push(ids[i]!);
+    } else {
+      failures.push(r);
+    }
+  });
 
-  if (successes > 0) {
-    addToast(tr("toast.cancelBatchSuccess", { count: successes }), "success");
+  if (successfulIds.length > 0) {
+    if (successfulIds.length === 1) {
+      addToastWithActions({
+        type: "success",
+        title: tr("toast.undoCancel"),
+        duration: 30000,
+        actions: [
+          {
+            label: tr("toast.undo"),
+            onClick: async () => {
+              try {
+                await api.undoCancelTask(successfulIds[0]!);
+                await refreshTaskList();
+              } catch (e) {
+                addToast(
+                  tr("toast.undoCancelFailed", { error: errorMessage(e) }),
+                  "error",
+                );
+              }
+            },
+          },
+        ],
+      });
+    } else {
+      addToastWithActions({
+        type: "success",
+        title: tr("toast.undoCancelBatch", { count: successfulIds.length }),
+        duration: 30000,
+        actions: [
+          {
+            label: tr("toast.undoAll"),
+            onClick: async () => {
+              const undoResults = await Promise.allSettled(
+                successfulIds.map((id) => api.undoCancelTask(id)),
+              );
+              const undoFailures = undoResults.filter(
+                (r): r is PromiseRejectedResult => r.status === "rejected",
+              );
+              if (undoFailures.length > 0) {
+                addToast(
+                  tr("toast.undoCancelFailed", {
+                    error: undoFailures[0]?.reason ?? "",
+                  }),
+                  "error",
+                );
+              }
+              await refreshTaskList();
+            },
+          },
+        ],
+      });
+    }
   }
   if (failures.length > 0) {
     addToast(
@@ -130,13 +187,68 @@ export async function deleteSelected(): Promise<void> {
       }),
     ),
   );
-  const failures = results.filter(
-    (r): r is PromiseRejectedResult => r.status === "rejected",
-  );
-  const successes = ids.length - failures.length;
+  const successfulIds: string[] = [];
+  const failures: PromiseRejectedResult[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      successfulIds.push(ids[i]!);
+    } else {
+      failures.push(r);
+    }
+  });
 
-  if (successes > 0) {
-    addToast(tr("toast.deleteBatchSuccess", { count: successes }), "success");
+  if (successfulIds.length > 0) {
+    if (successfulIds.length === 1) {
+      addToastWithActions({
+        type: "success",
+        title: tr("toast.undoDelete"),
+        duration: 30000,
+        actions: [
+          {
+            label: tr("toast.undo"),
+            onClick: async () => {
+              try {
+                await api.undoDeleteTask(successfulIds[0]!);
+                await refreshTaskList();
+              } catch (e) {
+                addToast(
+                  tr("toast.undoDeleteFailed", { error: errorMessage(e) }),
+                  "error",
+                );
+              }
+            },
+          },
+        ],
+      });
+    } else {
+      addToastWithActions({
+        type: "success",
+        title: tr("toast.undoDeleteBatch", { count: successfulIds.length }),
+        duration: 30000,
+        actions: [
+          {
+            label: tr("toast.undoAll"),
+            onClick: async () => {
+              const undoResults = await Promise.allSettled(
+                successfulIds.map((id) => api.undoDeleteTask(id)),
+              );
+              const undoFailures = undoResults.filter(
+                (r): r is PromiseRejectedResult => r.status === "rejected",
+              );
+              if (undoFailures.length > 0) {
+                addToast(
+                  tr("toast.undoDeleteFailed", {
+                    error: undoFailures[0]?.reason ?? "",
+                  }),
+                  "error",
+                );
+              }
+              await refreshTaskList();
+            },
+          },
+        ],
+      });
+    }
   }
   if (failures.length > 0) {
     addToast(
@@ -299,7 +411,7 @@ export async function openSelectedFolders(): Promise<void> {
         return;
       }
       try {
-        await api.openFolder(task.savePath);
+        await api.openFolder(getParentDirectory(task.savePath));
         opened++;
       } catch (e) {
         failures.push(errorMessage(e));

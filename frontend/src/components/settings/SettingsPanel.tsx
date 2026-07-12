@@ -83,6 +83,9 @@ export interface ConfigDraft {
   hub: {
     sourceMode: HfSourceMode;
   };
+  notifications: {
+    enabled: boolean;
+  };
 }
 
 const tabs: { id: SettingsTab; labelKey: MessageKey }[] = [
@@ -183,6 +186,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     hub: {
       sourceMode: "mirror",
     },
+    notifications: {
+      enabled: true,
+    },
   });
 
   const [saving, setSaving] = createSignal(false);
@@ -190,6 +196,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
   // 数据导入/导出
   const [importConfirmOpen, setImportConfirmOpen] = createSignal(false);
   const [importPath, setImportPath] = createSignal<string | null>(null);
+  const [exporting, setExporting] = createSignal(false);
   const [importing, setImporting] = createSignal(false);
   // About 标签:支持协议列表 + 应用版本(只读,来自后端)
   const [protocols, setProtocols] = createSignal<string[]>([]);
@@ -234,6 +241,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       },
       hub: {
         sourceMode: cfg.hub?.sourceMode ?? "mirror",
+      },
+      notifications: {
+        enabled: cfg.notifications?.enabled ?? true,
       },
     });
   };
@@ -301,6 +311,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       hub: {
         sourceMode: draft.hub.sourceMode,
       },
+      notifications: {
+        enabled: draft.notifications.enabled,
+      },
     };
   };
 
@@ -342,16 +355,19 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const path = await save({
-        filters: [{ name: "JSON", extensions: ["json"] }],
         defaultPath: "tachyon-backup.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (typeof path !== "string") {
         return;
       }
+      setExporting(true);
       await api.exportBackup(path);
       addToast(tr("toast.exportBackupSuccess"), "success");
     } catch (e) {
       addToast(tr("toast.exportBackupFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -557,27 +573,47 @@ export default function SettingsPanel(props: SettingsPanelProps) {
           </div>
 
           <div
-            class="flex items-center justify-end gap-2"
+            class="flex items-center justify-between gap-2"
             style={{
               padding: "12px 20px",
               "border-top": "1px solid var(--color-border-subtle)",
             }}
           >
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => props.onClose()}
-            >
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="brand"
-              size="sm"
-              loading={$configLoading.get() || saving()}
-              onClick={handleSave}
-            >
-              {saving() ? t("common.saving") : t("settings.save")}
-            </Button>
+            <div class="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={exporting()}
+                onClick={handleExportBackup}
+              >
+                {t("settings.exportBackup")}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={importing()}
+                onClick={() => setImportConfirmOpen(true)}
+              >
+                {t("settings.importBackup")}
+              </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => props.onClose()}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant="brand"
+                size="sm"
+                loading={$configLoading.get() || saving()}
+                onClick={handleSave}
+              >
+                {saving() ? t("common.saving") : t("settings.save")}
+              </Button>
+            </div>
           </div>
         </div>
       </div>

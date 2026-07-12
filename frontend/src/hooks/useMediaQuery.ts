@@ -49,3 +49,19 @@ export function useMediaQuery(query: string): Accessor<boolean> {
 export function useIsNarrowScreen(): Accessor<boolean> {
   return useMediaQuery(`(max-width: ${BREAKPOINTS.md}px)`);
 }
+
+/**
+ * 便捷:是否为超窄屏(<= sm 断点)。
+ * 超窄屏下批量工具栏收起次要操作到「更多」菜单,命令面板/弹窗接近全屏。
+ */
+export function useIsSmallScreen(): Accessor<boolean> {
+  return useMediaQuery(`(max-width: ${BREAKPOINTS.sm}px)`);
+}
+
+/**
+ * 便捷:是否为宽屏(>= xl 断点)。
+ * 宽屏下 DetailPanel 改为右侧固定侧栏,与列表并列。
+ */
+export function useIsWideScreen(): Accessor<boolean> {
+  return useMediaQuery(`(min-width: ${BREAKPOINTS.xl}px)`);
+}

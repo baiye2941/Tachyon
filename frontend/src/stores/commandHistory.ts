@@ -33,6 +33,14 @@ const [$pinned, setPinned] = createStore<string[]>(loadIds(PINNED_KEY));
 
 export { $recent, $pinned };
 
+/** 重置命令历史(用于测试隔离或清除用户数据) */
+export function resetCommandHistory(): void {
+  setRecent([]);
+  setPinned([]);
+  saveIds(RECENT_KEY, []);
+  saveIds(PINNED_KEY, []);
+}
+
 /** 将命令加入最近使用(去重、置顶最前、最多 8 条) */
 export function addRecentCommand(id: string): void {
   if (!COMMANDS.some((c) => c.id === id)) return;

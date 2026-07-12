@@ -32,6 +32,64 @@
   width: 100%;
 }
 
+.detail-panel--narrow .panel-header {
+  padding: 12px 16px;
+}
+
+.detail-panel--narrow .detail-file-info {
+  padding: 12px 16px;
+}
+
+.detail-panel--narrow .detail-progress-theater {
+  padding: 14px 16px 12px;
+}
+
+.detail-panel--narrow .detail-section {
+  padding: 0 16px 12px;
+}
+
+.detail-panel--narrow .detail-actions {
+  padding: 12px 16px 16px;
+}
+
+.detail-panel--side {
+  position: relative;
+  flex: 0 0 auto;
+  width: 360px;
+  min-width: 280px;
+  max-width: 600px;
+  box-shadow: none;
+  contain: layout paint;
+}
+
+.detail-panel-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 10;
+  background: transparent;
+  transition: background 150ms ease;
+}
+
+.detail-panel-resize-handle:hover,
+.detail-panel-resize-handle:active {
+  background: var(--color-accent-primary);
+}
+
+.detail-panel-resize-handle:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detail-panel-resize-handle {
+    transition: none;
+  }
+}
+
 .detail-panel-content {
   width: 100%;
   max-width: 100%;
@@ -470,14 +528,6 @@
   padding-top: 4px;
 }
 
-.detail-progress-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  margin-top: 8px;
-}
-
 .detail-action-btn {
   width: 100%;
   padding: 11px 20px;
@@ -551,6 +601,64 @@
   white-space: nowrap;
 }
 
+/* ============================================
+   Bandwidth Sparkline — Activity Metrics mini chart
+   ============================================ */
+.bandwidth-sparkline {
+  margin-top: 8px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  overflow: hidden;
+}
+
+.bandwidth-sparkline-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  transition: color 150ms ease, background 150ms ease;
+}
+
+.bandwidth-sparkline-toggle:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.bandwidth-sparkline-toggle:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: -2px;
+  border-radius: var(--radius-md);
+}
+
+.bandwidth-sparkline-chevron {
+  flex-shrink: 0;
+  transition: transform 180ms ease;
+}
+
+.bandwidth-sparkline-chevron--open {
+  transform: rotate(180deg);
+}
+
+.bandwidth-sparkline-body {
+  padding: 0 12px 10px;
+  min-height: 40px;
+}
+
+.bandwidth-sparkline-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
 .detail-tag:hover {
   background: var(--color-bg-active);
 }
@@ -569,4 +677,16 @@
 .detail-tags-input {
   flex: 1;
   min-width: 0;
+}
+
+.bandwidth-sparkline svg {
+  width: 100%;
+  height: 40px;
+  display: block;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bandwidth-sparkline-chevron {
+    transition: none;
+  }
 }

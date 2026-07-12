@@ -2,7 +2,7 @@ import { createSignal } from "solid-js";
 import { api } from "../api/invoke";
 
 // 单任务分片数据:真实 doneSet + downloadingSet
-interface TaskFragmentData {
+export interface TaskFragmentData {
   total: number;
   doneSet: Set<number>;
   downloadingSet: Set<number>;

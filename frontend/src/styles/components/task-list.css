@@ -92,6 +92,47 @@
   background: var(--color-bg-hover);
 }
 
+/* 移动端/超窄屏:减少内边距与字号,避免信息截断/重叠 */
+@media (max-width: 640px) {
+  .task-list--narrow .task-list-header {
+    padding: 0 12px;
+  }
+
+  .task-list--narrow .task-row {
+    padding: 8px 12px;
+  }
+
+  .task-list--narrow .task-row--compact {
+    padding: 4px 12px;
+  }
+
+  .task-list--narrow .task-file-icon {
+    width: 32px;
+    height: 32px;
+  }
+
+  .task-list--narrow .task-file-icon--compact {
+    width: 24px;
+    height: 24px;
+  }
+
+  .task-list--narrow .task-file-name {
+    font-size: 13px;
+  }
+
+  .task-list--narrow .task-file-name--compact {
+    font-size: 12px;
+  }
+
+  .task-list--narrow .task-file-meta {
+    font-size: 11px;
+  }
+
+  .task-list--narrow .task-list-cell-text {
+    font-size: 12px;
+  }
+}
+
 /* ============================================
    Task Group Header（分组视图）
    ============================================ */

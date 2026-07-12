@@ -21,8 +21,8 @@ pub use self::sniffer_commands::{
 };
 pub use self::task_commands::{
     add_task_tag, cancel_task, create_task, delete_task, export_backup, get_task_detail,
-    get_task_list, import_backup, pause_task, probe_filename, remove_task_tag, reorder_tasks,
-    resume_task, set_task_tags,
+    get_task_list, import_backup, move_task, pause_task, probe_filename, remove_task_tag,
+    reorder_tasks, resume_task, set_task_tags, undo_cancel_task, undo_delete_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,7 +150,7 @@ pub struct TaskInfo {
     /// HF 任务元数据（仅 HF 来源的下载任务有值）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_meta: Option<HfTaskMeta>,
-    /// 任务在列表中的显示顺序,越小越靠前。
+    /// 任务在列表中的显示顺序，越小越靠前。
     #[serde(default)]
     pub display_order: i64,
 }
@@ -759,6 +759,7 @@ pub(crate) mod tests {
             magnet: Default::default(),
             hub: Default::default(),
             clipboard: Default::default(),
+            notifications: Default::default(),
         }));
         let task_store = Arc::new(crate::task_store::TaskStore::open(tmp_store.path()).unwrap());
         // favorites_store 必须使用独立临时目录,不能与 task_store 共用同一目录:

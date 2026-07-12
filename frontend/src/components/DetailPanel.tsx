@@ -11,6 +11,12 @@ import {
   Suspense,
 } from "solid-js";
 import type { TaskInfo } from "../types";
+import {
+  $detailPanel,
+  MIN_WIDTH,
+  MAX_WIDTH,
+} from "../stores/detailPanel";
+import { getParentDirectory } from "../utils/path";
 import { loadTaskFragments, clearTaskFragments, getTaskFragmentData } from "../stores/taskFragments";
 import {
   formatSize,
@@ -41,6 +47,7 @@ import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr, type MessageKey } from "../i18n";
 import SpeedChart from "./SpeedChart";
+import BandwidthSparkline from "./BandwidthSparkline";
 import InfoRow from "./DetailInfoRow";
 import Button from "../shared/ui/Button";
 import LiquidProgress from "./LiquidProgress";
@@ -70,6 +77,7 @@ const DIAGNOSTICS_CATEGORY_KEY: Record<FailureInsight["category"], MessageKey> =
 interface DetailPanelProps {
   task: TaskInfo | null;
   onClose: () => void;
+  variant?: "overlay" | "side";
 }
 
 export default function DetailPanel(props: DetailPanelProps) {
@@ -91,6 +99,7 @@ export default function DetailPanel(props: DetailPanelProps) {
   // 响应式 + 动效偏好(Iteration 13)
   const isNarrow = useIsNarrowScreen();
   const reducedMotion = useReducedMotion();
+  const isOverlay = () => props.variant !== "side";
 
   let closeTimer: number | null = null;
   let copiedTimer: number | null = null;
@@ -149,16 +158,16 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (task) clearTaskFragments(task.id);
   });
 
-  // 详情覆盖式:focus trap 在 visible 时统一激活(宽屏也 trap,因列表被遮罩盖住)
+  // 详情覆盖式:focus trap 仅在覆盖模式时激活;侧栏模式列表仍可交互,不 trap
   useFocusTrap({
-    active: () => visible(),
+    active: () => visible() && isOverlay(),
     container: panelContentRef,
     onEscape: () => handleClose(),
   });
 
-  // 兜底 Esc 关闭(focus trap 未拦截时的键盘兜底)
+  // 兜底 Esc 关闭:仅覆盖模式需要;侧栏模式不拦截,避免误关面板
   createEffect(() => {
-    if (!visible()) return;
+    if (!visible() || !isOverlay()) return;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -178,6 +187,73 @@ export default function DetailPanel(props: DetailPanelProps) {
       closeTimer = null;
       untrack(() => props.onClose());
     }, 300);
+  };
+
+  // 侧栏宽度拖拽:左侧手柄,实时更新,释放后保持
+  const handleResizeKeyDown = (e: KeyboardEvent) => {
+    const { key, shiftKey } = e;
+    if (
+      key !== "ArrowLeft" &&
+      key !== "ArrowRight" &&
+      key !== "Home" &&
+      key !== "End"
+    ) {
+      return;
+    }
+
+    e.preventDefault();
+    const current = $detailPanel.width();
+    const step = shiftKey ? 100 : 20;
+
+    switch (key) {
+      case "ArrowLeft":
+        $detailPanel.setWidth(current - step);
+        break;
+      case "ArrowRight":
+        $detailPanel.setWidth(current + step);
+        break;
+      case "Home":
+        $detailPanel.setWidth(MIN_WIDTH);
+        break;
+      case "End":
+        $detailPanel.setWidth(MAX_WIDTH);
+        break;
+    }
+  };
+
+  const handleResizePointerDown = (e: PointerEvent) => {
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLDivElement;
+    const startX = e.clientX;
+    const startWidth = $detailPanel.width();
+
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      /* jsdom 等环境可能不支持 setPointerCapture,继续监听 window 事件 */
+    }
+
+    const onPointerMove = (ev: PointerEvent) => {
+      const delta = startX - ev.clientX;
+      const nextWidth = Math.min(
+        MAX_WIDTH,
+        Math.max(MIN_WIDTH, Math.round(startWidth + delta)),
+      );
+      $detailPanel.setWidth(nextWidth);
+    };
+
+    const onPointerUp = (ev: PointerEvent) => {
+      try {
+        handle.releasePointerCapture(ev.pointerId);
+      } catch {
+        /* ignore */
+      }
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
   };
 
   const task = () => displayTask();
@@ -368,7 +444,7 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (!t2) return;
     if (t2.savePath) {
       try {
-        await api.openFolder(t2.savePath);
+        await api.openFolder(getParentDirectory(t2.savePath));
       } catch {
         addToast(tr("toast.openFolderFailed"), "error");
       }
@@ -416,58 +492,28 @@ export default function DetailPanel(props: DetailPanelProps) {
     }
   };
 
-  return (
-    <Show when={shouldRender()}>
-      {/* 覆盖式遮罩:半透明 + 模糊,列表隐约可见但不可点(参考稿风格 + 保留下载器信息密度)
-          z-70:高于 Toolbar z-2 / BatchToolbar z-50,低于 CommandPalette z-100 与模态遮罩 z-200+ */}
-      <Show when={visible()}>
-        <div
-          class="absolute inset-0 z-[var(--z-detail-panel)] detail-scrim"
-          onClick={() => props.onClose()}
-        />
-      </Show>
-      {/* 详情面板:覆盖 main 区,从右滑入。z-80:高于遮罩 z-70。
-          统一 absolute inset-0(废弃宽屏 grid 列模式),窄屏宽屏同为覆盖式,
-          宽屏居中限宽,窄屏全宽。 */}
-      <Motion.div
-        class="detail-panel"
-        classList={{ "detail-panel--narrow": isNarrow() }}
-        initial={{ opacity: 0.92, x: "100%", scale: 0.98 }}
-        animate={
-          visible()
-            ? { opacity: 1, x: 0, scale: 1 }
-            : { opacity: 0.92, x: "100%", scale: 0.98 }
-        }
-        transition={
-          reducedMotion()
-            ? { duration: 0 }
-            : {
-                type: "spring",
-                stiffness: 300,
-                damping: 30,
-                mass: 0.8,
-              }
-        }
-      >
-        <div
-          ref={panelContentRef}
-          role="complementary"
-          aria-label={t("detail.aria")}
-          tabIndex={isNarrow() ? -1 : undefined}
-          class="detail-panel-content flex flex-col h-full scroll-container overflow-x-hidden"
-        >
+  const PanelContent = () => (
+    <div
+      ref={panelContentRef}
+      role="complementary"
+      aria-label={t("detail.aria")}
+      tabIndex={isOverlay() ? undefined : -1}
+      class="detail-panel-content flex flex-col h-full scroll-container overflow-x-hidden"
+    >
           <div class="panel-header">
             <div class="flex items-center gap-2 min-w-0 flex-1">
-              {/* 覆盖式:返回箭头(关闭详情回列表) */}
-              <Button
-                variant="ghost"
-                shape="icon-sm"
-                aria-label={t("detail.closeAria")}
-                title={t("detail.closeAria")}
-                onClick={handleClose}
-              >
-                <ArrowLeftIcon />
-              </Button>
+              {/* 覆盖式:返回箭头(关闭详情回列表);侧栏模式隐藏,避免与关闭按钮重复 */}
+              <Show when={isOverlay()}>
+                <Button
+                  variant="ghost"
+                  shape={isNarrow() ? "icon" : "icon-sm"}
+                  aria-label={t("detail.closeAria")}
+                  title={t("detail.closeAria")}
+                  onClick={handleClose}
+                >
+                  <ArrowLeftIcon />
+                </Button>
+              </Show>
 
               {/* 快捷操作:复制链接 / 打开文件夹 / 重新下载
                   与右键菜单动作保持一致,不再只藏在「更多」菜单内 */}
@@ -507,7 +553,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             <div class="flex items-center gap-1">
               <Button
                 variant="ghost"
-                shape="icon-sm"
+                shape={isNarrow() ? "icon" : "icon-sm"}
                 aria-label={t("detail.closeAria")}
                 title={t("detail.closeAria")}
                 onClick={handleClose}
@@ -729,7 +775,7 @@ export default function DetailPanel(props: DetailPanelProps) {
             )}
           </Show>
 
-          {/* Activity Metrics — 仅保留不重复的信息:剩余时间 + 并发分片 */}
+          {/* Activity Metrics — 仅保留不重复的信息:剩余时间 + 并发分片 + mini 带宽曲线 */}
           <Show when={isActive()}>
             <div class="detail-section">
               <div class="metric-grid">
@@ -745,6 +791,10 @@ export default function DetailPanel(props: DetailPanelProps) {
                   hint={t("detail.label.concurrency")}
                 />
               </div>
+              <BandwidthSparkline
+                taskId={task()!.id}
+                status={task()?.status}
+              />
             </div>
           </Show>
 
@@ -904,8 +954,67 @@ export default function DetailPanel(props: DetailPanelProps) {
               {t("detail.action.delete")}
             </Button>
           </div>
+    </div>
+  );
+
+  return (
+    <Show when={shouldRender()}>
+      <Show when={isOverlay()}>
+        {/* 覆盖式遮罩:半透明 + 模糊,列表隐约可见但不可点
+            z-70:高于 Toolbar z-2 / BatchToolbar z-50,低于 CommandPalette z-100 与模态遮罩 z-200+ */}
+        <Show when={visible()}>
+          <div
+            class="absolute inset-0 z-[var(--z-detail-panel)] detail-scrim"
+            onClick={() => props.onClose()}
+          />
+        </Show>
+        {/* 详情面板:覆盖 main 区,从右滑入。z-80:高于遮罩 z-70。
+            窄屏全宽,宽屏居中限宽。 */}
+        <Motion.div
+          class="detail-panel"
+          classList={{ "detail-panel--narrow": isNarrow() }}
+          initial={{ opacity: 0.92, x: "100%", scale: 0.98 }}
+          animate={
+            visible()
+              ? { opacity: 1, x: 0, scale: 1 }
+              : { opacity: 0.92, x: "100%", scale: 0.98 }
+          }
+          transition={
+            reducedMotion()
+              ? { duration: 0 }
+              : {
+                  type: "spring",
+                  stiffness: 300,
+                  damping: 30,
+                  mass: 0.8,
+                }
+          }
+        >
+          <PanelContent />
+        </Motion.div>
+      </Show>
+
+      <Show when={!isOverlay() && visible()}>
+        {/* 侧栏模式:与列表并列的固定右侧面板,宽度可拖拽调整 */}
+        <div
+          class="detail-panel detail-panel--side"
+          style={{ width: `${$detailPanel.width()}px` }}
+        >
+          <div
+            class="detail-panel-resize-handle"
+            role="separator"
+            tabIndex={0}
+            aria-orientation="vertical"
+            aria-label={t("detail.resizeHandleAria")}
+            aria-valuenow={$detailPanel.width()}
+            aria-valuemin={MIN_WIDTH}
+            aria-valuemax={MAX_WIDTH}
+            onPointerDown={handleResizePointerDown}
+            onKeyDown={handleResizeKeyDown}
+          />
+          <PanelContent />
         </div>
-      </Motion.div>
+      </Show>
     </Show>
   );
 }

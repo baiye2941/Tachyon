@@ -93,8 +93,8 @@ export const api = {
   /** 获取支持的协议列表 */
   getSupportedProtocols: () => invoke<string[]>('supported_protocols'),
   /** 创建下载任务 */
-  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string) =>
-    invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName }),
+  createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string, autoStart?: boolean) =>
+    invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName, autoStart }),
   /** 探测真实文件名(HEAD 请求获取 Content-Disposition / DHT 查询种子元数据) */
   probeFilename: (url: string) => invoke<string>('probe_filename', { url }),
   /** 获取任务列表 */
@@ -127,6 +127,14 @@ export const api = {
     }
     return invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm)
   },
+  /** 撤销取消任务(破坏性操作,需确认令牌) */
+  undoCancelTask: (taskId: string) => invoke<void>('undo_cancel_task', { taskId }),
+  /** 撤销删除任务(破坏性操作,需确认令牌) */
+  undoDeleteTask: (taskId: string) => invoke<void>('undo_delete_task', { taskId }),
+  /** 重排任务顺序 */
+  reorderTasks: (orderedIds: string[]) => invoke<void>('reorder_tasks', { orderedIds }),
+  /** 将任务移动到指定任务之前,beforeId 为空时移到末尾 */
+  moveTask: (taskId: string, beforeId?: string) => invoke<void>('move_task', { taskId, beforeId }),
   /** 打开文件夹 */
   openFolder: (path: string) => openPath(path),
   /** 获取下载进度详情 */
@@ -139,6 +147,10 @@ export const api = {
   getConfig: () => invoke<AppConfig>('get_config'),
   /** 更新应用配置(破坏性操作,需确认令牌。SettingsPanel 已自行确认,跳过 invoke 内 window.confirm) */
   updateConfig: (patch: ConfigPatch) => invoke<void>('update_config', { patch }, true),
+  /** 导出当前配置到指定路径(JSON) */
+  exportBackup: (path: string) => invoke<void>('export_backup', { path }),
+  /** 从指定路径导入配置并覆盖当前配置(破坏性操作,调用方已自行确认,跳过 invoke 内 window.confirm) */
+  importBackup: (path: string) => invoke<void>('import_backup', { path }, true),
   /** 获取嗅探资源列表 */
   getSnifferResources: () => invoke<SnifferResource[]>('get_sniffer_resources'),
   /** 添加嗅探过滤规则 */

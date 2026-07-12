@@ -1,20 +1,29 @@
-import { createSignal, createRoot, type Accessor } from "solid-js";
+/**
+ * 任务列表过滤/搜索/排序视图状态 store。
+ *
+ * 视图状态持久化到 localStorage key: tachyon.tasklist.view
+ * 包括：搜索关键词、状态筛选、文件类型筛选、排序 key/direction。
+ * 加载时校验非法值并回退到默认值。
+ */
+
+import { createRoot, createEffect, createSignal, type Accessor } from "solid-js";
 import type { TaskInfo, SidebarFilter, FileTypeFilter } from "../types";
+import type { SortKey, SortDir } from "../components/taskColumns";
 import { $tasks } from "./downloads";
 import { EXT_TYPE_MAP } from "../utils/format";
 import { createRootMemo } from "../utils/reactive";
 
-export interface SearchFilter {
-  type: string;
-  value: string;
-  raw: string;
+const STORAGE_KEY = "tachyon.tasklist.view";
+
+export interface SortState {
+  key: SortKey | null;
+  dir: SortDir;
 }
 
 interface FilterState {
   searchQuery: string;
   sidebarFilter: SidebarFilter;
   fileTypeFilter: FileTypeFilter;
-  tagFilter: string[];
 }
 
 interface TaskCounts {
@@ -25,14 +34,142 @@ interface TaskCounts {
   failed: number;
 }
 
-const [searchQuery, setSearchQuery] = createSignal("");
-const [sidebarFilter, setSidebarFilter] = createSignal<SidebarFilter>("all");
-const [fileTypeFilter, setFileTypeFilter] = createSignal<FileTypeFilter>("all");
+interface ViewState {
+  searchQuery: string;
+  sidebarFilter: SidebarFilter;
+  fileTypeFilter: FileTypeFilter;
+  sort: SortState;
+}
+
+const DEFAULT_SEARCH_QUERY = "";
+const DEFAULT_SIDEBAR_FILTER: SidebarFilter = "all";
+const DEFAULT_FILE_TYPE_FILTER: FileTypeFilter = "all";
+const DEFAULT_SORT_STATE: SortState = { key: null, dir: "desc" };
+
+const VALID_SIDEBAR_FILTERS: SidebarFilter[] = [
+  "all",
+  "downloading",
+  "completed",
+  "paused",
+  "failed",
+];
+const VALID_FILE_TYPE_FILTERS: FileTypeFilter[] = [
+  "all",
+  "video",
+  "audio",
+  "document",
+  "image",
+  "archive",
+  "executable",
+  "model",
+  "other",
+];
+const VALID_SORT_KEYS: SortKey[] = [
+  "name",
+  "progress",
+  "speed",
+  "status",
+  "size",
+  "remaining",
+  "downloaded",
+  "fragments",
+  "threads",
+  "createdAt",
+];
+const VALID_SORT_DIRS: SortDir[] = ["asc", "desc"];
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isValidSidebarFilter(value: unknown): value is SidebarFilter {
+  return (
+    typeof value === "string" &&
+    (VALID_SIDEBAR_FILTERS as string[]).includes(value)
+  );
+}
+
+function isValidFileTypeFilter(value: unknown): value is FileTypeFilter {
+  return (
+    typeof value === "string" &&
+    (VALID_FILE_TYPE_FILTERS as string[]).includes(value)
+  );
+}
+
+function isValidSortKey(value: unknown): value is SortKey | null {
+  return (
+    value === null ||
+    (typeof value === "string" && (VALID_SORT_KEYS as string[]).includes(value))
+  );
+}
+
+function isValidSortDir(value: unknown): value is SortDir {
+  return (
+    typeof value === "string" && (VALID_SORT_DIRS as string[]).includes(value)
+  );
+}
+
+function isValidSortState(value: unknown): value is SortState {
+  return isObject(value) && isValidSortKey(value.key) && isValidSortDir(value.dir);
+}
+
+function getDefaultState(): ViewState {
+  return {
+    searchQuery: DEFAULT_SEARCH_QUERY,
+    sidebarFilter: DEFAULT_SIDEBAR_FILTER,
+    fileTypeFilter: DEFAULT_FILE_TYPE_FILTER,
+    sort: DEFAULT_SORT_STATE,
+  };
+}
+
+function load(): ViewState {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return getDefaultState();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isObject(parsed)) return getDefaultState();
+    return {
+      searchQuery:
+        typeof parsed.searchQuery === "string"
+          ? parsed.searchQuery
+          : DEFAULT_SEARCH_QUERY,
+      sidebarFilter: isValidSidebarFilter(parsed.sidebarFilter)
+        ? parsed.sidebarFilter
+        : DEFAULT_SIDEBAR_FILTER,
+      fileTypeFilter: isValidFileTypeFilter(parsed.fileTypeFilter)
+        ? parsed.fileTypeFilter
+        : DEFAULT_FILE_TYPE_FILTER,
+      sort: isValidSortState(parsed.sort) ? parsed.sort : DEFAULT_SORT_STATE,
+    };
+  } catch {
+    return getDefaultState();
+  }
+}
+
+function save(state: ViewState): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    /* ignore */
+  }
+}
+
+const loaded = load();
+
+const [searchQuery, setSearchQuery] = createSignal<string>(loaded.searchQuery);
+const [sidebarFilter, setSidebarFilter] = createSignal<SidebarFilter>(
+  loaded.sidebarFilter,
+);
+const [fileTypeFilter, setFileTypeFilter] = createSignal<FileTypeFilter>(
+  loaded.fileTypeFilter,
+);
+// 标签过滤为会话级状态，不持久化到 localStorage
 const [tagFilter, setTagFilter] = createSignal<string[]>([]);
+const [sortState, setSortState] = createSignal<SortState>(loaded.sort);
 
 const searchFilters = createRootMemo(() => {
   const query = searchQuery().trim();
-  const filters: SearchFilter[] = [];
+  const filters: { type: string; value: string; raw: string }[] = [];
   let textQuery = query;
 
   const filterRegex = /(\w+):([^\s]+)/g;
@@ -73,7 +210,7 @@ function computeFilteredTasks(
   sf: SidebarFilter,
   tf: FileTypeFilter,
   tags: string[],
-  filters: SearchFilter[],
+  filters: { type: string; value: string; raw: string }[],
   textQuery: string,
 ): TaskInfo[] {
   let result = tasks;
@@ -269,12 +406,12 @@ export function toggleTagFilter(tag: string): void {
   );
 }
 
-/** toggle 筛选:点已选中的分类再点一次 = 回到 'all'(可取消,避免点了看不到全部)。 */
+/** toggle 筛选：点已选中的分类再点一次 = 回到 'all'（可取消，避免点了看不到全部）。 */
 export function toggleSidebarFilter(key: SidebarFilter): void {
   setSidebarFilter((prev) => (prev === key ? "all" : key));
 }
 
-/** toggle 文件类型筛选:同上,再点取消回 'all'。 */
+/** toggle 文件类型筛选：同上，再点取消回 'all'。 */
 export function toggleFileTypeFilter(key: FileTypeFilter): void {
   setFileTypeFilter((prev) => (prev === key ? "all" : key));
 }
@@ -292,8 +429,11 @@ export const $taskFilter = {
   get tagFilter(): Accessor<string[]> {
     return tagFilter;
   },
+  get sortState(): Accessor<SortState> {
+    return sortState;
+  },
   get searchFilters(): Accessor<{
-    filters: SearchFilter[];
+    filters: { type: string; value: string; raw: string }[];
     textQuery: string;
   }> {
     return searchFilters;
@@ -321,6 +461,8 @@ export {
   sidebarFilter,
   fileTypeFilter,
   tagFilter,
+  sortState,
+  setSortState,
 };
 
 // 在 createRoot 下读取状态，避免测试环境出现 computations created outside a createRoot 警告
@@ -331,10 +473,22 @@ export function readTaskFilterState(): FilterState {
         searchQuery: searchQuery(),
         sidebarFilter: sidebarFilter(),
         fileTypeFilter: fileTypeFilter(),
-        tagFilter: tagFilter(),
       };
     } finally {
       dispose();
     }
   });
 }
+
+// 模块级 createEffect 监听状态变化并持久化。
+// createRoot 提供 reactive owner，避免测试环境出现 warnings。
+createRoot(() => {
+  createEffect(() => {
+    save({
+      searchQuery: searchQuery(),
+      sidebarFilter: sidebarFilter(),
+      fileTypeFilter: fileTypeFilter(),
+      sort: sortState(),
+    });
+  });
+});

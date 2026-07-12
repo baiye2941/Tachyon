@@ -8,7 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tachyon_core::config::{AppConfig, DownloadConfig};
 use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log, sanitize_filename};
 use tachyon_core::types::DownloadState;
@@ -27,6 +29,8 @@ use tachyon_store::TaskSnapshot;
 const MAX_TAGS_PER_TASK: usize = 10;
 /// 单个标签最大字符长度
 const MAX_TAG_LENGTH: usize = 32;
+/// 撤销窗口时长:操作后 30 秒内可撤销
+const UNDO_WINDOW: Duration = Duration::from_secs(30);
 
 /// 清理并规范化标签列表
 ///
@@ -60,6 +64,25 @@ fn normalize_single_tag(tag: &str) -> String {
         return String::new();
     }
     trimmed.chars().take(MAX_TAG_LENGTH).collect::<String>()
+}
+
+/// 任务操作撤销记录
+///
+/// 保存在内存中,无需持久化。超过 [`UNDO_WINDOW`] 后撤销请求返回错误。
+enum UndoRecord {
+    /// 取消任务前的状态快照
+    Cancel {
+        previous_status: DownloadState,
+        timestamp: Instant,
+    },
+    /// 删除任务前保留的完整任务记录与快照(仅 delete_local_file == false)
+    ///
+    /// 使用 Box 减少枚举变体大小差异,避免 clippy::large_enum_variant。
+    Delete {
+        task: Box<TaskInfo>,
+        snapshot: Box<Option<TaskSnapshot>>,
+        timestamp: Instant,
+    },
 }
 
 /// 任务创建结果
@@ -104,6 +127,11 @@ pub struct TaskService {
     /// 仅在 config 变更时更新(极低频)。RwLock 允许多个读者并发读取,
     /// 比 Mutex 更适合读多写少场景。
     cached_download_dir: Arc<RwLock<String>>,
+    /// 撤销记录表:task_id -> UndoRecord
+    ///
+    /// 仅保存最近破坏性操作(cancel/delete)的快照,用于 30 秒内撤销恢复。
+    /// 内存中即可,应用重启后自然清空(持久化快照由 undo_delete 恢复)。
+    undo_records: DashMap<String, UndoRecord>,
 }
 
 fn resolve_delete_save_path(task: &TaskInfo, snapshot: Option<&TaskSnapshot>) -> Option<String> {
@@ -269,6 +297,7 @@ impl TaskService {
             task_store,
             create_task_lock,
             cached_download_dir: Arc::new(RwLock::new(initial_download_dir)),
+            undo_records: DashMap::new(),
         }
     }
 
@@ -534,7 +563,7 @@ impl TaskService {
 
     /// 取消任务
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), AppError> {
-        {
+        let previous_status = {
             let mut task = self
                 .task_repository
                 .get_mut(task_id)
@@ -544,12 +573,23 @@ impl TaskService {
                     return Err(AppError::Config(format!("任务已{},无法取消", task.status)));
                 }
                 _ => {
+                    let previous = task.status;
                     task.status = DownloadState::Cancelled;
                     task.speed = 0;
                     tracing::info!(task_id = %task_id, "取消任务");
+                    previous
                 }
             }
-        }
+        };
+
+        // 记录撤销信息:取消前状态
+        self.undo_records.insert(
+            task_id.to_string(),
+            UndoRecord::Cancel {
+                previous_status,
+                timestamp: Instant::now(),
+            },
+        );
 
         self.persist_snapshot(task_id, None).await;
         Ok(())
@@ -583,6 +623,19 @@ impl TaskService {
                 task_id = %task_id,
                 status = %task.status,
                 "删除非终态任务,自动取消"
+            );
+        }
+
+        // 仅当不删除本地文件时保存撤销记录,用于恢复任务记录与快照
+        if !delete_local_file {
+            let snapshot = self.task_store.load_snapshot(task_id).ok().flatten();
+            self.undo_records.insert(
+                task_id.to_string(),
+                UndoRecord::Delete {
+                    task: Box::new(task.clone()),
+                    snapshot: Box::new(snapshot),
+                    timestamp: Instant::now(),
+                },
             );
         }
 
@@ -633,6 +686,94 @@ impl TaskService {
         Ok(())
     }
 
+    /// 撤销取消任务
+    ///
+    /// 将任务状态恢复为取消前的状态,并持久化快照。返回恢复后的状态,
+    /// 调用方若需重新启动下载(原状态为 Downloading)可据此调用 restart_download。
+    pub async fn undo_cancel_task(&self, task_id: &str) -> Result<DownloadState, AppError> {
+        let record = self
+            .undo_records
+            .remove(task_id)
+            .map(|r| r.1)
+            .ok_or_else(|| AppError::Config("该任务无可用撤销记录".to_string()))?;
+        let UndoRecord::Cancel {
+            previous_status,
+            timestamp,
+        } = record
+        else {
+            return Err(AppError::Config("撤销记录类型不匹配".to_string()));
+        };
+        if timestamp.elapsed() > UNDO_WINDOW {
+            return Err(AppError::Config("撤销窗口已过期".to_string()));
+        }
+
+        {
+            let mut task = self
+                .task_repository
+                .get_mut(task_id)
+                .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            task.status = previous_status;
+            if previous_status == DownloadState::Downloading {
+                task.speed = 0;
+            }
+        }
+
+        self.persist_snapshot(task_id, None).await;
+        tracing::info!(
+            task_id = %task_id,
+            previous_status = %previous_status,
+            "撤销取消任务"
+        );
+        Ok(previous_status)
+    }
+
+    /// 撤销删除任务
+    ///
+    /// 仅恢复任务记录与断点续传快照,不恢复本地文件,也不重新启动下载。
+    /// 若原文件已被外部删除,仅恢复记录,不报错。
+    pub async fn undo_delete_task(&self, task_id: &str) -> Result<(), AppError> {
+        let record = self
+            .undo_records
+            .remove(task_id)
+            .map(|r| r.1)
+            .ok_or_else(|| AppError::Config("该任务无可用撤销记录".to_string()))?;
+        let UndoRecord::Delete {
+            task,
+            snapshot,
+            timestamp,
+        } = record
+        else {
+            return Err(AppError::Config("撤销记录类型不匹配".to_string()));
+        };
+        if timestamp.elapsed() > UNDO_WINDOW {
+            return Err(AppError::Config("撤销窗口已过期".to_string()));
+        }
+
+        // 恢复任务记录
+        self.task_repository.insert(task_id.to_string(), *task);
+
+        // 恢复快照(若存在):await 确保快照在返回前已落盘,
+        // 避免应用立即退出时恢复记录丢失。
+        if let Some(snapshot) = *snapshot {
+            let task_store = self.task_store.clone();
+            let task_id_for_log = task_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = task_store.save_snapshot(&snapshot) {
+                    tracing::warn!(
+                        task_id = %task_id_for_log,
+                        error = %e,
+                        "撤销删除时恢复快照失败"
+                    );
+                }
+            })
+            .await
+            .map_err(|e| AppError::Config(format!("撤销删除时恢复快照任务失败: {e}")))?;
+        }
+
+        tracing::info!(task_id = %task_id, "撤销删除任务,已恢复任务记录");
+        Ok(())
+    }
+
     /// 获取任务列表
     ///
     /// 默认按 `display_order` 升序排列,相同 order 时按 `created_at` 降序
@@ -666,46 +807,58 @@ impl TaskService {
     /// `ordered_ids` 中每个任务会按索引乘以 1000 分配 display_order,
     /// 留出空隙方便后续插入。所有 ID 必须存在,否则返回 `TaskNotFound`。
     pub async fn reorder_tasks(&self, ordered_ids: &[String]) -> Result<(), AppError> {
+        if ordered_ids.is_empty() {
+            return Ok(());
+        }
+
+        // 预检:所有 ID 必须存在,避免部分写入导致顺序不一致
         for id in ordered_ids {
-            if !self.task_repository.contains_key(id) {
+            if self.task_repository.get(id).is_none() {
                 return Err(AppError::TaskNotFound(id.clone()));
             }
         }
 
+        // 更新内存中的显示顺序
         for (idx, id) in ordered_ids.iter().enumerate() {
             if let Some(mut task) = self.task_repository.get_mut(id) {
                 task.display_order = (idx as i64).saturating_mul(1000);
             }
         }
 
+        // 持久化每个受影响任务的快照,保持 order 与磁盘一致
         for id in ordered_ids {
             self.persist_display_order(id).await;
         }
+        tracing::info!(count = ordered_ids.len(), "已重排任务顺序");
         Ok(())
     }
 
-    /// 将任务移动到某任务之前或末尾
+    /// 将任务移动到指定任务之前
     ///
     /// - `before_id` 为 `Some` 时,将 `task_id` 插入到 `before_id` 之前;
     /// - `before_id` 为 `None` 时,移动到列表末尾。
-    pub async fn move_task(&self, task_id: &str, before_id: Option<&str>) -> Result<(), AppError> {
-        if !self.task_repository.contains_key(task_id) {
-            return Err(AppError::TaskNotFound(task_id.to_string()));
+    pub async fn move_task(
+        &self,
+        task_id: String,
+        before_id: Option<String>,
+    ) -> Result<(), AppError> {
+        if self.task_repository.get(&task_id).is_none() {
+            return Err(AppError::TaskNotFound(task_id));
         }
-        if let Some(before) = before_id
-            && !self.task_repository.contains_key(before)
+        if let Some(ref before) = before_id
+            && self.task_repository.get(before).is_none()
         {
-            return Err(AppError::TaskNotFound(before.to_string()));
+            return Err(AppError::TaskNotFound(before.clone()));
         }
 
         let mut ordered: Vec<String> = self.get_task_list().into_iter().map(|t| t.id).collect();
         let current_pos = ordered
             .iter()
-            .position(|id| id == task_id)
-            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            .position(|id| id == &task_id)
+            .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
         ordered.remove(current_pos);
 
-        let insert_pos = if let Some(before) = before_id {
+        let insert_pos = if let Some(ref before) = before_id {
             ordered
                 .iter()
                 .position(|id| id == before)
@@ -713,7 +866,7 @@ impl TaskService {
         } else {
             ordered.len()
         };
-        ordered.insert(insert_pos, task_id.to_string());
+        ordered.insert(insert_pos, task_id);
 
         self.reorder_tasks(&ordered).await
     }

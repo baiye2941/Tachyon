@@ -4,11 +4,14 @@ const mockPauseTask = vi.fn()
 const mockResumeTask = vi.fn()
 const mockCancelTask = vi.fn()
 const mockDeleteTask = vi.fn()
+const mockUndoCancelTask = vi.fn()
+const mockUndoDeleteTask = vi.fn()
 const mockGetTaskList = vi.fn()
 const mockOpenFolder = vi.fn()
 const mockCreateTask = vi.fn()
 const mockRequestConfirm = vi.fn()
 const mockAddToast = vi.fn()
+const mockAddToastWithActions = vi.fn()
 
 // Iteration 11:不再 mock 整个 api 模块(会掩盖 invoke 包装层副作用),
 // 改为 mock confirm store + 真实 api(其 deleteTask 接收 opts.skipConfirm)。
@@ -18,10 +21,16 @@ vi.mock('../../api/invoke', () => ({
     resumeTask: (...args: unknown[]) => mockResumeTask(...args),
     cancelTask: (...args: unknown[]) => mockCancelTask(...args),
     deleteTask: (...args: unknown[]) => mockDeleteTask(...args),
+    undoCancelTask: (...args: unknown[]) => mockUndoCancelTask(...args),
+    undoDeleteTask: (...args: unknown[]) => mockUndoDeleteTask(...args),
     getTaskList: (...args: unknown[]) => mockGetTaskList(...args),
     openFolder: (...args: unknown[]) => mockOpenFolder(...args),
     createTask: (...args: unknown[]) => mockCreateTask(...args),
   },
+}))
+
+vi.mock('../../components/ToastContainer', () => ({
+  addToast: (...args: unknown[]) => mockAddToastWithActions(...args),
 }))
 
 vi.mock('../confirm', () => ({
@@ -60,11 +69,14 @@ beforeEach(async () => {
   mockResumeTask.mockReset()
   mockCancelTask.mockReset()
   mockDeleteTask.mockReset()
+  mockUndoCancelTask.mockReset()
+  mockUndoDeleteTask.mockReset()
   mockGetTaskList.mockReset()
   mockOpenFolder.mockReset()
   mockCreateTask.mockReset()
   mockRequestConfirm.mockReset()
   mockAddToast.mockReset()
+  mockAddToastWithActions.mockReset()
 
   downloadsModule = await import('../downloads')
   selectionModule = await import('../selection')
@@ -157,7 +169,58 @@ describe('batchActions store', () => {
     ids.forEach(id => {
       expect(mockDeleteTask).toHaveBeenCalledWith(id, { skipConfirm: true, deleteLocalFile: false })
     })
-    expect(mockAddToast).toHaveBeenCalledWith('已删除 10 个任务记录', 'success')
+    expect(mockAddToastWithActions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'success',
+        title: '已删除 10 个任务记录',
+        duration: 30000,
+        actions: expect.any(Array),
+      }),
+    )
+  })
+
+  it('deleteSelected 成功后点击撤销调用 undoDeleteTask', async () => {
+    downloadsModule.setTasks([makeTask('t1')])
+    selectionModule.selectAll(['t1'])
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockDeleteTask.mockResolvedValue(undefined)
+    mockUndoDeleteTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.deleteSelected()
+
+    expect(mockAddToastWithActions).toHaveBeenCalledTimes(1)
+    const toast = mockAddToastWithActions.mock.calls[0]![0] as {
+      actions?: { label: string; onClick: () => void }[]
+    }
+    expect(toast.actions).toHaveLength(1)
+    expect(toast.actions![0]!.label).toBe('撤销')
+    await toast.actions![0]!.onClick()
+    expect(mockUndoDeleteTask).toHaveBeenCalledWith('t1')
+    expect(mockGetTaskList).toHaveBeenCalled()
+  })
+
+  it('deleteSelected 批量成功后点击撤销全部调用多个 undoDeleteTask', async () => {
+    const ids = ['t1', 't2', 't3']
+    downloadsModule.setTasks(ids.map(id => makeTask(id)))
+    selectionModule.selectAll(ids)
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockDeleteTask.mockResolvedValue(undefined)
+    mockUndoDeleteTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.deleteSelected()
+
+    expect(mockAddToastWithActions).toHaveBeenCalledTimes(1)
+    const toast = mockAddToastWithActions.mock.calls[0]![0] as {
+      actions?: { label: string; onClick: () => void }[]
+    }
+    expect(toast.actions![0]!.label).toBe('撤销全部')
+    await toast.actions![0]!.onClick()
+    ids.forEach(id => {
+      expect(mockUndoDeleteTask).toHaveBeenCalledWith(id)
+    })
+    expect(mockGetTaskList).toHaveBeenCalled()
   })
 
   it('pauseSelected 部分失败时显示成功与失败汇总', async () => {
@@ -269,7 +332,14 @@ describe('batchActions store', () => {
     )
     expect(mockCancelTask).toHaveBeenCalledWith('t1')
     expect(selectionModule.$selectedIds.get().size).toBe(0)
-    expect(mockAddToast).toHaveBeenCalledWith('已取消 1 个任务', 'success')
+    expect(mockAddToastWithActions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'success',
+        title: '已取消任务',
+        duration: 30000,
+        actions: expect.any(Array),
+      }),
+    )
   })
 
   it('cancelSelected 用户取消时不执行', async () => {
@@ -281,6 +351,50 @@ describe('batchActions store', () => {
 
     expect(mockCancelTask).not.toHaveBeenCalled()
     expect(selectionModule.$selectedIds.get().size).toBe(1)
+  })
+
+  it('cancelSelected 成功后点击撤销调用 undoCancelTask', async () => {
+    downloadsModule.setTasks([makeTask('t1')])
+    selectionModule.selectAll(['t1'])
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockCancelTask.mockResolvedValue(undefined)
+    mockUndoCancelTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.cancelSelected()
+
+    expect(mockAddToastWithActions).toHaveBeenCalledTimes(1)
+    const toast = mockAddToastWithActions.mock.calls[0]![0] as {
+      actions?: { label: string; onClick: () => void }[]
+    }
+    expect(toast.actions).toHaveLength(1)
+    expect(toast.actions![0]!.label).toBe('撤销')
+    await toast.actions![0]!.onClick()
+    expect(mockUndoCancelTask).toHaveBeenCalledWith('t1')
+    expect(mockGetTaskList).toHaveBeenCalled()
+  })
+
+  it('cancelSelected 批量成功后点击撤销全部调用多个 undoCancelTask', async () => {
+    const ids = ['t1', 't2', 't3']
+    downloadsModule.setTasks(ids.map(id => makeTask(id)))
+    selectionModule.selectAll(ids)
+    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
+    mockCancelTask.mockResolvedValue(undefined)
+    mockUndoCancelTask.mockResolvedValue(undefined)
+    mockGetTaskList.mockResolvedValue([])
+
+    await batchActionsModule.cancelSelected()
+
+    expect(mockAddToastWithActions).toHaveBeenCalledTimes(1)
+    const toast = mockAddToastWithActions.mock.calls[0]![0] as {
+      actions?: { label: string; onClick: () => void }[]
+    }
+    expect(toast.actions![0]!.label).toBe('撤销全部')
+    await toast.actions![0]!.onClick()
+    ids.forEach(id => {
+      expect(mockUndoCancelTask).toHaveBeenCalledWith(id)
+    })
+    expect(mockGetTaskList).toHaveBeenCalled()
   })
 
   it('cancelAll 取消所有活跃与暂停任务', async () => {
@@ -316,8 +430,8 @@ describe('batchActions store', () => {
 
   it('openSelectedFolders 打开选中任务目录并提示结果', async () => {
     downloadsModule.setTasks([
-      makeTask('t1', { savePath: '/downloads/a' }),
-      makeTask('t2', { savePath: '/downloads/b' }),
+      makeTask('t1', { savePath: '/downloads/a/' }),
+      makeTask('t2', { savePath: '/downloads/b/' }),
       makeTask('t3', { savePath: '' }),
     ])
     selectionModule.selectAll(['t1', 't2', 't3'])

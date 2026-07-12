@@ -10,16 +10,13 @@
  * - clear():回到无排序(原序)。
  */
 
-import { createSignal, type Accessor } from 'solid-js'
+import type { Accessor } from 'solid-js'
 import type { TaskInfo, DownloadStatus } from '../types'
-import type { SortKey, SortDir } from '../components/taskColumns'
+import type { SortKey } from '../components/taskColumns'
+import { sortState, setSortState } from './taskFilter'
+import type { SortState } from './taskFilter'
 
-export interface SortState {
-  key: SortKey | null
-  dir: SortDir
-}
-
-const [sortState, setSortState] = createSignal<SortState>({ key: null, dir: 'desc' })
+export type { SortState }
 
 export const $taskSort = {
   get state(): Accessor<SortState> {

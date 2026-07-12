@@ -91,5 +91,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     exclude: ["e2e/**", "node_modules/**"],
+    // 部分组件测试（如 DetailPanel）在并行满载运行时容易超时，
+    // 提升到 10s 保证在普通开发机上稳定通过。
+    testTimeout: 10000,
   },
 });

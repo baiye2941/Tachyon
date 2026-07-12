@@ -1,6 +1,7 @@
 import { errorMessage } from "./utils/appError";
 import { createSignal, createEffect, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
-import type { ListDensity, SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
+import type { SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
+import { getParentDirectory } from "./utils/path";
 import { api } from "./api/invoke";
 import {
   $activeCount,
@@ -21,7 +22,8 @@ import {
   setLastSelectedAnchorId,
   hasSelection,
   intersectSelection,
-} from "./stores/selection";import {
+} from "./stores/selection";
+import {
   $ui,
   openView,
   openNewTaskModal,
@@ -33,6 +35,7 @@ import {
   removeSearchFilter,
 } from "./stores/taskFilter";
 import { $taskListView, toggleGroupBy } from "./stores/taskListView";
+import { $listDensity, toggleListDensity } from "./stores/listDensity";
 import { deleteHistoryRecord, getRecordById } from "./stores/history";
 import {
   pauseSelected,
@@ -49,6 +52,7 @@ import {
 } from "./stores/batchActions";
 import { useAppInit } from "./hooks/useAppInit";
 import { useGlobalKeyboard } from "./hooks/useGlobalKeyboard";
+import { useIsWideScreen } from "./hooks/useMediaQuery";
 import { useContextMenu } from "./hooks/useContextMenu";
 import { useDragDrop } from "./hooks/useDragDrop";
 import TitleBar from "./components/TitleBar";
@@ -58,6 +62,7 @@ import TaskList from "./components/TaskList";
 import DetailPanel from "./components/DetailPanel";
 import StatusBar from "./components/StatusBar";
 import ToastContainer from "./components/ToastContainer";
+import Announcer from "./components/Announcer";
 import ContextMenu from "./components/ContextMenu";
 import ConfirmDialog from "./components/ConfirmDialog";
 import ErrorPage from "./components/ErrorPage";
@@ -75,8 +80,6 @@ const HfBrowserPanel = lazy(() => import("./components/HfBrowserPanel"));
 const ShortcutHelp = lazy(() => import("./components/ShortcutHelp"));
 
 function AppContent() {
-  const [listDensity, setListDensity] =
-    createSignal<ListDensity>("comfortable");
   const [isMultiSelectMode, setIsMultiSelectMode] = createSignal(false);
   const [snifferResources, setSnifferResources] = createSignal<
     SnifferResource[]
@@ -91,6 +94,7 @@ function AppContent() {
     ),
   );
   useGlobalKeyboard();
+  const isWideScreen = useIsWideScreen();
   const {
     contextMenu,
     open: openContextMenu,
@@ -403,12 +407,8 @@ function AppContent() {
               deselectAll();
               $selectedId.set(null);
             }}
-            listDensity={listDensity()}
-            onToggleDensity={() =>
-              setListDensity((d) =>
-                d === "comfortable" ? "compact" : "comfortable",
-              )
-            }
+            listDensity={$listDensity.density()}
+            onToggleDensity={toggleListDensity}
             onNewTask={openNewTaskModal}
             onOpenSettings={$ui.openSettings}
             onPauseAll={pauseAll}
@@ -427,7 +427,7 @@ function AppContent() {
               onTaskContextMenu={openContextMenu}
               isMultiSelectMode={isMultiSelectMode()}
               selectedTaskIds={$selectedIds.get()}
-              density={listDensity()}
+              density={$listDensity.density()}
               searchQuery={$taskFilter.searchQuery()}
               onNewTask={openNewTaskModal}
               keyboardHandlers={{
@@ -441,6 +441,7 @@ function AppContent() {
             <DetailPanel
               task={$selectedTask.get()}
               onClose={handleDetailClose}
+              variant={isWideScreen() ? "side" : "overlay"}
             />
           </div>
         </div>
@@ -455,6 +456,7 @@ function AppContent() {
       />
 
       <ToastContainer />
+      <Announcer />
 
       {/* 全局应用内确认对话框(Iteration 11):
           所有破坏性操作(单/批量删除)走 requestConfirm,统一品牌视觉,
@@ -518,7 +520,7 @@ function AppContent() {
         onOpenFolder={(taskId) => {
           const task = $tasks.get().find((t) => t.id === taskId);
           if (task?.savePath) {
-            api.openFolder(task.savePath).catch(() => {
+            api.openFolder(getParentDirectory(task.savePath)).catch(() => {
               addToast(tr("toast.openFolderFailed"), "error");
             });
           } else {
@@ -558,11 +560,10 @@ function AppContent() {
             visible={$ui.historyVisible()}
             tasks={$tasks.get()}
             onClose={$ui.closeHistory}
-            onOpenFolder={(savePath) => {
-              // 问题2修复:直接用历史记录的 savePath 打开,
-              // 不再按 id 查 $tasks(历史记录 id 与任务 id 不同,且任务可能已删除)
-              if (savePath) {
-                api.openFolder(savePath).catch(() => {
+            onOpenFolder={(folderPath) => {
+              // HistoryPanel 内部已将 savePath 转为父目录,folderPath 即为要打开的文件夹路径
+              if (folderPath) {
+                api.openFolder(folderPath).catch(() => {
                   addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {
@@ -609,7 +610,7 @@ function AppContent() {
             onOpenTaskFolder={(taskId) => {
               const task = $tasks.get().find((t) => t.id === taskId);
               if (task?.savePath) {
-                api.openFolder(task.savePath).catch(() => {
+                api.openFolder(getParentDirectory(task.savePath)).catch(() => {
                   addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {
