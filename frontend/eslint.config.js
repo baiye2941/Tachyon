@@ -4,7 +4,7 @@ import solidPlugin from 'eslint-plugin-solid'
 
 export default [
   {
-    files: ['src/**/*.{ts,tsx}'],
+    files: ['src/**/*.{ts,tsx}', 'e2e/**/*.ts', '*.config.ts'],
     languageOptions: {
       parser: tsparser,
       parserOptions: {
