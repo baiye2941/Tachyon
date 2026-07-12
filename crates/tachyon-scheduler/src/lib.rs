@@ -6,10 +6,12 @@
 //! - 连接分配策略
 //! - 任务生命周期管理
 
+pub mod concurrency_controller;
 pub mod download_scheduler;
 pub mod predictor;
 pub mod scheduler;
 
+pub use concurrency_controller::ConcurrencyController;
 pub use download_scheduler::AdaptiveDownloadScheduler;
 pub use predictor::HoltLinearPredictor;
 pub use scheduler::{Priority, ScheduledTask, Scheduler};

@@ -62,6 +62,13 @@ pub struct MagnetProtocol {
     /// probe/download 方法内 `self.handle_cache.clone()` 是 Arc 浅拷贝,
     /// 共享底层 map —— 修复了值字段 DashMap 深拷贝导致 insert 不生效的 bug。
     handle_cache: HandleCache,
+    /// 自定义 StorageFactory(P2-4:消除双存储写放大)
+    ///
+    /// None 时用 librqbit 默认 FilesystemStorage(向后兼容)。
+    /// Some 时 librqbit 直接写到 Tachyon 的 AsyncStorage(目标文件),
+    /// 消除 FileStream 读取路径的中间磁盘读写。
+    /// 由 tachyon-engine 创建 TachyonStorageFactory 并注入。
+    storage_factory: Option<librqbit::storage::BoxStorageFactory>,
 }
 
 impl MagnetProtocol {
@@ -80,7 +87,23 @@ impl MagnetProtocol {
             config,
             download_dir,
             handle_cache,
+            storage_factory: None,
         }
+    }
+
+    /// 注入自定义 StorageFactory(P2-4:消除双存储写放大)
+    ///
+    /// 由 tachyon-engine 创建 TachyonStorageFactory 并注入。
+    /// 注入后 add_magnet_to_session 会把 factory 传给 AddTorrentOptions,
+    /// librqbit 直接写到 Tachyon 的 AsyncStorage(目标文件)。
+    pub fn with_storage_factory(mut self, factory: librqbit::storage::BoxStorageFactory) -> Self {
+        self.storage_factory = Some(factory);
+        self
+    }
+
+    /// 设置自定义 StorageFactory(可变引用版本,供引擎在 run 阶段注入)
+    pub fn set_storage_factory(&mut self, factory: Option<librqbit::storage::BoxStorageFactory>) {
+        self.storage_factory = factory;
     }
 
     /// 缓存 handle + layout,带容量上限防无限增长(修复 MEDIUM-2)
@@ -527,6 +550,7 @@ async fn add_magnet_to_session(
     force_tracker_interval: Option<Duration>,
     initial_peers: Vec<SocketAddr>,
     timeout: Duration,
+    storage_factory: Option<librqbit::storage::BoxStorageFactory>,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
     let opts = AddTorrentOptions {
         overwrite: true,
@@ -537,6 +561,7 @@ async fn add_magnet_to_session(
         } else {
             Some(initial_peers)
         },
+        storage_factory,
         ..Default::default()
     };
     // tokio::time::timeout 包裹 add_torrent:librqbit 对 magnet URL 即使
@@ -714,7 +739,7 @@ impl Protocol for MagnetProtocol {
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
-
+        let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
         Box::pin(async move {
             // 缓存命中短路:若 handle_cache 已有该 url 的 handle + layout(此前 probe /
             // from_handle / download_range_stream 已填充),直接从缓存 handle 派生
@@ -748,6 +773,7 @@ impl Protocol for MagnetProtocol {
                     etag: None,
                     last_modified: None,
                     file_layout: Some(layout),
+                    protocol_managed_storage: storage_factory.is_some(),
                 });
             }
 
@@ -777,6 +803,7 @@ impl Protocol for MagnetProtocol {
                 force_tracker_interval,
                 initial_peers,
                 metadata_timeout,
+                storage_factory.as_ref().map(|f| f.clone_box()),
             )
             .await?;
 
@@ -824,6 +851,7 @@ impl Protocol for MagnetProtocol {
                 last_modified: None,
                 // 多文件布局供 init_storage 构造 StorageSet::Multi;单文件退化为单元素
                 file_layout: Some(layout),
+                protocol_managed_storage: storage_factory.is_some(),
             })
         })
     }
@@ -864,6 +892,7 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let url = url.to_string();
+        let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
         // peer 智能等待:0 禁用(回退纯 stall_timeout),否则按配置秒数。
         // 死 swarm 下无 peer 时持续轮询 peer 健康,超此限则失败。
         let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
@@ -892,6 +921,7 @@ impl Protocol for MagnetProtocol {
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
                     metadata_timeout,
+                    storage_factory.as_ref().map(|f| f.clone_box()),
                 )
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
@@ -974,6 +1004,7 @@ impl Protocol for MagnetProtocol {
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
+        let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
         // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
@@ -996,6 +1027,7 @@ impl Protocol for MagnetProtocol {
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
                     metadata_timeout,
+                    storage_factory.as_ref().map(|f| f.clone_box()),
                 )
                 .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
@@ -1040,6 +1072,7 @@ impl Protocol for MagnetProtocol {
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
+        let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
         let peer_wait_secs = self.config.peer_wait_timeout_secs;
@@ -1056,6 +1089,7 @@ impl Protocol for MagnetProtocol {
                     None, // 回退路径不强制 tracker interval
                     Vec::new(),
                     metadata_timeout,
+                    storage_factory.as_ref().map(|f| f.clone_box()),
                 )
                 .await?;
                 let layout = h

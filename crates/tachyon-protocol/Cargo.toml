@@ -36,10 +36,15 @@ tracing.workspace = true
 futures.workspace = true
 dashmap.workspace = true
 librqbit = { workspace = true, optional = true }
+aes = "0.8"
+cbc = "0.1"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
+# magnet.rs 测试用 #[tokio::test(start_paused = true)] 需 test-util feature
+tokio = { workspace = true, features = ["test-util"] }
 # 开启自身 test-harness feature(联动开启 tachyon-core/test-harness,放行 SSRF
 # loopback),使 wiremock 端到端 HTTP 测试可运行。仅 dev-dependencies,不影响生产。
 tachyon-protocol = { path = ".", features = ["test-harness"] }

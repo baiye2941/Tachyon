@@ -360,9 +360,46 @@ impl HttpClient {
         }
         Ok(body)
     }
-}
 
-// Default 实现已移除 — TLS 初始化可能失败,请使用 HttpClient::new()
+    /// 获取 URL 的原始字节内容(用于 HLS 分片下载等二进制场景)
+    ///
+    /// 与 `get_text` 不同,此方法返回原始 `Bytes`,不进行 UTF-8 解码,
+    /// 适用于 TS 分片等二进制内容。同样受 `MAX_GET_TEXT_SIZE` 大小限制保护。
+    pub async fn get_bytes(&self, url: &str) -> DownloadResult<Bytes> {
+        let parsed_url = reqwest::Url::parse(url)?;
+        tachyon_core::validate_public_http_url(&parsed_url)?;
+
+        let mut response = self.client.get(url).send().await.map_err(|e| {
+            let chain = error_chain(&e);
+            DownloadError::Network(format!("GET 请求失败: {chain}"))
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_http_error(status, response.headers()));
+        }
+
+        check_response_size_limit(response.content_length())?;
+
+        // 流式读取,防止超大响应 OOM
+        let mut buf = Vec::new();
+        let mut total = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| DownloadError::Network(format!("读取响应块失败: {e}")))?
+        {
+            total += chunk.len() as u64;
+            if total > MAX_GET_TEXT_SIZE {
+                return Err(DownloadError::Protocol(format!(
+                    "响应体过大: {total} > 最大允许 {MAX_GET_TEXT_SIZE} 字节"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(buf))
+    }
+}
 
 const DNS_CACHE_TTL_SECS: u64 = 60;
 /// DNS 缓存最大条目数,防止 DashMap 无限增长导致内存泄漏
@@ -838,6 +875,7 @@ fn metadata_from_headers(
         etag,
         last_modified,
         file_layout: None,
+        protocol_managed_storage: false,
     }
 }
 

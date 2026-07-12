@@ -1,8 +1,5 @@
 use std::sync::Arc;
-use tachyon_core::config::{
-    AppConfig, ClipboardPatch, ConfigPatch, ConnectionPatch, DownloadPatch, HubPatch, MagnetPatch,
-    NotificationsPatch, SchedulerPatch,
-};
+use tachyon_core::config::{AppConfig, ConfigPatch};
 
 use super::{AppError, AppState};
 
@@ -659,6 +656,7 @@ mod tests {
                 authorized_dirs: vec![download_dir.to_string()],
                 io_strategy: IoStrategy::default(),
                 proxy: None,
+                enable_work_stealing: false,
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host,
@@ -698,6 +696,7 @@ mod tests {
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
                 proxy: None,
+                enable_work_stealing: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host,
@@ -747,6 +746,7 @@ mod tests {
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
                 proxy: None,
+                enable_work_stealing: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),
@@ -787,6 +787,7 @@ mod tests {
                 rate_limit_bytes_per_sec: None,
                 io_strategy: None,
                 proxy: None,
+                enable_work_stealing: None,
             }),
             connection: None,
             magnet: None,
@@ -942,6 +943,7 @@ mod tests {
                 authorized_dirs: vec!["/tmp".to_string()],
                 io_strategy: IoStrategy::default(),
                 proxy: None,
+                enable_work_stealing: false,
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host: 4,
@@ -1120,6 +1122,7 @@ mod tests {
                 rate_limit_bytes_per_sec: Some(Some(1_048_576)),
                 io_strategy: Some(IoStrategy::WinAligned),
                 proxy: None,
+                enable_work_stealing: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),

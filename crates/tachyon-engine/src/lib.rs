@@ -16,6 +16,8 @@ mod storage_adapter;
 
 #[cfg(feature = "magnet")]
 pub mod bt_session;
+#[cfg(feature = "magnet")]
+pub mod bt_storage;
 
 pub use connection::{ConnectionPool, PoolConfig};
 pub use downloader::{DownloadTask, StorageKind, VerifierKind, default_blake3_verifier};

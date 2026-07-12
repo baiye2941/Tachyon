@@ -55,6 +55,7 @@ fn app_config() {
         authorized_dirs: vec!["/tmp/test".to_string()],
         io_strategy: config::IoStrategy::default(),
         proxy: None,
+        enable_work_stealing: false,
     };
     assert_eq!(cfg.download_dir, "/tmp/test");
     assert_eq!(cfg.max_concurrent_fragments, 8);

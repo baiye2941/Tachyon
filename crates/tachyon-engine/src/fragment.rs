@@ -3,11 +3,18 @@
 //! 管理单个分片的生命周期:Pending -> Downloading -> Verifying -> Writing -> Done
 //! 支持失败重试(指数退避)和 EWMA 带宽追踪。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tachyon_core::config::SchedulerConfig;
 use tachyon_core::types::FragmentInfo;
 use tachyon_core::{DownloadError, DownloadResult};
+
+/// work-stealing 拆分的最小剩余大小(字节)
+///
+/// 剩余部分不足此值的 2 倍时不拆分,避免拆分开销超过收益。
+pub const MIN_SPLIT_SIZE: u64 = 64 * 1024;
 
 /// 分片状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -43,11 +50,31 @@ pub struct FragmentRecord {
     /// 下载时应从 `info.start + resume_offset` 处继续写入,
     /// 避免崩溃后完整重下整个分片。
     pub resume_offset: u64,
+    /// 下载开始时间(work-stealing 用):start_download 时设置,
+    /// 用于检测慢分片(运行时间远超平均完成时间)。
+    pub start_time: Option<std::time::Instant>,
+    /// 实时已下载字节数(work-stealing 用):download_single_fragment 逐 chunk 更新,
+    /// 用于检测慢分片(进度远低于平均进度)。
+    ///
+    /// `Arc<AtomicU64>` 使 worker 与主循环共享同一原子:worker `fetch_add`,
+    /// `find_slowest_fragment` / `calculate_split_point` `load`。
+    ///
+    /// 与 `info.downloaded` 不同:后者仅在完成时设置(供 record_completed_fragment),
+    /// 本字段在下载过程中实时更新(供 work-stealing 监控)。
+    pub realtime_downloaded: Arc<AtomicU64>,
+    /// 当前有效 end 偏移(work-stealing 用):初始化为 `info.end`,
+    /// `try_split` 将其缩小为 `split_point - 1`,worker 据此提前停止下载,
+    /// 避免与 steal worker 并发写同一磁盘区域(数据竞争修复)。
+    ///
+    /// `Arc<AtomicU64>` 使 worker 与主循环共享:主循环 `try_split` 时 `store`,
+    /// worker 每次 flush_batch 前 `load` 检查是否已缩小。
+    pub effective_end: Arc<AtomicU64>,
 }
 
 impl FragmentRecord {
     /// 创建新的分片记录
     pub fn new(info: FragmentInfo, max_retries: u32) -> Self {
+        let effective_end = Arc::new(AtomicU64::new(info.end));
         Self {
             info,
             state: FragmentState::Pending,
@@ -56,6 +83,9 @@ impl FragmentRecord {
             last_duration: None,
             computed_hash: None,
             resume_offset: 0,
+            start_time: None,
+            realtime_downloaded: Arc::new(AtomicU64::new(0)),
+            effective_end,
         }
     }
 
@@ -68,6 +98,7 @@ impl FragmentRecord {
             )));
         }
         self.state = FragmentState::Downloading;
+        self.start_time = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -154,9 +185,86 @@ impl FragmentRecord {
     /// 强制标记为最终失败状态(不可重试)
     ///
     /// 用于上层(如 spawn 内部重试循环)已确认重试耗尽、需要将分片置为终态时。
-    /// 与 `mark_failed` 不同,本方法不参与"是否可重试"判定,直接转入 `Failed`。
+    /// 与 `mark_failed` 不同,本方法不参与“是否可重试”判定,直接转入 `Failed`。
     pub fn force_fail(&mut self) {
         self.state = FragmentState::Failed;
+    }
+
+    /// 运行时拆分(work-stealing):将 Downloading 状态的分片在 split_point 处一分为二
+    ///
+    /// 原分片保留 [start, split_point-1],新分片 [split_point, end]。
+    /// 原分片已下载部分(`downloaded`)若超过 split_point,则裁剪到 split_point,
+    /// 超出部分转移到新分片的 resume_offset。
+    ///
+    /// # 参数
+    /// - `split_point`: 拆分点(新分片的 start,必须 > self.info.start 且 <= self.info.end)
+    /// - `new_index`: 新分片的索引(由调用方分配)
+    ///
+    /// # 返回
+    /// - `Ok(Some(new_record))`: 拆分成功,返回新分片(Downloading 状态)
+    /// - `Ok(None)`: 无法拆分(剩余太小、状态非法等)
+    /// - `Err`: split_point 越界
+    ///
+    /// # 状态机
+    /// - 仅 Downloading 状态可拆分(Pending/Done/Failed 拒绝)
+    /// - 拆分后原分片仍为 Downloading,新分片也为 Downloading(已被某个 worker 接手)
+    pub fn try_split(
+        &mut self,
+        split_point: u64,
+        new_index: u32,
+    ) -> DownloadResult<Option<FragmentRecord>> {
+        // 仅 Downloading 状态可拆分
+        if self.state != FragmentState::Downloading {
+            return Ok(None);
+        }
+
+        let start = self.info.start;
+        let end = self.info.end;
+
+        // split_point 必须在 (start, end] 范围内
+        if split_point <= start || split_point > end {
+            return Err(DownloadError::Fragment(format!(
+                "split_point {split_point} 越界: 必须在 ({start}, {end}] 范围内"
+            )));
+        }
+
+        // 剩余部分太小不值得拆分
+        let remaining_after_split = end - split_point + 1;
+        if remaining_after_split < MIN_SPLIT_SIZE {
+            return Ok(None);
+        }
+
+        // 用 realtime_downloaded(实时)而非 info.downloaded(仅在完成时设置)
+        // 检查 worker 是否已下载超过 split_point
+        let realtime_dl = self.realtime_downloaded.load(Ordering::Acquire);
+        let new_resume_offset = realtime_dl.saturating_sub(split_point - start);
+
+        // 原分片 end 更新为 split_point - 1
+        self.info.end = split_point - 1;
+        self.info.size = split_point - start;
+
+        // 缩小 effective_end:原 worker 下次 flush_batch 前检查到此值,
+        // 提前停止下载,避免与 steal worker 并发写 [split_point, end] 区域
+        self.effective_end.store(split_point - 1, Ordering::Release);
+
+        // 构造新分片:[split_point, end]
+        let new_size = end - split_point + 1;
+        let new_info = FragmentInfo::new(new_index, split_point, end, new_size)?;
+
+        let new_record = FragmentRecord {
+            info: new_info,
+            state: FragmentState::Downloading,
+            retry_count: 0,
+            max_retries: self.max_retries,
+            last_duration: None,
+            computed_hash: None,
+            resume_offset: new_resume_offset,
+            start_time: Some(std::time::Instant::now()),
+            realtime_downloaded: Arc::new(AtomicU64::new(new_resume_offset)),
+            effective_end: Arc::new(AtomicU64::new(end)),
+        };
+
+        Ok(Some(new_record))
     }
 
     /// 是否已完成
@@ -836,6 +944,148 @@ mod tests {
                 "应使用 SchedulerConfig::default_target_fragments 而非 PoolConfig::max_global"
             );
         }
+    }
+
+    // ── try_split (work-stealing) 测试 ──────────────────────────────
+
+    #[test]
+    fn test_try_split_basic() {
+        // 1MB 分片,从 512KB 处拆分
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+
+        let split_point = 512 * 1024;
+        let new_record = record
+            .try_split(split_point, 100)
+            .unwrap()
+            .expect("应拆分成功");
+
+        // 原分片:[0, 511KB]
+        assert_eq!(record.info.start, 0);
+        assert_eq!(record.info.end, split_point - 1);
+        assert_eq!(record.info.size, split_point);
+        assert_eq!(record.state, FragmentState::Downloading);
+
+        // 新分片:[512KB, 1MB-1]
+        assert_eq!(new_record.info.index, 100);
+        assert_eq!(new_record.info.start, split_point);
+        assert_eq!(new_record.info.end, 1024 * 1024 - 1);
+        assert_eq!(new_record.info.size, 512 * 1024);
+        assert_eq!(new_record.state, FragmentState::Downloading);
+        assert_eq!(new_record.resume_offset, 0);
+    }
+
+    #[test]
+    fn test_try_split_transfers_overflow_downloaded() {
+        // 已下载 600KB,在 512KB 处拆分 -> 88KB 转移到新分片
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+        let downloaded = 600 * 1024;
+        let split_point = 512 * 1024;
+        // 用 realtime_downloaded 模拟 worker 已写入 600KB
+        record
+            .realtime_downloaded
+            .store(downloaded, Ordering::Release);
+
+        let new_record = record
+            .try_split(split_point, 1)
+            .unwrap()
+            .expect("应拆分成功");
+
+        // 新分片 resume_offset = downloaded - split_point(已下载部分)
+        assert_eq!(new_record.resume_offset, downloaded - split_point);
+    }
+
+    #[test]
+    fn test_try_split_no_overflow_when_downloaded_below_split_point() {
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+        record
+            .realtime_downloaded
+            .store(100 * 1024, Ordering::Release);
+
+        let split_point = 512 * 1024;
+        let new_record = record
+            .try_split(split_point, 1)
+            .unwrap()
+            .expect("应拆分成功");
+        assert_eq!(new_record.resume_offset, 0);
+    }
+
+    #[test]
+    fn test_try_split_rejects_non_downloading_state() {
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        // Pending 状态不应拆分
+        let result = record.try_split(512 * 1024, 1).unwrap();
+        assert!(result.is_none(), "Pending 状态不应拆分");
+
+        // Done 状态也不应拆分
+        record.start_download().unwrap();
+        record
+            .complete_download_fast(1024 * 1024, Duration::from_millis(10))
+            .unwrap();
+        let result = record.try_split(512 * 1024, 1).unwrap();
+        assert!(result.is_none(), "Done 状态不应拆分");
+    }
+
+    #[test]
+    fn test_try_split_rejects_out_of_range_split_point() {
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+
+        // split_point == start (0) -> 越界
+        assert!(record.try_split(0, 1).is_err());
+        // split_point > end -> 越界
+        assert!(record.try_split(1024 * 1024 + 1, 1).is_err());
+    }
+
+    #[test]
+    fn test_try_split_updates_effective_end() {
+        // 验证 try_split 缩小 effective_end,使原 worker 提前停止
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+
+        let split_point = 512 * 1024;
+        let _ = record
+            .try_split(split_point, 1)
+            .unwrap()
+            .expect("应拆分成功");
+
+        // effective_end 应缩小为 split_point - 1
+        assert_eq!(
+            record.effective_end.load(Ordering::Acquire),
+            split_point - 1,
+            "effective_end 应更新为 split_point - 1"
+        );
+    }
+
+    #[test]
+    fn test_effective_end_initialized_to_info_end() {
+        let info = make_frag(0, 1024 * 1024);
+        let record = FragmentRecord::new(info, 3);
+        assert_eq!(
+            record.effective_end.load(Ordering::Acquire),
+            1024 * 1024 - 1,
+            "effective_end 初始化为 info.end"
+        );
+    }
+
+    #[test]
+    fn test_try_split_rejects_too_small_remaining() {
+        // 剩余 < 64KB 不应拆分
+        let info = make_frag(0, 128 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+
+        // 在 100KB 处拆分,剩余 28KB < 64KB
+        let result = record.try_split(100 * 1024, 1).unwrap();
+        assert!(result.is_none(), "剩余太小不应拆分");
     }
 }
 

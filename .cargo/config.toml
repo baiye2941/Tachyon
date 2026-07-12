@@ -1,0 +1,15 @@
+# Tachyon 全局构建配置
+#
+# HTTP/3(QUIC)支持:reqwest 的 `http3` feature 标记为 unstable,需要
+# `--cfg reqwest_unstable` 在编译期注入。reqwest 内部仅在 `feature = "http3"`
+# 代码块内检查此 cfg(见 reqwest src/lib.rs:252),因此全局设置此 cfg 对
+# 不启用 http3 feature 的构建完全无害——cfg 仅在 http3 feature 启用时生效。
+#
+# 启用 HTTP/3:
+#     cargo build --features tachyon-protocol/http3
+# 此时 reqwest 通过 Alt-Svc 协商自动升级到 HTTP/3,失败回退 HTTP/2。
+# `ConnectionConfig.enable_quic`(默认 true)为运行时意图开关,仅在编译期
+# http3 feature 可用时生效。
+
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]

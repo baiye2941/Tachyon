@@ -164,7 +164,7 @@ impl PauseInfo {
 }
 
 /// 文件元数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileMetadata {
     /// 文件名
     pub file_name: String,
@@ -185,6 +185,13 @@ pub struct FileMetadata {
     /// init_storage 据此构造 StorageSet::Multi,download_range_stream 据此拆分跨文件 range。
     #[serde(default)]
     pub file_layout: Option<FileLayout>,
+    /// 协议是否直接管理存储(P2-4: BT 自定义 Storage)
+    ///
+    /// true 时表示协议层(BT custom Storage)直接写入目标文件,
+    /// 引擎跳过 write_all_at(消除双存储写放大),仅消费流追踪进度+完成信号。
+    /// false 时引擎正常写入(HTTP/FTP/未启自定义 Storage 的 BT)。
+    #[serde(default)]
+    pub protocol_managed_storage: bool,
 }
 
 /// 多文件布局:全局偏移 ↔ (file_id, 文件内偏移) 的双向折算
@@ -441,6 +448,7 @@ mod tests {
             etag: Some("\"abc\"".into()),
             last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
             file_layout: None,
+            protocol_managed_storage: false,
         };
         assert_eq!(meta.file_size, Some(1024));
         assert!(meta.supports_range);
@@ -456,6 +464,7 @@ mod tests {
             etag: None,
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         };
         assert!(meta.file_size.is_none());
         assert!(!meta.supports_range);
@@ -493,6 +502,7 @@ mod tests {
             etag: None,
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();
@@ -999,6 +1009,7 @@ mod proptests {
                 etag: None,
                 last_modified: None,
                 file_layout: None,
+                protocol_managed_storage: false,
             };
             let json = serde_json::to_string(&meta).unwrap();
             let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();

@@ -218,9 +218,17 @@ pub struct DownloadConfig {
     pub io_strategy: IoStrategy,
     /// 显式代理 URL,如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`。
     /// None 时 reqwest 读取系统环境变量(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`),
-    /// 与 BT 侧 `detect_socks_proxy` 的"自动嗅探系统代理"语义对齐。
+    /// 与 BT 侧 `detect_socks_proxy` 的“自动嗅探系统代理”语义对齐。
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 是否启用动态分片/work-stealing(P1-1)。
+    ///
+    /// 启用后,execute 循环会监控慢分片(进度 < 平均 50%),
+    /// 将其剩余部分一分为二,空闲 worker 接手后半段(IDM 式加速)。
+    /// 论文依据:MDTP(arXiv 2505.09597)减少 10-22% 传输时间。
+    /// 默认 false(安全,需真实网络 bench 验证收益后启用)。
+    #[serde(default)]
+    pub enable_work_stealing: bool,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +256,8 @@ struct DownloadConfigSerde {
     io_strategy: IoStrategy,
     #[serde(default)]
     proxy: Option<String>,
+    #[serde(default)]
+    enable_work_stealing: bool,
 }
 
 fn default_pause_timeout_secs() -> u64 {
@@ -285,6 +295,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             authorized_dirs,
             io_strategy: value.io_strategy,
             proxy: value.proxy,
+            enable_work_stealing: value.enable_work_stealing,
         }
     }
 }
@@ -316,6 +327,7 @@ impl Default for DownloadConfig {
             authorized_dirs: vec![download_dir],
             io_strategy: IoStrategy::default(),
             proxy: None,
+            enable_work_stealing: false,
         }
     }
 }
@@ -1154,6 +1166,8 @@ pub struct DownloadPatch {
     pub io_strategy: Option<IoStrategy>,
     /// 显式代理 URL,None 表示不修改(保留原值,可能继续用系统环境变量)
     pub proxy: Option<Option<String>>,
+    /// 是否启用动态分片/work-stealing(P1-1)
+    pub enable_work_stealing: Option<bool>,
 }
 
 /// 连接配置白名单补丁
@@ -1351,6 +1365,9 @@ impl DownloadPatch {
         }
         if let Some(v) = &self.proxy {
             base.proxy = v.clone();
+        }
+        if let Some(v) = self.enable_work_stealing {
+            base.enable_work_stealing = v;
         }
     }
 }
@@ -3376,6 +3393,7 @@ mod tests {
             rate_limit_bytes_per_sec: None,
             io_strategy: None,
             proxy: Some(Some("http://127.0.0.1:7890".into())),
+            enable_work_stealing: None,
         };
         patch.apply_to(&mut cfg);
 
@@ -3405,6 +3423,7 @@ mod tests {
             rate_limit_bytes_per_sec: None,
             io_strategy: None,
             proxy: None,
+            enable_work_stealing: None,
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.download_dir, original.download_dir);
@@ -3559,6 +3578,7 @@ mod tests {
             rate_limit_bytes_per_sec: Some(Some(1_000_000)),
             io_strategy: Some(IoStrategy::Standard),
             proxy: Some(Some("http://127.0.0.1:7890".into())),
+            enable_work_stealing: None,
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.download_dir, "/patched");
@@ -4153,6 +4173,7 @@ mod proptests {
                     rate_limit_bytes_per_sec: None,
                     io_strategy: None,
                     proxy: None,
+            enable_work_stealing: None,
                 }),
                 connection: None,
                 magnet: None,

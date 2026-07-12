@@ -609,6 +609,7 @@ pub mod harness {
             etag: Some("\"abc123\"".into()),
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         }
     }
 
@@ -662,6 +663,7 @@ pub mod harness {
             // IoUring 后端有独立的单元测试覆盖(crates/tachyon-io/src/iouring.rs)。
             io_strategy: IoStrategy::Standard,
             proxy: None,
+            enable_work_stealing: false,
         }
     }
 

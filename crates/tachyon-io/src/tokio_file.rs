@@ -28,6 +28,11 @@ pub struct TokioFile {
 impl TokioFile {
     #[cfg(target_os = "windows")]
     pub async fn open<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
+        Self::open_sync(path).map_err(DownloadError::Io)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         use std::os::windows::fs::OpenOptionsExt;
         use win_share::*;
@@ -37,26 +42,28 @@ impl TokioFile {
             .create(true)
             .truncate(false)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(&path)
-            .map_err(DownloadError::Io)?;
+            .open(&path)?;
         Ok(Self {
             path,
             file: Arc::new(file),
-            #[cfg(target_os = "windows")]
             write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
     #[cfg(not(target_os = "windows"))]
     pub async fn open<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
+        Self::open_sync(path).map_err(DownloadError::Io)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
-            .map_err(DownloadError::Io)?;
+            .open(&path)?;
         Ok(Self {
             path,
             file: Arc::new(file),

@@ -517,6 +517,7 @@ mod tests {
             etag: None,
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         };
         let mock = MockTaskRunner {
             state: Arc::clone(&state),

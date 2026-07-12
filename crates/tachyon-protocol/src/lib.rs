@@ -5,6 +5,7 @@
 //! - BitTorrent 磁力链接(基于 librqbit)
 //! - 统一 Protocol trait
 
+pub mod hls;
 pub mod http;
 #[cfg(feature = "magnet")]
 pub mod magnet;
@@ -49,6 +50,7 @@ async fn download_range_stream() {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 })
             })
         }

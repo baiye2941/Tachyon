@@ -816,6 +816,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 }),
                 download_data: Ok(Bytes::from_static(b"mock")),
                 expected_url: None,
@@ -962,6 +963,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 })),
         );
 
@@ -976,6 +978,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 })),
         );
 
@@ -1003,6 +1006,7 @@ mod tests {
             etag: None,
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         })));
 
         let mirror = Arc::new(MockProtocol::new().with_probe_meta(Ok(FileMetadata {
@@ -1013,6 +1017,7 @@ mod tests {
             etag: None,
             last_modified: None,
             file_layout: None,
+            protocol_managed_storage: false,
         })));
 
         let mirror_protocol =
@@ -1131,6 +1136,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 }))
                 .with_download_data(Ok(Bytes::from_static(b"from mirror")))
                 .with_expected_url("http://mirror.com/file"),
@@ -1173,6 +1179,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 }))
                 .with_download_data(Err("primary download blocked".into())),
         );
@@ -1188,6 +1195,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     file_layout: None,
+                    protocol_managed_storage: false,
                 }))
                 .with_download_data(Ok(Bytes::from_static(b"from mirror")))
                 .with_expected_url("http://mirror.com/file"),
