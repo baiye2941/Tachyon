@@ -14,6 +14,7 @@ interface FilterState {
   searchQuery: string;
   sidebarFilter: SidebarFilter;
   fileTypeFilter: FileTypeFilter;
+  tagFilter: string[];
 }
 
 interface TaskCounts {
@@ -27,6 +28,7 @@ interface TaskCounts {
 const [searchQuery, setSearchQuery] = createSignal("");
 const [sidebarFilter, setSidebarFilter] = createSignal<SidebarFilter>("all");
 const [fileTypeFilter, setFileTypeFilter] = createSignal<FileTypeFilter>("all");
+const [tagFilter, setTagFilter] = createSignal<string[]>([]);
 
 const searchFilters = createRootMemo(() => {
   const query = searchQuery().trim();
@@ -70,6 +72,7 @@ function computeFilteredTasks(
   tasks: TaskInfo[],
   sf: SidebarFilter,
   tf: FileTypeFilter,
+  tags: string[],
   filters: SearchFilter[],
   textQuery: string,
 ): TaskInfo[] {
@@ -93,6 +96,14 @@ function computeFilteredTasks(
 
   if (tf !== "all") {
     result = result.filter((t) => getFileTypeByName(t.fileName) === tf);
+  }
+
+  if (tags.length > 0) {
+    const normalizedTags = tags.map((t) => t.trim().toLowerCase());
+    result = result.filter((t) => {
+      const taskTags = (t.tags ?? []).map((tag) => tag.toLowerCase());
+      return normalizedTags.every((tag) => taskTags.includes(tag));
+    });
   }
 
   for (const filter of filters) {
@@ -155,6 +166,7 @@ const filteredTasks = createRootMemo(() => {
     $tasks.get(),
     sidebarFilter(),
     fileTypeFilter(),
+    tagFilter(),
     searchFilters().filters,
     searchFilters().textQuery,
   );
@@ -209,6 +221,18 @@ const fileTypeCounts = createRootMemo(() => {
   return counts;
 });
 
+/** 所有任务中已存在的标签(去重、小写、排序) */
+const allTags = createRootMemo(() => {
+  const tags = new Set<string>();
+  for (const task of $tasks.get()) {
+    for (const tag of task.tags ?? []) {
+      const normalized = tag.trim().toLowerCase();
+      if (normalized) tags.add(normalized);
+    }
+  }
+  return Array.from(tags).sort((a, b) => a.localeCompare(b));
+});
+
 export function removeSearchFilter(raw: string): void {
   setSearchQuery((q) => q.replace(raw, "").trim().replace(/\s+/g, " "));
 }
@@ -217,6 +241,32 @@ export function resetFilters(): void {
   setSearchQuery("");
   setSidebarFilter("all");
   setFileTypeFilter("all");
+  setTagFilter([]);
+}
+
+/** 添加标签过滤条件(去重、转小写) */
+export function addTagFilter(tag: string): void {
+  const normalized = tag.trim().toLowerCase();
+  if (!normalized) return;
+  setTagFilter((prev) =>
+    prev.includes(normalized) ? prev : [...prev, normalized],
+  );
+}
+
+/** 移除单个标签过滤条件 */
+export function removeTagFilter(tag: string): void {
+  const normalized = tag.trim().toLowerCase();
+  setTagFilter((prev) => prev.filter((t) => t !== normalized));
+}
+
+/** toggle 标签过滤条件 */
+export function toggleTagFilter(tag: string): void {
+  const normalized = tag.trim().toLowerCase();
+  setTagFilter((prev) =>
+    prev.includes(normalized)
+      ? prev.filter((t) => t !== normalized)
+      : [...prev, normalized],
+  );
 }
 
 /** toggle 筛选:点已选中的分类再点一次 = 回到 'all'(可取消,避免点了看不到全部)。 */
@@ -239,6 +289,9 @@ export const $taskFilter = {
   get fileTypeFilter(): Accessor<FileTypeFilter> {
     return fileTypeFilter;
   },
+  get tagFilter(): Accessor<string[]> {
+    return tagFilter;
+  },
   get searchFilters(): Accessor<{
     filters: SearchFilter[];
     textQuery: string;
@@ -254,15 +307,20 @@ export const $taskFilter = {
   get fileTypeCounts(): Accessor<Record<FileTypeFilter, number>> {
     return fileTypeCounts;
   },
+  get allTags(): Accessor<string[]> {
+    return allTags;
+  },
 };
 
 export {
   setSearchQuery,
   setSidebarFilter,
   setFileTypeFilter,
+  setTagFilter,
   searchQuery,
   sidebarFilter,
   fileTypeFilter,
+  tagFilter,
 };
 
 // 在 createRoot 下读取状态，避免测试环境出现 computations created outside a createRoot 警告
@@ -273,6 +331,7 @@ export function readTaskFilterState(): FilterState {
         searchQuery: searchQuery(),
         sidebarFilter: sidebarFilter(),
         fileTypeFilter: fileTypeFilter(),
+        tagFilter: tagFilter(),
       };
     } finally {
       dispose();

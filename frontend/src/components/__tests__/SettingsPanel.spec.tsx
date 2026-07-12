@@ -5,6 +5,8 @@ import type { ConfigPatch, VerifyStrategy, IoStrategy } from '../../types'
 import { setConfig, setLoading } from '../../stores/settings'
 import { api } from '../../api/invoke'
 import { addToast } from '../../stores/toast'
+import { refreshTaskList } from '../../stores/downloads'
+import { save, open } from '@tauri-apps/plugin-dialog'
 import { setShortcut, resetAllShortcuts } from '../../stores/shortcuts'
 
 vi.mock('../../api/invoke', () => ({
@@ -13,11 +15,22 @@ vi.mock('../../api/invoke', () => ({
     updateConfig: vi.fn(),
     getSupportedProtocols: vi.fn(),
     getAppInfo: vi.fn(),
+    exportBackup: vi.fn(),
+    importBackup: vi.fn(),
   },
 }))
 
 vi.mock('../../stores/toast', () => ({
   addToast: vi.fn(),
+}))
+
+vi.mock('../../stores/downloads', () => ({
+  refreshTaskList: vi.fn(),
+}))
+
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  save: vi.fn(),
+  open: vi.fn(),
 }))
 
 const renderSettingsPanel = () => render(() => <SettingsPanel visible={true} onClose={() => undefined} />)
@@ -85,7 +98,12 @@ describe('SettingsPanel', () => {
     vi.mocked(api.updateConfig).mockReset()
     vi.mocked(api.getSupportedProtocols).mockReset()
     vi.mocked(api.getAppInfo).mockReset()
+    vi.mocked(api.exportBackup).mockReset()
+    vi.mocked(api.importBackup).mockReset()
     vi.mocked(addToast).mockReset()
+    vi.mocked(refreshTaskList).mockReset()
+    vi.mocked(save).mockReset()
+    vi.mocked(open).mockReset()
   })
 
   afterEach(() => {
@@ -552,6 +570,112 @@ describe('SettingsPanel', () => {
       expect(paletteRow.textContent).toContain('Ctrl')
       expect(paletteRow.textContent).toContain('K')
       expect(paletteRow.textContent).not.toContain('X')
+    })
+  })
+
+  // --- Task 4-10: 设置项导入/导出 ---
+  it('通用标签页显示导出/导入按钮', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    expect(screen.getByText('导出配置与任务')).toBeDefined()
+    expect(screen.getByText('导入配置与任务')).toBeDefined()
+  })
+
+  it('导出备份时调用文件对话框与 api.exportBackup', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(save).mockResolvedValue('/tmp/tachyon-backup.json')
+    vi.mocked(api.exportBackup).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('导出配置与任务'))
+
+    await waitFor(() => {
+      expect(save).toHaveBeenCalledTimes(1)
+    })
+    expect(api.exportBackup).toHaveBeenCalledWith('/tmp/tachyon-backup.json')
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith('备份已导出', 'success')
+    })
+  })
+
+  it('导入备份(覆盖)时调用 api.importBackup(true) 并刷新任务列表', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(open).mockResolvedValue('/tmp/tachyon-backup.json')
+    vi.mocked(api.importBackup).mockResolvedValue(5)
+    vi.mocked(refreshTaskList).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('导入配置与任务'))
+
+    await waitFor(() => {
+      expect(screen.getByText('导入备份')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('覆盖'))
+
+    await waitFor(() => {
+      expect(api.importBackup).toHaveBeenCalledWith('/tmp/tachyon-backup.json', true)
+    })
+    await waitFor(() => {
+      expect(refreshTaskList).toHaveBeenCalledTimes(1)
+    })
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith('已导入 5 个任务', 'success')
+    })
+  })
+
+  it('导入备份(合并)时调用 api.importBackup(false) 并刷新任务列表', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(open).mockResolvedValue('/tmp/tachyon-backup.json')
+    vi.mocked(api.importBackup).mockResolvedValue(2)
+    vi.mocked(refreshTaskList).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('导入配置与任务'))
+
+    await waitFor(() => {
+      expect(screen.getByText('导入备份')).toBeDefined()
+    })
+    fireEvent.click(screen.getByText('合并'))
+
+    await waitFor(() => {
+      expect(api.importBackup).toHaveBeenCalledWith('/tmp/tachyon-backup.json', false)
+    })
+    await waitFor(() => {
+      expect(refreshTaskList).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('导出备份失败时显示错误 toast', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(save).mockResolvedValue('/tmp/tachyon-backup.json')
+    vi.mocked(api.exportBackup).mockRejectedValue(new Error('disk full'))
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('导出配置与任务'))
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith(expect.stringContaining('导出备份失败'), 'error')
     })
   })
 })

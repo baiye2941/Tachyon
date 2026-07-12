@@ -59,6 +59,7 @@ describe("taskFilter store", () => {
     expect(state.searchQuery).toBe("");
     expect(state.sidebarFilter).toBe("all");
     expect(state.fileTypeFilter).toBe("all");
+    expect(state.tagFilter).toEqual([]);
   });
 
   it("setSearchQuery 更新搜索词", () => {
@@ -246,11 +247,69 @@ describe("taskFilter store", () => {
     taskFilterModule.setSearchQuery("status:completed");
     taskFilterModule.setSidebarFilter("completed");
     taskFilterModule.setFileTypeFilter("video");
+    taskFilterModule.addTagFilter("ai");
 
     taskFilterModule.resetFilters();
     const state = taskFilterModule.readTaskFilterState();
     expect(state.searchQuery).toBe("");
     expect(state.sidebarFilter).toBe("all");
     expect(state.fileTypeFilter).toBe("all");
+    expect(state.tagFilter).toEqual([]);
+  });
+
+  it("tagFilter 按标签过滤任务(交集,大小写不敏感)", () => {
+    downloadsModule.setTasks([
+      makeTask("t1", { tags: ["ai", "model"] }),
+      makeTask("t2", { tags: ["AI"] }),
+      makeTask("t3", { tags: ["video"] }),
+      makeTask("t4"),
+    ]);
+
+    taskFilterModule.addTagFilter("ai");
+    expect(
+      read(() => taskFilterModule.$taskFilter.filteredTasks()).map((t) => t.id),
+    ).toEqual(["t1", "t2"]);
+
+    taskFilterModule.addTagFilter("model");
+    expect(
+      read(() => taskFilterModule.$taskFilter.filteredTasks()).map((t) => t.id),
+    ).toEqual(["t1"]);
+
+    taskFilterModule.removeTagFilter("ai");
+    taskFilterModule.removeTagFilter("model");
+    expect(
+      read(() => taskFilterModule.$taskFilter.filteredTasks()).map((t) => t.id),
+    ).toEqual(["t1", "t2", "t3", "t4"]);
+  });
+
+  it("addTagFilter 去重、trim、转小写", () => {
+    taskFilterModule.addTagFilter("AI ");
+    taskFilterModule.addTagFilter(" ai");
+    taskFilterModule.addTagFilter("model");
+    expect(read(() => taskFilterModule.$taskFilter.tagFilter())).toEqual([
+      "ai",
+      "model",
+    ]);
+  });
+
+  it("toggleTagFilter 切换标签过滤", () => {
+    taskFilterModule.toggleTagFilter("ai");
+    expect(read(() => taskFilterModule.$taskFilter.tagFilter())).toEqual(["ai"]);
+    taskFilterModule.toggleTagFilter("AI");
+    expect(read(() => taskFilterModule.$taskFilter.tagFilter())).toEqual([]);
+  });
+
+  it("allTags 返回所有任务标签的去重排序集合", () => {
+    downloadsModule.setTasks([
+      makeTask("t1", { tags: ["model", "ai"] }),
+      makeTask("t2", { tags: ["AI", "video"] }),
+      makeTask("t3"),
+    ]);
+
+    expect(read(() => taskFilterModule.$taskFilter.allTags())).toEqual([
+      "ai",
+      "model",
+      "video",
+    ]);
   });
 });

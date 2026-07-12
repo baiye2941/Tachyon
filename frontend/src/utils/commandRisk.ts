@@ -55,15 +55,25 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   add_model_favorite: 'mutate',
   remove_model_favorite: 'mutate',
   batch_create_hf_tasks: 'mutate',
-  // 破坏性:数据删除 / 安全策略变更
+  // 破坏性:数据删除 / 安全策略变更 / 备份导入导出
   delete_task: 'destructive',
   update_config: 'destructive',
+  export_backup: 'destructive',
+  import_backup: 'destructive',
 }
 
 /** 破坏性命令的确认提示 i18n key */
-const DESTRUCTIVE_CONFIRM_KEYS: Record<string, 'confirm.destructive.deleteTask' | 'confirm.destructive.updateConfig'> = {
+const DESTRUCTIVE_CONFIRM_KEYS: Record<
+  string,
+  | 'confirm.destructive.deleteTask'
+  | 'confirm.destructive.updateConfig'
+  | 'confirm.destructive.exportBackup'
+  | 'confirm.destructive.importBackup'
+> = {
   delete_task: 'confirm.destructive.deleteTask',
   update_config: 'confirm.destructive.updateConfig',
+  export_backup: 'confirm.destructive.exportBackup',
+  import_backup: 'confirm.destructive.importBackup',
 }
 
 /** 获取命令风险等级,未登记的命令默认为 destructive(白名单原则) */

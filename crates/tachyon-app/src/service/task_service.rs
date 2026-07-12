@@ -23,6 +23,45 @@ use crate::repository::TaskRepository;
 use crate::task_store::{TaskStore, task_info_to_snapshot};
 use tachyon_store::TaskSnapshot;
 
+/// 单个任务最多允许的标签数量
+const MAX_TAGS_PER_TASK: usize = 10;
+/// 单个标签最大字符长度
+const MAX_TAG_LENGTH: usize = 32;
+
+/// 清理并规范化标签列表
+///
+/// 规则:trim 前后空白、转小写、截断至 32 字符、去重(保留首次出现顺序)、最多 10 个。
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tags.into_iter()
+        .map(|t| {
+            let trimmed = t.trim().to_lowercase();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                trimmed.chars().take(MAX_TAG_LENGTH).collect::<String>()
+            }
+        })
+        .filter(|t| {
+            if t.is_empty() || seen.contains(t) {
+                return false;
+            }
+            seen.insert(t.clone());
+            true
+        })
+        .take(MAX_TAGS_PER_TASK)
+        .collect()
+}
+
+/// 清理单个标签
+fn normalize_single_tag(tag: &str) -> String {
+    let trimmed = tag.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed.chars().take(MAX_TAG_LENGTH).collect::<String>()
+}
+
 /// 任务创建结果
 ///
 /// 包含创建任务后所需的全部信息，供 DownloadSupervisor 启动下载。
@@ -354,7 +393,9 @@ impl TaskService {
             save_path: download_dir_str.clone(),
             error_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性
@@ -593,11 +634,88 @@ impl TaskService {
     }
 
     /// 获取任务列表
+    ///
+    /// 默认按 `display_order` 升序排列,相同 order 时按 `created_at` 降序
+    /// (新创建的任务在前)。
     pub fn get_task_list(&self) -> Vec<TaskInfo> {
-        self.task_repository
+        let mut tasks: Vec<TaskInfo> = self
+            .task_repository
             .iter()
             .map(|r| r.value().clone())
-            .collect()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.display_order
+                .cmp(&b.display_order)
+                .then_with(|| Self::compare_created_at_desc(a, b))
+        });
+        tasks
+    }
+
+    fn compare_created_at_desc(a: &TaskInfo, b: &TaskInfo) -> std::cmp::Ordering {
+        match (
+            chrono::DateTime::parse_from_rfc3339(&a.created_at),
+            chrono::DateTime::parse_from_rfc3339(&b.created_at),
+        ) {
+            (Ok(ta), Ok(tb)) => tb.cmp(&ta),
+            _ => b.created_at.cmp(&a.created_at),
+        }
+    }
+
+    /// 按传入 ID 顺序重新设置 display_order
+    ///
+    /// `ordered_ids` 中每个任务会按索引乘以 1000 分配 display_order,
+    /// 留出空隙方便后续插入。所有 ID 必须存在,否则返回 `TaskNotFound`。
+    pub async fn reorder_tasks(&self, ordered_ids: &[String]) -> Result<(), AppError> {
+        for id in ordered_ids {
+            if !self.task_repository.contains_key(id) {
+                return Err(AppError::TaskNotFound(id.clone()));
+            }
+        }
+
+        for (idx, id) in ordered_ids.iter().enumerate() {
+            if let Some(mut task) = self.task_repository.get_mut(id) {
+                task.display_order = (idx as i64).saturating_mul(1000);
+            }
+        }
+
+        for id in ordered_ids {
+            self.persist_display_order(id).await;
+        }
+        Ok(())
+    }
+
+    /// 将任务移动到某任务之前或末尾
+    ///
+    /// - `before_id` 为 `Some` 时,将 `task_id` 插入到 `before_id` 之前;
+    /// - `before_id` 为 `None` 时,移动到列表末尾。
+    pub async fn move_task(&self, task_id: &str, before_id: Option<&str>) -> Result<(), AppError> {
+        if !self.task_repository.contains_key(task_id) {
+            return Err(AppError::TaskNotFound(task_id.to_string()));
+        }
+        if let Some(before) = before_id
+            && !self.task_repository.contains_key(before)
+        {
+            return Err(AppError::TaskNotFound(before.to_string()));
+        }
+
+        let mut ordered: Vec<String> = self.get_task_list().into_iter().map(|t| t.id).collect();
+        let current_pos = ordered
+            .iter()
+            .position(|id| id == task_id)
+            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+        ordered.remove(current_pos);
+
+        let insert_pos = if let Some(before) = before_id {
+            ordered
+                .iter()
+                .position(|id| id == before)
+                .unwrap_or(ordered.len())
+        } else {
+            ordered.len()
+        };
+        ordered.insert(insert_pos, task_id.to_string());
+
+        self.reorder_tasks(&ordered).await
     }
 
     /// 获取任务详情
@@ -621,6 +739,63 @@ impl TaskService {
         }
     }
 
+    /// 设置任务标签(全量替换)
+    ///
+    /// 输入标签会经过清理:trim、去重、转小写、单标签截断至 32 字符、最多保留 10 个。
+    pub async fn set_task_tags(&self, task_id: &str, tags: Vec<String>) -> Result<(), AppError> {
+        {
+            let mut task = self
+                .task_repository
+                .get_mut(task_id)
+                .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            task.tags = normalize_tags(tags);
+        }
+        self.persist_snapshot(task_id, None).await;
+        Ok(())
+    }
+
+    /// 为任务添加单个标签
+    pub async fn add_task_tag(&self, task_id: &str, tag: &str) -> Result<(), AppError> {
+        let normalized = normalize_single_tag(tag);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut task = self
+                .task_repository
+                .get_mut(task_id)
+                .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            if task.tags.contains(&normalized) {
+                return Ok(());
+            }
+            if task.tags.len() >= MAX_TAGS_PER_TASK {
+                return Err(AppError::Config(format!(
+                    "标签数量已达上限({MAX_TAGS_PER_TASK})"
+                )));
+            }
+            task.tags.push(normalized);
+        }
+        self.persist_snapshot(task_id, None).await;
+        Ok(())
+    }
+
+    /// 移除任务的单个标签(按清理后的小写值匹配)
+    pub async fn remove_task_tag(&self, task_id: &str, tag: &str) -> Result<(), AppError> {
+        let normalized = normalize_single_tag(tag);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut task = self
+                .task_repository
+                .get_mut(task_id)
+                .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            task.tags.retain(|t| t != &normalized);
+        }
+        self.persist_snapshot(task_id, None).await;
+        Ok(())
+    }
+
     /// 持久化任务快照
     async fn persist_snapshot(&self, task_id: &str, fail_reason: Option<String>) {
         // 1. 同步更新内存中 TaskInfo 的 error_reason,前端查询时立即可见
@@ -628,6 +803,25 @@ impl TaskService {
             task.error_reason = fail_reason.clone();
         }
 
+        self.persist_task_state(task_id, |snapshot| {
+            snapshot.fail_reason = fail_reason;
+        })
+        .await;
+    }
+
+    /// 持久化 display_order 变更,保留快照其他字段(含 fail_reason)
+    async fn persist_display_order(&self, task_id: &str) {
+        self.persist_task_state(task_id, |_| {}).await;
+    }
+
+    /// 通用任务状态持久化
+    ///
+    /// 读取现有快照合并分片进度等字段,应用 patch 后保存。
+    /// 错误仅记录警告,不阻塞调用方。
+    async fn persist_task_state<F>(&self, task_id: &str, patch: F)
+    where
+        F: FnOnce(&mut TaskSnapshot),
+    {
         let task = { self.task_repository.get(task_id).map(|r| r.value().clone()) };
         if let Some(task) = task {
             // 读取已存在快照用于字段合并。load 仅 read_to_string(无 fsync),
@@ -659,8 +853,9 @@ impl TaskService {
                 snapshot.etag = existing.etag;
                 snapshot.last_modified = existing.last_modified;
                 snapshot.retry_count = existing.retry_count;
+                snapshot.fail_reason = existing.fail_reason;
             }
-            snapshot.fail_reason = fail_reason;
+            patch(&mut snapshot);
             // task_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。
             // 此处采用 fire-and-forget:快照保存错误仅记录警告,无需阻塞调用方(如取消/暂停路径),
             // 避免在 fsync 期间拖延任务控制信号的发送。

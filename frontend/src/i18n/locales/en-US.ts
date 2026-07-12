@@ -132,6 +132,8 @@ const enUS = {
   "toolbar.densityCompact": "Compact List",
   "toolbar.settings": "Settings",
   "toolbar.multiSelect": "Multi-Select",
+  "toolbar.tagPlaceholder": "Filter by tag",
+  "toolbar.tagFilterAria": "Tag filter",
   "toolbar.removeFilter": "Remove filter {filter}",
 
   // —— Confirm dialogs ——
@@ -159,6 +161,8 @@ const enUS = {
   "confirm.destructive.deleteTask": "Delete this download task record",
   "confirm.destructive.updateConfig":
     "Modify downloader configuration (including security-related fields)",
+  "confirm.destructive.exportBackup": "Export configuration and task records",
+  "confirm.destructive.importBackup": "Import configuration and task records",
   "confirm.destructive.default": "This action cannot be undone",
   "confirm.destructive.prompt": "Confirm this action?\n\n{description}",
 
@@ -277,6 +281,11 @@ const enUS = {
   "detail.section.metadata": "More details",
   "detail.metadata.expand": "Expand",
   "detail.metadata.collapse": "Collapse",
+  "detail.section.tags": "Tags",
+  "detail.tagPlaceholder": "Enter tag and press Enter",
+  "detail.noTags": "No tags",
+  "detail.tagRemoveAria": "Remove tag {tag}",
+  "detail.addTag": "Add",
 
   // —— Failure diagnostics ——
   "error.title.accessDenied": "Access denied",
@@ -351,6 +360,8 @@ const enUS = {
   "toast.noSavePath": "No save path info for this task",
   "toast.noSavePathRecord": "No save path info for this record",
   "toast.deleteRecordFailed": "Failed to delete record: {error}",
+  "toast.addTagFailed": "Failed to add tag: {error}",
+  "toast.removeTagFailed": "Failed to remove tag: {error}",
   "toast.progressSubscribeFailed": "Progress subscription failed: {error}",
   "toast.recoveryWarning":
     "Detected {count} corrupted resumption records, skipped recovery",
@@ -370,6 +381,10 @@ const enUS = {
   "toast.configSaveFailed": "Failed to save configuration: {error}",
   "toast.configLoadFailed": "Failed to load configuration: {error}",
   "toast.openDirPickerFailed": "Cannot open directory picker: {error}",
+  "toast.exportBackupSuccess": "Backup exported",
+  "toast.exportBackupFailed": "Failed to export backup: {error}",
+  "toast.importBackupSuccess": "Imported {count} tasks",
+  "toast.importBackupFailed": "Failed to import backup: {error}",
   "toast.historySaveFailed": "Failed to save history, storage may be full",
   "toast.hubListFailed": "Failed to list repository files: {error}",
   "toast.hubUrlFailed": "Failed to get download URL: {error}",
@@ -518,6 +533,16 @@ const enUS = {
   "settings.about.headersCount": "{n} entries",
   "settings.about.securityHint":
     "These fields are protected by backend security policy and cannot be edited here (headers carry CRLF injection risk; user_agent should not be overridden by the frontend).",
+  "settings.backup.title": "Data",
+  "settings.backup.export": "Export config & tasks",
+  "settings.backup.import": "Import config & tasks",
+  "settings.backup.exportDescription": "Save settings and task records to a .json file",
+  "settings.backup.importDescription": "Restore settings and task records from a .json file",
+  "settings.backup.importConfirmTitle": "Import Backup",
+  "settings.backup.importConfirmMessage":
+    "Existing data with the same URL will be skipped. Choose \"Overwrite\" to replace all current data.",
+  "settings.backup.importConfirmOverwrite": "Overwrite",
+  "settings.backup.importConfirmMerge": "Merge",
   "settings.save": "Save",
 
   // —— History panel ——

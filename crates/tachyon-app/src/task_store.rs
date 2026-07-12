@@ -58,6 +58,24 @@ impl TaskStore {
         Ok((result.tasks, result.corrupt_keys))
     }
 
+    /// 加载所有任务快照(含终态任务),用于备份导出
+    ///
+    /// 返回任务快照列表和损坏 key 列表;损坏记录不阻断正常记录的导出。
+    pub fn load_all(&self) -> Result<(Vec<TaskSnapshot>, Vec<String>), AppError> {
+        let result = self
+            .manager
+            .load_all_task_snapshots()
+            .map_err(|e| AppError::Config(format!("加载所有任务快照失败: {e}")))?;
+        if !result.corrupt_keys.is_empty() {
+            tracing::warn!(
+                count = result.corrupt_keys.len(),
+                keys = ?result.corrupt_keys,
+                "备份导出时发现损坏快照"
+            );
+        }
+        Ok((result.tasks, result.corrupt_keys))
+    }
+
     /// 删除任务快照(用于完成/取消/失败后的清理)
     ///
     /// 清理后恢复时不再扫描该任务,减少启动恢复开销。
@@ -110,10 +128,12 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
         // 从快照恢复时保留失败原因与重试计数,前端诊断面板可直接使用后端原文
         error_reason: snapshot.fail_reason.clone(),
         retry_count: snapshot.retry_count,
+        tags: snapshot.tags.clone(),
         hf_meta: snapshot
             .hf_meta
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        display_order: snapshot.display_order,
     }
 }
 
@@ -155,11 +175,13 @@ pub fn task_info_to_snapshot(
         // 保留 TaskInfo 上的失败原因与重试计数,避免持久化时丢失
         fail_reason: task.error_reason.clone(),
         retry_count: task.retry_count,
+        tags: task.tags.clone(),
         hf_meta: task
             .hf_meta
             .as_ref()
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .filter(|v| !v.is_null()),
+        display_order: task.display_order,
     }
 }
 
@@ -189,7 +211,9 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
 
         let task = snapshot_to_task_info(&snapshot);
@@ -222,7 +246,9 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
 
         store.save_snapshot(&snapshot).unwrap();
@@ -258,7 +284,9 @@ mod tests {
             updated_at: "2026-05-29T00:00:00Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
         store.save_snapshot(&good).unwrap();
 
@@ -328,7 +356,9 @@ mod tests {
             save_path: "/downloads/file.bin".to_string(),
             error_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
 
         let snapshot = task_info_to_snapshot(
@@ -344,5 +374,46 @@ mod tests {
         assert_eq!(snapshot.content_length, Some(1024));
         assert_eq!(snapshot.etag.as_deref(), Some("\"abc\""));
         assert_eq!(snapshot.fragment_size, 256);
+    }
+
+    #[test]
+    fn test_task_info_to_snapshot_roundtrips_tags() {
+        let task = TaskInfo {
+            id: "task-tags".to_string(),
+            url: "https://example.com/file.bin".to_string(),
+            file_name: "file.bin".to_string(),
+            file_size: Some(1024),
+            downloaded: 0,
+            speed: 0,
+            status: DownloadState::Pending,
+            progress: 0.0,
+            fragments_total: 0,
+            fragments_done: 0,
+            active_concurrency: 0,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            save_path: "/downloads/file.bin".to_string(),
+            error_reason: None,
+            retry_count: 0,
+            tags: vec!["model".to_string(), "important".to_string()],
+            hf_meta: None,
+            display_order: 0,
+        };
+
+        let snapshot = task_info_to_snapshot(
+            &task,
+            "/downloads/file.bin".to_string(),
+            256,
+            vec![],
+            HashMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(
+            snapshot.tags,
+            vec!["model".to_string(), "important".to_string()]
+        );
+
+        let recovered = snapshot_to_task_info(&snapshot);
+        assert_eq!(recovered.tags, task.tags);
     }
 }

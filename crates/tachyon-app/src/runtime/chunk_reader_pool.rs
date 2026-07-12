@@ -472,7 +472,9 @@ mod tests {
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -557,7 +559,9 @@ mod tests {
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -637,7 +641,9 @@ mod tests {
                     save_path: "/tmp/file.bin".to_string(),
                     error_reason: None,
                     retry_count: 0,
+                    tags: vec![],
                     hf_meta: None,
+                    display_order: 0,
                 },
             );
 
@@ -711,7 +717,9 @@ mod tests {
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -798,7 +806,9 @@ mod tests {
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 

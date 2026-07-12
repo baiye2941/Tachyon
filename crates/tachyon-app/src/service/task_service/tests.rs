@@ -491,9 +491,292 @@ async fn test_create_task_sanitizes_filename() {
     assert!(!name.is_empty(), "sanitize 不应产生空名");
 }
 
+// ── 任务标签管理 ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_set_task_tags_normalizes_and_persists() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+
+    service
+        .set_task_tags(
+            "t1",
+            vec![
+                "  Important ".to_string(),
+                "MODEL".to_string(),
+                "important".to_string(),
+                "a".repeat(40),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let task = service.get_task_detail("t1").unwrap();
+    assert_eq!(
+        task.tags,
+        vec!["important".to_string(), "model".to_string(), "a".repeat(32)]
+    );
+
+    // 持久化快照应包含标签(persist_snapshot 内部为 spawn_blocking fire-and-forget,
+    // 轮询等待快照落盘,避免竞态)。
+    let mut snapshot = None;
+    for _ in 0..50 {
+        if let Ok(Some(s)) = service.task_store.load_snapshot("t1") {
+            snapshot = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(snapshot.is_some(), "快照应在 1 秒内落盘");
+    assert_eq!(snapshot.unwrap().tags, task.tags);
+}
+
+#[tokio::test]
+async fn test_set_task_tags_limits_count() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+
+    let tags: Vec<String> = (0..15).map(|i| format!("tag-{i}")).collect();
+    service.set_task_tags("t1", tags).await.unwrap();
+
+    let task = service.get_task_detail("t1").unwrap();
+    assert_eq!(task.tags.len(), 10);
+}
+
+#[tokio::test]
+async fn test_add_task_tag_appends_and_deduplicates() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+
+    service.add_task_tag("t1", "alpha").await.unwrap();
+    service.add_task_tag("t1", "ALPHA ").await.unwrap();
+    service.add_task_tag("t1", "beta").await.unwrap();
+
+    let task = service.get_task_detail("t1").unwrap();
+    assert_eq!(task.tags, vec!["alpha".to_string(), "beta".to_string()]);
+}
+
+#[tokio::test]
+async fn test_add_task_tag_rejects_when_limit_reached() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+
+    for i in 0..10 {
+        service
+            .add_task_tag("t1", &format!("tag-{i}"))
+            .await
+            .unwrap();
+    }
+
+    let result = service.add_task_tag("t1", "overflow").await;
+    assert!(result.is_err(), "超过 10 个标签时应报错");
+    assert!(result.unwrap_err().to_string().contains("上限"));
+}
+
+#[tokio::test]
+async fn test_remove_task_tag_removes_normalized_match() {
+    let (service, _dir) = make_service();
+    service
+        .task_repository
+        .insert("t1".to_string(), make_task("t1", "f.bin", "/dl".into()));
+
+    service
+        .set_task_tags("t1", vec!["keep".to_string(), "remove".to_string()])
+        .await
+        .unwrap();
+    service.remove_task_tag("t1", "REMOVE ").await.unwrap();
+
+    let task = service.get_task_detail("t1").unwrap();
+    assert_eq!(task.tags, vec!["keep".to_string()]);
+}
+
+#[tokio::test]
+async fn test_tag_operations_require_existing_task() {
+    let (service, _dir) = make_service();
+
+    assert!(service.set_task_tags("missing", vec![]).await.is_err());
+    assert!(service.add_task_tag("missing", "x").await.is_err());
+    assert!(service.remove_task_tag("missing", "x").await.is_err());
+}
+
+// ── 任务排序与拖拽 ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_get_task_list_sorts_by_display_order_asc() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 100, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task_with_order("t2", "b.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        make_task_with_order("t3", "c.bin", "/dl".into(), 50, "2026-01-01T00:00:00Z"),
+    );
+
+    let list = service.get_task_list();
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t2", "t3", "t1"]);
+}
+
+#[tokio::test]
+async fn test_get_task_list_stable_by_created_at_desc_when_order_equal() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task_with_order("t2", "b.bin", "/dl".into(), 0, "2026-01-03T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        make_task_with_order("t3", "c.bin", "/dl".into(), 0, "2026-01-02T00:00:00Z"),
+    );
+
+    let list = service.get_task_list();
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    // 相同 display_order 时按 created_at 降序,新创建在前
+    assert_eq!(ids, vec!["t2", "t3", "t1"]);
+}
+
+#[tokio::test]
+async fn test_reorder_tasks_assigns_orders_by_index() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task_with_order("t2", "b.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        make_task_with_order("t3", "c.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+
+    service
+        .reorder_tasks(&["t3".to_string(), "t1".to_string(), "t2".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(service.get_task_detail("t3").unwrap().display_order, 0);
+    assert_eq!(service.get_task_detail("t1").unwrap().display_order, 1000);
+    assert_eq!(service.get_task_detail("t2").unwrap().display_order, 2000);
+
+    let list = service.get_task_list();
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t3", "t1", "t2"]);
+}
+
+#[tokio::test]
+async fn test_reorder_tasks_persists_display_order() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    // 初始持久化一个快照,使后续 load 能合并字段
+    service.persist_display_order("t1").await;
+
+    service.reorder_tasks(&["t1".to_string()]).await.unwrap();
+
+    // 等待 fire-and-forget 持久化完成
+    let mut snapshot = None;
+    for _ in 0..50 {
+        if let Ok(Some(s)) = service.task_store.load_snapshot("t1") {
+            snapshot = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(snapshot.is_some(), "快照应在 1 秒内落盘");
+    assert_eq!(snapshot.unwrap().display_order, 0);
+}
+
+#[tokio::test]
+async fn test_reorder_tasks_rejects_missing_id() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+
+    let result = service
+        .reorder_tasks(&["t1".to_string(), "missing".to_string()])
+        .await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("任务不存在"));
+}
+
+#[tokio::test]
+async fn test_move_task_before_another_task() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task_with_order("t2", "b.bin", "/dl".into(), 1000, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t3".to_string(),
+        make_task_with_order("t3", "c.bin", "/dl".into(), 2000, "2026-01-01T00:00:00Z"),
+    );
+
+    service.move_task("t3", Some("t1")).await.unwrap();
+
+    let list = service.get_task_list();
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t3", "t1", "t2"]);
+}
+
+#[tokio::test]
+async fn test_move_task_to_end() {
+    let (service, _dir) = make_service();
+    service.task_repository.insert(
+        "t1".to_string(),
+        make_task_with_order("t1", "a.bin", "/dl".into(), 0, "2026-01-01T00:00:00Z"),
+    );
+    service.task_repository.insert(
+        "t2".to_string(),
+        make_task_with_order("t2", "b.bin", "/dl".into(), 1000, "2026-01-01T00:00:00Z"),
+    );
+
+    service.move_task("t1", None).await.unwrap();
+
+    let list = service.get_task_list();
+    let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["t2", "t1"]);
+}
+
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────
 
 fn make_task(id: &str, file_name: &str, save_path: String) -> TaskInfo {
+    make_task_with_order(id, file_name, save_path, 0, "2026-01-01T00:00:00Z")
+}
+
+fn make_task_with_order(
+    id: &str,
+    file_name: &str,
+    save_path: String,
+    display_order: i64,
+    created_at: &str,
+) -> TaskInfo {
     TaskInfo {
         id: id.to_string(),
         url: format!("https://example.com/{file_name}"),
@@ -506,11 +789,13 @@ fn make_task(id: &str, file_name: &str, save_path: String) -> TaskInfo {
         fragments_total: 0,
         fragments_done: 0,
         active_concurrency: 0,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
+        created_at: created_at.to_string(),
         save_path,
         error_reason: None,
         retry_count: 0,
+        tags: vec![],
         hf_meta: None,
+        display_order,
     }
 }
 
@@ -535,6 +820,8 @@ fn empty_snapshot() -> TaskSnapshot {
         updated_at: String::new(),
         fail_reason: None,
         retry_count: 0,
+        tags: vec![],
         hf_meta: None,
+        display_order: 0,
     }
 }

@@ -264,7 +264,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
         repository.insert(
@@ -285,7 +287,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -327,7 +331,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -381,7 +387,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -419,7 +427,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -484,7 +494,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 

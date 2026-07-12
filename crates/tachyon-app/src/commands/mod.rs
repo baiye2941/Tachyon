@@ -20,8 +20,9 @@ pub use self::sniffer_commands::{
     get_sniffer_resources, set_sniffer_capture_config,
 };
 pub use self::task_commands::{
-    cancel_task, create_task, delete_task, get_task_detail, get_task_list, pause_task,
-    probe_filename, resume_task,
+    add_task_tag, cancel_task, create_task, delete_task, export_backup, get_task_detail,
+    get_task_list, import_backup, pause_task, probe_filename, remove_task_tag, reorder_tasks,
+    resume_task, set_task_tags,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,9 +144,15 @@ pub struct TaskInfo {
     /// 任务级重试计数（保留字段，当前恒为 0，为后续重试策略预留接口）。
     #[serde(default)]
     pub retry_count: u32,
+    /// 用户自定义任务标签,用于前端分组/过滤。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// HF 任务元数据（仅 HF 来源的下载任务有值）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_meta: Option<HfTaskMeta>,
+    /// 任务在列表中的显示顺序,越小越靠前。
+    #[serde(default)]
+    pub display_order: i64,
 }
 
 /// 序列化 URL 时脱敏，前端只看到不含敏感参数的 URL
@@ -894,7 +901,9 @@ pub(crate) mod tests {
             save_path: "/downloads/file.zip".to_string(),
             error_reason: None,
             retry_count: 0,
+            tags: vec!["model".to_string()],
             hf_meta: None,
+            display_order: 0,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();

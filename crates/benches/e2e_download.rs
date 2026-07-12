@@ -41,6 +41,9 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
         updated_at: "2026-05-29T00:00:01Z".to_string(),
         fail_reason: None,
         retry_count: 0,
+        tags: vec![],
+        hf_meta: None,
+        display_order: 0,
     }
 }
 

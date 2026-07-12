@@ -144,6 +144,8 @@ pub fn run() {
             request_confirmation,
             // 任务管理
             create_task,
+            export_backup,
+            import_backup,
             probe_filename,
             pause_task,
             resume_task,
@@ -151,6 +153,10 @@ pub fn run() {
             delete_task,
             get_task_list,
             get_task_detail,
+            set_task_tags,
+            add_task_tag,
+            remove_task_tag,
+            reorder_tasks,
             // 进度查询
             get_download_progress,
             subscribe_progress,
@@ -210,7 +216,9 @@ async fn any_fragment() {
         save_path: String::new(),
         error_reason: None,
         retry_count: 0,
+        tags: vec![],
         hf_meta: None,
+        display_order: 0,
     };
     state.domain.task_repository.insert(task_id.clone(), task);
 
@@ -260,7 +268,9 @@ async fn max_concurrent() {
                     save_path: String::new(),
                     error_reason: None,
                     retry_count: 0,
+                    tags: vec![],
                     hf_meta: None,
+                    display_order: 0,
                 },
             );
         }

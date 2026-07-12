@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { createSignal, For, Show } from "solid-js";
 import {
   PlusIcon,
   SearchIcon,
@@ -15,11 +15,13 @@ import {
 import Button from "../../shared/ui/Button";
 import { useI18n } from "../../i18n";
 import { useIsNarrowScreen } from "../../hooks/useMediaQuery";
+import { $taskFilter, addTagFilter, removeTagFilter } from "../../stores/taskFilter";
 import type { ToolbarProps } from "../Toolbar";
 
 export default function ToolbarDefault(props: ToolbarProps) {
   const i18n = useI18n();
   const isNarrow = useIsNarrowScreen();
+  const [tagQuery, setTagQuery] = createSignal("");
 
   return (
     <div class="flex items-center gap-2 flex-1 min-w-0">
@@ -75,6 +77,42 @@ export default function ToolbarDefault(props: ToolbarProps) {
           />
         </div>
 
+        <Show when={$taskFilter.allTags().length > 0 || $taskFilter.tagFilter().length > 0}>
+          <div
+            class="relative flex items-center"
+            style={{ "flex-shrink": 1, "min-width": "120px", "max-width": "200px" }}
+          >
+            <input
+              type="text"
+              list="toolbar-tag-suggestions"
+              class="input"
+              placeholder={i18n.t("toolbar.tagPlaceholder") as string}
+              value={tagQuery()}
+              onInput={(e) => setTagQuery(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addTagFilter(tagQuery());
+                  setTagQuery("");
+                }
+              }}
+              style={{
+                width: "100%",
+                height: "34px",
+                "padding-left": "10px",
+                "padding-right": "10px",
+                "font-size": "13px",
+              }}
+              aria-label={i18n.t("toolbar.tagFilterAria") as string}
+            />
+            <datalist id="toolbar-tag-suggestions">
+              <For each={$taskFilter.allTags()}>
+                {(tag) => <option value={tag} />}
+              </For>
+            </datalist>
+          </div>
+        </Show>
+
         <Show when={props.filters.length > 0}>
           <div class="flex items-center gap-1.5 flex-shrink min-w-0 overflow-hidden">
             <For each={props.filters}>
@@ -117,6 +155,59 @@ export default function ToolbarDefault(props: ToolbarProps) {
                     aria-label={
                       i18n.t("toolbar.removeFilter", {
                         filter: filter.raw,
+                      }) as string
+                    }
+                  >
+                    <XIcon />
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        <Show when={$taskFilter.tagFilter().length > 0}>
+          <div class="flex items-center gap-1.5 flex-shrink min-w-0 overflow-hidden">
+            <For each={$taskFilter.tagFilter()}>
+              {(tag) => (
+                <div
+                  class="flex items-center gap-1 flex-shrink-0"
+                  style={{
+                    padding: "2px 8px",
+                    height: "22px",
+                    "border-radius": "11px",
+                    "font-size": "11px",
+                    "font-weight": 500,
+                    background: "var(--color-bg-hover)",
+                    border: "1px solid var(--color-accent-glow)",
+                    color: "var(--color-accent-primary)",
+                    "white-space": "nowrap",
+                  }}
+                >
+                  <span
+                    style={{
+                      "max-width": "120px",
+                      overflow: "hidden",
+                      "text-overflow": "ellipsis",
+                    }}
+                  >
+                    {tag}
+                  </span>
+                  <button
+                    class="flex items-center justify-center"
+                    style={{
+                      width: "12px",
+                      height: "12px",
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      color: "inherit",
+                      opacity: 0.6,
+                    }}
+                    onClick={() => removeTagFilter(tag)}
+                    aria-label={
+                      i18n.t("toolbar.removeFilter", {
+                        filter: tag,
                       }) as string
                     }
                   >

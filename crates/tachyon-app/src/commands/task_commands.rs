@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tachyon_core::config::DownloadConfig;
-use tachyon_core::safety::extract_filename_from_url;
+use serde::{Deserialize, Serialize};
+use tachyon_core::config::{AppConfig, DownloadConfig};
+use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log};
 use tachyon_core::traits::{Protocol, TaskRunner};
 use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::DownloadTask;
@@ -667,6 +669,41 @@ pub async fn get_task_detail(
     get_task_detail_inner(&state, task_id).await
 }
 
+#[tauri::command]
+pub async fn set_task_tags(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    tags: Vec<String>,
+) -> Result<(), AppError> {
+    set_task_tags_inner(&state, task_id, tags).await
+}
+
+#[tauri::command]
+pub async fn add_task_tag(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    tag: String,
+) -> Result<(), AppError> {
+    add_task_tag_inner(&state, task_id, tag).await
+}
+
+#[tauri::command]
+pub async fn remove_task_tag(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    tag: String,
+) -> Result<(), AppError> {
+    remove_task_tag_inner(&state, task_id, tag).await
+}
+
+#[tauri::command]
+pub async fn reorder_tasks(
+    state: tauri::State<'_, AppState>,
+    ordered_ids: Vec<String>,
+) -> Result<(), AppError> {
+    reorder_tasks_inner(&state, ordered_ids).await
+}
+
 /// 探测文件真实名称(HEAD 请求 / DHT 查询种子元数据)
 ///
 /// - HTTP/HTTPS: 发送 HEAD 请求获取 Content-Disposition 等元数据
@@ -954,6 +991,235 @@ pub(crate) async fn get_task_detail_inner(
     state.service.task_service.get_task_detail(&task_id)
 }
 
+pub(crate) async fn set_task_tags_inner(
+    state: &AppState,
+    task_id: String,
+    tags: Vec<String>,
+) -> Result<(), AppError> {
+    state
+        .service
+        .task_service
+        .set_task_tags(&task_id, tags)
+        .await
+}
+
+pub(crate) async fn add_task_tag_inner(
+    state: &AppState,
+    task_id: String,
+    tag: String,
+) -> Result<(), AppError> {
+    state
+        .service
+        .task_service
+        .add_task_tag(&task_id, &tag)
+        .await
+}
+
+pub(crate) async fn remove_task_tag_inner(
+    state: &AppState,
+    task_id: String,
+    tag: String,
+) -> Result<(), AppError> {
+    state
+        .service
+        .task_service
+        .remove_task_tag(&task_id, &tag)
+        .await
+}
+
+pub(crate) async fn reorder_tasks_inner(
+    state: &AppState,
+    ordered_ids: Vec<String>,
+) -> Result<(), AppError> {
+    state.service.task_service.reorder_tasks(&ordered_ids).await
+}
+
+// ---------------------------------------------------------------------------
+// Backup import/export (P4-10)
+// ---------------------------------------------------------------------------
+
+/// 备份文件 schema 版本号
+const BACKUP_SCHEMA_VERSION: u32 = 1;
+
+/// 导出的备份文件结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Backup {
+    version: u32,
+    config: AppConfig,
+    tasks: Vec<tachyon_store::TaskSnapshot>,
+}
+
+/// 验证破坏性备份命令的一次性确认令牌
+fn validate_backup_token(
+    state: &AppState,
+    token: Option<String>,
+    action: &str,
+) -> Result<(), AppError> {
+    match token {
+        Some(token) => state
+            .service
+            .confirmation_service
+            .validate_and_consume(&token, action),
+        None => Err(AppError::Config(format!(
+            "{action} 需要确认令牌,请先确认操作"
+        ))),
+    }
+}
+
+/// 导出当前配置与所有任务快照到 JSON 备份文件
+#[tauri::command]
+pub async fn export_backup(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    confirmation_token: Option<String>,
+) -> Result<(), AppError> {
+    validate_backup_token(&state, confirmation_token, "export_backup")?;
+    export_backup_inner(&state, path).await
+}
+
+/// 从 JSON 备份文件导入配置与任务快照
+#[tauri::command]
+pub async fn import_backup(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    overwrite: bool,
+    confirmation_token: Option<String>,
+) -> Result<usize, AppError> {
+    validate_backup_token(&state, confirmation_token, "import_backup")?;
+    import_backup_inner(&state, path, overwrite).await
+}
+
+/// 导出备份的内部实现(便于测试直接使用 AppState)
+pub(crate) async fn export_backup_inner(state: &AppState, path: String) -> Result<(), AppError> {
+    let config = { state.domain.config.lock().await.clone() };
+    let (tasks, corrupt_keys) = state
+        .infra
+        .task_store
+        .load_all()
+        .map_err(|e| AppError::Config(format!("加载任务快照失败: {e}")))?;
+    if !corrupt_keys.is_empty() {
+        tracing::warn!(
+            count = corrupt_keys.len(),
+            keys = ?corrupt_keys,
+            "导出备份时发现损坏快照"
+        );
+    }
+
+    let backup = Backup {
+        version: BACKUP_SCHEMA_VERSION,
+        config,
+        tasks,
+    };
+    let path_buf = std::path::PathBuf::from(path);
+
+    tokio::task::spawn_blocking(move || {
+        let json = serde_json::to_string_pretty(&backup)
+            .map_err(|e| AppError::Config(format!("序列化备份失败: {e}")))?;
+        if let Some(parent) = path_buf.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::Config(format!("创建备份目录失败: {e}")))?;
+        }
+        let tmp = path_buf.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)
+            .map_err(|e| AppError::Config(format!("写入备份临时文件失败: {e}")))?;
+        std::fs::rename(&tmp, &path_buf)
+            .map_err(|e| AppError::Config(format!("重命名备份文件失败: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("导出备份任务失败: {e}")))?
+}
+
+/// 导入备份的内部实现(便于测试直接使用 AppState)
+pub(crate) async fn import_backup_inner(
+    state: &AppState,
+    path: String,
+    overwrite: bool,
+) -> Result<usize, AppError> {
+    let path_buf = std::path::PathBuf::from(path);
+    let backup: Backup = tokio::task::spawn_blocking(move || {
+        let json = std::fs::read_to_string(&path_buf)
+            .map_err(|e| AppError::Config(format!("读取备份文件失败: {e}")))?;
+        serde_json::from_str::<Backup>(&json)
+            .map_err(|e| AppError::Config(format!("备份文件格式无效: {e}")))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("导入备份任务失败: {e}")))??;
+
+    if backup.version != BACKUP_SCHEMA_VERSION {
+        return Err(AppError::Config(format!(
+            "不支持的备份版本: {},当前仅支持版本 {}",
+            backup.version, BACKUP_SCHEMA_VERSION
+        )));
+    }
+
+    crate::commands::config_commands::validate_config(&backup.config)?;
+
+    if overwrite {
+        // 替换当前配置并持久化
+        {
+            let mut cfg = state.domain.config.lock().await;
+            *cfg = backup.config.clone();
+        }
+        state
+            .service
+            .task_service
+            .update_cached_download_dir(backup.config.download.download_dir.clone())
+            .await;
+        let config_to_persist = backup.config.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::commands::config_commands::persist_config(&config_to_persist)
+        })
+        .await
+        .map_err(|e| AppError::Config(format!("持久化导入配置任务失败: {e}")))??;
+
+        // 清空内存任务表与持久化快照
+        let ids: Vec<String> = state
+            .domain
+            .task_repository
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+        for id in &ids {
+            state.domain.task_repository.remove(id);
+            if let Err(e) = state.infra.task_store.remove_snapshot(id) {
+                tracing::warn!(task_id = %id, error = %e, "导入覆盖时清理旧快照失败");
+            }
+        }
+    }
+
+    let existing_urls: HashSet<String> = state
+        .domain
+        .task_repository
+        .iter()
+        .map(|r| redact_url_for_log(&r.value().url))
+        .collect();
+
+    let mut imported = 0usize;
+    for mut snapshot in backup.tasks {
+        let redacted = redact_url_for_log(&snapshot.url);
+        if !overwrite && existing_urls.contains(&redacted) {
+            continue;
+        }
+
+        snapshot.status = crate::task_store::normalize_recovered_status(snapshot.status);
+        let task = crate::task_store::snapshot_to_task_info(&snapshot);
+        state.domain.task_repository.insert(task.id.clone(), task);
+
+        let store = state.infra.task_store.clone();
+        let task_id = snapshot.id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.save_snapshot(&snapshot) {
+                tracing::warn!(task_id = %task_id, error = %e, "导入时保存任务快照失败");
+            }
+        });
+        imported += 1;
+    }
+
+    Ok(imported)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1010,7 +1276,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
 
@@ -2422,7 +2690,9 @@ mod tests {
                 save_path: String::new(),
                 error_reason: None,
                 retry_count: 0,
+                tags: vec![],
                 hf_meta: None,
+                display_order: 0,
             },
         );
         task_id
@@ -2817,5 +3087,152 @@ mod tests {
     #[test]
     fn test_simple_percent_decode_no_encoding() {
         assert_eq!(simple_percent_decode("filename.zip"), "filename.zip");
+    }
+
+    // --- P4-10: 配置与任务备份导入导出 ---
+
+    fn make_test_snapshot(
+        id: &str,
+        url: &str,
+        status: DownloadState,
+    ) -> tachyon_store::TaskSnapshot {
+        tachyon_store::TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            id: id.to_string(),
+            url: url.to_string(),
+            save_path: format!("/downloads/{id}.bin"),
+            file_name: format!("{id}.bin"),
+            file_size: Some(1024),
+            downloaded: 0,
+            completed_fragments: vec![],
+            partial_fragments: std::collections::HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 256,
+            status,
+            etag: None,
+            last_modified: None,
+            content_length: Some(1024),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip() {
+        let state = test_state();
+        let snapshot =
+            make_test_snapshot("snap-1", "https://example.com/a.bin", DownloadState::Paused);
+        state.infra.task_store.save_snapshot(&snapshot).unwrap();
+        state.domain.task_repository.insert(
+            snapshot.id.clone(),
+            crate::task_store::snapshot_to_task_info(&snapshot),
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        export_backup_inner(&state, path.clone()).await.unwrap();
+
+        let new_state = test_state();
+        let count = import_backup_inner(&new_state, path, false).await.unwrap();
+        assert_eq!(count, 1);
+
+        let task = get_task_detail_inner(&new_state, "snap-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(task.url, "https://example.com/a.bin");
+        assert_eq!(task.status, DownloadState::Paused);
+    }
+
+    #[tokio::test]
+    async fn test_import_corrupt_json_returns_error() {
+        let state = test_state();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "not valid json").unwrap();
+
+        let result =
+            import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), false).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("备份文件格式无效"));
+    }
+
+    #[tokio::test]
+    async fn test_import_merge_skips_duplicate_url() {
+        let state = test_state();
+        let existing = make_test_snapshot(
+            "existing",
+            "https://example.com/dup.bin",
+            DownloadState::Paused,
+        );
+        state.infra.task_store.save_snapshot(&existing).unwrap();
+        state.domain.task_repository.insert(
+            existing.id.clone(),
+            crate::task_store::snapshot_to_task_info(&existing),
+        );
+
+        let imported = make_test_snapshot(
+            "imported",
+            "https://example.com/dup.bin",
+            DownloadState::Completed,
+        );
+        let backup = Backup {
+            version: BACKUP_SCHEMA_VERSION,
+            config: AppConfig::default(),
+            tasks: vec![imported],
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+
+        let count = import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), false)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            get_task_detail_inner(&state, "existing".to_string())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_overwrite_replaces_tasks() {
+        let state = test_state();
+        let old = make_test_snapshot("old", "https://example.com/old.bin", DownloadState::Paused);
+        state.infra.task_store.save_snapshot(&old).unwrap();
+        state.domain.task_repository.insert(
+            old.id.clone(),
+            crate::task_store::snapshot_to_task_info(&old),
+        );
+
+        let new = make_test_snapshot(
+            "new",
+            "https://example.com/new.bin",
+            DownloadState::Completed,
+        );
+        let backup = Backup {
+            version: BACKUP_SCHEMA_VERSION,
+            config: AppConfig::default(),
+            tasks: vec![new],
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+
+        let count = import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), true)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            get_task_detail_inner(&state, "old".to_string())
+                .await
+                .is_err()
+        );
+        let task = get_task_detail_inner(&state, "new".to_string())
+            .await
+            .unwrap();
+        assert_eq!(task.status, DownloadState::Completed);
     }
 }

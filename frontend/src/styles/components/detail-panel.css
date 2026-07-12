@@ -507,3 +507,66 @@
 .detail-action-delete:active {
   transform: scale(0.98);
 }
+
+/* Tags */
+.detail-tags-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.detail-tags-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  letter-spacing: -0.01em;
+}
+
+.detail-tags-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 28px;
+  margin-bottom: 10px;
+}
+
+.detail-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 3px 3px 10px;
+  border-radius: var(--radius-full, 9999px);
+  background: var(--color-bg-hover);
+  border: 1px solid var(--color-border-subtle);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  transition: background 150ms ease;
+}
+
+.detail-tag-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-tag:hover {
+  background: var(--color-bg-active);
+}
+
+.detail-tags-empty {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  padding: 4px 0;
+}
+
+.detail-tags-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.detail-tags-input {
+  flex: 1;
+  min-width: 0;
+}

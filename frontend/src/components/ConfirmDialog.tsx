@@ -1,4 +1,4 @@
-import { createEffect, createSignal, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { CloseIcon, WarningCircleIcon } from "./icons";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -32,6 +32,13 @@ interface ConfirmDialogProps {
   onConfirm: (options: { deleteLocalFile: boolean }) => void;
   /** 取消/关闭回调 */
   onCancel: () => void;
+  /** 额外操作按钮(如导入备份的"合并"),显示在取消与确认按钮之间 */
+  extraActions?: {
+    label: string;
+    onClick: () => void;
+    variant?: "primary" | "secondary" | "danger";
+    loading?: boolean;
+  }[];
 }
 
 /**
@@ -213,6 +220,19 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
             >
               {props.cancelLabel ?? tr("common.cancel")}
             </Button>
+            <For each={props.extraActions}>
+              {(action) => (
+                <Button
+                  variant={action.variant ?? "secondary"}
+                  size="md"
+                  loading={action.loading}
+                  onClick={() => action.onClick()}
+                  disabled={action.loading}
+                >
+                  {action.loading ? tr("common.processing") : action.label}
+                </Button>
+              )}
+            </For>
             <Button
               variant={props.tone === "danger" ? "danger" : "primary"}
               size="md"

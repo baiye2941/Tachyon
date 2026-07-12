@@ -8,6 +8,7 @@ import {
 import { I18nProvider, i18n } from "../../i18n";
 import type { TaskInfo } from "../../types";
 import DetailPanel from "../DetailPanel";
+import { refreshTaskList } from "../../stores/downloads";
 
 const mockApi = vi.hoisted(() => ({
   pauseTask: vi.fn(),
@@ -16,6 +17,8 @@ const mockApi = vi.hoisted(() => ({
   deleteTask: vi.fn(),
   createTask: vi.fn(),
   openFolder: vi.fn(),
+  addTaskTag: vi.fn(),
+  removeTaskTag: vi.fn(),
 }));
 
 vi.mock("../../api/invoke", () => ({
@@ -287,5 +290,38 @@ describe("DetailPanel", () => {
     // 关闭有过渡动画,等待 350ms 后断言回调
     await new Promise((r) => setTimeout(r, 350));
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("应渲染任务标签", async () => {
+    renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
+    await waitForRaf();
+
+    expect(screen.getByText("标签")).toBeTruthy();
+    expect(screen.getByText("ai")).toBeTruthy();
+    expect(screen.getByText("model")).toBeTruthy();
+  });
+
+  it("输入标签并回车应调用 api.addTaskTag 并刷新列表", async () => {
+    renderWithI18n(baseTask);
+    await waitForRaf();
+
+    const input = screen.getByPlaceholderText("输入标签,回车添加");
+    fireEvent.input(input, { target: { value: "ai" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mockApi.addTaskTag).toHaveBeenCalledWith("task-1", "ai");
+    expect(refreshTaskList).toHaveBeenCalled();
+  });
+
+  it("点击标签移除按钮应调用 api.removeTaskTag 并刷新列表", async () => {
+    renderWithI18n({ ...baseTask, tags: ["ai", "model"] });
+    await waitForRaf();
+
+    fireEvent.click(screen.getByRole("button", { name: "移除标签 ai" }));
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mockApi.removeTaskTag).toHaveBeenCalledWith("task-1", "ai");
+    expect(refreshTaskList).toHaveBeenCalled();
   });
 });

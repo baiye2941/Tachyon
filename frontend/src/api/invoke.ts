@@ -101,6 +101,12 @@ export const api = {
   getTaskList: () => invoke<TaskInfo[]>('get_task_list'),
   /** 获取任务详情 */
   getTaskDetail: (taskId: string) => invoke<TaskInfo>('get_task_detail', { taskId }),
+  /** 设置任务标签(全量替换) */
+  setTaskTags: (taskId: string, tags: string[]) => invoke<void>('set_task_tags', { taskId, tags }),
+  /** 添加单个任务标签 */
+  addTaskTag: (taskId: string, tag: string) => invoke<void>('add_task_tag', { taskId, tag }),
+  /** 移除单个任务标签 */
+  removeTaskTag: (taskId: string, tag: string) => invoke<void>('remove_task_tag', { taskId, tag }),
   /** 暂停任务 */
   pauseTask: (taskId: string) => invoke<void>('pause_task', { taskId }),
   /** 恢复任务 */
@@ -166,4 +172,10 @@ export const api = {
   /** 批量创建 HF 下载任务 */
   batchCreateHfTasks: (repoId: string, filePaths: string[], revision?: string, downloadDir?: string) =>
     invoke<string[]>('batch_create_hf_tasks', { repoId, revision, filePaths, downloadDir }),
+  /** 导出配置与任务快照到 JSON 备份文件(破坏性操作,需确认令牌) */
+  exportBackup: (path: string) =>
+    invoke<void>('export_backup', { path }, true),
+  /** 从 JSON 备份文件导入配置与任务快照(破坏性操作,需确认令牌) */
+  importBackup: (path: string, overwrite: boolean) =>
+    invoke<number>('import_backup', { path, overwrite }, true),
 }

@@ -885,7 +885,9 @@ mod tests {
             save_path: "/custom/file.bin".to_string(),
             error_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         };
         state
             .domain

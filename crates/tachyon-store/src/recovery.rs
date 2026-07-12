@@ -14,7 +14,7 @@ use crate::kv::KvStore;
 /// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
 /// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
 /// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// 下载任务快照（用于断点续传）
 ///
@@ -63,8 +63,15 @@ pub struct TaskSnapshot {
     pub fail_reason: Option<String>,
     #[serde(default)]
     pub retry_count: u32,
+    /// 用户自定义任务标签(如 "important"、"model" 等),用于前端分组/过滤。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_meta: Option<serde_json::Value>,
+    /// 任务在列表中的显示顺序,越小越靠前。
+    /// 旧版快照无此字段时默认 0,保持与创建时间降序的兼容排序。
+    #[serde(default)]
+    pub display_order: i64,
 }
 
 /// 下载任务持久化记录（旧接口，保持向后兼容）
@@ -129,7 +136,9 @@ impl From<TaskRecord> for TaskSnapshot {
             updated_at: String::new(),
             fail_reason: None,
             retry_count: 0,
+            tags: Vec::new(),
             hf_meta: None,
+            display_order: 0,
         }
     }
 }
@@ -372,7 +381,9 @@ mod tests {
             updated_at: String::new(),
             fail_reason: None,
             retry_count: 0,
+            tags: vec![],
             hf_meta: None,
+            display_order: 0,
         }
     }
 
@@ -563,7 +574,9 @@ mod tests {
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
             retry_count: 0,
+            tags: vec!["model".to_string(), "important".to_string()],
             hf_meta: None,
+            display_order: 0,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -599,6 +612,8 @@ mod tests {
         assert_eq!(snapshot.schema_version, 0);
         assert_eq!(snapshot.id, "old-task");
         assert_eq!(snapshot.downloaded, 512);
+        // 旧 JSON 无 displayOrder,应默认为 0
+        assert_eq!(snapshot.display_order, 0);
     }
 
     #[test]

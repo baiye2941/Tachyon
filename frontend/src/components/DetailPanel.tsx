@@ -3,6 +3,7 @@ import {
   createMemo,
   createSignal,
   createEffect,
+  For,
   Show,
   onCleanup,
   untrack,
@@ -83,6 +84,9 @@ export default function DetailPanel(props: DetailPanelProps) {
   // 重试 loading 态:防止重复点击(Iteration 16)
   const [retrying, setRetrying] = createSignal(false);
   const [mirrorRetrying, setMirrorRetrying] = createSignal(false);
+  // 标签输入与处理态
+  const [tagInput, setTagInput] = createSignal("");
+  const [tagProcessing, setTagProcessing] = createSignal(false);
 
   // 响应式 + 动效偏好(Iteration 13)
   const isNarrow = useIsNarrowScreen();
@@ -370,6 +374,37 @@ export default function DetailPanel(props: DetailPanelProps) {
       }
     } else {
       addToast(tr("toast.noSavePath"), "info");
+    }
+  };
+
+  const handleAddTag = async () => {
+    const t2 = currentTask();
+    if (!t2) return;
+    const raw = tagInput().trim();
+    if (!raw) return;
+    setTagProcessing(true);
+    try {
+      await api.addTaskTag(t2.id, raw);
+      setTagInput("");
+      await refreshTaskList();
+    } catch (e) {
+      addToast(tr("toast.addTagFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setTagProcessing(false);
+    }
+  };
+
+  const handleRemoveTag = async (tag: string) => {
+    const t2 = currentTask();
+    if (!t2) return;
+    setTagProcessing(true);
+    try {
+      await api.removeTaskTag(t2.id, tag);
+      await refreshTaskList();
+    } catch (e) {
+      addToast(tr("toast.removeTagFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setTagProcessing(false);
     }
   };
 
@@ -748,6 +783,59 @@ export default function DetailPanel(props: DetailPanelProps) {
                 />
               </div>
             </Show>
+          </div>
+
+          {/* Tags */}
+          <div class="detail-section">
+            <div class="detail-tags-header">
+              <span class="detail-tags-title">{t("detail.section.tags")}</span>
+            </div>
+            <div class="detail-tags-list">
+              <For each={task()?.tags ?? []}>
+                {(tag) => (
+                  <span class="detail-tag">
+                    <span class="detail-tag-label">{tag}</span>
+                    <Button
+                      variant="ghost"
+                      shape="icon-sm"
+                      aria-label={t("detail.tagRemoveAria", { tag })}
+                      title={t("detail.tagRemoveAria", { tag })}
+                      disabled={tagProcessing()}
+                      onClick={() => void handleRemoveTag(tag)}
+                    >
+                      <CloseIcon />
+                    </Button>
+                  </span>
+                )}
+              </For>
+              <Show when={!task()?.tags?.length}>
+                <span class="detail-tags-empty">{t("detail.noTags")}</span>
+              </Show>
+            </div>
+            <div class="detail-tags-input-row">
+              <input
+                type="text"
+                class="input detail-tags-input"
+                placeholder={t("detail.tagPlaceholder")}
+                value={tagInput()}
+                onInput={(e) => setTagInput(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleAddTag();
+                  }
+                }}
+                disabled={tagProcessing()}
+              />
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={!tagInput().trim() || tagProcessing()}
+                onClick={() => void handleAddTag()}
+              >
+                {tagProcessing() ? t("common.processing") : t("detail.addTag")}
+              </Button>
+            </div>
           </div>
 
           {/* Speed Chart - collapsible, after stats */}

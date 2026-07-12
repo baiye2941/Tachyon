@@ -28,6 +28,8 @@ export interface TaskInfo {
   errorReason?: string
   /** 任务级重试计数(保留字段,当前恒为 0) */
   retryCount?: number
+  /** 用户自定义任务标签,用于分组/过滤 */
+  tags?: string[]
   /** HF 任务元数据(HuggingFace 模型下载任务特有) */
   hfMeta?: HfTaskMeta
 }

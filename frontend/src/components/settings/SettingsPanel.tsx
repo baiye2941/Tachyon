@@ -11,6 +11,7 @@ import { createStore } from "solid-js/store";
 import { api } from "../../api/invoke";
 import { $config, $configLoading } from "../../stores/settings";
 import { addToast } from "../../stores/toast";
+import { refreshTaskList } from "../../stores/downloads";
 import type { AppConfig, ConfigPatch, HfSourceMode } from "../../types";
 import { CloseIcon } from "../icons";
 import ConfirmDialog from "../ConfirmDialog";
@@ -186,6 +187,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
 
   const [saving, setSaving] = createSignal(false);
   const [confirmOpen, setConfirmOpen] = createSignal(false);
+  // 数据导入/导出
+  const [importConfirmOpen, setImportConfirmOpen] = createSignal(false);
+  const [importPath, setImportPath] = createSignal<string | null>(null);
+  const [importing, setImporting] = createSignal(false);
   // About 标签:支持协议列表 + 应用版本(只读,来自后端)
   const [protocols, setProtocols] = createSignal<string[]>([]);
   const [appVersion, setAppVersion] = createSignal<string>("");
@@ -333,6 +338,63 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     }
   };
 
+  const handleExportBackup = async () => {
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        defaultPath: "tachyon-backup.json",
+      });
+      if (typeof path !== "string") {
+        return;
+      }
+      await api.exportBackup(path);
+      addToast(tr("toast.exportBackupSuccess"), "success");
+    } catch (e) {
+      addToast(tr("toast.exportBackupFailed", { error: errorMessage(e) }), "error");
+    }
+  };
+
+  const handleImportBackup = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        multiple: false,
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      setImportPath(selected);
+      setImportConfirmOpen(true);
+    } catch (e) {
+      addToast(tr("toast.importBackupFailed", { error: errorMessage(e) }), "error");
+    }
+  };
+
+  const executeImport = async (overwrite: boolean) => {
+    const path = importPath();
+    if (!path) {
+      return;
+    }
+    setImporting(true);
+    try {
+      const count = await api.importBackup(path, overwrite);
+      // 导入后重新加载配置与任务列表,确保前端状态与后端一致
+      const fresh = await api.getConfig();
+      $config.set(fresh);
+      applyConfig(fresh);
+      await refreshTaskList();
+      addToast(tr("toast.importBackupSuccess", { count }), "success");
+    } catch (e) {
+      addToast(tr("toast.importBackupFailed", { error: errorMessage(e) }), "error");
+    } finally {
+      setImporting(false);
+      setImportConfirmOpen(false);
+      setImportPath(null);
+    }
+  };
+
   const tabContent = () => {
     const tab = activeTab();
     switch (tab) {
@@ -342,6 +404,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
             draft={draft}
             setDraft={setDraft}
             onChooseDownloadDir={handleChooseDownloadDir}
+            onExportBackup={handleExportBackup}
+            onImportBackup={handleImportBackup}
           />
         );
       case "download":
@@ -527,6 +591,30 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         loading={saving()}
         onConfirm={handleConfirmSave}
         onCancel={() => setConfirmOpen(false)}
+      />
+
+      {/* 数据导入确认对话框:覆盖 / 合并 */}
+      <ConfirmDialog
+        open={importConfirmOpen()}
+        title={t("settings.backup.importConfirmTitle")}
+        message={t("settings.backup.importConfirmMessage")}
+        confirmLabel={t("settings.backup.importConfirmOverwrite")}
+        cancelLabel={t("common.cancel")}
+        tone="danger"
+        loading={importing()}
+        extraActions={[
+          {
+            label: t("settings.backup.importConfirmMerge"),
+            onClick: () => executeImport(false),
+            variant: "secondary",
+            loading: importing(),
+          },
+        ]}
+        onConfirm={() => executeImport(true)}
+        onCancel={() => {
+          setImportConfirmOpen(false);
+          setImportPath(null);
+        }}
       />
     </Show>
   );
