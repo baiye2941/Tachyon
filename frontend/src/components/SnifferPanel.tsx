@@ -10,6 +10,7 @@ import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
 import { addToast } from '../stores/toast'
 import { requestConfirm } from '../stores/confirm'
+import { useFocusTrap } from '../hooks/useFocusTrap'
 
 const typeColors: Record<string, string> = {
   video: 'var(--color-file-video)',
@@ -55,6 +56,14 @@ export default function SnifferPanel(props: SnifferPanelProps) {
   const [urlInput, setUrlInput] = createSignal('')
   const [configOpen, setConfigOpen] = createSignal(false)
   const [filterInput, setFilterInput] = createSignal('')
+
+  // 焦点陷阱:与 ConfirmDialog/NewTaskModal 一致,捕获 Tab/Esc,防止焦点逃逸到背景
+  let panelRef: HTMLDivElement | undefined
+  useFocusTrap({
+    active: () => props.visible,
+    container: () => panelRef,
+    onEscape: () => props.onClose(),
+  })
 
   const types = () => ['all', 'video', 'audio', 'document', 'archive', 'executable', 'image', 'other'] as const
 
@@ -155,6 +164,7 @@ export default function SnifferPanel(props: SnifferPanelProps) {
 
   return (
     <div
+      ref={panelRef}
       class="slide-panel"
       role="dialog"
       aria-modal="true"

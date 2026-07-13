@@ -106,12 +106,14 @@ pub enum IoStrategy {
 | `gpu` | 禁用 | GPU 加速哈希校验（wgpu，实验性） |
 
 ```bash
-# 仅 HTTP，最小二进制
-cargo build --no-default-features
-
-# HTTP + Magnet（同默认）
+# HTTP + Magnet（默认）
 cargo build
-cargo build --features magnet
+
+# 注意:根包当前未定义 feature 开关,`--no-default-features` 不会裁剪磁力支持
+# (磁力由 tachyon-protocol 的 default feature 控制)。如需最小 HTTP 构建,
+# 需在 tachyon-protocol 层关闭 default-features:
+#   cargo build -p tachyon-protocol --no-default-features
+cargo build
 
 # 启用 QUIC / HTTP3（reqwest http3 标记为 unstable，须注入 cfg）
 RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
@@ -151,9 +153,9 @@ cargo build
 # 发布构建
 cargo build --release
 
-# Feature 裁剪
-cargo build --no-default-features                    # 仅 HTTP
-cargo build --features magnet                        # HTTP + Magnet（同默认）
+# Feature 裁剪(注意:根包未定义 feature,以下需在 tachyon-protocol 层执行)
+# cargo build -p tachyon-protocol --no-default-features   # 仅 HTTP(关闭磁力)
+# cargo build -p tachyon-protocol --features magnet       # HTTP + Magnet(同默认)
 RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3  # 启用 QUIC/HTTP3
 ```
 
@@ -224,7 +226,7 @@ cd frontend && bun run build
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
 | QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
-| 无 SOCKS/HTTP 代理支持 | 当前 `HttpClient` 直接使用 reqwest，未暴露代理配置接口 |
+| HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。注意:代理模式下最终目标 IP 由代理解析,本地公网过滤不覆盖代理后端(信任边界由代理决定) |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
 | 前端仅支持中/英双语 | `solid-i18n` 当前仅配置 zh-CN 和 en-US |
 | BitTorrent Magnet 已支持分片并发 | 单文件 magnet 走 `download_range_stream`（基于 librqbit `FileStream`）进入引擎多 worker 分片路径；多文件 magnet 仍回退整文件流式 |
@@ -242,7 +244,7 @@ cd frontend && bun run build
 5. 确保 `cargo clippy --all-targets --all-features -- -D warnings` 零警告。
 6. 确保 `cargo fmt --all -- --check` 通过。
 7. 新功能需附带测试，核心 crate 覆盖率不低于 90%。
-8. 协议层改动需验证 `--no-default-features` 编译通过。
+8. 协议层改动需验证 `cargo build -p tachyon-protocol --no-default-features` 编译通过。
 9. 所有 unsafe 代码必须有 Safety 注释。
 10. 提交 PR 前运行本地 CI 预检命令全绿：
 

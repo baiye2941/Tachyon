@@ -13,6 +13,7 @@ import Button from '../shared/ui/Button'
 import EmptyState from '../shared/ui/EmptyState'
 import ErrorState from '../shared/ui/ErrorState'
 import { tr } from '../i18n'
+import { useFocusTrap } from '../hooks/useFocusTrap'
 
 interface HfBrowserPanelProps {
   visible: boolean
@@ -247,6 +248,14 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   const error = () => $hub.error()
   let inputRef: HTMLInputElement | undefined
 
+  // 焦点陷阱:与 ConfirmDialog/NewTaskModal 一致,捕获 Tab/Esc,防止焦点逃逸到背景
+  let panelRef: HTMLDivElement | undefined
+  useFocusTrap({
+    active: () => props.visible,
+    container: () => panelRef,
+    onEscape: () => props.onClose(),
+  })
+
   const handleBrowse = async () => {
     const id = repoId().trim()
     if (!id) {
@@ -417,6 +426,7 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
 
       {/* Panel(Iteration 06 DI-4:移除玻璃拟态,实色 + token 化) */}
       <div
+        ref={panelRef}
         class="fixed z-[var(--z-panel-content)] flex flex-col hf-panel"
         role="dialog"
         aria-modal="true"

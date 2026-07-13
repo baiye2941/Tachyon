@@ -125,6 +125,11 @@ pub fn run() {
                                 corrupt_keys,
                                 count,
                             };
+                            // P1-22-3: setup 阶段前端事件监听器尚未注册,直接 emit 会被漏接。
+                            // 暂存到 AppState,前端 mount 时通过 get_recovery_warning 命令拉取,
+                            // 双保险确保告警不丢失。
+                            *state.runtime.recovery_warning.lock().await =
+                                Some(warning.clone());
                             let _ = handle.emit("recovery-warning", &warning);
                         }
                     }
@@ -147,6 +152,8 @@ pub fn run() {
             supported_protocols,
             // 确认令牌(P1-11b)
             request_confirmation,
+            // 启动恢复告警(P1-22-3)
+            get_recovery_warning,
             // 任务管理
             create_task,
             probe_filename,
@@ -160,6 +167,8 @@ pub fn run() {
             move_task,
             get_task_list,
             get_task_detail,
+            open_task_folder,
+            open_folder_under_download_root,
             set_task_tags,
             add_task_tag,
             remove_task_tag,

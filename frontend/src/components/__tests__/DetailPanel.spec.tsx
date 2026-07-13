@@ -211,14 +211,14 @@ describe("DetailPanel", () => {
     );
   });
 
-  it("点击打开文件夹应调用 api.openFolder 并传入父目录", async () => {
+  it("点击打开文件夹应调用 api.openFolder 并传入任务 id(P1-21 后端校验)", async () => {
     await renderWithI18n(baseTask);
     await waitForRaf();
 
     fireEvent.click(screen.getByRole("button", { name: "打开文件夹" }));
 
     expect(mockApi.openFolder).toHaveBeenCalledWith(
-      "D:\\Downloads",
+      "task-1",
     );
   });
 

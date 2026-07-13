@@ -7,7 +7,7 @@ import type {
   ModelSourceFilter,
 } from '../types'
 import { getParentDirectory } from "../utils/path"
-import { CloseIcon, FolderOpenIcon, RefreshIcon, TrashIcon } from './icons'
+import { CloseIcon, FolderOpenIcon, RefreshIcon } from './icons'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
 import { formatSize } from '../utils/format'
@@ -157,10 +157,6 @@ export default function ModelDetail(props: ModelDetailProps) {
     }
   }
 
-  const handleDeleteLocal = async () => {
-    addToast(tr("toast.deleteLocalNotImplemented"), "info")
-  }
-
   const handleRedownload = async () => {
     const id = repoId()
     if (!id) return
@@ -180,7 +176,8 @@ export default function ModelDetail(props: ModelDetailProps) {
   const handleOpenDir = async () => {
     if (isLocalModel(props.model)) {
       try {
-        await api.openFolder(getParentDirectory((props.model as LocalModel).localPath))
+        // 本地模型路径来自已完成任务 save_path 的父目录,经后端校验在下载根目录内(P1-21)
+        await api.openFolderUnderRoot(getParentDirectory((props.model as LocalModel).localPath))
       } catch {
         addToast(tr('toast.openFolderFailed'), 'error')
       }
@@ -452,10 +449,6 @@ export default function ModelDetail(props: ModelDetailProps) {
               >
                 <RefreshIcon />
                 {tr('hub.action.verify')}
-              </Button>
-              <Button variant="secondary" size="sm" onClick={handleDeleteLocal}>
-                <TrashIcon />
-                {tr('hub.action.deleteLocal')}
               </Button>
               <Button variant="secondary" size="sm" onClick={handleRedownload}>
                 <RefreshIcon />

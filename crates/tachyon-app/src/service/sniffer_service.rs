@@ -16,6 +16,11 @@ use uuid::Uuid;
 
 use crate::commands::{AppError, resource_type_to_string};
 
+/// 过滤规则长度上限(与 add_filter 一致)
+const MAX_FILTER_LENGTH: usize = 256;
+/// 过滤规则数量上限(与 add_filter 一致)
+const MAX_FILTER_COUNT: usize = 100;
+
 /// 嗅探器应用服务
 ///
 /// 负责嗅探器相关的业务逻辑：
@@ -46,8 +51,42 @@ impl SnifferService {
     }
 
     /// 更新捕获配置
-    pub async fn set_capture_config(&self, config: CaptureConfig) {
+    ///
+    /// 与 [`add_filter`](Self::add_filter) 应用相同的校验规则,避免
+    /// set_capture_config 旁路绕过单条过滤器的长度/数量/重复约束(P1-22-5):
+    /// - 每条 url_filter 非空且长度 <= MAX_FILTER_LENGTH
+    /// - url_filters 总数 <= MAX_FILTER_COUNT
+    /// - url_filters 无重复
+    /// - min_size 非负(u64 天然 >= 0,保留显式校验以明确语义)
+    pub async fn set_capture_config(&self, config: CaptureConfig) -> Result<(), AppError> {
+        for f in &config.url_filters {
+            if f.is_empty() {
+                return Err(AppError::Config("过滤规则不能为空".to_string()));
+            }
+            if f.len() > MAX_FILTER_LENGTH {
+                return Err(AppError::Config(format!(
+                    "过滤规则长度不能超过 {MAX_FILTER_LENGTH} 字符"
+                )));
+            }
+        }
+        if config.url_filters.len() > MAX_FILTER_COUNT {
+            return Err(AppError::Config(format!(
+                "过滤规则数量已达上限 {MAX_FILTER_COUNT}"
+            )));
+        }
+        // 去重检查:O(n^2) 在 MAX_FILTER_COUNT=100 下可接受,避免额外哈希分配
+        let mut seen = std::collections::HashSet::with_capacity(config.url_filters.len());
+        for f in &config.url_filters {
+            if !seen.insert(f.as_str()) {
+                return Err(AppError::Config("过滤规则已存在".to_string()));
+            }
+        }
+        // min_size 为 u64,天然 >= 0;显式校验语义清晰(未来若改 i64 需拦截负数)
+        if config.min_size > i64::MAX as u64 {
+            return Err(AppError::Config("最小文件大小值非法".to_string()));
+        }
         *self.capture_config.write().await = config;
+        Ok(())
     }
 
     /// 获取所有资源（按发现时间倒序）
@@ -121,14 +160,12 @@ impl SnifferService {
         if filter.is_empty() {
             return Err(AppError::Config("过滤规则不能为空".to_string()));
         }
-        const MAX_FILTER_LENGTH: usize = 256;
         if filter.len() > MAX_FILTER_LENGTH {
             return Err(AppError::Config(format!(
                 "过滤规则长度不能超过 {MAX_FILTER_LENGTH} 字符"
             )));
         }
         let mut config = self.capture_config.write().await;
-        const MAX_FILTER_COUNT: usize = 100;
         if config.url_filters.len() >= MAX_FILTER_COUNT {
             return Err(AppError::Config(format!(
                 "过滤规则数量已达上限 {MAX_FILTER_COUNT}"
@@ -309,7 +346,7 @@ mod tests {
         let mut cfg = service.capture_config().await;
         cfg.enabled_types
             .remove(&tachyon_sniffer::capture::ResourceType::Video);
-        service.set_capture_config(cfg).await;
+        service.set_capture_config(cfg).await.unwrap();
         let result = service
             .add_resource("http://example.com/movie.mp4".to_string())
             .await;
@@ -325,5 +362,62 @@ mod tests {
             .add_resource("http://example.com/movie.mp4".to_string())
             .await;
         assert!(result.is_some(), "默认配置应捕获视频");
+    }
+
+    // P1-22-5: set_capture_config 必须与 add_filter 应用相同校验,禁止旁路绕过
+
+    #[tokio::test]
+    async fn test_set_capture_config_rejects_empty_filter() {
+        let service = SnifferService::new();
+        let mut cfg = service.capture_config().await;
+        cfg.url_filters.push(String::new());
+        let result = service.set_capture_config(cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("不能为空"));
+    }
+
+    #[tokio::test]
+    async fn test_set_capture_config_rejects_too_long_filter() {
+        let service = SnifferService::new();
+        let mut cfg = service.capture_config().await;
+        cfg.url_filters.push("a".repeat(257));
+        let result = service.set_capture_config(cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("长度不能超过"));
+    }
+
+    #[tokio::test]
+    async fn test_set_capture_config_rejects_too_many_filters() {
+        let service = SnifferService::new();
+        let mut cfg = service.capture_config().await;
+        cfg.url_filters = (0..101).map(|i| format!("filter-{i}")).collect();
+        let result = service.set_capture_config(cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("上限"));
+    }
+
+    #[tokio::test]
+    async fn test_set_capture_config_rejects_duplicate_filters() {
+        let service = SnifferService::new();
+        let mut cfg = service.capture_config().await;
+        cfg.url_filters = vec!["cdn.example.com".to_string(), "cdn.example.com".to_string()];
+        let result = service.set_capture_config(cfg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("已存在"));
+    }
+
+    #[tokio::test]
+    async fn test_set_capture_config_accepts_valid() {
+        let service = SnifferService::new();
+        let mut cfg = service.capture_config().await;
+        cfg.url_filters = vec![
+            "cdn.example.com".to_string(),
+            "cdn2.example.com".to_string(),
+        ];
+        cfg.min_size = 4096;
+        service.set_capture_config(cfg.clone()).await.unwrap();
+        let got = service.capture_config().await;
+        assert_eq!(got.url_filters, cfg.url_filters);
+        assert_eq!(got.min_size, 4096);
     }
 }

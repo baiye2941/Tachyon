@@ -109,6 +109,7 @@ fn build_initial_progress_event(
                     file_size: t.file_size,
                     completed_delta: vec![],
                     started_delta: vec![],
+                    error_reason: None,
                 },
             )
         })
@@ -276,6 +277,7 @@ mod tests {
             file_size: None,
             completed_delta: vec![],
             started_delta: vec![],
+            error_reason: None,
         };
         let mut last = HashMap::new();
         last.insert("t1".to_string(), tp.clone());
@@ -302,6 +304,7 @@ mod tests {
                 file_size: None,
                 completed_delta: vec![],
                 started_delta: vec![],
+                error_reason: None,
             },
         );
         last.insert(
@@ -318,6 +321,7 @@ mod tests {
                 file_size: None,
                 completed_delta: vec![],
                 started_delta: vec![],
+                error_reason: None,
             },
         );
 
@@ -354,6 +358,7 @@ mod tests {
                 file_size: None,
                 completed_delta: vec![],
                 started_delta: vec![],
+                error_reason: None,
             },
         );
 
@@ -384,6 +389,7 @@ mod tests {
                 file_size: None,
                 completed_delta: vec![],
                 started_delta: vec![],
+                error_reason: None,
             },
         );
 

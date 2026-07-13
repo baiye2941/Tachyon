@@ -54,16 +54,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy 零告警
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force cargo-nextest
 
       - name: 运行测试(nextest, 失败重试 2 次)
-        run: cargo nextest run --all --retries 2
+        run: cargo nextest run --all --locked --retries 2
 
       - name: 文档构建(零警告)
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -85,7 +85,7 @@ jobs:
             echo "::group::覆盖率: $crate"
             cargo llvm-cov -p "$crate" \
               --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
-              --fail-under-lines 90 --summary-only
+              --fail-under-regions 90 --summary-only
             echo "::endgroup::"
           done
 

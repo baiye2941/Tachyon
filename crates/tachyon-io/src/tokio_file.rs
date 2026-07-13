@@ -13,6 +13,9 @@ mod win_share {
     pub const FILE_SHARE_READ: u32 = 0x00000001;
     pub const FILE_SHARE_WRITE: u32 = 0x00000002;
     pub const FILE_SHARE_DELETE: u32 = 0x00000004;
+    /// 不跟随重解析点(symlink/junction)。FIX-09: 关闭 validate_save_path 与最终 open
+    /// 之间的最终组件 TOCTOU。详见 winio::win_flags::FILE_FLAG_OPEN_REPARSE_POINT。
+    pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
 }
 
 pub struct TokioFile {
@@ -41,6 +44,7 @@ impl TokioFile {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&path)?;
         Ok(Self {
@@ -50,19 +54,24 @@ impl TokioFile {
         })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     pub async fn open<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
         Self::open_sync(path).map_err(DownloadError::Io)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref().to_path_buf();
+        // FIX-09: O_NOFOLLOW 防止 validate_save_path 与最终 open 之间的最终组件 TOCTOU。
+        // 若最终路径组件是符号链接,open 失败(ELOOP)而非跟随。对新文件创建无影响。
+        // 注意:仅保护最终组件;中间目录被替换为符号链接是残留 TOCTOU,需 openat/handle 化打开。
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
         Ok(Self {
             path,

@@ -97,8 +97,8 @@ cargo build
 # 发布构建
 cargo build --release
 
-# 仅 HTTP，最小二进制
-cargo build --no-default-features
+# 默认包含 HTTP + Magnet(根包未定义 feature 开关,如需仅 HTTP 请在 tachyon-protocol 层关闭)
+cargo build
 ```
 
 ### 开发模式

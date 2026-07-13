@@ -301,9 +301,11 @@ Tauri 层暴露的 HF 命令包括：浏览仓库文件、获取下载 URL、获
 | `RecoveryManager` | 任务快照恢复，过滤已完成/已取消任务 |
 | `TaskSnapshot` / `TaskRecord` | 快照数据结构 |
 
-### 4.10 tachyon-app — Tauri 应用入口
+### 4.10 tachyon-app - Tauri 应用入口
 
-**注册的 Tauri IPC 命令**（当前约 20 个）：
+> **已知技术债（分层）**：`tachyon-app` 当前直接依赖 `tachyon-io::BufferPool`、`tachyon-scheduler::AdaptiveDownloadScheduler`、`tachyon-crypto::CpuVerifier`，绕过 `tachyon-engine` 封装。按 AGENTS.md 分层规则（core > {protocol,io,crypto,scheduler} > engine > app），这些组装应经 `tachyon-engine` 的工厂/配置化入口暴露，避免应用层跨层选具体部件。后续重构应收敛为一个引擎拥有的组装入口。
+
+**注册的 Tauri IPC 命令**（当前 41 个）：
 
 | 分类 | 命令 |
 |------|------|
@@ -365,7 +367,7 @@ flowchart TD
     RECOVER --> CHECK{"有损坏快照?"}
     CHECK -->|是| WARN["emit recovery-warning 事件通知前端"]
     CHECK -->|否| REGISTER
-    WARN --> REGISTER["注册约 20 个 Tauri IPC 命令"]
+    WARN --> REGISTER["注册 41 个 Tauri IPC 命令"]
     REGISTER --> RUN["tauri::run() 进入事件循环"]
 ```
 

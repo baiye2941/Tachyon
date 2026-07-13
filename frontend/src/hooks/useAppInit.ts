@@ -76,6 +76,25 @@ export function useAppInit(
       return (() => {}) as (() => void);
     });
 
+    // P1-22-3: setup 阶段在事件监听器注册前可能已 emit `recovery-warning`,
+    // 上述 listener 会漏接。mount 时主动拉取暂存的告警补全该遗漏事件。
+    api
+      .getRecoveryWarning()
+      .then((payload) => {
+        if (payload && payload.count > 0) {
+          addToast(
+            tr("toast.recoveryWarning", { count: payload.count }),
+            "info",
+          );
+        }
+      })
+      .catch((e) =>
+        addToast(
+          tr("toast.recoveryListenFailed", { error: errorMessage(e) }),
+          "error",
+        ),
+      );
+
     // 监听新嗅探资源事件,实时追加到列表
     const snifferUnlistenPromise = onSnifferResourceAdded((resource) => {
       addSnifferResource(resource);

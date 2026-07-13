@@ -1423,7 +1423,14 @@ impl DownloadTask {
             "使用调度器并发建议"
         );
 
-        let semaphore = Arc::new(Semaphore::new(effective_concurrency));
+        // FIX-05: Semaphore 作为硬上限(防 OOM)应用配置最大值 max_concurrent_fragments，
+        // 而非初始建议值 effective_concurrency。ConcurrencyController.should_spawn() 作为
+        // 软目标门禁(active < target)，实现动态升降:上调时 should_spawn 放行、Semaphore 有余量；
+        // 下调时 should_spawn 阻止新 spawn、在途任务自然完成。旧实现用 effective_concurrency
+        // 构造 Semaphore，导致初始建议为 1 时即便后续 set_target(4) 也无法超过 1 个在途。
+        let semaphore = Arc::new(Semaphore::new(
+            self.config.max_concurrent_fragments as usize,
+        ));
         // 闭环并发控制(P2-5):ConcurrencyController 维护 active/target,
         // 可升可降(set_target)。Semaphore 作为硬上限(permits RAII),
         // Controller 作为软目标(动态调优)。spawn 前检查 should_spawn()。

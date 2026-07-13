@@ -669,6 +669,111 @@ pub async fn get_task_detail(
     get_task_detail_inner(&state, task_id).await
 }
 
+/// 在系统文件管理器中打开任务文件所在目录(P1-21)
+///
+/// 替代前端 `shell.open`,移除前端 `shell:allow-open` 权限后由后端统一控制:
+/// - 按 task_id 查找任务,取其 save_path 的父目录
+/// - canonicalize 后校验该目录位于配置的 download_dir 之内,拒绝路径逃逸
+/// - 通过 OS 原生命令打开(Windows: explorer / macOS: open / Linux: xdg-open)
+///
+/// 安全边界:仅能打开下载根目录内的路径,防止 save_path 被污染后打开任意目录。
+#[tauri::command]
+pub async fn open_task_folder(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), AppError> {
+    // 查找任务并取 save_path 的父目录
+    let task = state.service.task_service.get_task_detail(&task_id)?;
+    let save_path = std::path::Path::new(&task.save_path);
+    let target_dir = save_path
+        .parent()
+        .ok_or_else(|| AppError::Config("任务保存路径无父目录".to_string()))?;
+    open_dir_under_download_root(&state, target_dir.to_path_buf()).await
+}
+
+/// 在系统文件管理器中打开指定目录(P1-21)
+///
+/// 用于历史记录/本地模型等不在任务仓库中的场景:调用方传入完整路径,
+/// 后端校验该路径位于配置的 download_dir 之内后打开,拒绝路径逃逸。
+#[tauri::command]
+pub async fn open_folder_under_download_root(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), AppError> {
+    let target = std::path::PathBuf::from(path);
+    open_dir_under_download_root(&state, target).await
+}
+
+/// 校验 target 目录位于配置的 download_dir 之内,并通过 OS 文件管理器打开
+async fn open_dir_under_download_root(
+    state: &AppState,
+    target: std::path::PathBuf,
+) -> Result<(), AppError> {
+    // 读取配置的 download_dir 作为安全边界
+    let download_dir_str = {
+        let cfg = state.domain.config.lock().await;
+        cfg.download.download_dir.clone()
+    };
+    let download_root = std::path::PathBuf::from(&download_dir_str);
+
+    // canonicalize 双方后做前缀校验,拒绝路径逃逸
+    // (canonicalize 要求路径存在;目标目录在任务完成后均应存在,
+    //  不存在则视为非法,直接拒绝)
+    let canon_target = tokio::task::spawn_blocking(move || target.canonicalize())
+        .await
+        .map_err(|e| AppError::Config(format!("路径规范化失败: {e}")))?
+        .map_err(|e| AppError::Config(format!("目标目录不可访问: {e}")))?;
+
+    let canon_root = tokio::task::spawn_blocking(move || download_root.canonicalize())
+        .await
+        .map_err(|e| AppError::Config(format!("路径规范化失败: {e}")))?
+        .map_err(|e| AppError::Config(format!("下载根目录不可访问: {e}")))?;
+
+    if !canon_target.starts_with(&canon_root) {
+        tracing::warn!(
+            target = %canon_target.display(),
+            root = %canon_root.display(),
+            "拒绝打开下载根目录之外的路径"
+        );
+        return Err(AppError::Config("路径不在下载目录范围内".to_string()));
+    }
+
+    // 通过 OS 原生命令打开文件管理器(独立后台进程,不阻塞)
+    let target_str = canon_target.to_string_lossy().to_string();
+    tokio::task::spawn_blocking(move || {
+        let result = open_in_file_manager(&target_str);
+        if let Err(e) = result {
+            tracing::warn!(error = %e, path = %target_str, "打开文件管理器失败");
+        }
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("打开文件管理器任务失败: {e}")))?;
+    Ok(())
+}
+
+/// 跨平台调用系统文件管理器打开指定目录
+fn open_in_file_manager(path: &str) -> std::io::Result<()> {
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    // 文件管理器是长生命周期独立进程,无需等待其退出
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_task_tags(
     state: tauri::State<'_, AppState>,

@@ -65,6 +65,26 @@ export default function GeneralTab(props: GeneralTabProps) {
         {t("settings.notifications.enabledHint")}
       </div>
 
+      {/* P1-23-A: 剪贴板监听开关 */}
+      <ToggleItem
+        label={t("settings.clipboard.enableWatch")}
+        value={props.draft.clipboard.enableWatch}
+        onChange={(v) => props.setDraft("clipboard", "enableWatch", v)}
+      />
+      <div
+        style={{
+          "font-size": "11px",
+          color: props.draft.clipboard.enableWatch
+            ? "var(--color-warning)"
+            : "var(--color-text-tertiary)",
+          "margin-top": "-12px",
+        }}
+      >
+        {props.draft.clipboard.enableWatch
+          ? t("settings.clipboard.restartRequired")
+          : t("settings.clipboard.enableWatchHint")}
+      </div>
+
       <div
         style={{
           "border-top": "1px solid var(--color-border-subtle)",

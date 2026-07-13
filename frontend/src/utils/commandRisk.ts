@@ -45,6 +45,10 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   verify_model: 'safe',
   list_model_favorites: 'safe',
   request_confirmation: 'safe',
+  // P1-21/P1-22-3: 后端校验型只读/打开命令,无数据变更
+  open_task_folder: 'safe',
+  open_folder_under_download_root: 'safe',
+  get_recovery_warning: 'safe',
   // 状态变更 / 网络触发
   pause_task: 'mutate',
   resume_task: 'mutate',

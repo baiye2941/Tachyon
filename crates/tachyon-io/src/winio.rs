@@ -13,6 +13,11 @@ use crate::storage::AsyncStorage;
 mod win_flags {
     pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
     pub const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+    /// 不跟随重解析点(symlink/junction)。FIX-09: 防止 validate_save_path 与最终 open
+    /// 之间的 TOCTOU——攻击者在验证后、打开前把目标目录项替换为重解析点时,
+    /// 该标志使 open 不跟随到重解析目标,而是打开重解析点本身(或失败),
+    /// 避免写入被重定向到未授权位置。对新文件创建无影响(尚无重解析点)。
+    pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
     pub const FILE_SHARE_READ: u32 = 0x00000001;
     pub const FILE_SHARE_WRITE: u32 = 0x00000002;
     pub const FILE_SHARE_DELETE: u32 = 0x00000004;
@@ -56,7 +61,9 @@ impl WinFile {
             .write(true)
             .create(true)
             .truncate(false)
-            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN)
+            .custom_flags(
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&path)
             .map_err(DownloadError::Io)?;
@@ -79,6 +86,7 @@ impl WinFile {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&path)
             .map_err(DownloadError::Io)?;

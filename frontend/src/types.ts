@@ -107,6 +107,14 @@ export interface NotificationsConfig {
   enabled: boolean
 }
 
+/** 剪贴板监听配置(与后端 ClipboardConfig 对齐,camelCase) */
+export interface ClipboardConfig {
+  /** 是否启用剪贴板监听,默认 false */
+  enableWatch?: boolean
+  /** 轮询间隔(毫秒),默认 1000 */
+  pollIntervalMs?: number
+}
+
 export interface AppConfig {
   maxConcurrentTasks: number
   download: DownloadConfig
@@ -115,9 +123,11 @@ export interface AppConfig {
   magnet: MagnetConfig
   hub: HubConfig
   notifications: NotificationsConfig
+  /** 剪贴板监听配置(P1-23-A) */
+  clipboard?: ClipboardConfig
 }
 
-/** 配置白名单补丁 — 仅包含允许前端修改的字段 */
+/** 配置白名单补丁 - 仅包含允许前端修改的字段 */
 export interface ConfigPatch {
   maxConcurrentTasks?: number
   download?: DownloadPatch
@@ -126,6 +136,14 @@ export interface ConfigPatch {
   scheduler?: SchedulerPatch
   hub?: HubPatch
   notifications?: NotificationsPatch
+  /** 剪贴板监听配置补丁(P1-23-A) */
+  clipboard?: ClipboardPatch
+}
+
+/** 剪贴板监听配置白名单补丁(P1-23-A) */
+export interface ClipboardPatch {
+  enableWatch?: boolean
+  pollIntervalMs?: number
 }
 
 /** 系统通知配置白名单补丁 */
@@ -233,6 +251,8 @@ export interface ProgressPayload {
   completedDelta?: number[]
   /** 本周期新开始下载的分片索引增量(后端 Started 事件累积) */
   startedDelta?: number[]
+  /** 任务失败原因。Failed 终态时由后端写入,UI 无需等待 get_task_list 全量刷新即可展示错误详情(P1-22-4) */
+  errorReason?: string | null
 }
 
 export type ProgressEvent = Record<string, ProgressPayload>

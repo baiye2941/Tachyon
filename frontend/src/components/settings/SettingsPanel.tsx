@@ -86,6 +86,10 @@ export interface ConfigDraft {
   notifications: {
     enabled: boolean;
   };
+  clipboard: {
+    enableWatch: boolean;
+    pollIntervalMs: number;
+  };
 }
 
 const tabs: { id: SettingsTab; labelKey: MessageKey }[] = [
@@ -189,6 +193,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     notifications: {
       enabled: true,
     },
+    clipboard: {
+      enableWatch: false,
+      pollIntervalMs: 1000,
+    },
   });
 
   const [saving, setSaving] = createSignal(false);
@@ -244,6 +252,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       },
       notifications: {
         enabled: cfg.notifications?.enabled ?? true,
+      },
+      clipboard: {
+        enableWatch: cfg.clipboard?.enableWatch ?? false,
+        pollIntervalMs: cfg.clipboard?.pollIntervalMs ?? 1000,
       },
     });
   };
@@ -313,6 +325,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       },
       notifications: {
         enabled: draft.notifications.enabled,
+      },
+      clipboard: {
+        enableWatch: draft.clipboard.enableWatch,
+        pollIntervalMs: draft.clipboard.pollIntervalMs,
       },
     };
   };
@@ -592,7 +608,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
                 variant="secondary"
                 size="sm"
                 loading={importing()}
-                onClick={() => setImportConfirmOpen(true)}
+                onClick={handleImportBackup}
               >
                 {t("settings.importBackup")}
               </Button>

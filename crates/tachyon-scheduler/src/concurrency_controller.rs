@@ -245,4 +245,37 @@ mod tests {
         ctrl.set_target(6);
         assert!(ctrl.should_spawn(), "active=1 < target=6 应可 spawn");
     }
+
+    /// FIX-05 回归:动态并发上调不被固定信号量容量阻断。
+    ///
+    /// 旧实现 Semaphore 以初始建议值(可为 1)构造,即便 set_target(4) 后 should_spawn()
+    /// 放行,新任务仍 acquire 不到 permit,在途永不超过 1。修复后 Semaphore 以 hard_limit
+    /// (= max_concurrent_fragments) 构造,should_spawn() 作为唯一软目标门禁。
+    ///
+    /// 本测试验证控制器语义:初始 target=1,hard_limit=4;set_target(4) 后应允许 4 个
+    /// 并发 spawn(active 0→4 全部 should_spawn=true),且不触达硬上限。
+    #[test]
+    fn test_fix05_scale_up_not_blocked_by_initial_target() {
+        // 模拟初始建议=1,配置硬上限=4
+        let ctrl = ConcurrencyController::new(1, 4);
+        assert_eq!(ctrl.target(), 1);
+        assert!(ctrl.should_spawn(), "active=0 < target=1 可 spawn");
+        // 初始 target=1 下只能 spawn 1 个
+        ctrl.record_spawn();
+        assert_eq!(ctrl.active(), 1);
+        assert!(!ctrl.should_spawn(), "active=1 >= target=1 应阻止 spawn");
+
+        // 调度器重采样后建议上调到 4
+        ctrl.set_target(4);
+        assert_eq!(ctrl.target(), 4);
+        // 现在应能继续 spawn 到 4 个(active 1→4 全部放行)
+        assert!(ctrl.should_spawn(), "active=1 < target=4 应可 spawn");
+        ctrl.record_spawn();
+        ctrl.record_spawn();
+        ctrl.record_spawn();
+        assert_eq!(ctrl.active(), 4);
+        assert!(!ctrl.should_spawn(), "active=4 >= target=4 应阻止 spawn");
+        // 未触达硬上限 4(若信号量以 hard_limit 构造,4 个 permit 恰好满足)
+        assert_eq!(ctrl.hard_limit(), 4);
+    }
 }

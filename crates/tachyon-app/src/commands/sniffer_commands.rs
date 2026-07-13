@@ -45,8 +45,7 @@ pub async fn set_sniffer_capture_config(
         .service
         .sniffer_service
         .set_capture_config(config)
-        .await;
-    Ok(())
+        .await
 }
 
 /// 获取当前嗅探捕获配置
@@ -207,7 +206,8 @@ mod tests {
             .service
             .sniffer_service
             .set_capture_config(cfg.clone())
-            .await;
+            .await
+            .unwrap();
         let got = state.service.sniffer_service.capture_config().await;
         assert!(!got.enabled_types.contains(&ResourceType::Video));
         assert_eq!(got.min_size, 10_000);

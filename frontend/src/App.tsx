@@ -1,7 +1,6 @@
 import { errorMessage } from "./utils/appError";
 import { createSignal, createEffect, Show, lazy, Suspense, ErrorBoundary } from "solid-js";
 import type { SnifferResource, TaskInfo, ViewName, CaptureConfig } from "./types";
-import { getParentDirectory } from "./utils/path";
 import { api } from "./api/invoke";
 import {
   $activeCount,
@@ -519,8 +518,8 @@ function AppContent() {
         }}
         onOpenFolder={(taskId) => {
           const task = $tasks.get().find((t) => t.id === taskId);
-          if (task?.savePath) {
-            api.openFolder(getParentDirectory(task.savePath)).catch(() => {
+          if (task) {
+            api.openFolder(task.id).catch(() => {
               addToast(tr("toast.openFolderFailed"), "error");
             });
           } else {
@@ -562,8 +561,9 @@ function AppContent() {
             onClose={$ui.closeHistory}
             onOpenFolder={(folderPath) => {
               // HistoryPanel 内部已将 savePath 转为父目录,folderPath 即为要打开的文件夹路径
+              // 历史记录的任务可能已从任务仓库删除,走 path 校验命令(P1-21)
               if (folderPath) {
-                api.openFolder(folderPath).catch(() => {
+                api.openFolderUnderRoot(folderPath).catch(() => {
                   addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {
@@ -609,8 +609,8 @@ function AppContent() {
             getSelectedTask={() => $selectedTask.get()}
             onOpenTaskFolder={(taskId) => {
               const task = $tasks.get().find((t) => t.id === taskId);
-              if (task?.savePath) {
-                api.openFolder(getParentDirectory(task.savePath)).catch(() => {
+              if (task) {
+                api.openFolder(task.id).catch(() => {
                   addToast(tr("toast.openFolderFailed"), "error");
                 });
               } else {

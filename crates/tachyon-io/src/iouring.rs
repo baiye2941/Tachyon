@@ -42,7 +42,7 @@ use bytes::{Bytes, BytesMut};
 use std::cell::UnsafeCell;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tachyon_core::{DownloadError, DownloadResult};
@@ -308,15 +308,12 @@ struct IoUringHandle {
     /// 因为 reqwest 产出的 Bytes 不满足 O_DIRECT 对齐要求。
     /// driver task 只负责构造 SQE 和提交。
     buffers: std::sync::Arc<Vec<AlignedBuffer>>,
-    /// fixed buffer 分配位图(1=已占用, 0=空闲)
+    /// fixed buffer 索引分配池(1=已占用, 0=空闲)。
     ///
-    /// M-01: 多字位图,支持超过 64 个 fixed buffer。
-    /// 字数 = `div_ceil(buffer_count, 64)`,最后一个 word 的越界高位预置为 1
-    /// (已占用),防止 alloc 分配到超出 buffer_count 的索引。
-    buffer_bitmap: Box<[AtomicU64]>,
-    /// buffer 数量(用于 alloc 失败时的诊断 + free 时边界检查)
-    #[allow(dead_code)]
-    buffer_count: usize,
+    /// 由调用方(driver 提交前)与 driver task(CQE 完成时)共享:索引所有权在
+    /// 命令发送给 driver 时转移,driver 在 CQE 完成时回收,避免与内核 in-flight
+    /// op 竞争同一 buffer(参见 `IoUringBufferGuard`)。
+    pool: std::sync::Arc<BufferIndexPool>,
 }
 
 /// io_uring 驱动任务命令
@@ -395,6 +392,7 @@ async fn driver_task(
     mut ring: io_uring::IoUring,
     mut cmd_rx: tokio::sync::mpsc::Receiver<DriverCmd>,
     buffers: std::sync::Arc<Vec<AlignedBuffer>>,
+    pool: std::sync::Arc<BufferIndexPool>,
 ) {
     // 用于为每个 SQE 生成唯一 user_data,使 CQE 可安全匹配到原始请求。
     // 从 1 开始避免与默认值 0 混淆。
@@ -469,6 +467,9 @@ async fn driver_task(
                         next_user_data = next_user_data.wrapping_add(1);
                         inflight.insert(user_data, InflightReq::Write(req));
                     } else {
+                        // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
+                        // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
+                        pool.free(req.buf_idx);
                         let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
                             "io_uring 提交队列已满",
                         ))));
@@ -512,6 +513,9 @@ async fn driver_task(
                         next_user_data = next_user_data.wrapping_add(1);
                         inflight.insert(user_data, InflightReq::Read(req));
                     } else {
+                        // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
+                        // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
+                        pool.free(req.buf_idx);
                         let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
                             "io_uring 提交队列已满",
                         ))));
@@ -568,7 +572,9 @@ async fn driver_task(
 
         // submit_and_wait: 提交所有 SQE 并等待全部完成
         if ring.submitter().submit_and_wait(total_sqes).is_err() {
-            // 提交失败：通知所有 inflight 请求
+            // 提交失败：通知所有 inflight 请求。
+            // 此处不回收 buf_idx——submit_and_wait 失败时部分 SQE 可能已被内核
+            // 消费并仍在处理,贸然释放会导致复用竞争。索引泄漏是安全的(不被复用)。
             for (_, req) in inflight.drain() {
                 match req {
                     InflightReq::Write(r) => {
@@ -611,6 +617,9 @@ async fn driver_task(
                     } else {
                         Ok(r as usize)
                     };
+                    // 内核写操作已完成(成功或失败),fixed buffer 不再被内核引用,
+                    // 此时回收索引是安全点(所有权在调用方 mark_submitted 时转移给 driver)。
+                    pool.free(write_req.buf_idx);
                     let _ = write_req.done.send(result);
                 }
                 InflightReq::Read(read_req) => {
@@ -633,6 +642,9 @@ async fn driver_task(
                         let src = unsafe { std::slice::from_raw_parts(buf.as_ptr(), bytes_read) };
                         Ok(src.to_vec())
                     };
+                    // 数据已从 fixed buffer 拷出(to_vec),内核读操作已完成,
+                    // 回收索引(必须在 to_vec 之后,确保数据已脱离 buffer)。
+                    pool.free(read_req.buf_idx);
                     let _ = read_req.done.send(result);
                 }
                 InflightReq::Sync(done) => {
@@ -646,7 +658,8 @@ async fn driver_task(
             }
         }
 
-        // 若 CQE 缺失,通知剩余 inflight 请求
+        // 若 CQE 缺失,通知剩余 inflight 请求。
+        // 不回收 buf_idx——缺失的 CQE 对应的内核 op 可能仍在处理,泄漏是安全的。
         if !inflight.is_empty() {
             tracing::warn!(remaining = inflight.len(), "io_uring CQE 缺失");
             for (_, req) in inflight.drain() {
@@ -676,95 +689,124 @@ async fn driver_task(
 impl IoUringHandle {
     /// 原子分配一个空闲 fixed buffer 索引。
     ///
-    /// 位图不变量: 每一位对应一个 fixed buffer, `1` = 已占用, `0` = 空闲。
-    /// 超出 `buffers.len()` 的高位在初始化时被预置为 `1`(见 `init` 中的
-    /// `build_buffer_bitmap`),因此本函数只会选中 `[0, buffers.len()-1]` 范围内的位。
-    ///
-    /// M-01: 支持多字位图(超过 64 个 buffer)。遍历每个 word,对其执行
-    /// `(!current).trailing_zeros()` 找空闲位,CAS 占用。全局索引 =
-    /// `word_idx * 64 + bit`,边界由 `buffer_count` 兜底校验。
-    ///
-    /// 返回的索引保证落在 `buffers` 内,当所有 buffer 都被占用时返回 None。
+    /// 委托给 `BufferIndexPool`(跨平台纯逻辑)。返回的索引保证落在 `buffers` 内,
+    /// 当所有 buffer 都被占用时返回 None。
     fn alloc_buffer_index(&self) -> Option<usize> {
-        bitmap_alloc_first_free(&self.buffer_bitmap, self.buffer_count)
+        self.pool.alloc()
+    }
+}
+
+/// fixed buffer 索引分配池(跨平台纯逻辑,不依赖 io_uring 内核)。
+///
+/// 位图语义: `0` = 空闲, `1` = 已占用。超出 `buffer_count` 的高位在构造时
+/// 预置为 `1`,防止分配到越界索引。`alloc`/`free` 均为原子操作,可在多线程
+/// 并发调用(driver task 在 CQE 回收、调用方在提交前分配)。
+///
+/// # 索引所有权模型
+///
+/// 索引所有权在命令发送给 driver 时由调用方转移给 driver_task;driver_task
+/// 在收到该 op 的 CQE(成功或错误)时回收索引。这避免了取消路径下调用方
+/// 提前释放索引、而内核仍持有引用该 buffer 的 in-flight SQE 所致的数据竞争。
+/// driver 异常退出时未回收的索引将泄漏(不被复用,安全)。
+#[cfg(any(test, target_os = "linux"))]
+struct BufferIndexPool {
+    bitmap: Box<[AtomicU64]>,
+    buffer_count: usize,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl BufferIndexPool {
+    fn new(buffer_count: usize) -> Self {
+        Self {
+            bitmap: build_buffer_bitmap(buffer_count),
+            buffer_count,
+        }
     }
 
-    /// 释放 fixed buffer 索引,使其可被后续操作重新分配。
-    ///
-    /// M-01: 多字位图下计算 `word_idx = idx / 64`、`bit = idx % 64`,
-    /// 对相应 word 执行 CAS 清位。idx 越界(>= buffer_count)时静默忽略,
-    /// 防止误清非本 handle 管辖的位。
-    fn free_buffer_index(&self, idx: usize) {
+    /// 原子分配一个空闲索引,全部占用时返回 None。
+    fn alloc(&self) -> Option<usize> {
+        bitmap_alloc_first_free(&self.bitmap, self.buffer_count)
+    }
+
+    /// 释放索引使其可被重新分配。idx 越界时静默忽略。
+    fn free(&self, idx: usize) {
         if idx >= self.buffer_count {
             return;
         }
         let word_idx = idx / 64;
         let bit = idx % 64;
-        // word_idx < buffer_bitmap.len() 由 init 保证(div_ceil(buffer_count,64)),
+        // word_idx < bitmap.len() 由 build_buffer_bitmap 保证(div_ceil),
         // 且 idx < buffer_count 时 word_idx 一定在位图范围内。
-        self.buffer_bitmap[word_idx].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+        self.bitmap[word_idx].fetch_and(!(1u64 << bit), Ordering::Relaxed);
     }
 }
 
-/// RAII 守卫,保证 io_uring fixed buffer 索引在任何路径(含 `?` 提前返回与
-/// 外层 `select!` 取消导致的 future drop)下都能被回收。
+/// RAII 守卫,管理 io_uring fixed buffer 索引在调用方一侧的生命周期。
+///
+/// # 所有权模型(修复取消路径提前释放竞争)
+///
+/// `submit_read`/`submit_write` 在 `alloc_buffer_index()` 后创建本守卫。守卫持
+/// 有 `submitted` 标志,描述索引所有权是否已转移给 driver_task:
+///
+/// - `submitted == false`(命令尚未发送):Drop 时回收索引。覆盖 `alloc` 后、
+///   `mark_submitted` 前因 `?` 提前返回或外层 `select!` 取消的路径——此刻
+///   driver 未收到命令、内核无 in-flight op,回收安全。
+/// - `submitted == true`(命令已发送或即将发送):Drop 时 **不** 回收索引。
+///   driver_task 在该 op 的 CQE 完成时回收;若调用方 future 被取消(外层
+///   `select!` drop),driver 仍持有引用该 buffer 的 in-flight SQE,提前释放
+///   会让新操作复用同一索引并 `copy_from_slice` 覆盖正在被内核读写的 buffer,
+///   造成数据竞争。因此取消路径下索引泄漏(不被复用),是安全的。
+///
+/// 正常完成路径:driver 在 CQE 完成时已回收索引(先于 `done_rx` 唤醒调用方),
+/// 守卫 `submitted == true`,Drop 也不再回收——无双重释放。
 ///
 /// 对称于 IOCP 路径的 `PendingWriteCancelGuard`(见 `iocp.rs`)。
-///
-/// # 背景
-///
-/// `submit_read`/`submit_write` 在 `alloc_buffer_index()` 后,通过 `done_rx.await`
-/// 等待 driver task 完成。若该 await 被 `?` 提前返回(如 driver 关闭)或被外层
-/// `tokio::select!` 取消(future drop),原实现跳过 `free_buffer_index`,导致
-/// fixed buffer 索引永久泄漏。累积后 `alloc_buffer_index` 返回 None,写入全部失败。
-///
-/// 本守卫在 Drop 时若仍 armed,自动调用 `free_buffer_index` 回收索引。
-/// 正常路径在 `done_rx.await` 成功后调用 `disarm()` 取消守卫职责。
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 struct IoUringBufferGuard {
-    handle: std::sync::Arc<IoUringHandle>,
+    pool: std::sync::Arc<BufferIndexPool>,
     buf_idx: usize,
-    armed: bool,
+    /// `true` = 命令已/将发送给 driver,索引所有权已转移,Drop 不回收。
+    submitted: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 impl IoUringBufferGuard {
-    fn new(handle: std::sync::Arc<IoUringHandle>, buf_idx: usize) -> Self {
+    fn new(pool: std::sync::Arc<BufferIndexPool>, buf_idx: usize) -> Self {
         Self {
-            handle,
+            pool,
             buf_idx,
-            armed: true,
+            submitted: false,
         }
     }
 
-    /// 正常完成路径调用,取消 Drop 时的回收职责。
-    fn disarm(&mut self) {
-        self.armed = false;
+    /// 标记命令即将发送给 driver,索引所有权转移给 driver_task。
+    ///
+    /// 必须在 `cmd_tx.send(...)` 之前调用,以确保 `send` 期间被取消时
+    /// 索引不会被提前回收(tokio mpsc `send` 取消时消息不入队,但保守起见
+    /// 仍按"已转移"处理,泄漏而非竞争)。
+    fn mark_submitted(&mut self) {
+        self.submitted = true;
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 impl Drop for IoUringBufferGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.submitted {
+            // 所有权已转移给 driver_task:driver 在 CQE 完成时回收索引。
+            // 此处不回收,避免与 driver 残留的内核 in-flight op 竞争同一 buffer
+            // (新操作复用索引并写入会覆盖正在被内核读写的 buffer)。
+            // driver 异常退出(done_rx 返回 Err)时索引将泄漏——泄漏是安全的
+            // (索引保持占用态不会被复用),仅损失一个 buffer 槽位。
+            tracing::debug!(
+                buf_idx = self.buf_idx,
+                "IoUringBufferGuard: 索引所有权已转移给 driver,Drop 不回收"
+            );
             return;
         }
-        // 取消路径(driver 关闭或外层 select! drop future):
-        // 释放 fixed buffer 索引,使其可被后续操作复用,避免累积泄漏。
-        // 注意:此处不向 driver task 发取消——driver task 仍可能在批处理队列中
-        // 持有该 buf_idx 的 SQE。但位图语义是"占用标记",释放后 driver 若仍提交,
-        // 内核会处理该 I/O(数据写入正确,只是 buffer 被复用可能覆盖)。
-        // 为避免 driver 仍在使用该 buffer 时被 alloc 复用导致数据竞争,
-        // 保守做法是:取消路径下仍释放索引(允许复用),但 driver task 在处理
-        // CQE 完成时不会再次 free(它不持有索引所有权——所有权在调用方)。
-        // 真正的安全保障:alloc_buffer_index 的 CAS 保证同一时刻只有一个操作
-        // 拿到该索引;若取消后释放,driver 残留的 SQE 完成时数据已写入 buffer,
-        // 但调用方 future 已 drop 不再读取结果——无别名访问,安全。
-        tracing::debug!(
-            buf_idx = self.buf_idx,
-            "IoUringBufferGuard: 取消路径回收 fixed buffer 索引"
-        );
-        self.handle.free_buffer_index(self.buf_idx);
+        // 命令尚未发送给 driver(alloc 后、mark_submitted 前的提前返回/取消):
+        // 内核无 in-flight op,回收索引安全。
+        self.pool.free(self.buf_idx);
     }
 }
 
@@ -774,7 +816,7 @@ impl Drop for IoUringBufferGuard {
 /// 位图语义: `0` = 空闲, `1` = 已占用。最后一个 word 中超出 `buffer_count`
 /// 的高位预置为 `1`(已占用),防止 `alloc` 分配到越界索引——与 `iocp.rs`
 /// 的 `free_bitmap` 初始化模式一致(见 `CompletionSlots::new`)。
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 fn build_buffer_bitmap(buffer_count: usize) -> Box<[AtomicU64]> {
     let words = buffer_count.div_ceil(64);
     // Safety: words == 0 当且仅当 buffer_count == 0,但 init() 在此之前已通过
@@ -809,7 +851,7 @@ fn build_buffer_bitmap(buffer_count: usize) -> Box<[AtomicU64]> {
 /// `build_buffer_bitmap` 预置为 `1`,此处再做 `idx >= buffer_count` 兜底校验。
 ///
 /// 返回的索引保证 `< buffer_count`(超出范围则返回 None)。
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 fn bitmap_alloc_first_free(bitmap: &[AtomicU64], buffer_count: usize) -> Option<usize> {
     for (word_idx, word) in bitmap.iter().enumerate() {
         let mut current = word.load(Ordering::Relaxed);
@@ -988,20 +1030,19 @@ impl IoUringStorage {
         // 批量提交 SQE，一次 submit_and_wait(N) 替代逐请求 submit_and_wait(1)
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DriverCmd>(256);
         let driver_buffers = std::sync::Arc::clone(&buffers_arc);
+        // 索引分配池由调用方(提交前 alloc)与 driver task(CQE 完成时回收)共享。
+        let pool = std::sync::Arc::new(BufferIndexPool::new(buffer_count));
+        let driver_pool = std::sync::Arc::clone(&pool);
 
         let driver_join = tokio::spawn(async move {
-            driver_task(ring, cmd_rx, driver_buffers).await;
+            driver_task(ring, cmd_rx, driver_buffers, driver_pool).await;
         });
-
-        // M-01: 多字位图,支持超过 64 个 fixed buffer。
-        let buffer_bitmap = build_buffer_bitmap(buffer_count);
 
         self.ring = Some(std::sync::Arc::new(IoUringHandle {
             cmd_tx,
             driver_join: std::sync::Mutex::new(Some(driver_join)),
             buffers: buffers_arc,
-            buffer_bitmap,
-            buffer_count,
+            pool,
         }));
         self.state = IoUringState::Ready;
 
@@ -1063,10 +1104,17 @@ impl IoUringStorage {
                 "io_uring fixed buffer 已耗尽,并发读取操作过多",
             ))
         })?;
-        // RAII 守卫:保证 `?` 提前返回或外层 select! 取消时索引被回收。
-        let mut guard = IoUringBufferGuard::new(ring_handle.clone(), buf_idx);
+        // RAII 守卫:在命令发送前发生 `?` 提前返回或外层 select! 取消时回收索引。
+        // 命令发送后(submitted=true)所有权转移给 driver,Drop 不再回收——
+        // driver 在 CQE 完成时回收,避免与内核 in-flight op 竞争同一 buffer。
+        let mut guard = IoUringBufferGuard::new(ring_handle.pool.clone(), buf_idx);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        // 标记所有权转移:此后索引由 driver 负责(在 CQE 完成时回收)。
+        // 即使 send 失败(driver 已关闭)或 done_rx 返回 Err(driver 异常退出),
+        // 索引将泄漏而非被提前回收——泄漏是安全的(不会被复用)。
+        guard.mark_submitted();
 
         ring_handle
             .cmd_tx
@@ -1084,10 +1132,8 @@ impl IoUringStorage {
             .await
             .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring 读取完成通知丢失")))??;
 
-        // 正常完成,解除守卫的 Drop 回收职责
-        guard.disarm();
-        // 释放 buffer 索引
-        ring_handle.free_buffer_index(buf_idx);
+        // driver 已在 CQE 完成时回收 buf_idx(数据已从 fixed buffer 拷出),
+        // 此处无需释放;guard(submitted=true)的 Drop 也不会回收,无双重释放。
 
         // 从返回的 Vec 复制到用户缓冲区
         let bytes_read = read_result.len();
@@ -1200,15 +1246,18 @@ impl IoUringStorage {
                 "io_uring fixed buffer 已耗尽,并发写入操作过多",
             ))
         })?;
-        // RAII 守卫:保证 `?` 提前返回或外层 select! 取消时索引被回收。
-        let mut guard = IoUringBufferGuard::new(ring_handle.clone(), buf_idx);
+        // RAII 守卫:在命令发送前发生 `?` 提前返回或外层 select! 取消时回收索引。
+        // 命令发送后(submitted=true)所有权转移给 driver,Drop 不再回收--
+        // driver 在 CQE 完成时回收,避免与内核 in-flight op 竞争同一 buffer。
+        let mut guard = IoUringBufferGuard::new(ring_handle.pool.clone(), buf_idx);
 
         // 将数据复制到 fixed buffer（必须在发送请求前完成，
         // 因为 driver task 会直接引用 buffer 地址构造 SQE）
         let buf = &ring_handle.buffers[buf_idx];
         // SAFETY:
         // - alloc_buffer_index 通过原子位图 CAS 保证同一时刻只有一个操作使用该
-        //   buffer 索引(独占),此刻无其他别名引用 buffers[buf_idx] 的数据区,可变访问安全。
+        //   buffer 索引(独占);该独占期从 alloc 持续到 driver CQE 回收,此刻
+        //   (发送前)无其他别名引用 buffers[buf_idx] 的数据区,可变访问安全。
         // - len 已由上方 validate_fixed_buffer_write_len(len, buffer_len) 校验
         //   len <= buffer_len(= buf.len()),from_raw_parts_mut 切片范围在 buffer 有效区间内。
         // - buf.ptr() 返回对齐后的起始裸指针(UnsafeCell 内部可变性合法化),指向
@@ -1217,6 +1266,11 @@ impl IoUringStorage {
         dst.copy_from_slice(data);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        // 标记所有权转移:此后索引由 driver 负责(在 CQE 完成时回收)。
+        // 即使 send 失败(driver 已关闭)或 done_rx 返回 Err(driver 异常退出),
+        // 索引将泄漏而非被提前回收--泄漏是安全的(不会被复用)。
+        guard.mark_submitted();
 
         ring_handle
             .cmd_tx
@@ -1234,11 +1288,8 @@ impl IoUringStorage {
             .await
             .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring 写入完成通知丢失")))?;
 
-        // 正常完成,解除守卫的 Drop 回收职责
-        guard.disarm();
-        // 无论成功失败都释放 buffer 索引
-        ring_handle.free_buffer_index(buf_idx);
-
+        // driver 已在 CQE 完成时回收 buf_idx,此处无需释放;
+        // guard(submitted=true)的 Drop 也不会回收,无双重释放。
         result
     }
 }
@@ -1250,7 +1301,7 @@ impl IoUringStorage {
 ///   1. 驱动 task 持有 `IoUring`(含已注册 fixed buffers 的内核映射)和
 ///      `buffers: Arc<Vec<AlignedBuffer>>`,在 Storage drop 后仍存活,
 ///      驱动可能在 IoUring / buffers 被释放后继续访问悬垂资源;
-///   2. IoUringHandle 的 Arc 引用计数不会归零,buffer_bitmap / channel
+///   2. IoUringHandle 的 Arc 引用计数不会归零,索引分配池 / channel
 ///      等资源泄漏,直到驱动 task 自行结束(可能永不结束)。
 ///
 /// Drop 策略(参照 `iocp.rs` 的 cancel + drain + join 模式,适配 tokio task):
@@ -1957,7 +2008,6 @@ mod tests {
     /// 第一个置位(已占用)位,与"找第一个空闲位"语义相反。
     /// 初始化 used_mask = (!0u64) << 16 = 0xFFFFFFFFFFFF0000 时,
     /// trailing_zeros 返回 16, 导致 buffers[16] 越界 panic。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_alloc_first_free_returns_zero_with_initial_used_mask() {
         let buffer_count = 16;
@@ -1974,7 +2024,6 @@ mod tests {
     }
 
     /// 回归测试: 所有 buffer 占用时返回 None,不越界。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_alloc_first_free_returns_none_when_all_used() {
         let buffer_count = 4;
@@ -1994,7 +2043,6 @@ mod tests {
     }
 
     /// 回归测试: 防御性边界检查 - 超出 buffer_count 的位不应被分配。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_alloc_first_free_respects_buffer_count_boundary() {
         let buffer_count = 8;
@@ -2015,7 +2063,6 @@ mod tests {
     }
 
     /// 回归测试: 释放后可重新分配。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_alloc_free_reuse_cycle() {
         let buffer_count = 4;
@@ -2042,7 +2089,6 @@ mod tests {
     /// 2. 第一个 word 全 0,第二个 word 全 0(128 恰为 64 倍数,无越界高位);
     /// 3. 可分配 0..128 全部索引,不越界;
     /// 4. 占满后返回 None。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_multi_word_alloc_across_word_boundary() {
         let buffer_count = 128;
@@ -2073,7 +2119,6 @@ mod tests {
     /// M-01: 多字位图测试 - buffer_count=70(非 64 倍数)时,
     /// 第二个 word 的越界高位(位 70-127)被预置为 1(已占用),
     /// 不会分配到 idx >= 70 的索引。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_multi_word_excess_bits_preoccupied() {
         let buffer_count = 70;
@@ -2106,7 +2151,6 @@ mod tests {
     }
 
     /// M-01: 多字位图测试 - 释放跨 word 的索引后可重新分配。
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_bitmap_multi_word_free_and_realloc() {
         let buffer_count = 96;
@@ -2128,6 +2172,104 @@ mod tests {
             Some(64),
             "释放 idx=64 后应重新分配到 64"
         );
+    }
+
+    /// FIX-02: 守卫未提交(submitted=false)时 Drop 应回收索引(命令从未发送给 driver)。
+    ///
+    /// 模拟 alloc 成功后、mark_submitted 前的提前返回或取消路径:此刻 driver 未收到
+    /// 命令、内核无 in-flight op,索引可安全回收。
+    #[test]
+    fn test_guard_not_submitted_frees_on_drop() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(4));
+        let idx = pool.alloc().expect("首次分配应成功");
+        assert_eq!(idx, 0);
+        {
+            let _guard = IoUringBufferGuard::new(pool.clone(), idx);
+            // drop: submitted=false -> 回收 idx
+        }
+        // 回收后应能再次分配到 idx=0
+        let idx2 = pool.alloc().expect("回收后应可重新分配");
+        assert_eq!(idx2, 0, "未提交守卫 Drop 后索引应被回收");
+    }
+
+    /// FIX-02: 守卫已提交(submitted=true)时 Drop 不应回收索引——driver 在 CQE 完成时回收。
+    ///
+    /// 模拟取消路径:命令已发送给 driver,调用方 future 被外层 select! drop,但 driver
+    /// 仍持有引用该 buffer 的 in-flight SQE。若守卫此时回收,新操作会复用该索引并
+    /// copy_from_slice 覆盖正在被内核读写的 buffer,造成数据竞争。故应泄漏(安全)。
+    #[test]
+    fn test_guard_submitted_does_not_free_on_drop() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(4));
+        let idx = pool.alloc().expect("首次分配应成功");
+        assert_eq!(idx, 0);
+        {
+            let mut guard = IoUringBufferGuard::new(pool.clone(), idx);
+            guard.mark_submitted();
+            // drop: submitted=true -> 不回收(模拟 driver 仍持有 in-flight op)
+        }
+        // idx=0 仍被占用,下次分配应返回 idx=1
+        let idx2 = pool.alloc().expect("应分配到下一个索引");
+        assert_eq!(idx2, 1, "已提交守卫 Drop 后索引不应被回收");
+    }
+
+    /// FIX-02: 分配/释放互斥性——占用的索引在释放前不会被再次分配。
+    #[test]
+    fn test_guard_alloc_exclusivity() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(3));
+        let a = pool.alloc().unwrap();
+        let b = pool.alloc().unwrap();
+        let c = pool.alloc().unwrap();
+        assert_eq!([a, b, c], [0, 1, 2]);
+        assert!(pool.alloc().is_none(), "占满后应返回 None");
+        pool.free(b);
+        assert_eq!(pool.alloc(), Some(1), "释放 b 后应重新分配到 1");
+    }
+
+    /// FIX-02: 模拟完整生命周期(取消 + driver CQE 回收):
+    ///
+    /// 1. 调用方分配 A 并 mark_submitted(所有权转移给 driver);
+    /// 2. 调用方 future 被取消(drop guard)——driver 仍持有 in-flight op;
+    /// 3. 新操作 alloc:不得返回 A(driver 仍在用),应返回 B;
+    /// 4. driver 完成 CQE,pool.free(A) 回收 A;
+    /// 5. 下次 alloc 应返回 A(已回收)。
+    ///
+    /// 旧实现在第 2 步就回收了 A,导致第 3 步复用 A 并与内核 in-flight op 竞争。
+    #[test]
+    fn test_guard_submitted_blocks_realloc_until_driver_frees() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(2));
+        // 调用方分配 A 并提交给 driver
+        let a = pool.alloc().expect("分配 A");
+        assert_eq!(a, 0);
+        let mut guard_a = IoUringBufferGuard::new(pool.clone(), a);
+        guard_a.mark_submitted(); // 所有权转移给 driver
+
+        // 模拟调用方 future 被取消(drop guard_a)——driver 仍持有 in-flight op
+        drop(guard_a);
+
+        // 新操作分配:不得返回 A(driver 仍在用),应返回 B=1
+        let b = pool.alloc().expect("分配 B");
+        assert_eq!(b, 1, "driver 持有的索引不应被复用");
+
+        // driver 完成 CQE,回收 A
+        pool.free(a);
+
+        // 下次分配应返回 A=0
+        let next = pool.alloc().expect("A 回收后应可分配");
+        assert_eq!(next, 0, "driver CQE 回收后索引应可复用");
+    }
+
+    /// FIX-02: 模拟 driver 在 SQE 入队失败时回收索引(内核不会处理该 op)。
+    ///
+    /// 调用方已 mark_submitted(不会回收),故 driver 必须在 push 失败分支回收,
+    /// 否则索引永久泄漏。此测试验证 BufferIndexPool::free 可被 driver 侧调用回收。
+    #[test]
+    fn test_guard_driver_reclaim_on_push_failure() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(2));
+        let a = pool.alloc().expect("分配 A");
+        // 调用方已 mark_submitted,模拟 driver 侧 SQE push 失败:driver 回收索引
+        pool.free(a);
+        // 回收后应能再次分配到 A
+        assert_eq!(pool.alloc(), Some(0), "driver push 失败回收后索引应可复用");
     }
 
     /// B1 并发 RMW 数据完整性测试。

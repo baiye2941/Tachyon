@@ -11,6 +11,7 @@ vi.mock('../../api/invoke', () => ({
     getConfig: vi.fn(),
     subscribeProgress: vi.fn(),
     getSnifferResources: vi.fn(),
+    getRecoveryWarning: vi.fn(),
   },
 }))
 
@@ -56,6 +57,8 @@ describe('useAppInit', () => {
     vi.mocked(api.getConfig).mockReset()
     vi.mocked(api.subscribeProgress).mockReset()
     vi.mocked(api.getSnifferResources).mockReset()
+    vi.mocked(api.getRecoveryWarning).mockReset()
+    vi.mocked(api.getRecoveryWarning).mockResolvedValue(null)
     vi.mocked(addToast).mockReset()
     vi.mocked(api.getConfig).mockResolvedValue({
       maxConcurrentTasks: 3,

@@ -227,6 +227,9 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       // (后端 #[serde(skip_serializing_if = "Option::is_none")] 省略空值,
       //  仅在探测完成有值时到达前端)
       const newSize = p.fileSize ?? task.fileSize;
+      // P1-22-4: Failed 终态时后端通过进度事件同步 errorReason,
+      // 详情页无需等待 get_task_list 全量刷新即可展示错误详情
+      const newErrorReason = p.errorReason ?? task.errorReason;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -266,6 +269,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           fragmentsTotal: newFragmentsTotal,
           fileSize: newSize,
           activeConcurrency: newConcurrency,
+          errorReason: newErrorReason,
         });
       }
 

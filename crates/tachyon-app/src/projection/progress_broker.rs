@@ -294,6 +294,7 @@ fn build_progress_event(
                     file_size: t.file_size,
                     completed_delta,
                     started_delta,
+                    error_reason: t.error_reason.clone(),
                 },
             )
         })

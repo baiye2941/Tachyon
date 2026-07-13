@@ -1,8 +1,27 @@
 
 /* ============================================
    Base Styles
-
+   Geist 字体本地加载(配合生产 CSP:font-src 'self' data:,禁止外部 CDN)
    ============================================ */
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/Geist-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
 * {
   margin: 0;
   padding: 0;

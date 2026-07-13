@@ -161,6 +161,11 @@ pub fn validate_save_path(
     final_path: &std::path::Path,
     expected_base: &std::path::Path,
 ) -> crate::DownloadResult<std::path::PathBuf> {
+    // 安全模型说明(FIX-09): 本函数 canonicalize 基目录与父目录、检查已观察到的链接逃逸，
+    // 返回 canonical_parent.join(file_name)。但路径字符串校验不能消除「validate 与最终 open
+    // 之间目录项被替换为符号链接/重解析点」的 TOCTOU。下游 TokioFile/WinFile 的最终 open
+    // 已加 no-follow 标志(Unix: O_NOFOLLOW;Windows: FILE_FLAG_OPEN_REPARSE_POINT)关闭最终
+    // 组件的跟随。残留风险:中间目录被替换为符号链接需 openat/句柄化打开，当前未覆盖。
     // 1. 确保基目录存在且可 canonicalize
     let canonical_base = expected_base
         .canonicalize()

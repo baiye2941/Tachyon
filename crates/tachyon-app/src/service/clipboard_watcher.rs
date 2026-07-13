@@ -71,6 +71,11 @@ impl ClipboardWatcher {
     /// 必须在 Tokio reactor 上下文中调用(如 Tauri `setup` 钩子的 `block_on` 内)。
     /// 若 `clipboard.enable_watch` 为 false,则不启动。
     /// 轮询间隔由 `clipboard.poll_interval_ms` 控制(默认 1000ms)。
+    ///
+    /// P1-23-A 已知限制:监听仅在应用启动时根据配置决定是否拉起,运行时通过
+    /// update_config 启用 `enable_watch` 不会动态 spawn 轮询任务(需重启应用)。
+    /// 未来改进:实现 start-on-demand,在配置变更时检测 false→true 转换并拉起任务。
+    /// 前端 SettingsPanel 在启用时已提示“需要重启应用以启用剪贴板监听”。
     pub async fn start(&self) {
         let cfg = self.config.lock().await;
         if !cfg.clipboard.enable_watch {

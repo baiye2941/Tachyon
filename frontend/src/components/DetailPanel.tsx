@@ -16,7 +16,6 @@ import {
   MIN_WIDTH,
   MAX_WIDTH,
 } from "../stores/detailPanel";
-import { getParentDirectory } from "../utils/path";
 import { loadTaskFragments, clearTaskFragments, getTaskFragmentData } from "../stores/taskFragments";
 import {
   formatSize,
@@ -444,7 +443,7 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (!t2) return;
     if (t2.savePath) {
       try {
-        await api.openFolder(getParentDirectory(t2.savePath));
+        await api.openFolder(t2.id);
       } catch {
         addToast(tr("toast.openFolderFailed"), "error");
       }

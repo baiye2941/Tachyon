@@ -2,6 +2,7 @@ import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, Do
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask } from '../stores/mockData'
+import type { RecoveryWarningPayload } from './events'
 
 async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
   try {
@@ -60,9 +61,9 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>, skipConfir
 /**
  * 判断路径是否为合法本地文件系统路径(非带 scheme 的 URL)。
  *
- * F-02 防御:shell.open 仅用于打开本地下载文件夹。拒绝任何带 scheme 的路径
- * (如 javascript:/http:/https:),防止 task.savePath 被污染后触发任意 URL 打开。
- * 合法本地路径无 "://" 前缀;Windows 盘符(如 C:\)与 UNC(\\)均不含 "://"。
+ * 保留作为工具函数供其他模块复用;P1-21 后打开文件夹改由后端
+ * `open_task_folder` 命令处理(后端校验路径在下载根目录内),
+ * 前端不再直接调用 shell.open,该函数仅保留路径合法性校验语义。
  */
 export function isLocalPath(path: string): boolean {
   // 拒绝任何 scheme 前缀(如 javascript:/http:/https:/file:/ftp:)。
@@ -75,23 +76,13 @@ export function isLocalPath(path: string): boolean {
   return true
 }
 
-async function openPath(path: string): Promise<void> {
-  if (!isLocalPath(path)) {
-    return
-  }
-  try {
-    const { open } = await import('@tauri-apps/plugin-shell')
-    await open(path)
-  } catch {
-    // shell 插件不可用时静默降级（浏览器/SSR 环境）
-  }
-}
-
 export const api = {
   /** 获取应用信息(版本号、名称) */
   getAppInfo: () => invoke<AppInfo>('get_app_info'),
   /** 获取支持的协议列表 */
   getSupportedProtocols: () => invoke<string[]>('supported_protocols'),
+  /** 拉取启动恢复告警(P1-22-3):setup 阶段 emit 的事件前端会漏接,主动拉取补全 */
+  getRecoveryWarning: () => invoke<RecoveryWarningPayload | null>('get_recovery_warning'),
   /** 创建下载任务 */
   createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string, autoStart?: boolean) =>
     invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName, autoStart }),
@@ -135,8 +126,10 @@ export const api = {
   reorderTasks: (orderedIds: string[]) => invoke<void>('reorder_tasks', { orderedIds }),
   /** 将任务移动到指定任务之前,beforeId 为空时移到末尾 */
   moveTask: (taskId: string, beforeId?: string) => invoke<void>('move_task', { taskId, beforeId }),
-  /** 打开文件夹 */
-  openFolder: (path: string) => openPath(path),
+  /** 打开任务文件所在文件夹(后端校验路径在下载根目录内,P1-21) */
+  openFolder: (taskId: string) => invoke<void>('open_task_folder', { taskId }),
+  /** 打开指定路径所在文件夹(历史记录/本地模型等不在任务仓库中的场景,后端校验路径在下载根目录内,P1-21) */
+  openFolderUnderRoot: (path: string) => invoke<void>('open_folder_under_download_root', { path }),
   /** 获取下载进度详情 */
   getDownloadProgress: (taskId: string) => invoke<DownloadProgress>('get_download_progress', { taskId }),
   /** 订阅进度更新(通过 Tauri 事件推送) */

@@ -21,8 +21,9 @@ pub use self::sniffer_commands::{
 };
 pub use self::task_commands::{
     add_task_tag, cancel_task, create_task, delete_task, export_backup, get_task_detail,
-    get_task_list, import_backup, move_task, pause_task, probe_filename, remove_task_tag,
-    reorder_tasks, resume_task, set_task_tags, undo_cancel_task, undo_delete_task,
+    get_task_list, import_backup, move_task, open_folder_under_download_root, open_task_folder,
+    pause_task, probe_filename, remove_task_tag, reorder_tasks, resume_task, set_task_tags,
+    undo_cancel_task, undo_delete_task,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -265,6 +266,10 @@ pub struct TaskProgress {
     /// 本周期新开始下载的分片索引增量(Started 事件累积)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started_delta: Vec<u32>,
+    /// 任务失败原因。Failed 终态时由后端写入,通过进度事件同步到前端,
+    /// 避免 UI 依赖 get_task_list 全量刷新才能展示错误详情(P1-22-4)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -451,6 +456,7 @@ impl AppState {
                 supervisor,
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
+                recovery_warning: Arc::new(tokio::sync::Mutex::new(None)),
             },
             fragment_state_store: crate::projection::FragmentStateStore::new(),
         })
@@ -523,6 +529,18 @@ pub fn supported_protocols() -> Vec<&'static str> {
     #[cfg(feature = "magnet")]
     protocols.push("BitTorrent");
     protocols
+}
+
+/// 拉取启动恢复告警(P1-22-3)
+///
+/// setup 阶段在 Tauri 事件监听器注册前即检测到损坏快照并 emit `recovery-warning`,
+/// 前端会漏接该事件。此命令返回暂存的告警(消费后清空),前端 mount 时主动拉取,
+/// 双保险确保告警不丢失。返回 `None` 表示无损坏快照或已被前端消费过。
+#[tauri::command]
+pub async fn get_recovery_warning(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RecoveryWarning>, AppError> {
+    Ok(state.runtime.recovery_warning.lock().await.take())
 }
 
 /// 请求破坏性操作的确认令牌(P1-11b)
@@ -816,6 +834,7 @@ pub(crate) mod tests {
                 supervisor,
                 progress_broker,
                 progress_subscribed: Arc::new(AtomicBool::new(false)),
+                recovery_warning: Arc::new(tokio::sync::Mutex::new(None)),
             },
             fragment_state_store: crate::projection::FragmentStateStore::new(),
         })

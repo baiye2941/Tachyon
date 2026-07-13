@@ -70,10 +70,14 @@ pub struct ServiceState {
     pub confirmation_service: Arc<ConfirmationService>,
 }
 
-/// 运行时时状态：任务生命周期与进度广播
+/// 运行时时状态:任务生命周期与进度广播
 #[derive(Clone)]
 pub struct RuntimeState {
     pub supervisor: Arc<DownloadSupervisor>,
     pub progress_broker: Arc<ProgressBroker>,
     pub progress_subscribed: Arc<AtomicBool>,
+    /// 启动恢复告警(损坏快照)。setup 阶段在 Tauri 事件监听器注册前就绪,
+    /// 直接 emit 会被前端漏接,故暂存于此供 `get_recovery_warning` 命令拉取,
+    /// 前端 mount 时主动查询以补全遗漏事件(P1-22-3)。
+    pub recovery_warning: Arc<Mutex<Option<crate::commands::RecoveryWarning>>>,
 }
