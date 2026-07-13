@@ -7,6 +7,8 @@ pub mod states;
 pub mod task_commands;
 
 // Re-exports: Tauri commands and public types
+#[cfg(feature = "magnet")]
+pub use self::config_commands::get_bt_proxy_coverage;
 pub use self::config_commands::{get_config, update_config};
 pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{

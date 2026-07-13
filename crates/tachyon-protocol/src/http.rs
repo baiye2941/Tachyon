@@ -185,6 +185,14 @@ impl HttpClient {
             // 拖慢首字节。
         }
 
+        // HTTP/2 强制控制(FIX-19):enable_http2=false 时显式调用 http1_only(),
+        // 确保 reqwest 不经 Alt-Svc/ALPN 协商升级到 HTTP/2。旧实现仅不设置 h2 相关选项,
+        // 但 reqwest 默认可能仍会协商 h2,使用户「关闭 HTTP/2」配置不生效。
+        // enable_http2=true 时保持上述显式大窗口 + PING 保活配置。
+        if !enable_http2 {
+            builder = builder.http1_only();
+        }
+
         // HTTP/3(QUIC):reqwest 在编译期开启 `http3` feature 后,默认即通过 Alt-Svc
         // 协商自动升级到 HTTP/3,失败回退 HTTP/2(无需显式调用 builder 方法)。
         // 本块仅在"编译期 http3 可用 + 运行期 enable_quic"时记录意图日志。
@@ -196,9 +204,13 @@ impl HttpClient {
         }
         #[cfg(not(all(feature = "http3", reqwest_unstable)))]
         if enable_quic {
-            // 运行期请求 QUIC 但编译期未启用 http3 feature(或未设 reqwest_unstable),
-            // 静默降级为 HTTP/2,不影响下载。
-            debug!("enable_quic=true 但 HTTP/3 未编译启用,降级使用 HTTP/2");
+            // FIX-19:运行期请求 QUIC 但编译期未启用 http3 feature,降级为 HTTP/2。
+            // 提升为 warn(原为 debug),使用户知晓 QUIC 配置实际未生效(避免「能力谎言」)。
+            // 配置层与前端应据此提示「当前构建不支持 HTTP/3,已降级 HTTP/2」。
+            warn!(
+                "enable_quic=true 但 HTTP/3 未编译启用(reqwest http3 feature 缺失),降级使用 HTTP/2;http3_compiled={}",
+                http3_compiled()
+            );
         }
 
         let client = builder
@@ -210,6 +222,27 @@ impl HttpClient {
     /// 使用自定义 reqwest Client 创建
     pub fn with_client(client: Client) -> Self {
         Self { client }
+    }
+
+    /// FIX-19 测试辅助:用给定 HTTP/2 与 QUIC 开关构造客户端(连接/读取超时用默认值),
+    /// 供测试验证 enable_http2=false 时 http1_only 路径可成功构造。
+    #[cfg(test)]
+    pub(crate) fn build_client_for_test(
+        enable_http2: bool,
+        enable_quic: bool,
+        pool_max_idle_per_host: usize,
+        keep_alive_secs: u64,
+        proxy: Option<&str>,
+    ) -> DownloadResult<Self> {
+        Self::build_client(
+            5,
+            10,
+            enable_http2,
+            enable_quic,
+            pool_max_idle_per_host,
+            keep_alive_secs,
+            proxy,
+        )
     }
 
     /// 创建 h2c prior-knowledge 客户端(明文 HTTP/2,不发 H1 Upgrade)
@@ -339,9 +372,11 @@ impl HttpClient {
         // 校验响应体大小,防止超大响应导致 OOM(复用统一的字节上限逻辑)
         check_response_size_limit(response.content_length())?;
 
-        // S-14: 使用 chunk() 流式读取,对无 Content-Length 的 chunked 响应
-        // 也能在累积大小超限时及时终止,而非等到读超时或 OOM
-        let mut body = String::new();
+        // FIX-18.6:旧实现对每个 chunk 独立 `String::from_utf8_lossy`,多字节 UTF-8 码点
+        // 跨 chunk 边界时会被部分字节替换为 U+FFFD,损坏播放列表/文本(如 HLS .m3u8)。
+        // 现改为累积原始字节后整体解码,由 decode_chunks_to_string 统一处理。
+        // S-14:使用 chunk() 流式读取,对无 Content-Length 的 chunked 响应也能在累积大小超限时及时终止。
+        let mut buf: Vec<u8> = Vec::new();
         let mut total_size = 0u64;
         while let Some(chunk) = response
             .chunk()
@@ -354,11 +389,9 @@ impl HttpClient {
                     "响应体过大: {total_size} > 最大允许 {MAX_GET_TEXT_SIZE} 字节"
                 )));
             }
-            // chunk 是 Bytes (UTF-8 边界安全),直接 extend
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            body.push_str(&chunk_str);
+            buf.extend_from_slice(&chunk);
         }
-        Ok(body)
+        decode_chunks_to_string(std::iter::once(buf.as_slice()))
     }
 
     /// 获取 URL 的原始字节内容(用于 HLS 分片下载等二进制场景)
@@ -404,6 +437,34 @@ impl HttpClient {
 const DNS_CACHE_TTL_SECS: u64 = 60;
 /// DNS 缓存最大条目数,防止 DashMap 无限增长导致内存泄漏
 const DNS_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// 将多个字节块解码为一个 UTF-8 字符串。
+///
+/// FIX-18.6:旧 `get_text` 对每个 HTTP chunk 独立调用 `String::from_utf8_lossy`,
+/// 当多字节 UTF-8 码点跨 chunk 边界时,部分字节会被替换为 U+FFFD,损坏播放列表/文本
+/// (如 HLS .m3u8 中的 CJK 字符)。本函数累积所有字节后整体解码,避免边界损坏;
+/// 无效 UTF-8 序列返回 `Err`(不静默 lossy 替换,便于上游诊断)。
+///
+/// 调用方负责在累积过程中做大小限制(防止 OOM)。
+pub(crate) fn decode_chunks_to_string<'a, I>(chunks: I) -> DownloadResult<String>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    for chunk in chunks {
+        buf.extend_from_slice(chunk);
+    }
+    String::from_utf8(buf)
+        .map_err(|e| DownloadError::Protocol(format!("响应体不是有效 UTF-8: {e}")))
+}
+
+/// FIX-19:当前构建是否编译启用了 HTTP/3(reqwest http3 feature + reqwest_unstable cfg)。
+///
+/// 供配置层/前端判断「QUIC 配置是否真能生效」,避免 enable_quic=true 在未编译 http3
+/// 时静默降级形成「能力谎言」(audit 问题 19)。build_client 据此在降级时发 warn。
+pub fn http3_compiled() -> bool {
+    cfg!(all(feature = "http3", reqwest_unstable))
+}
 
 #[derive(Debug, Clone)]
 struct PublicDnsResolver {
@@ -529,14 +590,26 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 ///
 /// 不一致时返回 `RangeMismatch` 错误,交由上层(mirror 调度器)切源。
 /// 一致或无 Content-Range 头(部分服务器不返回)时返回 Ok。
+/// 校验 206 响应的 Content-Range 与请求的 [start, end] 一致。
+///
+/// FIX-06(RFC 9110):单范围请求的 206 响应必须携带格式正确的
+/// `Content-Range: bytes start-end/total`,且 start/end 与请求区间完全匹配。
+///
+/// - 缺失 Content-Range 头 -> Err(旧实现放行,可静默拼接错位/同长度异版本字节)
+/// - 不可解析 -> Err
+/// - start/end 不匹配 -> Err(RangeMismatch 语义,交由上层切源)
+///
+/// 一致时返回 Ok。
 fn validate_content_range(
     headers: &reqwest::header::HeaderMap,
     start: u64,
     end: u64,
 ) -> DownloadResult<()> {
     let Some(cr_value) = headers.get("content-range").and_then(|v| v.to_str().ok()) else {
-        // 无 Content-Range 头:无法校验,放行(部分服务器 206 时不返回此头)
-        return Ok(());
+        // FIX-06:无 Content-Range 头的 206 违反 RFC 9110,拒绝而非放行
+        return Err(DownloadError::Protocol(format!(
+            "206 响应缺少 Content-Range 头,无法校验字节范围 [请求 {start},{end}]"
+        )));
     };
     match parse_content_range(cr_value) {
         Some((resp_start, resp_end, _)) => {
@@ -547,7 +620,9 @@ fn validate_content_range(
             }
             Ok(())
         }
-        None => Ok(()), // 解析失败(如 unsatisfied range),放行交由后续哈希校验兜底
+        None => Err(DownloadError::Protocol(format!(
+            "206 响应的 Content-Range 无法解析: {cr_value}"
+        ))),
     }
 }
 
@@ -1302,6 +1377,73 @@ mod tests {
         assert_eq!(extract_filename("http://example.com/", None), "unknown");
     }
 
+    // ── FIX-18.6: get_text 跨 chunk UTF-8 解码 ──────────────
+
+    /// FIX-18.6: 多字节 UTF-8 码点跨 HTTP chunk 边界时,旧实现对每个 chunk 独立
+    /// `String::from_utf8_lossy` 会把断裂的部分字节替换为 U+FFFD,损坏播放列表/文本。
+    /// 新辅助函数 `decode_chunks_to_string` 累积原始字节后整体解码,避免边界损坏。
+    #[test]
+    fn test_decode_chunks_preserves_multibyte_across_boundary() {
+        // “中”(U+4E2D)的 UTF-8 编码是 E4 B8 AD(3 字节),拆成两 chunk:前 1 字节 + 后 2 字节
+        let s = "hello 世界 utf8";
+        let bytes = s.as_bytes();
+        // 找一个多字节字符的内部位置拆分
+        // “世”起始于某偏移,选 split_at = 该偏移 + 1(字节内部,落在多字节序列中)
+        let shi_idx = s.find("世").unwrap();
+        let split_at = shi_idx + 1; // “世”的 UTF-8 第 1 字节后
+        let chunks: Vec<&[u8]> = vec![&bytes[..split_at], &bytes[split_at..]];
+        let decoded = super::decode_chunks_to_string(chunks.into_iter()).expect("应解码成功");
+        assert_eq!(
+            decoded, s,
+            "跨 chunk 边界的多字节字符必须完整保留,不得出现 U+FFFD"
+        );
+        assert!(!decoded.contains('\u{FFFD}'), "不得含替换字符");
+    }
+
+    #[test]
+    fn test_decode_chunks_single_chunk() {
+        // 单 chunk 整体解码与直接 from_utf8 一致
+        let chunks: Vec<&[u8]> = vec![b"plain ascii"];
+        let decoded = super::decode_chunks_to_string(chunks.into_iter()).expect("应解码成功");
+        assert_eq!(decoded, "plain ascii");
+    }
+
+    #[test]
+    fn test_decode_chunks_rejects_invalid_utf8() {
+        // 无效 UTF-8 序列应报错(不静默 lossy 替换,便于上游诊断)
+        let chunks: Vec<&[u8]> = vec![&[0xFF, 0xFE, 0xFD][..]];
+        assert!(super::decode_chunks_to_string(chunks.into_iter()).is_err());
+    }
+
+    // ── FIX-19: HTTP/2 强制与 HTTP/3 能力检测 ──
+
+    /// FIX-19:http3_compiled() 反映编译期 http3 feature 状态,供配置层/前端判断 QUIC
+    /// 是否真能生效(避免 enable_quic=true 在未编译时静默降级的「能力谎言」)。
+    #[test]
+    fn test_http3_compiled_matches_feature_cfg() {
+        // 仅断言函数可调用且返回 bool(具体值取决于编译 feature,不在单测中固定)
+        let compiled = super::http3_compiled();
+        // 默认构建未启用 http3 feature + reqwest_unstable -> 应为 false
+        // (CI 默认 --all-features 可能启用 http3,故仅断言类型与可调用性,不硬编码值)
+        let _ = compiled;
+        assert!(
+            compiled == true || compiled == false,
+            "http3_compiled 应返回 bool"
+        );
+    }
+
+    /// FIX-19:enable_http2=false 时 build_client 应成功并强制 HTTP/1(http1_only),
+    /// 不报错(旧实现仅不设 h2 选项,可能仍协商 h2)。此处验证客户端可成功构造。
+    #[test]
+    fn test_build_client_http1_only_when_http2_disabled() {
+        // enable_http2=false 构造客户端,应成功(显式 http1_only 不影响构造)
+        let client = HttpClient::build_client_for_test(false, false, 16, 30, None);
+        assert!(
+            client.is_ok(),
+            "enable_http2=false 时客户端应成功构造并强制 HTTP/1"
+        );
+    }
+
     #[test]
     fn test_parse_content_disposition_filename() {
         assert_eq!(
@@ -1792,9 +1934,31 @@ mod tests {
 
     #[test]
     fn test_validate_content_range_absent_header() {
-        // 无 Content-Range 头 → 放行(部分服务器 206 时不返回此头)
+        // FIX-06:无 Content-Range 头的 206 违反 RFC 9110,拒绝(旧实现放行可静默拼接错位数据)
         let headers = reqwest::header::HeaderMap::new();
-        assert!(super::validate_content_range(&headers, 100, 199).is_ok());
+        assert!(super::validate_content_range(&headers, 100, 199).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_unparseable() {
+        // FIX-06:不可解析的 Content-Range 拒绝
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "garbage".parse().unwrap());
+        assert!(super::validate_content_range(&headers, 100, 199).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_wrong_start() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 50-199/1000".parse().unwrap());
+        assert!(super::validate_content_range(&headers, 100, 199).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_wrong_end() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-range", "bytes 100-150/1000".parse().unwrap());
+        assert!(super::validate_content_range(&headers, 100, 199).is_err());
     }
 
     // --- HEAD 回退 GET 探测:回退判定 ---

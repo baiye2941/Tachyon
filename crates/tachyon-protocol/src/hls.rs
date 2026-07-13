@@ -68,6 +68,9 @@ pub enum Playlist {
         segments: Vec<MediaSegment>,
         encryption: Option<EncryptionKey>,
         is_vod: bool,
+        /// FIX-18.1:EXT-X-MEDIA-SEQUENCE 值(缺省 0)。AES-128 未显式 IV 时,
+        /// IV = media_sequence + segment_index(RFC 8216 §4.3.2.4)。
+        media_sequence: u64,
     },
 }
 
@@ -98,6 +101,8 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
     let mut is_vod = false;
     let mut pending_duration: Option<f64> = None;
     let mut pending_variant: Option<VariantStream> = None;
+    // FIX-18.1:EXT-X-MEDIA-SEQUENCE(缺省 0),供 AES-128 IV 计算
+    let mut media_sequence: u64 = 0;
 
     for line in lines {
         let line = line.trim();
@@ -133,6 +138,12 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
                 }
             };
             let uri = attrs.get("URI").cloned();
+            // FIX-18.2:密钥 URI 必须相对播放列表 base_url 解析(与分片 URI 一致),
+            // 否则相对密钥地址(如 URI="key.bin")会被 reqwest::Url::parse 拒绝。
+            let uri = match uri {
+                Some(u) => Some(resolve_uri(&u, base_url)?),
+                None => None,
+            };
             let iv = attrs.get("IV").cloned();
             let key = EncryptionKey {
                 method: method.clone(),
@@ -149,6 +160,9 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
             }
         } else if line.starts_with("#EXT-X-ENDLIST") {
             is_vod = true;
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            // FIX-18.1:解析媒体序列号(供 AES-128 IV 计算用)
+            media_sequence = rest.trim().parse::<u64>().unwrap_or(0);
         } else if !line.starts_with('#') {
             let resolved_uri = resolve_uri(line, base_url)?;
             if let Some(ref mut variant) = pending_variant {
@@ -172,6 +186,7 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
             segments,
             encryption: global_encryption,
             is_vod,
+            media_sequence,
         })
     }
 }
@@ -372,14 +387,16 @@ impl Protocol for HlsProtocol {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
             match playlist {
-                Playlist::Media { segments, .. } => {
-                    // 估算文件大小:总时长 * 假设码率(5Mbps)
-                    let total_duration: f64 = segments.iter().map(|s| s.duration).sum();
-                    let estimated_size = (total_duration * 625_000.0) as u64; // 5Mbps / 8 = 625KB/s
+                Playlist::Media { .. } => {
+                    // FIX-18.9:HLS 无法预知精确字节数。旧实现用 "总时长 * 假设 5Mbps" 估算
+                    // 并写入 file_size:Some(estimate),但引擎 execute_full_download 把
+                    // Some(file_size) 当作精确 EOF 后置条件(pos != expected_size -> Err),
+                    // 导致码率估算与真实长度不符时正确下载被误判失败。
+                    // 正确做法:file_size 为 None(大小未知),引擎对未知大小走宽松完成路径。
                     let file_name = extract_filename(&url, None);
                     Ok(FileMetadata {
                         file_name,
-                        file_size: Some(estimated_size),
+                        file_size: None,
                         content_type: Some("video/mp2t".to_string()),
                         supports_range: false,
                         etag: None,
@@ -431,10 +448,37 @@ impl Protocol for HlsProtocol {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
             match playlist {
-                Playlist::Media { segments, .. } => {
+                Playlist::Media {
+                    segments,
+                    media_sequence,
+                    ..
+                } => {
                     let mut buf = Vec::new();
-                    for seg in &segments {
+                    for (i, seg) in segments.iter().enumerate() {
                         let data = hls.http.get_bytes(&seg.uri).await?;
+                        // FIX-18.3:download_full 必须与 download_full_stream 一致地对
+                        // AES-128 分片解密(旧实现直接拼接密文,两个 API 结果不同)。
+                        let data = match &seg.encryption {
+                            Some(key) => match key.method {
+                                EncryptionMethod::Aes128 => {
+                                    decrypt_aes128(
+                                        &hls.http,
+                                        key,
+                                        &data,
+                                        // FIX-18.1:IV 序号 = media_sequence + 分片索引
+                                        media_sequence as u128 + i as u128,
+                                    )
+                                    .await?
+                                }
+                                EncryptionMethod::None => data,
+                                EncryptionMethod::SampleAes => {
+                                    return Err(DownloadError::Protocol(
+                                        "SAMPLE-AES 加密不支持".into(),
+                                    ));
+                                }
+                            },
+                            None => data,
+                        };
                         buf.extend_from_slice(&data);
                     }
                     Ok(Bytes::from(buf))
@@ -454,7 +498,11 @@ impl Protocol for HlsProtocol {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
             match playlist {
-                Playlist::Media { segments, .. } => {
+                Playlist::Media {
+                    segments,
+                    media_sequence,
+                    ..
+                } => {
                     let http = Arc::clone(&hls.http);
                     let total = segments.len();
                     // 收集每个分片的 (uri, encryption) 信息,传入 unfold state
@@ -464,10 +512,10 @@ impl Protocol for HlsProtocol {
                         .collect();
                     let idx = 0usize;
                     // 使用 unfold 逐分片下载,避免 async_stream 依赖
-                    // state 持 http + (uri, encryption) 列表 + idx,避免借用 segments
+                    // state 持 http + (uri, encryption) 列表 + idx + media_sequence,避免借用 segments
                     let stream = futures::stream::unfold(
-                        (http, seg_info, idx, total),
-                        |(http, segs, i, total)| async move {
+                        (http, seg_info, idx, total, media_sequence),
+                        |(http, segs, i, total, media_sequence)| async move {
                             if i >= total {
                                 None
                             } else {
@@ -479,7 +527,11 @@ impl Protocol for HlsProtocol {
                                             Some(key) => match key.method {
                                                 EncryptionMethod::Aes128 => {
                                                     match decrypt_aes128(
-                                                        &http, key, &data, i as u128,
+                                                        &http,
+                                                        key,
+                                                        &data,
+                                                        // FIX-18.1:IV 序号 = media_sequence + 分片索引(RFC 8216 §4.3.2.4)
+                                                        media_sequence as u128 + i as u128,
                                                     )
                                                     .await
                                                     {
@@ -487,7 +539,13 @@ impl Protocol for HlsProtocol {
                                                         Err(e) => {
                                                             return Some((
                                                                 Err(e),
-                                                                (http, segs, total, total),
+                                                                (
+                                                                    http,
+                                                                    segs,
+                                                                    total,
+                                                                    total,
+                                                                    media_sequence,
+                                                                ),
                                                             ));
                                                         }
                                                     }
@@ -498,15 +556,17 @@ impl Protocol for HlsProtocol {
                                                         Err(DownloadError::Protocol(
                                                             "SAMPLE-AES 加密暂不支持".into(),
                                                         )),
-                                                        (http, segs, total, total),
+                                                        (http, segs, total, total, media_sequence),
                                                     ));
                                                 }
                                             },
                                             None => data,
                                         };
-                                        Some((Ok(data), (http, segs, i + 1, total)))
+                                        Some((Ok(data), (http, segs, i + 1, total, media_sequence)))
                                     }
-                                    Err(e) => Some((Err(e), (http, segs, total, total))),
+                                    Err(e) => {
+                                        Some((Err(e), (http, segs, total, total, media_sequence)))
+                                    }
                                 }
                             }
                         },
@@ -542,6 +602,7 @@ segment2.ts
                 segments,
                 is_vod,
                 encryption,
+                ..
             } => {
                 assert_eq!(segments.len(), 3, "应解析 3 个分片");
                 assert_eq!(segments[0].uri, "segment0.ts");
@@ -613,6 +674,86 @@ segment1.ts
                     Some("0x00000000000000000000000000000001")
                 );
                 assert!(segments[0].encryption.is_some());
+            }
+            _ => panic!("应为 Media playlist"),
+        }
+    }
+
+    // ── FIX-18.2: EXT-X-KEY 的相对 URI 必须相对播放列表解析 ──
+
+    /// FIX-18.2:旧实现仅对分片 URI 调用 resolve_uri,EXT-X-KEY 的 URI 原样保留,
+    /// 导致相对密钥地址(如 URI="key.bin")无法被 http.get_bytes 解析(reqwest::Url::parse 拒绝相对 URL)。
+    /// 修复后密钥 URI 也应相对 base_url 解析。
+    #[test]
+    fn test_parse_resolves_relative_key_uri() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin"
+#EXTINF:10.000,
+segment0.ts
+#EXT-X-ENDLIST
+"#;
+        let base = "https://cdn.example.com/playlist/";
+        let playlist = parse_m3u8(content, Some(base)).expect("应解析成功");
+        match playlist {
+            Playlist::Media {
+                segments,
+                encryption,
+                ..
+            } => {
+                assert_eq!(
+                    segments[0].uri,
+                    "https://cdn.example.com/playlist/segment0.ts"
+                );
+                let key = encryption.expect("应有加密信息");
+                assert_eq!(
+                    key.uri.as_deref(),
+                    Some("https://cdn.example.com/playlist/key.bin"),
+                    "相对密钥 URI 必须相对播放列表 base_url 解析"
+                );
+            }
+            _ => panic!("应为 Media playlist"),
+        }
+    }
+
+    // ── FIX-18.1: 解析 EXT-X-MEDIA-SEQUENCE 用于 AES-128 IV ──
+
+    /// FIX-18.1:RFC 8216 规定 AES-128 未显式给出 IV 时使用媒体序列号(EXT-X-MEDIA-SEQUENCE)。
+    /// 旧实现不解析该标签,download_full_stream 用本地从 0 开始的分片索引作 IV,导致非 0 起始的
+    /// 加密分片解密错误。修复后 parse_m3u8 解析 EXT-X-MEDIA-SEQUENCE 并存入 Playlist::Media,
+    /// 供解密时使用 media_sequence + segment_index 作 IV。
+    #[test]
+    fn test_parse_media_sequence() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:5
+#EXTINF:10.000,
+segment0.ts
+#EXTINF:10.000,
+segment1.ts
+#EXT-X-ENDLIST
+"#;
+        let playlist = parse_m3u8(content, None).expect("应解析成功");
+        match playlist {
+            Playlist::Media { media_sequence, .. } => {
+                assert_eq!(media_sequence, 5, "应解析 EXT-X-MEDIA-SEQUENCE");
+            }
+            _ => panic!("应为 Media playlist"),
+        }
+    }
+
+    #[test]
+    fn test_parse_media_sequence_defaults_to_zero() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:10.000,
+segment0.ts
+#EXT-X-ENDLIST
+"#;
+        let playlist = parse_m3u8(content, None).expect("应解析成功");
+        match playlist {
+            Playlist::Media { media_sequence, .. } => {
+                assert_eq!(media_sequence, 0, "缺省 EXT-X-MEDIA-SEQUENCE 应为 0");
             }
             _ => panic!("应为 Media playlist"),
         }
@@ -745,9 +886,13 @@ plain.ts
         let meta = hls.probe(&url).await.expect("probe 应成功");
         assert!(!meta.supports_range, "HLS 不应支持 Range");
         assert_eq!(meta.content_type.as_deref(), Some("video/mp2t"));
-        assert!(meta.file_size.is_some(), "应估算文件大小");
-        // 两个分片各 10 秒 * 625KB/s = 12.5MB
-        assert_eq!(meta.file_size.unwrap(), 12_500_000);
+        // FIX-18.9:HLS 无法预知精确字节数(码率估算 != 真实长度)。probe 不得把估算值
+        // 放入 file_size,否则引擎 execute_full_download 会把 Some(file_size) 当作
+        // 精确 EOF 后置条件(pos != expected_size -> Err),导致正确下载被误判失败。
+        assert!(
+            meta.file_size.is_none(),
+            "HLS probe 的 file_size 必须为 None(大小未知),不得用码率估算值"
+        );
     }
 
     #[tokio::test]
@@ -947,5 +1092,66 @@ plain.ts
             collected.extend_from_slice(&chunk.expect("不应出错"));
         }
         assert_eq!(&collected, b"DECRYPTED!!!");
+    }
+
+    /// FIX-18.3 回归:download_full 必须与 download_full_stream 一致地对 AES-128 分片解密。
+    /// 旧实现 download_full 直接拼接密文(不调用 decrypt_aes128),导致两个 API 结果不同。
+    #[tokio::test]
+    async fn test_hls_download_full_decrypts_aes128_like_stream() {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri();
+
+        let key: [u8; 16] = [0xAB; 16];
+        let iv: [u8; 16] = [0x11; 16];
+        let iv_hex = "0x11111111111111111111111111111111";
+
+        let plaintext = b"DECRYPTED!!!"; // 12 字节 -> PKCS7 填充到 16
+        let mut buf = vec![0u8; 16];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let cipher = Aes128CbcEnc::new(&key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+            .unwrap()
+            .to_vec();
+
+        let m3u8 = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI=\"{base}/key.bin\",IV={iv_hex}\n#EXTINF:10.000,\nseg.ts\n#EXT-X-ENDLIST\n"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/playlist.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(m3u8))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/key.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(key.to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/seg.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cipher.clone()))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        // download_full 应返回解密后的明文,而非拼接的密文
+        let result = hls
+            .download_full(&format!("{base}/playlist.m3u8"))
+            .await
+            .expect("download_full 应成功");
+        assert_eq!(
+            result.as_ref(),
+            plaintext,
+            "download_full 必须解密 AES-128 分片,不得返回密文"
+        );
+        assert_ne!(
+            result.as_ref(),
+            cipher.as_slice(),
+            "结果不得等于密文(旧 bug:download_full 直接拼接密文)"
+        );
     }
 }

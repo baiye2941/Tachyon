@@ -1,4 +1,5 @@
 import type { SetStoreFunction } from "solid-js/store";
+import { For, Show } from "solid-js";
 import { tr } from "../../../i18n";
 import { addToast } from "../../../stores/toast";
 import NumberInput from "../items/NumberInput";
@@ -6,6 +7,8 @@ import SectionLabel from "../items/SectionLabel";
 import ToggleItem from "../items/ToggleItem";
 import TrackerList from "../items/TrackerList";
 import { PRESET_TRACKERS } from "../constants";
+import { computeBtProxyCoverage, type BtProxyCoverageReport } from "../../../utils/btProxyCoverage";
+import type { ProxyCoverage } from "../../../types";
 import type { ConfigDraft } from "../SettingsPanel";
 
 export interface MagnetTabProps {
@@ -67,6 +70,9 @@ export default function MagnetTab(props: MagnetTabProps) {
           {t("settings.magnet.socksProxyUrlHint")}
         </span>
       </div>
+
+      {/* FIX-16: BT 代理流量覆盖状态(隐私可见性) —— 展示各流量类别是否经代理/可能绕过 */}
+      <BtProxyCoveragePanel draft={props.draft} />
 
       {/* —— Task 9: Peer 超时配置(需重启生效) —— */}
       <SectionLabel text={t("settings.magnet.sectionPeer")} />
@@ -153,5 +159,77 @@ export default function MagnetTab(props: MagnetTabProps) {
         }}
       />
     </div>
+  );
+}
+
+/// FIX-16:BT 代理流量覆盖状态面板。展示各流量类别(peer TCP / HTTP tracker / UDP tracker+DHT /
+/// uTP / UPnP)相对 SOCKS 代理的覆盖状态,让用户知晓隐私边界与可能绕过的流量。
+function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
+  const t = tr;
+  const report = (): BtProxyCoverageReport =>
+    computeBtProxyCoverage(props.draft.magnet);
+
+  const rows = (): Array<{ label: string; status: ProxyCoverage }> => [
+    { label: t("settings.magnet.coveragePeerTcp"), status: report().peerTcp },
+    { label: t("settings.magnet.coverageHttpTracker"), status: report().httpTracker },
+    { label: t("settings.magnet.coverageUdpTrackerDht"), status: report().udpTrackerDht },
+    { label: t("settings.magnet.coverageUtp"), status: report().utp },
+    { label: t("settings.magnet.coverageUpnp"), status: report().upnp },
+  ];
+
+  const statusColor = (s: ProxyCoverage): string => {
+    switch (s) {
+      case "ViaProxy": return "var(--color-success, #22c55e)";
+      case "Blocked":
+      case "Disabled": return "var(--color-text-secondary, #888)";
+      case "MayBypass": return "var(--color-warning, #f59e0b)";
+      default: return "var(--color-text-secondary, #888)";
+    }
+  };
+
+  const statusText = (s: ProxyCoverage): string => {
+    switch (s) {
+      case "Direct": return t("settings.magnet.coverageDirect");
+      case "ViaProxy": return t("settings.magnet.coverageViaProxy");
+      case "Blocked": return t("settings.magnet.coverageBlocked");
+      case "Disabled": return t("settings.magnet.coverageDisabled");
+      case "MayBypass": return t("settings.magnet.coverageMayBypass");
+    }
+  };
+
+  return (
+    <Show when={report().socksEnabled}>
+      <div
+        style={{
+          "margin-top": "6px",
+          padding: "8px 10px",
+          "border-radius": "6px",
+          "border": "1px solid var(--color-border, #333)",
+          background: "var(--color-bg-secondary, #1a1a1a)",
+        }}
+      >
+        <div style={{ "font-size": "12px", "font-weight": 600, "margin-bottom": "4px" }}>
+          {t("settings.magnet.coverageTitle")}
+        </div>
+        <For each={rows()}>
+          {(row) => (
+            <div
+              style={{
+                display: "flex",
+                "justify-content": "space-between",
+                "font-size": "11px",
+                "margin-top": "2px",
+              }}
+            >
+              <span>{row.label}</span>
+              <span style={{ color: statusColor(row.status) }}>{statusText(row.status)}</span>
+            </div>
+          )}
+        </For>
+        <div style={{ "font-size": "10px", "color": "var(--color-text-secondary)", "margin-top": "4px" }}>
+          {t("settings.magnet.coverageHint")}
+        </div>
+      </div>
+    </Show>
   );
 }

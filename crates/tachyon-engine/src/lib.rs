@@ -26,7 +26,7 @@ pub use rate_limit::RateLimiter;
 pub use tachyon_core::FragmentProgress;
 
 #[cfg(feature = "magnet")]
-pub use bt_session::BtSession;
+pub use bt_session::{BtSession, ProxyCoverage, ProxyCoverageReport, bt_proxy_coverage_status};
 #[cfg(feature = "magnet")]
 pub use tachyon_protocol::MagnetProtocol;
 #[cfg(feature = "magnet")]

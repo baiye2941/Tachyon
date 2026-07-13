@@ -12,6 +12,17 @@ pub async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, 
     get_config_inner(&state).await
 }
 
+/// FIX-16:返回 BT 各流量类别的代理覆盖状态(隐私可见性),供前端展示哪些流量经代理、
+/// 哪些可能绕过(uTP/UPnP 基于 UDP/局域网,SOCKS5 不代理)。
+#[cfg(feature = "magnet")]
+#[tauri::command]
+pub async fn get_bt_proxy_coverage(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<tachyon_engine::ProxyCoverageReport>, AppError> {
+    let bt = state.infra.bt_session.lock().await;
+    Ok(bt.as_ref().map(|s| s.proxy_coverage_status()))
+}
+
 #[tauri::command]
 pub async fn update_config(
     state: tauri::State<'_, AppState>,

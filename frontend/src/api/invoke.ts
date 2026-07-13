@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask } from '../stores/mockData'
@@ -138,6 +138,8 @@ export const api = {
   getTaskFragments: (taskId: string) => invoke<TaskFragmentsView>('get_task_fragments', { taskId }),
   /** 获取应用配置 */
   getConfig: () => invoke<AppConfig>('get_config'),
+  /** FIX-16:获取 BT 各流量类别的代理覆盖状态(隐私可见性) */
+  getBtProxyCoverage: () => invoke<BtProxyCoverageReport | null>('get_bt_proxy_coverage'),
   /** 更新应用配置(破坏性操作,需确认令牌。SettingsPanel 已自行确认,跳过 invoke 内 window.confirm) */
   updateConfig: (patch: ConfigPatch) => invoke<void>('update_config', { patch }, true),
   /** 获取嗅探资源列表 */

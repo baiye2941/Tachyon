@@ -161,6 +161,17 @@ impl BtSession {
         opts
     }
 
+    /// FIX-16:报告 BT 各流量类别在当前配置下的代理覆盖状态(隐私可见性)。
+    ///
+    /// 审计指出:应用侧已注入 socks_proxy_url、过滤 UDP tracker、禁用 DHT,但 librqbit
+    /// 内部对 peer TCP / HTTP(S) tracker / UDP tracker / DHT / uTP / UPnP 各路径是否走
+    /// SOCKS 不可从应用代码证明。本函数在应用层对「已配置状态」做可见性汇总,供前端展示
+    /// 隐私边界。注意:ViaProxy 表示「应用已配置走代理」,不等于「已证实全程未泄漏」--
+    /// librqbit 内部行为需外部抓包验证。
+    pub fn proxy_coverage_status(&self) -> ProxyCoverageReport {
+        bt_proxy_coverage_status(&self.config)
+    }
+
     /// 获取内部 Session 引用
     pub fn session(&self) -> Arc<Session> {
         self.inner.clone()
@@ -182,6 +193,91 @@ impl BtSession {
     /// 使 handle_cache 跨实例共享:probe_filename 填充的 handle 对下载任务可见。
     pub fn handle_cache(&self) -> HandleCache {
         Arc::clone(&self.handle_cache)
+    }
+}
+
+/// FIX-16:BT 某类流量相对 SOCKS 代理的覆盖状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ProxyCoverage {
+    /// 未配置 SOCKS,流量直连(无代理保护)。
+    Direct,
+    /// 已配置 SOCKS 且应用已注入 socks_proxy_url,流量经代理。
+    /// 注意:ViaProxy 表示「应用已配置」,不等于「已证实全程未泄漏」。
+    ViaProxy,
+    /// 流量被过滤/禁用(如 SOCKS 下 UDP tracker/DHT 不可达被关闭),不产生流量。
+    Blocked,
+    /// 功能关闭(如 UPnP=false),不产生流量。
+    Disabled,
+    /// 流量可能绕过代理(如 uTP/UPnP 基于 UDP 或局域网,SOCKS5 不代理 UDP)。
+    MayBypass,
+}
+
+/// FIX-16:BT 各流量类别的代理覆盖报告(隐私可见性)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProxyCoverageReport {
+    /// 是否已启用 SOCKS5 代理(显式配置或自动检测)。
+    pub socks_enabled: bool,
+    /// 对等 TCP 连接(librqbit peer TCP,经 socks_proxy_url)。
+    pub peer_tcp: ProxyCoverage,
+    /// HTTP(S) tracker(reqwest,经 socks_proxy_url)。
+    pub http_tracker: ProxyCoverage,
+    /// UDP tracker + DHT(基于 UDP,SOCKS5 不代理 UDP)。
+    pub udp_tracker_dht: ProxyCoverage,
+    /// uTP(基于 UDP 的传输,SOCKS5 不代理 UDP,可能绕过)。
+    pub utp: ProxyCoverage,
+    /// UPnP(局域网端口映射,不走 SOCKS,可能绕过)。
+    pub upnp: ProxyCoverage,
+}
+
+/// FIX-16:根据 MagnetConfig 计算 BT 各流量类别的代理覆盖状态(纯函数,可独立测试)。
+///
+/// 与 `build_session_options` 对齐:socks_proxy_url 注入 peer TCP + HTTP tracker;
+/// disable_dht_when_socks 控制 UDP tracker/DHT;uTP/UPnP 因 UDP/局域网性质标记 MayBypass/Disabled。
+/// 注意:detect_socks_proxy() 依赖环境变量,本函数仅看显式配置 socks_proxy_url(确定性测试)。
+pub fn bt_proxy_coverage_status(config: &MagnetConfig) -> ProxyCoverageReport {
+    let socks_enabled = config.socks_proxy_url.is_some();
+    if !socks_enabled {
+        // 无 SOCKS:所有流量直连(UPnP 按开关区分 Direct/Disabled)
+        let upnp = if config.enable_upnp {
+            ProxyCoverage::Direct
+        } else {
+            ProxyCoverage::Disabled
+        };
+        return ProxyCoverageReport {
+            socks_enabled: false,
+            peer_tcp: ProxyCoverage::Direct,
+            http_tracker: ProxyCoverage::Direct,
+            udp_tracker_dht: ProxyCoverage::Direct,
+            utp: ProxyCoverage::Direct,
+            upnp,
+        };
+    }
+    // SOCKS 启用
+    // peer TCP / HTTP tracker:应用已注入 socks_proxy_url -> ViaProxy
+    let peer_tcp = ProxyCoverage::ViaProxy;
+    let http_tracker = ProxyCoverage::ViaProxy;
+    // UDP tracker + DHT:SOCKS5 不代理 UDP。disable_dht_when_socks=true 时应用禁用 DHT、
+    // 过滤 UDP tracker -> Blocked;否则未禁用但 UDP 不经代理 -> MayBypass
+    let udp_tracker_dht = if config.disable_dht_when_socks {
+        ProxyCoverage::Blocked
+    } else {
+        ProxyCoverage::MayBypass
+    };
+    // uTP 基于 UDP,SOCKS5 不代理 UDP -> MayBypass
+    let utp = ProxyCoverage::MayBypass;
+    // UPnP 局域网端口映射,不走 SOCKS:关闭时 Disabled,开启时 MayBypass
+    let upnp = if config.enable_upnp {
+        ProxyCoverage::MayBypass
+    } else {
+        ProxyCoverage::Disabled
+    };
+    ProxyCoverageReport {
+        socks_enabled: true,
+        peer_tcp,
+        http_tracker,
+        udp_tracker_dht,
+        utp,
+        upnp,
     }
 }
 
@@ -444,5 +540,59 @@ mod tests {
             !redacted.contains(invalid),
             "非法 URL 时不应回显原始输入(可能含凭据)"
         );
+    }
+
+    // ── FIX-16: BT 代理流量覆盖状态(隐私可见性) ──────────────
+
+    /// FIX-16:审计指出 BT SOCKS 代理的「全流量覆盖」缺乏证据(应用侧措施已存在,
+    /// 但 librqbit 内部对 peer TCP / HTTP(S) tracker / UDP tracker / DHT / uTP / UPnP 各路径
+    /// 是否走 SOCKS 不可从应用代码证明)。本函数在应用层对已配置状态做可见性汇总,
+    /// 供前端展示隐私边界,让用户知晓哪些流量经代理、哪些可能绕过。
+    #[test]
+    fn test_bt_proxy_coverage_no_socks_all_direct() {
+        let mut config = test_config();
+        config.socks_proxy_url = None;
+        config.enable_dht = true;
+        config.enable_upnp = false;
+        let report = bt_proxy_coverage_status(&config);
+        assert_eq!(report.peer_tcp, ProxyCoverage::Direct);
+        assert_eq!(report.http_tracker, ProxyCoverage::Direct);
+        assert_eq!(report.udp_tracker_dht, ProxyCoverage::Direct);
+        assert_eq!(report.utp, ProxyCoverage::Direct);
+        assert!(!report.socks_enabled);
+    }
+
+    #[test]
+    fn test_bt_proxy_coverage_socks_proxies_core_and_blocks_udp_dht() {
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.disable_dht_when_socks = true;
+        config.enable_upnp = true;
+        let report = bt_proxy_coverage_status(&config);
+        assert!(report.socks_enabled);
+        assert_eq!(report.peer_tcp, ProxyCoverage::ViaProxy);
+        assert_eq!(report.http_tracker, ProxyCoverage::ViaProxy);
+        assert_eq!(report.udp_tracker_dht, ProxyCoverage::Blocked);
+        assert_eq!(report.utp, ProxyCoverage::MayBypass);
+        assert_eq!(report.upnp, ProxyCoverage::MayBypass);
+    }
+
+    #[test]
+    fn test_bt_proxy_coverage_socks_keeps_dht_when_not_disabled() {
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.disable_dht_when_socks = false;
+        config.enable_dht = true;
+        let report = bt_proxy_coverage_status(&config);
+        assert_eq!(report.udp_tracker_dht, ProxyCoverage::MayBypass);
+    }
+
+    #[test]
+    fn test_bt_proxy_coverage_upnp_off_when_disabled() {
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.enable_upnp = false;
+        let report = bt_proxy_coverage_status(&config);
+        assert_eq!(report.upnp, ProxyCoverage::Disabled);
     }
 }

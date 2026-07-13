@@ -151,6 +151,19 @@ export interface NotificationsPatch {
   enabled?: boolean
 }
 
+/** FIX-16:BT 某类流量相对 SOCKS 代理的覆盖状态 */
+export type ProxyCoverage = 'Direct' | 'ViaProxy' | 'Blocked' | 'Disabled' | 'MayBypass'
+
+/** FIX-16:BT 各流量类别的代理覆盖报告(隐私可见性) */
+export interface BtProxyCoverageReport {
+  socksEnabled: boolean
+  peerTcp: ProxyCoverage
+  httpTracker: ProxyCoverage
+  udpTrackerDht: ProxyCoverage
+  utp: ProxyCoverage
+  upnp: ProxyCoverage
+}
+
 /** 下载配置白名单补丁 */
 export interface DownloadPatch {
   downloadDir?: string

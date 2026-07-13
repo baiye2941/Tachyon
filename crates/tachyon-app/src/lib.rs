@@ -185,6 +185,7 @@ pub fn run() {
             clear_sniffer_resources,
             // 配置管理
             get_config,
+            #[cfg(feature = "magnet")] get_bt_proxy_coverage,
             update_config,
             export_backup,
             import_backup,
