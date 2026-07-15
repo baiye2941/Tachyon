@@ -194,6 +194,99 @@ pub struct FileMetadata {
     pub protocol_managed_storage: bool,
 }
 
+/// HTTP 对象身份(ETag / Last-Modified / size)
+///
+/// 用于 resume 准入、Range `If-Range` 与镜像兼容筛选,防止同长度不同版本静默拼接。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObjectIdentity {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+impl ObjectIdentity {
+    /// 从探测元数据提取对象身份。
+    pub fn from_metadata(meta: &FileMetadata) -> Self {
+        Self {
+            etag: meta.etag.clone(),
+            last_modified: meta.last_modified.clone(),
+            file_size: meta.file_size,
+        }
+    }
+
+    /// 是否为 strong ETag(非 `W/` / `w/` 前缀)。
+    pub fn is_strong_etag(etag: &str) -> bool {
+        let t = etag.trim();
+        !(t.starts_with("W/") || t.starts_with("w/"))
+    }
+
+    /// 规范化 ETag 比较键:去空白、可选弱标记、两侧引号。
+    pub fn normalize_etag(etag: &str) -> String {
+        let mut t = etag.trim();
+        if let Some(rest) = t.strip_prefix("W/").or_else(|| t.strip_prefix("w/")) {
+            t = rest.trim();
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+            t[1..t.len() - 1].to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// 适合写入 `If-Range` 的值:仅 strong ETag 或 Last-Modified。
+    ///
+    /// weak ETag 不得作为 `If-Range`(RFC 9110)。
+    pub fn if_range_value(&self) -> Option<String> {
+        if let Some(ref etag) = self.etag
+            && Self::is_strong_etag(etag)
+        {
+            return Some(etag.trim().to_string());
+        }
+        self.last_modified
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// resume 是否可安全沿用已完成/部分分片。
+    ///
+    /// - 双方 strong ETag 规范化后相等 → 可
+    /// - 无 strong 时双方 Last-Modified 相等 → 可
+    /// - 仅 size 或未知 → 不可(防同长换版)
+    pub fn compatible_for_resume(&self, remote: &Self) -> bool {
+        if let (Some(a), Some(b)) = (self.strong_etag_key(), remote.strong_etag_key()) {
+            return a == b;
+        }
+        // 任一侧仅有 weak/无 ETag 时不靠 ETag 证明
+        if let (Some(a), Some(b)) = (
+            self.last_modified.as_ref().map(|s| s.trim()),
+            remote.last_modified.as_ref().map(|s| s.trim()),
+        ) && !a.is_empty()
+            && !b.is_empty()
+        {
+            return a == b;
+        }
+        false
+    }
+
+    /// 镜像源是否可与 baseline 混拼同一逻辑对象。
+    ///
+    /// 规则与 resume 相同:仅 strong ETag 或 Last-Modified 可证明;仅 size 不可混拼。
+    pub fn compatible_for_mirror(&self, other: &Self) -> bool {
+        self.compatible_for_resume(other)
+    }
+
+    fn strong_etag_key(&self) -> Option<String> {
+        self.etag.as_ref().and_then(|e| {
+            if Self::is_strong_etag(e) {
+                Some(Self::normalize_etag(e))
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// 多文件布局:全局偏移 ↔ (file_id, 文件内偏移) 的双向折算
 ///
 /// 用于 BitTorrent 多文件 torrent:引擎按 torrent 全局字节流切分片
@@ -508,6 +601,117 @@ mod tests {
         let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.file_name, "test.bin");
         assert_eq!(deserialized.file_size, Some(1024));
+    }
+
+    #[test]
+    fn test_object_identity_strong_etag_compatible() {
+        let a = ObjectIdentity {
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+            file_size: Some(100),
+        };
+        let b = ObjectIdentity {
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+            file_size: Some(100),
+        };
+        assert!(a.compatible_for_resume(&b));
+        assert!(a.compatible_for_mirror(&b));
+        assert_eq!(a.if_range_value().as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn test_object_identity_strong_etag_mismatch_rejects() {
+        let old = ObjectIdentity {
+            etag: Some("\"v1\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            file_size: Some(100),
+        };
+        let new = ObjectIdentity {
+            etag: Some("\"v2\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            file_size: Some(100),
+        };
+        assert!(!old.compatible_for_resume(&new));
+        assert!(!old.compatible_for_mirror(&new));
+    }
+
+    #[test]
+    fn test_object_identity_weak_etag_not_if_range_and_not_safe_alone() {
+        let a = ObjectIdentity {
+            etag: Some("W/\"weak\"".into()),
+            last_modified: None,
+            file_size: Some(100),
+        };
+        let b = ObjectIdentity {
+            etag: Some("W/\"weak\"".into()),
+            last_modified: None,
+            file_size: Some(100),
+        };
+        assert!(!ObjectIdentity::is_strong_etag("W/\"weak\""));
+        assert!(a.if_range_value().is_none());
+        // 仅 weak ETag + size 不得证明 resume/mirror 兼容
+        assert!(!a.compatible_for_resume(&b));
+        assert!(!a.compatible_for_mirror(&b));
+    }
+
+    #[test]
+    fn test_object_identity_last_modified_fallback() {
+        let a = ObjectIdentity {
+            etag: None,
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            file_size: Some(50),
+        };
+        let same = ObjectIdentity {
+            etag: None,
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            file_size: Some(50),
+        };
+        let different = ObjectIdentity {
+            etag: None,
+            last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
+            file_size: Some(50),
+        };
+        assert!(a.compatible_for_resume(&same));
+        assert!(!a.compatible_for_resume(&different));
+        assert_eq!(
+            a.if_range_value().as_deref(),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn test_object_identity_size_only_not_safe() {
+        let a = ObjectIdentity {
+            etag: None,
+            last_modified: None,
+            file_size: Some(1024),
+        };
+        let b = ObjectIdentity {
+            etag: None,
+            last_modified: None,
+            file_size: Some(1024),
+        };
+        assert!(!a.compatible_for_resume(&b));
+        assert!(!a.compatible_for_mirror(&b));
+        assert!(a.if_range_value().is_none());
+    }
+
+    #[test]
+    fn test_object_identity_from_metadata() {
+        let meta = FileMetadata {
+            file_name: "x.bin".into(),
+            file_size: Some(9),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"e\"".into()),
+            last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".into()),
+            file_layout: None,
+            protocol_managed_storage: false,
+        };
+        let id = ObjectIdentity::from_metadata(&meta);
+        assert_eq!(id.etag.as_deref(), Some("\"e\""));
+        assert_eq!(id.file_size, Some(9));
     }
 
     #[test]

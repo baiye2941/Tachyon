@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use futures::Stream;
 
 use crate::error::{DownloadError, DownloadResult};
-use crate::types::FileMetadata;
+use crate::types::{FileMetadata, ObjectIdentity};
 
 /// 字节流类型别名
 ///
@@ -33,11 +33,15 @@ pub trait Protocol: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>>;
 
     /// 下载指定字节范围的数据
+    ///
+    /// `identity` 为 probe/resume 建立的对象身份;HTTP 实现用于 `If-Range`。
+    /// 无身份或非 HTTP 协议可传 `None`。
     fn download_range(
         &self,
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>>;
 
     /// 流式下载指定字节范围的数据
@@ -45,11 +49,14 @@ pub trait Protocol: Send + Sync {
     /// 与 `download_range` 不同,此方法以流式方式返回数据块,
     /// 允许调用方边接收边写入存储,降低峰值内存占用。
     /// 调用方应使用 `StreamExt::next()` 逐块消费。
+    ///
+    /// `identity` 语义同 `download_range`。
     fn download_range_stream(
         &self,
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>>;
 
     /// 下载整个文件(不支持 Range 时使用)
@@ -267,6 +274,9 @@ pub trait TaskRunner: Send + Sync {
     /// 注入未完整下载的分片及其已下载字节数(字节级断点续传)
     fn set_partial_fragments(&mut self, fragments: HashMap<u32, u64>);
 
+    /// 注入断点快照对象身份(ETag/Last-Modified/size)
+    fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>);
+
     /// 注入分片进度发送端
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>);
 
@@ -299,6 +309,10 @@ impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
 
     fn set_partial_fragments(&mut self, fragments: HashMap<u32, u64>) {
         (**self).set_partial_fragments(fragments)
+    }
+
+    fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
+        (**self).set_resume_object_identity(identity)
     }
 
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>) {
@@ -480,6 +494,8 @@ mod tests {
         fn set_partial_fragments(&mut self, _fragments: HashMap<u32, u64>) {
             self.state.lock().unwrap().partial_fragments_set = true;
         }
+
+        fn set_resume_object_identity(&mut self, _identity: Option<ObjectIdentity>) {}
 
         fn set_progress_sender(&mut self, _tx: mpsc::Sender<FragmentProgress>) {
             self.state.lock().unwrap().progress_sender_set = true;

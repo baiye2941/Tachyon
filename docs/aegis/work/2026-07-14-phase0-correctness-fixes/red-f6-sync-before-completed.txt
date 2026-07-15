@@ -1,0 +1,28 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 27.58s
+────────────
+ Nextest run ID 80c063e8-3a19-4c14-8a5f-79cb4892fec0 with nextest profile: default
+    Starting 1 test across 1 binary (284 tests skipped)
+       START [         ] (1/1) tachyon-engine downloader::tests::test_fragment_completed_progress_requires_storage_sync_first
+
+running 1 test
+
+thread 'downloader::tests::test_fragment_completed_progress_requires_storage_sync_first' (26952) panicked at crates\tachyon-engine\src\downloader.rs:8601:9:
+I-F6 RED：completed:true 到达时 sync_count 仍为 0（期望 >=1）。旧路径在任务结束 close 前发送 completed，导致 snapshot 可领先 page cache。events=[Write, Completed]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test downloader::tests::test_fragment_completed_progress_requires_storage_sync_first ... FAILED
+
+failures:
+
+failures:
+    downloader::tests::test_fragment_completed_progress_requires_storage_sync_first
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 284 filtered out; finished in 0.00s
+
+        FAIL [   0.452s] (1/1) tachyon-engine downloader::tests::test_fragment_completed_progress_requires_storage_sync_first
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.453s] 1 test run: 0 passed, 1 failed, 284 skipped
+        FAIL [   0.452s] (1/1) tachyon-engine downloader::tests::test_fragment_completed_progress_requires_storage_sync_first
+error: test run failed

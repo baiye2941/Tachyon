@@ -1,0 +1,156 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-io v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-io)
+    Finished `test` profile [optimized + debuginfo] target(s) in 11.20s
+────────────
+ Nextest run ID fbae7d78-e5f7-40e6-aaa7-ec44389b5707 with nextest profile: default
+    Starting 148 tests across 1 binary
+        PASS [   0.230s] (  1/148) tachyon-io aligned_buf::tests::test_split_freeze_not_aliased_with_parent_writes
+        PASS [   0.417s] (  2/148) tachyon-io aligned_buf::tests::test_extend_and_len
+        PASS [   0.597s] (  3/148) tachyon-io aligned_buf::tests::test_new_rejects_zero_cap
+        PASS [   0.798s] (  4/148) tachyon-io aligned_buf::tests::test_extend_panics_on_overflow
+        PASS [   1.000s] (  5/148) tachyon-io aligned_buf::tests::test_split_preserves_no_buffering_alignment
+        PASS [   1.200s] (  6/148) tachyon-io aligned_buf::tests::test_as_mut_slice_initializes_full_capacity_and_preserves_prefix
+        PASS [   1.415s] (  7/148) tachyon-io aligned_buf::tests::test_clear
+        PASS [   1.608s] (  8/148) tachyon-io aligned_buf::tests::test_freeze_produces_aligned_bytes
+        PASS [   1.792s] (  9/148) tachyon-io aligned_buf::tests::test_as_mut_ptr_cow_detaches_from_frozen_snapshot
+        PASS [   1.980s] ( 10/148) tachyon-io aligned_buf::tests::test_split_preserves_alignment
+        PASS [   2.170s] ( 11/148) tachyon-io aligned_buf::tests::test_unaligned_length_returns_false
+        PASS [   2.378s] ( 12/148) tachyon-io aligned_buf::tests::test_freeze_after_split_aligned
+        PASS [   2.589s] ( 13/148) tachyon-io aligned_buf::tests::test_non_sector_split_stays_aligned_and_isolated_from_parent_writes
+        PASS [   2.743s] ( 14/148) tachyon-io aligned_buf::tests::test_aligned_buf_satisfies_no_buffering_alignment
+        PASS [   2.965s] ( 15/148) tachyon-io aligned_buf::tests::test_mutated_nonempty_split_child_freeze_not_aliased_with_parent_writes
+        PASS [   3.201s] ( 16/148) tachyon-io aligned_buf::tests::test_split_then_continue_writing
+        PASS [   3.439s] ( 17/148) tachyon-io aligned_buf::tests::test_split_preserves_parent_capacity_and_aligned_window
+        PASS [   3.685s] ( 18/148) tachyon-io aligned_buf::tests::test_large_buffer_alignment
+        PASS [   3.910s] ( 19/148) tachyon-io aligned_buf::tests::test_new_allocates_aligned
+        PASS [   4.133s] ( 20/148) tachyon-io aligned_buf::tests::test_split_freeze_drop_reuses_original_parent_allocation
+        PASS [   4.122s] ( 21/148) tachyon-io aligned_buf::tests::test_unaligned_offset_returns_false
+        PASS [   4.149s] ( 22/148) tachyon-io backpressure
+        PASS [   4.182s] ( 23/148) tachyon-io backpressure_wakes_waiter
+        PASS [   4.196s] ( 24/148) tachyon-io buffer::tests::test_alloc_blocks_when_permits_exhausted
+        PASS [   4.168s] ( 25/148) tachyon-io buffer::tests::test_alloc_from_empty_creates_new
+        PASS [   4.194s] ( 26/148) tachyon-io buffer::tests::test_alloc_from_prefill
+        PASS [   4.165s] ( 27/148) tachyon-io buffer::tests::test_alloc_unblocks_after_release
+        PASS [   4.168s] ( 28/148) tachyon-io buffer::tests::test_buffer_guard_auto_release
+        PASS [   4.190s] ( 29/148) tachyon-io buffer::tests::test_buffer_guard_deref
+        PASS [   4.167s] ( 30/148) tachyon-io buffer::tests::test_clone_shares_pool
+        PASS [   4.236s] ( 31/148) tachyon-io buffer::tests::test_concurrent_alloc_release_safety
+        PASS [   4.232s] ( 32/148) tachyon-io buffer::tests::test_concurrent_exhaustion_and_return
+        PASS [   4.302s] ( 33/148) tachyon-io buffer::tests::test_new_pool_empty
+        PASS [   4.382s] ( 34/148) tachyon-io buffer::tests::test_prefill_pool
+        PASS [   4.364s] ( 35/148) tachyon-io buffer::tests::test_prewarm_after_alloc
+        PASS [   4.282s] ( 36/148) tachyon-io buffer::tests::test_prewarm_buffers_have_correct_capacity
+        PASS [   4.205s] ( 37/148) tachyon-io buffer::tests::test_prewarm_fills_empty_pool
+        PASS [   4.093s] ( 38/148) tachyon-io buffer::tests::test_prewarm_idempotent
+        PASS [   4.027s] ( 39/148) tachyon-io buffer::tests::test_release_clears_buffer
+        PASS [   3.946s] ( 40/148) tachyon-io buffer::tests::test_release_permits_stable
+        PASS [   3.891s] ( 41/148) tachyon-io buffer::tests::test_release_returns_to_pool
+        PASS [   3.826s] ( 42/148) tachyon-io buffer::tests::test_stats_after_alloc_and_release
+        PASS [   3.768s] ( 43/148) tachyon-io buffer::tests::test_stats_after_prefill
+        PASS [   3.698s] ( 44/148) tachyon-io buffer_align
+        PASS [   3.686s] ( 45/148) tachyon-io iocp::tests::test_allocate_physical_size_windows
+        PASS [   3.578s] ( 46/148) tachyon-io iocp::tests::test_cancel_guard_skips_when_slot_already_free
+        PASS [   3.556s] ( 47/148) tachyon-io iocp::tests::test_cancel_guard_skips_when_slot_generation_changed
+        PASS [   3.489s] ( 48/148) tachyon-io iocp::tests::test_complete_pending_write_unknown_ptr_no_bitmap_leak
+        PASS [   3.446s] ( 49/148) tachyon-io iocp::tests::test_completion_slots_alloc_release
+        PASS [   3.429s] ( 50/148) tachyon-io iocp::tests::test_completion_slots_concurrent_alloc_no_duplicates
+        PASS [   3.321s] ( 51/148) tachyon-io iocp::tests::test_completion_slots_ptr_to_index_roundtrip
+        PASS [   3.263s] ( 52/148) tachyon-io iocp::tests::test_iocp_cancel_guard_preserves_pending_slot_entry
+        PASS [   3.049s] ( 53/148) tachyon-io iocp::tests::test_iocp_drop_sets_closed
+        PASS [   3.356s] ( 54/148) tachyon-io iocp::tests::test_iocp_concurrent_rmw_same_sector_no_lost_update
+        PASS [   2.986s] ( 55/148) tachyon-io iocp::tests::test_iocp_error_mapping_access_denied
+        PASS [   2.965s] ( 56/148) tachyon-io iocp::tests::test_iocp_error_mapping_disk_full
+        PASS [   2.944s] ( 57/148) tachyon-io iocp::tests::test_iocp_error_mapping_eof
+        PASS [   2.978s] ( 58/148) tachyon-io iocp::tests::test_iocp_error_mapping_io_pending
+        PASS [   3.005s] ( 59/148) tachyon-io iocp::tests::test_iocp_error_mapping_operation_aborted
+        PASS [   3.025s] ( 60/148) tachyon-io iocp::tests::test_iocp_error_mapping_unknown
+        PASS [   3.041s] ( 61/148) tachyon-io iocp::tests::test_iocp_high_concurrency_64_writes
+        PASS [   3.033s] ( 62/148) tachyon-io iocp::tests::test_iocp_init_state_ready
+        PASS [   3.093s] ( 63/148) tachyon-io iocp::tests::test_iocp_init_twice_errors
+        PASS [   3.171s] ( 64/148) tachyon-io iocp::tests::test_iocp_new_defaults
+        PASS [   3.229s] ( 65/148) tachyon-io iocp::tests::test_iocp_read_at_joinset_abort_all_no_uaf
+        PASS [   3.321s] ( 66/148) tachyon-io iocp::tests::test_iocp_registered_completion_resolves_pending_write
+        PASS [   3.360s] ( 67/148) tachyon-io iocp::tests::test_iocp_unknown_completion_is_not_owned
+        PASS [   3.416s] ( 68/148) tachyon-io iocp::tests::test_iocp_write_at_basic
+        PASS [   3.455s] ( 69/148) tachyon-io iocp::tests::test_iocp_write_at_not_ready
+        PASS [   3.531s] ( 70/148) tachyon-io iocp::tests::test_iocp_write_at_offset
+        PASS [   3.609s] ( 71/148) tachyon-io iocp::tests::test_iocp_write_at_unaligned_buffer_ptr_fallback
+        PASS [   3.695s] ( 72/148) tachyon-io iocp::tests::test_iocp_writefile_submission_error_mapping
+        PASS [   3.608s] ( 73/148) tachyon-io iouring::tests::test_align_buffer_size_rounding
+        PASS [   3.770s] ( 74/148) tachyon-io iouring::tests::test_allocate_returns_not_connected_when_uninitialized
+        PASS [   3.923s] ( 75/148) tachyon-io iouring::tests::test_bitmap_alloc_first_free_respects_buffer_count_boundary
+        PASS [   4.006s] ( 76/148) tachyon-io iouring::tests::test_bitmap_alloc_first_free_returns_none_when_all_used
+        PASS [   4.081s] ( 77/148) tachyon-io iouring::tests::test_bitmap_alloc_first_free_returns_zero_with_initial_used_mask
+        PASS [   4.074s] ( 78/148) tachyon-io iouring::tests::test_bitmap_alloc_free_reuse_cycle
+        PASS [   4.094s] ( 79/148) tachyon-io iouring::tests::test_bitmap_multi_word_alloc_across_word_boundary
+        PASS [   4.133s] ( 80/148) tachyon-io iouring::tests::test_bitmap_multi_word_excess_bits_preoccupied
+        PASS [   4.150s] ( 81/148) tachyon-io iouring::tests::test_bitmap_multi_word_free_and_realloc
+        PASS [   4.228s] ( 82/148) tachyon-io iouring::tests::test_buffer_align
+        PASS [   4.217s] ( 83/148) tachyon-io iouring::tests::test_config_debug
+        PASS [   4.215s] ( 84/148) tachyon-io iouring::tests::test_custom_config
+        PASS [   4.205s] ( 85/148) tachyon-io iouring::tests::test_default_buffer_size_covers_write_batch_bytes
+        PASS [   4.205s] ( 86/148) tachyon-io iouring::tests::test_default_config
+        PASS [   4.223s] ( 87/148) tachyon-io iouring::tests::test_default_config_buffer_total
+        PASS [   4.251s] ( 88/148) tachyon-io iouring::tests::test_file_size_returns_not_connected_when_uninitialized
+        PASS [   4.258s] ( 89/148) tachyon-io iouring::tests::test_fixed_buffer_config_rejects_empty_buffers
+        PASS [   4.243s] ( 90/148) tachyon-io iouring::tests::test_fixed_buffer_write_len_allows_exact_buffer_size
+        PASS [   4.224s] ( 91/148) tachyon-io iouring::tests::test_fixed_buffer_write_len_rejects_oversized_payload
+        PASS [   4.202s] ( 92/148) tachyon-io iouring::tests::test_guard_alloc_exclusivity
+        PASS [   4.196s] ( 93/148) tachyon-io iouring::tests::test_guard_driver_reclaim_on_push_failure
+        PASS [   4.116s] ( 94/148) tachyon-io iouring::tests::test_guard_not_submitted_frees_on_drop
+        PASS [   4.137s] ( 95/148) tachyon-io iouring::tests::test_guard_submitted_blocks_realloc_until_driver_frees
+        PASS [   4.122s] ( 96/148) tachyon-io iouring::tests::test_guard_submitted_does_not_free_on_drop
+        PASS [   4.119s] ( 97/148) tachyon-io iouring::tests::test_init_returns_unsupported_on_non_linux
+        PASS [   4.174s] ( 98/148) tachyon-io iouring::tests::test_new_storage_config_ref
+        PASS [   4.174s] ( 99/148) tachyon-io iouring::tests::test_new_storage_path
+        PASS [   4.161s] (100/148) tachyon-io iouring::tests::test_new_storage_state_is_created
+        PASS [   4.166s] (101/148) tachyon-io iouring::tests::test_read_at_returns_not_connected_when_uninitialized
+        PASS [   4.154s] (102/148) tachyon-io iouring::tests::test_state_clone_copy
+        PASS [   4.159s] (103/148) tachyon-io iouring::tests::test_state_debug
+        PASS [   4.160s] (104/148) tachyon-io iouring::tests::test_state_variants
+        PASS [   4.154s] (105/148) tachyon-io iouring::tests::test_sync_returns_not_connected_when_uninitialized
+        PASS [   4.173s] (106/148) tachyon-io iouring::tests::test_write_at_after_failed_init
+        PASS [   4.168s] (107/148) tachyon-io iouring::tests::test_write_at_returns_not_connected_when_uninitialized
+        PASS [   4.210s] (108/148) tachyon-io storage::tests::test_async_storage_other_methods
+        PASS [   4.220s] (109/148) tachyon-io storage::tests::test_write_at_aligned_aligned_data
+        PASS [   4.164s] (110/148) tachyon-io storage::tests::test_write_at_aligned_empty_data
+        PASS [   4.173s] (111/148) tachyon-io storage::tests::test_write_at_aligned_non_aligned_data
+        PASS [   4.170s] (112/148) tachyon-io storage::tests::test_write_at_aligned_non_power_of_two_alignment
+        PASS [   4.175s] (113/148) tachyon-io storage::tests::test_write_at_aligned_return_value_semantics
+        PASS [   4.209s] (114/148) tachyon-io storage::tests::test_write_at_aligned_zero_alignment
+        PASS [   4.169s] (115/148) tachyon-io storage::tests::test_write_at_mut_delegates_to_write_at
+        PASS [   4.155s] (116/148) tachyon-io tokio_file::tests::test_allocate
+        PASS [   4.150s] (117/148) tachyon-io tokio_file::tests::test_allocate_physical_size_windows
+        PASS [   4.176s] (118/148) tachyon-io tokio_file::tests::test_close_calls_sync_data
+        PASS [   4.172s] (119/148) tachyon-io tokio_file::tests::test_concurrent_read_write_mixed
+        PASS [   4.195s] (120/148) tachyon-io tokio_file::tests::test_concurrent_write_at_correctness
+        PASS [   4.223s] (121/148) tachyon-io tokio_file::tests::test_concurrent_writes
+        PASS [   4.196s] (122/148) tachyon-io tokio_file::tests::test_file_size
+        PASS [   4.188s] (123/148) tachyon-io tokio_file::tests::test_open_and_write
+        PASS [   4.176s] (124/148) tachyon-io tokio_file::tests::test_path_returns_correct_path
+        PASS [   4.156s] (125/148) tachyon-io tokio_file::tests::test_read_at_joinset_abort_all_no_uaf
+        PASS [   4.072s] (126/148) tachyon-io tokio_file::tests::test_read_at_offset
+        PASS [   4.056s] (127/148) tachyon-io tokio_file::tests::test_sync
+        PASS [   3.992s] (128/148) tachyon-io tokio_file::tests::test_windows_concurrent_write_at_no_interleave
+        PASS [   3.975s] (129/148) tachyon-io tokio_file::tests::test_write_and_read
+        PASS [   4.031s] (130/148) tachyon-io winfile_align
+        PASS [   4.037s] (131/148) tachyon-io winio::tests::test_allocate_via_trait
+        PASS [   4.050s] (132/148) tachyon-io winio::tests::test_allocate_via_trait_physical_size_windows
+        PASS [   4.080s] (133/148) tachyon-io winio::tests::test_concurrent_write_at_no_interleave
+        PASS [   4.056s] (134/148) tachyon-io winio::tests::test_open_optimized_windows
+        PASS [   4.055s] (135/148) tachyon-io winio::tests::test_open_standard_and_write
+        PASS [   4.069s] (136/148) tachyon-io winio::tests::test_open_standard_write_and_read
+        PASS [   4.070s] (137/148) tachyon-io winio::tests::test_path
+        PASS [   4.033s] (138/148) tachyon-io winio::tests::test_preallocate
+        PASS [   4.039s] (139/148) tachyon-io winio::tests::test_preallocate_optimized_windows
+        PASS [   4.031s] (140/148) tachyon-io winio::tests::test_preallocate_physical_size_windows
+        PASS [   3.996s] (141/148) tachyon-io winio::tests::test_read_at_joinset_abort_all_no_uaf
+        PASS [   3.959s] (142/148) tachyon-io winio::tests::test_sync
+        PASS [   3.953s] (143/148) tachyon-io winio::tests::test_winfile_align
+        PASS [   3.972s] (144/148) tachyon-io winio::tests::test_winfile_close_flushes_data
+        PASS [   4.005s] (145/148) tachyon-io winio::tests::test_winfile_mixed_aligned_and_unaligned_writes
+        PASS [   4.073s] (146/148) tachyon-io winio::tests::test_winfile_no_buffering_aligned_write_uses_main_handle
+        PASS [   4.101s] (147/148) tachyon-io winio::tests::test_winfile_no_buffering_unaligned_write_fallback
+        PASS [   4.121s] (148/148) tachyon-io winio::tests::test_write_at_offset
+────────────
+     Summary [  29.258s] 148 tests run: 148 passed, 0 skipped

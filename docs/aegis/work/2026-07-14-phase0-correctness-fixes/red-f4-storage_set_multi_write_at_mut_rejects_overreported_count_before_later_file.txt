@@ -1,0 +1,31 @@
+=== storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.95s
+────────────
+ Nextest run ID 01042f27-f9f0-4ea6-9e38-8b8fecc48447 with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        FAIL [   0.413s] (1/1) tachyon-engine storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file
+  stdout ───
+
+    running 1 test
+    test storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file ... FAILED
+
+    failures:
+
+    failures:
+        storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 280 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file' (29404) panicked at C:\cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bytes-1.12.0\src\bytes.rs:374:28:
+    range start must not be greater than end: 2 <= 1
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.415s] 1 test run: 0 passed, 1 failed, 280 skipped
+        FAIL [   0.413s] (1/1) tachyon-engine storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file
+error: test run failed
+EXIT=100

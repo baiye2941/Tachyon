@@ -1,0 +1,18 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+error: rustc 1.85.0 is not supported by the following packages:
+  icu_collections@2.2.0 requires rustc 1.86
+  icu_locale_core@2.2.0 requires rustc 1.86
+  icu_normalizer@2.2.0 requires rustc 1.86
+  icu_normalizer_data@2.2.0 requires rustc 1.86
+  icu_normalizer_data@2.2.0 requires rustc 1.86
+  icu_normalizer_data@2.2.0 requires rustc 1.86
+  icu_properties@2.2.0 requires rustc 1.86
+  icu_properties_data@2.2.0 requires rustc 1.86
+  icu_properties_data@2.2.0 requires rustc 1.86
+  icu_properties_data@2.2.0 requires rustc 1.86
+  icu_provider@2.2.0 requires rustc 1.86
+  idna_adapter@1.2.2 requires rustc 1.86
+Either upgrade rustc or select compatible dependency versions with
+`cargo update <name>@<current-ver> --precise <compatible-ver>`
+where `<compatible-ver>` is the latest version supporting rustc 1.85.0
+

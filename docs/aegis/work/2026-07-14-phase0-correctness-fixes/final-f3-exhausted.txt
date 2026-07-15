@@ -1,0 +1,9 @@
+=== test_fragment_retry_exhausted_marks_correct_fragment ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 2.00s
+────────────
+ Nextest run ID 7c90b4ba-65aa-4880-b75f-888bcdfef4c0 with nextest profile: default
+    Starting 1 test across 1 binary (273 tests skipped)
+        PASS [   1.526s] (1/1) tachyon-engine downloader::tests::test_fragment_retry_exhausted_marks_correct_fragment
+────────────
+     Summary [   1.535s] 1 test run: 1 passed, 273 skipped

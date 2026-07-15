@@ -181,12 +181,13 @@ impl Protocol for ChaoticProtocol {
         url: &str,
         start: u64,
         end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
         let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             this.maybe_inject_network_chaos().await?;
-            this.inner.download_range(&url, start, end).await
+            this.inner.download_range(&url, start, end, None).await
         })
     }
 
@@ -195,6 +196,7 @@ impl Protocol for ChaoticProtocol {
         url: &str,
         start: u64,
         end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
         let this = self.clone();
         let url = url.to_owned();
@@ -202,7 +204,10 @@ impl Protocol for ChaoticProtocol {
             // 连接阶段混沌
             this.maybe_inject_network_chaos().await?;
             // 获取底层流
-            let inner_stream = this.inner.download_range_stream(&url, start, end).await?;
+            let inner_stream = this
+                .inner
+                .download_range_stream(&url, start, end, None)
+                .await?;
             // 包装为混沌流:每个 chunk 产出前注入故障
             let chaos = this.clone();
             let chaotic_stream = inner_stream.then(move |result| {

@@ -1,0 +1,9 @@
+=== dyn_storage_write_at_rejects_overreported_byte_count ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.98s
+────────────
+ Nextest run ID a9aaa2ce-58fd-40c1-8e83-7b2c4b2b37f0 with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        PASS [   0.408s] (1/1) tachyon-engine storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count
+────────────
+     Summary [   0.411s] 1 test run: 1 passed, 280 skipped

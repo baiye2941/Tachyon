@@ -82,6 +82,9 @@ strum = { version = "0.28", features = ["derive"] }
 # 内存分配器
 mimalloc = "0.1"
 
+# 平台 FFI
+libc = "0.2"
+
 # 开发/测试/bench 专用依赖(非运行时依赖,不被 workspace 成员 crate 引用)
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }

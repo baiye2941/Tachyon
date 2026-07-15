@@ -1,0 +1,32 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-io v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-io)
+    Finished `test` profile [optimized + debuginfo] target(s) in 19.04s
+────────────
+ Nextest run ID 4f8763d1-53fa-4a97-be2d-f2253f965f57 with nextest profile: default
+    Starting 1 test across 1 binary (148 tests skipped)
+        FAIL [   0.190s] (1/1) tachyon-io aligned_buf::tests::test_empty_split_child_mut_slice_keeps_parent_allocation
+  stdout ───
+
+    running 1 test
+    test aligned_buf::tests::test_empty_split_child_mut_slice_keeps_parent_allocation ... FAILED
+
+    failures:
+
+    failures:
+        aligned_buf::tests::test_empty_split_child_mut_slice_keeps_parent_allocation
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 148 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'aligned_buf::tests::test_empty_split_child_mut_slice_keeps_parent_allocation' (35132) panicked at crates\tachyon-io\src\aligned_buf.rs:512:9:
+    assertion `left == right` failed: 零容量子窗口的可变入口不得脱离父缓冲的真实分配
+      left: 0x200
+     right: 0x1aa7599b400
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.192s] 1 test run: 0 passed, 1 failed, 148 skipped
+        FAIL [   0.190s] (1/1) tachyon-io aligned_buf::tests::test_empty_split_child_mut_slice_keeps_parent_allocation
+error: test run failed

@@ -350,6 +350,22 @@ pub(crate) async fn inject_resume_snapshot(
             );
             task.set_partial_fragments(snapshot.partial_fragments);
         }
+        let identity = tachyon_core::ObjectIdentity {
+            etag: snapshot.etag,
+            last_modified: snapshot.last_modified,
+            file_size: snapshot.file_size.or(snapshot.content_length),
+        };
+        if identity.etag.is_some()
+            || identity.last_modified.is_some()
+            || identity.file_size.is_some()
+        {
+            tracing::info!(
+                task_id = %task_id,
+                etag = ?identity.etag,
+                "断点续传:注入对象身份"
+            );
+            task.set_resume_object_identity(Some(identity));
+        }
     }
 }
 
@@ -900,6 +916,9 @@ pub(crate) async fn probe_filename_inner(
     validate_download_url(&url)?;
 
     // 磁力链接:使用 BtSession 通过 DHT/Tracker 探测真实文件名
+    // P0-8: UI 探测是一次性元数据读取,与 DownloadTask 的 factory 绑定不同
+    // (probe 无 storage_factory,下载有 factory → 不同 cache key)。
+    // 若不 pause+delete,会留下无所有者的 session torrent 持续联网。
     #[cfg(feature = "magnet")]
     if url.starts_with("magnet:?") {
         let bt_session = state.infra.bt_session.lock().await.clone();
@@ -909,8 +928,12 @@ pub(crate) async fn probe_filename_inner(
                 session.config().clone(),
                 session.download_dir().clone(),
                 session.handle_cache(),
-            );
-            match protocol.probe(&url).await {
+            )
+            .with_ops_gate(session.ops_gate());
+            let probe_result = protocol.probe(&url).await;
+            // 无论成功/失败都清理:失败也可能已 add 到 session 或半写 cache
+            protocol.stop_and_remove_torrent(&url).await;
+            match probe_result {
                 Ok(meta) => return Ok(meta.file_name),
                 Err(e) => {
                     tracing::warn!(error = %e, "磁力链接探测失败,回退到本地提取");

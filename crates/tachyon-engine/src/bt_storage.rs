@@ -175,6 +175,8 @@ pub struct TachyonStorageFactory {
     io_strategy: IoStrategy,
     /// 下载目录(自动打开模式用,与引擎 download_dir 对齐)
     download_dir: PathBuf,
+    /// 用户最终根名(单文件名/多文件根目录名);优先于 torrent metadata.name
+    preferred_root_name: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 impl TachyonStorageFactory {
@@ -194,7 +196,26 @@ impl TachyonStorageFactory {
             handle,
             io_strategy,
             download_dir,
+            preferred_root_name: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
+    }
+
+    /// 注入用户最终根名(须在 probe/add_torrent 前)
+    pub fn with_preferred_root_name(self, name: impl Into<String>) -> Self {
+        *self.preferred_root_name.write() = Some(name.into());
+        self
+    }
+
+    pub fn set_preferred_root_name(&self, name: Option<String>) {
+        *self.preferred_root_name.write() = name;
+    }
+
+    /// 测试/调试:解析自动打开模式下的根名
+    pub fn resolved_root_name(&self, torrent_name: &str) -> String {
+        self.preferred_root_name
+            .read()
+            .clone()
+            .unwrap_or_else(|| torrent_name.to_string())
     }
 
     /// 注册 torrent 的 storages(在 add_torrent 前调用,可选)
@@ -225,7 +246,11 @@ impl TachyonStorageFactory {
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<Vec<Arc<dyn AsyncStorage>>> {
         let file_infos = &metadata.file_infos;
-        let torrent_name = metadata.name.as_deref().unwrap_or("unknown_torrent");
+        let preferred = self.preferred_root_name.read().clone();
+        let torrent_name = preferred
+            .as_deref()
+            .or(metadata.name.as_deref())
+            .unwrap_or("unknown_torrent");
 
         let multi_file = file_infos.len() > 1;
         let mut storages = Vec::with_capacity(file_infos.len());
@@ -242,9 +267,9 @@ impl TachyonStorageFactory {
             )
             .map_err(|e| anyhow::anyhow!("多文件路径校验失败: {e}"))?;
             for path in &paths {
-                let file = self
-                    .handle
-                    .block_on(tachyon_io::TokioFile::open(path))
+                // 多文件 factory 在 librqbit async 上下文同步 create;禁止嵌套 Handle::block_on。
+                // 与单文件分支一致使用 open_sync。
+                let file = tachyon_io::TokioFile::open_sync(path)
                     .map_err(|e| anyhow::anyhow!("打开文件 {} 失败: {e}", path.display()))?;
                 storages.push(Arc::new(file) as Arc<dyn AsyncStorage>);
             }
@@ -297,6 +322,7 @@ impl Clone for TachyonStorageFactory {
             handle: self.handle.clone(),
             io_strategy: self.io_strategy,
             download_dir: self.download_dir.clone(),
+            preferred_root_name: self.preferred_root_name.clone(),
         }
     }
 }
@@ -491,5 +517,48 @@ mod tests {
         let mut buf = [0u8; 4];
         ts.pread_exact(0, 1020, &mut buf).unwrap();
         assert_eq!(&buf, b"abcd");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_preferred_root_name_overrides_torrent_name() {
+        let handle = tokio::runtime::Handle::current();
+        let factory = TachyonStorageFactory::new(
+            handle,
+            IoStrategy::default(),
+            std::path::PathBuf::from("/tmp/dl"),
+        )
+        .with_preferred_root_name("user_renamed.bin");
+        assert_eq!(
+            factory.resolved_root_name("original.bin"),
+            "user_renamed.bin"
+        );
+        factory.set_preferred_root_name(Some("later.bin".into()));
+        assert_eq!(factory.resolved_root_name("original.bin"), "later.bin");
+    }
+
+    #[test]
+    fn test_multi_file_open_path_does_not_use_nested_block_on_comment() {
+        // 静态不变量: open_storages_from_metadata 多文件分支使用 open_sync
+        // (源码契约;避免 async runtime 内嵌套 block_on)。
+        let src = include_str!("bt_storage.rs");
+        assert!(
+            src.contains(
+                "// 多文件 factory 在 librqbit async 上下文同步 create;禁止嵌套 Handle::block_on。"
+            ),
+            "多文件打开路径应保留禁止嵌套 block_on 的契约注释"
+        );
+        // 在 open_storages_from_metadata 函数体内不应再出现 block_on(TokioFile::open
+        let start = src
+            .find("fn open_storages_from_metadata")
+            .expect("open_storages_from_metadata");
+        let body = &src[start..start + 2500];
+        assert!(
+            !body.contains("block_on(tachyon_io::TokioFile::open"),
+            "open_storages_from_metadata 不得嵌套 block_on 打开文件"
+        );
+        assert!(
+            body.contains("TokioFile::open_sync"),
+            "多文件/单文件应使用 open_sync"
+        );
     }
 }

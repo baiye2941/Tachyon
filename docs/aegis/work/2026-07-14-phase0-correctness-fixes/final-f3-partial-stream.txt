@@ -1,0 +1,9 @@
+=== test_fragment_retry_discards_partial_stream_buffer ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.99s
+────────────
+ Nextest run ID 821b6320-c39b-4ac2-8a54-17adf074cdee with nextest profile: default
+    Starting 1 test across 1 binary (273 tests skipped)
+        PASS [   0.519s] (1/1) tachyon-engine downloader::tests::test_fragment_retry_discards_partial_stream_buffer
+────────────
+     Summary [   0.522s] 1 test run: 1 passed, 273 skipped

@@ -10,7 +10,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use librqbit::{PeerConnectionOptions, Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
-use tachyon_protocol::magnet::HandleCache;
+use tachyon_protocol::magnet::{HandleCache, SessionOpsGate};
 
 /// 脱敏 SOCKS 代理 URL 的凭据,保留 scheme/host/port 供日志排查
 ///
@@ -45,11 +45,14 @@ pub struct BtSession {
     download_dir: PathBuf,
     /// 跨 MagnetProtocol 实例共享的 handle 缓存。
     ///
-    /// probe_filename 命令与 build_download_task 创建各自的 MagnetProtocol 实例,
-    /// 但共享同一份 handle_cache:前者探测后 insert 的 handle/layout,后者直接命中,
-    /// 跳过重复的 add_magnet_to_session(死 swarm 下会永久挂起)。
+    /// 同一 binding(download_dir + factory + preferred + url)的多次 probe/run
+    /// 可共享 handle,避免重复 add_magnet_to_session。
+    /// UI `probe_filename`(无 factory)与下载任务(有 TachyonStorageFactory)绑定不同,
+    /// 不跨 binding 共享;probe 结束后 stop_and_remove,ops_gate 串行 delete/add。
     /// 热切换重建 BtSession 时,新实例自带空 cache,旧 handle 随旧 Session 丢弃。
     handle_cache: HandleCache,
+    /// 与所有 MagnetProtocol 共享:probe cleanup 与 download add 串行
+    ops_gate: SessionOpsGate,
 }
 
 impl BtSession {
@@ -79,6 +82,7 @@ impl BtSession {
             config,
             download_dir,
             handle_cache: Arc::new(DashMap::new()),
+            ops_gate: Arc::new(DashMap::new()),
         })
     }
 
@@ -189,10 +193,14 @@ impl BtSession {
 
     /// 获取跨实例共享的 handle 缓存(Arc 浅克隆)
     ///
-    /// probe_filename 命令与下载任务各自创建 MagnetProtocol 时传入同一 Arc,
-    /// 使 handle_cache 跨实例共享:probe_filename 填充的 handle 对下载任务可见。
+    /// 所有 MagnetProtocol 传入同一 Arc,使同 binding 的 handle 跨实例共享。
     pub fn handle_cache(&self) -> HandleCache {
         Arc::clone(&self.handle_cache)
+    }
+
+    /// 跨实例共享的 session 操作锁表
+    pub fn ops_gate(&self) -> SessionOpsGate {
+        Arc::clone(&self.ops_gate)
     }
 }
 

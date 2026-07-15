@@ -8,6 +8,12 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
@@ -26,7 +32,7 @@ use tachyon_core::test_harness::harness::MemoryStorage as MemStorage;
 use tachyon_core::DownloadError;
 
 // ---------------------------------------------------------------------------
-// P4: 下载前磁盘空间预检(跨平台,无新增 crate 依赖)
+// P4: 下载前磁盘空间预检(跨平台)
 // ---------------------------------------------------------------------------
 
 /// P4:磁盘空间预检 margin —— file_size 的 1% 或 100MB 取小值。
@@ -46,12 +52,12 @@ const fn disk_space_margin(file_size: u64) -> u64 {
 
 /// P4:查询 `dir` 所在分区的可用磁盘空间(字节)。
 ///
-/// 跨平台实现,不引入新 crate 依赖:
+/// 跨平台实现:
 /// - Windows:`GetDiskFreeSpaceExW`(kernel32,原始 extern "system" 声明)
-/// - Unix(Linux/macOS):`statvfs`(libc,原始 extern "C" 声明)
+/// - Unix(Linux/macOS):`libc::statvfs`(libc 提供目标平台完整 ABI 结构)
 ///
 /// `dir` 不存在时,向上回溯到最近的存在的父目录(下载目录可能尚未创建)。
-/// 全部回溯失败或系统调用失败时返回 `Ok(None)`,调用方降级为"不预检"
+/// 全部回溯失败、路径含 NUL 或系统调用失败时返回 `None`,调用方降级为"不预检"
 /// (不阻断下载,保持向后兼容)。
 ///
 /// # Safety
@@ -59,10 +65,8 @@ const fn disk_space_margin(file_size: u64) -> u64 {
 /// 本函数内部使用 `unsafe` 调用平台 FFI:
 /// - Windows:`GetDiskFreeSpaceExW` 接收 UTF-16 路径指针(以 null 结尾),
 ///   传出三个 `u64` 出参指针。指针均指向栈上合法内存,调用后立即读取。
-/// - Unix:`statvfs` 接收 C 字符串路径,传出 `Statvfs` 结构体指针。
-///   结构体为 `#[repr(C)]`,字段类型按平台 ABI 精确还原:f_bsize/f_frsize 用
-///   `c_ulong`,块计数字段用 `fsblkcnt_t`(macOS=c_uint,Linux=c_ulong),
-///   消除旧实现"全 u64"断言导致的 macOS 偏移错位。仅取 f_bavail*f_frsize。
+/// - Unix:`libc::statvfs` 接收 C 字符串路径,传出由 libc 定义的完整
+///   `libc::statvfs` 结构体缓冲。仅当调用成功后才将该缓冲视为已初始化。
 ///
 /// 两条路径的 FFI 调用均不跨越 await 点,指针生命周期在同步栈帧内。
 pub(crate) fn available_disk_space(dir: &Path) -> Option<u64> {
@@ -127,64 +131,33 @@ fn available_disk_space_inner(dir: &Path) -> Option<u64> {
     Some(free_available)
 }
 
+/// 从已完整初始化的原生 `libc::statvfs` 结构计算可用字节数。
+///
+/// 调用方必须仅在 `statvfs` 成功返回后传入完整输出结构。
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn available_bytes_from_statvfs(stat: &libc::statvfs) -> u64 {
+    // libc 字段的目标 ABI 整数别名不同：Linux 两字段同型，macOS 的 f_bavail 为 u32；
+    // 统一直接转为 u64，避免制造并不存在的可失败转换，且允许范围仅限本函数。
+    (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+}
+
 #[cfg(unix)]
 fn available_disk_space_inner(dir: &Path) -> Option<u64> {
-    // statvfs 返回结构体的"块计数字段"类型(fsblkcnt_t),按平台 ABI 区分:
-    //
-    // - macOS: `unsigned int`(c_uint, 4 字节)—— f_blocks/f_bfree/f_bavail 均为
-    //   `fsblkcnt_t = unsigned int`,而 f_bsize/f_frsize 是 `unsigned long`(8 字节)。
-    // - Linux: `unsigned long`(c_ulong)—— 64 位为 8 字节,32 位为 4 字节;
-    //   fsblkcnt_t 在 glibc 与 musl 均为 `unsigned long`,与 f_bsize/f_frsize 同类型。
-    //
-    // 历史问题(P4-statvfs):旧实现把 5 个字段全部硬编码为 u64,断言"布局在
-    // Linux/macOS 一致"。该断言对 macOS 错误:f_bavail(u32)位于偏移 24,但按 u64
-    // 读取会从偏移 32 取到 f_ffree/f_favail 拼接的垃圾值,导致 check_disk_space
-    // 恒放行(保护失效)。此类型别名按平台 ABI 精确还原字段宽度,消除偏移错位。
-    // f_bsize/f_frsize 统一用 c_ulong(跟随平台:macOS/Linux-64=8 字节,Linux-32=4 字节)。
-    #[cfg(target_os = "macos")]
-    type FsblkcntT = std::os::raw::c_uint;
-    #[cfg(not(target_os = "macos"))]
-    type FsblkcntT = std::os::raw::c_ulong;
+    let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat = MaybeUninit::<libc::statvfs>::uninit();
 
-    // statvfs 结构体:仅取前 5 个字段,字段类型按平台 ABI 还原(见 FsblkcntT)。
-    // 完整结构体更长,但只读 f_frsize(第 2)和 f_bavail(第 5),
-    // 后续字段不影响前 5 个的偏移布局。
-    #[repr(C)]
-    struct Statvfs {
-        f_bsize: std::os::raw::c_ulong,
-        f_frsize: std::os::raw::c_ulong,
-        f_blocks: FsblkcntT,
-        f_bfree: FsblkcntT,
-        f_bavail: FsblkcntT,
-        // 其余字段省略(不读取,不影响前 5 个字段布局)
-    }
-
-    unsafe extern "C" {
-        fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
-    }
-
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
-
-    let mut stat = Statvfs {
-        f_bsize: 0,
-        f_frsize: 0,
-        f_blocks: 0,
-        f_bfree: 0,
-        f_bavail: 0,
-    };
-    // SAFETY:c_path 以 null 结尾且指针在调用期间有效;stat 指针指向栈上
-    // 合法 Statvfs 内存。statvfs 是 POSIX 线程安全函数(无全局可变状态)。
-    let rc = unsafe { statvfs(c_path.as_ptr(), &mut stat) };
+    // SAFETY:c_path 以 null 结尾且指针在调用期间有效;stat 指向完整的 libc::statvfs
+    // 输出缓冲。statvfs 是 POSIX 线程安全函数(无全局可变状态),可在任意线程调用。
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if rc != 0 {
         tracing::warn!(dir = %dir.display(), "statvfs 失败,跳过磁盘空间预检");
         return None;
     }
-    // f_bavail(fsblkcnt_t)与 f_frsize(c_ulong)宽度因平台而异(macOS u32 / Linux u64),
-    // 统一提升为 u64 后用 saturating_mul 防止乘法溢出(超大磁盘 f_bavail*f_frsize 可能超 u64)。
-    // c_ulong/c_uint 是平台别名,Linux-64 上与 u64 同宽会触发 clippy unnecessary_cast,
-    // 但 macOS 上 f_bavail 为 c_uint(u32)确需转换,故整行 allow。
-    #[allow(clippy::unnecessary_cast)]
-    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+
+    // SAFETY:仅在 statvfs 返回 0 后执行,此时完整输出缓冲已由 libc 初始化。
+    let stat = unsafe { stat.assume_init() };
+    Some(available_bytes_from_statvfs(&stat))
 }
 
 /// P4:预检磁盘空间是否足够容纳 `file_size`(+margin)。
@@ -398,12 +371,26 @@ impl DynStorage {
 
     /// 写入数据到指定偏移
     pub async fn write_at(&self, offset: u64, data: Bytes) -> DownloadResult<usize> {
-        self.0.write_at_erased(offset, data).await
+        let offered = data.len();
+        let written = self.0.write_at_erased(offset, data).await?;
+        if written > offered {
+            return Err(DownloadError::Fragment(format!(
+                "存储后端返回的写入字节数超过输入长度: offset={offset}, offered={offered}, returned={written}"
+            )));
+        }
+        Ok(written)
     }
 
     /// 写入 BytesMut 数据（避免 freeze() 产生额外复制）
     pub async fn write_at_mut(&self, offset: u64, data: &mut BytesMut) -> DownloadResult<usize> {
-        self.0.write_at_mut_erased(offset, data).await
+        let offered = data.len();
+        let written = self.0.write_at_mut_erased(offset, data).await?;
+        if written > offered {
+            return Err(DownloadError::Fragment(format!(
+                "存储后端返回的写入字节数超过输入长度: offset={offset}, offered={offered}, returned={written}"
+            )));
+        }
+        Ok(written)
     }
 
     /// 从指定偏移读取数据
@@ -516,9 +503,8 @@ impl StorageSet {
     /// (4MB batch / 3 段 ~3MB 复制)从 ~2.8ms 降至纯 split/freeze/slice 指针操作。
     ///
     /// 契约变化:Multi 路径会用 `split_to` 消费 `data`(逐段取走前缀),成功时 `data`
-    /// 被清空。调用方 `write_all_at_mut` 用 `advance(written.min(batch.len()))`
-    /// 兼容此行为(Min 防止空 batch 上 advance 越界 panic);Single 路径不消费 data,
-    /// `min` 退化为 `written`,行为与旧版一致。
+    /// 被清空;Single 路径不消费 `data`。两条路径返回值均遵守 `AsyncStorage`
+    /// 写入计数契约,不得超过调用时提供的输入长度。
     pub async fn write_at_mut(&self, offset: u64, data: &mut BytesMut) -> DownloadResult<usize> {
         match self {
             Self::Single(s) => s.write_at_mut(offset, data).await,
@@ -699,10 +685,186 @@ impl DynStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
     use bytes::{Bytes, BytesMut};
 
     use super::{DynStorage, StorageSet};
+    use tachyon_core::DownloadResult;
     use tachyon_core::config::IoStrategy;
+    use tachyon_io::storage::AsyncStorage;
+
+    type WriteCalls = Arc<Mutex<Vec<u64>>>;
+
+    /// 故意违反 `AsyncStorage` 写入计数契约的测试存储。
+    ///
+    /// 每次写入都会记录 offset，并声称比输入多写入一个字节，用于验证
+    /// `DynStorage` 的类型擦除边界能拦截不可信后端的错误计数。
+    #[derive(Clone)]
+    struct OverreportingStorage {
+        calls: WriteCalls,
+    }
+
+    impl OverreportingStorage {
+        fn new() -> (Self, WriteCalls) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl AsyncStorage for OverreportingStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.lock().unwrap().push(offset);
+                Ok(data.len() + 1)
+            })
+        }
+
+        fn write_at_mut<'a>(
+            &'a self,
+            offset: u64,
+            data: &'a mut BytesMut,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.lock().unwrap().push(offset);
+                Ok(data.len() + 1)
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            _offset: u64,
+            _buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            _size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 记录实际写入调用的正常测试存储，用于断言失败不会继续到后续文件。
+    #[derive(Clone)]
+    struct RecordingStorage {
+        calls: WriteCalls,
+    }
+
+    impl RecordingStorage {
+        fn new() -> (Self, WriteCalls) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl AsyncStorage for RecordingStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.lock().unwrap().push(offset);
+                Ok(data.len())
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            _offset: u64,
+            _buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn allocate(
+            &self,
+            _size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn dyn_storage_write_at_rejects_overreported_byte_count() {
+        let (broken, calls) = OverreportingStorage::new();
+        let storage = DynStorage::new(broken);
+
+        let error = storage
+            .write_at(7, Bytes::from_static(b"abc"))
+            .await
+            .expect_err("类型擦除边界必须拒绝超过输入长度的 write_at 返回值");
+
+        assert!(
+            matches!(error, tachyon_core::DownloadError::Fragment(_)),
+            "越界写入计数必须返回 Fragment 错误，实际为: {error:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn dyn_storage_write_at_mut_rejects_overreported_byte_count() {
+        let (broken, calls) = OverreportingStorage::new();
+        let storage = DynStorage::new(broken);
+        let mut data = BytesMut::from(&b"abc"[..]);
+
+        let error = storage
+            .write_at_mut(11, &mut data)
+            .await
+            .expect_err("类型擦除边界必须拒绝超过输入长度的 write_at_mut 返回值");
+
+        assert!(
+            matches!(error, tachyon_core::DownloadError::Fragment(_)),
+            "越界写入计数必须返回 Fragment 错误，实际为: {error:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![11]);
+    }
 
     #[tokio::test]
     async fn test_dyn_storage_open_with_strategy_standard() {
@@ -801,6 +963,74 @@ mod tests {
     // ===== StorageSet 多文件测试 =====
 
     use tachyon_core::{FileLayout, FileSpan};
+
+    fn two_single_byte_file_layout() -> FileLayout {
+        FileLayout::from_spans(vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1,
+                name: "first".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 1,
+                len: 1,
+                name: "second".into(),
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn storage_set_multi_write_at_rejects_overreported_count_before_later_file() {
+        let (broken, broken_calls) = OverreportingStorage::new();
+        let (later, later_calls) = RecordingStorage::new();
+        let storage = StorageSet::multi(
+            vec![DynStorage::new(broken), DynStorage::new(later)],
+            two_single_byte_file_layout(),
+        );
+
+        let error = storage
+            .write_at(0, Bytes::from_static(b"ab"))
+            .await
+            .expect_err("首个文件的越界写入计数必须返回错误而非切片 panic");
+
+        assert!(
+            matches!(error, tachyon_core::DownloadError::Fragment(_)),
+            "越界写入计数必须返回 Fragment 错误，实际为: {error:?}"
+        );
+        assert_eq!(*broken_calls.lock().unwrap(), vec![0]);
+        assert!(
+            later_calls.lock().unwrap().is_empty(),
+            "首个文件失败后不得调用后续文件"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file() {
+        let (broken, broken_calls) = OverreportingStorage::new();
+        let (later, later_calls) = RecordingStorage::new();
+        let storage = StorageSet::multi(
+            vec![DynStorage::new(broken), DynStorage::new(later)],
+            two_single_byte_file_layout(),
+        );
+        let mut data = BytesMut::from(&b"ab"[..]);
+
+        let error = storage
+            .write_at_mut(0, &mut data)
+            .await
+            .expect_err("首个文件的越界写入计数必须返回错误而非切片 panic");
+
+        assert!(
+            matches!(error, tachyon_core::DownloadError::Fragment(_)),
+            "越界写入计数必须返回 Fragment 错误，实际为: {error:?}"
+        );
+        assert_eq!(*broken_calls.lock().unwrap(), vec![0]);
+        assert!(
+            later_calls.lock().unwrap().is_empty(),
+            "首个文件失败后不得调用后续文件"
+        );
+    }
 
     /// 构造双文件 StorageSet:file0 [0,4095], file1 [4096,8191]
     fn make_multi_storage_set() -> StorageSet {
@@ -1019,6 +1249,8 @@ mod tests {
 
     // ===== P4: 磁盘空间预检测试 =====
 
+    #[cfg(unix)]
+    use super::available_bytes_from_statvfs;
     use super::{available_disk_space, check_disk_space, disk_space_margin};
     use tachyon_core::DownloadError;
 
@@ -1068,6 +1300,38 @@ mod tests {
             (ONE_MB..ONE_EB).contains(&available),
             "可用空间 {available} 字节不在合理物理区间 [1MB, 1EB),\
              疑似 statvfs 字段偏移错位产生的垃圾值"
+        );
+    }
+
+    /// Unix 回归：锁定完整原生 `libc::statvfs` 结构到可用字节数的纯转换。
+    ///
+    /// 该 oracle 与被测 helper 共用一次原生系统调用得到的完整 ABI 结构，不通过第二次
+    /// `statvfs` 调用取样，因此 `f_bavail` 的并发变化不会造成 TOCTOU 抖动。
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn test_available_bytes_from_complete_native_statvfs() {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = std::env::temp_dir();
+        let c_path =
+            CString::new(tmp.as_os_str().as_bytes()).expect("系统临时目录路径不应包含 NUL");
+        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+
+        // SAFETY:c_path 是调用期间有效的 NUL 结尾 Unix 路径；stat 为完整 libc 输出缓冲。
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        assert_eq!(rc, 0, "应能查询系统临时目录的 statvfs");
+        // SAFETY:上方已断言 statvfs 返回成功，完整输出结构已初始化。
+        let stat = unsafe { stat.assume_init() };
+        // libc 字段的整数别名因 Unix 目标而异；测试统一转成 u64 以固定跨平台 oracle。
+        let expected = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+
+        assert_eq!(
+            available_bytes_from_statvfs(&stat),
+            expected,
+            "转换结果必须精确等于同一完整原生结构的 f_bavail * f_frsize"
         );
     }
 

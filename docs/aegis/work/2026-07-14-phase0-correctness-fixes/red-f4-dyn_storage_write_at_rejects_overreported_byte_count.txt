@@ -1,0 +1,31 @@
+=== dyn_storage_write_at_rejects_overreported_byte_count ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.47s
+────────────
+ Nextest run ID e16d47f4-c902-4b3b-a794-dfe64954307c with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        FAIL [   0.477s] (1/1) tachyon-engine storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count
+  stdout ───
+
+    running 1 test
+    test storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count ... FAILED
+
+    failures:
+
+    failures:
+        storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 280 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count' (36528) panicked at crates\tachyon-engine\src\storage_adapter.rs:829:14:
+    类型擦除边界必须拒绝超过输入长度的 write_at 返回值: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.484s] 1 test run: 0 passed, 1 failed, 280 skipped
+        FAIL [   0.477s] (1/1) tachyon-engine storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count
+error: test run failed
+EXIT=100

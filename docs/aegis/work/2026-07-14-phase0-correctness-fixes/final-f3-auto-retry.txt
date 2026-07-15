@@ -1,0 +1,9 @@
+=== test_fragment_auto_retry_succeeds_within_limit ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.23s
+────────────
+ Nextest run ID 9b2856f2-2de6-4590-9894-f5988ff5f4b5 with nextest profile: default
+    Starting 1 test across 1 binary (273 tests skipped)
+        PASS [   2.633s] (1/1) tachyon-engine downloader::tests::test_fragment_auto_retry_succeeds_within_limit
+────────────
+     Summary [   2.637s] 1 test run: 1 passed, 273 skipped

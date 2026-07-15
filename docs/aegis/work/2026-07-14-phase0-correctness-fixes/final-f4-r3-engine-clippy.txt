@@ -1,0 +1,8 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Checking tachyon-core v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-core)
+    Checking tachyon-io v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-io)
+    Checking tachyon-scheduler v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-scheduler)
+    Checking tachyon-crypto v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-crypto)
+    Checking tachyon-protocol v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-protocol)
+    Checking tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 12.54s

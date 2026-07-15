@@ -1,0 +1,9 @@
+=== storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.93s
+────────────
+ Nextest run ID c4e24b65-ab31-4550-b3f1-a65c97d5ca0b with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        PASS [   0.430s] (1/1) tachyon-engine storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file
+────────────
+     Summary [   0.432s] 1 test run: 1 passed, 280 skipped

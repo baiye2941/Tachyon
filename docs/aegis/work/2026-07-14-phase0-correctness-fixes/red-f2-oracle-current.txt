@@ -1,0 +1,10 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 41.92s
+────────────
+ Nextest run ID 6ca4e2e6-411a-4856-ac78-757a99969241 with nextest profile: default
+    Starting 0 tests across 1 binary (274 tests skipped)
+────────────
+     Summary [   0.001s] 0 tests run: 0 passed, 274 skipped
+error: no tests to run
+(hint: use `--no-tests` to customize)

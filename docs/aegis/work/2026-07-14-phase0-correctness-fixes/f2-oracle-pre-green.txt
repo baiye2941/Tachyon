@@ -1,0 +1,4 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+error: cannot update the lock file D:\Rust\Tachyon\Cargo.lock because --locked was passed to prevent this
+help: to generate the lock file without accessing the network, remove the --locked flag and use --offline instead.
+error: command `'C:\Users\白夜\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe' metadata '--format-version=1' --all-features --filter-platform x86_64-pc-windows-msvc --locked` failed with exit code: 101

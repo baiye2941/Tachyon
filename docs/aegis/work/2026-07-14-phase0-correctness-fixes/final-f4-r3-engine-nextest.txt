@@ -1,0 +1,291 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.98s
+────────────
+ Nextest run ID 98eb3e8a-f7bb-4d0a-8a5b-c74765c06165 with nextest profile: default
+    Starting 284 tests across 1 binary
+        PASS [   0.325s] (  1/284) tachyon-engine bt_storage::tests::test_tachyon_torrent_storage_multiple_files
+        PASS [   0.653s] (  2/284) tachyon-engine bt_session::tests::test_default_config_has_peer_opts_and_defer_writes
+        PASS [   0.948s] (  3/284) tachyon-engine bt_session::tests::test_bt_proxy_coverage_no_socks_all_direct
+        PASS [   1.279s] (  4/284) tachyon-engine bt_session::tests::test_socks_keeps_dht_when_disable_dht_when_socks_false
+        PASS [   1.582s] (  5/284) tachyon-engine bt_storage::tests::test_pread_exact_short_read_errors
+        PASS [   1.874s] (  6/284) tachyon-engine bt_storage::tests::test_tachyon_torrent_storage_ensure_file_length
+        PASS [   2.142s] (  7/284) tachyon-engine bt_session::tests::test_bt_proxy_coverage_socks_keeps_dht_when_not_disabled
+        PASS [   2.467s] (  8/284) tachyon-engine bt_session::tests::test_socks_filters_udp_trackers_and_appends_https
+        PASS [   2.725s] (  9/284) tachyon-engine bt_session::tests::test_redact_socks_proxy_strips_credentials_keeps_host_port
+        PASS [   3.036s] ( 10/284) tachyon-engine bt_storage::tests::test_tachyon_torrent_storage_pwrite_pread
+        PASS [   3.301s] ( 11/284) tachyon-engine bt_session::tests::test_redact_socks_proxy_invalid_url_returns_placeholder
+        PASS [   3.571s] ( 12/284) tachyon-engine bt_session::tests::test_no_socks_keeps_udp_trackers
+        PASS [   3.842s] ( 13/284) tachyon-engine bt_storage::tests::test_tachyon_torrent_storage_file_id_out_of_range
+        PASS [   3.962s] ( 14/284) tachyon-engine bt_session::tests::test_bt_proxy_coverage_upnp_off_when_disabled
+        PASS [   4.268s] ( 15/284) tachyon-engine bt_session::tests::test_bt_session_new_constructs_without_panic
+        PASS [   4.521s] ( 16/284) tachyon-engine bt_session::tests::test_defer_writes_filled_when_nonzero
+        PASS [   4.781s] ( 17/284) tachyon-engine bt_session::tests::test_defer_writes_disabled_when_zero
+        PASS [   5.048s] ( 18/284) tachyon-engine bt_session::tests::test_peer_opts_filled_from_config
+        PASS [   5.298s] ( 19/284) tachyon-engine bt_session::tests::test_redact_socks_proxy_without_credentials_unchanged
+        PASS [   5.565s] ( 20/284) tachyon-engine bt_session::tests::test_bt_proxy_coverage_socks_proxies_core_and_blocks_udp_dht
+        PASS [   5.504s] ( 21/284) tachyon-engine bt_storage::tests::test_tachyon_torrent_storage_take_returns_clone
+        PASS [   5.426s] ( 22/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_allow_when_closed
+        PASS [   5.393s] ( 23/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_closed_by_default
+        PASS [   5.377s] ( 24/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_half_open_after_duration
+        PASS [   5.319s] ( 25/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_half_open_allows_one_probe
+        PASS [   5.233s] ( 26/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_opens_after_threshold
+        PASS [   5.277s] ( 27/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_probe_failure_reopens
+        PASS [   5.234s] ( 28/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_probe_success_closes
+        PASS [   5.402s] ( 29/284) tachyon-engine circuit_breaker::tests::test_circuit_breaker_success_closes
+        PASS [   5.245s] ( 30/284) tachyon-engine circuit_breaker::tests::test_half_open_after_duration_with_paused_time
+        PASS [   5.465s] ( 31/284) tachyon-engine circuit_breaker::tests::test_half_open_only_allows_one_probe
+        PASS [   5.685s] ( 32/284) tachyon-engine circuit_breaker::tests::test_half_open_probe_failure_reopens_with_paused_time
+        PASS [   5.903s] ( 33/284) tachyon-engine circuit_breaker::tests::test_half_open_probe_success_closes_with_paused_time
+        PASS [   6.261s] ( 34/284) tachyon-engine circuit_breaker::tests::test_source_circuit_breakers_allow_and_record
+        PASS [   6.460s] ( 35/284) tachyon-engine circuit_breaker::tests::test_source_circuit_breakers_half_open_probe
+        PASS [   6.712s] ( 36/284) tachyon-engine circuit_breaker::tests::test_source_circuit_breakers_half_open_probe_with_paused_time
+        PASS [   6.958s] ( 37/284) tachyon-engine circuit_breaker::tests::test_source_circuit_breakers_isolated_per_source
+        PASS [   7.180s] ( 38/284) tachyon-engine circuit_breaker::tests::test_source_circuit_breakers_success_resets
+        PASS [   7.425s] ( 39/284) tachyon-engine connection::tests::test_acquire_and_release
+        PASS [   7.670s] ( 40/284) tachyon-engine connection::tests::test_active_connections_initial
+        PASS [   7.912s] ( 41/284) tachyon-engine connection::tests::test_active_connections_with_permits
+        PASS [   8.170s] ( 42/284) tachyon-engine connection::tests::test_cleanup_idle_hosts_empty_pool
+        PASS [   8.392s] ( 43/284) tachyon-engine connection::tests::test_cleanup_idle_hosts_keeps_active
+        PASS [   8.551s] ( 44/284) tachyon-engine connection::tests::test_cleanup_idle_hosts_removes_inactive
+        PASS [   8.810s] ( 45/284) tachyon-engine connection::tests::test_connection_config_from_pool_config
+        PASS [   8.752s] ( 46/284) tachyon-engine connection::tests::test_default_config
+        PASS [   8.915s] ( 47/284) tachyon-engine connection::tests::test_different_hosts_independent
+        PASS [   9.135s] ( 48/284) tachyon-engine connection::tests::test_host_active_connections_tracks_permits
+        PASS [   9.203s] ( 49/284) tachyon-engine connection::tests::test_host_count
+        PASS [   9.497s] ( 50/284) tachyon-engine connection::tests::test_host_limit
+        PASS [   9.519s] ( 51/284) tachyon-engine connection::tests::test_host_semaphores_auto_cleanup_at_threshold
+        PASS [   9.523s] ( 52/284) tachyon-engine connection::tests::test_host_semaphores_no_cleanup_below_threshold
+        PASS [   9.510s] ( 53/284) tachyon-engine connection::tests::test_http2_auto_increases_default_max_per_host
+        PASS [   9.519s] ( 54/284) tachyon-engine connection::tests::test_http2_disabled_keeps_default_max_per_host
+        PASS [   9.468s] ( 55/284) tachyon-engine connection::tests::test_http2_keeps_explicit_max_per_host
+        PASS [   9.483s] ( 56/284) tachyon-engine connection::tests::test_max_global_blocks_new_acquire
+        PASS [   9.455s] ( 57/284) tachyon-engine connection::tests::test_permit_drop_releases_on_panic
+        PASS [   9.469s] ( 58/284) tachyon-engine connection::tests::test_pool_config_from_connection_config
+        PASS [   9.483s] ( 59/284) tachyon-engine connection::tests::test_pool_creation
+        PASS [   9.361s] ( 60/284) tachyon-engine connection::tests::test_semaphore
+        PASS [   9.260s] ( 61/284) tachyon-engine connection::tests::test_semaphore_closed_returns_error
+        PASS [   8.896s] ( 62/284) tachyon-engine downloader::tests::test_apply_terminal_error_paused_timeout_keeps_paused
+        PASS [   8.931s] ( 63/284) tachyon-engine downloader::tests::test_b11_cancel_penetrates_full_download_stalled_stream
+        PASS [   8.940s] ( 64/284) tachyon-engine downloader::tests::test_b5_mirrors_path_does_not_trip_engine_circuit_breaker
+        PASS [   9.268s] ( 65/284) tachyon-engine downloader::tests::test_batch_flush_threshold_hash
+        PASS [   9.295s] ( 66/284) tachyon-engine downloader::tests::test_bt_fallback_capacity_preflush
+        PASS [   9.300s] ( 67/284) tachyon-engine downloader::tests::test_bt_fallback_large_chunk_direct_write
+        PASS [   9.298s] ( 68/284) tachyon-engine downloader::tests::test_bt_fallback_multi_chunk_accumulate_and_residual
+        PASS [   9.388s] ( 69/284) tachyon-engine downloader::tests::test_bt_fallback_triggered_on_http_failure
+        PASS [   9.546s] ( 70/284) tachyon-engine downloader::tests::test_buffer_pool_backpressure_blocks_until_release
+        PASS [   9.429s] ( 71/284) tachyon-engine downloader::tests::test_buffer_pool_limits_concurrent_fragment_downloads
+        PASS [   9.017s] ( 72/284) tachyon-engine downloader::tests::test_buffer_pool_no_leak_on_fragment_abort
+        PASS [   8.821s] ( 73/284) tachyon-engine downloader::tests::test_buffer_pool_returns_buffers_after_run
+        PASS [  12.919s] ( 74/284) tachyon-engine downloader::tests::test_b5_single_source_path_trips_engine_circuit_breaker
+        PASS [   8.697s] ( 75/284) tachyon-engine downloader::tests::test_cancel_signal_in_prepare_storage_phase
+        PASS [   8.482s] ( 76/284) tachyon-engine downloader::tests::test_cancel_signal_in_probe_phase
+        PASS [   8.335s] ( 77/284) tachyon-engine downloader::tests::test_cancel_signal_interrupts_blocked_fragment_storage_write
+        PASS [   7.999s] ( 78/284) tachyon-engine downloader::tests::test_cancel_signal_interrupts_stalled_stream_read
+        PASS [   7.719s] ( 79/284) tachyon-engine downloader::tests::test_concurrent_download_failure
+        PASS [   7.636s] ( 80/284) tachyon-engine downloader::tests::test_concurrent_fragment_execution
+        PASS [   7.687s] ( 81/284) tachyon-engine downloader::tests::test_connection_pool_permit_limits_real_range_requests
+        PASS [   7.595s] ( 82/284) tachyon-engine downloader::tests::test_control_downloading_does_not_abort_fragmented_download
+        PASS [   7.331s] ( 83/284) tachyon-engine downloader::tests::test_control_downloading_does_not_abort_full_download
+        PASS [   7.101s] ( 84/284) tachyon-engine downloader::tests::test_disk_full_storage_error_propagates_gracefully
+        PASS [   6.569s] ( 85/284) tachyon-engine downloader::tests::test_dispatcher_no_hol_blocking_slow_worker
+        PASS [   6.128s] ( 86/284) tachyon-engine downloader::tests::test_empty_file_handling
+        PASS [   5.896s] ( 87/284) tachyon-engine downloader::tests::test_empty_file_unknown_size
+        PASS [   5.671s] ( 88/284) tachyon-engine downloader::tests::test_execute_fragmented_download_handles_storage_short_writes
+        PASS [   5.386s] ( 89/284) tachyon-engine downloader::tests::test_execute_fragmented_download_overlong_batch_flush_does_not_cross_boundary
+        PASS [   5.106s] ( 90/284) tachyon-engine downloader::tests::test_execute_fragmented_download_overlong_range_stream_errors
+        PASS [   5.237s] ( 91/284) tachyon-engine downloader::tests::test_execute_fragmented_download_short_range_stream_errors
+        PASS [   5.676s] ( 92/284) tachyon-engine downloader::tests::test_execute_full_stream_cancel_blocks_short_write_retry_after_first_write
+        PASS [   5.961s] ( 93/284) tachyon-engine downloader::tests::test_execute_full_stream_pause_blocks_short_write_retry_until_resume
+        PASS [   5.962s] ( 94/284) tachyon-engine downloader::tests::test_forbidden_error_not_retried
+        PASS [   6.375s] ( 95/284) tachyon-engine downloader::tests::test_fragment_fail_from_verifying_and_writing
+        PASS [   6.615s] ( 96/284) tachyon-engine downloader::tests::test_fragment_failure_aborts_and_drains_remaining_tasks_before_returning
+        PASS [   6.877s] ( 97/284) tachyon-engine downloader::tests::test_fragment_failure_records_failed_state_and_run_fails
+        PASS [   8.187s] ( 98/284) tachyon-engine downloader::tests::test_fragment_auto_retry_succeeds_within_limit
+        PASS [   7.234s] ( 99/284) tachyon-engine downloader::tests::test_fragment_panic_aborts_and_drains_remaining_tasks_before_returning
+        PASS [   7.328s] (100/284) tachyon-engine downloader::tests::test_fragment_record_pending_to_done
+        PASS [   7.328s] (101/284) tachyon-engine downloader::tests::test_fragment_record_to_failed
+        PASS [   7.732s] (102/284) tachyon-engine downloader::tests::test_fragment_retry_discards_partial_stream_buffer
+        PASS [   8.214s] (103/284) tachyon-engine downloader::tests::test_fragment_retry_resilience
+        PASS [   8.943s] (104/284) tachyon-engine downloader::tests::test_fragment_retry_exhausted_marks_correct_fragment
+        PASS [   8.290s] (105/284) tachyon-engine downloader::tests::test_fragmented_download_aborts_on_midway_storage_failure
+        PASS [   8.709s] (106/284) tachyon-engine downloader::tests::test_fragments_exceeding_channel_capacity_do_not_deadlock
+        PASS [   8.947s] (107/284) tachyon-engine downloader::tests::test_full_download_uses_fragment_state_machine
+        PASS [   9.160s] (108/284) tachyon-engine downloader::tests::test_invalid_url_fails
+        PASS [   9.366s] (109/284) tachyon-engine downloader::tests::test_large_chunk_direct_write_hash
+        PASS [   9.135s] (110/284) tachyon-engine downloader::tests::test_mirror_downloads_use_probe_selected_source
+        PASS [   9.098s] (111/284) tachyon-engine downloader::tests::test_mirror_fallback_on_full_failure
+        PASS [   9.073s] (112/284) tachyon-engine downloader::tests::test_mirror_fallback_on_range_failure
+        PASS [   8.993s] (113/284) tachyon-engine downloader::tests::test_mirror_fallback_on_stream_failure
+        PASS [   9.447s] (114/284) tachyon-engine downloader::tests::test_mirror_returns_primary_error_when_all_fail
+        PASS [   8.951s] (115/284) tachyon-engine downloader::tests::test_mirror_uses_primary_when_success
+        PASS [   8.873s] (116/284) tachyon-engine downloader::tests::test_multi_chunk_fragment_computed_hash_matches
+        PASS [   8.944s] (117/284) tachyon-engine downloader::tests::test_multi_write_at_short_write_correctness
+        PASS [   8.930s] (118/284) tachyon-engine downloader::tests::test_new_initializes_fields
+        PASS [   9.329s] (119/284) tachyon-engine downloader::tests::test_no_buffer_pool_runs_successfully
+        PASS [   9.423s] (120/284) tachyon-engine downloader::tests::test_open_with_strategy_iocp
+        PASS [   9.479s] (121/284) tachyon-engine downloader::tests::test_open_with_strategy_standard
+        PASS [   9.523s] (122/284) tachyon-engine downloader::tests::test_open_with_strategy_win_aligned_fallback_on_non_windows
+        PASS [   9.500s] (123/284) tachyon-engine downloader::tests::test_p6_cancel_penetrates_verify_disk_read_loop
+        PASS [   9.096s] (124/284) tachyon-engine downloader::tests::test_pause_then_resume_continues_download
+        PASS [   9.620s] (125/284) tachyon-engine downloader::tests::test_paused_control_prevents_fragment_writes
+        PASS [   9.146s] (126/284) tachyon-engine downloader::tests::test_plan_generates_fragments
+        PASS [   9.163s] (127/284) tachyon-engine downloader::tests::test_plan_without_probe_fails
+        PASS [  10.161s] (128/284) tachyon-engine downloader::tests::test_paused_control_respects_pause_timeout
+        PASS [   9.191s] (129/284) tachyon-engine downloader::tests::test_preferred_file_name_overrides_probed_name
+        PASS [   9.530s] (130/284) tachyon-engine downloader::tests::test_prepare_storage_allocates
+        PASS [   9.518s] (131/284) tachyon-engine downloader::tests::test_probe_fetches_metadata
+        PASS [   9.533s] (132/284) tachyon-engine downloader::tests::test_probe_keeps_protocol_file_name_when_no_preference
+        PASS [   9.506s] (133/284) tachyon-engine downloader::tests::test_probe_propagates_error
+        PASS [   9.500s] (134/284) tachyon-engine downloader::tests::test_progress_no_fragments_is_zero
+        PASS [   9.502s] (135/284) tachyon-engine downloader::tests::test_progress_tracking
+        PASS [   9.561s] (136/284) tachyon-engine downloader::tests::test_progress_tx_and_metrics_updated
+        PASS [   9.489s] (137/284) tachyon-engine downloader::tests::test_progress_various_fragment_states
+        PASS [   9.502s] (138/284) tachyon-engine downloader::tests::test_progress_zero_size_fragments
+        PASS [   9.523s] (139/284) tachyon-engine downloader::tests::test_rate_limiter_not_lowered_by_observed_bandwidth
+        PASS [   9.521s] (140/284) tachyon-engine downloader::tests::test_resume_partial_fragment_sets_resume_offset
+        PASS [  10.525s] (141/284) tachyon-engine downloader::tests::test_rate_limit_real_effect
+        PASS [   9.198s] (142/284) tachyon-engine downloader::tests::test_resume_progress_reflects_completed
+        PASS [   8.604s] (143/284) tachyon-engine downloader::tests::test_resume_skips_completed_fragments
+        PASS [   8.847s] (144/284) tachyon-engine downloader::tests::test_run_failure_marks_state
+        PASS [   8.578s] (145/284) tachyon-engine downloader::tests::test_run_full_flow_with_mock
+        PASS [   8.448s] (146/284) tachyon-engine downloader::tests::test_run_full_stream_pause_blocks_short_write_retry_until_resume
+        PASS [   8.132s] (147/284) tachyon-engine downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes
+        PASS [   8.423s] (148/284) tachyon-engine downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write
+        PASS [   8.265s] (149/284) tachyon-engine downloader::tests::test_run_multi_file_writes_to_directory
+        PASS [   8.014s] (150/284) tachyon-engine downloader::tests::test_run_no_range_support
+        PASS [   7.858s] (151/284) tachyon-engine downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes
+        PASS [   7.661s] (152/284) tachyon-engine downloader::tests::test_shared_rate_limiter_is_used
+        PASS [   7.514s] (153/284) tachyon-engine downloader::tests::test_should_try_bt_fallback_excludes_cancelled
+        PASS [   7.340s] (154/284) tachyon-engine downloader::tests::test_slow_storage_backpressure_bounds_inflight_buffers
+        PASS [   7.022s] (155/284) tachyon-engine downloader::tests::test_slow_storage_multi_chunk_hash_integrity
+        PASS [   6.704s] (156/284) tachyon-engine downloader::tests::test_small_chunks_no_progress_countdown_panic
+        PASS [   6.533s] (157/284) tachyon-engine downloader::tests::test_state_transitions
+        PASS [   5.382s] (158/284) tachyon-engine downloader::tests::test_unknown_size_full_download_respects_max_full_stream_bytes
+        PASS [   5.155s] (159/284) tachyon-engine downloader::tests::test_unknown_size_full_stream_download_success
+        PASS [   5.412s] (160/284) tachyon-engine downloader::tests::test_verifier_kind_clone
+        PASS [   7.123s] (161/284) tachyon-engine downloader::tests::test_throttled_error_is_retried_and_recovers
+        PASS [   5.483s] (162/284) tachyon-engine downloader::tests::test_verify_best_effort_skips_without_expected_hash
+        PASS [   5.368s] (163/284) tachyon-engine downloader::tests::test_verify_best_effort_verifies_with_expected_hash
+        PASS [   5.437s] (164/284) tachyon-engine downloader::tests::test_verify_detects_corruption
+        PASS [   5.598s] (165/284) tachyon-engine downloader::tests::test_verify_fragments_with_hash
+        PASS [   5.725s] (166/284) tachyon-engine downloader::tests::test_verify_parallel_concurrent_reads
+        PASS [   6.045s] (167/284) tachyon-engine downloader::tests::test_verify_parallel_multi_fragment_one_corrupt_fails
+        PASS [   6.243s] (168/284) tachyon-engine downloader::tests::test_verify_require_strategy_hash_mismatch_fails
+        PASS [   6.417s] (169/284) tachyon-engine downloader::tests::test_verify_require_strategy_without_expected_hash_fails
+        PASS [   6.646s] (170/284) tachyon-engine downloader::tests::test_verify_skip_strategy_always_skips
+        PASS [   6.823s] (171/284) tachyon-engine downloader::tests::test_verify_skipped_when_disabled
+        PASS [   7.010s] (172/284) tachyon-engine downloader::tests::test_with_hybrid_sources_no_mirrors_degrades_to_bt
+        PASS [   7.188s] (173/284) tachyon-engine downloader::tests::test_with_mirrors_creates_task
+        PASS [   7.298s] (174/284) tachyon-engine downloader::tests::test_work_stealing_disabled_slow_fragment_still_completes
+        PASS [   7.459s] (175/284) tachyon-engine downloader::tests::test_write_all_at_mut_256k_noop_timing
+        PASS [   7.711s] (176/284) tachyon-engine downloader::tests::test_write_all_at_mut_multi_concurrent_correctness
+        PASS [   7.824s] (177/284) tachyon-engine downloader::tests::test_write_all_at_mut_multi_short_write_correctness
+        PASS [   9.030s] (178/284) tachyon-engine downloader::tests::test_work_stealing_split_produces_correct_data
+        PASS [   7.994s] (179/284) tachyon-engine downloader::tests::test_write_all_at_mut_short_write_loop_correctness
+        PASS [   8.229s] (180/284) tachyon-engine fragment::proptests::test_backoff_duration_jitter_bounded
+        PASS [   8.532s] (181/284) tachyon-engine fragment::proptests::test_backoff_duration_monotonic
+        PASS [   8.980s] (182/284) tachyon-engine fragment::proptests::test_bandwidth_tracker_alpha_clamped
+        PASS [   9.231s] (183/284) tachyon-engine fragment::proptests::test_bandwidth_tracker_ewma_bounded
+        PASS [   9.332s] (184/284) tachyon-engine fragment::proptests::test_fragment_size_always_in_range
+        PASS [   9.352s] (185/284) tachyon-engine fragment::proptests::test_fragment_state_machine_valid
+        PASS [   9.341s] (186/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_empty_file
+        PASS [   9.333s] (187/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_empty_file_no_range
+        PASS [   9.334s] (188/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_exactly_one_page
+        PASS [   9.326s] (189/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_large_file_total_coverage
+        PASS [   9.029s] (190/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_no_range_support
+        PASS [   9.052s] (191/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_normal_range_supported
+        PASS [   9.071s] (192/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_single_byte
+        PASS [   9.047s] (193/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_small_file
+        PASS [   9.095s] (194/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_suggested_size_zero_falls_back
+        PASS [   9.015s] (195/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_uses_scheduler_target_not_pool_max
+        PASS [   8.931s] (196/284) tachyon-engine fragment::tests::plan_tests::test_plan_fragments_with_suggested_size
+        PASS [   8.978s] (197/284) tachyon-engine fragment::tests::plan_tests::test_with_scheduler_config
+        PASS [   9.096s] (198/284) tachyon-engine fragment::tests::test_backoff_duration
+        PASS [   9.525s] (199/284) tachyon-engine fragment::tests::test_backoff_duration_with_jitter
+        PASS [   9.538s] (200/284) tachyon-engine fragment::tests::test_backoff_jitter_produces_different_values
+        PASS [   9.460s] (201/284) tachyon-engine fragment::tests::test_bandwidth_tracker
+        PASS [   9.409s] (202/284) tachyon-engine fragment::tests::test_bandwidth_tracker_default
+        PASS [   9.392s] (203/284) tachyon-engine fragment::tests::test_bandwidth_tracker_default_and_zero_samples
+        PASS [   9.402s] (204/284) tachyon-engine fragment::tests::test_complete_download_fast_sets_last_duration
+        PASS [   9.364s] (205/284) tachyon-engine fragment::tests::test_compute_fragment_size_high_bandwidth
+        PASS [   9.002s] (206/284) tachyon-engine fragment::tests::test_compute_fragment_size_normal
+        PASS [   8.934s] (207/284) tachyon-engine fragment::tests::test_compute_fragment_size_small_file
+        PASS [   8.934s] (208/284) tachyon-engine fragment::tests::test_compute_fragment_size_zero
+        PASS [   8.957s] (209/284) tachyon-engine fragment::tests::test_effective_end_initialized_to_info_end
+        PASS [   9.254s] (210/284) tachyon-engine fragment::tests::test_force_fail_vs_mark_failed_boundary
+        PASS [   9.242s] (211/284) tachyon-engine fragment::tests::test_fragment_record_illegal_state_transitions
+        PASS [   9.194s] (212/284) tachyon-engine fragment::tests::test_fragment_retry
+        PASS [   9.221s] (213/284) tachyon-engine fragment::tests::test_fragment_state_transitions
+        PASS [   9.228s] (214/284) tachyon-engine fragment::tests::test_try_split_basic
+        PASS [   9.231s] (215/284) tachyon-engine fragment::tests::test_try_split_no_overflow_when_downloaded_below_split_point
+        PASS [   9.334s] (216/284) tachyon-engine fragment::tests::test_try_split_rejects_non_downloading_state
+        PASS [   9.169s] (217/284) tachyon-engine fragment::tests::test_try_split_rejects_out_of_range_split_point
+        PASS [   9.038s] (218/284) tachyon-engine fragment::tests::test_try_split_rejects_too_small_remaining
+        PASS [   8.821s] (219/284) tachyon-engine fragment::tests::test_try_split_transfers_overflow_downloaded
+        PASS [   8.644s] (220/284) tachyon-engine fragment::tests::test_try_split_updates_effective_end
+        PASS [   8.168s] (221/284) tachyon-engine mirror::tests::bench_source_selection_lock_overhead
+        PASS [   8.648s] (222/284) tachyon-engine mirror::tests::bench_multi_source_vs_single_source_throughput
+        PASS [   7.961s] (223/284) tachyon-engine mirror::tests::test_circuit_opens_via_actual_failures_single_source
+        PASS [   7.733s] (224/284) tachyon-engine mirror::tests::test_clear_selected_resets_probe_choice
+        PASS [   7.637s] (225/284) tachyon-engine mirror::tests::test_download_fallback_to_mirror_when_primary_fails
+        PASS [   7.801s] (226/284) tachyon-engine mirror::tests::test_download_falls_back_to_race_when_selected_source_fails
+        PASS [   7.635s] (227/284) tachyon-engine mirror::tests::test_download_range_fallback_to_mirror_when_primary_fails
+        PASS [   7.423s] (228/284) tachyon-engine mirror::tests::test_download_range_stream_fallback_to_mirror_when_primary_fails
+        PASS [   7.179s] (229/284) tachyon-engine mirror::tests::test_download_uses_selected_mirror_url_not_primary_url
+        PASS [   6.997s] (230/284) tachyon-engine mirror::tests::test_host_of_malformed_url_returns_none
+        PASS [   6.780s] (231/284) tachyon-engine mirror::tests::test_host_of_none_degrades_without_acquire
+        PASS [   6.604s] (232/284) tachyon-engine mirror::tests::test_host_of_normal_url_returns_host
+        PASS [   6.364s] (233/284) tachyon-engine mirror::tests::test_least_in_flight_multiple_sources_both_engaged
+        PASS [   6.136s] (234/284) tachyon-engine mirror::tests::test_least_in_flight_selected_not_exclusive
+        PASS [   6.144s] (235/284) tachyon-engine mirror::tests::test_multiplicative_scoring_fast_source_does_more_without_overload
+        PASS [   5.725s] (236/284) tachyon-engine mirror::tests::test_p1_per_host_acquire_mutex
+        PASS [   5.585s] (237/284) tachyon-engine mirror::tests::test_p1_permit_released_after_bytes_download
+        PASS [   5.334s] (238/284) tachyon-engine mirror::tests::test_p1_permit_released_on_stream_abort
+        PASS [   5.296s] (239/284) tachyon-engine mirror::tests::test_p3_clear_selected_decay_idempotent_no_underflow
+        PASS [   5.217s] (240/284) tachyon-engine mirror::tests::test_p3_clear_selected_decays_stats
+        PASS [   5.054s] (241/284) tachyon-engine mirror::tests::test_probe_selects_fastest_mirror
+        PASS [   5.407s] (242/284) tachyon-engine mirror::tests::test_quality_aware_slow_primary_demoted_in_serial
+        PASS [   5.282s] (243/284) tachyon-engine mirror::tests::test_soft_circuit_breaker_half_open_when_all_open
+        PASS [   5.275s] (244/284) tachyon-engine mirror::tests::test_soft_circuit_breaker_lifecycle
+        PASS [   5.183s] (245/284) tachyon-engine mirror::tests::test_soft_circuit_breaker_reset_on_clear_selected
+        PASS [   5.135s] (246/284) tachyon-engine mirror::tests::test_soft_circuit_breaker_skips_open_source
+        PASS [   5.136s] (247/284) tachyon-engine mirror::tests::test_traffic_migrates_via_quality_weighting_before_circuit
+        PASS [   5.109s] (248/284) tachyon-engine rate_limit::proptests::test_rate_limiter_acquire_zero_or_rate_zero_no_panic
+        PASS [   5.075s] (249/284) tachyon-engine rate_limit::proptests::test_rate_limiter_update_rate_invariant
+        PASS [   5.242s] (250/284) tachyon-engine rate_limit::tests::acquire_within_initial_tokens_returns_immediately
+        PASS [   5.448s] (251/284) tachyon-engine rate_limit::tests::acquire_zero_bytes_returns_immediately
+        PASS [   6.056s] (252/284) tachyon-engine rate_limit::tests::acquire_exceeding_tokens_waits
+        PASS [   5.691s] (253/284) tachyon-engine rate_limit::tests::bytes_per_sec_returns_configured_value
+        PASS [   5.564s] (254/284) tachyon-engine rate_limit::tests::concurrent_acquire_does_not_panic
+        PASS [   5.970s] (255/284) tachyon-engine rate_limit::tests::concurrent_update_rate_preserves_debt
+        PASS [   6.265s] (256/284) tachyon-engine rate_limit::tests::update_rate_changes_bytes_per_sec
+        PASS [   6.668s] (257/284) tachyon-engine rate_limit::tests::update_rate_to_zero_disables_limiting
+        PASS [   6.887s] (258/284) tachyon-engine resume_download
+        PASS [   7.110s] (259/284) tachyon-engine semaphore
+        PASS [   7.363s] (260/284) tachyon-engine storage_adapter::tests::dyn_storage_write_at_mut_rejects_overreported_byte_count
+        PASS [   7.453s] (261/284) tachyon-engine storage_adapter::tests::dyn_storage_write_at_rejects_overreported_byte_count
+        PASS [   7.818s] (262/284) tachyon-engine storage_adapter::tests::storage_set_multi_write_at_mut_rejects_overreported_count_before_later_file
+        PASS [   9.556s] (263/284) tachyon-engine rate_limit::tests::concurrent_acquire_honors_rate_limit
+        PASS [   8.033s] (264/284) tachyon-engine storage_adapter::tests::storage_set_multi_write_at_rejects_overreported_count_before_later_file
+        PASS [   8.277s] (265/284) tachyon-engine storage_adapter::tests::test_available_disk_space_handles_nonexistent_dir
+        PASS [   8.476s] (266/284) tachyon-engine storage_adapter::tests::test_available_disk_space_not_garbage_magnitude
+        PASS [   8.714s] (267/284) tachyon-engine storage_adapter::tests::test_available_disk_space_returns_positive_for_temp_dir
+        PASS [   8.922s] (268/284) tachyon-engine storage_adapter::tests::test_check_disk_space_err_when_insufficient
+        PASS [   9.167s] (269/284) tachyon-engine storage_adapter::tests::test_check_disk_space_ok_when_sufficient
+        PASS [   8.602s] (270/284) tachyon-engine storage_adapter::tests::test_disk_space_margin_uses_smaller_of_one_pct_and_100mb
+        PASS [   8.598s] (271/284) tachyon-engine storage_adapter::tests::test_dyn_storage_delegation
+        PASS [   9.043s] (272/284) tachyon-engine storage_adapter::tests::test_dyn_storage_open_with_strategy_iocp
+        PASS [   9.062s] (273/284) tachyon-engine storage_adapter::tests::test_dyn_storage_open_with_strategy_iouring
+        PASS [   9.410s] (274/284) tachyon-engine storage_adapter::tests::test_dyn_storage_open_with_strategy_standard
+        PASS [   8.891s] (275/284) tachyon-engine storage_adapter::tests::test_dyn_storage_open_with_strategy_win_aligned
+        PASS [   8.871s] (276/284) tachyon-engine storage_adapter::tests::test_multi_read_at_large_file_timing
+        PASS [   8.862s] (277/284) tachyon-engine storage_adapter::tests::test_multi_write_at_mut_cross_boundary_timing
+        PASS [   9.168s] (278/284) tachyon-engine storage_adapter::tests::test_multi_write_at_mut_large_file_timing
+        PASS [   8.936s] (279/284) tachyon-engine storage_adapter::tests::test_storage_set_multi_file_size
+        PASS [   8.955s] (280/284) tachyon-engine storage_adapter::tests::test_storage_set_multi_write_across_boundary
+        PASS [   8.966s] (281/284) tachyon-engine storage_adapter::tests::test_storage_set_multi_write_mut_across_boundary
+        PASS [   8.992s] (282/284) tachyon-engine storage_adapter::tests::test_storage_set_multi_write_within_single_file
+        PASS [   9.437s] (283/284) tachyon-engine storage_adapter::tests::test_storage_set_single_passthrough
+        PASS [   9.480s] (284/284) tachyon-engine verifier
+────────────
+     Summary [ 112.576s] 284 tests run: 284 passed, 0 skipped

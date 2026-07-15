@@ -221,12 +221,11 @@ pub struct DownloadConfig {
     /// 与 BT 侧 `detect_socks_proxy` 的“自动嗅探系统代理”语义对齐。
     #[serde(default)]
     pub proxy: Option<String>,
-    /// 是否启用动态分片/work-stealing(P1-1)。
+    /// work-stealing/动态拆分请求开关(配置兼容字段)。
     ///
-    /// 启用后,execute 循环会监控慢分片(进度 < 平均 50%),
-    /// 将其剩余部分一分为二,空闲 worker 接手后半段(IDM 式加速)。
-    /// 论文依据:MDTP(arXiv 2505.09597)减少 10-22% 传输时间。
-    /// 默认 false(安全,需真实网络 bench 验证收益后启用)。
+    /// Phase0 运行时 hard-disable:`true` 仅表示 requested,DownloadTask 不会动态 split
+    /// 慢分片,也不会改变初始静态 topology。字段保留用于配置/备份兼容与后续阶段恢复。
+    /// 默认 `false`(缺字段反序列化亦为 `false`)。
     #[serde(default)]
     pub enable_work_stealing: bool,
 }
@@ -1166,7 +1165,10 @@ pub struct DownloadPatch {
     pub io_strategy: Option<IoStrategy>,
     /// 显式代理 URL,None 表示不修改(保留原值,可能继续用系统环境变量)
     pub proxy: Option<Option<String>>,
-    /// 是否启用动态分片/work-stealing(P1-1)
+    /// work-stealing 请求开关补丁(配置兼容字段)。
+    ///
+    /// Phase0 运行时 hard-disable:`Some(true)` 仅写入 requested 状态,DownloadTask
+    /// 不会动态 split。字段保留用于配置/备份兼容与后续阶段恢复。
     pub enable_work_stealing: Option<bool>,
 }
 
@@ -1671,6 +1673,73 @@ mod tests {
         }"#;
         let config: DownloadConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.rate_limit_bytes_per_sec, None);
+    }
+
+    /// 缺字段时 enable_work_stealing 必须反序列化为 false(配置契约)。
+    #[test]
+    fn test_enable_work_stealing_missing_field_deserializes_false() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enable_work_stealing, "缺字段必须默认 false");
+    }
+
+    /// 显式 true 必须保留为 requested=true(Phase0 运行时 hard-disable 不改 schema 语义)。
+    #[test]
+    fn test_enable_work_stealing_explicit_true_deserializes() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "enableWorkStealing":true
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.enable_work_stealing,
+            "显式 enableWorkStealing:true 必须反序列化为 true"
+        );
+    }
+
+    /// 序列化输出必须包含 camelCase 字段 enableWorkStealing。
+    #[test]
+    fn test_enable_work_stealing_serializes_camel_case() {
+        let mut config = DownloadConfig::default();
+        config.enable_work_stealing = true;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("\"enableWorkStealing\":true"),
+            "序列化必须包含 enableWorkStealing:true,实际: {json}"
+        );
+    }
+
+    /// DownloadPatch::apply_to 必须写入 enable_work_stealing requested 值。
+    #[test]
+    fn test_download_patch_enable_work_stealing_apply_true() {
+        let mut base = DownloadConfig::default();
+        assert!(
+            !base.enable_work_stealing,
+            "默认必须为 false,作为 apply 前置条件"
+        );
+        let patch = DownloadPatch {
+            enable_work_stealing: Some(true),
+            ..Default::default()
+        };
+        patch.apply_to(&mut base);
+        assert!(
+            base.enable_work_stealing,
+            "DownloadPatch enable_work_stealing:Some(true) 必须 apply 到 base"
+        );
     }
 
     #[test]

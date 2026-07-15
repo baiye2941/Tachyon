@@ -1,0 +1,30 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1m 49s
+────────────
+ Nextest run ID e894e557-8a08-4610-9800-1e189a622306 with nextest profile: default
+    Starting 1 test across 1 binary (275 tests skipped)
+        FAIL [   0.425s] (1/1) tachyon-engine downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes
+  stdout ───
+
+    running 1 test
+    test downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes ... FAILED
+
+    failures:
+
+    failures:
+        downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes' (37916) panicked at crates\tachyon-engine\src\downloader.rs:4079:16:
+    已知大小整文件流必须循环补写短写尾部: Io(Custom { kind: InvalidData, error: "下载数据不完整: 预期 16 字节, 实际写入 8 字节" })
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.429s] 1 test run: 0 passed, 1 failed, 275 skipped
+        FAIL [   0.425s] (1/1) tachyon-engine downloader::tests::test_run_known_size_full_stream_handles_storage_short_writes
+error: test run failed

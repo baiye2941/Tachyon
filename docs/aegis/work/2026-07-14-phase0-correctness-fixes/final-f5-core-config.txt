@@ -1,0 +1,39 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.59s
+────────────
+ Nextest run ID 66b81183-b4d8-4922-bdce-e45529b4612e with nextest profile: default
+    Starting 4 tests across 1 binary (430 tests skipped)
+       START [         ] (1/4) tachyon-core config::tests::test_download_patch_enable_work_stealing_apply_true
+
+running 1 test
+test config::tests::test_download_patch_enable_work_stealing_apply_true ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 433 filtered out; finished in 0.00s
+
+        PASS [   0.270s] (1/4) tachyon-core config::tests::test_download_patch_enable_work_stealing_apply_true
+       START [         ] (2/4) tachyon-core config::tests::test_enable_work_stealing_explicit_true_deserializes
+
+running 1 test
+test config::tests::test_enable_work_stealing_explicit_true_deserializes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 433 filtered out; finished in 0.00s
+
+        PASS [   0.236s] (2/4) tachyon-core config::tests::test_enable_work_stealing_explicit_true_deserializes
+       START [         ] (3/4) tachyon-core config::tests::test_enable_work_stealing_missing_field_deserializes_false
+
+running 1 test
+test config::tests::test_enable_work_stealing_missing_field_deserializes_false ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 433 filtered out; finished in 0.00s
+
+        PASS [   0.177s] (3/4) tachyon-core config::tests::test_enable_work_stealing_missing_field_deserializes_false
+       START [         ] (4/4) tachyon-core config::tests::test_enable_work_stealing_serializes_camel_case
+
+running 1 test
+test config::tests::test_enable_work_stealing_serializes_camel_case ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 433 filtered out; finished in 0.00s
+
+        PASS [   0.249s] (4/4) tachyon-core config::tests::test_enable_work_stealing_serializes_camel_case
+────────────
+     Summary [   0.934s] 4 tests run: 4 passed, 430 skipped

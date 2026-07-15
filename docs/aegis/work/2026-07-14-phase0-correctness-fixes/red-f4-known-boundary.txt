@@ -1,0 +1,32 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 2m 16s
+────────────
+ Nextest run ID 10eda83e-e829-4191-9493-a0bcd225413b with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        FAIL [   0.452s] (1/1) tachyon-engine downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write
+  stdout ───
+
+    running 1 test
+    test downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write ... FAILED
+
+    failures:
+
+    failures:
+        downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 280 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write' (31540) panicked at crates\tachyon-engine\src\downloader.rs:4126:9:
+    assertion `left == right` failed: 越界 chunk 必须在调用 storage.write_at 前被拒绝
+      left: [97, 98, 99, 100, 101, 102]
+     right: [97, 98, 99]
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.454s] 1 test run: 0 passed, 1 failed, 280 skipped
+        FAIL [   0.452s] (1/1) tachyon-engine downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write
+error: test run failed

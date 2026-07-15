@@ -1,0 +1,9 @@
+=== dyn_storage_write_at_mut_rejects_overreported_byte_count ===
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.94s
+────────────
+ Nextest run ID a1113d88-78c8-4611-949a-5d7a3c91618c with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        PASS [   0.399s] (1/1) tachyon-engine storage_adapter::tests::dyn_storage_write_at_mut_rejects_overreported_byte_count
+────────────
+     Summary [   0.402s] 1 test run: 1 passed, 280 skipped

@@ -28,7 +28,9 @@ use tachyon_core::config::{DownloadConfig, SchedulerConfig};
 use tachyon_core::traits::{DownloadScheduler, Protocol, Verifier};
 
 use crate::rate_limit::RateLimiter;
-use tachyon_core::types::{DownloadState, FileMetadata, FragmentInfo, TaskCommand, TaskId};
+use tachyon_core::types::{
+    DownloadState, FileMetadata, FragmentInfo, ObjectIdentity, TaskCommand, TaskId,
+};
 use tachyon_core::{DownloadError, DownloadResult, FragmentProgress, Metrics};
 use tachyon_crypto::CpuVerifier;
 use tachyon_protocol::http::HttpClient;
@@ -134,6 +136,7 @@ struct FragmentSpawnCtx<'a> {
     max_retries: u32,
     pause_timeout: Duration,
     skip_write: bool,
+    object_identity: Option<ObjectIdentity>,
 }
 
 use crate::connection::ConnectionPool;
@@ -141,6 +144,15 @@ use crate::fragment::FragmentRecord;
 
 #[cfg(test)]
 use tachyon_core::test_harness::harness::MockProtocol as MockProto;
+
+/// URL 路径(去 query/fragment)是否以 HLS playlist 扩展名结尾。
+fn looks_like_hls_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = parsed.path().to_ascii_lowercase();
+    path.ends_with(".m3u8") || path.ends_with(".m3u")
+}
 
 // ---------------------------------------------------------------------------
 // DownloadTask: 下载任务执行器
@@ -173,6 +185,8 @@ pub struct DownloadTask {
     completed_fragments: Vec<u32>,
     /// 未完整下载的分片及其已持久化的字节数(字节级断点续传)
     partial_fragments: HashMap<u32, u64>,
+    /// 断点续传快照中的对象身份
+    resume_object_identity: Option<ObjectIdentity>,
     /// 外部共享限速器(跨任务全局限速)。
     /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -191,6 +205,12 @@ pub struct DownloadTask {
     /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
     /// 调用方负责传入已 sanitize 的合法文件名(由 app 层 service 完成)。
     preferred_file_name: Option<String>,
+    /// 可在 set_preferred 后更新根名的 BT storage factory(与 boxed 注入共享 preferred Arc)
+    #[cfg(feature = "magnet")]
+    bt_storage_factory: Option<crate::bt_storage::TachyonStorageFactory>,
+    /// 具体 MagnetProtocol 引用(与 protocol 同源),用于 preferred 同步与生命周期清理
+    #[cfg(feature = "magnet")]
+    bt_magnet: Option<std::sync::Arc<tachyon_protocol::MagnetProtocol>>,
     /// BitTorrent Session（可选，仅磁力链接任务需要）
     #[cfg(feature = "magnet")]
     #[allow(dead_code)]
@@ -307,7 +327,7 @@ impl DownloadTask {
             //
             // 连接池调优:若有 ConnectionPool,用其 max_per_host 参数化 reqwest
             // 空闲连接池大小,使 reqwest 连接复用与信号量并发上限对齐。
-            Arc::new(if let Some(ref p) = pool {
+            let http = if let Some(ref p) = pool {
                 let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
                 HttpClient::with_connection_config(
                     &conn_config,
@@ -321,7 +341,15 @@ impl DownloadTask {
                     config.request_timeout_secs,
                     config.proxy.as_deref(),
                 )?
-            })
+            };
+            // P0-7: .m3u8/.m3u URL 走 HlsProtocol(VOD 媒体分片),否则 HttpClient
+            if looks_like_hls_url(&url) {
+                Arc::new(tachyon_protocol::hls::HlsProtocol::new(
+                    std::sync::Arc::new(http),
+                ))
+            } else {
+                Arc::new(http)
+            }
         } else if url.starts_with("magnet:?") {
             #[cfg(feature = "magnet")]
             {
@@ -338,17 +366,48 @@ impl DownloadTask {
                     tokio::runtime::Handle::current(),
                     config.io_strategy,
                     std::path::PathBuf::from(&config.download_dir),
-                )
-                .boxed();
-                Arc::new(
+                );
+                let magnet_arc = Arc::new(
                     MagnetProtocol::new(
                         session.session(),
                         session.config().clone(),
                         session.download_dir().clone(),
                         session.handle_cache(),
                     )
-                    .with_storage_factory(factory),
-                )
+                    .with_ops_gate(session.ops_gate())
+                    .with_storage_factory(factory.clone().boxed()),
+                );
+                let protocol: Arc<dyn Protocol> = magnet_arc.clone();
+                // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
+                return Ok(Self {
+                    id: TaskId::new_v4(),
+                    url,
+                    config,
+                    protocol,
+                    storage: None,
+                    scheduler_config: SchedulerConfig::default(),
+                    scheduler,
+                    pool,
+                    buffer_pool: None,
+                    control_rx: None,
+                    state: DownloadState::Pending,
+                    metadata: None,
+                    fragments: Vec::new(),
+                    progress_tx: None,
+                    verifier: default_blake3_verifier(),
+                    completed_fragments: Vec::new(),
+                    partial_fragments: HashMap::new(),
+                    resume_object_identity: None,
+                    rate_limiter: None,
+                    metrics: None,
+                    circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+                    has_mirrors: false,
+                    preferred_file_name: None,
+                    bt_storage_factory: Some(factory),
+                    bt_magnet: Some(magnet_arc),
+                    bt_session,
+                    bt_fallback: None,
+                });
             }
             #[cfg(not(feature = "magnet"))]
             {
@@ -379,11 +438,16 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
+            resume_object_identity: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
             #[cfg(feature = "magnet")]
             bt_session,
             #[cfg(feature = "magnet")]
@@ -401,6 +465,14 @@ impl DownloadTask {
     /// 调用方负责传入已 sanitize 的合法文件名;若 `probe()` 已经执行过,
     /// 此处不会回填到已缓存的 `self.metadata`(只影响首次 probe 的写入路径)。
     pub fn set_preferred_file_name(&mut self, name: String) {
+        #[cfg(feature = "magnet")]
+        if let Some(ref factory) = self.bt_storage_factory {
+            factory.set_preferred_root_name(Some(name.clone()));
+        }
+        #[cfg(feature = "magnet")]
+        if let Some(ref magnet) = self.bt_magnet {
+            magnet.set_preferred_root_name(Some(name.clone()));
+        }
         self.preferred_file_name = Some(name);
     }
 
@@ -423,6 +495,11 @@ impl DownloadTask {
         config: DownloadConfig,
         pool: Option<Arc<ConnectionPool>>,
     ) -> DownloadResult<Self> {
+        if looks_like_hls_url(&url) || mirror_urls.iter().any(|u| looks_like_hls_url(u)) {
+            return Err(DownloadError::Config(
+                "HLS(.m3u8) 暂不支持镜像混拼;请使用单源 DownloadTask".into(),
+            ));
+        }
         // P2:镜像路径复用连接池配置(对齐 with_pool_and_scheduler:247-256)
         // pool 存在时用 with_connection_config 透传 max_per_host/keep_alive/http2,
         // 使每镜像的 reqwest 连接池与全局并发控制对齐;否则回退 with_timeouts。
@@ -484,11 +561,16 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
+            resume_object_identity: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: true,
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
             #[cfg(feature = "magnet")]
@@ -574,6 +656,7 @@ impl DownloadTask {
                 bt_session.download_dir().clone(),
                 bt_session.handle_cache(),
             )
+            .with_ops_gate(bt_session.ops_gate())
             .with_storage_factory(bt_factory),
         );
 
@@ -595,11 +678,16 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
+            resume_object_identity: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: true,
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
             #[cfg(feature = "magnet")]
             bt_session: Some(bt_session),
             #[cfg(feature = "magnet")]
@@ -632,11 +720,16 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
+            resume_object_identity: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
             #[cfg(feature = "magnet")]
@@ -672,11 +765,16 @@ impl DownloadTask {
             verifier: default_blake3_verifier(),
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
+            resume_object_identity: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
             preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
             #[cfg(feature = "magnet")]
             bt_session: None,
             #[cfg(feature = "magnet")]
@@ -712,6 +810,11 @@ impl DownloadTask {
     /// 使 `execute()` 从已下载位置继续,避免完整重下整个分片。
     pub fn set_partial_fragments(&mut self, partial: HashMap<u32, u64>) {
         self.partial_fragments = partial;
+    }
+
+    /// 设置断点续传快照对象身份(须在 plan 前;probe 后会与远端比较)
+    pub fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
+        self.resume_object_identity = identity;
     }
 
     /// 设置调度器配置(供 bench 调整 sampling_interval_secs 等参数)
@@ -840,6 +943,20 @@ impl DownloadTask {
             supports_range = metadata.supports_range,
             "探测完成"
         );
+        if let Some(ref snap) = self.resume_object_identity {
+            let remote = ObjectIdentity::from_metadata(&metadata);
+            if !snap.compatible_for_resume(&remote) {
+                warn!(
+                    url = %self.url,
+                    snap_etag = ?snap.etag,
+                    remote_etag = ?remote.etag,
+                    "对象身份与断点快照不兼容,丢弃已完成/部分分片并全量重下"
+                );
+                self.completed_fragments.clear();
+                self.partial_fragments.clear();
+                self.resume_object_identity = None;
+            }
+        }
         self.metadata = Some(metadata);
         self.metadata
             .as_ref()
@@ -1259,6 +1376,7 @@ impl DownloadTask {
         let max_retries = ctx.max_retries;
         let pause_timeout = ctx.pause_timeout;
         let skip_write = ctx.skip_write;
+        let frag_object_identity = ctx.object_identity.clone();
 
         handles.spawn(async move {
             let _permit = permit; // RAII:完成/drop 即归还
@@ -1304,6 +1422,7 @@ impl DownloadTask {
                     write_buf.as_mut(),
                     skip_write,
                     &shared,
+                    frag_object_identity.clone(),
                 )
                 .await;
 
@@ -1685,6 +1804,10 @@ impl DownloadTask {
                                 max_retries,
                                 pause_timeout,
                                 skip_write,
+                                object_identity: self
+                                    .metadata
+                                    .as_ref()
+                                    .map(ObjectIdentity::from_metadata),
                             };
                             if let Err(e) =
                                 Self::spawn_fragment_task(&spawn_ctx, spec, &mut handles).await
@@ -1730,6 +1853,10 @@ impl DownloadTask {
                             max_retries,
                             pause_timeout,
                             skip_write,
+                            object_identity: self
+                                .metadata
+                                .as_ref()
+                                .map(ObjectIdentity::from_metadata),
                         };
                         if let Err(e) =
                             Self::spawn_fragment_task(&spawn_ctx, spec, &mut handles).await
@@ -2154,6 +2281,7 @@ impl DownloadTask {
         write_buf: &mut AlignedBuf,
         skip_write: bool,
         shared: &FragmentShared,
+        object_identity: Option<ObjectIdentity>,
     ) -> DownloadResult<(u64, Duration, Option<String>)> {
         let mut control_rx = control_rx.clone();
 
@@ -2194,7 +2322,7 @@ impl DownloadTask {
             .min(frag_end);
         let stream = if let Some(rx) = control_rx.as_mut() {
             tokio::select! {
-                result = protocol.download_range_stream(url, actual_start, current_effective_end) => result?,
+                result = protocol.download_range_stream(url, actual_start, current_effective_end, object_identity.clone()) => result?,
                 control = Self::watch_for_interrupt(rx, pause_timeout) => {
                     control?;
                     return Err(DownloadError::Other("控制信号异常结束".into()));
@@ -2202,7 +2330,7 @@ impl DownloadTask {
             }
         } else {
             protocol
-                .download_range_stream(url, actual_start, current_effective_end)
+                .download_range_stream(url, actual_start, current_effective_end, object_identity)
                 .await?
         };
 
@@ -2620,7 +2748,38 @@ impl DownloadTask {
             warn!(state = ?self.state, error = %error, "下载任务结束为非成功状态");
         }
 
+        // P0-8: 终态/成功后停止 BT torrent,防止取消后仍联网写盘
+        #[cfg(feature = "magnet")]
+        self.cleanup_bt_torrent_if_needed(&result).await;
+
         result
+    }
+
+    /// cancel/fail/complete 时 pause+delete(保留文件)+清 cache;暂停超时保持 Paused 不清理
+    #[cfg(feature = "magnet")]
+    async fn cleanup_bt_torrent_if_needed(&self, result: &DownloadResult<()>) {
+        if !self.url.starts_with("magnet:?") {
+            return;
+        }
+        let should_cleanup = match result {
+            Ok(()) => true,
+            Err(DownloadError::Cancelled) => true,
+            Err(_) => matches!(
+                self.state,
+                DownloadState::Cancelled | DownloadState::Failed | DownloadState::Completed
+            ),
+        };
+        if !should_cleanup {
+            return;
+        }
+        if let Some(magnet) = &self.bt_magnet {
+            magnet.stop_and_remove_torrent(&self.url).await;
+            return;
+        }
+        // hybrid fallback 路径
+        if let Some(magnet) = &self.bt_fallback {
+            magnet.stop_and_remove_torrent(&self.url).await;
+        }
     }
 
     fn apply_terminal_error(&mut self, error: &DownloadError) {
@@ -3066,6 +3225,10 @@ impl tachyon_core::traits::TaskRunner for DownloadTask {
         self.set_partial_fragments(fragments);
     }
 
+    fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
+        self.set_resume_object_identity(identity);
+    }
+
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
         self.set_progress_sender(tx);
     }
@@ -3473,6 +3636,102 @@ mod tests {
 
         // 再次访问 metadata 也应保持覆盖结果
         assert_eq!(task.metadata().unwrap().file_name, "user_renamed.bin");
+    }
+
+    #[tokio::test]
+    async fn test_with_mirrors_rejects_hls_playlist_url() {
+        let config = test_config();
+        let result = DownloadTask::with_mirrors(
+            "https://cdn.example.com/live/index.m3u8".into(),
+            vec!["https://mirror.example.com/index.m3u8".into()],
+            config,
+            None,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("HLS 镜像应被拒绝"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HLS") || msg.contains("m3u8"),
+            "错误应说明 HLS 不支持镜像: {msg}"
+        );
+    }
+
+    /// P0-7: DownloadTask 对 .m3u8 走 HlsProtocol,产物为分片拼接而非 playlist 文本
+    /// 需 test-harness 放行 loopback SSRF。
+    #[cfg(feature = "test-harness")]
+    #[tokio::test]
+    async fn test_download_task_hls_vod_downloads_segments_not_playlist() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let playlist = concat!(
+            "#EXTM3U\n",
+            "#EXTINF:1.0,\n",
+            "seg0.ts\n",
+            "#EXTINF:1.0,\n",
+            "seg1.ts\n",
+            "#EXT-X-ENDLIST\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/vod.m3u8"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.apple.mpegurl")
+                    .set_body_string(playlist),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/seg0.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"AAAA", "video/mp2t"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/seg1.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"BBBB", "video/mp2t"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.download_dir = dir.path().to_string_lossy().into_owned();
+        config.max_retries = 1;
+        let url = format!("{}/vod.m3u8", server.uri());
+        let mut task = DownloadTask::new(url, config)
+            .await
+            .expect("构造 HLS 任务应成功");
+        task.run().await.expect("HLS VOD 下载应成功");
+        // 产物应是分片拼接
+        let out = dir.path().join("vod.m3u8");
+        // HlsProtocol extract_filename 可能保留 .m3u8 名;内容必须是媒体字节
+        let path = if out.exists() {
+            out
+        } else {
+            // 回退扫描目录
+            let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            assert!(!entries.is_empty(), "应产生下载文件");
+            entries.remove(0)
+        };
+        let bytes = std::fs::read(&path).expect("读产物");
+        assert_eq!(
+            bytes,
+            b"AAAABBBB",
+            "产物应为 segment 拼接,不应为 playlist 文本; got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            !bytes.starts_with(b"#EXTM3U"),
+            "产物不得是 m3u8 播放列表文本"
+        );
     }
 
     /// 未设置 preferred_file_name 时,probe() 行为不变。
@@ -5109,6 +5368,7 @@ mod tests {
                 _url: &str,
                 _start: u64,
                 _end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
                 let count = self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -5127,13 +5387,14 @@ mod tests {
                 url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
             > {
                 let this = self.clone();
                 let url = url.to_owned();
                 Box::pin(async move {
-                    let data = this.download_range(&url, start, end).await?;
+                    let data = this.download_range(&url, start, end, None).await?;
                     Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
                 })
             }
@@ -5228,6 +5489,7 @@ mod tests {
                 _url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
                 let count = self.fail_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -5246,13 +5508,14 @@ mod tests {
                 url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
             > {
                 let this = self.clone();
                 let url = url.to_owned();
                 Box::pin(async move {
-                    let data = this.download_range(&url, start, end).await?;
+                    let data = this.download_range(&url, start, end, None).await?;
                     Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
                 })
             }
@@ -5375,6 +5638,7 @@ mod tests {
                 _url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
                 Box::pin(async move { Ok(Bytes::from(vec![0xDD; (end - start + 1) as usize])) })
@@ -5385,6 +5649,7 @@ mod tests {
                 _url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
             > {
@@ -5631,6 +5896,7 @@ mod tests {
                 _url: &str,
                 _start: u64,
                 _end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
             {
                 Box::pin(async move { Ok(Bytes::new()) })
@@ -5641,6 +5907,7 @@ mod tests {
                 _url: &str,
                 start: u64,
                 end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
             > {
@@ -5916,6 +6183,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             Box::pin(async move { Ok(Bytes::from(vec![0xF1; (end - start + 1) as usize])) })
@@ -5926,6 +6194,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let started = Arc::clone(&self.started);
@@ -6654,6 +6923,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             let fail_start = self.fail_start;
@@ -6678,12 +6948,13 @@ mod tests {
             url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let this = self.clone();
             let url = url.to_owned();
             Box::pin(async move {
-                let data = this.download_range(&url, start, end).await?;
+                let data = this.download_range(&url, start, end, None).await?;
                 Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
             })
         }
@@ -6933,6 +7204,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             let fail_start = self.fail_start;
@@ -6956,12 +7228,13 @@ mod tests {
             url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let this = self.clone();
             let url = url.to_owned();
             Box::pin(async move {
-                let data = this.download_range(&url, start, end).await?;
+                let data = this.download_range(&url, start, end, None).await?;
                 Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
             })
         }
@@ -7099,6 +7372,7 @@ mod tests {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             let data = self.range_data.clone();
@@ -7110,12 +7384,13 @@ mod tests {
             url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let this = self.clone();
             let url = url.to_owned();
             Box::pin(async move {
-                let data = this.download_range(&url, start, end).await?;
+                let data = this.download_range(&url, start, end, None).await?;
                 Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
             })
         }
@@ -7167,7 +7442,7 @@ mod tests {
         );
 
         let range = protocol
-            .download_range("http://primary.com/file.bin", 0, 11)
+            .download_range("http://primary.com/file.bin", 0, 11, None)
             .await
             .unwrap();
         assert!(
@@ -7177,7 +7452,7 @@ mod tests {
         );
 
         let mut stream = protocol
-            .download_range_stream("http://primary.com/file.bin", 0, 11)
+            .download_range_stream("http://primary.com/file.bin", 0, 11, None)
             .await
             .unwrap();
         let chunk = tokio_stream::StreamExt::next(&mut stream)
@@ -7219,6 +7494,7 @@ mod tests {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             Box::pin(async { Err(DownloadError::Network("主源不可用".into())) })
@@ -7228,6 +7504,7 @@ mod tests {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             Box::pin(async { Err(DownloadError::Network("主源不可用(流)".into())) })
@@ -7253,7 +7530,7 @@ mod tests {
             MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
 
         let result = mirror_proto
-            .download_range("http://primary.com", 0, 99)
+            .download_range("http://primary.com", 0, 99, None)
             .await;
         assert!(result.is_ok(), "镜像回退应成功");
         assert_eq!(result.unwrap().len(), 100);
@@ -7271,7 +7548,7 @@ mod tests {
             MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
 
         let result = mirror_proto
-            .download_range_stream("http://primary.com", 0, 99)
+            .download_range_stream("http://primary.com", 0, 99, None)
             .await;
         assert!(result.is_ok(), "镜像流式回退应成功");
     }
@@ -7307,7 +7584,7 @@ mod tests {
             MirrorProtocol::new(primary, vec![("http://mirror1.com".into(), mirror)]);
 
         let result = mirror_proto
-            .download_range("http://primary.com", 0, 49)
+            .download_range("http://primary.com", 0, 49, None)
             .await;
         assert!(result.is_ok(), "主源成功时应直接返回");
     }
@@ -7324,7 +7601,7 @@ mod tests {
         );
 
         let result = mirror_proto
-            .download_range("http://primary.com", 0, 99)
+            .download_range("http://primary.com", 0, 99, None)
             .await;
         assert!(result.is_err(), "所有源失败时应返回错误");
     }
@@ -7779,6 +8056,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             Box::pin(async move { Ok(Bytes::from(vec![0xDD; (end - start + 1) as usize])) })
@@ -7789,6 +8067,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let active = Arc::clone(&self.active);
@@ -8457,6 +8736,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             let data = self.total_data.slice(start as usize..=(end as usize));
@@ -8468,6 +8748,7 @@ mod tests {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let slice = self.total_data.slice(start as usize..=(end as usize));
@@ -8970,6 +9251,7 @@ mod tests {
                 _url: &str,
                 _start: u64,
                 _end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
                 Box::pin(async { Err(DownloadError::Protocol("不应调用".into())) })
             }
@@ -8978,6 +9260,7 @@ mod tests {
                 _url: &str,
                 _start: u64,
                 _end: u64,
+                _identity: Option<ObjectIdentity>,
             ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
                 Box::pin(async {
                     Ok(Box::pin(futures::stream::pending::<DownloadResult<Bytes>>()) as ByteStream)

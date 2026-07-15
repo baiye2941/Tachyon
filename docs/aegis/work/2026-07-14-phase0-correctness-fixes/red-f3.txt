@@ -1,0 +1,30 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 22.86s
+────────────
+ Nextest run ID 5d085456-2834-4390-90f0-cbdce7584534 with nextest profile: default
+    Starting 1 test across 1 binary (273 tests skipped)
+        FAIL [   0.412s] (1/1) tachyon-engine downloader::tests::test_fragment_retry_discards_partial_stream_buffer
+  stdout ───
+
+    running 1 test
+    test downloader::tests::test_fragment_retry_discards_partial_stream_buffer ... FAILED
+
+    failures:
+
+    failures:
+        downloader::tests::test_fragment_retry_discards_partial_stream_buffer
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 273 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'downloader::tests::test_fragment_retry_discards_partial_stream_buffer' (10864) panicked at crates\tachyon-engine\src\downloader.rs:6838:16:
+    清除失败尝试的残留写缓冲后,完整重试应成功: Fragment("分片下载数据越界: index=0, 预期 64 字节, 本次将写入 69 字节")
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.416s] 1 test run: 0 passed, 1 failed, 273 skipped
+        FAIL [   0.412s] (1/1) tachyon-engine downloader::tests::test_fragment_retry_discards_partial_stream_buffer
+error: test run failed

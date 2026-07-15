@@ -34,11 +34,45 @@ use tachyon_core::types::{FileLayout, FileMetadata, FileSpan};
 
 /// 按 magnet URL 缓存的 ManagedTorrent 句柄 + 文件布局
 ///
-/// 跨 MagnetProtocol 实例共享(由 BtSession 持有 Arc),使 probe_filename
-/// 命令探测后填充的缓存对后续 build_download_task 创建的下载实例可见,
-/// 避免重复 add_torrent(librqbit 对 magnet URL 即使 AlreadyManaged 也会先
-/// resolve_magnet 联网拉 metadata,死 swarm 下永久挂起)。
-pub type HandleCache = Arc<DashMap<String, (Arc<ManagedTorrent>, FileLayout)>>;
+/// 跨 MagnetProtocol 实例共享(由 BtSession 持有 Arc)。
+///
+/// 注意 P0-8:cache 键绑定 download_dir + factory + preferred + url。
+/// UI `probe_filename`(无 storage_factory)与下载任务(有 TachyonStorageFactory)
+/// 使用不同 binding key,因此 **不能** 依赖 probe 缓存给下载短路;
+/// probe 结束后应 `stop_and_remove_torrent` 清理 session,避免无主 orphan torrent。
+/// 同 binding 的多次 probe/run 仍可共享缓存。
+/// 缓存条目:handle + layout + 绑定上下文(目录/factory/preferred)
+#[derive(Clone)]
+pub struct CachedTorrent {
+    pub handle: Arc<ManagedTorrent>,
+    pub layout: FileLayout,
+    pub download_dir: PathBuf,
+    pub has_storage_factory: bool,
+    pub preferred_root: Option<String>,
+}
+
+pub type HandleCache = Arc<DashMap<String, CachedTorrent>>;
+
+/// 同一 magnet URL 上 session add / pause-delete 的串行锁表。
+///
+/// UI `probe_filename` 的 stop_and_remove 与随后下载任务的 add_magnet 可能并发:
+/// delete 尚未完成时 add 可能拿到半关闭 handle 或 AlreadyManaged 脏状态。
+/// 两边对同一 URL 持同一把 `tokio::sync::Mutex`,保证 cleanup 与 add 互斥。
+pub type SessionOpsGate = Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// 在同一 magnet URL 的 session 操作锁下执行 future(add / pause-delete)。
+pub async fn with_magnet_session_op<T>(
+    gate: &SessionOpsGate,
+    magnet_url: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    let lock = gate
+        .entry(magnet_url.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+    fut.await
+}
 
 /// 磁力链接协议客户端
 ///
@@ -62,6 +96,8 @@ pub struct MagnetProtocol {
     /// probe/download 方法内 `self.handle_cache.clone()` 是 Arc 浅拷贝,
     /// 共享底层 map —— 修复了值字段 DashMap 深拷贝导致 insert 不生效的 bug。
     handle_cache: HandleCache,
+    /// 与 BtSession 共享的 session 操作锁表(probe cleanup ↔ download add 串行)
+    ops_gate: SessionOpsGate,
     /// 自定义 StorageFactory(P2-4:消除双存储写放大)
     ///
     /// None 时用 librqbit 默认 FilesystemStorage(向后兼容)。
@@ -69,6 +105,8 @@ pub struct MagnetProtocol {
     /// 消除 FileStream 读取路径的中间磁盘读写。
     /// 由 tachyon-engine 创建 TachyonStorageFactory 并注入。
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
+    /// 用户最终根名(与 TachyonStorageFactory preferred 对齐,用于 cache 绑定)
+    preferred_root_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl MagnetProtocol {
@@ -87,8 +125,16 @@ impl MagnetProtocol {
             config,
             download_dir,
             handle_cache,
+            ops_gate: Arc::new(DashMap::new()),
             storage_factory: None,
+            preferred_root_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// 注入与 BtSession 共享的 session 操作锁表(生产路径必填)
+    pub fn with_ops_gate(mut self, gate: SessionOpsGate) -> Self {
+        self.ops_gate = gate;
+        self
     }
 
     /// 注入自定义 StorageFactory(P2-4:消除双存储写放大)
@@ -99,6 +145,29 @@ impl MagnetProtocol {
     pub fn with_storage_factory(mut self, factory: librqbit::storage::BoxStorageFactory) -> Self {
         self.storage_factory = Some(factory);
         self
+    }
+
+    /// 注入 preferred 根名(须在 probe 前,与引擎 set_preferred_file_name 对齐)
+    pub fn with_preferred_root_name(self, name: impl Into<String>) -> Self {
+        *self
+            .preferred_root_name
+            .write()
+            .expect("preferred_root lock") = Some(name.into());
+        self
+    }
+
+    pub fn set_preferred_root_name(&self, name: Option<String>) {
+        *self
+            .preferred_root_name
+            .write()
+            .expect("preferred_root lock") = name;
+    }
+
+    pub fn preferred_root_name(&self) -> Option<String> {
+        self.preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone()
     }
 
     /// 设置自定义 StorageFactory(可变引用版本,供引擎在 run 阶段注入)
@@ -120,21 +189,199 @@ impl MagnetProtocol {
     /// 接收 `&HandleCache`(`&Arc<DashMap>`),通过 Deref 操作底层 DashMap。
     /// 超过 `MAX_CACHED_HANDLES` 时淘汰一个旧条目(非严格 LRU,DashMap 无序,
     /// 但足以防无限增长;实际并发下载数通常 ≤ 10,上限 64 足够)。
-    fn insert_with_capacity(
-        cache: &HandleCache,
-        url: String,
-        handle: Arc<ManagedTorrent>,
-        layout: FileLayout,
-    ) {
-        // 容量超限时淘汰一个旧条目(iter 顺序非确定,但任意淘汰即可防泄漏)
+    fn insert_with_capacity(cache: &HandleCache, key: String, entry: CachedTorrent) {
+        // 容量超限时淘汰一个旧条目(非严格 LRU,DashMap 无序)
         if cache.len() >= Self::MAX_CACHED_HANDLES
-            && let Some(entry) = cache.iter().next()
+            && let Some(old) = cache.iter().next()
         {
-            let key = entry.key().clone();
-            drop(entry); // 释放 iter 的读锁,避免与 remove 的写锁死锁
-            cache.remove(&key);
+            let old_key = old.key().clone();
+            drop(old);
+            cache.remove(&old_key);
         }
-        cache.insert(url, (handle, layout));
+        cache.insert(key, entry);
+    }
+
+    /// 实例自身的 binding cache key
+    pub fn binding_key_for(&self, magnet_url: &str) -> String {
+        let preferred = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        Self::cache_binding_key(
+            &self.download_dir,
+            self.storage_factory.is_some(),
+            preferred.as_deref(),
+            magnet_url,
+        )
+    }
+
+    fn lookup_compatible(&self, magnet_url: &str) -> Option<CachedTorrent> {
+        let key = self.binding_key_for(magnet_url);
+        if let Some(e) = self.handle_cache.get(&key) {
+            return Some(e.clone());
+        }
+        // 兼容旧键(纯 magnet URL):仅当绑定上下文匹配时命中
+        if let Some(e) = self.handle_cache.get(magnet_url) {
+            let ok_dir = e.download_dir == self.download_dir;
+            let ok_factory = e.has_storage_factory == self.storage_factory.is_some();
+            let ok_pref = e.preferred_root
+                == *self
+                    .preferred_root_name
+                    .read()
+                    .expect("preferred_root lock");
+            if ok_dir && ok_factory && ok_pref {
+                return Some(e.clone());
+            }
+            tracing::warn!(
+                %magnet_url,
+                "handle_cache 旧键命中但绑定上下文不匹配,忽略(防写错路径)"
+            );
+        }
+        None
+    }
+
+    /// 从共享缓存移除句柄(取消/完成/失败后调用)。
+    ///
+    /// 同时清理 binding key 与兼容旧 URL 键。
+    pub fn remove_cached_handle(cache: &HandleCache, key_or_url: &str) {
+        cache.remove(key_or_url);
+    }
+
+    /// 仅从 handle_cache 摘除本实例 binding(bind_key + 兼容 raw url 键)。
+    ///
+    /// 返回被摘除的条目(若有)。不操作 session。
+    /// 若其他 binding 仍引用同一 torrent_id,调用方不应 pause/delete。
+    pub fn detach_cached_binding(&self, magnet_url: &str) -> Option<CachedTorrent> {
+        let preferred = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        let has_factory = self.storage_factory.is_some();
+        let bind_key = Self::cache_binding_key(
+            &self.download_dir,
+            has_factory,
+            preferred.as_deref(),
+            magnet_url,
+        );
+
+        let mut removed: Option<CachedTorrent> = None;
+        if let Some((_, e)) = self.handle_cache.remove(&bind_key) {
+            removed = Some(e);
+        }
+        // 注意:不得在 get() 持有 Ref 时再 remove 同一 map(DashMap 会死锁)。
+        // 先判断兼容性并 clone,drop guard 后再 remove。
+        let raw_compatible = self.handle_cache.get(magnet_url).and_then(|e| {
+            let ok_dir = e.download_dir == self.download_dir;
+            let ok_factory = e.has_storage_factory == has_factory;
+            let ok_pref = e.preferred_root == preferred;
+            if ok_dir && ok_factory && ok_pref {
+                Some(())
+            } else {
+                None
+            }
+        });
+        if raw_compatible.is_some()
+            && let Some((_, e2)) = self.handle_cache.remove(magnet_url)
+            && removed.is_none()
+        {
+            removed = Some(e2);
+        }
+        removed
+    }
+
+    /// cache 中是否仍有其他 binding 引用该 torrent_id
+    pub fn cache_has_torrent_id(&self, torrent_id: usize) -> bool {
+        self.handle_cache
+            .iter()
+            .any(|kv| kv.value().handle.id() == torrent_id)
+    }
+
+    /// 暂停并删除 session 中的 torrent,并清理 cache(不删除用户文件)。
+    ///
+    /// 若其他 binding key 仍引用同一 torrent(例如 UI probe 与下载任务
+    /// 共享 session 但 cache 键因 factory/preferred 不同),则只清本实例
+    /// 的 cache 条目,**不** pause/delete,避免误杀进行中的下载。
+    ///
+    /// session.pause/delete 在后台执行并带超时:librqbit 清理可能阻塞 runtime,
+    /// UI probe / cancel 路径只保证 cache 立即摘除,不因 session 侧挂起而卡住。
+    pub async fn stop_and_remove_torrent(&self, magnet_url: &str) {
+        let Some(entry) = self.detach_cached_binding(magnet_url) else {
+            return;
+        };
+
+        let torrent_id = entry.handle.id();
+        if self.cache_has_torrent_id(torrent_id) {
+            tracing::debug!(
+                %magnet_url,
+                torrent_id,
+                "cache 中仍有其他 binding 引用同一 torrent,跳过 session delete"
+            );
+            return;
+        }
+
+        let session = Arc::clone(&self.session);
+        let handle = entry.handle;
+        let magnet_url = magnet_url.to_string();
+        let ops_gate = Arc::clone(&self.ops_gate);
+        // 后台清理:不阻塞调用方。pause/delete 各 5s 超时,失败仅 warn。
+        // 持 URL 级 ops 锁:与 add_magnet_to_session 互斥,消除 probe→download 竞态。
+        tokio::spawn(async move {
+            const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+            with_magnet_session_op(&ops_gate, &magnet_url, async {
+            match tokio::time::timeout(CLEANUP_TIMEOUT, session.pause(&handle)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, %magnet_url, "pause torrent 失败(可能已停止)");
+                }
+                Err(_) => {
+                    tracing::warn!(%magnet_url, "pause torrent 超时,继续尝试 delete");
+                }
+            }
+            let id = librqbit::api::TorrentIdOrHash::Id(torrent_id);
+            match tokio::time::timeout(CLEANUP_TIMEOUT, session.delete(id, false)).await {
+                Ok(Ok(())) => {
+                    tracing::info!(%magnet_url, "已从 BT session 删除 torrent(保留文件)");
+                }
+                Ok(Err(e)) => {
+                    let hash = librqbit::api::TorrentIdOrHash::Hash(handle.info_hash());
+                    match tokio::time::timeout(CLEANUP_TIMEOUT, session.delete(hash, false)).await {
+                        Ok(Ok(())) => {
+                            tracing::info!(%magnet_url, "已从 BT session 按 hash 删除 torrent(保留文件)");
+                        }
+                        Ok(Err(e2)) => {
+                            tracing::warn!(error = %e, error2 = %e2, %magnet_url, "删除 torrent 失败");
+                        }
+                        Err(_) => {
+                            tracing::warn!(%magnet_url, error = %e, "delete torrent(hash) 超时");
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(%magnet_url, "delete torrent 超时(cache 已清,session 侧可能残留直至重启)");
+                }
+            }
+            }).await;
+        });
+    }
+
+    /// 绑定 cache 键:目录 + 是否自定义 factory + 最终根名 + magnet URL。
+    ///
+    /// 不同 download_dir / factory / preferred 名不得复用同一 handle。
+    pub fn cache_binding_key(
+        download_dir: &std::path::Path,
+        has_storage_factory: bool,
+        preferred_root: Option<&str>,
+        magnet_url: &str,
+    ) -> String {
+        format!(
+            "dir={}|factory={}|preferred={}|url={}",
+            download_dir.display(),
+            has_storage_factory as u8,
+            preferred_root.unwrap_or(""),
+            magnet_url
+        )
     }
 
     /// 采集 BT 层 peer/piece 统计快照
@@ -145,8 +392,8 @@ impl MagnetProtocol {
     /// 由 tachyon-app 层持有 `MagnetProtocol` 具体类型时调用(不经 `dyn Protocol`,
     /// 因 `peer_stats_snapshot` 是协议特有的诊断方法,不在 `Protocol` trait 上)。
     pub fn peer_stats_snapshot(&self, url: &str) -> Option<BtPeerStats> {
-        let entry = self.handle_cache.get(url)?;
-        let live = entry.0.live()?;
+        let entry = self.lookup_compatible(url)?;
+        let live = entry.handle.live()?;
         let snap = live.stats_snapshot();
         Some(BtPeerStats {
             live_peers: snap.peer_stats.live,
@@ -198,8 +445,18 @@ impl MagnetProtocol {
     ) -> Self {
         // 测试接缝:创建独立 cache(不与生产 BtSession 共享),保持测试隔离
         let handle_cache: HandleCache = Arc::new(DashMap::new());
-        let proto = Self::new(session, config, download_dir, handle_cache);
-        Self::insert_with_capacity(&proto.handle_cache, url.to_string(), handle, layout);
+        let proto = Self::new(session, config, download_dir.clone(), handle_cache);
+        let entry = CachedTorrent {
+            handle,
+            layout,
+            download_dir,
+            has_storage_factory: false,
+            preferred_root: None,
+        };
+        // 测试接缝:同时写 binding key 与 raw url,兼容旧测试 get(&url)
+        let key = proto.binding_key_for(url);
+        Self::insert_with_capacity(&proto.handle_cache, key, entry.clone());
+        Self::insert_with_capacity(&proto.handle_cache, url.to_string(), entry);
         proto
     }
 }
@@ -543,6 +800,7 @@ fn resolve_first_file_path(
 /// 死 swarm 下 `resolve_magnet` 会永久挂起,此超时兜底触发 `Err(Timeout)`,
 /// 使引擎能重试/失败而非永久卡死。复用 `metadata_timeout_secs`(语义一致:
 /// 元数据获取超时覆盖 add_torrent + wait_until_initialized 全流程)。
+#[allow(clippy::too_many_arguments)] // session 操作参数 + ops_gate 串行锁,内聚于单路径
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
@@ -551,37 +809,42 @@ async fn add_magnet_to_session(
     initial_peers: Vec<SocketAddr>,
     timeout: Duration,
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
+    ops_gate: &SessionOpsGate,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
-    let opts = AddTorrentOptions {
-        overwrite: true,
-        output_folder: Some(download_dir.to_string_lossy().into()),
-        force_tracker_interval,
-        initial_peers: if initial_peers.is_empty() {
-            None
-        } else {
-            Some(initial_peers)
-        },
-        storage_factory,
-        ..Default::default()
-    };
-    // tokio::time::timeout 包裹 add_torrent:librqbit 对 magnet URL 即使
-    // AlreadyManaged 也会先 resolve_magnet 联网拉 metadata(session.rs:1072 在
-    // 1140 之前),死 swarm 下永久挂起。超时兜底让引擎能重试/失败。
-    let added = tokio::time::timeout(
-        timeout,
-        session.add_torrent(AddTorrent::from_url(url), Some(opts)),
-    )
+    // 与 stop_and_remove 串行:等 UI probe 后台 delete 完成后再 add
+    with_magnet_session_op(ops_gate, url, async {
+        let opts = AddTorrentOptions {
+            overwrite: true,
+            output_folder: Some(download_dir.to_string_lossy().into()),
+            force_tracker_interval,
+            initial_peers: if initial_peers.is_empty() {
+                None
+            } else {
+                Some(initial_peers)
+            },
+            storage_factory,
+            ..Default::default()
+        };
+        // tokio::time::timeout 包裹 add_torrent:librqbit 对 magnet URL 即使
+        // AlreadyManaged 也会先 resolve_magnet 联网拉 metadata(session.rs:1072 在
+        // 1140 之前),死 swarm 下永久挂起。超时兜底让引擎能重试/失败。
+        let added = tokio::time::timeout(
+            timeout,
+            session.add_torrent(AddTorrent::from_url(url), Some(opts)),
+        )
+        .await
+        .map_err(|_| {
+            DownloadError::Timeout(format!(
+                "磁力链接添加超时（{}秒），可能无可用 peer 提供元数据",
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| DownloadError::Network(format!("添加磁力链接失败: {e}")))?;
+        added
+            .into_handle()
+            .ok_or_else(|| DownloadError::Protocol("磁力链接已存在或添加失败".into()))
+    })
     .await
-    .map_err(|_| {
-        DownloadError::Timeout(format!(
-            "磁力链接添加超时（{}秒），可能无可用 peer 提供元数据",
-            timeout.as_secs()
-        ))
-    })?
-    .map_err(|e| DownloadError::Network(format!("添加磁力链接失败: {e}")))?;
-    added
-        .into_handle()
-        .ok_or_else(|| DownloadError::Protocol("磁力链接已存在或添加失败".into()))
 }
 
 /// 进度采样器:抽取 BT 层"已下载并校验字节数"作为看门狗输入(修复 B2-Critical)
@@ -740,6 +1003,17 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
+        let preferred_root = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        let ops_gate = Arc::clone(&self.ops_gate);
+        let this_for_lookup = (
+            download_dir.clone(),
+            storage_factory.is_some(),
+            preferred_root.clone(),
+        );
         Box::pin(async move {
             // 缓存命中短路:若 handle_cache 已有该 url 的 handle + layout(此前 probe /
             // from_handle / download_range_stream 已填充),直接从缓存 handle 派生
@@ -754,27 +1028,46 @@ impl Protocol for MagnetProtocol {
             // 是同一 handle(librqbit 对已存在 torrent 返回 AlreadyManaged),结果等价;
             // layout 同样取自缓存(由先前 probe 从 file_infos 构造),一致。生产首次 probe
             // 缓存为空,走原路径不受影响。
-            if let Some(entry) = handle_cache.get(&url) {
-                let (handle, layout) = (Arc::clone(&entry.0), entry.1.clone());
-                let (file_name, file_size) = handle
-                    .with_metadata(|m| {
-                        let name = m
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| "unknown_torrent".to_string());
-                        (name, m.lengths.total_length())
+            {
+                let bind_key = MagnetProtocol::cache_binding_key(
+                    &this_for_lookup.0,
+                    this_for_lookup.1,
+                    this_for_lookup.2.as_deref(),
+                    &url,
+                );
+                let hit = handle_cache.get(&bind_key).or_else(|| {
+                    handle_cache.get(&url).and_then(|e| {
+                        let ok = e.download_dir == this_for_lookup.0
+                            && e.has_storage_factory == this_for_lookup.1
+                            && e.preferred_root == this_for_lookup.2;
+                        if ok { Some(e) } else { None }
                     })
-                    .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
-                return Ok(FileMetadata {
-                    file_name,
-                    file_size: Some(file_size),
-                    content_type: None,
-                    supports_range: true,
-                    etag: None,
-                    last_modified: None,
-                    file_layout: Some(layout),
-                    protocol_managed_storage: storage_factory.is_some(),
                 });
+                if let Some(entry) = hit {
+                    let handle = Arc::clone(&entry.handle);
+                    let layout = entry.layout.clone();
+                    let (file_name, file_size) = handle
+                        .with_metadata(|m| {
+                            let name = m
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "unknown_torrent".to_string());
+                            (name, m.lengths.total_length())
+                        })
+                        .map_err(|e| {
+                            DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}"))
+                        })?;
+                    return Ok(FileMetadata {
+                        file_name,
+                        file_size: Some(file_size),
+                        content_type: None,
+                        supports_range: true,
+                        etag: None,
+                        last_modified: None,
+                        file_layout: Some(layout),
+                        protocol_managed_storage: storage_factory.is_some(),
+                    });
+                }
             }
 
             // force_tracker_interval: 0 禁用(None),否则按配置秒数强制 tracker 回连间隔
@@ -804,6 +1097,7 @@ impl Protocol for MagnetProtocol {
                 initial_peers,
                 metadata_timeout,
                 storage_factory.as_ref().map(|f| f.clone_box()),
+                &ops_gate,
             )
             .await?;
 
@@ -834,12 +1128,24 @@ impl Protocol for MagnetProtocol {
                 .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
 
             // 缓存 handle + layout,供后续 download_range_stream 每分片命中
-            Self::insert_with_capacity(
-                &handle_cache,
-                url.clone(),
-                Arc::clone(&handle),
-                layout.clone(),
+            let entry = CachedTorrent {
+                handle: Arc::clone(&handle),
+                layout: layout.clone(),
+                download_dir: download_dir.clone(),
+                has_storage_factory: storage_factory.is_some(),
+                preferred_root: preferred_root.clone(),
+            };
+            let bind_key = MagnetProtocol::cache_binding_key(
+                &download_dir,
+                storage_factory.is_some(),
+                preferred_root.as_deref(),
+                &url,
             );
+            Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
+            // 兼容旧键:仅当 preferred 为空时写入 raw url(避免跨 preferred 误命中)
+            if preferred_root.is_none() {
+                Self::insert_with_capacity(&handle_cache, url.clone(), entry);
+            }
 
             Ok(FileMetadata {
                 file_name,
@@ -861,6 +1167,7 @@ impl Protocol for MagnetProtocol {
         _url: &str,
         _start: u64,
         _end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
         Box::pin(async {
             Err(DownloadError::Protocol(
@@ -874,6 +1181,7 @@ impl Protocol for MagnetProtocol {
         url: &str,
         start: u64,
         end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
         if let Err(e) = validate_magnet_uri(url) {
             return Box::pin(async move { Err(e) });
@@ -893,6 +1201,12 @@ impl Protocol for MagnetProtocol {
         let handle_cache = self.handle_cache.clone();
         let url = url.to_string();
         let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
+        let preferred_root = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        let ops_gate = Arc::clone(&self.ops_gate);
         // peer 智能等待:0 禁用(回退纯 stall_timeout),否则按配置秒数。
         // 死 swarm 下无 peer 时持续轮询 peer 健康,超此限则失败。
         let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
@@ -911,8 +1225,17 @@ impl Protocol for MagnetProtocol {
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
             // 否则回退 add_magnet_to_session（无 layout,构造单文件默认）
-            let (handle, layout) = if let Some(entry) = handle_cache.get(&url) {
-                (Arc::clone(&entry.0), entry.1.clone())
+            let bind_key = MagnetProtocol::cache_binding_key(
+                &download_dir,
+                storage_factory.is_some(),
+                preferred_root.as_deref(),
+                &url,
+            );
+            let (handle, layout) = if let Some(entry) = handle_cache
+                .get(&bind_key)
+                .or_else(|| handle_cache.get(&url))
+            {
+                (Arc::clone(&entry.handle), entry.layout.clone())
             } else {
                 let h = add_magnet_to_session(
                     &session,
@@ -922,18 +1245,32 @@ impl Protocol for MagnetProtocol {
                     Vec::new(),
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
+                    &ops_gate,
                 )
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
                     .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
-                Self::insert_with_capacity(
-                    &handle_cache,
-                    url.clone(),
-                    Arc::clone(&h),
-                    layout.clone(),
-                );
+                {
+                    let entry = CachedTorrent {
+                        handle: Arc::clone(&h),
+                        layout: layout.clone(),
+                        download_dir: download_dir.clone(),
+                        has_storage_factory: storage_factory.is_some(),
+                        preferred_root: preferred_root.clone(),
+                    };
+                    let bind_key = MagnetProtocol::cache_binding_key(
+                        &download_dir,
+                        storage_factory.is_some(),
+                        preferred_root.as_deref(),
+                        &url,
+                    );
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
+                    if preferred_root.is_none() {
+                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
+                    }
+                }
                 (h, layout)
             };
 
@@ -1005,6 +1342,12 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
+        let preferred_root = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
         // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
@@ -1017,8 +1360,17 @@ impl Protocol for MagnetProtocol {
 
         Box::pin(async move {
             // 命中缓存(probe 已填充 handle + layout);未命中则现场添加(回退,无 layout)
-            let handle = if let Some(entry) = handle_cache.get(&url) {
-                Arc::clone(&entry.0)
+            let bind_key = MagnetProtocol::cache_binding_key(
+                &download_dir,
+                storage_factory.is_some(),
+                preferred_root.as_deref(),
+                &url,
+            );
+            let handle = if let Some(entry) = handle_cache
+                .get(&bind_key)
+                .or_else(|| handle_cache.get(&url))
+            {
+                Arc::clone(&entry.handle)
             } else {
                 let h = add_magnet_to_session(
                     &session,
@@ -1028,13 +1380,32 @@ impl Protocol for MagnetProtocol {
                     Vec::new(),
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
+                    &ops_gate,
                 )
                 .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
-                Self::insert_with_capacity(&handle_cache, url.clone(), Arc::clone(&h), layout);
+                {
+                    let entry = CachedTorrent {
+                        handle: Arc::clone(&h),
+                        layout: layout.clone(),
+                        download_dir: download_dir.clone(),
+                        has_storage_factory: storage_factory.is_some(),
+                        preferred_root: preferred_root.clone(),
+                    };
+                    let bind_key = MagnetProtocol::cache_binding_key(
+                        &download_dir,
+                        storage_factory.is_some(),
+                        preferred_root.as_deref(),
+                        &url,
+                    );
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
+                    if preferred_root.is_none() {
+                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
+                    }
+                }
                 h
             };
 
@@ -1073,14 +1444,29 @@ impl Protocol for MagnetProtocol {
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let storage_factory = self.storage_factory.as_ref().map(|f| f.clone_box());
+        let preferred_root = self
+            .preferred_root_name
+            .read()
+            .expect("preferred_root lock")
+            .clone();
+        let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
         let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
         Box::pin(async move {
             // 命中缓存;未命中则现场添加
-            let handle = if let Some(entry) = handle_cache.get(&url) {
-                Arc::clone(&entry.0)
+            let bind_key = MagnetProtocol::cache_binding_key(
+                &download_dir,
+                storage_factory.is_some(),
+                preferred_root.as_deref(),
+                &url,
+            );
+            let handle = if let Some(entry) = handle_cache
+                .get(&bind_key)
+                .or_else(|| handle_cache.get(&url))
+            {
+                Arc::clone(&entry.handle)
             } else {
                 let h = add_magnet_to_session(
                     &session,
@@ -1090,6 +1476,7 @@ impl Protocol for MagnetProtocol {
                     Vec::new(),
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
+                    &ops_gate,
                 )
                 .await?;
                 let layout = h
@@ -1108,7 +1495,25 @@ impl Protocol for MagnetProtocol {
                         FileLayout::from_spans(spans)
                     })
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
-                Self::insert_with_capacity(&handle_cache, url.clone(), Arc::clone(&h), layout);
+                {
+                    let entry = CachedTorrent {
+                        handle: Arc::clone(&h),
+                        layout: layout.clone(),
+                        download_dir: download_dir.clone(),
+                        has_storage_factory: storage_factory.is_some(),
+                        preferred_root: preferred_root.clone(),
+                    };
+                    let bind_key = MagnetProtocol::cache_binding_key(
+                        &download_dir,
+                        storage_factory.is_some(),
+                        preferred_root.as_deref(),
+                        &url,
+                    );
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
+                    if preferred_root.is_none() {
+                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
+                    }
+                }
                 h
             };
 
@@ -1495,7 +1900,7 @@ mod tests {
         // 读取全文件 [0, len-1]
         let end = (content.len() - 1) as u64;
         let stream = protocol
-            .download_range_stream(&url, 0, end)
+            .download_range_stream(&url, 0, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1516,7 +1921,7 @@ mod tests {
         let start: u64 = 1500;
         let end: u64 = 3500;
         let stream = protocol
-            .download_range_stream(&url, start, end)
+            .download_range_stream(&url, start, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1542,7 +1947,7 @@ mod tests {
 
         let pos: u64 = 2048;
         let stream = protocol
-            .download_range_stream(&url, pos, pos)
+            .download_range_stream(&url, pos, pos, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1622,7 +2027,7 @@ mod tests {
 
         let end = (global.len() - 1) as u64;
         let stream = protocol
-            .download_range_stream(&url, 0, end)
+            .download_range_stream(&url, 0, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1647,7 +2052,7 @@ mod tests {
         let start: u64 = 3000;
         let end: u64 = 5000;
         let stream = protocol
-            .download_range_stream(&url, start, end)
+            .download_range_stream(&url, start, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1676,7 +2081,7 @@ mod tests {
         let start: u64 = 1000;
         let end: u64 = 5000;
         let stream = protocol
-            .download_range_stream(&url, start, end)
+            .download_range_stream(&url, start, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1704,7 +2109,7 @@ mod tests {
         let start: u64 = 5000;
         let end: u64 = 6000;
         let stream = protocol
-            .download_range_stream(&url, start, end)
+            .download_range_stream(&url, start, end, None)
             .await
             .expect("download_range_stream 失败");
 
@@ -1746,7 +2151,7 @@ mod tests {
         let total = global.len() as u64;
         let start = std::time::Instant::now();
         let stream = protocol
-            .download_range_stream(&url, 0, total - 1)
+            .download_range_stream(&url, 0, total - 1, None)
             .await
             .expect("download_range_stream 失败");
         let collected = collect_stream(stream).await;
@@ -1795,7 +2200,7 @@ mod tests {
         // 预热
         for _ in 0..3 {
             let s = protocol
-                .download_range_stream(&url, 0, single_len - 1)
+                .download_range_stream(&url, 0, single_len - 1, None)
                 .await
                 .unwrap();
             let _ = collect_stream(s).await;
@@ -1803,7 +2208,7 @@ mod tests {
         let single_start = std::time::Instant::now();
         for _ in 0..iterations {
             let s = protocol
-                .download_range_stream(&url, 0, single_len - 1)
+                .download_range_stream(&url, 0, single_len - 1, None)
                 .await
                 .unwrap();
             let collected = collect_stream(s).await;
@@ -1816,7 +2221,7 @@ mod tests {
         // 预热
         for _ in 0..3 {
             let s = protocol
-                .download_range_stream(&url, 0, multi_len - 1)
+                .download_range_stream(&url, 0, multi_len - 1, None)
                 .await
                 .unwrap();
             let _ = collect_stream(s).await;
@@ -1824,7 +2229,7 @@ mod tests {
         let multi_start = std::time::Instant::now();
         for _ in 0..iterations {
             let s = protocol
-                .download_range_stream(&url, 0, multi_len - 1)
+                .download_range_stream(&url, 0, multi_len - 1, None)
                 .await
                 .unwrap();
             let collected = collect_stream(s).await;
@@ -2632,5 +3037,179 @@ mod tests {
             proto_b.handle_cache.get(&url).is_none(),
             "独立 cache 的 proto_b 不应命中 proto_a 的条目"
         );
+    }
+
+    #[test]
+    fn test_cache_binding_key_distinguishes_dir_factory_preferred() {
+        let a = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl/a"),
+            true,
+            Some("renamed.bin"),
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let b = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl/b"),
+            true,
+            Some("renamed.bin"),
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let c = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl/a"),
+            false,
+            Some("renamed.bin"),
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let d = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl/a"),
+            true,
+            None,
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert_ne!(a, b, "不同 download_dir 不得共享 cache 键");
+        assert_ne!(a, c, "有/无 factory 不得共享 cache 键");
+        assert_ne!(a, d, "preferred 名不同不得共享 cache 键");
+    }
+
+    #[test]
+    fn test_remove_cached_handle_drops_entry() {
+        let cache: HandleCache = Arc::new(DashMap::new());
+        // 仅验证 remove API;不构造真实 ManagedTorrent
+        assert!(cache.is_empty());
+        MagnetProtocol::remove_cached_handle(&cache, "magnet:?xt=urn:btih:dead");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_compatible_rejects_mismatched_preferred() {
+        let cache: HandleCache = Arc::new(DashMap::new());
+        // 不构造真实 ManagedTorrent:只测 binding key 分离语义
+        let key_a = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl"),
+            true,
+            Some("a.bin"),
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let key_b = MagnetProtocol::cache_binding_key(
+            std::path::Path::new("/dl"),
+            true,
+            Some("b.bin"),
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert_ne!(key_a, key_b);
+        // 模拟两个 preferred 写入不同键
+        assert!(cache.get(&key_a).is_none());
+        assert!(cache.get(&key_b).is_none());
+        MagnetProtocol::remove_cached_handle(&cache, &key_a);
+        assert!(cache.get(&key_a).is_none());
+    }
+
+    /// P0-8: 多 binding 共存时 detach 只清本键,其他 binding 仍引用同一 torrent
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_detach_binding_preserves_other_binding_on_same_torrent() {
+        let (proto_ui, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        let download_proto = MagnetProtocol::new(
+            proto_ui.session.clone(),
+            proto_ui.config.clone(),
+            proto_ui.download_dir.clone(),
+            Arc::clone(&proto_ui.handle_cache),
+        );
+        download_proto.set_preferred_root_name(Some("user-renamed.bin".into()));
+
+        let ui_entry = proto_ui
+            .handle_cache
+            .get(&url)
+            .expect("from_handle 应写入 raw url 键")
+            .clone();
+        let torrent_id = ui_entry.handle.id();
+        let download_key = download_proto.binding_key_for(&url);
+        let mut download_entry = ui_entry.clone();
+        download_entry.preferred_root = Some("user-renamed.bin".into());
+        MagnetProtocol::insert_with_capacity(
+            &download_proto.handle_cache,
+            download_key.clone(),
+            download_entry,
+        );
+
+        // 仅 detach UI(不触发 session pause/delete,避免 librqbit 清理挂起)
+        let removed = proto_ui.detach_cached_binding(&url);
+        assert!(removed.is_some(), "UI binding 应被摘除");
+        assert!(
+            proto_ui.lookup_compatible(&url).is_none(),
+            "UI binding 兼容查找应 miss"
+        );
+        assert!(
+            download_proto.handle_cache.get(&download_key).is_some(),
+            "下载 binding 必须保留"
+        );
+        assert!(
+            download_proto.cache_has_torrent_id(torrent_id),
+            "下载 binding 仍引用 torrent → stop 应跳过 session delete"
+        );
+
+        let removed_dl = download_proto.detach_cached_binding(&url);
+        assert!(removed_dl.is_some());
+        assert!(
+            !download_proto.cache_has_torrent_id(torrent_id),
+            "sole owner detach 后 cache 中不应再有该 torrent"
+        );
+    }
+
+    /// P0-8: sole owner detach 清空 cache 键
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_detach_sole_owner_clears_cache() {
+        let (proto, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+        assert!(proto.lookup_compatible(&url).is_some());
+        let entry = proto.detach_cached_binding(&url).expect("应摘除");
+        assert!(!proto.cache_has_torrent_id(entry.handle.id()));
+        assert!(proto.lookup_compatible(&url).is_none());
+        assert!(proto.handle_cache.get(&url).is_none());
+    }
+
+    /// P0-8: 同一 magnet URL 上 session 操作串行(cleanup ↔ add 互斥)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_with_magnet_session_op_serializes() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration as TokioDuration, sleep};
+
+        let gate: SessionOpsGate = StdArc::new(DashMap::new());
+        let order = StdArc::new(AtomicUsize::new(0));
+        let url = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let order1 = StdArc::clone(&order);
+        let gate1 = StdArc::clone(&gate);
+        let t1 = tokio::spawn(async move {
+            with_magnet_session_op(&gate1, url, async {
+                // 持锁期间让 second 等待
+                sleep(TokioDuration::from_millis(80)).await;
+                assert_eq!(order1.fetch_add(1, Ordering::SeqCst), 0, "cleanup 应先执行");
+            })
+            .await;
+        });
+
+        // 确保 t1 先拿到锁
+        sleep(TokioDuration::from_millis(20)).await;
+
+        let order2 = StdArc::clone(&order);
+        let gate2 = StdArc::clone(&gate);
+        let t2 = tokio::spawn(async move {
+            with_magnet_session_op(&gate2, url, async {
+                assert_eq!(
+                    order2.fetch_add(1, Ordering::SeqCst),
+                    1,
+                    "add 必须等 cleanup 后"
+                );
+            })
+            .await;
+        });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+        assert_eq!(order.load(Ordering::SeqCst), 2);
     }
 }

@@ -350,6 +350,16 @@ impl HlsProtocol {
     /// 获取并解析 playlist,若是 master 则跟随到最高码率 variant
     ///
     /// 返回 `(media_playlist, base_url)`
+    fn reject_if_not_vod(playlist: &Playlist) -> DownloadResult<()> {
+        match playlist {
+            Playlist::Media { is_vod, .. } if *is_vod => Ok(()),
+            Playlist::Media { .. } => Err(DownloadError::Protocol(
+                "HLS live/EVENT(无 EXT-X-ENDLIST)暂不支持;仅支持 VOD".into(),
+            )),
+            Playlist::Master { .. } => Err(DownloadError::Protocol("期望 media playlist".into())),
+        }
+    }
+
     async fn fetch_media_playlist(
         self: &Arc<Self>,
         url: &str,
@@ -387,7 +397,12 @@ impl Protocol for HlsProtocol {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
             match playlist {
-                Playlist::Media { .. } => {
+                Playlist::Media { is_vod, .. } => {
+                    if !is_vod {
+                        return Err(DownloadError::Protocol(
+                            "HLS live/EVENT(无 EXT-X-ENDLIST)暂不支持;仅支持 VOD".into(),
+                        ));
+                    }
                     // FIX-18.9:HLS 无法预知精确字节数。旧实现用 "总时长 * 假设 5Mbps" 估算
                     // 并写入 file_size:Some(estimate),但引擎 execute_full_download 把
                     // Some(file_size) 当作精确 EOF 后置条件(pos != expected_size -> Err),
@@ -417,6 +432,7 @@ impl Protocol for HlsProtocol {
         _url: &str,
         _start: u64,
         _end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
         Box::pin(async {
             Err(DownloadError::Protocol(
@@ -430,6 +446,7 @@ impl Protocol for HlsProtocol {
         _url: &str,
         _start: u64,
         _end: u64,
+        _identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
         Box::pin(async {
             Err(DownloadError::Protocol(
@@ -447,6 +464,7 @@ impl Protocol for HlsProtocol {
         Box::pin(async move {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
+            HlsProtocol::reject_if_not_vod(&playlist)?;
             match playlist {
                 Playlist::Media {
                     segments,
@@ -497,6 +515,7 @@ impl Protocol for HlsProtocol {
         Box::pin(async move {
             let hls = Arc::new(HlsProtocol::new(this));
             let (playlist, _) = hls.fetch_media_playlist(&url).await?;
+            HlsProtocol::reject_if_not_vod(&playlist)?;
             match playlist {
                 Playlist::Media {
                     segments,
@@ -915,7 +934,7 @@ plain.ts
         let (_server, url) = setup_hls_mock().await;
         let http = HttpClient::with_timeouts(5, 10, None).unwrap();
         let hls = HlsProtocol::new(Arc::new(http));
-        let result = hls.download_range(&url, 0, 100).await;
+        let result = hls.download_range(&url, 0, 100, None).await;
         assert!(result.is_err(), "HLS download_range 应返回错误");
     }
 

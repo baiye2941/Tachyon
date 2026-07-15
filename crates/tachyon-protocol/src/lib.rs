@@ -59,6 +59,7 @@ async fn download_range_stream() {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<tachyon_core::ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
         {
             let data = self.data.clone();
@@ -69,6 +70,7 @@ async fn download_range_stream() {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<tachyon_core::ObjectIdentity>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
         {
             let data = self.data.clone();
@@ -90,7 +92,12 @@ async fn download_range_stream() {
     let mock = LocalMock { data: data.clone() };
 
     let stream = mock
-        .download_range_stream("http://example.com/stream.bin", 0, data.len() as u64 - 1)
+        .download_range_stream(
+            "http://example.com/stream.bin",
+            0,
+            data.len() as u64 - 1,
+            None,
+        )
         .await;
     assert!(stream.is_ok(), "download_range_stream 应成功");
 

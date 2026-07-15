@@ -1,0 +1,31 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.94s
+────────────
+ Nextest run ID 0be0d969-1860-45a1-aab1-971b8bff7b06 with nextest profile: default
+    Starting 1 test across 1 binary (275 tests skipped)
+        FAIL [   0.466s] (1/1) tachyon-engine downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes
+  stdout ───
+
+    running 1 test
+    test downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes ... FAILED
+
+    failures:
+
+    failures:
+        downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes' (39024) panicked at crates\tachyon-engine\src\downloader.rs:4128:9:
+    assertion `left == right` failed: 未知大小下载成功后不得静默丢失每个 chunk 的短写尾部
+      left: [81, 0, 109, 55, 114, 117, 16, 116, 97, 101, 110, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+     right: [81, 0, 109, 63, 55, 114, 117, 115, 116, 33, 255, 16, 116, 97, 105, 108, 90, 101, 110, 100, 45, 52, 50, 33, 120]
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.470s] 1 test run: 0 passed, 1 failed, 275 skipped
+        FAIL [   0.466s] (1/1) tachyon-engine downloader::tests::test_run_unknown_size_full_stream_handles_storage_short_writes
+error: test run failed

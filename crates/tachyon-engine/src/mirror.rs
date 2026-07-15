@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use tachyon_core::traits::Protocol;
-use tachyon_core::types::FileMetadata;
+use tachyon_core::types::{FileMetadata, ObjectIdentity};
 use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 
 use crate::connection::ConnectionPool;
@@ -263,6 +263,10 @@ pub(crate) struct MirrorProtocol {
     sources: Vec<Source>,
     /// probe 成功的源 index 集合(download 只从中选;空集则用全部源)
     probe_ok: Arc<Mutex<HashSet<usize>>>,
+    /// 首成功 probe 建立的对象身份;后续源须与之兼容才可混拼
+    baseline_identity: Arc<Mutex<Option<ObjectIdentity>>>,
+    /// 已确认与基线不兼容的源 index(永不混拼)
+    identity_rejected: Arc<Mutex<HashSet<usize>>>,
     /// 每源在途分片数(与 sources 等长,least-in-flight 选源依据)
     in_flight: Arc<std::sync::Mutex<Vec<usize>>>,
     /// 每源质量统计(与 sources 等长,选源加权 + stability 回填)
@@ -307,6 +311,8 @@ impl MirrorProtocol {
         Self {
             sources,
             probe_ok: Arc::new(Mutex::new(HashSet::new())),
+            baseline_identity: Arc::new(Mutex::new(None)),
+            identity_rejected: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(std::sync::Mutex::new(vec![0; n])),
             stats: Arc::new(std::sync::Mutex::new(vec![SourceStats::default(); n])),
             pool,
@@ -321,6 +327,8 @@ impl MirrorProtocol {
     /// 反映真实带宽采样,非失败惩罚)。
     pub(crate) async fn clear_selected(&self) {
         *self.probe_ok.lock().await = HashSet::new();
+        *self.baseline_identity.lock().await = None;
+        *self.identity_rejected.lock().await = HashSet::new();
         // 重置 in_flight:重试前所有源在途数归零(避免跨调用累积)
         if let Ok(mut inflight) = self.in_flight.lock() {
             for v in inflight.iter_mut() {
@@ -359,6 +367,7 @@ impl MirrorProtocol {
     async fn download_via_least_in_flight<T: Send + 'static>(
         sources: Vec<Source>,
         probe_ok: Arc<Mutex<HashSet<usize>>>,
+        identity_rejected: Arc<Mutex<HashSet<usize>>>,
         in_flight: Arc<std::sync::Mutex<Vec<usize>>>,
         stats: Arc<std::sync::Mutex<Vec<SourceStats>>>,
         pool: Option<Arc<ConnectionPool>>,
@@ -372,16 +381,17 @@ impl MirrorProtocol {
         + 'static,
         error_label: &str,
     ) -> DownloadResult<(T, usize, Option<crate::connection::ConnectionPermit>)> {
-        // 候选源 index 列表:probe_ok 优先,全部源兜底
-        // 修复 BUG-D:排序保证确定性 tie-break(HashSet 迭代顺序随机导致 flaky)
-        // 修复 BUG-H 副作用:probe 首成功即返回时,后台 probe_ok 可能未补全,
-        //   download 时 probe_ok 的候选失败后需全部源兜底
+        // 候选:
+        // - probe_ok 非空: probe_ok ∪ (全部源 - identity_rejected)
+        //   保留失败回退,但永不混拼已确认身份不兼容源
+        // - probe_ok 空: 全部源 - identity_rejected
+        // 修复 BUG-D:排序保证确定性 tie-break
         let mut candidates: Vec<usize> = {
             let ok = probe_ok.lock().await;
-            if ok.is_empty() {
+            let rejected = identity_rejected.lock().await;
+            let mut v: Vec<usize> = if ok.is_empty() {
                 (0..sources.len()).collect()
             } else {
-                // probe_ok 优先,再补全部源(去重)
                 let mut v: Vec<usize> = ok.iter().copied().collect();
                 for i in 0..sources.len() {
                     if !v.contains(&i) {
@@ -389,7 +399,9 @@ impl MirrorProtocol {
                     }
                 }
                 v
-            }
+            };
+            v.retain(|i| !rejected.contains(i));
+            v
         };
         candidates.sort_unstable();
         candidates.dedup();
@@ -546,13 +558,16 @@ impl Protocol for MirrorProtocol {
     {
         let sources = self.sources.clone();
         let probe_ok = self.probe_ok.clone();
+        let baseline_slot = self.baseline_identity.clone();
+        let self_rejected = self.identity_rejected.clone();
         let url = url.to_string();
         Box::pin(async move {
             if sources.len() == 1 {
                 // 单源(无镜像):直接 probe
                 let result = sources[0].1.probe(&url).await;
-                if result.is_ok() {
+                if let Ok(ref meta) = result {
                     probe_ok.lock().await.insert(0);
+                    *baseline_slot.lock().await = Some(ObjectIdentity::from_metadata(meta));
                 }
                 return result;
             }
@@ -602,22 +617,30 @@ impl Protocol for MirrorProtocol {
                 );
             };
 
-            // 记录首个成功源
+            // 记录首个成功源与对象身份基线
+            let baseline = ObjectIdentity::from_metadata(&meta);
             probe_ok.lock().await.insert(idx);
+            *baseline_slot.lock().await = Some(baseline.clone());
 
-            // 第二阶段:剩余 probe 任务后台 spawn,完成时补全 probe_ok
-            // set 还持有未完成的 probe,detach 让它们继续跑
-            // 修复 MEDIUM-3:detached spawn 的 join_next 加超时,防慢源永久驻留 runtime
+            // 第二阶段:剩余 probe 仅补全身份兼容源
             let probe_ok_bg = probe_ok.clone();
+            let rejected_bg = self_rejected.clone();
+            let baseline_bg = baseline;
             tokio::spawn(async move {
-                // 每个剩余 probe 最多再等 PROBE_TIMEOUT,超时即放弃补全(首成功已返回,
-                // 慢源即使后续成功也非关键)。逐次 join_next + timeout 避免整体超时
-                // 误杀快源。
                 while let Ok(Some(result)) =
                     tokio::time::timeout(PROBE_TIMEOUT, set.join_next()).await
                 {
-                    if let Ok((idx, Ok(_))) = result {
-                        probe_ok_bg.lock().await.insert(idx);
+                    if let Ok((idx, Ok(meta))) = result {
+                        let id = ObjectIdentity::from_metadata(&meta);
+                        if baseline_bg.compatible_for_mirror(&id) {
+                            probe_ok_bg.lock().await.insert(idx);
+                        } else {
+                            rejected_bg.lock().await.insert(idx);
+                            tracing::warn!(
+                                source_index = idx,
+                                "镜像源对象身份与基线不兼容,已剔除混拼候选"
+                            );
+                        }
                     }
                 }
             });
@@ -631,9 +654,11 @@ impl Protocol for MirrorProtocol {
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<ObjectIdentity>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
         let sources = self.sources.clone();
         let probe_ok = self.probe_ok.clone();
+        let identity_rejected = self.identity_rejected.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
         let pool = self.pool.clone();
@@ -647,11 +672,12 @@ impl Protocol for MirrorProtocol {
             let (data, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
+                identity_rejected,
                 in_flight.clone(),
                 stats.clone(),
                 pool,
                 &url,
-                move |proto, u| proto.download_range(&u, start, end),
+                move |proto, u| proto.download_range(&u, start, end, identity.clone()),
                 "",
             )
             .await?;
@@ -676,10 +702,12 @@ impl Protocol for MirrorProtocol {
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<ObjectIdentity>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>>
     {
         let sources = self.sources.clone();
         let probe_ok = self.probe_ok.clone();
+        let identity_rejected = self.identity_rejected.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
         let pool = self.pool.clone();
@@ -688,11 +716,12 @@ impl Protocol for MirrorProtocol {
             let (stream, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
+                identity_rejected,
                 in_flight.clone(),
                 stats.clone(),
                 pool,
                 &url,
-                move |proto, u| proto.download_range_stream(&u, start, end),
+                move |proto, u| proto.download_range_stream(&u, start, end, identity.clone()),
                 "(流式)",
             )
             .await?;
@@ -708,6 +737,7 @@ impl Protocol for MirrorProtocol {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
         let sources = self.sources.clone();
         let probe_ok = self.probe_ok.clone();
+        let identity_rejected = self.identity_rejected.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
         let pool = self.pool.clone();
@@ -720,6 +750,7 @@ impl Protocol for MirrorProtocol {
             let (data, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
+                identity_rejected,
                 in_flight.clone(),
                 stats.clone(),
                 pool,
@@ -752,6 +783,7 @@ impl Protocol for MirrorProtocol {
     ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
         let sources = self.sources.clone();
         let probe_ok = self.probe_ok.clone();
+        let identity_rejected = self.identity_rejected.clone();
         let in_flight = self.in_flight.clone();
         let stats = self.stats.clone();
         let pool = self.pool.clone();
@@ -760,6 +792,7 @@ impl Protocol for MirrorProtocol {
             let (stream, idx, permit) = Self::download_via_least_in_flight(
                 sources,
                 probe_ok,
+                identity_rejected,
                 in_flight.clone(),
                 stats.clone(),
                 pool,
@@ -785,7 +818,7 @@ mod tests {
 
     use super::MirrorProtocol;
     use tachyon_core::traits::Protocol;
-    use tachyon_core::types::FileMetadata;
+    use tachyon_core::types::{FileMetadata, ObjectIdentity};
     use tachyon_core::{ByteStream, DownloadError, DownloadResult};
 
     #[derive(Clone)]
@@ -813,7 +846,7 @@ mod tests {
                     file_size: Some(100),
                     content_type: None,
                     supports_range: true,
-                    etag: None,
+                    etag: Some("\"mock-v1\"".into()),
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
@@ -879,6 +912,7 @@ mod tests {
             url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
             let result = self.download_data.clone();
             let expected = self.expected_url.clone();
@@ -902,6 +936,7 @@ mod tests {
             _url: &str,
             _start: u64,
             _end: u64,
+            _identity: Option<ObjectIdentity>,
         ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
             let result = self.download_data.clone();
             let delay = self.download_delay;
@@ -1079,7 +1114,7 @@ mod tests {
         );
 
         let result = mirror_protocol
-            .download_range("http://primary.com/file", 0, 99)
+            .download_range("http://primary.com/file", 0, 99, None)
             .await;
         assert_eq!(
             result.unwrap(),
@@ -1103,7 +1138,7 @@ mod tests {
         );
 
         let result = mirror_protocol
-            .download_range_stream("http://primary.com/file", 0, 99)
+            .download_range_stream("http://primary.com/file", 0, 99, None)
             .await;
         assert!(result.is_ok(), "主源流式失败时应回退到镜像源");
 
@@ -1151,7 +1186,7 @@ mod tests {
 
         // 下载:必须用镜像 URL 才能成功。若错误地用主源 URL,镜像会因 expected_url 不匹配而失败
         let result = mirror_protocol
-            .download_range("http://primary.com/file", 0, 99)
+            .download_range("http://primary.com/file", 0, 99, None)
             .await;
         assert!(
             result.is_ok(),
@@ -1176,7 +1211,7 @@ mod tests {
                     file_size: Some(100),
                     content_type: None,
                     supports_range: true,
-                    etag: None,
+                    etag: Some("\"same\"".into()),
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
@@ -1192,7 +1227,7 @@ mod tests {
                     file_size: Some(100),
                     content_type: None,
                     supports_range: true,
-                    etag: None,
+                    etag: Some("\"same\"".into()),
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
@@ -1210,7 +1245,7 @@ mod tests {
 
         // 下载:官方(选中源)失败后,必须回退到镜像竞速,而非直接报错
         let result = mirror_protocol
-            .download_range("http://primary.com/file", 0, 99)
+            .download_range("http://primary.com/file", 0, 99, None)
             .await;
         assert!(
             result.is_ok(),
@@ -1247,7 +1282,7 @@ mod tests {
         for i in 0..8 {
             let mp = mp.clone();
             handles.spawn(async move {
-                mp.download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                mp.download_range_stream("http://fast/file", i * 100, i * 100 + 99, None)
                     .await
                     .expect("下载失败")
             });
@@ -1300,7 +1335,7 @@ mod tests {
         for i in 0..8 {
             let mp = mp.clone();
             handles.spawn(async move {
-                mp.download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                mp.download_range_stream("http://fast/file", i * 100, i * 100 + 99, None)
                     .await
                     .expect("下载失败")
             });
@@ -1342,7 +1377,7 @@ mod tests {
         // 必须消费流到 EOF,StatsStream 才会记录 success(更新 quality)
         for i in 0..8u64 {
             let stream = mp
-                .download_range_stream("http://slow/file", i * 100, i * 100 + 99)
+                .download_range_stream("http://slow/file", i * 100, i * 100 + 99, None)
                 .await
                 .unwrap();
             // 消费流到 EOF,触发 StatsStream record_success
@@ -1388,7 +1423,7 @@ mod tests {
         // 串行下载 12 个分片(每分片消费到 EOF 再发下一个,使 quality 积累)
         for i in 0..12u64 {
             let stream = mp
-                .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                .download_range_stream("http://fast/file", i * 100, i * 100 + 99, None)
                 .await
                 .unwrap();
             use futures::StreamExt;
@@ -1424,7 +1459,12 @@ mod tests {
         let single_start = std::time::Instant::now();
         for i in 0..frag_count {
             let stream = single
-                .download_range_stream("http://fast/file", i as u64 * 100, i as u64 * 100 + 99)
+                .download_range_stream(
+                    "http://fast/file",
+                    i as u64 * 100,
+                    i as u64 * 100 + 99,
+                    None,
+                )
                 .await
                 .unwrap();
             // 消费流到 EOF(触发 delay,模拟真实下载)
@@ -1450,7 +1490,12 @@ mod tests {
             let mp = mp.clone();
             handles.spawn(async move {
                 let stream = mp
-                    .download_range_stream("http://fast/file", i as u64 * 100, i as u64 * 100 + 99)
+                    .download_range_stream(
+                        "http://fast/file",
+                        i as u64 * 100,
+                        i as u64 * 100 + 99,
+                        None,
+                    )
                     .await
                     .unwrap();
                 // 消费流到 EOF(触发 delay)
@@ -1498,7 +1543,7 @@ mod tests {
             let fast = fast.clone();
             handles.spawn(async move {
                 let stream = fast
-                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99, None)
                     .await
                     .unwrap();
                 use futures::StreamExt;
@@ -1516,7 +1561,7 @@ mod tests {
             let mp = mp.clone();
             handles.spawn(async move {
                 let stream = mp
-                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99)
+                    .download_range_stream("http://fast/file", i * 100, i * 100 + 99, None)
                     .await
                     .unwrap();
                 use futures::StreamExt;
@@ -1540,6 +1585,52 @@ mod tests {
     }
 
     // ===== P3 衰减测试:clear_selected 遗忘历史 stats =====
+
+    /// P0-6: 不同 strong ETag 的镜像不得进入混拼候选(失败也不回退到不兼容源)
+    #[tokio::test]
+    async fn test_mirror_rejects_incompatible_object_identity() {
+        let primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "model.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: Some("\"v-a\"".into()),
+                    last_modified: None,
+                    file_layout: None,
+                    protocol_managed_storage: false,
+                }))
+                .with_download_data(Err("primary down".into())),
+        );
+        let mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "model.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: true,
+                    etag: Some("\"v-b\"".into()),
+                    last_modified: None,
+                    file_layout: None,
+                    protocol_managed_storage: false,
+                }))
+                .with_download_data(Ok(Bytes::from_static(b"BBBBBBBBBB")))
+                .with_expected_url("http://mirror.com/file"),
+        );
+        let mp = MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+        let meta = mp.probe("http://primary.com/file").await.unwrap();
+        assert_eq!(meta.etag.as_deref(), Some("\"v-a\""));
+        // 等待后台 probe 标记 mirror 为 identity_rejected
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let result = mp
+            .download_range("http://primary.com/file", 0, 9, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "身份不兼容镜像不得作为回退混拼源: {result:?}"
+        );
+    }
 
     /// P3:clear_selected 应对 stats 做 success/fail 衰减(各除以 2),
     /// 避免瞬时故障镜像因 fail 永久累积被永久冷落。
@@ -1666,7 +1757,9 @@ mod tests {
             Some(pool.clone()),
         );
 
-        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        let result = mp
+            .download_range("http://primary.com/file", 0, 99, None)
+            .await;
         assert!(result.is_ok(), "畸形镜像 URL 不应阻断下载(降级)");
         assert_eq!(
             pool.active_connections(),
@@ -1704,7 +1797,7 @@ mod tests {
 
         // 首个下载:拿到 permit,pending 流占住(永不释放,直到 drop)
         let first = mp
-            .download_range_stream("http://same.host/file", 0, 99)
+            .download_range_stream("http://same.host/file", 0, 99, None)
             .await;
         assert!(first.is_ok(), "首个下载应成功获取 permit");
         assert_eq!(
@@ -1718,7 +1811,7 @@ mod tests {
         let mp2 = Arc::clone(&mp);
         let second = tokio::time::timeout(
             Duration::from_millis(50),
-            mp2.download_range_stream("http://same.host/file", 100, 199),
+            mp2.download_range_stream("http://same.host/file", 100, 199, None),
         )
         .await;
         assert!(
@@ -1773,7 +1866,7 @@ mod tests {
 
         // 拿到流:permit 被 StatsStream 持有,active=1
         let stream = mp
-            .download_range_stream("http://example.com/file", 0, 99)
+            .download_range_stream("http://example.com/file", 0, 99, None)
             .await
             .expect("流创建应成功");
         assert_eq!(pool.active_connections(), 1, "流存在时应持有 1 个 permit");
@@ -1810,7 +1903,9 @@ mod tests {
         }
 
         // download:primary 已熔断应被跳过,选 mirror
-        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        let result = mp
+            .download_range("http://primary.com/file", 0, 99, None)
+            .await;
         assert!(result.is_ok(), "应跳过熔断源选 mirror 成功");
         assert_eq!(
             result.unwrap(),
@@ -1850,7 +1945,9 @@ mod tests {
         }
 
         // download:全熔断应半开重置,不阻断
-        let result = mp.download_range("http://primary.com/file", 0, 99).await;
+        let result = mp
+            .download_range("http://primary.com/file", 0, 99, None)
+            .await;
         assert!(result.is_ok(), "全熔断时应半开重置,不阻断下载");
 
         // 成功后(record_success)选中源的 consecutive_failures 应清零
@@ -1933,7 +2030,7 @@ mod tests {
 
         // 连续发起 5 次下载:每次坏源失败 → record_failure 递增
         for i in 0..super::SOFT_CIRCUIT_BREAKER_THRESHOLD {
-            let result = mp.download_range("http://bad.com/file", 0, 99).await;
+            let result = mp.download_range("http://bad.com/file", 0, 99, None).await;
             assert!(
                 result.is_err(),
                 "第 {} 次下载应失败(坏源无 fallback)",
@@ -1949,7 +2046,7 @@ mod tests {
 
         // 第 6 次下载:坏源已熔断,但单源场景触发半开重置(all-open),
         // 给一次恢复探测机会 → 坏源被再试一次 → 仍失败
-        let result = mp.download_range("http://bad.com/file", 0, 99).await;
+        let result = mp.download_range("http://bad.com/file", 0, 99, None).await;
         assert!(result.is_err(), "半开探测后坏源仍失败");
         assert_eq!(
             bad_counter.load(std::sync::atomic::Ordering::Relaxed),
@@ -1974,7 +2071,7 @@ mod tests {
 
         // 第 1 次下载:两源 quality 相同(默认),index 0(bad)优先被选 → 失败 →
         // fallback 到 good → 成功。good 的 quality 升高。
-        let result = mp.download_range("http://bad.com/file", 0, 99).await;
+        let result = mp.download_range("http://bad.com/file", 0, 99, None).await;
         assert!(result.is_ok(), "第 1 次应 fallback 到 good 成功");
         assert_eq!(result.unwrap(), Bytes::from_static(b"good-data"));
         assert_eq!(
@@ -1991,7 +2088,7 @@ mod tests {
         // 后续 9 次下载:good 的 quality 已升高(有成功记录),bad 的 quality 仍默认,
         // least-in-flight 在 inflight=0 时按 quality 选 → 直接选 good,跳过 bad。
         for _ in 0..9 {
-            let result = mp.download_range("http://bad.com/file", 0, 99).await;
+            let result = mp.download_range("http://bad.com/file", 0, 99, None).await;
             assert!(result.is_ok(), "后续下载应直接选 good");
         }
         // 坏源计数不应增长(被 quality 加权跳过,未达熔断)

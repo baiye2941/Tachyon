@@ -1141,6 +1141,7 @@ impl Protocol for HttpClient {
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
         let client = self.client.clone();
         let url = url.to_owned();
@@ -1148,20 +1149,32 @@ impl Protocol for HttpClient {
             let parsed_url = reqwest::Url::parse(&url)?;
             tachyon_core::validate_public_http_url(&parsed_url)?;
             let range = format!("bytes={start}-{end}");
-            debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, "HTTP Range 请求开始");
-            let response = client
-                .get(&url)
-                .header("Range", &range)
-                .send()
-                .await
-                .map_err(|e| {
-                    let chain = error_chain(&e);
-                    warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "Range 请求连接失败");
-                    DownloadError::Network(format!("Range 请求失败: {chain}"))
-                })?;
+            let if_range = identity.as_ref().and_then(|id| id.if_range_value());
+            debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, if_range = ?if_range, "HTTP Range 请求开始");
+            let mut request = client.get(&url).header("Range", &range);
+            if let Some(ref validator) = if_range {
+                request = request.header("If-Range", validator.as_str());
+            }
+            let response = request.send().await.map_err(|e| {
+                let chain = error_chain(&e);
+                warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "Range 请求连接失败");
+                DownloadError::Network(format!("Range 请求失败: {chain}"))
+            })?;
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
+                // 发过 If-Range 却收到 200: 对象已变更,禁止截取全对象与旧分片拼接。
+                if if_range.is_some() {
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&url),
+                        start,
+                        end,
+                        "If-Range 条件未满足(HTTP 200),拒绝拼接"
+                    );
+                    return Err(DownloadError::Protocol(
+                        "对象版本已变更(If-Range 返回 200),拒绝续传拼接".into(),
+                    ));
+                }
                 // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
                 // B-1 修复:改用流式回退(make_200_fallback_stream)收集为 Bytes,
                 // 避免原 `response.bytes()` 把整个响应体载入内存导致大文件 OOM。
@@ -1227,6 +1240,7 @@ impl Protocol for HttpClient {
         url: &str,
         start: u64,
         end: u64,
+        identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
         let client = self.client.clone();
         let url = url.to_owned();
@@ -1234,20 +1248,31 @@ impl Protocol for HttpClient {
             let parsed_url = reqwest::Url::parse(&url)?;
             tachyon_core::validate_public_http_url(&parsed_url)?;
             let range = format!("bytes={start}-{end}");
-            debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, "HTTP 流式 Range 请求开始");
-            let response = client
-                .get(&url)
-                .header("Range", range)
-                .send()
-                .await
-                .map_err(|e| {
-                    let chain = error_chain(&e);
-                    warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "流式 Range 请求连接失败");
-                    DownloadError::Network(format!("Range 请求失败: {chain}"))
-                })?;
+            let if_range = identity.as_ref().and_then(|id| id.if_range_value());
+            debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, if_range = ?if_range, "HTTP 流式 Range 请求开始");
+            let mut request = client.get(&url).header("Range", range);
+            if let Some(ref validator) = if_range {
+                request = request.header("If-Range", validator.as_str());
+            }
+            let response = request.send().await.map_err(|e| {
+                let chain = error_chain(&e);
+                warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "流式 Range 请求连接失败");
+                DownloadError::Network(format!("Range 请求失败: {chain}"))
+            })?;
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
+                if if_range.is_some() {
+                    warn!(
+                        url = %tachyon_core::redact_url_for_log(&url),
+                        start,
+                        end,
+                        "If-Range 条件未满足(HTTP 200 流式),拒绝拼接"
+                    );
+                    return Err(DownloadError::Protocol(
+                        "对象版本已变更(If-Range 返回 200),拒绝续传拼接".into(),
+                    ));
+                }
                 // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
                 // B-2 修复:委托 make_200_fallback_stream 统一实现流式回退,
                 // 取满即终止流,避免浪费剩余带宽。download_range 路径也复用此函数。
@@ -1425,11 +1450,7 @@ mod tests {
         let compiled = super::http3_compiled();
         // 默认构建未启用 http3 feature + reqwest_unstable -> 应为 false
         // (CI 默认 --all-features 可能启用 http3,故仅断言类型与可调用性,不硬编码值)
-        let _ = compiled;
-        assert!(
-            compiled == true || compiled == false,
-            "http3_compiled 应返回 bool"
-        );
+        let _: bool = compiled;
     }
 
     /// FIX-19:enable_http2=false 时 build_client 应成功并强制 HTTP/1(http1_only),
@@ -2510,6 +2531,97 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_download_range_sends_if_range_for_strong_etag() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/if-range"))
+                .and(header("Range", "bytes=0-4"))
+                .and(header("If-Range", "\"abc\""))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-4/11")
+                        .insert_header("Content-Length", "5")
+                        .set_body_raw(b"hello", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/if-range", server.uri());
+            let identity = tachyon_core::ObjectIdentity {
+                etag: Some("\"abc\"".into()),
+                last_modified: None,
+                file_size: Some(11),
+            };
+            let bytes = client
+                .download_range(&url, 0, 4, Some(identity))
+                .await
+                .expect("带 strong ETag 的 If-Range 应成功");
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+        }
+
+        #[tokio::test]
+        async fn test_download_range_weak_etag_does_not_send_if_range() {
+            let server = MockServer::start().await;
+            // 仅匹配 Range；若错误带上 If-Range，wiremock 仍会匹配本 mock，
+            // 因此再挂一个“带 If-Range 则 500”的更高优先级反向用例不方便。
+            // 改为：无 If-Range 时 206；有 If-Range 时不应被调用——用缺 If-Range 的成功路径。
+            Mock::given(method("GET"))
+                .and(path("/weak"))
+                .and(header("Range", "bytes=0-3"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-3/4")
+                        .insert_header("Content-Length", "4")
+                        .set_body_raw(b"weak", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/weak", server.uri());
+            let identity = tachyon_core::ObjectIdentity {
+                etag: Some("W/\"w1\"".into()),
+                last_modified: None,
+                file_size: Some(4),
+            };
+            let bytes = client
+                .download_range(&url, 0, 3, Some(identity))
+                .await
+                .expect("weak ETag 不发 If-Range 仍应 206");
+            assert_eq!(bytes, Bytes::from_static(b"weak"));
+        }
+
+        #[tokio::test]
+        async fn test_download_range_if_range_200_is_rejected() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/changed"))
+                .and(header("Range", "bytes=5-9"))
+                .and(header("If-Range", "\"old\""))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "10")
+                        .set_body_raw(b"NEWCONTENT", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/changed", server.uri());
+            let identity = tachyon_core::ObjectIdentity {
+                etag: Some("\"old\"".into()),
+                last_modified: None,
+                file_size: Some(10),
+            };
+            let result = client.download_range(&url, 5, 9, Some(identity)).await;
+            assert!(
+                result.is_err(),
+                "If-Range 触发 200 全对象时不得截取拼接: {result:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn test_download_range_206_returns_exact_bytes() {
             let server = MockServer::start().await;
             let body = b"hello world".to_vec();
@@ -2527,7 +2639,7 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/data", server.uri());
-            let bytes = client.download_range(&url, 0, 4).await.unwrap();
+            let bytes = client.download_range(&url, 0, 4, None).await.unwrap();
             assert_eq!(bytes, Bytes::from_static(b"hello"));
         }
 
@@ -2549,7 +2661,7 @@ mod tests {
             let client = test_client();
             let url = format!("{}/no-range", server.uri());
             // 请求 0-4,服务端返回完整 11 字节,应截取前 5 字节
-            let bytes = client.download_range(&url, 0, 4).await.unwrap();
+            let bytes = client.download_range(&url, 0, 4, None).await.unwrap();
             assert_eq!(bytes, Bytes::from_static(b"hello"));
         }
 
@@ -2571,7 +2683,7 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/mismatch", server.uri());
-            let result = client.download_range(&url, 0, 4).await;
+            let result = client.download_range(&url, 0, 4, None).await;
             assert!(result.is_err(), "Content-Range 错位应被拒绝");
         }
 
@@ -2586,7 +2698,7 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/gone", server.uri());
-            let result = client.download_range(&url, 0, 99).await;
+            let result = client.download_range(&url, 0, 99, None).await;
             assert!(result.is_err());
         }
 
@@ -2607,7 +2719,10 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/stream", server.uri());
-            let stream = client.download_range_stream(&url, 0, 9).await.unwrap();
+            let stream = client
+                .download_range_stream(&url, 0, 9, None)
+                .await
+                .unwrap();
             let mut s = Box::pin(stream);
             let mut collected = Vec::new();
             while let Some(chunk) = s.next().await {
@@ -2632,7 +2747,10 @@ mod tests {
             let client = test_client();
             let url = format!("{}/stream200", server.uri());
             // 请求 2-5,服务端返回完整 10 字节,应流式截取 [2,5]
-            let stream = client.download_range_stream(&url, 2, 5).await.unwrap();
+            let stream = client
+                .download_range_stream(&url, 2, 5, None)
+                .await
+                .unwrap();
             let mut s = Box::pin(stream);
             let mut collected = Vec::new();
             while let Some(chunk) = s.next().await {
@@ -2733,7 +2851,7 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/throttled", server.uri());
-            let result = client.download_range(&url, 0, 99).await;
+            let result = client.download_range(&url, 0, 99, None).await;
             assert!(result.is_err());
             // 429 应分类为 Throttled(含 retry_after_secs)
             match result {

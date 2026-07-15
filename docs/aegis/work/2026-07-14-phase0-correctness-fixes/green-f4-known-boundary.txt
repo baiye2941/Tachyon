@@ -1,0 +1,14 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-core v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-core)
+   Compiling tachyon-scheduler v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-scheduler)
+   Compiling tachyon-io v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-io)
+   Compiling tachyon-crypto v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-crypto)
+   Compiling tachyon-protocol v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-protocol)
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3m 17s
+────────────
+ Nextest run ID 8ae6befa-79ca-4afe-80f4-aac64a61f014 with nextest profile: default
+    Starting 1 test across 1 binary (280 tests skipped)
+        PASS [   0.934s] (1/1) tachyon-engine downloader::tests::test_run_known_size_full_stream_rejects_overflow_before_storage_write
+────────────
+     Summary [   0.937s] 1 test run: 1 passed, 280 skipped

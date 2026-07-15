@@ -273,6 +273,7 @@ pub mod harness {
             _url: &str,
             start: u64,
             end: u64,
+            _identity: Option<crate::types::ObjectIdentity>,
         ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
             let this = self.clone();
             Box::pin(async move {
@@ -288,6 +289,7 @@ pub mod harness {
             url: &str,
             start: u64,
             end: u64,
+            _identity: Option<crate::types::ObjectIdentity>,
         ) -> Pin<
             Box<dyn std::future::Future<Output = DownloadResult<crate::traits::ByteStream>> + Send>,
         > {
@@ -318,7 +320,7 @@ pub mod harness {
                             as crate::traits::ByteStream,
                     );
                 }
-                let data = this.download_range(&url, start, end).await?;
+                let data = this.download_range(&url, start, end, None).await?;
                 // 分块流模式:按 chunk_size 拆成多个 chunk 流式产出,
                 // 模拟 HTTP chunked / BT FileStream 多次 read,覆盖引擎流读取循环
                 // 的逐块哈希、批量刷写、取消信号穿透路径。
@@ -729,7 +731,7 @@ mod tests {
         let data = Bytes::from_static(b"hello world");
         let protocol = MockProtocol::new(meta).with_range_data(0, 10, data.clone());
         let result = protocol
-            .download_range("http://example.com/file.bin", 0, 10)
+            .download_range("http://example.com/file.bin", 0, 10, None)
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), data);
@@ -740,7 +742,7 @@ mod tests {
         let meta = test_metadata("file.bin", 100);
         let protocol = MockProtocol::new(meta);
         let result = protocol
-            .download_range("http://example.com/file.bin", 0, 10)
+            .download_range("http://example.com/file.bin", 0, 10, None)
             .await;
         assert!(result.is_err());
     }
@@ -764,7 +766,7 @@ mod tests {
             .with_chunk_size(256)
             .with_chunk_delay(std::time::Duration::from_millis(20));
         let stream = protocol
-            .download_range_stream("http://example.com/slow.bin", 0, 1023)
+            .download_range_stream("http://example.com/slow.bin", 0, 1023, None)
             .await
             .unwrap();
         let start = std::time::Instant::now();
@@ -791,12 +793,12 @@ mod tests {
             .fail_on_attempt(1, DownloadError::Network("间歇连接重置".into()));
         // 第 1 次:失败
         let result = protocol
-            .download_range_stream("http://example.com/flaky.bin", 0, 63)
+            .download_range_stream("http://example.com/flaky.bin", 0, 63, None)
             .await;
         assert!(result.is_err(), "第 1 次调用应失败");
         // 第 2 次:成功
         let stream = protocol
-            .download_range_stream("http://example.com/flaky.bin", 0, 63)
+            .download_range_stream("http://example.com/flaky.bin", 0, 63, None)
             .await
             .unwrap();
         use futures::StreamExt;

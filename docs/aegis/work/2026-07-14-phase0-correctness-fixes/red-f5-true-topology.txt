@@ -1,0 +1,28 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+   Compiling tachyon-engine v0.1.1-0 (D:\Rust\Tachyon\crates\tachyon-engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 49.50s
+────────────
+ Nextest run ID e7a9a9c8-e04b-4b85-8b23-0e1c77800d39 with nextest profile: default
+    Starting 1 test across 1 binary (283 tests skipped)
+       START [         ] (1/1) tachyon-engine downloader::tests::test_work_stealing_true_never_splits_static_topology
+
+running 1 test
+
+thread 'downloader::tests::test_work_stealing_true_never_splits_static_topology' (41172) panicked at crates\tachyon-engine\src\downloader.rs:1736:65:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test downloader::tests::test_work_stealing_true_never_splits_static_topology ... FAILED
+
+failures:
+
+failures:
+    downloader::tests::test_work_stealing_true_never_splits_static_topology
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 283 filtered out; finished in 1.00s
+
+        FAIL [   1.519s] (1/1) tachyon-engine downloader::tests::test_work_stealing_true_never_splits_static_topology
+  Cancelling due to test failure: 
+────────────
+     Summary [   1.520s] 1 test run: 0 passed, 1 failed, 283 skipped
+        FAIL [   1.519s] (1/1) tachyon-engine downloader::tests::test_work_stealing_true_never_splits_static_topology
+error: test run failed

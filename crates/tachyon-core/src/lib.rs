@@ -31,7 +31,7 @@ pub use safety::{
 pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{
     DownloadState, DownloadStateChange, FileLayout, FileMetadata, FileSpan, FragmentInfo,
-    FragmentProgress, TaskCommand, TaskId, TaskProgress,
+    FragmentProgress, ObjectIdentity, TaskCommand, TaskId, TaskProgress,
 };
 pub use utils::{Metrics, hex_encode};
 

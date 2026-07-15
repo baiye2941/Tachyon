@@ -1,0 +1,8 @@
+[rtk] /!\ No hook installed — run `rtk init -g` for automatic token savings
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.04s
+────────────
+ Nextest run ID be7dd0be-dea6-4153-95b2-5932f4265726 with nextest profile: default
+    Starting 1 test across 1 binary (284 tests skipped)
+        PASS [   0.356s] (1/1) tachyon-engine downloader::tests::test_fragment_completed_progress_requires_storage_sync_first
+────────────
+     Summary [   0.358s] 1 test run: 1 passed, 284 skipped
