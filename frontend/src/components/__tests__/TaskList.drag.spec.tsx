@@ -139,7 +139,7 @@ describe("TaskList 拖拽排序", () => {
       expect(container.querySelectorAll('[role="option"]').length).toBeGreaterThan(0);
     });
 
-    const speedHeader = Array.from(container.querySelectorAll('[role="columnheader"]')).find(
+    const speedHeader = Array.from(container.querySelectorAll('.task-list-col--sortable')).find(
       (el) => el.textContent?.includes("速度"),
     );
     if (speedHeader) {

@@ -17,6 +17,7 @@ vi.mock('../../api/invoke', () => ({
     getAppInfo: vi.fn(),
     exportBackup: vi.fn(),
     importBackup: vi.fn(),
+    getBtProxyCoverage: vi.fn().mockResolvedValue(null),
   },
 }))
 
