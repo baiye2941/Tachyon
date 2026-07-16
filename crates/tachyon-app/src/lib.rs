@@ -72,7 +72,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
+        // 审计 FT-03:系统通知路径需注册插件;未使用的 shell 已移除以缩小攻击面
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::new())
         .setup(|app| {

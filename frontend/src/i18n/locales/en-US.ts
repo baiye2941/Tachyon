@@ -379,6 +379,7 @@ const enUS = {
   "toast.addTagFailed": "Failed to add tag: {error}",
   "toast.removeTagFailed": "Failed to remove tag: {error}",
   "toast.progressSubscribeFailed": "Progress subscription failed: {error}",
+  "toast.progressListenFailed": "Progress event listener failed: {error}",
   "toast.recoveryWarning":
     "Detected {count} corrupted resumption records, skipped recovery",
   "toast.recoveryListenFailed": "Recovery warning listener failed: {error}",
@@ -683,6 +684,8 @@ const enUS = {
   "sniffer.addUrlPlaceholder": "Paste a resource URL, press Enter to add",
   "sniffer.addUrlButton": "Add",
   "sniffer.clear": "Clear",
+  "sniffer.close": "Close sniffer panel",
+  "sniffer.removeFilter": "Remove filter",
   "sniffer.clearConfirm": "Clear all sniffed resources?",
   "sniffer.clearConfirmTitle": "Clear sniffed resources",
   "sniffer.clearConfirmLabel": "Clear",

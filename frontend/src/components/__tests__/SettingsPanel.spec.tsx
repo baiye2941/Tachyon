@@ -449,7 +449,7 @@ describe('SettingsPanel', () => {
 
   it('About 标签展示支持协议 + 只读 User-Agent', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
-    vi.mocked(api.getSupportedProtocols).mockResolvedValue(['http', 'https', 'ftp'])
+    vi.mocked(api.getSupportedProtocols).mockResolvedValue(['http', 'https'])
     vi.mocked(api.getAppInfo).mockResolvedValue({ version: '1.2.3', name: 'Tachyon' })
     renderSettingsPanel()
 

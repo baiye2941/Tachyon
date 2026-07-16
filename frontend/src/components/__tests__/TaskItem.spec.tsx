@@ -229,4 +229,46 @@ describe("TaskItem", () => {
     const row = screen.getByRole("button");
     expect(row.getAttribute("aria-selected")).toBeNull();
   });
+
+  it("审计 FT-04:热进度覆盖 cold task 的 progress 显示", async () => {
+    const { setTasks, updateProgress } = await import("../../stores/downloads");
+    const cold: TaskInfo = {
+      ...task,
+      id: "hot-1",
+      status: "downloading",
+      progress: 0.1,
+      speed: 100,
+      downloaded: 100,
+      fragmentsDone: 0,
+    };
+    setTasks([cold]);
+    updateProgress({
+      "hot-1": {
+        id: "hot-1",
+        progress: 0.77,
+        downloaded: 770,
+        speed: 2500,
+        status: "downloading",
+        fragmentsDone: 3,
+        fragmentsTotal: 10,
+        activeConcurrency: 2,
+      },
+    });
+
+    renderWithI18n(() => (
+      <TaskItem
+        task={cold}
+        index={0}
+        isSelected={false}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    // aria-label 使用 liveProgress → 77.0%
+    const row = screen.getByRole("button", { name: /77\.0/ });
+    expect(row).toBeTruthy();
+  });
 });

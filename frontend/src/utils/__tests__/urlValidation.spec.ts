@@ -70,4 +70,16 @@ describe('validateUrl', () => {
     expect(validateUrl('magnet:?xt=urn:btih:abc123&dn=test.zip').protocol)
       .toBe('magnet')
   })
+
+  it('审计 FT-13:ftp 不再标为可下载', () => {
+    const r = validateUrl('ftp://example.com/file.zip')
+    expect(r.valid).toBe(false)
+    expect(r.protocol).toBe('unknown')
+    expect(r.hintKey).toBe('url.hint.invalid')
+  })
+
+  it('http/https 仍有效', () => {
+    expect(validateUrl('https://cdn.example.com/a.bin').valid).toBe(true)
+    expect(validateUrl('http://cdn.example.com/a.bin').protocol).toBe('http')
+  })
 })

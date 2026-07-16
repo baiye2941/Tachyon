@@ -1,4 +1,4 @@
-import { createSignal, createMemo, createEffect, Show, For } from "solid-js";
+import { createSignal, createMemo, createEffect, onCleanup, Show, For } from "solid-js";
 import { CloseIcon, FolderOpenIcon, PlusIcon, XIcon, ChevronDownIcon, SearchIcon } from "./icons";
 import { api } from "../api/invoke";
 import { addToast } from "../stores/toast";
@@ -14,6 +14,10 @@ import { parseHfUrl } from "../utils/hfUrl";
 import { getModelInfo } from "../stores/hub";
 import { batchDownload } from "../stores/model";
 import type { HfModelInfo } from "../types";
+import {
+  shouldApplyHfPreview,
+  shouldApplyProbeResult,
+} from "../utils/asyncRequestIdentity";
 
 interface NewTaskModalProps {
   onClose: () => void;
@@ -37,6 +41,9 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // ── HuggingFace 预览 ──────────────────────────────────
   const [hfPreview, setHfPreview] = createSignal<HfModelInfo | null>(null);
   let hfDebounceTimer: number | undefined;
+  // 审计 FT-10:单调请求代数,丢弃陈旧异步响应
+  let hfRequestSeq = 0;
+  let probeRequestSeq = 0;
 
   // ── 探测真实文件名 ──────────────────────────────────
   const [probing, setProbing] = createSignal(false);
@@ -62,34 +69,70 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   // URL 变化时清除探测结果(新 URL 需重新探测),同步清空已填入的文件名
   createEffect(() => {
     validUrls();
+    // 使进行中的 probe 结果失效
+    probeRequestSeq += 1;
     setProbedFilename(null);
     setFileName("");
   });
 
   // ── HF URL 识别与预览 ──────────────────────────────────
+  // 审计 FT-10:每次 effect 运行先清 timer;onCleanup 再清;响应前比对 repo/revision/seq
   createEffect(() => {
     const urls = validUrls();
+
+    if (hfDebounceTimer !== undefined) {
+      window.clearTimeout(hfDebounceTimer);
+      hfDebounceTimer = undefined;
+    }
+
     if (urls.length !== 1) {
+      hfRequestSeq += 1;
       setHfPreview(null);
       return;
     }
     const url = urls[0]!;
     const parsed = parseHfUrl(url);
     if (!parsed) {
+      hfRequestSeq += 1;
       setHfPreview(null);
       return;
     }
-    if (hfDebounceTimer) {
-      window.clearTimeout(hfDebounceTimer);
-    }
+
+    const seq = ++hfRequestSeq;
+    const repoId = parsed.repoId;
+    const revision = parsed.revision ?? undefined;
+
     hfDebounceTimer = window.setTimeout(async () => {
       try {
-        const info = await getModelInfo(parsed.repoId, parsed.revision ?? undefined);
+        const info = await getModelInfo(repoId, revision);
+        const current = validUrls();
+        const now =
+          current.length === 1 ? parseHfUrl(current[0]!) : null;
+        if (
+          !shouldApplyHfPreview(
+            seq,
+            hfRequestSeq,
+            { repoId, revision },
+            now
+              ? { repoId: now.repoId, revision: now.revision ?? undefined }
+              : null,
+          )
+        ) {
+          return;
+        }
         setHfPreview(info);
       } catch {
-        setHfPreview(null);
+        if (seq === hfRequestSeq) setHfPreview(null);
       }
     }, 300);
+
+    // Solid:onCleanup 在依赖变化重跑/卸载时清除 timer
+    onCleanup(() => {
+      if (hfDebounceTimer !== undefined) {
+        window.clearTimeout(hfDebounceTimer);
+        hfDebounceTimer = undefined;
+      }
+    });
   });
 
   // 显示的文件名:优先探测结果,回退到本地提取
@@ -103,15 +146,28 @@ export default function NewTaskModal(props: NewTaskModalProps) {
   const handleProbe = async () => {
     const url = validUrls()[0];
     if (!url) return;
+    const seq = ++probeRequestSeq;
+    const urlSnapshot = url;
     setProbing(true);
     try {
-      const name = await api.probeFilename(url);
+      const name = await api.probeFilename(urlSnapshot);
+      // 审计 FT-10:仅当仍是同一次探测且 URL 未变时写入
+      if (
+        !shouldApplyProbeResult(
+          seq,
+          probeRequestSeq,
+          urlSnapshot,
+          validUrls()[0],
+        )
+      ) {
+        return;
+      }
       setProbedFilename(name);
       setFileName(name);
     } catch {
       // 探测失败保持本地提取结果
     } finally {
-      setProbing(false);
+      if (seq === probeRequestSeq) setProbing(false);
     }
   };
 
@@ -206,11 +262,19 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       const failed = results.filter((r) => r.status === "rejected");
       if (failed.length === 0) {
         addToast(tr("toast.tasksCreated", { count: urls.length }), "success");
+        // 全部成功:重置并关闭
+        setUrlText("");
+        setMirrors([]);
+        setSavePath("");
+        setFileName("");
+        setAutoStart(true);
+        props.onClose();
       } else if (failed.length === urls.length) {
         const first = failed[0];
         const reason =
           first && first.status === "rejected" ? String(first.reason) : "";
         addToast(tr("toast.createTaskError", { error: reason }), "error");
+        // 审计 FT-09:全部失败不关闭,保留输入便于修改后重试
       } else {
         const reasons = failed
           .map((r) => (r.status === "rejected" ? String(r.reason) : ""))
@@ -223,18 +287,13 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           }),
           "info",
         );
+        // 审计 FT-09:部分失败时保留失败 URL,不关弹窗,避免输入丢失
+        const failedUrls = urls.filter((_, i) => results[i]?.status === "rejected");
+        setUrlText(failedUrls.join("\n"));
       }
 
       // 刷新任务列表,确保新创建的任务立即显示
       await refreshTaskList();
-
-      // 重置并关闭
-      setUrlText("");
-      setMirrors([]);
-      setSavePath("");
-      setFileName("");
-      setAutoStart(true);
-      props.onClose();
     } catch (err) {
       addToast(tr("toast.createTaskError", { error: err }), "error");
     } finally {

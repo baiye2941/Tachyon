@@ -184,8 +184,20 @@ export const api = {
   /** 移除收藏 */
   removeModelFavorite: (repoId: string) => invoke<void>('remove_model_favorite', { repoId }),
   /** 批量创建 HF 下载任务 */
-  batchCreateHfTasks: (repoId: string, filePaths: string[], revision?: string, downloadDir?: string) =>
-    invoke<string[]>('batch_create_hf_tasks', { repoId, revision, filePaths, downloadDir }),
+  batchCreateHfTasks: (
+    repoId: string,
+    filePaths: string[],
+    revision?: string,
+    downloadDir?: string,
+    forceMirror?: boolean,
+  ) =>
+    invoke<string[]>('batch_create_hf_tasks', {
+      repoId,
+      revision,
+      filePaths,
+      downloadDir,
+      forceMirror: forceMirror ?? false,
+    }),
   /** 导出配置与任务快照到 JSON 备份文件(破坏性操作,需确认令牌) */
   exportBackup: (path: string) =>
     invoke<void>('export_backup', { path }, true),

@@ -1,5 +1,5 @@
 import { errorMessage } from "../utils/appError";
-import { createSignal, Show, For, createMemo, untrack } from 'solid-js'
+import { createSignal, Show, For, createMemo, untrack, createEffect } from 'solid-js'
 import { api } from '../api/invoke'
 import { $hub, listRepoFiles, clearRepoFiles } from '../stores/hub'
 import { addToast } from '../stores/toast'
@@ -8,7 +8,6 @@ import type { HubFileInfo } from '../types'
 import { CloseIcon, SearchIcon, CheckboxIcon, ArrowDownIcon, ChevronDownIcon, FileIcon, HubIcon } from './icons'
 import { detectFormat, detectQuant, isModelWeight, isLargeFile, type QuantLevel } from '../utils/modelMeta'
 import { buildTree, countByType, type TreeNode } from '../utils/hfTree'
-import { buildHfMirrorUrl } from '../utils/hfMirror'
 import Button from '../shared/ui/Button'
 import EmptyState from '../shared/ui/EmptyState'
 import ErrorState from '../shared/ui/ErrorState'
@@ -57,7 +56,7 @@ function matchesFilter(f: HubFileInfo, filter: FilterKey, query: string): boolea
   return true
 }
 
-/** 递归树节点组件(支持 ARIA tree + 键盘导航,Iteration 06 AA-1) */
+/** 递归树节点组件(支持 ARIA tree + roving tabindex,审计 FT-14) */
 function TreeNodeItem(props: {
   node: TreeNode
   repoId: string
@@ -68,6 +67,9 @@ function TreeNodeItem(props: {
   onToggleSelect: (path: string) => void
   /** 当前节点 path 是否匹配筛选(非匹配降透明度) */
   isMatched: () => boolean
+  /** roving 焦点 path */
+  focusedPath: () => string | null
+  setFocusedPath: (path: string) => void
 }) {
   // 初始展开:根层目录(depth<1)默认展开。untrack 明确表示仅作初始值读取一次,
   // 非响应式追踪(节点 depth/isDirectory 在生命周期内不变)。
@@ -77,21 +79,22 @@ function TreeNodeItem(props: {
 
   const handleDownload = async () => {
     try {
-      const url = await api.getHfDownloadUrl(props.repoId, props.node.path, props.revision || undefined)
-      if (url) {
-        await api.createTask(url)
-        refreshTaskList()
-        addToast(tr('toast.hubAddedDownload', { name: props.node.name }), 'success')
-      }
+      // 审计 FT-07:走 batch_create_hf_tasks 注入 HfTaskMeta,禁止 getUrl+createTask 分叉
+      await api.batchCreateHfTasks(
+        props.repoId,
+        [props.node.path],
+        props.revision || undefined,
+      )
+      refreshTaskList()
+      addToast(tr('toast.hubAddedDownload', { name: props.node.name }), 'success')
     } catch (e) {
       addToast(tr('toast.hubDownloadFailed', { error: errorMessage(e) }), 'error')
     }
     props.onDownload(props.node.path)
   }
 
-  /** 键盘导航(Iteration 06 II-3):←→ 展开/折叠、Space 勾选、Enter 下载。
-   *  焦点移动用浏览器原生 Tab 流(每个 treeitem tabindex=0),完整 roving
-   *  tabindex(↑↓ 在节点间移动)留作后续增强。 */
+  /** 键盘导航:←→ 展开/折叠、Space 勾选、Enter 下载。
+   *  审计 FT-14:↑↓ 由树容器 roving 处理;本节点仅处理本项动作。 */
   const handleKeyDown = (e: KeyboardEvent) => {
     if (props.node.isDirectory) {
       if (e.key === 'ArrowRight' && !expanded()) { e.preventDefault(); setExpanded(true); return }
@@ -114,10 +117,11 @@ function TreeNodeItem(props: {
         class="flex items-center gap-2 cursor-pointer select-none hf-tree-row"
         classList={{ 'hf-tree-row-dimmed': !props.isMatched() }}
         role="treeitem"
+        data-hf-path={props.node.path}
         aria-level={props.depth + 1}
         aria-expanded={props.node.isDirectory ? expanded() : undefined}
         aria-selected={props.isSelected(props.node.path)}
-        tabindex={props.node.isDirectory ? 0 : 0}
+        tabindex={props.focusedPath() === props.node.path ? 0 : -1}
         style={{
           padding: '4px 8px',
           'border-radius': '4px',
@@ -126,7 +130,11 @@ function TreeNodeItem(props: {
           transition: 'background 100ms ease',
           outline: 'none',
         }}
-        onClick={() => props.node.isDirectory && setExpanded((v) => !v)}
+        onFocus={() => props.setFocusedPath(props.node.path)}
+        onClick={() => {
+          props.setFocusedPath(props.node.path)
+          if (props.node.isDirectory) setExpanded((v) => !v)
+        }}
         onKeyDown={handleKeyDown}
       >
         {/* 多选勾选框(仅文件) */}
@@ -227,6 +235,8 @@ function TreeNodeItem(props: {
               isSelected={props.isSelected}
               onToggleSelect={props.onToggleSelect}
               isMatched={props.isMatched}
+              focusedPath={props.focusedPath}
+              setFocusedPath={props.setFocusedPath}
             />
           )}
         </For>
@@ -243,6 +253,9 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   const [batchDownloading, setBatchDownloading] = createSignal(false)
   const [filter, setFilter] = createSignal<FilterKey>('all')
   const [searchInput, setSearchInput] = createSignal('')
+  /** 审计 FT-14:tree 内 roving 焦点 */
+  const [treeFocusedPath, setTreeFocusedPath] = createSignal<string | null>(null)
+  let treeContainerRef: HTMLDivElement | undefined
   const repoFiles = () => $hub.repoFiles() ?? []
   const loading = () => $hub.loading()
   const error = () => $hub.error()
@@ -357,31 +370,18 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
     const rev = revision().trim() || 'main'
     setBatchDownloading(true)
     try {
-      const results = await Promise.allSettled(
-        paths.map(async (path) => {
-          const originalUrl = await api.getHfDownloadUrl(id, path, rev)
-          if (!originalUrl) throw new Error(tr('toast.hubUrlMissing', { path }))
-          if (useMirror) {
-            // 镜像主源:基于 repoId 构造 hf-mirror resolve URL(鲁棒,绕过 CDN 域名)
-            const mirrorUrl = buildHfMirrorUrl(id, rev, path)
-            return api.createTask(mirrorUrl)
-          }
-          return api.createTask(originalUrl)
-        }),
+      // 审计 FT-07:官方与镜像均走 batch_create_hf_tasks 写入 HfTaskMeta
+      await api.batchCreateHfTasks(id, paths, rev, undefined, useMirror)
+      addToast(
+        useMirror
+          ? tr('toast.hubMirrorCreated', { count: paths.length })
+          : tr('toast.hubCreated', { count: paths.length }),
+        'success',
       )
-      const failed = results.filter((r) => r.status === 'rejected')
-      if (failed.length === 0) {
-        addToast(
-          useMirror ? tr('toast.hubMirrorCreated', { count: paths.length }) : tr('toast.hubCreated', { count: paths.length }),
-          'success',
-        )
-      } else if (failed.length === paths.length) {
-        addToast(tr('toast.hubCreateFailed'), 'error')
-      } else {
-        addToast(tr('toast.batchPartialShort', { success: paths.length - failed.length, failed: failed.length }), 'info')
-      }
       refreshTaskList()
       props.onClose()
+    } catch {
+      addToast(tr('toast.hubCreateFailed'), 'error')
     } finally {
       setBatchDownloading(false)
     }
@@ -390,6 +390,18 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
   // DI-2:tree memo 化,仅 repoFiles 变化时重建(勾选/筛选不触发树重算)
   const tree = createMemo(() => buildTree(repoFiles() ?? []))
   const fileCount = () => (repoFiles() ?? []).filter((f: HubFileInfo) => f.type !== 'directory').length
+
+  // 审计 FT-14:无焦点时落到树根第一项,保证仅一个 tabindex=0
+  createEffect(() => {
+    const roots = tree()
+    if (roots.length === 0) {
+      setTreeFocusedPath(null)
+      return
+    }
+    if (!treeFocusedPath()) {
+      setTreeFocusedPath(roots[0]!.path)
+    }
+  })
 
   // DI-5:筛选 + 类型计数
   const counts = createMemo(() => countByType(repoFiles() ?? []))
@@ -566,7 +578,45 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                 {tr("hub.smartSelect")}
               </Button>
             </div>
-            <div role="tree" aria-label={tr("hub.aria.fileTree", { repoId: repoId() })}>
+            <div
+              ref={(el) => {
+                treeContainerRef = el
+              }}
+              role="tree"
+              aria-label={tr("hub.aria.fileTree", { repoId: repoId() })}
+              onKeyDown={(e) => {
+                if (
+                  e.key !== 'ArrowDown' &&
+                  e.key !== 'ArrowUp' &&
+                  e.key !== 'Home' &&
+                  e.key !== 'End'
+                ) {
+                  return
+                }
+                const root = treeContainerRef
+                if (!root) return
+                const items = Array.from(
+                  root.querySelectorAll<HTMLElement>('[role="treeitem"]'),
+                )
+                if (items.length === 0) return
+                const currentPath = treeFocusedPath()
+                let idx = items.findIndex(
+                  (el) => el.dataset.hfPath === currentPath,
+                )
+                if (idx < 0) idx = 0
+                let next = idx
+                if (e.key === 'ArrowDown') next = Math.min(items.length - 1, idx + 1)
+                if (e.key === 'ArrowUp') next = Math.max(0, idx - 1)
+                if (e.key === 'Home') next = 0
+                if (e.key === 'End') next = items.length - 1
+                if (next === idx && e.key !== 'Home' && e.key !== 'End') return
+                e.preventDefault()
+                const el = items[next]!
+                const path = el.dataset.hfPath
+                if (path) setTreeFocusedPath(path)
+                el.focus()
+              }}
+            >
               <For each={tree()}>
                 {(node) => (
                   <TreeNodeItem
@@ -584,6 +634,8 @@ export default function HfBrowserPanel(props: HfBrowserPanelProps) {
                         ? hasMatchedDescendant(node, matched)
                         : matched.has(node.path)
                     }}
+                    focusedPath={treeFocusedPath}
+                    setFocusedPath={setTreeFocusedPath}
                   />
                 )}
               </For>

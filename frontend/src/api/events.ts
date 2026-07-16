@@ -2,14 +2,15 @@ import type { ProgressEvent, SnifferResource, ClipboardUrlDetected } from '../ty
 
 type UnlistenFn = () => void
 
-export async function onProgressUpdate(handler: (payload: ProgressEvent) => void): Promise<UnlistenFn> {
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<ProgressEvent>('progress-update', (e) => handler(e.payload))
-    return unlisten
-  } catch {
-    return () => {}
-  }
+/**
+ * 审计 FT-05:listen 注册失败必须 reject,调用方可 toast/重连。
+ * 不再把注册失败吞成 no-op unlisten(否则 .catch 分支不可达)。
+ */
+export async function onProgressUpdate(
+  handler: (payload: ProgressEvent) => void,
+): Promise<UnlistenFn> {
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<ProgressEvent>('progress-update', (e) => handler(e.payload))
 }
 
 /** 启动恢复时检测到损坏快照的告警 payload */
@@ -22,39 +23,24 @@ export interface RecoveryWarningPayload {
 export async function onRecoveryWarning(
   handler: (payload: RecoveryWarningPayload) => void,
 ): Promise<UnlistenFn> {
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<RecoveryWarningPayload>('recovery-warning', (e) => handler(e.payload))
-    return unlisten
-  } catch {
-    return () => {}
-  }
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<RecoveryWarningPayload>('recovery-warning', (e) => handler(e.payload))
 }
 
 /** 监听新嗅探资源事件(手动添加或未来 adapter 注入时触发) */
 export async function onSnifferResourceAdded(
   handler: (payload: SnifferResource) => void,
 ): Promise<UnlistenFn> {
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<SnifferResource>('sniffer://resource-added', (e) => handler(e.payload))
-    return unlisten
-  } catch {
-    return () => {}
-  }
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<SnifferResource>('sniffer://resource-added', (e) => handler(e.payload))
 }
 
 /** 监听剪贴板 URL 检测事件(后端轮询发现可下载 URL 时触发) */
 export async function onClipboardUrlDetected(
   handler: (payload: ClipboardUrlDetected) => void,
 ): Promise<UnlistenFn> {
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<ClipboardUrlDetected>('clipboard://url-detected', (e) => handler(e.payload))
-    return unlisten
-  } catch {
-    return () => {}
-  }
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<ClipboardUrlDetected>('clipboard://url-detected', (e) => handler(e.payload))
 }
 
 /** 任务终态通知事件 payload */
@@ -69,11 +55,6 @@ export interface TaskNotificationPayload {
 export async function onTaskNotification(
   handler: (payload: TaskNotificationPayload) => void,
 ): Promise<UnlistenFn> {
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen<TaskNotificationPayload>('task-notification', (e) => handler(e.payload))
-    return unlisten
-  } catch {
-    return () => {}
-  }
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<TaskNotificationPayload>('task-notification', (e) => handler(e.payload))
 }

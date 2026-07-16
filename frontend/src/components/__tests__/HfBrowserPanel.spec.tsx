@@ -29,6 +29,7 @@ vi.mock('../../api/invoke', () => ({
   api: {
     getHfDownloadUrl: vi.fn(),
     createTask: vi.fn(),
+    batchCreateHfTasks: vi.fn().mockResolvedValue(['task-1']),
   },
 }))
 

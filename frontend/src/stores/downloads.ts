@@ -108,6 +108,11 @@ export const $hotProgress = {
   get: hotProgress,
 };
 
+/** 读取单任务 hot 进度;缺失时返回 undefined(调用方回退 cold task) */
+export function getHotProgress(taskId: string): HotProgress | undefined {
+  return hotProgress().get(taskId);
+}
+
 export const $tasks = {
   get: () => tasks,
   set: setTasks,
@@ -227,9 +232,11 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       // (后端 #[serde(skip_serializing_if = "Option::is_none")] 省略空值,
       //  仅在探测完成有值时到达前端)
       const newSize = p.fileSize ?? task.fileSize;
-      // P1-22-4: Failed 终态时后端通过进度事件同步 errorReason,
-      // 详情页无需等待 get_task_list 全量刷新即可展示错误详情
-      const newErrorReason = p.errorReason ?? task.errorReason;
+      // 审计 FT-04:errorReason 显式 null 必须可清空;undefined 才表示字段缺失
+      const newErrorReason =
+        p.errorReason !== undefined
+          ? (p.errorReason ?? undefined)
+          : task.errorReason;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -252,14 +259,19 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         pushTaskSpeed(id, newSpeed);
       }
 
-      // cold 层:status 变化时才更新 tasks store(低频)
-      // 同时 hot 层变化时也需同步 tasks store,保持数据一致性
-      const hasChanged = hotChanged || newStatus !== oldStatus;
-      // file_size 变化(探测完成时 None → Some)也需同步到 tasks store
+      // 审计 FT-04:cold 字段(fragmentsTotal/concurrency/errorReason)不能被
+      // hot/status/size 三类条件代理,否则详情线程列与错误文案会卡在旧值
+      const oldConcurrency = task.activeConcurrency ?? 0;
+      const coldChanged =
+        newFragmentsTotal !== task.fragmentsTotal ||
+        newConcurrency !== oldConcurrency ||
+        newErrorReason !== task.errorReason;
       const sizeChanged = newSize !== task.fileSize;
+      const hasChanged =
+        hotChanged || newStatus !== oldStatus || coldChanged || sizeChanged;
 
       // 只有至少一个字段真正变化时才更新 store，避免无意义 reconcile
-      if (hasChanged || sizeChanged) {
+      if (hasChanged) {
         setTasksRaw(idx, {
           downloaded: newDownloaded,
           speed: newSpeed,

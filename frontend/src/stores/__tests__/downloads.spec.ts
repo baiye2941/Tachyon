@@ -262,6 +262,126 @@ describe('downloads store', () => {
     expect(mockAddHistoryRecord).not.toHaveBeenCalled()
   })
 
+  // ── 审计 FT-04:cold 字段独立变化也必须写入 tasks store ─────────
+
+  it('updateProgress 仅 fragmentsTotal 变化时更新 task', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        speed: 100,
+        downloaded: 100,
+        progress: 0.1,
+        fragmentsDone: 0,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.1,
+        downloaded: 100,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 0,
+        fragmentsTotal: 16,
+        activeConcurrency: 0,
+      },
+    })
+
+    expect(downloadsModule.$tasks.get()[0]?.fragmentsTotal).toBe(16)
+  })
+
+  it('updateProgress 仅 activeConcurrency 变化时更新 task', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        speed: 100,
+        downloaded: 100,
+        progress: 0.1,
+        fragmentsDone: 1,
+        fragmentsTotal: 8,
+        activeConcurrency: 1,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.1,
+        downloaded: 100,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 1,
+        fragmentsTotal: 8,
+        activeConcurrency: 4,
+      },
+    })
+
+    expect(downloadsModule.$tasks.get()[0]?.activeConcurrency).toBe(4)
+  })
+
+  it('updateProgress 已 failed 时补发 errorReason 写入 task', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'failed',
+        speed: 0,
+        downloaded: 50,
+        progress: 0.05,
+        fragmentsDone: 0,
+        fragmentsTotal: 4,
+        errorReason: undefined,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.05,
+        downloaded: 50,
+        speed: 0,
+        status: 'failed',
+        fragmentsDone: 0,
+        fragmentsTotal: 4,
+        activeConcurrency: 0,
+        errorReason: 'HTTP 404',
+      },
+    })
+
+    expect(downloadsModule.$tasks.get()[0]?.errorReason).toBe('HTTP 404')
+  })
+
+  it('updateProgress errorReason 显式 null 清空旧错误', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        speed: 100,
+        downloaded: 100,
+        progress: 0.1,
+        fragmentsDone: 1,
+        fragmentsTotal: 4,
+        errorReason: 'stale',
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.1,
+        downloaded: 100,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 1,
+        fragmentsTotal: 4,
+        activeConcurrency: 0,
+        errorReason: null,
+      },
+    })
+
+    expect(downloadsModule.$tasks.get()[0]?.errorReason).toBeUndefined()
+  })
+
   it('refreshTaskList 成功时更新任务列表', async () => {
     const tasks = [makeTask('t1'), makeTask('t2')]
     mockGetTaskList.mockResolvedValue(tasks)

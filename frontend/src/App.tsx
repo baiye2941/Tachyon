@@ -69,6 +69,7 @@ import Skeleton from "./shared/ui/Skeleton";
 import { $confirm, requestConfirm, resolveConfirm } from "./stores/confirm";
 import { clearTaskHistory } from "./stores/taskSpeedHistory";
 import { tr } from "./i18n";
+import { resolveOptimisticConfigOnFailure } from "./utils/asyncRequestIdentity";
 
 const SnifferPanel = lazy(() => import("./components/SnifferPanel"));
 const HistoryPanel = lazy(() => import("./components/HistoryPanel"));
@@ -214,16 +215,20 @@ function AppContent() {
   };
 
   const handleUpdateSnifferConfig = (config: CaptureConfig) => {
-    // 乐观更新:先更新本地状态,再异步提交后端
+    // 审计 FT-11:乐观更新失败后回滚到 previous,避免 UI 与后端永久分叉
+    const previous = snifferConfig();
     setSnifferConfig(config);
     api
       .setSnifferCaptureConfig(config)
-      .catch((e) =>
+      .catch((e) => {
+        setSnifferConfig(
+          resolveOptimisticConfigOnFailure(previous, config, true),
+        );
         addToast(
           tr("sniffer.config.updateFailed", { error: errorMessage(e) }),
           "error",
-        ),
-      );
+        );
+      });
   };
 
   // 嗅探面板首次打开时加载捕获配置(响应式:监听面板可见性)

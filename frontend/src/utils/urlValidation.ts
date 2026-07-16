@@ -9,7 +9,6 @@
 export type UrlProtocol =
   | 'http'
   | 'https'
-  | 'ftp'
   | 'huggingface'
   | 'magnet'
   | 'unknown'
@@ -24,7 +23,6 @@ export interface UrlValidation {
 }
 
 const HTTP_RE = /^https?:\/\/[^\s/$.?#].[^\s]*$/i
-const FTP_RE = /^ftp:\/\/[^\s/$.?#].[^\s]*$/i
 const HF_RE = /^https?:\/\/(www\.)?huggingface\.co\//i
 const MAGNET_RE = /^magnet:\?xt=urn:btih:/i
 
@@ -75,11 +73,11 @@ export function extractSuggestedFileName(raw: string): string | undefined {
 /**
  * 校验单个 URL 字符串。
  *
- * 识别逻辑:
- * - magnet: 磁力链接,有效(通过 BitTorrent 协议下载)
- * - huggingface: HuggingFace 链接,有效(为 Iteration 06 HF Provider 铺路)
- * - http/https/ftp: 标准协议,有效
- * - 其他: invalid
+ * 识别逻辑(与后端 supported_protocols 对齐,审计 FT-13):
+ * - magnet: 磁力链接,有效(BitTorrent)
+ * - huggingface: HuggingFace 链接,有效
+ * - http/https: 标准协议,有效
+ * - ftp 及其他: invalid(后端不支持 FTP)
  */
 export function validateUrl(raw: string): UrlValidation {
   const trimmed = raw.trim()
@@ -107,10 +105,6 @@ export function validateUrl(raw: string): UrlValidation {
       valid: true,
       protocol: trimmed.startsWith('https') ? 'https' : 'http',
     }
-  }
-
-  if (FTP_RE.test(trimmed)) {
-    return { valid: true, protocol: 'ftp' }
   }
 
   return {

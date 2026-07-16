@@ -1,4 +1,5 @@
 import { createSignal, createMemo, For, Show } from 'solid-js'
+import { createVirtualizer } from '@tanstack/solid-virtual'
 import type { SnifferResource, CaptureConfig, SnifferResourceType } from '../types'
 import {
   CloseIcon, BrowserIcon, VideoIcon, AudioIcon, DocumentIcon,
@@ -71,6 +72,18 @@ export default function SnifferPanel(props: SnifferPanelProps) {
     const ft = filterType()
     if (ft === 'all') return props.resources
     return props.resources.filter(r => r.type === ft)
+  })
+
+  /** 审计 FT-06:资源列表虚拟滚动(固定行高约 72px) */
+  const SNIFFER_ROW_HEIGHT = 72
+  let listScrollRef: HTMLDivElement | undefined
+  const resourceVirtualizer = createVirtualizer({
+    get count() {
+      return filteredResources().length
+    },
+    getScrollElement: () => listScrollRef ?? null,
+    estimateSize: () => SNIFFER_ROW_HEIGHT,
+    overscan: 8,
   })
 
   const toggleSelect = (id: string) => {
@@ -184,12 +197,15 @@ export default function SnifferPanel(props: SnifferPanelProps) {
           <button
             class="icon-btn-sm hover-light"
             title={tr("sniffer.clear")}
+            aria-label={tr("sniffer.clear")}
             onClick={handleClear}
           >
             <TrashIcon />
           </button>
           <button
             class="icon-btn-sm hover-light"
+            title={tr("sniffer.close")}
+            aria-label={tr("sniffer.close")}
             onClick={() => props.onClose()}
           >
             <CloseIcon />
@@ -342,6 +358,8 @@ export default function SnifferPanel(props: SnifferPanelProps) {
                         <button
                           class="icon-btn-sm hover-light"
                           style={{ width: '24px', height: '24px', 'flex-shrink': 0 }}
+                          title={tr('sniffer.removeFilter')}
+                          aria-label={tr('sniffer.removeFilter')}
                           onClick={() => removeUrlFilter(keyword)}
                         >
                           <CloseIcon />
@@ -394,8 +412,14 @@ export default function SnifferPanel(props: SnifferPanelProps) {
         </Button>
       </div>
 
-      {/* Resource List */}
-      <div class="flex-1 scroll-container" style={{ padding: '0 12px 12px' }}>
+      {/* Resource List — 审计 FT-06:虚拟列表,避免 1000 项全量 DOM */}
+      <div
+        ref={(el) => {
+          listScrollRef = el
+        }}
+        class="flex-1 scroll-container"
+        style={{ padding: '0 12px 12px' }}
+      >
         <Show when={filteredResources().length > 0} fallback={
           <div class="flex flex-col items-center justify-center" style={{
             padding: '48px 20px',
@@ -409,79 +433,103 @@ export default function SnifferPanel(props: SnifferPanelProps) {
             {tr("sniffer.empty")}
           </div>
         }>
-          <For each={filteredResources()}>
-            {(resource, index) => {
-              const isSelected = () => selectedIds().has(resource.id)
-              const Icon = (typeIcons[resource.type] ?? typeIcons['other'])!
-              return (
-                <div
-                  class="flex items-start gap-3 cursor-pointer hover-row"
-                  style={{
-                    padding: '10px 12px',
-                    'border-radius': '8px',
-                    background: isSelected() ? 'var(--color-accent-soft)' : 'transparent',
-                    'border-left': isSelected() ? '2px solid var(--color-accent-primary)' : '2px solid transparent',
-                    transition: 'all 150ms ease',
-                    animation: `card-fade-in 200ms ease forwards`,
-                    'animation-delay': `${index() * 40}ms`,
-                    opacity: 0,
-                  }}
-                  onClick={() => {
-                    if (batchMode()) {
-                      toggleSelect(resource.id)
-                    }
-                  }}
-                >
-                  {/* Icon */}
+          <div
+            style={{
+              position: 'relative',
+              height: `${resourceVirtualizer.getTotalSize()}px`,
+            }}
+          >
+            <For each={resourceVirtualizer.getVirtualItems()}>
+              {(virtualRow) => {
+                const resource = () => filteredResources()[virtualRow.index]!
+                const index = () => virtualRow.index
+                const isSelected = () => selectedIds().has(resource().id)
+                const IconComp =
+                  typeIcons[resource().type] ?? typeIcons['other']!
+                return (
                   <div
-                    class="flex-shrink-0 flex items-center justify-center"
                     style={{
-                      width: '32px',
-                      height: '32px',
-                      color: typeColors[resource.type] || 'var(--color-file-other)',
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      height: `${virtualRow.size}px`,
+                      transform: `translateY(${virtualRow.start}px)`,
                     }}
                   >
-                    <Show when={batchMode()} fallback={<Icon />}>
-                      <div style={{ color: isSelected() ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}>
-                        <CheckboxIcon checked={isSelected()} />
-                      </div>
-                    </Show>
-                  </div>
-
-                  {/* Info */}
-                  <div class="flex-1 min-w-0">
-                    <div class="truncate" style={{ 'font-size': '14px', color: 'var(--color-text-title)', 'font-weight': 500 }}>
-                      {resource.name}
-                    </div>
-                    <div style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
-                      {formatSize(resource.size)} · {resource.contentType || resource.type}
-                    </div>
-                    <Show when={resource.sourcePage}>
-                      <div class="truncate" style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
-                        {resource.sourcePage}
-                      </div>
-                    </Show>
-                  </div>
-
-                  {/* Add button */}
-                  <Show when={!batchMode()}>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      class="hover-accent"
-                      style={{ color: 'var(--color-accent-primary)' }}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        props.onAddDownload(resource)
+                    <div
+                      class="flex items-start gap-3 cursor-pointer hover-row"
+                      style={{
+                        padding: '10px 12px',
+                        'border-radius': '8px',
+                        height: '100%',
+                        'box-sizing': 'border-box',
+                        background: isSelected() ? 'var(--color-accent-soft)' : 'transparent',
+                        'border-left': isSelected() ? '2px solid var(--color-accent-primary)' : '2px solid transparent',
+                        transition: 'background 150ms ease, border-color 150ms ease',
+                        animation: `card-fade-in 200ms ease forwards`,
+                        // 审计 FT-06:stagger 仅限首屏约 8 项,硬顶 320ms
+                        'animation-delay': `${Math.min(index(), 8) * 40}ms`,
+                        opacity: 0,
+                      }}
+                      onClick={() => {
+                        if (batchMode()) {
+                          toggleSelect(resource().id)
+                        }
                       }}
                     >
-                      <PlusIcon />
-                    </Button>
-                  </Show>
-                </div>
-              )
-            }}
-          </For>
+                      {/* Icon */}
+                      <div
+                        class="flex-shrink-0 flex items-center justify-center"
+                        style={{
+                          width: '32px',
+                          height: '32px',
+                          color: typeColors[resource().type] || 'var(--color-file-other)',
+                        }}
+                      >
+                        <Show when={batchMode()} fallback={<IconComp />}>
+                          <div style={{ color: isSelected() ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}>
+                            <CheckboxIcon checked={isSelected()} />
+                          </div>
+                        </Show>
+                      </div>
+
+                      {/* Info */}
+                      <div class="flex-1 min-w-0">
+                        <div class="truncate" style={{ 'font-size': '14px', color: 'var(--color-text-title)', 'font-weight': 500 }}>
+                          {resource().name}
+                        </div>
+                        <div style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
+                          {formatSize(resource().size)} · {resource().contentType || resource().type}
+                        </div>
+                        <Show when={resource().sourcePage}>
+                          <div class="truncate" style={{ 'font-size': '12px', color: 'var(--color-text-tertiary)', 'margin-top': '2px' }}>
+                            {resource().sourcePage}
+                          </div>
+                        </Show>
+                      </div>
+
+                      {/* Add button */}
+                      <Show when={!batchMode()}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          class="hover-accent"
+                          style={{ color: 'var(--color-accent-primary)' }}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            props.onAddDownload(resource())
+                          }}
+                        >
+                          <PlusIcon />
+                        </Button>
+                      </Show>
+                    </div>
+                  </div>
+                )
+              }}
+            </For>
+          </div>
         </Show>
       </div>
 

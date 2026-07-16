@@ -68,20 +68,25 @@ export default defineConfig({
               "@tauri-apps/plugin-dialog",
               "@tauri-apps/plugin-notification",
               "@motionone/solid",
+              "@tanstack/solid-virtual",
             ];
             if (vendorLibs.some((lib) => id.includes(lib))) {
               return "vendor";
             }
+            return undefined;
           }
-          const panelModules = [
-            "/components/SnifferPanel",
-            "/components/HistoryPanel",
-            "/components/SettingsPanel",
-            "/components/NewTaskModal",
-            "/components/CommandPalette",
+          // 审计 FT-16:懒加载面板各自独立 chunk,禁止合并成单一 panels
+          const panelChunkMap: Array<[string, string]> = [
+            ["/components/SnifferPanel", "panel-sniffer"],
+            ["/components/HistoryPanel", "panel-history"],
+            ["/components/settings/SettingsPanel", "panel-settings"],
+            ["/components/NewTaskModal", "panel-new-task"],
+            ["/components/CommandPalette", "panel-command"],
+            ["/components/HfBrowserPanel", "panel-hf"],
+            ["/components/ShortcutHelp", "panel-shortcuts"],
           ];
-          if (panelModules.some((module) => id.includes(module))) {
-            return "panels";
+          for (const [modulePath, chunkName] of panelChunkMap) {
+            if (id.includes(modulePath)) return chunkName;
           }
           return undefined;
         },

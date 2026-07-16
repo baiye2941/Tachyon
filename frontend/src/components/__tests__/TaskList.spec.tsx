@@ -239,15 +239,17 @@ describe("TaskList 空状态与交互", () => {
       />
     ));
 
-    const headers = container.querySelectorAll('[role="columnheader"]');
+    // 审计 FT-14:listbox 不再伪用 columnheader/grid;表头用 .task-list-col
+    const headers = container.querySelectorAll(".task-list-col");
     expect(headers.length).toBe(4);
     expect(headers[0]?.textContent).toContain("文件名");
     expect(headers[1]?.textContent).toContain("进度");
     expect(headers[2]?.textContent).toContain("速度");
     expect(headers[3]?.textContent).toContain("状态");
+    expect(container.querySelectorAll('[role="columnheader"]').length).toBe(0);
   });
 
-  it("表头应具有 scope=col", () => {
+  it("可排序列头使用 button 角色且具备焦点环样式", () => {
     const { container } = renderWithI18n(() => (
       <TaskList
         tasks={[]}
@@ -260,31 +262,12 @@ describe("TaskList 空状态与交互", () => {
       />
     ));
 
-    const headers = container.querySelectorAll('[role="columnheader"]');
-    expect(headers.length).toBeGreaterThan(0);
-    headers.forEach((h) => {
-      expect(h.getAttribute("scope")).toBe("col");
-    });
-  });
-
-  it("可排序列头应具备焦点环样式", () => {
-    const { container } = renderWithI18n(() => (
-      <TaskList
-        tasks={[]}
-        selectedTaskId={null}
-        onTaskClick={noopTaskClick}
-        isMultiSelectMode={false}
-        selectedTaskIds={new Set()}
-        density="comfortable"
-        keyboardHandlers={noopHandlers()}
-      />
-    ));
-
-    const headers = container.querySelectorAll('[role="columnheader"]');
+    const headers = container.querySelectorAll(".task-list-col");
     expect(headers.length).toBeGreaterThan(0);
 
     headers.forEach((h) => {
       if (h.hasAttribute("tabindex")) {
+        expect(h.getAttribute("role")).toBe("button");
         const className = h.className;
         expect(className).toContain("focus:outline-none");
         expect(className).toContain("focus-visible:focus-ring");
@@ -313,7 +296,7 @@ describe("TaskList 空状态与交互", () => {
     expect(sizeCheckbox).not.toBeNull();
     fireEvent.click(sizeCheckbox!);
 
-    const headers = container.querySelectorAll('[role="columnheader"]');
+    const headers = container.querySelectorAll(".task-list-col");
     expect(headers.length).toBe(5);
     expect(Array.from(headers).some((h) => h.textContent?.includes("大小"))).toBe(true);
   });
@@ -356,7 +339,7 @@ describe("TaskList 空状态与交互", () => {
       />
     ));
 
-    const headers = container.querySelectorAll('[role="columnheader"]');
+    const headers = container.querySelectorAll(".task-list-col");
     const progressHeader = Array.from(headers).find((h) =>
       h.textContent?.includes("进度"),
     );
@@ -385,7 +368,7 @@ describe("TaskList 空状态与交互", () => {
     const speedCheckbox = screen.getByRole("checkbox", { name: /速度/ });
     fireEvent.click(speedCheckbox!);
 
-    const headers = container.querySelectorAll('[role="columnheader"]');
+    const headers = container.querySelectorAll(".task-list-col");
     expect(Array.from(headers).some((h) => h.textContent?.includes("速度"))).toBe(false);
   });
 

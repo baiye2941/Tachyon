@@ -494,6 +494,7 @@ pub async fn batch_create_hf_tasks(
     revision: Option<String>,
     file_paths: Vec<String>,
     download_dir: Option<String>,
+    force_mirror: Option<bool>,
 ) -> Result<Vec<String>, AppError> {
     validate_repo_id(&repo_id)?;
     let rev = revision.unwrap_or_else(|| "main".to_string());
@@ -507,10 +508,16 @@ pub async fn batch_create_hf_tasks(
     let api = tachyon_hub::api::HubApi::from_config(&hub)
         .map_err(|e| AppError::Config(format!("Hub API 初始化失败: {e}")))?;
 
+    let force_mirror = force_mirror.unwrap_or(false);
+
     let mut task_ids = Vec::new();
     for file_path in file_paths {
         validate_file_path(&file_path)?;
-        let url = api.download_url(&repo_id, &rev, &file_path);
+        let mut url = api.download_url(&repo_id, &rev, &file_path);
+        // 审计 FT-07:显式镜像时仍注入 HfTaskMeta;URL 走 hf-mirror resolve
+        if force_mirror {
+            url = super::rewrite_hf_url(&url, tachyon_core::config::HfSourceMode::Mirror);
+        }
         let hf_meta = HfTaskMeta {
             repo_id: repo_id.clone(),
             revision: rev.clone(),

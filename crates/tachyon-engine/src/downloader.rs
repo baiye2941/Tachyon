@@ -333,6 +333,11 @@ impl DownloadTask {
         .await
     }
 
+    /// 便利构造:带连接池但使用 **默认** 调度器。
+    ///
+    /// 审计 A-13:生产路径应优先 `with_pool_and_scheduler` + `AppConfig.scheduler`;
+    /// 本方法保留给测试/简易调用,勿在 app 层使用以免再引入 A-04 默认调度分叉。
+    #[deprecated(note = "use with_pool_and_scheduler with AppConfig.scheduler (A-04/A-13)")]
     pub async fn with_pool(
         url: String,
         config: DownloadConfig,

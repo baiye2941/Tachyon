@@ -7,6 +7,7 @@ import {
   type ColumnKey,
 } from "./taskColumns";
 import { $taskColumns } from "../stores/taskColumnsConfig";
+import { getHotProgress } from "../stores/downloads";
 import {
   formatSize,
   formatSpeed,
@@ -84,6 +85,29 @@ export default function TaskItem(props: TaskItemProps) {
   const fileInfo = createMemo(() => getFileType(props.task.fileName));
   const isCompact = createMemo(() => props.density === "compact");
 
+  // 审计 FT-04:高频字段优先读 $hotProgress,避免列表只依赖 cold task 陈旧值
+  const liveProgress = createMemo(() => {
+    const hot = getHotProgress(props.task.id);
+    return hot?.progress ?? props.task.progress;
+  });
+  const liveSpeed = createMemo(() => {
+    const hot = getHotProgress(props.task.id);
+    return hot?.speed ?? props.task.speed;
+  });
+
+  /** 列渲染用的 task 视图:hot 字段覆盖 cold 实体 */
+  const displayTask = createMemo(() => {
+    const hot = getHotProgress(props.task.id);
+    if (!hot) return props.task;
+    return {
+      ...props.task,
+      progress: hot.progress,
+      speed: hot.speed,
+      downloaded: hot.downloaded,
+      fragmentsDone: hot.fragmentsDone,
+    };
+  });
+
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -92,7 +116,7 @@ export default function TaskItem(props: TaskItemProps) {
   };
 
   const ariaLabel = () => {
-    const progress = (props.task.progress * 100).toFixed(1);
+    const progress = (liveProgress() * 100).toFixed(1);
     const status = getStatusLabel(props.task.status);
     return tr("taskList.aria.taskItem", {
       name: props.task.fileName,
@@ -222,15 +246,15 @@ export default function TaskItem(props: TaskItemProps) {
                             : tr("taskList.unknownSize")}
                           {" · "}
                           {props.task.url.split(":")[0]?.toUpperCase() ?? ""}
-                          {props.task.speed > 0 &&
-                            ` · ${formatSpeed(props.task.speed)}`}
+                          {liveSpeed() > 0 &&
+                            ` · ${formatSpeed(liveSpeed())}`}
                         </div>
                       </Show>
                     </div>
                   </div>
 
                   <LiquidProgress
-                    progress={props.task.progress}
+                    progress={liveProgress()}
                     status={props.task.status}
                     size="sm"
                     class={`task-row-progress ${isCompact() ? "task-row-progress--compact" : ""}`}
@@ -240,7 +264,7 @@ export default function TaskItem(props: TaskItemProps) {
               </div>
             ) : (
               <span class="task-list-cell-text">
-                {COLUMN_CELL_RENDERERS[col.key](props.task, {
+                {COLUMN_CELL_RENDERERS[col.key](displayTask(), {
                   isCompact: isCompact(),
                 })}
               </span>

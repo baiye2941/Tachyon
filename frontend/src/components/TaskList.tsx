@@ -549,9 +549,8 @@ export default function TaskList(props: TaskListProps) {
                 : "none";
             return (
               <div
-                role="columnheader"
-                {...{ scope: "col" }}
-                aria-sort={ariaSort()}
+                role={col.sortable ? "button" : undefined}
+                aria-sort={col.sortable ? ariaSort() : undefined}
                 class={`task-list-col task-list-col--align-${col.align}`}
                 classList={{
                   "task-list-col--sortable": col.sortable,
@@ -751,6 +750,7 @@ export default function TaskList(props: TaskListProps) {
         >
           {/* Outer wrapper: sets total scrollable height via spacer */}
           <div
+            role="presentation"
             style={{
               position: "relative",
               height: `${virtualizer.getTotalSize()}px`,

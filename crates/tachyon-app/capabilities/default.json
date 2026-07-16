@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Tachyon 主窗口默认权限:核心事件/窗口/对话框;剪贴板由后端 ClipboardWatcher 读取,不向 WebView 暴露 clipboard-manager:allow-read-text(SEC-009)",
+  "description": "Tachyon 主窗口默认权限: core 窗口控制; dialog open/save; notification 系统通知; 剪贴板仅后端 ClipboardWatcher 读取(无 clipboard-manager:allow-read-text, SEC-009); 无 shell",
   "windows": [
     "main"
   ],
@@ -13,6 +13,8 @@
     "core:window:allow-close",
     "core:window:allow-is-maximized",
     "core:window:allow-start-dragging",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "notification:default"
   ]
 }

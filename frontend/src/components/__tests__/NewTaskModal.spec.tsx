@@ -360,4 +360,59 @@ describe("NewTaskModal", () => {
       expect(panel!.getAttribute("style")).toContain("padding: 16px");
     });
   });
+
+  describe("审计 FT-09 部分失败不关弹窗", () => {
+    it("全部 createTask 失败时不调用 onClose 且保留 URL 文本", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.createTask as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("boom"),
+      );
+      const onClose = vi.fn();
+
+      render(() => <NewTaskModal onClose={onClose} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: "https://example.com/a.bin" },
+        currentTarget: { value: "https://example.com/a.bin" },
+      });
+
+      await fireEvent.click(screen.getByRole("button", { name: /开始/ }));
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(api.createTask).toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+      expect((screen.getByLabelText(/下载链接/) as HTMLTextAreaElement).value).toContain(
+        "https://example.com/a.bin",
+      );
+    });
+
+    it("部分失败时仅保留失败 URL 且不关闭", async () => {
+      const { api } = await import("../../api/invoke");
+      (api.createTask as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce("ok-1")
+        .mockRejectedValueOnce(new Error("fail-2"));
+      const onClose = vi.fn();
+
+      render(() => <NewTaskModal onClose={onClose} />);
+
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: {
+          value: "https://example.com/ok.bin\nhttps://example.com/bad.bin",
+        },
+        currentTarget: {
+          value: "https://example.com/ok.bin\nhttps://example.com/bad.bin",
+        },
+      });
+
+      await fireEvent.click(screen.getByRole("button", { name: /开始/ }));
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(onClose).not.toHaveBeenCalled();
+      const text = (screen.getByLabelText(/下载链接/) as HTMLTextAreaElement).value;
+      expect(text).toContain("https://example.com/bad.bin");
+      expect(text).not.toContain("https://example.com/ok.bin");
+    });
+  });
 });
