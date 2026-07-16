@@ -70,12 +70,24 @@ pub fn run() {
     tauri::async_runtime::set(runtime.handle().clone());
     let _runtime_guard = runtime;
 
+    // 白屏根因之一:AppState::new().expect 在存储锁占用时直接 panic,
+    // WebView 未启动,用户只见空白窗口。改为显式错误退出。
+    let app_state = match AppState::try_new() {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!(error = %e, "AppState 初始化失败,应用退出");
+            eprintln!("Tachyon 启动失败: {e}");
+            eprintln!("若已有 Tachyon 实例在运行,请先关闭后再试(数据目录锁: ~/.tachyon/store/.lock)。");
+            std::process::exit(1);
+        }
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // 审计 FT-03:系统通知路径需注册插件;未使用的 shell 已移除以缩小攻击面
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(AppState::new())
+        .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>();
             let handle = app.handle().clone();

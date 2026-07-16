@@ -471,6 +471,7 @@ impl AppState {
     }
 
     pub fn new() -> Self {
+        // CLI/测试路径仍用 expect;GUI run() 必须走 try_new 以免白屏 panic
         Self::try_new().expect("AppState 初始化失败")
     }
 

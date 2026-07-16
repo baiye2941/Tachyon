@@ -61,32 +61,21 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes("node_modules")) {
-            const vendorLibs = [
-              "solid-js",
-              "@tauri-apps/api",
-              "@tauri-apps/plugin-dialog",
-              "@tauri-apps/plugin-notification",
-              "@motionone/solid",
-              "@tanstack/solid-virtual",
-            ];
-            if (vendorLibs.some((lib) => id.includes(lib))) {
-              return "vendor";
-            }
-            return undefined;
-          }
-          // 审计 FT-16:懒加载面板各自独立 chunk,禁止合并成单一 panels
-          const panelChunkMap: Array<[string, string]> = [
-            ["/components/SnifferPanel", "panel-sniffer"],
-            ["/components/HistoryPanel", "panel-history"],
-            ["/components/settings/SettingsPanel", "panel-settings"],
-            ["/components/NewTaskModal", "panel-new-task"],
-            ["/components/CommandPalette", "panel-command"],
-            ["/components/HfBrowserPanel", "panel-hf"],
-            ["/components/ShortcutHelp", "panel-shortcuts"],
+          // 审计 FT-16 修正:仅拆 node_modules vendor。
+          // 禁止用 path includes 把懒加载面板打成独立 chunk——rolldown/vite
+          // 会把共享模块(含 solid-js/stores)吸入 panel-command,导致 index
+          // 静态 import 面板 chunk,白屏或破坏真正 lazy。
+          if (!id.includes("node_modules")) return undefined;
+          const vendorLibs = [
+            "solid-js",
+            "@tauri-apps/api",
+            "@tauri-apps/plugin-dialog",
+            "@tauri-apps/plugin-notification",
+            "@motionone/solid",
+            "@tanstack/solid-virtual",
           ];
-          for (const [modulePath, chunkName] of panelChunkMap) {
-            if (id.includes(modulePath)) return chunkName;
+          if (vendorLibs.some((lib) => id.includes(lib))) {
+            return "vendor";
           }
           return undefined;
         },
