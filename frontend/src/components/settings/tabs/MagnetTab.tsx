@@ -1,5 +1,5 @@
 import type { SetStoreFunction } from "solid-js/store";
-import { For, Show, createResource, createMemo } from "solid-js";
+import { For, Show, createMemo } from "solid-js";
 import { tr } from "../../../i18n";
 import { addToast } from "../../../stores/toast";
 import NumberInput from "../items/NumberInput";
@@ -10,7 +10,7 @@ import { PRESET_TRACKERS } from "../constants";
 import { computeBtProxyCoverage, type BtProxyCoverageReport } from "../../../utils/btProxyCoverage";
 import type { ProxyCoverage, SocksProxySource } from "../../../types";
 import type { ConfigDraft } from "../SettingsPanel";
-import { api } from "../../../api/invoke";
+import { getBtProxyCoverageResource } from "../../../stores/btProxyCoverageCache";
 
 export interface MagnetTabProps {
   draft: ConfigDraft;
@@ -165,15 +165,11 @@ export default function MagnetTab(props: MagnetTabProps) {
 
 /// 审计 A-09:BT 代理流量覆盖面板。优先展示后端 Session 运行时 effective SOCKS;
 /// draft 仅作未应用预测,避免环境代理实际生效时 UI 隐藏面板。
+/// 闪烁修复:运行时报告用应用级缓存 resource,tab 重挂载不重新 fetch,
+/// 避免 pending(隐藏) -> resolved(显示) 的单帧 DOM 闪烁。
 function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
   const t = tr;
-  const [runtime] = createResource(async () => {
-    try {
-      return await api.getBtProxyCoverage();
-    } catch {
-      return null;
-    }
-  });
+  const runtime = getBtProxyCoverageResource();
 
   const draftReport = createMemo((): BtProxyCoverageReport =>
     computeBtProxyCoverage(props.draft.magnet),
