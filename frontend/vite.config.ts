@@ -17,21 +17,25 @@ export default defineConfig({
     // deps optimizer 在插件钩子前用 new URL 把 /@solid-refresh 转成
     // file:///@solid-refresh 触发 TypeError。此插件在 solidPlugin 之前
     // 把虚拟 id 重定向到真实文件,绕过 vitest 的错误转换。
-    {
-      name: "solid-refresh-virtual-fix",
-      enforce: "pre",
-      resolveId(id) {
-        if (id === "/@solid-refresh") {
-          // pathToFileURL:Windows 下 require.resolve 返回带反斜杠的绝对路径,
-          // rollup 的 resolveId 钩子约定返回 file:// URL 或绝对路径均可,
-          // 统一转 file:// URL 避免跨平台路径分隔符差异。
-          return pathToFileURL(
-            require.resolve("solid-refresh/dist/solid-refresh.mjs")
-          ).href;
-        }
-        return null;
-      },
-    },
+    //
+    // 重要:仅限 vitest 环境。dev/build 浏览器会拒绝 file:// 加载导致白屏,
+    // 而 vite-plugin-solid 自带 /@solid-refresh 虚拟模块在 dev 下工作正常。
+    ...(process.env.VITEST
+      ? [
+          {
+            name: "solid-refresh-virtual-fix",
+            enforce: "pre" as const,
+            resolveId(id: string) {
+              if (id === "/@solid-refresh") {
+                return pathToFileURL(
+                  require.resolve("solid-refresh/dist/solid-refresh.mjs"),
+                ).href;
+              }
+              return null;
+            },
+          },
+        ]
+      : []),
     solidPlugin(),
     tailwindcss(),
     process.env.ANALYZE === "true"
