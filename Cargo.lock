@@ -5057,15 +5057,13 @@ version = "0.1.1-0"
 dependencies = [
  "chrono",
  "dashmap",
+ "futures",
  "mimalloc",
  "serde",
  "serde_json",
  "tachyon-core",
- "tachyon-crypto",
  "tachyon-engine",
  "tachyon-hub",
- "tachyon-io",
- "tachyon-scheduler",
  "tachyon-sniffer",
  "tachyon-store",
  "tauri",
@@ -5209,6 +5207,7 @@ name = "tachyon-sniffer"
 version = "0.1.1-0"
 dependencies = [
  "serde",
+ "serde_json",
  "tachyon-core",
  "tracing",
  "url",

@@ -10,7 +10,7 @@ pub mod http;
 #[cfg(feature = "magnet")]
 pub mod magnet;
 
-pub use http::HttpClient;
+pub use http::{HttpClient, effective_quic_enabled, http3_compiled};
 #[cfg(feature = "magnet")]
 pub use magnet::BtPeerStats;
 #[cfg(feature = "magnet")]
@@ -51,6 +51,7 @@ async fn download_range_stream() {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 })
             })
         }

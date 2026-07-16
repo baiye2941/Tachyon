@@ -10,6 +10,7 @@ pub mod circuit_breaker;
 pub mod connection;
 pub mod downloader;
 pub mod fragment;
+pub mod http_client_registry;
 mod mirror;
 pub mod rate_limit;
 mod storage_adapter;
@@ -19,14 +20,24 @@ pub mod bt_session;
 #[cfg(feature = "magnet")]
 pub mod bt_storage;
 
-pub use connection::{ConnectionPool, PoolConfig};
-pub use downloader::{DownloadTask, StorageKind, VerifierKind, default_blake3_verifier};
+pub use connection::{ConcurrencyLimiter, ConnectionPool, PoolConfig};
+pub use downloader::{
+    DownloadTask, StorageKind, VerifierKind, create_adaptive_scheduler, default_blake3_verifier,
+    default_sha256_verifier, sha256_file,
+};
 pub use fragment::{BandwidthTracker, FragmentRecord, FragmentState};
+pub use http_client_registry::{HttpClientRegistry, global_http_client_registry};
 pub use rate_limit::RateLimiter;
 pub use tachyon_core::FragmentProgress;
+// 审计 A-01:app 经 engine 门面获取下游类型,禁止直接依赖 io/scheduler/crypto
+pub use tachyon_io::BufferPool;
+pub use tachyon_scheduler::AdaptiveDownloadScheduler;
 
 #[cfg(feature = "magnet")]
-pub use bt_session::{BtSession, ProxyCoverage, ProxyCoverageReport, bt_proxy_coverage_status};
+pub use bt_session::{
+    BtSession, ProxyCoverage, ProxyCoverageReport, SocksProxySource, bt_proxy_coverage_status,
+    bt_proxy_coverage_status_effective,
+};
 #[cfg(feature = "magnet")]
 pub use tachyon_protocol::MagnetProtocol;
 #[cfg(feature = "magnet")]
@@ -44,6 +55,17 @@ fn verifier() {
     let hash = v.compute_hash(data).unwrap();
     let hash2 = v2.compute_hash(data).unwrap();
     assert_eq!(hash, hash2, "clone 后校验器应行为一致");
+}
+
+/// 审计 A-01:engine 门面工厂可构造调度器
+#[cfg(test)]
+#[test]
+fn test_a01_create_adaptive_scheduler_facade() {
+    let cfg = tachyon_core::config::SchedulerConfig::default();
+    let sched = create_adaptive_scheduler(cfg);
+    let rec = sched.recommend(1024 * 1024, 0);
+    assert!(rec.concurrency >= 1);
+    assert!(rec.fragment_size >= 1);
 }
 
 /// 验证信号量关闭时返回错误而非 panic

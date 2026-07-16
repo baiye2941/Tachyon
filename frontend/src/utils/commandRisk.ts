@@ -64,6 +64,7 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   undo_cancel_task: 'destructive',
   undo_delete_task: 'destructive',
   update_config: 'destructive',
+  authorize_download_directory: 'destructive',
   export_backup: 'destructive',
   import_backup: 'destructive',
 }

@@ -7,6 +7,7 @@
 
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -62,9 +63,73 @@ pub fn check_response_size_limit(content_length: Option<u64>) -> DownloadResult<
     Ok(())
 }
 
+/// 协议保留头:用户自定义 headers 不得覆盖,否则破坏 Range/If-Range/Host 等引擎语义。
+fn is_reserved_request_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "range"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "content-encoding"
+            | "expect"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "keep-alive"
+            | "proxy-connection"
+            | "if-range"
+            | "if-match"
+            | "if-none-match"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "authorization"
+            | "cookie"
+            | "proxy-authorization"
+            | "user-agent" // 走独立 user_agent 字段
+    )
+}
+
+/// 将 DownloadConfig.headers 转为 reqwest default_headers,过滤 reserved/CRLF。
+fn build_default_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> DownloadResult<reqwest::header::HeaderMap> {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (key, value) in headers {
+        if key.contains('\r') || key.contains('\n') || value.contains('\r') || value.contains('\n')
+        {
+            return Err(DownloadError::Config(format!(
+                "headers 键/值不能包含换行符(CR/LF): {key}"
+            )));
+        }
+        if is_reserved_request_header(key) {
+            warn!(header = %key, "忽略保留请求头,防止覆盖协议语义");
+            continue;
+        }
+        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| DownloadError::Config(format!("非法 header 名 '{key}': {e}")))?;
+        let val = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|e| DownloadError::Config(format!("非法 header 值 '{key}': {e}")))?;
+        map.insert(name, val);
+    }
+    Ok(map)
+}
+
+/// 审计 SEC-004/下载:HF token 仅允许发往官方 huggingface.co 主机(含子域)
+pub fn host_allows_hf_token(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "huggingface.co" || h.ends_with(".huggingface.co")
+}
+
 /// HTTP/HTTPS 协议客户端
+#[derive(Clone)]
 pub struct HttpClient {
     client: Client,
+    /// 可选 Bearer token;仅当请求 host 为官方 huggingface.co 时附加 Authorization
+    auth_bearer: Option<String>,
+    /// 审计 HTTP-13:最近一次成功响应 final host
+    last_resolved_host: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl HttpClient {
@@ -89,7 +154,43 @@ impl HttpClient {
         read_secs: u64,
         proxy: Option<&str>,
     ) -> DownloadResult<Self> {
-        Self::build_client(connect_secs, read_secs, false, false, 16, 30, proxy)
+        Self::build_client(
+            connect_secs,
+            read_secs,
+            false,
+            false,
+            16,
+            30,
+            proxy,
+            tachyon_core::config::USER_AGENT,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    /// 带 DownloadConfig 身份(UA + 自定义 headers)的超时构造
+    pub fn with_timeouts_and_headers(
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<&str>,
+        user_agent: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> DownloadResult<Self> {
+        let ua = if user_agent.is_empty() {
+            tachyon_core::config::USER_AGENT
+        } else {
+            user_agent
+        };
+        Self::build_client(
+            connect_secs,
+            read_secs,
+            false,
+            false,
+            16,
+            30,
+            proxy,
+            ua,
+            headers,
+        )
     }
 
     /// 使用连接配置创建 HTTP 客户端(含 HTTP/2 控制与连接池调优)
@@ -111,7 +212,70 @@ impl HttpClient {
             config.max_connections_per_host as usize,
             config.keep_alive_timeout_secs,
             proxy,
+            tachyon_core::config::USER_AGENT,
+            &std::collections::HashMap::new(),
         )
+    }
+
+    /// 连接配置 + DownloadConfig 身份(UA + headers)
+    pub fn with_connection_config_and_headers(
+        config: &tachyon_core::config::ConnectionConfig,
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<&str>,
+        user_agent: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> DownloadResult<Self> {
+        let ua = if user_agent.is_empty() {
+            tachyon_core::config::USER_AGENT
+        } else {
+            user_agent
+        };
+        Self::build_client(
+            connect_secs,
+            read_secs,
+            config.enable_http2,
+            config.enable_quic,
+            config.max_connections_per_host as usize,
+            config.keep_alive_timeout_secs,
+            proxy,
+            ua,
+            headers,
+        )
+    }
+
+    /// 注入运行时 Bearer token(不进 default_headers,按请求 host 门禁)
+    pub fn with_auth_bearer(mut self, token: Option<String>) -> Self {
+        self.auth_bearer = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// 当前是否持有 token(测试/诊断;不暴露明文)
+    pub fn has_auth_bearer(&self) -> bool {
+        self.auth_bearer.is_some()
+    }
+
+    fn note_resolved_host(&self, response_url: &reqwest::Url) {
+        if let Some(host) = response_url.host_str()
+            && let Ok(mut guard) = self.last_resolved_host.lock()
+        {
+            *guard = Some(host.to_string());
+        }
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilder {
+        let Some(token) = self.auth_bearer.as_deref() else {
+            return req;
+        };
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return req;
+        };
+        match parsed.host_str() {
+            Some(host) if host_allows_hf_token(host) => {
+                req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            }
+            _ => req,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -123,9 +287,13 @@ impl HttpClient {
         pool_max_idle_per_host: usize,
         keep_alive_secs: u64,
         proxy: Option<&str>,
+        user_agent: &str,
+        headers: &std::collections::HashMap<String, String>,
     ) -> DownloadResult<Self> {
+        let default_headers = build_default_headers(headers)?;
         let mut builder = Client::builder()
-            .user_agent(tachyon_core::config::USER_AGENT)
+            .user_agent(user_agent)
+            .default_headers(default_headers)
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(std::time::Duration::from_secs(keep_alive_secs))
             .tcp_keepalive(std::time::Duration::from_secs(keep_alive_secs))
@@ -137,6 +305,8 @@ impl HttpClient {
         // 不再调用 `.no_proxy()` —— 原实现强制屏蔽系统代理,导致国内被墙 CDN 直连失败,
         // 且与 BT 侧 `detect_socks_proxy` 自动嗅探系统代理的语义割裂。
         // None 时 reqwest 默认读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量。
+        // 审计 SEC-007:走代理时 PublicDnsResolver 只解析代理主机,目标域名由代理解析;
+        // 本地 reject_forbidden_ip 不覆盖代理后端——代理即 SSRF 信任边界。
         if let Some(proxy_url) = proxy {
             let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
                 // 安全:proxy URL 可能含 user:pass@,错误信息须脱敏避免凭据泄露到前端。
@@ -216,12 +386,20 @@ impl HttpClient {
         let client = builder
             .build()
             .map_err(|e| DownloadError::Network(format!("创建 HTTP 客户端失败: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            auth_bearer: None,
+            last_resolved_host: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// 使用自定义 reqwest Client 创建
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            auth_bearer: None,
+            last_resolved_host: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// FIX-19 测试辅助:用给定 HTTP/2 与 QUIC 开关构造客户端(连接/读取超时用默认值),
@@ -242,6 +420,8 @@ impl HttpClient {
             pool_max_idle_per_host,
             keep_alive_secs,
             proxy,
+            tachyon_core::config::USER_AGENT,
+            &std::collections::HashMap::new(),
         )
     }
 
@@ -294,7 +474,11 @@ impl HttpClient {
         let client = builder
             .build()
             .map_err(|e| DownloadError::Network(format!("创建 h2c 客户端失败: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            auth_bearer: None,
+            last_resolved_host: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// 创建 HTTP/1.1 only 客户端(禁用 H2,用于 bench H1 vs H2 对比)
@@ -339,7 +523,11 @@ impl HttpClient {
         let client = builder
             .build()
             .map_err(|e| DownloadError::Network(format!("创建 h1c 客户端失败: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            auth_bearer: None,
+            last_resolved_host: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// 发送 GET 请求并返回响应文本
@@ -354,7 +542,7 @@ impl HttpClient {
         let parsed_url = reqwest::Url::parse(url)?;
         tachyon_core::validate_public_http_url(&parsed_url)?;
 
-        let mut req = self.client.get(url);
+        let mut req = self.apply_auth(self.client.get(url), url);
         for (key, value) in headers {
             req = req.header(*key, *value);
         }
@@ -394,6 +582,91 @@ impl HttpClient {
         decode_chunks_to_string(std::iter::once(buf.as_slice()))
     }
 
+    /// 与 `get_text` 相同,但额外返回重定向后的最终 URL。
+    ///
+    /// 审计 HLS-09:playlist 若经 302 换目录,相对 segment/key URI 必须以 final URL 为基址。
+    pub async fn get_text_with_final_url(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> DownloadResult<(String, String)> {
+        let parsed_url = reqwest::Url::parse(url)?;
+        tachyon_core::validate_public_http_url(&parsed_url)?;
+
+        let mut req = self.apply_auth(self.client.get(url), url);
+        for (key, value) in headers {
+            req = req.header(*key, *value);
+        }
+
+        let mut response = req.send().await.map_err(|e| {
+            let chain = error_chain(&e);
+            DownloadError::Network(format!("GET 请求失败: {chain}"))
+        })?;
+
+        let final_url = response.url().as_str().to_owned();
+        self.note_resolved_host(response.url());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_http_error(status, response.headers()));
+        }
+
+        check_response_size_limit(response.content_length())?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut total_size = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| DownloadError::Network(format!("读取响应块失败: {e}")))?
+        {
+            total_size += chunk.len() as u64;
+            if total_size > MAX_GET_TEXT_SIZE {
+                return Err(DownloadError::Protocol(format!(
+                    "响应体过大: {total_size} > 最大允许 {MAX_GET_TEXT_SIZE} 字节"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let text = decode_chunks_to_string(std::iter::once(buf.as_slice()))?;
+        Ok((text, final_url))
+    }
+
+    /// 带可重试退避的二进制 GET(审计 HLS-06:segment/key 瞬断不应一次失败)。
+    ///
+    /// `max_retries` 为额外重试次数(总 attempt = max_retries + 1)。
+    pub async fn get_bytes_with_retry(&self, url: &str, max_retries: u32) -> DownloadResult<Bytes> {
+        let mut attempt = 0u32;
+        loop {
+            match self.get_bytes(url).await {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    if e.is_retryable() && attempt < max_retries {
+                        let backoff = match &e {
+                            DownloadError::Throttled {
+                                retry_after_secs: Some(secs),
+                            } => Duration::from_secs((*secs).min(60)),
+                            _ => {
+                                Duration::from_millis(200u64.saturating_mul(1u64 << attempt.min(5)))
+                            }
+                        };
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries,
+                            ?backoff,
+                            error = %e,
+                            url = %tachyon_core::redact_url_for_log(url),
+                            "get_bytes 可重试失败"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// 获取 URL 的原始字节内容(用于 HLS 分片下载等二进制场景)
     ///
     /// 与 `get_text` 不同,此方法返回原始 `Bytes`,不进行 UTF-8 解码,
@@ -402,10 +675,14 @@ impl HttpClient {
         let parsed_url = reqwest::Url::parse(url)?;
         tachyon_core::validate_public_http_url(&parsed_url)?;
 
-        let mut response = self.client.get(url).send().await.map_err(|e| {
-            let chain = error_chain(&e);
-            DownloadError::Network(format!("GET 请求失败: {chain}"))
-        })?;
+        let mut response = self
+            .apply_auth(self.client.get(url), url)
+            .send()
+            .await
+            .map_err(|e| {
+                let chain = error_chain(&e);
+                DownloadError::Network(format!("GET 请求失败: {chain}"))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -466,21 +743,28 @@ pub fn http3_compiled() -> bool {
     cfg!(all(feature = "http3", reqwest_unstable))
 }
 
+/// 运行期意图与编译态的交集:仅当两者都真时 QUIC/H3 可能生效。
+pub fn effective_quic_enabled(enable_quic: bool) -> bool {
+    enable_quic && http3_compiled()
+}
+
+/// 公共 DNS 解析器:SSRF 校验 + 共享 TTL 缓存。
+///
+/// 审计 HTTP-14:缓存必须是 `Arc<DashMap>`。`DashMap::clone()` 只深拷贝条目,
+/// 写回 clone 不会更新 resolver 自身,导致缓存永久 miss。
+/// 系统 `to_socket_addrs` 在 `spawn_blocking` 中执行,避免阻塞 Tokio worker。
 #[derive(Debug, Clone)]
 struct PublicDnsResolver {
-    cache: DashMap<String, (Vec<std::net::SocketAddr>, Instant)>,
+    cache: Arc<DashMap<String, (Vec<std::net::SocketAddr>, Instant)>>,
 }
 
 impl PublicDnsResolver {
     fn new() -> Self {
         Self {
-            cache: DashMap::new(),
+            cache: Arc::new(DashMap::new()),
         }
     }
 
-    /// 清理过期的 DNS 缓存条目
-    /// 清理过期 DNS 缓存条目
-    ///
     /// N-03: 在每次 DNS 解析前调用,防止缓存无限增长。
     /// 使用概率式清理(每 100 次解析触发一次),避免每次都遍历全表。
     fn maybe_evict_expired(&self) {
@@ -490,12 +774,23 @@ impl PublicDnsResolver {
             self.cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
         }
     }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[cfg(test)]
+    fn cache_contains(&self, host: &str) -> bool {
+        self.cache.contains_key(host)
+    }
 }
 
 impl reqwest::dns::Resolve for PublicDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
-        let cache = self.cache.clone();
+        // 共享同一 map(Arc clone),禁止 DashMap 内容 clone
+        let cache = Arc::clone(&self.cache);
 
         // N-03: 定期清理过期 DNS 缓存条目
         self.maybe_evict_expired();
@@ -508,7 +803,20 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
         }
 
         Box::pin(async move {
-            let addrs: Vec<std::net::SocketAddr> = (host.as_str(), 0).to_socket_addrs()?.collect();
+            let host_for_lookup = host.clone();
+            let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+                (host_for_lookup.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|iter| iter.collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(format!(
+                    "DNS spawn_blocking join 失败: {e}"
+                )))
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
             for addr in &addrs {
                 tachyon_core::reject_forbidden_ip(addr.ip())
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
@@ -516,7 +824,6 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
 
             // 容量检查: 达到上限时先清理过期条目,仍满则拒绝缓存(仍返回解析结果)
             if cache.len() >= DNS_CACHE_MAX_ENTRIES {
-                // 借用 self 不可用(已 move 进闭包),通过 cache 引用操作
                 let ttl = Duration::from_secs(DNS_CACHE_TTL_SECS);
                 cache.retain(|_, (_, ts)| ts.elapsed() < ttl);
             }
@@ -586,10 +893,6 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
-/// 校验 206 响应的 Content-Range 与请求的 [start, end] 一致。
-///
-/// 不一致时返回 `RangeMismatch` 错误,交由上层(mirror 调度器)切源。
-/// 一致或无 Content-Range 头(部分服务器不返回)时返回 Ok。
 /// 校验 206 响应的 Content-Range 与请求的 [start, end] 一致。
 ///
 /// FIX-06(RFC 9110):单范围请求的 206 响应必须携带格式正确的
@@ -705,7 +1008,7 @@ fn head_status_should_fallback(status: reqwest::StatusCode) -> bool {
 ///
 /// - 429/503: 返回 Throttled,尝试解析 Retry-After 头中的秒数(整数或 HTTP-date)
 /// - 401/403: 返回 Forbidden
-/// - 其他: 返回通用 Protocol 错误
+/// - 其他: 返回 `Http { status, reason }` 供 is_retryable 按状态码判定
 fn classify_http_error(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -720,7 +1023,15 @@ fn classify_http_error(
             DownloadError::Throttled { retry_after_secs }
         }
         401 | 403 => DownloadError::Forbidden { status: code },
-        _ => DownloadError::Protocol(format!("HTTP {status}")),
+        // 审计 HTTP-08:带状态码的 HTTP 错误必须走 `Http`,才能按状态码决定 is_retryable。
+        // 旧实现把 404/410/416 等打成 `Protocol`,而 Protocol 默认可重试,导致永久 4xx 空转。
+        _ => DownloadError::Http {
+            status: code,
+            reason: status
+                .canonical_reason()
+                .unwrap_or("HTTP error")
+                .to_string(),
+        },
     }
 }
 
@@ -729,7 +1040,7 @@ fn classify_http_error(
 /// 与 `classify_http_error` 行为一致:
 /// - 429/503 仍归类为 `Throttled`,URL 上下文不影响重试语义(避免破坏外层重试逻辑)
 /// - 401/403 仍归类为 `Forbidden`,URL 不进入消息体(类型字段足够区分)
-/// - 其他状态码进入 `Protocol`,消息中带上 URL 上下文,帮助用户定位问题
+/// - 其他状态码进入 `Http`,reason 带 URL 上下文,帮助用户定位问题
 fn classify_http_error_with_context(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -745,7 +1056,14 @@ fn classify_http_error_with_context(
             DownloadError::Throttled { retry_after_secs }
         }
         401 | 403 => DownloadError::Forbidden { status: code },
-        _ => DownloadError::Protocol(format!("{url_context} 返回 HTTP {status}")),
+        // 与 classify_http_error 同构:状态码进 Http.status;URL 进 reason 便于诊断
+        _ => DownloadError::Http {
+            status: code,
+            reason: format!(
+                "{url_context} 返回 HTTP {status} ({})",
+                status.canonical_reason().unwrap_or("HTTP error")
+            ),
+        },
     }
 }
 
@@ -942,6 +1260,10 @@ fn metadata_from_headers(
         (size, supports)
     };
 
+    let resolved_host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()));
+
     FileMetadata {
         file_name,
         file_size,
@@ -951,6 +1273,7 @@ fn metadata_from_headers(
         last_modified,
         file_layout: None,
         protocol_managed_storage: false,
+        resolved_host,
     }
 }
 
@@ -960,11 +1283,21 @@ fn metadata_from_headers(
 /// - 200:服务端忽略 Range,返回完整文件;仅取响应头(`Content-Length` 即总大小),
 ///   不消费响应体,`supports_range` 取自 `Accept-Ranges`(通常为 false)
 /// - 其他错误:返回 GET 的真实错误分类(不再回退),错误消息含 URL 上下文
-async fn probe_via_get_range(client: &Client, request_url: &str) -> DownloadResult<FileMetadata> {
+async fn probe_via_get_range(
+    client: &Client,
+    request_url: &str,
+    auth_bearer: Option<&str>,
+) -> DownloadResult<FileMetadata> {
     debug!(url = %tachyon_core::redact_url_for_log(request_url), "GET Range 探测开始");
-    let response = client
-        .get(request_url)
-        .header("Range", "bytes=0-0")
+    let mut req = client.get(request_url).header("Range", "bytes=0-0");
+    if let Some(token) = auth_bearer
+        && let Ok(parsed) = reqwest::Url::parse(request_url)
+        && let Some(host) = parsed.host_str()
+        && host_allows_hf_token(host)
+    {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req
         .send()
         .await
         .map_err(|e| {
@@ -977,6 +1310,8 @@ async fn probe_via_get_range(client: &Client, request_url: &str) -> DownloadResu
     let url_context = format_probe_url_context(request_url, &final_url);
     let status = response.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        // 审计 HTTP-04:与 download_range 同构,206 必须验证 Content-Range 覆盖 0-0
+        validate_content_range(response.headers(), 0, 0)?;
         let metadata = metadata_from_headers(&final_url, response.headers(), true);
         info!(
             url = %tachyon_core::redact_url_for_log(&final_url),
@@ -1073,11 +1408,15 @@ fn make_200_fallback_stream(response: reqwest::Response, start: u64, end: u64) -
 }
 
 impl Protocol for HttpClient {
+    fn last_resolved_host(&self) -> Option<String> {
+        self.last_resolved_host.lock().ok().and_then(|g| g.clone())
+    }
+
     fn probe(
         &self,
         url: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>> {
-        let client = self.client.clone();
+        let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let parsed_url = reqwest::Url::parse(&url)?;
@@ -1086,7 +1425,7 @@ impl Protocol for HttpClient {
             // HEAD 请求:签名 CDN(如 bytetos)可能拒绝 HEAD 方法导致 403/405,
             // 也可能直接超时断连(签名 URL 对 HEAD 的连接策略不同于 GET)。
             // 两种场景均回退到 GET + Range:0-0 探测。
-            let response = match client.head(&url).send().await {
+            let response = match this.apply_auth(this.client.head(&url), &url).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     let chain = error_chain(&e);
@@ -1095,11 +1434,13 @@ impl Protocol for HttpClient {
                         error = %e, error_chain = %chain,
                         "HEAD 请求失败,回退 GET Range 探测"
                     );
-                    return probe_via_get_range(&client, &url).await;
+                    return probe_via_get_range(&this.client, &url, this.auth_bearer.as_deref())
+                        .await;
                 }
             };
 
             let final_url = response.url().as_str().to_owned();
+            this.note_resolved_host(response.url());
             let status = response.status();
             // reqwest 自动跟随 301/302 重定向,这里 final_url 可能与原始 url 不同。
             // 把判定逻辑从 IO 中抽离到 `evaluate_head_response`,便于纯函数测试。
@@ -1120,7 +1461,7 @@ impl Protocol for HttpClient {
                         status = %status,
                         "HEAD 探测被拒,回退 GET Range 探测"
                     );
-                    probe_via_get_range(&client, &url).await
+                    probe_via_get_range(&this.client, &url, this.auth_bearer.as_deref()).await
                 }
                 Err(HeadEvalError::Final(err)) => {
                     warn!(
@@ -1143,7 +1484,7 @@ impl Protocol for HttpClient {
         end: u64,
         identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let client = self.client.clone();
+        let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let parsed_url = reqwest::Url::parse(&url)?;
@@ -1151,7 +1492,9 @@ impl Protocol for HttpClient {
             let range = format!("bytes={start}-{end}");
             let if_range = identity.as_ref().and_then(|id| id.if_range_value());
             debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, if_range = ?if_range, "HTTP Range 请求开始");
-            let mut request = client.get(&url).header("Range", &range);
+            let mut request = this
+                .apply_auth(this.client.get(&url), &url)
+                .header("Range", &range);
             if let Some(ref validator) = if_range {
                 request = request.header("If-Range", validator.as_str());
             }
@@ -1160,6 +1503,7 @@ impl Protocol for HttpClient {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "Range 请求连接失败");
                 DownloadError::Network(format!("Range 请求失败: {chain}"))
             })?;
+            this.note_resolved_host(response.url());
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
@@ -1242,7 +1586,7 @@ impl Protocol for HttpClient {
         end: u64,
         identity: Option<tachyon_core::ObjectIdentity>,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
-        let client = self.client.clone();
+        let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let parsed_url = reqwest::Url::parse(&url)?;
@@ -1250,7 +1594,9 @@ impl Protocol for HttpClient {
             let range = format!("bytes={start}-{end}");
             let if_range = identity.as_ref().and_then(|id| id.if_range_value());
             debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, if_range = ?if_range, "HTTP 流式 Range 请求开始");
-            let mut request = client.get(&url).header("Range", range);
+            let mut request = this
+                .apply_auth(this.client.get(&url), &url)
+                .header("Range", range);
             if let Some(ref validator) = if_range {
                 request = request.header("If-Range", validator.as_str());
             }
@@ -1259,6 +1605,7 @@ impl Protocol for HttpClient {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), start, end, error = %e, error_chain = %chain, "流式 Range 请求连接失败");
                 DownloadError::Network(format!("Range 请求失败: {chain}"))
             })?;
+            this.note_resolved_host(response.url());
 
             let status = response.status();
             if status == reqwest::StatusCode::OK {
@@ -1307,13 +1654,13 @@ impl Protocol for HttpClient {
         &self,
         url: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
-        let client = self.client.clone();
+        let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let parsed_url = reqwest::Url::parse(&url)?;
             tachyon_core::validate_public_http_url(&parsed_url)?;
-            let response = client
-                .get(&url)
+            let mut response = this
+                .apply_auth(this.client.get(&url), &url)
                 .send()
                 .await
                 .map_err(|e| {
@@ -1321,27 +1668,40 @@ impl Protocol for HttpClient {
                     warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
                     DownloadError::Network(format!("下载请求失败: {chain}"))
                 })?;
+            this.note_resolved_host(response.url());
 
             let status = response.status();
             if !status.is_success() {
                 return Err(classify_http_error(status, response.headers()));
             }
 
-            // 限制非流式响应大小，防止 OOM
+            // 审计 HTTP-14:Content-Length 预检 + 无 CL 时逐 chunk 累加上限
+            // 禁止无界 response.bytes() 被超大 chunked body 推高 OOM
+            let max = tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64;
             if let Some(content_length) = response.content_length()
-                && content_length > tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE as u64
+                && content_length > max
             {
                 return Err(DownloadError::Protocol(format!(
-                    "响应体过大: {} > 最大允许 {} 字节",
-                    content_length,
-                    tachyon_core::config::MAX_FULL_DOWNLOAD_SIZE
+                    "响应体过大: {content_length} > 最大允许 {max} 字节"
                 )));
             }
 
-            response
-                .bytes()
+            let mut buf: Vec<u8> = Vec::new();
+            let mut total = 0u64;
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map_err(|e| DownloadError::Network(format!("读取响应体失败: {e}")))
+                .map_err(|e| DownloadError::Network(format!("读取响应体失败: {e}")))?
+            {
+                total += chunk.len() as u64;
+                if total > max {
+                    return Err(DownloadError::Protocol(format!(
+                        "响应体过大: {total} > 最大允许 {max} 字节"
+                    )));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(buf))
         })
     }
 
@@ -1349,14 +1709,14 @@ impl Protocol for HttpClient {
         &self,
         url: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>> {
-        let client = self.client.clone();
+        let this = self.clone();
         let url = url.to_owned();
         Box::pin(async move {
             let parsed_url = reqwest::Url::parse(&url)?;
             tachyon_core::validate_public_http_url(&parsed_url)?;
             debug!(url = %tachyon_core::redact_url_for_log(&url), "HTTP 整块流式请求开始");
-            let response = client
-                .get(&url)
+            let response = this
+                .apply_auth(this.client.get(&url), &url)
                 .send()
                 .await
                 .map_err(|e| {
@@ -1364,6 +1724,7 @@ impl Protocol for HttpClient {
                     warn!(url = %tachyon_core::redact_url_for_log(&url), error = %e, error_chain = %chain, "整块下载请求连接失败");
                     DownloadError::Network(format!("下载请求失败: {chain}"))
                 })?;
+            this.note_resolved_host(response.url());
 
             let status = response.status();
             if !status.is_success() {
@@ -1526,6 +1887,49 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 审计 HTTP-14:第二次 resolve 必须命中共享缓存(Arc),而非独立 clone。
+    #[cfg(feature = "test-harness")]
+    #[tokio::test]
+    async fn test_public_dns_resolver_cache_shared_across_resolves() {
+        use reqwest::dns::Resolve;
+        let resolver = super::PublicDnsResolver::new();
+        // test-harness 下放行 loopback,系统解析 localhost 应成功
+        let name1: reqwest::dns::Name = "localhost".parse().unwrap();
+        let first = Resolve::resolve(&resolver, name1).await;
+        assert!(first.is_ok(), "localhost 首次解析应成功");
+        assert!(
+            resolver.cache_contains("localhost"),
+            "首次成功解析后应写入共享 cache"
+        );
+        let len_after_first = resolver.cache_len();
+        let name2: reqwest::dns::Name = "localhost".parse().unwrap();
+        let second = Resolve::resolve(&resolver, name2).await;
+        assert!(second.is_ok(), "localhost 二次解析应成功");
+        assert_eq!(
+            resolver.cache_len(),
+            len_after_first,
+            "二次解析应命中 cache,不应新增条目"
+        );
+    }
+
+    /// Clone resolver 后仍共享同一 cache map
+    #[cfg(feature = "test-harness")]
+    #[tokio::test]
+    async fn test_public_dns_resolver_clone_shares_cache() {
+        use reqwest::dns::Resolve;
+        let resolver = super::PublicDnsResolver::new();
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        let addrs = Resolve::resolve(&resolver, name).await.unwrap();
+        // 消费 iterator,避免 unused_must_use
+        let _count = addrs.count();
+        assert!(_count > 0, "localhost 应至少有一个地址");
+        let cloned = resolver.clone();
+        assert!(
+            cloned.cache_contains("localhost"),
+            "clone 后的 resolver 必须看到原 cache 写入(Arc 共享)"
+        );
+    }
+
     // --- 任务 1: with_timeouts 测试 ---
 
     #[test]
@@ -1562,6 +1966,45 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    /// 审计 HTTP-17:connect timeout 由构造参数(来自 DownloadConfig)决定,
+    /// 不是 ConnectionConfig 字段隐式生效。
+    #[test]
+    fn test_connect_timeout_owner_is_explicit_arg() {
+        let conn = tachyon_core::config::ConnectionConfig {
+            connect_timeout_secs: 99, // 即使很大,也不应被 with_connection_config 忽略参数
+            ..Default::default()
+        };
+        // 显式传 1 秒:构造应成功(不发起真实连接)
+        let client = HttpClient::with_connection_config(&conn, 1, 30, None);
+        assert!(client.is_ok());
+        // with_connection_config 签名强制调用方传入 connect_secs,与 DownloadConfig 对齐
+        let client2 = HttpClient::with_connection_config(&conn, 30, 30, None);
+        assert!(client2.is_ok());
+    }
+
+    #[test]
+    fn test_socks5_proxy_builds_client() {
+        // 审计 HTTP-11:启用 socks feature 后 socks5:// 应能构造 client(不要求代理可达)
+        let client = HttpClient::with_timeouts(5, 30, Some("socks5://127.0.0.1:1080"));
+        assert!(
+            client.is_ok(),
+            "socks5 代理构造失败: {}",
+            client.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn test_build_default_headers_skips_reserved() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom".into(), "yes".into());
+        headers.insert("Range".into(), "bytes=0-1".into());
+        headers.insert("Host".into(), "evil.example".into());
+        let map = super::build_default_headers(&headers).unwrap();
+        assert!(map.contains_key("x-custom"));
+        assert!(!map.contains_key("range"));
+        assert!(!map.contains_key("host"));
+    }
+
     #[test]
     fn test_with_timeouts_explicit_proxy() {
         // 显式代理 URL 应被接受(reqwest 在 build 时校验代理 URL 语法)
@@ -1570,6 +2013,42 @@ mod tests {
     }
 
     // --- get_text 响应体大小限制测试 (P2-42) ---
+
+    /// 审计 HTTP-14:download_full 走逐 chunk 累加(小 body 成功路径)
+    #[tokio::test]
+    async fn test_download_full_chunked_small_body_ok() {
+        use tachyon_core::traits::Protocol;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // 构造略大于上限的 body(测试环境用较小上限不现实;用真实 MAX 会太慢)
+        // 改为:直接调 get 路径验证流式累加逻辑已挂到 download_full —
+        // 用 chunked 小响应 + 临时无法降低常量时,验证 download_full 能完成小响应。
+        // 另:单元级验证通过内部累计路径(与 get_bytes 同构)。
+        let body = vec![b'x'; 1024];
+        Mock::given(method("GET"))
+            .and(path("/chunked.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let data = http
+            .download_full(&format!("{}/chunked.bin", server.uri()))
+            .await
+            .expect("小 body 应成功");
+        assert_eq!(data.len(), 1024);
+    }
+
+    #[test]
+    fn test_effective_quic_enabled_requires_compile() {
+        // 默认工作区未编 http3:即使 want=true 也无效
+        assert!(!effective_quic_enabled(true) || http3_compiled());
+        assert!(!effective_quic_enabled(false));
+        if !http3_compiled() {
+            assert!(!effective_quic_enabled(true));
+        }
+    }
 
     #[test]
     fn test_max_get_text_size_constant_is_64mb() {
@@ -1696,15 +2175,47 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_404_protocol_error() {
+    fn test_classify_404_is_http_non_retryable() {
         let headers = reqwest::header::HeaderMap::new();
         let err = super::classify_http_error(reqwest::StatusCode::NOT_FOUND, &headers);
-        match err {
-            DownloadError::Protocol(msg) => {
-                assert!(msg.contains("404"));
+        match &err {
+            DownloadError::Http { status, reason } => {
+                assert_eq!(*status, 404);
+                assert!(reason.contains("Not Found") || reason.contains("404"));
             }
-            other => panic!("预期 Protocol,实际: {other:?}"),
+            other => panic!("预期 Http,实际: {other:?}"),
         }
+        assert!(!err.is_retryable(), "404 不可重试");
+    }
+
+    #[test]
+    fn test_classify_permanent_4xx_are_non_retryable() {
+        let headers = reqwest::header::HeaderMap::new();
+        for code in [400u16, 404, 405, 410, 416] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = super::classify_http_error(status, &headers);
+            assert!(
+                matches!(err, DownloadError::Http { status: s, .. } if s == code),
+                "status {code} 应映射 Http"
+            );
+            assert!(!err.is_retryable(), "永久 4xx {code} 不可重试");
+        }
+    }
+
+    #[test]
+    fn test_classify_500_is_retryable_http() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = super::classify_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers);
+        assert!(matches!(err, DownloadError::Http { status: 500, .. }));
+        assert!(err.is_retryable(), "500 可重试");
+    }
+
+    #[test]
+    fn test_classify_408_is_retryable_http() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = super::classify_http_error(reqwest::StatusCode::REQUEST_TIMEOUT, &headers);
+        assert!(matches!(err, DownloadError::Http { status: 408, .. }));
+        assert!(err.is_retryable(), "408 可重试");
     }
 
     // --- HTML 响应识别 ---
@@ -1819,18 +2330,19 @@ mod tests {
         let err = super::classify_http_error_with_context(
             reqwest::StatusCode::NOT_FOUND,
             &headers,
-            "https://console.example.com/page",
+            "https://cdn.example/file.bin",
         );
-        match err {
-            DownloadError::Protocol(msg) => {
-                assert!(msg.contains("404"), "应保留状态码: {msg}");
+        match &err {
+            DownloadError::Http { status, reason } => {
+                assert_eq!(*status, 404);
                 assert!(
-                    msg.contains("https://console.example.com/page"),
-                    "应包含 URL 上下文: {msg}"
+                    reason.contains("cdn.example") || reason.contains("file.bin"),
+                    "reason 应含 URL 上下文: {reason}"
                 );
             }
-            other => panic!("预期 Protocol,实际: {other:?}"),
+            other => panic!("预期 Http,实际: {other:?}"),
         }
+        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -1844,12 +2356,12 @@ mod tests {
         let err =
             super::classify_http_error_with_context(reqwest::StatusCode::NOT_FOUND, &headers, &ctx);
         match err {
-            DownloadError::Protocol(msg) => {
-                assert!(msg.contains("->"), "应保留重定向箭头: {msg}");
-                assert!(msg.contains("orig"), "应包含原始路径: {msg}");
-                assert!(msg.contains("dest"), "应包含最终路径: {msg}");
+            DownloadError::Http { reason, .. } => {
+                assert!(reason.contains("->"), "应保留重定向箭头: {reason}");
+                assert!(reason.contains("orig"), "应包含原始路径: {reason}");
+                assert!(reason.contains("dest"), "应包含最终路径: {reason}");
             }
-            other => panic!("预期 Protocol,实际: {other:?}"),
+            other => panic!("预期 Http,实际: {other:?}"),
         }
     }
 
@@ -2118,7 +2630,17 @@ mod tests {
         // 验证 build_client 在 keep_alive_secs=60 时能正常创建
         // pool_idle_timeout 应与 keep_alive_secs 对齐,
         // 避免 reqwest 默认 90s idle timeout 与 semaphore 侧不一致
-        let client = HttpClient::build_client(10, 30, false, false, 16, 60, None);
+        let client = HttpClient::build_client(
+            10,
+            30,
+            false,
+            false,
+            16,
+            60,
+            None,
+            tachyon_core::config::USER_AGENT,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             client.is_ok(),
             "build_client(keep_alive=60) 应成功(已配置 pool_idle_timeout)"
@@ -2130,7 +2652,17 @@ mod tests {
         // 验证启用 HTTP/2(含 keep_alive_while_idle)能正确创建客户端。
         // 此前未配置 keep_alive_while_idle,空闲连接可能被 NAT 静默掐断。
         // 开启后多文件串行下载的文件间隙连接保持复用,省 TCP+TLS 握手。
-        let client = HttpClient::build_client(10, 30, true, false, 16, 90, None);
+        let client = HttpClient::build_client(
+            10,
+            30,
+            true,
+            false,
+            16,
+            90,
+            None,
+            tachyon_core::config::USER_AGENT,
+            &std::collections::HashMap::new(),
+        );
         assert!(
             client.is_ok(),
             "build_client(enable_http2=true) 应成功(含 keep_alive_while_idle 配置)"
@@ -2238,12 +2770,22 @@ mod tests {
             "https://console.example.com/coding-plan",
         );
         match result {
-            Err(super::HeadEvalError::Final(DownloadError::Protocol(msg))) => {
-                assert!(msg.contains("404"), "应保留状态码: {msg}");
-                assert!(msg.contains("console.example.com"), "应包含 host: {msg}");
-                assert!(msg.contains("->"), "重定向应在消息中体现: {msg}");
+            Err(super::HeadEvalError::Final(DownloadError::Http { status, reason })) => {
+                assert_eq!(status, 404, "应保留状态码");
+                assert!(
+                    reason.contains("console.example.com"),
+                    "应包含 host: {reason}"
+                );
+                assert!(reason.contains("->"), "重定向应在消息中体现: {reason}");
+                assert!(
+                    !DownloadError::Http {
+                        status,
+                        reason: reason.clone()
+                    }
+                    .is_retryable()
+                );
             }
-            other => panic!("预期带 URL 的 Protocol 错误,实际: {other:?}"),
+            other => panic!("预期带 URL 的 Http 错误,实际: {other:?}"),
         }
     }
 
@@ -2441,6 +2983,63 @@ mod tests {
             HttpClient::with_timeouts(5, 10, None).unwrap()
         }
 
+        /// 审计 HTTP-10:自定义 User-Agent 进入请求
+        #[tokio::test]
+        async fn test_custom_user_agent_sent() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/ua"))
+                .and(header("User-Agent", "Tachyon-Test/9.9"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "3")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = HttpClient::with_timeouts_and_headers(
+                5,
+                10,
+                None,
+                "Tachyon-Test/9.9",
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
+            let url = format!("{}/ua", server.uri());
+            let meta = client.probe(&url).await.unwrap();
+            assert_eq!(meta.file_size, Some(3));
+        }
+
+        /// 审计 HTTP-10:自定义 headers 进入请求,保留头被剥离
+        #[tokio::test]
+        async fn test_custom_headers_sent_and_reserved_stripped() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/hdr"))
+                .and(header("X-Trace", "abc"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "1")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("X-Trace".into(), "abc".into());
+            headers.insert("Range".into(), "bytes=0-0".into()); // 必须被忽略
+            let client =
+                HttpClient::with_timeouts_and_headers(5, 10, None, "Tachyon-Test/hdr", &headers)
+                    .unwrap();
+            let url = format!("{}/hdr", server.uri());
+            client.probe(&url).await.unwrap();
+        }
+
         #[tokio::test]
         async fn test_probe_head_returns_metadata() {
             let server = MockServer::start().await;
@@ -2513,6 +3112,70 @@ mod tests {
             let meta = client.probe(&url).await.unwrap();
             assert_eq!(meta.file_size, Some(5000));
             assert!(meta.supports_range);
+        }
+
+        /// 审计 HTTP-04:GET Range probe 的 206 必须校验 Content-Range 为 0-0
+        #[tokio::test]
+        async fn test_probe_get_range_rejects_mismatched_content_range() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/bad-cr"))
+                .respond_with(ResponseTemplate::new(405))
+                .mount(&server)
+                .await;
+            // 故意返回 start=9 而非 0-0
+            Mock::given(method("GET"))
+                .and(path("/bad-cr"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 9-9/100")
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/bad-cr", server.uri());
+            let err = client
+                .probe(&url)
+                .await
+                .expect_err("畸形 Content-Range 应拒绝");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Content-Range") || msg.contains("范围") || msg.contains("不匹配"),
+                "错误应指向 Content-Range: {msg}"
+            );
+        }
+
+        /// 审计 HTTP-04:缺 Content-Range 的 206 不得宣称 supports_range
+        #[tokio::test]
+        async fn test_probe_get_range_rejects_missing_content_range() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/no-cr"))
+                .respond_with(ResponseTemplate::new(405))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/no-cr"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/no-cr", server.uri());
+            let err = client
+                .probe(&url)
+                .await
+                .expect_err("缺 Content-Range 应拒绝");
+            assert!(!matches!(err, DownloadError::Cancelled));
         }
 
         #[tokio::test]
@@ -2860,6 +3523,71 @@ mod tests {
                 }
                 other => panic!("429 应分类为 Throttled,实际: {other:?}"),
             }
+        }
+
+        #[tokio::test]
+        async fn test_auth_bearer_sent_only_to_official_hf_host() {
+            // 审计:token 仅在 host 为 huggingface.co 时附加;loopback mock 模拟非官方 host 不带 Authorization
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/model.bin"))
+                .and(header("Authorization", "Bearer hf_secret"))
+                .respond_with(ResponseTemplate::new(200).insert_header("content-length", "4"))
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("HEAD"))
+                .and(path("/model.bin"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-length", "4")
+                        .insert_header("accept-ranges", "bytes"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client().with_auth_bearer(Some("hf_secret".into()));
+            let url = format!("{}/model.bin", server.uri());
+            let meta = client
+                .probe(&url)
+                .await
+                .expect("非官方 host 应不带 token 成功");
+            assert_eq!(meta.file_size, Some(4));
+        }
+
+        #[tokio::test]
+        async fn test_last_resolved_host_updated_after_probe() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/file.bin"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-length", "10")
+                        .insert_header("accept-ranges", "bytes"),
+                )
+                .mount(&server)
+                .await;
+            let client = test_client();
+            let url = format!("{}/file.bin", server.uri());
+            let _ = client.probe(&url).await.unwrap();
+            let host = client
+                .last_resolved_host()
+                .expect("probe 后应记录 final host");
+            let expected = reqwest::Url::parse(&server.uri())
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(host, expected);
+        }
+
+        #[test]
+        fn test_host_allows_hf_token_hosts() {
+            assert!(host_allows_hf_token("huggingface.co"));
+            assert!(host_allows_hf_token("cdn.huggingface.co"));
+            assert!(!host_allows_hf_token("hf-mirror.com"));
+            assert!(!host_allows_hf_token("evil-huggingface.co"));
+            assert!(!host_allows_hf_token("example.com"));
         }
     }
 }

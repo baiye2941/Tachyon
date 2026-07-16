@@ -192,6 +192,11 @@ pub struct FileMetadata {
     /// false 时引擎正常写入(HTTP/FTP/未启自定义 Storage 的 BT)。
     #[serde(default)]
     pub protocol_managed_storage: bool,
+    /// 审计 HTTP-13:探测/重定向后的最终 host(用于 per-host 许可记账)
+    ///
+    /// None 表示未解析或非 HTTP;引擎 `request_host` 优先使用该值,避免 origin 与 CDN 记账分裂。
+    #[serde(default)]
+    pub resolved_host: Option<String>,
 }
 
 /// HTTP 对象身份(ETag / Last-Modified / size)
@@ -542,6 +547,7 @@ mod tests {
             last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         assert_eq!(meta.file_size, Some(1024));
         assert!(meta.supports_range);
@@ -558,6 +564,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         assert!(meta.file_size.is_none());
         assert!(!meta.supports_range);
@@ -596,6 +603,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();
@@ -708,6 +716,7 @@ mod tests {
             last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".into()),
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let id = ObjectIdentity::from_metadata(&meta);
         assert_eq!(id.etag.as_deref(), Some("\"e\""));
@@ -1214,6 +1223,7 @@ mod proptests {
                 last_modified: None,
                 file_layout: None,
                 protocol_managed_storage: false,
+                resolved_host: None,
             };
             let json = serde_json::to_string(&meta).unwrap();
             let deserialized: FileMetadata = serde_json::from_str(&json).unwrap();

@@ -1,6 +1,8 @@
 use super::{AppError, AppState, DownloadProgress, ProgressEvent, TaskProgress};
 use std::collections::HashMap;
 
+use tokio::sync::broadcast;
+
 use crate::service::try_claim_subscription;
 
 // ---------------------------------------------------------------------------
@@ -36,23 +38,30 @@ pub async fn subscribe_progress(
         let mut last_snapshot: ProgressEvent = build_initial_progress_event(&task_repository);
         let _ = app_handle.emit("progress-update", &last_snapshot);
 
-        while rx.changed().await.is_ok() {
-            let snapshot = (*rx.borrow_and_update()).clone();
-            let delta = compute_progress_delta(&snapshot, &last_snapshot);
-
-            if !delta.is_empty() {
-                for tp in delta.values() {
-                    if tp.downloaded > 0 || tp.speed > 0 {
-                        tracing::info!(
-                            tid = tp.id,
-                            downloaded = tp.downloaded,
-                            speed = tp.speed,
-                            "emit progress-update"
-                        );
+        // 审计 M-03:broadcast 顺序投递,不因 watch 覆盖丢失 completed/started delta
+        loop {
+            match rx.recv().await {
+                Ok(snapshot) => {
+                    let delta = compute_progress_delta(&snapshot, &last_snapshot);
+                    if !delta.is_empty() {
+                        for tp in delta.values() {
+                            if tp.downloaded > 0 || tp.speed > 0 {
+                                tracing::info!(
+                                    tid = tp.id,
+                                    downloaded = tp.downloaded,
+                                    speed = tp.speed,
+                                    "emit progress-update"
+                                );
+                            }
+                        }
+                        let _ = app_handle.emit("progress-update", &delta);
+                        last_snapshot = snapshot;
                     }
                 }
-                let _ = app_handle.emit("progress-update", &delta);
-                last_snapshot = snapshot;
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "进度 broadcast 订阅滞后,继续接收后续事件");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

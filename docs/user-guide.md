@@ -33,7 +33,7 @@ Tachyon 支持以下传输协议，可通过 Feature Flag 裁剪：
 - **多源竞速**：`MirrorProtocol` 对多个镜像源并行 probe，主源失败自动 fallback。
 - **断点续传**：任务快照持久化到 `tachyon-store`，支持分片级与字节级续传。
 - **流式哈希校验**：下载过程中增量计算 BLAKE3 / SHA-256，完成后再做完整性校验。
-- **限速控制**：无锁令牌桶，支持跨任务全局限速。
+- **限速控制**：无锁令牌桶，**跨任务共享**同一 `RateLimiter`（进程总带宽上限；非每任务各自一套）。
 - **浏览器资源嗅探**：通过文件扩展名识别视频、音频、文档、压缩包等资源类型。
 - **HuggingFace Hub 集成**：浏览模型仓库、解析 LFS、管理 Token、批量创建下载任务。
 
@@ -76,7 +76,7 @@ Tachyon 支持以下传输协议，可通过 Feature Flag 裁剪：
 |------|------|--------|------|
 | `max_concurrent_tasks` | u32 | — | 全局最大并发任务数（上限 100） |
 | `download` | DownloadConfig | — | 下载配置 |
-| `connection` | ConnectionConfig | — | 连接池配置 |
+| `connection` | ConnectionConfig | — | 并发许可/连接相关配置（非 TCP 池本身） |
 | `scheduler` | SchedulerConfig | — | 调度器配置 |
 | `magnet` | MagnetConfig | — | BitTorrent 配置（`magnet` feature） |
 
@@ -226,10 +226,14 @@ cd frontend && bun run build
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
 | QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
-| HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。注意:代理模式下最终目标 IP 由代理解析,本地公网过滤不覆盖代理后端(信任边界由代理决定) |
+| HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。**SEC-007**:代理模式下最终目标域名解析/可达 IP 由代理决定;本地 `PublicDnsResolver`/`reject_forbidden_ip` 不覆盖代理后端——代理即 SSRF 信任边界,仅使用可信代理。 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
 | 前端仅支持中/英双语 | `solid-i18n` 当前仅配置 zh-CN 和 en-US |
 | BitTorrent Magnet 已支持分片并发 | 单文件 magnet 走 `download_range_stream`（基于 librqbit `FileStream`）进入引擎多 worker 分片路径；多文件 magnet 仍回退整文件流式 |
+| 路径授权非 openat2 | `validate_save_path` 拒绝中间 symlink/reparse 并在 open 前复查；**不**声称 `openat2(RESOLVE_BENEATH)` 句柄级路径封印，validate→open 仍存在 TOCTOU 残余 |
+| ConnectionPool 非 TCP 池 | 历史名 `ConnectionPool` 实为并发许可器；TCP/TLS/H2 复用由 reqwest Client / `HttpClientRegistry` |
+| quick-xml 间接漏洞 | CI 暂 ignore RUSTSEC-2026-0194/0195（librqbit-upnp + Tauri/plist 双链）；目标 quick-xml ≥0.41 后移除 |
+| 配置热更新字段语义不统一 | `rate_limit`/`ConnectionPool`/`BufferPool`/`BtSession(magnet|download_dir)` 即时或新任务生效；剪贴板 `enable_watch` **即时**（轮询循环启动后按配置门禁）；`poll_interval_ms` 间隔热改仍为非目标；任务级 `retry_count` 当前恒 0（未聚合引擎 attempt） |
 
 ---
 

@@ -163,6 +163,12 @@ impl MagnetProtocol {
             .expect("preferred_root lock") = name;
     }
 
+    /// 是否应按 SOCKS 隐私策略剥离 magnet 内嵌 UDP tracker
+    fn socks_active(&self) -> bool {
+        self.config.socks_proxy_url.is_some()
+            || tachyon_core::config::detect_socks_proxy().is_some()
+    }
+
     pub fn preferred_root_name(&self) -> Option<String> {
         self.preferred_root_name
             .read()
@@ -218,27 +224,7 @@ impl MagnetProtocol {
 
     fn lookup_compatible(&self, magnet_url: &str) -> Option<CachedTorrent> {
         let key = self.binding_key_for(magnet_url);
-        if let Some(e) = self.handle_cache.get(&key) {
-            return Some(e.clone());
-        }
-        // 兼容旧键(纯 magnet URL):仅当绑定上下文匹配时命中
-        if let Some(e) = self.handle_cache.get(magnet_url) {
-            let ok_dir = e.download_dir == self.download_dir;
-            let ok_factory = e.has_storage_factory == self.storage_factory.is_some();
-            let ok_pref = e.preferred_root
-                == *self
-                    .preferred_root_name
-                    .read()
-                    .expect("preferred_root lock");
-            if ok_dir && ok_factory && ok_pref {
-                return Some(e.clone());
-            }
-            tracing::warn!(
-                %magnet_url,
-                "handle_cache 旧键命中但绑定上下文不匹配,忽略(防写错路径)"
-            );
-        }
-        None
+        self.handle_cache.get(&key).map(|e| e.clone())
     }
 
     /// 从共享缓存移除句柄(取消/完成/失败后调用)。
@@ -404,6 +390,24 @@ impl MagnetProtocol {
         })
     }
 
+    /// 审计 BT-17:引擎分片 FileStream 读完后,等待 librqbit piece truth 完成。
+    ///
+    /// `protocol_managed_storage` 路径只读已 have 的区间;若 snapshot 与 piece
+    /// 边界漂移,可能在 torrent 尚未全部校验完成时标 Completed。此处在
+    /// 标完成前阻塞到 `wait_until_completed`(带 peer_wait 看门狗)。
+    pub async fn wait_torrent_completed(&self, url: &str) -> DownloadResult<()> {
+        let entry = self.lookup_compatible(url).ok_or_else(|| {
+            DownloadError::Network(format!(
+                "BT wait_torrent_completed: 未找到缓存 handle: {}",
+                tachyon_core::redact_url_for_log(url)
+            ))
+        })?;
+        let handle = Arc::clone(&entry.handle);
+        let sampler = ManagedTorrentProgress::new(Arc::clone(&handle));
+        let peer_wait = self.config.peer_wait_timeout_secs;
+        wait_with_progress_watch(&handle, &sampler, peer_wait).await
+    }
+
     /// 从 librqbit 的 file_infos 构造 FileLayout(消除 DUP-1:四处重复的闭包)
     ///
     /// 单文件退化为单元素,多文件按 file_infos 各文件段(file_id=索引,
@@ -453,12 +457,83 @@ impl MagnetProtocol {
             has_storage_factory: false,
             preferred_root: None,
         };
-        // 测试接缝:同时写 binding key 与 raw url,兼容旧测试 get(&url)
+        // 仅写 binding key(与生产路径一致,禁止 raw url 双写)
         let key = proto.binding_key_for(url);
-        Self::insert_with_capacity(&proto.handle_cache, key, entry.clone());
-        Self::insert_with_capacity(&proto.handle_cache, url.to_string(), entry);
+        Self::insert_with_capacity(&proto.handle_cache, key, entry);
         proto
     }
+}
+
+/// 审计 BT privacy:SOCKS 下剥离 magnet 内嵌 `tr=udp://` tracker。
+///
+/// Session 级 trackers 已在 BtSession 过滤 UDP,但 BEP 9 magnet 自带的 `tr=`
+/// 仍由 librqbit 直连 UDP announce,可泄露 info-hash/公网地址。
+/// 仅当 `socks_active` 为 true 时改写 URI;HTTP(S) tracker 保留。
+pub fn strip_udp_trackers_from_magnet(uri: &str, socks_active: bool) -> String {
+    if !socks_active || !tachyon_core::looks_like_magnet_url(uri) {
+        return uri.to_string();
+    }
+    let (prefix, query) = uri.split_at(8); // "magnet:?"
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|param| {
+            let lower = param.to_ascii_lowercase();
+            if let Some(tr) = lower.strip_prefix("tr=") {
+                // percent-encoded udp:// 亦过滤
+                let decoded = urlencoding_loose_decode(tr);
+                let d = decoded.to_ascii_lowercase();
+                if d.starts_with("udp://") || d.starts_with("udp%3a%2f%2f") {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    format!("{prefix}{}", kept.join("&"))
+}
+
+/// 轻量 percent-decode(仅处理常见 %xx,失败则原样)
+fn urlencoding_loose_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = || -> Option<u8> {
+                let hi = (bytes[i + 1] as char).to_digit(16)? as u8;
+                let lo = (bytes[i + 2] as char).to_digit(16)? as u8;
+                Some((hi << 4) | lo)
+            };
+            if let Some(b) = h() {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn test_strip_udp_trackers_from_magnet_when_socks() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=udp://tracker.example.com:6969&tr=https://ok.example/announce";
+    let out = strip_udp_trackers_from_magnet(uri, true);
+    assert!(!out.to_ascii_lowercase().contains("tr=udp://"));
+    assert!(out.contains("https://ok.example/announce") || out.contains("tr=https://ok.example"));
+    // socks off: unchanged
+    assert_eq!(strip_udp_trackers_from_magnet(uri, false), uri);
+}
+
+#[test]
+fn test_strip_udp_trackers_percent_encoded() {
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=udp%3A%2F%2Ftracker.example.com%3A6969";
+    let out = strip_udp_trackers_from_magnet(uri, true);
+    assert!(
+        !out.to_ascii_lowercase().contains("udp"),
+        "应剥离 percent-encoded udp tracker: {out}"
+    );
 }
 
 /// 磁力链接格式校验
@@ -471,7 +546,7 @@ impl MagnetProtocol {
 /// BEP 9 规范要求 info_hash 必须是合法的 SHA1(hex 40) 或 Base32(32) 编码,
 /// 此前仅校验非空,允许畸形输入深入到 librqbit 解析路径增加日志噪声与攻击面。
 pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
-    if !uri.starts_with("magnet:?") {
+    if !tachyon_core::looks_like_magnet_url(uri) {
         return Err(DownloadError::Config(format!(
             "磁力链接必须以 magnet:? 开头: {uri}"
         )));
@@ -597,10 +672,12 @@ impl ManagedTorrentPeerHealth {
 
 impl PeerHealthSource for ManagedTorrentPeerHealth {
     fn healthy(&self) -> bool {
-        // live 状态下取 stats_snapshot 的 peer_stats;非 live 或快照失败视为无 peer
+        // 审计 BT-09:queued 表示已发现待连 peer,不是死 swarm。
+        // live 状态下取 stats_snapshot 的 peer_stats;非 live 或快照失败视为无 peer。
         self.handle.live().is_some_and(|live| {
             let snap = live.stats_snapshot();
-            snap.peer_stats.live + snap.peer_stats.connecting > 0
+            let p = snap.peer_stats;
+            p.live + p.connecting + p.queued > 0
         })
     }
 }
@@ -672,7 +749,7 @@ fn format_duration_human(d: Duration) -> String {
 ///      **墙钟** `started.elapsed()` 对比 `peer_wait` 总限决定是否失败
 ///
 ///    peer_wait 给死 swarm 恢复的窗口(tracker 重试 60s,DHT 重建 1-2min),
-///    默认 5 分钟。`Duration::MAX` 禁用(回退纯 stall_timeout)。
+///    默认 5 分钟。`Duration::MAX` 禁用等 peer:无 peer 时立即按 stall 语义失败(审计 BT-08)。
 ///
 /// 注意:`started` 在每次 `unfold` 产出后重置(每次 poll_next 一个新调用),
 /// 因此 peer_wait 是"单次 read 尝试序列"的上限,而非整流的总下载时间。
@@ -734,11 +811,22 @@ where
                             }
                             // 无 peer:智能等待 —— 用墙钟判断是否超 peer_wait 总限。
                             // no_peer_elapsed 仅作诊断(保留累加供日志/调试),不参与超时决策。
+                            //
+                            // 审计 BT-08:`peer_wait=MAX`(配置 peer_wait_timeout_secs=0)表示
+                            // 禁用“等 peer 恢复”窗口,必须回退纯 stall 语义。旧实现在
+                            // wait=MAX 时永不超时并 sleep 轮询,死 swarm 下 range 路径永久循环。
+                            if wait == Duration::MAX {
+                                return Some((
+                                    Err(DownloadError::Timeout(format!(
+                                        "无可用 peer,且 peer_wait 已禁用(stall={})",
+                                        format_duration_human(stall)
+                                    ))),
+                                    (reader, no_peer_elapsed),
+                                ));
+                            }
                             let poll = Duration::from_secs(PEER_HEALTH_POLL_SECS);
                             no_peer_elapsed = no_peer_elapsed.saturating_add(poll);
-                            // peer_wait=MAX(禁用)时短路:永不触发,继续轮询等待 peer。
-                            // 否则用墙钟 elapsed(含 stall 等待 + 轮询 sleep)对比 peer_wait。
-                            if wait != Duration::MAX && started.elapsed() >= wait {
+                            if started.elapsed() >= wait {
                                 return Some((
                                     Err(DownloadError::Timeout(format!(
                                         "无可用 peer,等待 {}秒后超时",
@@ -810,9 +898,16 @@ async fn add_magnet_to_session(
     timeout: Duration,
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
     ops_gate: &SessionOpsGate,
+    socks_active: bool,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
+    // SOCKS 下剥离 magnet 内嵌 UDP tracker(审计 privacy)
+    let url_owned = strip_udp_trackers_from_magnet(url, socks_active);
+    if socks_active && url_owned != url {
+        tracing::info!("SOCKS 启用:已从 magnet URI 剥离 tr=udp:// tracker(防直连泄露)");
+    }
+    let url_for_op = url_owned.clone();
     // 与 stop_and_remove 串行:等 UI probe 后台 delete 完成后再 add
-    with_magnet_session_op(ops_gate, url, async {
+    with_magnet_session_op(ops_gate, &url_for_op, async {
         let opts = AddTorrentOptions {
             overwrite: true,
             output_folder: Some(download_dir.to_string_lossy().into()),
@@ -830,7 +925,7 @@ async fn add_magnet_to_session(
         // 1140 之前),死 swarm 下永久挂起。超时兜底让引擎能重试/失败。
         let added = tokio::time::timeout(
             timeout,
-            session.add_torrent(AddTorrent::from_url(url), Some(opts)),
+            session.add_torrent(AddTorrent::from_url(&url_owned), Some(opts)),
         )
         .await
         .map_err(|_| {
@@ -1035,14 +1130,7 @@ impl Protocol for MagnetProtocol {
                     this_for_lookup.2.as_deref(),
                     &url,
                 );
-                let hit = handle_cache.get(&bind_key).or_else(|| {
-                    handle_cache.get(&url).and_then(|e| {
-                        let ok = e.download_dir == this_for_lookup.0
-                            && e.has_storage_factory == this_for_lookup.1
-                            && e.preferred_root == this_for_lookup.2;
-                        if ok { Some(e) } else { None }
-                    })
-                });
+                let hit = handle_cache.get(&bind_key);
                 if let Some(entry) = hit {
                     let handle = Arc::clone(&entry.handle);
                     let layout = entry.layout.clone();
@@ -1066,6 +1154,7 @@ impl Protocol for MagnetProtocol {
                         last_modified: None,
                         file_layout: Some(layout),
                         protocol_managed_storage: storage_factory.is_some(),
+                        resolved_host: None,
                     });
                 }
             }
@@ -1088,6 +1177,8 @@ impl Protocol for MagnetProtocol {
                 addrs
             };
             // metadata_timeout 覆盖 add_torrent(含 resolve_magnet)+ wait_until_initialized 全流程
+            let socks_active = config.socks_proxy_url.is_some()
+                || tachyon_core::config::detect_socks_proxy().is_some();
             let metadata_timeout = Duration::from_secs(config.metadata_timeout_secs);
             let handle = add_magnet_to_session(
                 &session,
@@ -1098,6 +1189,7 @@ impl Protocol for MagnetProtocol {
                 metadata_timeout,
                 storage_factory.as_ref().map(|f| f.clone_box()),
                 &ops_gate,
+                socks_active,
             )
             .await?;
 
@@ -1141,11 +1233,7 @@ impl Protocol for MagnetProtocol {
                 preferred_root.as_deref(),
                 &url,
             );
-            Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
-            // 兼容旧键:仅当 preferred 为空时写入 raw url(避免跨 preferred 误命中)
-            if preferred_root.is_none() {
-                Self::insert_with_capacity(&handle_cache, url.clone(), entry);
-            }
+            Self::insert_with_capacity(&handle_cache, bind_key, entry);
 
             Ok(FileMetadata {
                 file_name,
@@ -1158,6 +1246,7 @@ impl Protocol for MagnetProtocol {
                 // 多文件布局供 init_storage 构造 StorageSet::Multi;单文件退化为单元素
                 file_layout: Some(layout),
                 protocol_managed_storage: storage_factory.is_some(),
+                resolved_host: None,
             })
         })
     }
@@ -1207,8 +1296,8 @@ impl Protocol for MagnetProtocol {
             .expect("preferred_root lock")
             .clone();
         let ops_gate = Arc::clone(&self.ops_gate);
-        // peer 智能等待:0 禁用(回退纯 stall_timeout),否则按配置秒数。
-        // 死 swarm 下无 peer 时持续轮询 peer 健康,超此限则失败。
+        // peer 智能等待:0 禁用等 peer 窗口(无 peer 时按 stall 失败,审计 BT-08),
+        // 否则按配置秒数;死 swarm 下在窗口内轮询 peer 健康,超限失败。
         let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
             Duration::MAX
         } else {
@@ -1221,6 +1310,7 @@ impl Protocol for MagnetProtocol {
         let stall_timeout = resolve_stall_timeout(self.config.stall_timeout_secs, peer_wait);
         // add_torrent 超时(复用 metadata_timeout,覆盖 resolve_magnet 死 swarm 兜底)
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        let socks_active = self.socks_active();
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
@@ -1231,10 +1321,7 @@ impl Protocol for MagnetProtocol {
                 preferred_root.as_deref(),
                 &url,
             );
-            let (handle, layout) = if let Some(entry) = handle_cache
-                .get(&bind_key)
-                .or_else(|| handle_cache.get(&url))
-            {
+            let (handle, layout) = if let Some(entry) = handle_cache.get(&bind_key) {
                 (Arc::clone(&entry.handle), entry.layout.clone())
             } else {
                 let h = add_magnet_to_session(
@@ -1246,6 +1333,7 @@ impl Protocol for MagnetProtocol {
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
+                    socks_active,
                 )
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
@@ -1266,10 +1354,7 @@ impl Protocol for MagnetProtocol {
                         preferred_root.as_deref(),
                         &url,
                     );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
-                    if preferred_root.is_none() {
-                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
-                    }
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
                 }
                 (h, layout)
             };
@@ -1349,6 +1434,7 @@ impl Protocol for MagnetProtocol {
             .clone();
         let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        let socks_active = self.socks_active();
         // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
         // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
         // 下载常需 30 分钟以上,5 分钟超时必然在下载中途误杀,产出误导错误信息
@@ -1366,10 +1452,7 @@ impl Protocol for MagnetProtocol {
                 preferred_root.as_deref(),
                 &url,
             );
-            let handle = if let Some(entry) = handle_cache
-                .get(&bind_key)
-                .or_else(|| handle_cache.get(&url))
-            {
+            let handle = if let Some(entry) = handle_cache.get(&bind_key) {
                 Arc::clone(&entry.handle)
             } else {
                 let h = add_magnet_to_session(
@@ -1381,6 +1464,7 @@ impl Protocol for MagnetProtocol {
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
+                    socks_active,
                 )
                 .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
@@ -1401,10 +1485,7 @@ impl Protocol for MagnetProtocol {
                         preferred_root.as_deref(),
                         &url,
                     );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
-                    if preferred_root.is_none() {
-                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
-                    }
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
                 }
                 h
             };
@@ -1451,6 +1532,7 @@ impl Protocol for MagnetProtocol {
             .clone();
         let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        let socks_active = self.socks_active();
         // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
         let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
@@ -1462,10 +1544,7 @@ impl Protocol for MagnetProtocol {
                 preferred_root.as_deref(),
                 &url,
             );
-            let handle = if let Some(entry) = handle_cache
-                .get(&bind_key)
-                .or_else(|| handle_cache.get(&url))
-            {
+            let handle = if let Some(entry) = handle_cache.get(&bind_key) {
                 Arc::clone(&entry.handle)
             } else {
                 let h = add_magnet_to_session(
@@ -1477,6 +1556,7 @@ impl Protocol for MagnetProtocol {
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
+                    socks_active,
                 )
                 .await?;
                 let layout = h
@@ -1509,10 +1589,7 @@ impl Protocol for MagnetProtocol {
                         preferred_root.as_deref(),
                         &url,
                     );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry.clone());
-                    if preferred_root.is_none() {
-                        Self::insert_with_capacity(&handle_cache, url.clone(), entry);
-                    }
+                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
                 }
                 h
             };
@@ -2406,6 +2483,34 @@ mod tests {
         }
     }
 
+    /// 审计 BT-08:peer_wait=MAX 且无 peer 时不得永久轮询,应立即 Timeout
+    #[tokio::test(start_paused = true)]
+    async fn test_make_chunk_stream_peer_wait_disabled_no_infinite_poll() {
+        use futures::StreamExt;
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
+        // stall 短超时进入无 peer 分支;peer_wait=MAX 表示禁用等 peer
+        let stream = make_chunk_stream(
+            PendingReader,
+            Duration::from_secs(1),
+            Duration::MAX,
+            Some(health),
+        );
+        let mut s = Box::pin(stream);
+        // 若回归永久轮询,60s(paused) 内拿不到项会失败
+        let result = tokio::time::timeout(Duration::from_secs(5), s.next()).await;
+        assert!(result.is_ok(), "peer_wait 禁用时不应永久挂起");
+        let item = result.unwrap().expect("流应产出项");
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("无可用 peer") || msg.contains("peer_wait"),
+                    "应说明无 peer 且 peer_wait 禁用,实际: {msg}"
+                );
+            }
+            other => panic!("应产出 Timeout,实际: {other:?}"),
+        }
+    }
+
     /// 验证:无 peer→有 peer 切换,peer_wait 重置后避免"无可用 peer"超时
     ///
     /// 前 4s 无 peer(累计等待),第 4s 切换为有 peer。
@@ -2978,11 +3083,10 @@ mod tests {
             .await
             .expect("构造离线 protocol 失败");
 
-        // proto_a 的 handle_cache 已由 from_handle 预填充(离线测试接缝)
-        // 验证 proto_a 自身能命中缓存
+        // proto_a 的 handle_cache 已由 from_handle 预填充(仅 binding key)
         assert!(
-            proto_a.handle_cache.get(&url).is_some(),
-            "proto_a 的 handle_cache 应有 url 条目"
+            proto_a.lookup_compatible(&url).is_some(),
+            "proto_a 应能通过 binding key 命中缓存"
         );
 
         // 创建 proto_b 共享 proto_a 的 handle_cache(模拟生产:两个 MagnetProtocol
@@ -2994,10 +3098,10 @@ mod tests {
             Arc::clone(&proto_a.handle_cache),
         );
 
-        // proto_b 应能命中 proto_a 填充的缓存(跨实例共享)
+        // proto_b 应能命中 proto_a 填充的缓存(跨实例共享,同 binding)
         assert!(
-            proto_b.handle_cache.get(&url).is_some(),
-            "proto_b 共享 handle_cache 后应命中 proto_a 填充的条目"
+            proto_b.lookup_compatible(&url).is_some(),
+            "proto_b 共享 handle_cache 后应命中 proto_a 的 binding 条目"
         );
 
         // proto_b 的 probe 命中缓存短路:不调 add_magnet_to_session,
@@ -3034,7 +3138,7 @@ mod tests {
 
         // proto_b 的独立 cache 不含 proto_a 填充的条目
         assert!(
-            proto_b.handle_cache.get(&url).is_none(),
+            proto_b.lookup_compatible(&url).is_none(),
             "独立 cache 的 proto_b 不应命中 proto_a 的条目"
         );
     }
@@ -3119,9 +3223,8 @@ mod tests {
         download_proto.set_preferred_root_name(Some("user-renamed.bin".into()));
 
         let ui_entry = proto_ui
-            .handle_cache
-            .get(&url)
-            .expect("from_handle 应写入 raw url 键")
+            .lookup_compatible(&url)
+            .expect("from_handle 应写入 binding key")
             .clone();
         let torrent_id = ui_entry.handle.id();
         let download_key = download_proto.binding_key_for(&url);
@@ -3167,7 +3270,7 @@ mod tests {
         let entry = proto.detach_cached_binding(&url).expect("应摘除");
         assert!(!proto.cache_has_torrent_id(entry.handle.id()));
         assert!(proto.lookup_compatible(&url).is_none());
-        assert!(proto.handle_cache.get(&url).is_none());
+        assert!(proto.lookup_compatible(&url).is_none());
     }
 
     /// P0-8: 同一 magnet URL 上 session 操作串行(cleanup ↔ add 互斥)

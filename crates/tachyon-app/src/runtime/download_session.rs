@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use tachyon_core::config::DownloadConfig;
 use tachyon_core::traits::TaskRunner;
-use tachyon_engine::connection::ConnectionPool;
-use tachyon_io::BufferPool;
+use tachyon_engine::BufferPool;
+use tachyon_engine::ConnectionPool;
 use tokio::sync::{Mutex, watch};
 
 use crate::commands::task_commands::{
@@ -102,13 +102,23 @@ impl DownloadSession {
                         tracing::info!(task_id = %task_id, "暂停已恢复,继续");
                         true
                     }
-                    ResumeOrCancel::Cancel | ResumeOrCancel::Timeout => {
+                    ResumeOrCancel::Cancel => {
                         update_task_status(
                             &state.domain.task_repository,
                             task_id,
                             tachyon_core::types::DownloadState::Cancelled,
                         );
-                        // cleanup_runtime 内部会调 broadcast_all,确保前端收到终态
+                        cleanup_runtime(state, task_id);
+                        false
+                    }
+                    // 审计 M-05:执行前 pause 超时 → 保持 Paused(可后续 Resume 重启),
+                    // 不再误映射为 Cancelled。cleanup 掉本代 channel,resume 走 restart 路径。
+                    ResumeOrCancel::Timeout => {
+                        update_task_status(
+                            &state.domain.task_repository,
+                            task_id,
+                            tachyon_core::types::DownloadState::Paused,
+                        );
                         cleanup_runtime(state, task_id);
                         false
                     }
@@ -119,8 +129,15 @@ impl DownloadSession {
 
     /// 执行完整下载生命周期
     pub async fn run(mut self) {
-        // 读取 HF 源模式(配置驱动)。锁失败降级为默认 Mirror。
-        let hf_mode = self.state.domain.config.lock().await.hub.source_mode;
+        // 读取 HF 源模式 + token(配置驱动)。锁失败降级为默认 Mirror。
+        let (hf_mode, hub_token) = {
+            let cfg = self.state.domain.config.lock().await;
+            (cfg.hub.source_mode, cfg.hub.token.clone())
+        };
+        // 官方 resolve URL 下载注入 Bearer;镜像 URL 由 HttpClient host 门禁不发送
+        if self.url.contains("huggingface.co") || self.url.contains("hf-mirror.com") {
+            self.download_config.auth_bearer = hub_token;
+        }
 
         // 按模式改写 URL:Official 不改写,Mirror/Race 替换为 hf-mirror.com
         // (Race 浏览与主源均走镜像保证国内可达,官方作为竞速源在下方注入)
@@ -181,12 +198,18 @@ impl DownloadSession {
         }
 
         // 3. 构造下载任务
+        let scheduler_config = {
+            let cfg = self.state.domain.config.lock().await;
+            cfg.scheduler.clone()
+        };
         let mut download_task: Box<dyn TaskRunner> = match build_download_task(
             &self.task_id,
             &self.url,
             self.download_config,
             self.connection_pool,
             self.buffer_pool.clone(),
+            self.state.infra.global_rate_limiter.clone(),
+            scheduler_config,
             self.mirror_urls,
             #[cfg(feature = "magnet")]
             self.state.infra.bt_session.lock().await.clone(),

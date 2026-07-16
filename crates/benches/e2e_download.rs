@@ -23,6 +23,7 @@ fn temp_dir() -> PathBuf {
 fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u32) -> TaskSnapshot {
     TaskSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
+        revision: 0,
         id: id.to_string(),
         url: format!("https://example.com/{}.bin", id),
         save_path: format!("/tmp/{}.bin", id),

@@ -319,7 +319,11 @@ impl MirrorProtocol {
         }
     }
 
-    /// 清除 probe 结果 + 重置选源状态(修复 BUG-B:不清 in_flight 导致失败源永久饿死)
+    /// 清除 probe 结果 + 重置选源状态(修复 BUG-B:不清选中源会导致失败源永久饿死)
+    ///
+    /// 审计 M-02:**不得** 将 `in_flight` 全清零。在途计数仅由 `StatsStream`
+    /// 的 EOF/Err/Drop 调整；分片 retry 的 `clear_selected` 若清零,仍活流的 Drop
+    /// 会把新 stream 的计数减掉,导致 least-in-flight 过度集中。
     ///
     /// P3 遗忘机制:同时对 stats 做衰减(success/fail 各除以 2),避免瞬时故障
     /// 镜像因 fail 永久累积被永久冷落。衰减保留趋势(质量排序大致不变)但弱化
@@ -329,12 +333,6 @@ impl MirrorProtocol {
         *self.probe_ok.lock().await = HashSet::new();
         *self.baseline_identity.lock().await = None;
         *self.identity_rejected.lock().await = HashSet::new();
-        // 重置 in_flight:重试前所有源在途数归零(避免跨调用累积)
-        if let Ok(mut inflight) = self.in_flight.lock() {
-            for v in inflight.iter_mut() {
-                *v = 0;
-            }
-        }
         // P3 衰减:success/fail 各除以 2(整数除法,保留趋势弱化历史)
         // 遗忘机制避免瞬时故障永久污名化:某镜像曾连续失败数次,quality 持续
         // 偏低,即使后续恢复也会因历史 fail 累积而难被选中。衰减后 fail 计数
@@ -850,6 +848,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }),
                 download_data: Ok(Bytes::from_static(b"mock")),
                 expected_url: None,
@@ -999,6 +998,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 })),
         );
 
@@ -1014,6 +1014,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 })),
         );
 
@@ -1042,6 +1043,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         })));
 
         let mirror = Arc::new(MockProtocol::new().with_probe_meta(Ok(FileMetadata {
@@ -1053,6 +1055,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         })));
 
         let mirror_protocol =
@@ -1072,6 +1075,29 @@ mod tests {
         assert!(
             mirror_protocol.probe_ok.lock().await.is_empty(),
             "clear_selected 后应清空可用源"
+        );
+    }
+
+    /// 审计 M-02:clear_selected 不得把仍存活 stream 的 in_flight 清零
+    #[tokio::test]
+    async fn test_clear_selected_preserves_in_flight_counts() {
+        let primary = Arc::new(MockProtocol::new());
+        let mirror = Arc::new(MockProtocol::new());
+        let mp = MirrorProtocol::new(primary, vec![("http://m/file".into(), mirror)]);
+        {
+            let mut inflight = mp.in_flight.lock().unwrap();
+            inflight[0] = 3;
+            inflight[1] = 1;
+        }
+        mp.clear_selected().await;
+        let inflight = mp.in_flight.lock().unwrap();
+        assert_eq!(
+            inflight[0], 3,
+            "M-02: clear_selected 不得清零仍存活 stream 的 in_flight[0]"
+        );
+        assert_eq!(
+            inflight[1], 1,
+            "M-02: clear_selected 不得清零仍存活 stream 的 in_flight[1]"
         );
     }
 
@@ -1172,6 +1198,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }))
                 .with_download_data(Ok(Bytes::from_static(b"from mirror")))
                 .with_expected_url("http://mirror.com/file"),
@@ -1215,6 +1242,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }))
                 .with_download_data(Err("primary download blocked".into())),
         );
@@ -1231,6 +1259,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }))
                 .with_download_data(Ok(Bytes::from_static(b"from mirror")))
                 .with_expected_url("http://mirror.com/file"),
@@ -1600,6 +1629,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }))
                 .with_download_data(Err("primary down".into())),
         );
@@ -1614,6 +1644,7 @@ mod tests {
                     last_modified: None,
                     file_layout: None,
                     protocol_managed_storage: false,
+                    resolved_host: None,
                 }))
                 .with_download_data(Ok(Bytes::from_static(b"BBBBBBBBBB")))
                 .with_expected_url("http://mirror.com/file"),

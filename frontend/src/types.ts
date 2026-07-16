@@ -154,7 +154,10 @@ export interface NotificationsPatch {
 /** FIX-16:BT 某类流量相对 SOCKS 代理的覆盖状态 */
 export type ProxyCoverage = 'Direct' | 'ViaProxy' | 'Blocked' | 'Disabled' | 'MayBypass'
 
-/** FIX-16:BT 各流量类别的代理覆盖报告(隐私可见性) */
+/** 审计 A-09:Session 构建时 SOCKS 来源 */
+export type SocksProxySource = 'none' | 'explicit' | 'environment'
+
+/** FIX-16 / A-09:BT 各流量类别的代理覆盖报告(隐私可见性) */
 export interface BtProxyCoverageReport {
   socksEnabled: boolean
   peerTcp: ProxyCoverage
@@ -162,6 +165,10 @@ export interface BtProxyCoverageReport {
   udpTrackerDht: ProxyCoverage
   utp: ProxyCoverage
   upnp: ProxyCoverage
+  /** Session 构建时解析来源;缺省兼容旧响应 */
+  socksSource?: SocksProxySource
+  /** 脱敏 endpoint;缺省兼容旧响应 */
+  socksEndpointRedacted?: string | null
 }
 
 /** 下载配置白名单补丁 */
@@ -224,8 +231,8 @@ export type SnifferResourceType = 'video' | 'audio' | 'document' | 'archive' | '
 export interface SnifferResource {
   id: string
   url: string
-  /** 资源原始 URL(含凭据,用于实际下载) */
-  downloadUrl: string
+  /** @deprecated SEC-009: 后端不再下发完整下载 URL;请用 createTaskFromSniffer(id) */
+  downloadUrl?: string
   name: string
   type: SnifferResourceType
   size: number | null

@@ -187,8 +187,9 @@ function AppContent() {
   };
 
   const handleAddFromSniffer = (resource: SnifferResource) => {
+    // 审计 SEC-009:不经前端传递含凭据 downloadUrl,由后端按资源 id 建任务
     api
-      .createTask(resource.downloadUrl)
+      .createTaskFromSniffer(resource.id)
       .then(() => refreshTaskList())
       .catch((e) =>
         addToast(tr("toast.createTaskFailed", { error: errorMessage(e) }), "error"),

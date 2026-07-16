@@ -118,15 +118,70 @@ impl ChunkReaderPool {
             worker_rxs.push(rx);
         }
 
-        // dispatcher: 从中心 channel 读取 job,round-robin 分发到 per-worker channel
+        // dispatcher: 从中心 channel 读取 job,分发到 per-worker channel。
+        // 审计 M-04:禁止对固定 next_worker 阻塞 send——worker buffer=1 时若该
+        // worker 正在处理长 job 且队列已满,dispatcher 会 HOL 饿死其他空闲 worker。
+        // 策略:从 round-robin 起点 try_reserve;全满则 clone Sender 并发 reserve,
+        // 第一个拿到 permit 的 worker 收下 job(job 本身不需 Clone)。
         tokio::spawn(async move {
             let mut next_worker = 0usize;
+            let n = worker_txs.len();
             while let Some(job) = job_rx.recv().await {
-                let worker_id = next_worker % worker_txs.len();
-                if worker_txs[worker_id].send(job).await.is_err() {
-                    tracing::debug!(worker_id, "chunk reader worker 已退出,丢弃 job");
+                if n == 0 {
+                    break;
                 }
-                next_worker = worker_id.wrapping_add(1);
+                let mut job_opt = Some(job);
+                let mut delivered = false;
+                for offset in 0..n {
+                    let worker_id = (next_worker + offset) % n;
+                    match worker_txs[worker_id].try_reserve() {
+                        Ok(permit) => {
+                            if let Some(j) = job_opt.take() {
+                                permit.send(j);
+                            }
+                            next_worker = worker_id.wrapping_add(1);
+                            delivered = true;
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Full(())) => {}
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            tracing::debug!(
+                                worker_id,
+                                "chunk reader worker 已退出,try_reserve 忽略"
+                            );
+                        }
+                    }
+                }
+                if delivered {
+                    continue;
+                }
+                // 全部 worker 队列满:并发 reserve;第一个拿到 permit 且抢到 job 的 worker 收下。
+                // job 放在 Mutex 中,避免 Permit 生命周期绑定本地 Sender 无法跨 future 返回。
+                let job_cell = std::sync::Arc::new(tokio::sync::Mutex::new(job_opt.take()));
+                let mut reserve_futs = Vec::with_capacity(n);
+                for (worker_id, tx) in worker_txs.iter().enumerate() {
+                    let tx = tx.clone();
+                    let job_cell = std::sync::Arc::clone(&job_cell);
+                    reserve_futs.push(Box::pin(async move {
+                        let permit = tx.reserve().await.map_err(|_| ())?;
+                        let mut guard = job_cell.lock().await;
+                        if let Some(j) = guard.take() {
+                            permit.send(j);
+                            Ok(worker_id)
+                        } else {
+                            // 其他 worker 已交付;drop permit 释放预留槽
+                            Err(())
+                        }
+                    }));
+                }
+                match futures::future::select_ok(reserve_futs).await {
+                    Ok((worker_id, _)) => {
+                        next_worker = worker_id.wrapping_add(1);
+                    }
+                    Err(_) => {
+                        tracing::debug!("chunk reader 全部 worker 已退出,丢弃 job");
+                    }
+                }
             }
             // 中心 channel 关闭,通知所有 worker 退出
             drop(worker_txs);

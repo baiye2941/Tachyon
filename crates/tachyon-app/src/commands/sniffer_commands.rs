@@ -14,6 +14,36 @@ pub async fn get_sniffer_resources(
     Ok(state.service.sniffer_service.get_resources().await)
 }
 
+/// 审计 SEC-009:按嗅探资源 id 创建下载任务(原始 URL 不经 IPC 回前端)
+#[tauri::command]
+pub async fn create_task_from_sniffer(
+    state: tauri::State<'_, AppState>,
+    resource_id: String,
+    download_dir: Option<String>,
+    auto_start: Option<bool>,
+) -> Result<String, AppError> {
+    let resource = state
+        .service
+        .sniffer_service
+        .get_resource_by_id(&resource_id)
+        .await
+        .ok_or_else(|| AppError::Config(format!("嗅探资源不存在: {resource_id}")))?;
+    let url = resource.download_url;
+    if url.is_empty() {
+        return Err(AppError::Config("嗅探资源缺少下载 URL".into()));
+    }
+    crate::commands::task_commands::create_task_inner(
+        &state,
+        url,
+        download_dir,
+        None,
+        None,
+        auto_start.unwrap_or(true),
+        None,
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn add_sniffer_filter(
     state: tauri::State<'_, AppState>,
@@ -84,6 +114,43 @@ mod tests {
         let state = test_state();
         let resources = state.service.sniffer_service.get_resources().await;
         assert!(resources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_task_from_sniffer_uses_backend_url() {
+        let state = test_state();
+        let resource = state
+            .service
+            .sniffer_service
+            .add_resource("https://example.com/sniffer-sec009.bin?token=secret".into())
+            .await
+            .expect("应添加嗅探资源");
+        let json = serde_json::to_string(&resource).unwrap();
+        assert!(!json.contains("token=secret"), "IPC 序列化泄漏: {json}");
+        assert!(
+            !json.contains("downloadUrl"),
+            "IPC 不得含 downloadUrl: {json}"
+        );
+
+        let task_id = crate::commands::task_commands::create_task_inner(
+            &state,
+            resource.download_url.clone(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("应按后端 download_url 建任务");
+        let detail = crate::commands::task_commands::get_task_detail_inner(&state, task_id)
+            .await
+            .unwrap();
+        assert!(
+            detail.url.contains("sniffer-sec009.bin"),
+            "任务 URL 应来自嗅探资源: {}",
+            detail.url
+        );
     }
 
     #[tokio::test]

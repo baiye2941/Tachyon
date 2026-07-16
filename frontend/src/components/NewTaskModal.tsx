@@ -150,7 +150,15 @@ export default function NewTaskModal(props: NewTaskModalProps) {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({ directory: true, multiple: false });
       if (selected) {
-        setSavePath(selected as string);
+        const path = selected as string;
+        // 审计 SEC-002:dialog 选目录后须显式授权,create_task 不再静默扩权
+        try {
+          const authorized = await api.authorizeDownloadDirectory(path);
+          setSavePath(authorized);
+        } catch (authErr) {
+          console.warn("authorize download dir failed", authErr);
+          addToast(tr("toast.createTaskError", { error: String(authErr) }), "error");
+        }
       }
     } catch (err) {
       console.warn(tr("newTask.folderPickerUnavailable"), err);

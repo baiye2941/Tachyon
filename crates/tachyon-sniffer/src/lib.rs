@@ -12,7 +12,10 @@ pub mod filter;
 pub mod resources;
 
 pub use capture::{CaptureConfig, ResourceType, identify_resource, should_capture};
-pub use resources::{ResourceManager, SnifferResource, redact_sensitive_params};
+pub use resources::{
+    CaptureConfigError, MAX_FILTER_COUNT, MAX_FILTER_LENGTH, MAX_SNIFFER_RESOURCES,
+    ResourceManager, SnifferResource, redact_sensitive_params, validate_capture_config,
+};
 
 #[cfg(test)]
 #[test]

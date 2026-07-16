@@ -135,6 +135,8 @@ jobs:
         run: cargo binstall -y --force cargo-audit
       # 与 deny.toml [advisories].ignore 对齐,治理同一组已知的间接依赖漏洞
       # (librqbit/Tauri 引入的 quick-xml、glib、bincode、backoff 等)。
+      # 审计 A-10:quick-xml 0194/0195 同时覆盖 librqbit-upnp 与 Tauri/plist 链,
+      # 目标 quick-xml >=0.41 后移除 ignore;不得再标注为「仅 UPnP」。
       # RUSTSEC-2026-0186(memmap2)已随 0.9.11 升级消除,不再忽略。
       - run: cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0012 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0060 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0190
 
@@ -291,7 +293,8 @@ jobs:
     name: CI 通过
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, bench, frontend]
+    # 审计 C2:MSRV 必须纳入汇总,否则 1.85 编译失败仍可能显示 CI 全绿
+    needs: [fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, bench, frontend, msrv]
     steps:
       - name: 检查所有 CI 作业是否成功
         run: |

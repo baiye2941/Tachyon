@@ -36,7 +36,7 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | HuggingFace Hub 集成 | 模型浏览、LFS 解析、Token 管理、本地模型扫描 |
 | 浏览器资源嗅探 | 基于扩展名识别视频 / 音频 / 文档 / 压缩包等资源 |
 | 多源并发下载 | MirrorProtocol 多镜像源 least-in-flight 调度 + 质量加权选源 |
-| 限速控制 | 无锁令牌桶，支持跨任务全局限速 |
+| 限速控制 | 无锁令牌桶，支持跨任务全局限速（进程内共享 RateLimiter） |
 
 ---
 
@@ -61,7 +61,7 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | Crate | 职责 |
 |------|------|
 | `tachyon-core` | 类型、trait、错误体系、配置、安全校验 |
-| `tachyon-engine` | 分片引擎、连接池、多源竞速、限速器 |
+| `tachyon-engine` | 分片引擎、并发许可器、多源竞速、限速器 |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 |
 | `tachyon-io` | 跨平台异步 I/O（io_uring/IOCP）、BufferPool 池化、直接 async write |
 | `tachyon-protocol` | HTTP/HTTPS、QUIC、BitTorrent 协议实现 |

@@ -334,7 +334,7 @@ impl TaskService {
         // 提前获取配置和下载目录,避免在检查-插入间隙中 await(消除 TOCTOU 竞态)
         // 同时预校验 max_concurrent_fragments,避免锁外失败需要回滚 tasks.insert
         let (max_tasks, download_dir_str, download_config) = {
-            let mut cfg = self.config.lock().await;
+            let cfg = self.config.lock().await;
             if cfg.download.max_concurrent_fragments == 0 {
                 return Err(AppError::Config(
                     "max_concurrent_fragments 不能为 0".to_string(),
@@ -348,41 +348,11 @@ impl TaskService {
             // 在 async fn 内直接调用会阻塞 Tokio 工作线程。先在锁内完成授权逻辑,
             // 记录待持久化的配置,drop 锁后用 spawn_blocking 包裹持久化,
             // 与 update_config_inner 的模式一致。
-            let mut persist_pending: Option<AppConfig> = None;
-            let authorized = match authorize_download_dir(&cfg, &requested) {
-                Ok(dir) => dir,
-                Err(_) if download_dir.is_some() => {
-                    // 用户通过对话框明确选择了目录,但不在 authorized_dirs 中
-                    // 执行基本安全验证后自动授权该目录
-                    let validated =
-                        crate::commands::config_commands::validate_explicit_download_dir(
-                            &requested,
-                        )?;
-                    cfg.download.authorized_dirs.push(validated.clone());
-                    // 重新授权(此时目录已在 authorized_dirs 中)
-                    let authorized = authorize_download_dir(&cfg, &requested)?;
-                    persist_pending = Some(cfg.clone());
-                    authorized
-                }
-                Err(e) => return Err(e),
-            };
+            // 审计 SEC-002:禁止 create_task 对任意绝对路径自动 authorize_dirs.push。
+            // 新目录须先经 authorize_download_directory(确认令牌)加入白名单。
+            let authorized = authorize_download_dir(&cfg, &requested)?;
             let config = build_download_config(&cfg, &authorized);
             drop(cfg);
-            if let Some(config_to_save) = persist_pending {
-                match tokio::task::spawn_blocking(move || {
-                    crate::commands::config_commands::persist_config(&config_to_save)
-                })
-                .await
-                .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))?
-                {
-                    Err(e) => {
-                        tracing::warn!(error = %e, "自动授权目录后持久化配置失败");
-                    }
-                    Ok(()) => {
-                        tracing::info!(dir = %authorized, "已自动授权下载目录并持久化配置");
-                    }
-                }
-            }
             (max_tasks, authorized, config)
         };
 
@@ -758,7 +728,7 @@ impl TaskService {
             let task_store = self.task_store.clone();
             let task_id_for_log = task_id.to_string();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = task_store.save_snapshot(&snapshot) {
+                if let Err(e) = task_store.restore_snapshot(&snapshot) {
                     tracing::warn!(
                         task_id = %task_id_for_log,
                         error = %e,
@@ -1007,6 +977,8 @@ impl TaskService {
                 snapshot.last_modified = existing.last_modified;
                 snapshot.retry_count = existing.retry_count;
                 snapshot.fail_reason = existing.fail_reason;
+                // 审计 H-05:full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序
+                snapshot.revision = existing.revision;
             }
             patch(&mut snapshot);
             // task_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。

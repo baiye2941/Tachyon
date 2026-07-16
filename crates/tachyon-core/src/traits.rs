@@ -65,6 +65,13 @@ pub trait Protocol: Send + Sync {
         url: &str,
     ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>>;
 
+    /// 审计 HTTP-13:最近一次成功响应的 final host(重定向后 CDN)。
+    ///
+    /// 默认 `None`。HTTP 实现在 probe/range/full 后更新;引擎据此刷新 per-host 许可归属。
+    fn last_resolved_host(&self) -> Option<String> {
+        None
+    }
+
     /// 清除已选中的源(用于重试时触发镜像轮换)
     ///
     /// 默认实现为空操作。`MirrorProtocol` 覆盖此方法以清除 probe 选中的源,
@@ -534,6 +541,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let mock = MockTaskRunner {
             state: Arc::clone(&state),

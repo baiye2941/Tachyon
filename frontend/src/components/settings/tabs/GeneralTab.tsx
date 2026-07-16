@@ -74,15 +74,11 @@ export default function GeneralTab(props: GeneralTabProps) {
       <div
         style={{
           "font-size": "11px",
-          color: props.draft.clipboard.enableWatch
-            ? "var(--color-warning)"
-            : "var(--color-text-tertiary)",
+          color: "var(--color-text-tertiary)",
           "margin-top": "-12px",
         }}
       >
-        {props.draft.clipboard.enableWatch
-          ? t("settings.clipboard.restartRequired")
-          : t("settings.clipboard.enableWatchHint")}
+        {t("settings.clipboard.enableWatchHint")}
       </div>
 
       <div

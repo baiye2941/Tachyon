@@ -570,8 +570,13 @@ async fn driver_task(
             continue;
         }
 
-        // submit_and_wait: 提交所有 SQE 并等待全部完成
-        if ring.submitter().submit_and_wait(total_sqes).is_err() {
+        // submit_and_wait: 提交所有 SQE 并等待全部完成。
+        // 审计 M-01:该调用是同步阻塞 syscall;在 async driver_task 中直接调用会
+        // 占死 cooperative worker,abort 无法穿透。block_in_place 允许 runtime
+        // 在阻塞期间调度其他 task(非完整 eventfd/AsyncCancel 方案)。
+        let submit_result =
+            tokio::task::block_in_place(|| ring.submitter().submit_and_wait(total_sqes));
+        if submit_result.is_err() {
             // 提交失败：通知所有 inflight 请求。
             // 此处不回收 buf_idx——submit_and_wait 失败时部分 SQE 可能已被内核
             // 消费并仍在处理,贸然释放会导致复用竞争。索引泄漏是安全的(不被复用)。
@@ -743,22 +748,25 @@ impl BufferIndexPool {
 
 /// RAII 守卫,管理 io_uring fixed buffer 索引在调用方一侧的生命周期。
 ///
-/// # 所有权模型(修复取消路径提前释放竞争)
+/// # 所有权模型(审计 H-07)
 ///
 /// `submit_read`/`submit_write` 在 `alloc_buffer_index()` 后创建本守卫。守卫持
 /// 有 `submitted` 标志,描述索引所有权是否已转移给 driver_task:
 ///
-/// - `submitted == false`(命令尚未发送):Drop 时回收索引。覆盖 `alloc` 后、
-///   `mark_submitted` 前因 `?` 提前返回或外层 `select!` 取消的路径——此刻
-///   driver 未收到命令、内核无 in-flight op,回收安全。
-/// - `submitted == true`(命令已发送或即将发送):Drop 时 **不** 回收索引。
-///   driver_task 在该 op 的 CQE 完成时回收;若调用方 future 被取消(外层
-///   `select!` drop),driver 仍持有引用该 buffer 的 in-flight SQE,提前释放
-///   会让新操作复用同一索引并 `copy_from_slice` 覆盖正在被内核读写的 buffer,
-///   造成数据竞争。因此取消路径下索引泄漏(不被复用),是安全的。
+/// - `submitted == false`(命令尚未入队):Drop 时回收索引。覆盖 `alloc` 后、
+///   `reserve().await` 等待 channel 容量期间的外层 `select!` 取消,以及
+///   `mark_submitted` 前的 `?` 提前返回——此刻 driver 未收到命令、内核无
+///   in-flight op,回收安全。
+/// - `submitted == true`(permit 已拿到且命令已/将 `permit.send`):Drop 时
+///   **不** 回收索引。driver 在 CQE 完成时回收;若调用方在 **入队之后** 被
+///   cancel,driver 仍可能持有 in-flight SQE,提前释放会与内核竞争 buffer。
 ///
-/// 正常完成路径:driver 在 CQE 完成时已回收索引(先于 `done_rx` 唤醒调用方),
-/// 守卫 `submitted == true`,Drop 也不再回收——无双重释放。
+/// **H-07 关键顺序**:必须先 `cmd_tx.reserve().await` 拿到 permit,再
+/// `mark_submitted`,再同步 `permit.send`。禁止在 await send 前 mark——
+/// 旧实现在 `send().await` 等待容量时取消会泄漏 16 槽 fixed buffer。
+///
+/// 正常完成路径:driver 在 CQE 完成时已回收索引;守卫 `submitted == true`,
+/// Drop 也不再回收——无双重释放。
 ///
 /// 对称于 IOCP 路径的 `PendingWriteCancelGuard`(见 `iocp.rs`)。
 #[cfg(any(test, target_os = "linux"))]
@@ -779,13 +787,22 @@ impl IoUringBufferGuard {
         }
     }
 
-    /// 标记命令即将发送给 driver,索引所有权转移给 driver_task。
+    /// 标记命令即将经 `permit.send` 入队,索引所有权转移给 driver_task。
     ///
-    /// 必须在 `cmd_tx.send(...)` 之前调用,以确保 `send` 期间被取消时
-    /// 索引不会被提前回收(tokio mpsc `send` 取消时消息不入队,但保守起见
-    /// 仍按"已转移"处理,泄漏而非竞争)。
+    /// 审计 H-07:仅在 `cmd_tx.reserve().await` **成功之后**调用。此时 channel
+    /// 已预留容量,`permit.send` 为同步非 await,取消窗口不再覆盖"等容量"。
     fn mark_submitted(&mut self) {
         self.submitted = true;
+    }
+
+    /// send 失败(driver 已关闭,消息未入队)时显式回收。
+    ///
+    /// 调用后 `submitted=false`,后续 Drop 不再 double-free。
+    fn reclaim_unsent(&mut self) {
+        if self.submitted {
+            self.pool.free(self.buf_idx);
+            self.submitted = false;
+        }
     }
 }
 
@@ -1111,13 +1128,14 @@ impl IoUringStorage {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
-        // 标记所有权转移:此后索引由 driver 负责(在 CQE 完成时回收)。
-        // 即使 send 失败(driver 已关闭)或 done_rx 返回 Err(driver 异常退出),
-        // 索引将泄漏而非被提前回收——泄漏是安全的(不会被复用)。
+        // 审计 H-07:先 reserve 拿到 channel 容量,再 mark_submitted + 同步 send。
+        // reserve 等待期间若被外层 select! 取消,guard 仍 unsubmitted,Drop 回收槽位。
+        let permit =
+            ring_handle.cmd_tx.reserve().await.map_err(|_| {
+                DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭"))
+            })?;
         guard.mark_submitted();
-
-        ring_handle
-            .cmd_tx
+        if permit
             .send(DriverCmd::Read(ReadReq {
                 offset,
                 read_len,
@@ -1125,8 +1143,14 @@ impl IoUringStorage {
                 buf_idx,
                 done: done_tx,
             }))
-            .await
-            .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭")))?;
+            .is_err()
+        {
+            // receiver 关闭:消息未入队,显式回收(mark 后 Drop 不会 free)
+            guard.reclaim_unsent();
+            return Err(DownloadError::Io(std::io::Error::other(
+                "io_uring driver task 已关闭",
+            )));
+        }
 
         let read_result: Vec<u8> = done_rx
             .await
@@ -1267,13 +1291,14 @@ impl IoUringStorage {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
-        // 标记所有权转移:此后索引由 driver 负责(在 CQE 完成时回收)。
-        // 即使 send 失败(driver 已关闭)或 done_rx 返回 Err(driver 异常退出),
-        // 索引将泄漏而非被提前回收--泄漏是安全的(不会被复用)。
+        // 审计 H-07:先 reserve 拿到 channel 容量,再 mark_submitted + 同步 send。
+        // 数据已拷入 fixed buffer;若在 reserve 等待时取消,guard Drop 回收槽位。
+        let permit =
+            ring_handle.cmd_tx.reserve().await.map_err(|_| {
+                DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭"))
+            })?;
         guard.mark_submitted();
-
-        ring_handle
-            .cmd_tx
+        if permit
             .send(DriverCmd::Write(WriteReq {
                 offset,
                 len,
@@ -1281,8 +1306,13 @@ impl IoUringStorage {
                 buf_idx,
                 done: done_tx,
             }))
-            .await
-            .map_err(|_| DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭")))?;
+            .is_err()
+        {
+            guard.reclaim_unsent();
+            return Err(DownloadError::Io(std::io::Error::other(
+                "io_uring driver task 已关闭",
+            )));
+        }
 
         let result = done_rx
             .await
@@ -2270,6 +2300,47 @@ mod tests {
         pool.free(a);
         // 回收后应能再次分配到 A
         assert_eq!(pool.alloc(), Some(0), "driver push 失败回收后索引应可复用");
+    }
+
+    /// 审计 H-07:reserve 成功后若 send 失败,reclaim_unsent 必须归还槽位。
+    #[test]
+    fn test_guard_reclaim_unsent_after_failed_enqueue() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(2));
+        let a = pool.alloc().expect("分配 A");
+        let mut guard = IoUringBufferGuard::new(pool.clone(), a);
+        // 模拟:reserve 已成功并 mark,但 permit.send 失败(driver 关闭)
+        guard.mark_submitted();
+        guard.reclaim_unsent();
+        drop(guard);
+        assert_eq!(
+            pool.alloc(),
+            Some(0),
+            "send 失败后 reclaim_unsent 应归还 fixed buffer 槽位"
+        );
+    }
+
+    /// 审计 H-07:reserve 等待期间取消(未 mark)必须回收——与 mark 前 Drop 同构。
+    #[test]
+    fn test_h07_cancel_before_mark_does_not_exhaust_pool() {
+        let pool = std::sync::Arc::new(BufferIndexPool::new(4));
+        // 模拟 4 次"alloc → 等 channel 时 cancel(未 mark) → Drop"
+        for _ in 0..4 {
+            let idx = pool.alloc().expect("未提交取消后槽位应可复用");
+            let guard = IoUringBufferGuard::new(pool.clone(), idx);
+            drop(guard); // submitted=false
+        }
+        // 池应仍可满配 4 个
+        let mut held = Vec::new();
+        for i in 0..4 {
+            held.push(
+                pool.alloc()
+                    .unwrap_or_else(|| panic!("第 {i} 次 alloc 失败,池被错误耗尽")),
+            );
+        }
+        assert!(pool.alloc().is_none());
+        for idx in held {
+            pool.free(idx);
+        }
     }
 
     /// B1 并发 RMW 数据完整性测试。

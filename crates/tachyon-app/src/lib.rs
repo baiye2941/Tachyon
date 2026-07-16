@@ -180,6 +180,7 @@ pub fn run() {
             get_sniffer_resources,
             add_sniffer_filter,
             add_sniffer_resource,
+            create_task_from_sniffer,
             get_sniffer_capture_config,
             set_sniffer_capture_config,
             clear_sniffer_resources,
@@ -187,6 +188,7 @@ pub fn run() {
             get_config,
             #[cfg(feature = "magnet")] get_bt_proxy_coverage,
             update_config,
+            authorize_download_directory,
             export_backup,
             import_backup,
             // HuggingFace Hub

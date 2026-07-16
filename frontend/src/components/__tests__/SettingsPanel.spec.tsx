@@ -52,6 +52,8 @@ const mockConfig = {
     headers: {
       Authorization: 'Bearer test-token',
     },
+    proxy: null as string | null,
+    ioStrategy: 'standard' as const,
   },
   connection: {
     maxConnectionsPerHost: 4,

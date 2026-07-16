@@ -9,7 +9,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tokio::sync::watch;
 
-use tachyon_engine::connection::ConnectionPool;
+use tachyon_engine::ConnectionPool;
 
 use crate::AppState;
 use crate::commands::TaskCommand;
@@ -31,6 +31,8 @@ pub struct DownloadSupervisor {
     pub(crate) handles: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     /// 控制命令通道（TaskCommand，而非 DownloadState）
     pub(crate) command_channels: Arc<DashMap<String, watch::Sender<TaskCommand>>>,
+    /// 审计 H-02:每 task 控制命令串行锁,防止 pause/resume 交错写 TaskInfo 与 watch
+    pub(crate) command_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 全局连接池热替换句柄
     pub(crate) connection_pool: Arc<tokio::sync::RwLock<Arc<ConnectionPool>>>,
 }
@@ -41,8 +43,17 @@ impl DownloadSupervisor {
         Self {
             handles: Arc::new(DashMap::new()),
             command_channels: Arc::new(DashMap::new()),
+            command_locks: Arc::new(DashMap::new()),
             connection_pool,
         }
+    }
+
+    /// 获取/创建任务控制串行锁(审计 H-02)
+    pub fn task_command_lock(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.command_locks
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 启动下载任务
@@ -69,7 +80,8 @@ impl DownloadSupervisor {
         let pool_handle = self.connection_pool.clone();
         // 切片2:从 AppState.infra 取全局 BufferPool 经 task_fn 注入到 DownloadTask,
         // 使 worker 用池化 buffer 写入磁盘(反压 + 内存有界)。
-        let buffer_pool_clone = state.infra.buffer_pool.clone();
+        // 审计 A-14:读锁 clone 任务启动时刻的池快照,热重建不影响运行中任务。
+        let buffer_pool_handle = state.infra.buffer_pool.clone();
         let tid = task_id.to_string();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
@@ -78,6 +90,7 @@ impl DownloadSupervisor {
             // 读锁内 clone 出当前 Arc<ConnectionPool>:
             // 取的是任务启动时刻的 pool 快照,后续热重建不影响本任务。
             let pool_clone = pool_handle.read().await.clone();
+            let buffer_pool_clone = buffer_pool_handle.read().await.clone();
             task_fn(
                 state,
                 tid,
@@ -108,11 +121,11 @@ impl DownloadSupervisor {
 
     /// 发送控制命令到指定任务
     ///
-    /// 返回 true 表示命令成功发送，false 表示任务不存在或通道已关闭。
+    /// 返回 true 表示命令成功入队；false 表示任务不存在或
+    /// receiver 已关闭（审计 H-03：不得忽略 `send` Err 伪成功，否则 Resume 会被永久吞掉）。
     pub fn send_command(&self, task_id: &str, command: TaskCommand) -> bool {
         if let Some(control) = self.command_channels.get(task_id) {
-            let _ = control.send(command);
-            true
+            control.send(command).is_ok()
         } else {
             false
         }
@@ -135,24 +148,85 @@ impl DownloadSupervisor {
     pub fn cleanup(&self, task_id: &str) {
         self.command_channels.remove(task_id);
         self.handles.remove(task_id);
+        self.command_locks.remove(task_id);
     }
 
     /// 等待任务 JoinHandle 完成（带超时）
     ///
-    /// 用于在任务结束后等待 progress monitor 和 chunk reader 完成。
+    /// 审计 H-04:删除/停止路径在删文件或 drop 运行时前应 await generation。
+    /// - 从 maps 取出 handle,避免与并发 cleanup 竞态
+    /// - 超时后 abort,并再短等以尽量 drain abort
+    /// - 同时移除 command channel,防止旧 Cancel 通道泄漏
     pub async fn wait_for_handle(
         &self,
         task_id: &str,
         timeout: Duration,
     ) -> Option<Result<(), tokio::task::JoinError>> {
-        let mut handle = self.handles.remove(task_id)?.1;
+        let handle = self.handles.remove(task_id).map(|(_, h)| h);
+        let Some(mut handle) = handle else {
+            self.command_channels.remove(task_id);
+            return None;
+        };
         match tokio::time::timeout(timeout, &mut handle).await {
-            Ok(result) => Some(result),
+            Ok(result) => {
+                self.command_channels.remove(task_id);
+                Some(result)
+            }
             Err(_) => {
-                tracing::warn!(task_id = %task_id, "任务 JoinHandle 等待超时");
+                tracing::warn!(task_id = %task_id, ?timeout, "任务 JoinHandle 等待超时,abort");
                 handle.abort();
+                // abort 后尽量 drain,避免调用方立刻删文件时旧 task 仍持有写句柄
+                let abort_grace =
+                    Duration::from_secs(2).min(timeout.max(Duration::from_millis(100)));
+                let _ = tokio::time::timeout(abort_grace, &mut handle).await;
+                self.command_channels.remove(task_id);
                 None
             }
         }
+    }
+
+    /// 删除路径默认等待活跃下载 quiesce 的上限
+    pub const DELETE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(15);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tachyon_engine::{ConnectionPool, PoolConfig};
+
+    fn empty_supervisor() -> DownloadSupervisor {
+        let pool = Arc::new(tokio::sync::RwLock::new(Arc::new(ConnectionPool::new(
+            PoolConfig::default(),
+        ))));
+        DownloadSupervisor::new(pool)
+    }
+
+    /// 审计 H-03:receiver 已关闭时 send_command 必须返回 false(不得伪成功)
+    #[test]
+    fn test_send_command_returns_false_when_receiver_closed() {
+        let supervisor = empty_supervisor();
+        let (tx, rx) = watch::channel(TaskCommand::Start);
+        supervisor.command_channels.insert("t-closed".into(), tx);
+        drop(rx); // 关闭 receiver,模拟 session 已退出但 entry 未 cleanup
+
+        let ok = supervisor.send_command("t-closed", TaskCommand::Resume);
+        assert!(
+            !ok,
+            "H-03: receiver 关闭后 send_command 必须 false,否则 Resume 被永久吞掉"
+        );
+    }
+
+    #[test]
+    fn test_send_command_returns_true_when_receiver_alive() {
+        let supervisor = empty_supervisor();
+        let (tx, _rx) = watch::channel(TaskCommand::Start);
+        supervisor.command_channels.insert("t-ok".into(), tx);
+        assert!(supervisor.send_command("t-ok", TaskCommand::Pause));
+    }
+
+    #[test]
+    fn test_send_command_returns_false_for_unknown_task() {
+        let supervisor = empty_supervisor();
+        assert!(!supervisor.send_command("missing", TaskCommand::Cancel));
     }
 }

@@ -86,6 +86,14 @@ export const api = {
   /** 创建下载任务 */
   createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string, autoStart?: boolean) =>
     invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName, autoStart }),
+  /** 显式授权下载目录(SEC-002:需确认令牌,禁止 create_task 静默扩权) */
+  authorizeDownloadDirectory: async (path: string) => {
+    const token = await requestConfirmation('authorize_download_directory')
+    return invoke<string>('authorize_download_directory', {
+      path,
+      confirmationToken: token,
+    })
+  },
   /** 探测真实文件名(HEAD 请求获取 Content-Disposition / DHT 查询种子元数据) */
   probeFilename: (url: string) => invoke<string>('probe_filename', { url }),
   /** 获取任务列表 */
@@ -148,6 +156,9 @@ export const api = {
   addSnifferFilter: (filter: string) => invoke<void>('add_sniffer_filter', { filter }),
   /** 手动添加嗅探资源 URL */
   addSnifferResource: (url: string) => invoke<void>('add_sniffer_resource', { url }),
+  /** 审计 SEC-009:按嗅探资源 id 建任务,原始 URL 不经前端 */
+  createTaskFromSniffer: (resourceId: string, downloadDir?: string, autoStart?: boolean) =>
+    invoke<string>('create_task_from_sniffer', { resourceId, downloadDir, autoStart }),
   /** 清空所有嗅探资源 */
   clearSnifferResources: () => invoke<void>('clear_sniffer_resources'),
   /** 获取嗅探捕获配置 */

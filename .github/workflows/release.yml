@@ -222,7 +222,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 10
-    continue-on-error: true  # CI 无头环境缺少 display server,GUI 验证可能失败
+    # 审计 SEC-013:产物存在/本平台包结构为硬门禁;不再 job 级 continue-on-error
     steps:
       - uses: actions/checkout@v7
 
@@ -237,10 +237,11 @@ jobs:
       - name: 验证产物存在且非零大小(硬性要求)
         shell: bash
         run: |
+          set -euo pipefail
           echo "=== 构建产物列表 ==="
           find dist -type f -ls 2>/dev/null || ls -laR dist/
 
-          # S-08: 产物存在性检查为硬性要求,不因 CI 环境限制而跳过
+          # SEC-013: 全局至少有一个安装包;本平台类型在后续 step 再硬校验
           found=0
           for ext in msi deb dmg AppImage; do
             files=$(find dist -name "*.$ext" -size +0c 2>/dev/null || true)
@@ -254,68 +255,81 @@ jobs:
             exit 1
           fi
 
-      - name: Windows 安装验证
+      - name: Windows 本平台产物与结构验证(硬性)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path dist -Filter "*.msi" | Select-Object -First 1
-          if ($msi) {
-            Write-Host "安装 MSI: $($msi.FullName)"
-            # 仅验证文件可被 msiexec 识别,不执行静默安装(CI 无 display server)
-            $output = msiexec /a "$($msi.FullName)" /qb TARGETDIR="$env:RUNNER_TEMP\msi-validate" 2>&1
-            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) {
-              Write-Host "MSI 管理安装验证通过"
-              # 检查安装目录中有可执行文件
-              $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\msi-validate" -Filter "tachyon*.exe" -Recurse | Select-Object -First 1
-              if ($exe) {
-                Write-Host "找到可执行文件: $($exe.FullName)"
-              } else {
-                Write-Host "::warning::管理安装中未找到 tachyon 可执行文件"
-              }
-            } else {
-              Write-Host "::warning::MSI 管理安装返回退出码 $LASTEXITCODE (CI 无 display server,属预期行为)"
-            }
-          } else {
-            Write-Host "::warning::未找到 MSI 安装包"
+          $msi = Get-ChildItem -Path dist -Filter "*.msi" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            Write-Error "SEC-013: 未找到非零 MSI 安装包"
+            exit 1
           }
+          if ($msi.Length -le 0) {
+            Write-Error "SEC-013: MSI 文件大小为 0: $($msi.FullName)"
+            exit 1
+          }
+          Write-Host "找到 MSI: $($msi.FullName) ($($msi.Length) bytes)"
+          $target = Join-Path $env:RUNNER_TEMP "msi-validate"
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/a", $msi.FullName, "/qn", "TARGETDIR=$target") -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Write-Error "SEC-013: MSI 管理安装失败,exit=$($p.ExitCode)"
+            exit 1
+          }
+          $exe = Get-ChildItem -Path $target -Filter "tachyon*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "SEC-013: 管理安装结果中未找到 tachyon 可执行文件"
+            exit 1
+          }
+          Write-Host "找到可执行文件: $($exe.FullName)"
 
-      - name: Linux 安装验证
+      - name: Linux 本平台产物与结构验证(硬性)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          deb=$(find dist -name "*.deb" -size +0c | head -1)
+          set -euo pipefail
+          deb=$(find dist -name "*.deb" -size +0c 2>/dev/null | head -1 || true)
+          appimage=$(find dist -name "*.AppImage" -size +0c 2>/dev/null | head -1 || true)
+          if [ -z "$deb" ] && [ -z "$appimage" ]; then
+            echo "::error::SEC-013: 未找到非零 DEB/AppImage 安装包"
+            exit 1
+          fi
           if [ -n "$deb" ]; then
             echo "验证 DEB: $deb"
-            # dpkg-deb 可在不安装的情况下检查包结构
-            dpkg-deb --info "$deb" && echo "DEB 包元数据验证通过" || echo "::warning::DEB 包元数据验证失败"
-            dpkg-deb --contents "$deb" && echo "DEB 包内容验证通过" || echo "::warning::DEB 包内容验证失败"
-          else
-            echo "::warning::未找到 DEB 安装包"
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb" | head -50
+            if ! dpkg-deb --contents "$deb" | grep -Eiq 'tachyon|usr/bin|usr/lib'; then
+              echo "::error::SEC-013: DEB 内容异常,未见应用入口线索"
+              exit 1
+            fi
+            echo "DEB 包结构验证通过"
           fi
-
-          appimage=$(find dist -name "*.AppImage" -size +0c | head -1)
           if [ -n "$appimage" ]; then
             echo "验证 AppImage: $appimage"
             chmod +x "$appimage"
-            # AppImage --appimage-help 不需要 display server
-            "$appimage" --appimage-help 2>&1 | head -5 || echo "::warning::AppImage 验证失败(CI 环境,可忽略)"
+            if ! "$appimage" --appimage-help >/tmp/appimage-help.txt 2>&1; then
+              echo "::warning::AppImage --appimage-help 失败(可能缺 FUSE),已确认文件非零且可 chmod"
+              head -5 /tmp/appimage-help.txt || true
+            else
+              head -5 /tmp/appimage-help.txt
+              echo "AppImage help 验证通过"
+            fi
           fi
 
-      - name: macOS 安装验证
+      - name: macOS 本平台产物与结构验证(硬性)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          dmg=$(find dist -name "*.dmg" -size +0c | head -1)
-          if [ -n "$dmg" ]; then
-            echo "验证 DMG: $dmg"
-            # hdiutil attach 需要 sudo 权限,CI 中可能受限
-            # 改为验证 DMG 文件结构可被解析
-            hdiutil imageinfo "$dmg" 2>&1 | head -20 && echo "DMG 镜像信息验证通过" || echo "::warning::DMG 验证失败(CI 环境,可忽略)"
-          else
-            echo "::warning::未找到 DMG 安装包"
+          set -euo pipefail
+          dmg=$(find dist -name "*.dmg" -size +0c 2>/dev/null | head -1 || true)
+          if [ -z "$dmg" ]; then
+            echo "::error::SEC-013: 未找到非零 DMG 安装包"
+            exit 1
           fi
+          echo "验证 DMG: $dmg"
+          hdiutil imageinfo "$dmg" | head -20
+          echo "DMG 镜像信息验证通过"
 
-  # 发布门禁:所有检查(含安装冒烟)通过后才将 draft release 变为 public
+  # 发布门禁:  # 发布门禁:所有检查(含安装冒烟)通过后才将 draft release 变为 public
   release-gate:
     name: 发布门禁
     needs: [install-smoke]
@@ -470,7 +484,8 @@ jobs:
           cd dist
           for sha_file in *.sha256; do
             if [ -f "$sha_file" ]; then
-              gh release upload "$TAG" "$sha_file" --repo "${{ github.repository }}" || true
+              # 审计 SEC-013:校验文件上传失败必须阻断公开发布
+              gh release upload "$TAG" "$sha_file" --repo "${{ github.repository }}" --clobber
             fi
           done
 

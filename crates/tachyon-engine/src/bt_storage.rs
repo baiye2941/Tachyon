@@ -85,12 +85,19 @@ impl TorrentStorage for TachyonTorrentStorage {
             self.handle.block_on(async move {
                 // safety: tmp 在 block_on 期间存活,tmp_ptr 有效
                 let tmp_slice = unsafe { std::slice::from_raw_parts_mut(tmp_ptr, len) };
-                let n = storage.read_at(offset, tmp_slice).await?;
-                if n < len {
-                    return Err(tachyon_core::DownloadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!("pread_exact: 读取不足 {n}/{len}"),
-                    )));
+                // 审计 BT-18:exact 读 —— 循环读满;零进度 EOF 才算不足
+                let mut pos = 0usize;
+                let mut off = offset;
+                while pos < len {
+                    let n = storage.read_at(off, &mut tmp_slice[pos..]).await?;
+                    if n == 0 {
+                        return Err(tachyon_core::DownloadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("pread_exact: 读取不足 {pos}/{len}"),
+                        )));
+                    }
+                    pos += n;
+                    off += n as u64;
                 }
                 Ok(())
             })
@@ -106,12 +113,21 @@ impl TorrentStorage for TachyonTorrentStorage {
         let data = bytes::Bytes::copy_from_slice(buf);
         let len = buf.len();
         self.block_on(async move {
-            let written = storage.write_at(offset, data).await?;
-            if written < len {
-                return Err(tachyon_core::DownloadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("pwrite_all: 写入不足 {written}/{len}"),
-                )));
+            // 审计 BT-18:exact 契约 —— 循环写满,禁止单次 short write 后当成功
+            // 也不应仅报一次 short 就丢弃已写进度;写零进度视为错误。
+            let mut pos = 0usize;
+            let mut off = offset;
+            while pos < len {
+                let chunk = data.slice(pos..);
+                let written = storage.write_at(off, chunk).await?;
+                if written == 0 {
+                    return Err(tachyon_core::DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!("pwrite_all: 零进度写入 pos={pos}/{len}"),
+                    )));
+                }
+                pos += written;
+                off += written as u64;
             }
             Ok(())
         })
@@ -177,6 +193,9 @@ pub struct TachyonStorageFactory {
     download_dir: PathBuf,
     /// 用户最终根名(单文件名/多文件根目录名);优先于 torrent metadata.name
     preferred_root_name: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
+    /// 审计 BT-19 测试用:最近一次自动打开所选后端名
+    #[cfg(test)]
+    last_open_backend: std::sync::Arc<parking_lot::Mutex<Option<&'static str>>>,
 }
 
 impl TachyonStorageFactory {
@@ -197,7 +216,21 @@ impl TachyonStorageFactory {
             io_strategy,
             download_dir,
             preferred_root_name: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            last_open_backend: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// 测试:读取最近自动打开的后端标签
+    #[cfg(test)]
+    pub fn last_open_backend(&self) -> Option<&'static str> {
+        *self.last_open_backend.lock()
+    }
+
+    /// 测试:当前配置的 io_strategy
+    #[cfg(test)]
+    pub fn io_strategy(&self) -> IoStrategy {
+        self.io_strategy
     }
 
     /// 注入用户最终根名(须在 probe/add_torrent 前)
@@ -240,6 +273,9 @@ impl TachyonStorageFactory {
     ///
     /// 安全:与 init_storage 使用同一套 validate_multi_save_paths/validate_save_path,
     /// 确保 librqbit 写入路径与引擎存储路径一致(消除双存储写放大的前提)。
+    ///
+    /// 审计 BT-19:按 `io_strategy` 选择后端(平台不可用/初始化失败时回退 Standard),
+    /// 禁止忽略配置硬编码 TokioFile。
     fn open_storages_from_metadata(
         &self,
         _shared: &ManagedTorrentShared,
@@ -268,21 +304,154 @@ impl TachyonStorageFactory {
             .map_err(|e| anyhow::anyhow!("多文件路径校验失败: {e}"))?;
             for path in &paths {
                 // 多文件 factory 在 librqbit async 上下文同步 create;禁止嵌套 Handle::block_on。
-                // 与单文件分支一致使用 open_sync。
-                let file = tachyon_io::TokioFile::open_sync(path)
-                    .map_err(|e| anyhow::anyhow!("打开文件 {} 失败: {e}", path.display()))?;
-                storages.push(Arc::new(file) as Arc<dyn AsyncStorage>);
+                let (file, backend) = self.open_storage_for_path(path)?;
+                #[cfg(test)]
+                {
+                    *self.last_open_backend.lock() = Some(backend);
+                }
+                let _ = backend;
+                storages.push(file);
             }
         } else {
             // 单文件:download_dir/<name>,与 init_storage 的单文件路径一致
             let final_path = self.download_dir.join(torrent_name);
             let canonical_path = tachyon_core::validate_save_path(&final_path, &self.download_dir)
                 .map_err(|e| anyhow::anyhow!("单文件路径校验失败: {e}"))?;
-            let file = tachyon_io::TokioFile::open_sync(&canonical_path)
-                .map_err(|e| anyhow::anyhow!("打开文件 {} 失败: {e}", canonical_path.display()))?;
-            storages.push(Arc::new(file) as Arc<dyn AsyncStorage>);
+            let (file, backend) = self.open_storage_for_path(&canonical_path)?;
+            #[cfg(test)]
+            {
+                *self.last_open_backend.lock() = Some(backend);
+            }
+            let _ = backend;
+            storages.push(file);
         }
         Ok(storages)
+    }
+
+    /// 审计 BT-19:按 io_strategy 同步打开 AsyncStorage。
+    ///
+    /// 在 librqbit StorageFactory::create 同步上下文中调用,禁止再嵌套 Handle::block_on。
+    /// 高级后端用其同步 init/open 路径;失败或平台不支持时回退 TokioFile::open_sync。
+    fn open_storage_for_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<(Arc<dyn AsyncStorage>, &'static str)> {
+        match self.io_strategy {
+            IoStrategy::Standard => self.open_standard_storage(path),
+            IoStrategy::WinAligned => {
+                #[cfg(target_os = "windows")]
+                {
+                    match self.open_win_aligned_storage(path) {
+                        Ok(s) => Ok((s, "WinAligned")),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "BT WinAligned 打开失败,回退 Standard"
+                            );
+                            self.open_standard_storage(path)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "BT WinAligned 策略在非 Windows 不可用,回退 Standard"
+                    );
+                    self.open_standard_storage(path)
+                }
+            }
+            IoStrategy::Iocp => {
+                #[cfg(target_os = "windows")]
+                {
+                    match self.open_iocp_storage(path) {
+                        Ok(s) => Ok((s, "Iocp")),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "BT IOCP 初始化失败,回退 Standard"
+                            );
+                            self.open_standard_storage(path)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "BT Iocp 策略在非 Windows 不可用,回退 Standard"
+                    );
+                    self.open_standard_storage(path)
+                }
+            }
+            IoStrategy::IoUring => {
+                #[cfg(target_os = "linux")]
+                {
+                    match self.open_iouring_storage(path) {
+                        Ok(s) => Ok((s, "IoUring")),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "BT io_uring 初始化失败,回退 Standard"
+                            );
+                            self.open_standard_storage(path)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "BT IoUring 策略在非 Linux 不可用,回退 Standard"
+                    );
+                    self.open_standard_storage(path)
+                }
+            }
+        }
+    }
+
+    fn open_standard_storage(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<(Arc<dyn AsyncStorage>, &'static str)> {
+        let file = tachyon_io::TokioFile::open_sync(path)
+            .map_err(|e| anyhow::anyhow!("打开文件 {} 失败: {e}", path.display()))?;
+        Ok((Arc::new(file) as Arc<dyn AsyncStorage>, "Standard"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn open_win_aligned_storage(&self, path: &Path) -> anyhow::Result<Arc<dyn AsyncStorage>> {
+        // WinFile::open_optimized 内部为同步 OpenOptions;此处用 block_in_place 包装
+        // 仅在 factory create 同步上下文,且不得嵌套 runtime handle.block_on 打开 TokioFile。
+        let path = path.to_path_buf();
+        let file = tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(tachyon_io::WinFile::open_optimized(&path))
+        })
+        .map_err(|e| anyhow::anyhow!("WinAligned 打开 {} 失败: {e}", path.display()))?;
+        Ok(Arc::new(file) as Arc<dyn AsyncStorage>)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn open_iocp_storage(&self, path: &Path) -> anyhow::Result<Arc<dyn AsyncStorage>> {
+        let mut storage = tachyon_io::IoCpStorage::new(path);
+        storage
+            .init()
+            .map_err(|e| anyhow::anyhow!("IOCP init {} 失败: {e}", path.display()))?;
+        Ok(Arc::new(storage) as Arc<dyn AsyncStorage>)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_iouring_storage(&self, path: &Path) -> anyhow::Result<Arc<dyn AsyncStorage>> {
+        let mut storage =
+            tachyon_io::IoUringStorage::new(path, tachyon_io::IoUringConfig::default());
+        storage
+            .init()
+            .map_err(|e| anyhow::anyhow!("io_uring init {} 失败: {e}", path.display()))?;
+        Ok(Arc::new(storage) as Arc<dyn AsyncStorage>)
     }
 }
 
@@ -323,6 +492,8 @@ impl Clone for TachyonStorageFactory {
             io_strategy: self.io_strategy,
             download_dir: self.download_dir.clone(),
             preferred_root_name: self.preferred_root_name.clone(),
+            #[cfg(test)]
+            last_open_backend: self.last_open_backend.clone(),
         }
     }
 }
@@ -442,6 +613,113 @@ mod tests {
         assert_eq!(&buf, b"hello world");
     }
 
+    /// 审计 BT-18:底层 short write 时 pwrite_all 须循环写满
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pwrite_all_retries_short_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ShortWriteStorage {
+            inner: InMemStorage,
+            max_per_call: usize,
+            calls: AtomicUsize,
+        }
+
+        impl AsyncStorage for ShortWriteStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<usize>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let max = self.max_per_call;
+                Box::pin(async move {
+                    let n = data.len().min(max);
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                    self.inner.write_at(offset, data.slice(..n)).await
+                })
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<usize>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.sync()
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<u64>> + Send + '_,
+                >,
+            > {
+                self.inner.file_size()
+            }
+
+            fn close(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.close()
+            }
+        }
+
+        let short = Arc::new(ShortWriteStorage {
+            inner: InMemStorage::new(),
+            max_per_call: 3,
+            calls: AtomicUsize::new(0),
+        }) as Arc<dyn AsyncStorage>;
+        let handle = tokio::runtime::Handle::current();
+        let ts = TachyonTorrentStorage::new(vec![short.clone()], handle);
+
+        let payload = b"hello world!!"; // 13 bytes, max 3 -> >=5 calls
+        ts.pwrite_all(0, 0, payload).unwrap();
+        // 通过 trait object 读回:构造另一个 storage 引用困难,用 pread
+        let mut buf = [0u8; 13];
+        ts.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(&buf, payload);
+
+        // calls 在 short 上:需要 downcast 不可行;至少数据完整即证明循环写满
+        // 再写一次验证可重复
+        ts.pwrite_all(0, 0, b"ABCDEFGHIJKLM").unwrap();
+        let mut buf2 = [0u8; 13];
+        ts.pread_exact(0, 0, &mut buf2).unwrap();
+        assert_eq!(&buf2, b"ABCDEFGHIJKLM");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tachyon_torrent_storage_multiple_files() {
         let s0 = Arc::new(InMemStorage::new()) as Arc<dyn AsyncStorage>;
@@ -467,6 +745,100 @@ mod tests {
 
         let err = ts.pwrite_all(1, 0, b"data").unwrap_err();
         assert!(err.to_string().contains("越界"));
+    }
+
+    /// 审计 BT-18:底层 short read 时 pread_exact 须循环读满
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pread_exact_retries_short_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ShortReadStorage {
+            inner: InMemStorage,
+            max_per_call: usize,
+            calls: AtomicUsize,
+        }
+
+        impl AsyncStorage for ShortReadStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<usize>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<usize>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let max = self.max_per_call;
+                Box::pin(async move {
+                    let limit = buf.len().min(max);
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                    self.inner.read_at(offset, &mut buf[..limit]).await
+                })
+            }
+
+            fn sync(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.sync()
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = tachyon_core::DownloadResult<u64>> + Send + '_,
+                >,
+            > {
+                self.inner.file_size()
+            }
+
+            fn close(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = tachyon_core::DownloadResult<()>> + Send + '_>,
+            > {
+                self.inner.close()
+            }
+        }
+
+        let short = Arc::new(ShortReadStorage {
+            inner: InMemStorage::new(),
+            max_per_call: 3,
+            calls: AtomicUsize::new(0),
+        }) as Arc<dyn AsyncStorage>;
+        let handle = tokio::runtime::Handle::current();
+        let ts = TachyonTorrentStorage::new(vec![short], handle);
+        ts.pwrite_all(0, 0, b"hello world!!").unwrap();
+        let mut buf = [0u8; 13];
+        ts.pread_exact(0, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello world!!");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -538,8 +910,8 @@ mod tests {
 
     #[test]
     fn test_multi_file_open_path_does_not_use_nested_block_on_comment() {
-        // 静态不变量: open_storages_from_metadata 多文件分支使用 open_sync
-        // (源码契约;避免 async runtime 内嵌套 block_on)。
+        // 静态不变量: open_storages_from_metadata 不得嵌套 block_on(TokioFile::open)
+        // (源码契约;避免 async runtime 内嵌套 block_on 打开 TokioFile 异步路径)。
         let src = include_str!("bt_storage.rs");
         assert!(
             src.contains(
@@ -547,18 +919,67 @@ mod tests {
             ),
             "多文件打开路径应保留禁止嵌套 block_on 的契约注释"
         );
-        // 在 open_storages_from_metadata 函数体内不应再出现 block_on(TokioFile::open
         let start = src
             .find("fn open_storages_from_metadata")
             .expect("open_storages_from_metadata");
-        let body = &src[start..start + 2500];
+        let body = &src[start..start + 3500];
         assert!(
             !body.contains("block_on(tachyon_io::TokioFile::open"),
-            "open_storages_from_metadata 不得嵌套 block_on 打开文件"
+            "open_storages_from_metadata 不得嵌套 block_on 打开 TokioFile 异步路径"
         );
         assert!(
-            body.contains("TokioFile::open_sync"),
-            "多文件/单文件应使用 open_sync"
+            body.contains("open_storage_for_path"),
+            "BT-19:应通过 open_storage_for_path 按 io_strategy 打开"
         );
+    }
+
+    /// 审计 BT-19:Standard 策略打开 Standard 后端
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt19_standard_opens_standard_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let factory =
+            TachyonStorageFactory::new(handle, IoStrategy::Standard, dir.path().to_path_buf());
+        let path = dir.path().join("f.bin");
+        let (storage, backend) = factory.open_storage_for_path(&path).unwrap();
+        assert_eq!(backend, "Standard");
+        // 可写
+        use bytes::Bytes;
+        let n = storage
+            .write_at(0, Bytes::from_static(b"ab"))
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// 审计 BT-19:非本平台策略回退 Standard 而不是 panic/忽略配置
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt19_cross_platform_strategy_falls_back_to_standard() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = tokio::runtime::Handle::current();
+        // Windows 上 IoUring 应回退;非 Windows 上 Iocp 应回退
+        #[cfg(target_os = "windows")]
+        let strategy = IoStrategy::IoUring;
+        #[cfg(not(target_os = "windows"))]
+        let strategy = IoStrategy::Iocp;
+        let factory = TachyonStorageFactory::new(handle, strategy, dir.path().to_path_buf());
+        let path = dir.path().join("fallback.bin");
+        let (_storage, backend) = factory.open_storage_for_path(&path).unwrap();
+        assert_eq!(
+            backend, "Standard",
+            "跨平台不可用策略必须回退 Standard,backend={backend}"
+        );
+    }
+
+    /// 审计 BT-19:factory 保存的 io_strategy 可被读取(不再是死字段)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt19_factory_retains_io_strategy() {
+        let handle = tokio::runtime::Handle::current();
+        let factory = TachyonStorageFactory::new(
+            handle,
+            IoStrategy::WinAligned,
+            std::path::PathBuf::from("/tmp/dl"),
+        );
+        assert_eq!(factory.io_strategy(), IoStrategy::WinAligned);
     }
 }

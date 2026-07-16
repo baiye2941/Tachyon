@@ -9,7 +9,7 @@ pub mod task_commands;
 // Re-exports: Tauri commands and public types
 #[cfg(feature = "magnet")]
 pub use self::config_commands::get_bt_proxy_coverage;
-pub use self::config_commands::{get_config, update_config};
+pub use self::config_commands::{authorize_download_directory, get_config, update_config};
 pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{
     add_model_favorite, batch_create_hf_tasks, get_hf_download_url, get_model_info,
@@ -18,8 +18,8 @@ pub use self::hub_commands::{
 };
 pub use self::progress_commands::{get_download_progress, subscribe_progress};
 pub use self::sniffer_commands::{
-    add_sniffer_filter, add_sniffer_resource, clear_sniffer_resources, get_sniffer_capture_config,
-    get_sniffer_resources, set_sniffer_capture_config,
+    add_sniffer_filter, add_sniffer_resource, clear_sniffer_resources, create_task_from_sniffer,
+    get_sniffer_capture_config, get_sniffer_resources, set_sniffer_capture_config,
 };
 pub use self::task_commands::{
     add_task_tag, cancel_task, create_task, delete_task, export_backup, get_task_detail,
@@ -36,10 +36,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tachyon_core::config::{AppConfig, DownloadConfig};
 use tachyon_core::types::DownloadState;
-use tachyon_engine::connection::{ConnectionPool, PoolConfig};
-use tachyon_io::BufferPool;
+use tachyon_engine::BufferPool;
+use tachyon_engine::{ConnectionPool, PoolConfig};
 use tachyon_sniffer::capture::ResourceType;
-use url::Url;
 
 use crate::projection::ProgressBroker;
 use crate::repository::TaskRepository;
@@ -144,7 +143,10 @@ pub struct TaskInfo {
     /// 前端诊断面板据此展示真实错误，无需启发式推断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<String>,
-    /// 任务级重试计数（保留字段，当前恒为 0，为后续重试策略预留接口）。
+    /// 任务级重试计数。
+    ///
+    /// 审计 A-13 诚实：当前恒为 0，未接入引擎分片/整流 attempt 聚合；
+    /// 仅在快照与 IPC 间原样复制，前端诊断「已重试 N 次」在 N=0 时不展示。
     #[serde(default)]
     pub retry_count: u32,
     /// 用户自定义任务标签,用于前端分组/过滤。
@@ -414,14 +416,17 @@ impl AppState {
         let task_repository = TaskRepository::new();
         let max_concurrent_tasks = config.max_concurrent_tasks;
         let max_concurrent_fragments = config.download.max_concurrent_fragments;
+        // 审计 A-03:全局共享限速器;None 配置 → 0(不限速)
+        let initial_rate = config.download.rate_limit_bytes_per_sec.unwrap_or(0);
+        let global_rate_limiter = Arc::new(tachyon_engine::RateLimiter::new(initial_rate));
         let config_arc = Arc::new(tokio::sync::Mutex::new(config));
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
         // 全局 buffer 池:容量 = 任务并发 × 分片并发,buffer_size = WRITE_BATCH_BYTES。
         // 惰性分配(用 new 而非 with_prefill),首次 alloc 才创建 buffer,降低启动内存开销。
-        let buffer_pool = Arc::new(BufferPool::new(
+        let buffer_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(BufferPool::new(
             tachyon_core::config::WRITE_BATCH_BYTES,
             (max_concurrent_tasks as usize) * (max_concurrent_fragments as usize),
-        ));
+        ))));
 
         let task_service = Arc::new(TaskService::new(
             task_repository.clone(),
@@ -446,6 +451,7 @@ impl AppState {
                 favorites_store,
                 chunk_reader_pool,
                 buffer_pool,
+                global_rate_limiter,
                 #[cfg(feature = "magnet")]
                 bt_session: Arc::new(tokio::sync::Mutex::new(None)),
             },
@@ -557,9 +563,34 @@ pub async fn get_recovery_warning(
 /// - 容量满时返回明确错误,而非静默返回空字符串(S-04)
 #[tauri::command]
 pub fn request_confirmation(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     action: String,
 ) -> Result<String, AppError> {
+    // 审计 SEC-003:签发 token 前必须弹出 OS 原生确认框。
+    // 恶意 WebView 脚本无法在无用户点击时静默获取破坏性 action token。
+    // 测试环境(无 GUI / 未 manage Dialog)跳过 OS 对话框,仅保留 token 密码学属性。
+    #[cfg(not(test))]
+    {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+        let title = "确认操作";
+        let message = format!(
+            "应用请求执行破坏性操作: {action}
+
+请确认这是你本人发起的操作。"
+        );
+        let confirmed = app
+            .dialog()
+            .message(message)
+            .title(title)
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancel)
+            .blocking_show();
+        if !confirmed {
+            return Err(AppError::Config("用户取消了确认操作".into()));
+        }
+    }
+    let _ = &app;
     state.service.confirmation_service.request(&action)
 }
 
@@ -568,28 +599,46 @@ pub fn request_confirmation(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_download_url(url_str: &str) -> Result<(), AppError> {
-    // 磁力链接走独立校验路径，不经过 HTTP SSRF 防护
-    // （magnet URI 无 host，不适用 validate_public_http_url）
-    #[cfg(feature = "magnet")]
-    if url_str.starts_with("magnet:?") {
-        return tachyon_engine::validate_magnet_uri(url_str)
-            .map_err(|e| AppError::Config(e.to_string()));
-    }
-    #[cfg(not(feature = "magnet"))]
-    if url_str.starts_with("magnet:?") {
-        return Err(AppError::UnsupportedProtocol("magnet".to_string()));
-    }
+    // 审计 A-06:统一分类入口,再叠加 magnet 细节校验 / 协议支持列表
+    let source = tachyon_core::parse_download_source(url_str).map_err(|e| {
+        // parse 失败:可能是格式/SSRF/不支持 scheme
+        match e {
+            tachyon_core::DownloadError::Config(msg) if msg.contains("不支持的协议") => {
+                let scheme = url_str
+                    .split(':')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_uppercase();
+                AppError::UnsupportedProtocol(scheme)
+            }
+            other => AppError::Network(other.to_string()),
+        }
+    })?;
 
-    let url = Url::parse(url_str).map_err(|e| AppError::Network(format!("URL 格式无效: {e}")))?;
-    tachyon_core::validate_public_http_url(&url).map_err(|e| AppError::Network(e.to_string()))?;
-
-    let scheme = url.scheme().to_uppercase();
-    let supported = supported_protocols();
-    if !supported.iter().any(|p| *p == scheme) {
-        return Err(AppError::UnsupportedProtocol(scheme));
+    match source.kind {
+        tachyon_core::DownloadSourceKind::Magnet => {
+            #[cfg(feature = "magnet")]
+            {
+                tachyon_engine::validate_magnet_uri(url_str)
+                    .map_err(|e| AppError::Config(e.to_string()))
+            }
+            #[cfg(not(feature = "magnet"))]
+            {
+                Err(AppError::UnsupportedProtocol("magnet".to_string()))
+            }
+        }
+        tachyon_core::DownloadSourceKind::Http | tachyon_core::DownloadSourceKind::Hls => {
+            // parse_download_source 已做 validate_public_http_url;再对齐 supported_protocols
+            let scheme = url::Url::parse(url_str)
+                .map(|u| u.scheme().to_uppercase())
+                .unwrap_or_else(|_| "HTTP".into());
+            let supported = supported_protocols();
+            if !supported.iter().any(|p| *p == scheme) {
+                return Err(AppError::UnsupportedProtocol(scheme));
+            }
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
 pub(crate) fn now_iso8601() -> String {
@@ -686,6 +735,7 @@ pub(crate) async fn persist_task_snapshot(
             snapshot.etag = existing.etag;
             snapshot.last_modified = existing.last_modified;
             snapshot.retry_count = existing.retry_count;
+            snapshot.revision = existing.revision;
         }
         snapshot.fail_reason = fail_reason;
         // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
@@ -724,7 +774,12 @@ pub(crate) fn rewrite_hf_url(url: &str, mode: tachyon_core::config::HfSourceMode
         tachyon_core::config::HfSourceMode::Mirror | tachyon_core::config::HfSourceMode::Race => {
             let rewritten = url.replace("https://huggingface.co", "https://hf-mirror.com");
             if rewritten != url {
-                tracing::info!(original = %url, rewritten = %rewritten, mode = ?mode, "HF 下载切换至镜像源");
+                tracing::info!(
+                    original = %tachyon_core::safety::redact_url_for_log(url),
+                    rewritten = %tachyon_core::safety::redact_url_for_log(&rewritten),
+                    mode = ?mode,
+                    "HF 下载切换至镜像源"
+                );
             }
             rewritten
         }
@@ -756,7 +811,7 @@ pub(crate) mod tests {
     use super::*;
     use tachyon_core::config::{ConnectionConfig, DownloadConfig};
     use tachyon_core::safety::{extract_filename_from_url, parse_content_disposition};
-    use tachyon_io::BufferPool;
+    use tachyon_engine::BufferPool;
 
     /// 共享测试辅助:创建测试用 AppState
     pub(crate) fn test_state() -> Arc<AppState> {
@@ -808,10 +863,11 @@ pub(crate) mod tests {
         let chunk_reader_pool = Arc::new(ChunkReaderPool::new(5));
         // 夹具修复:InfraState 新增 buffer_pool 字段后,字面量构造需同步补字段。
         // 此处用默认规格(WRITE_BATCH_BYTES, 5*16=80)构造池,仅满足结构体契约。
-        let buffer_pool = Arc::new(BufferPool::new(
+        let buffer_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(BufferPool::new(
             tachyon_core::config::WRITE_BATCH_BYTES,
             5 * 16,
-        ));
+        ))));
+        let global_rate_limiter = Arc::new(tachyon_engine::RateLimiter::new(0));
 
         Arc::new(AppState {
             domain: DomainState {
@@ -824,6 +880,7 @@ pub(crate) mod tests {
                 favorites_store,
                 chunk_reader_pool,
                 buffer_pool,
+                global_rate_limiter,
                 #[cfg(feature = "magnet")]
                 bt_session: Arc::new(tokio::sync::Mutex::new(None)),
             },
@@ -1386,7 +1443,7 @@ pub(crate) mod tests {
         };
 
         let state = AppState::new();
-        let pool = &state.infra.buffer_pool;
+        let pool = state.infra.buffer_pool.blocking_read().clone();
 
         // buffer_size 应等于 WRITE_BATCH_BYTES(256 KiB)
         assert_eq!(
@@ -1420,30 +1477,32 @@ pub(crate) mod tests {
 
     /// 验证 buffer_pool 在 clone_for_task 后共享同一底层池实例
     ///
-    /// clone_for_task 通过 InfraState::clone 共享 Arc<BufferPool>,
+    /// clone_for_task 通过 InfraState::clone 共享 Arc 句柄,
     /// 两个 AppState 应看到相同的信号量状态。
     #[tokio::test]
     async fn test_buffer_pool_shared_across_clone_for_task() {
         let state = AppState::new();
-        let capacity = state.infra.buffer_pool.capacity();
+        let pool = state.infra.buffer_pool.read().await.clone();
+        let capacity = pool.capacity();
 
         // 在原 state 上 alloc 一个 buffer,消耗一个许可
-        let _buf = state.infra.buffer_pool.alloc().await;
+        let _buf = pool.alloc().await;
         assert_eq!(
-            state.infra.buffer_pool.available(),
+            pool.available(),
             capacity - 1,
             "alloc 后原 state 可用许可应减 1"
         );
 
-        // clone_for_task 应共享同一池实例,可用许可一致
+        // clone_for_task 应共享同一热替换句柄,当前池 Arc 一致
         let cloned = state.clone_for_task();
+        let cloned_pool = cloned.infra.buffer_pool.read().await.clone();
         assert_eq!(
-            Arc::as_ptr(&cloned.infra.buffer_pool),
-            Arc::as_ptr(&state.infra.buffer_pool),
+            Arc::as_ptr(&cloned_pool),
+            Arc::as_ptr(&pool),
             "clone_for_task 应共享同一 Arc<BufferPool> 实例"
         );
         assert_eq!(
-            cloned.infra.buffer_pool.available(),
+            cloned_pool.available(),
             capacity - 1,
             "克隆态应看到相同的可用许可数"
         );
@@ -1475,5 +1534,41 @@ pub(crate) mod tests {
     fn test_validate_download_url_rejects_unsupported_scheme() {
         let result = validate_download_url("ftp://example.com/file.bin");
         assert!(result.is_err(), "FTP URL(未启用 ftp feature 时)应被拒绝");
+    }
+
+    /// 审计 A-06:HLS playlist URL 应被接受(与 HTTP 同源 SSRF 校验)
+    #[test]
+    fn test_validate_download_url_accepts_hls() {
+        let result = validate_download_url("https://cdn.example.com/vod/index.m3u8");
+        assert!(result.is_ok(), "公网 HLS URL 应被接受: {result:?}");
+    }
+
+    /// 审计 A-06:分类与 validate 同源 — HLS query 不影响识别
+    #[test]
+    fn test_a06_classify_hls_with_query() {
+        let kind = tachyon_core::classify_download_url("https://cdn.example.com/list.m3u8?token=x")
+            .unwrap();
+        assert_eq!(kind, tachyon_core::DownloadSourceKind::Hls);
+    }
+
+    /// 审计 A-01:app 不得在 Cargo.toml 直连 io/crypto/scheduler
+    #[test]
+    fn test_a01_app_cargo_no_direct_io_crypto_scheduler() {
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        // 仅检查 [dependencies] 段,避免 dev-dependencies 误伤
+        let deps = manifest
+            .split("[dev-dependencies]")
+            .next()
+            .unwrap_or(manifest);
+        for forbidden in ["tachyon-io", "tachyon-crypto", "tachyon-scheduler"] {
+            assert!(
+                !deps.contains(forbidden),
+                "A-01:tachyon-app [dependencies] 不得直连 {forbidden}"
+            );
+        }
+        assert!(
+            deps.contains("tachyon-engine"),
+            "A-01:app 应经 tachyon-engine 门面"
+        );
     }
 }

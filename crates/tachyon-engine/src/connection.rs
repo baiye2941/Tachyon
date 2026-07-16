@@ -1,13 +1,13 @@
 //! 并发限制器(命名沿用 ConnectionPool,实为 per-host + global 信号量许可管理)
 //!
-//! 本类型不持有/复用 TCP 连接 —— 真正的连接池由底层 reqwest 客户端管理。
+//! 本类型不持有/复用 TCP 连接 —— 真正的连接池由底层 reqwest 客户端
+//! (`HttpClient` / `HttpClientRegistry`)管理。
 //! 其职责是按主机 + 全局两级的并发许可限制:每个主机维护独立信号量,
 //! 配合全局信号量控制总并发,避免单主机打满或全局过载。
 //! 使用 DashMap 实现无锁主机信号量索引,避免高并发下的锁竞争。
 //!
-//! 命名说明:历史命名为 ConnectionPool,虽语义实为 ConcurrencyLimiter,
-//! 但因已作为公共 API 广泛导出(tachyon-app/runtime 等多处引用),
-//! 重命名成本与回归风险高于收益,故保留名称但在此澄清真实职责。
+//! 审计 A-02:优先使用类型别名 `ConcurrencyLimiter` 与 `active_requests()`;
+//! 历史名 `ConnectionPool` / `active_connections` 保留兼容。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,6 +31,11 @@ pub struct PoolConfig {
     /// Keep-Alive 超时(秒)
     pub keep_alive_timeout_secs: u64,
     /// 连接建立超时(秒)
+    ///
+    /// 审计 HTTP-17:**不**驱动 `HttpClient` 的 connect timeout。
+    /// HTTP 连接超时唯一 owner 是 `DownloadConfig.connect_timeout_secs`,
+    /// 由 engine 构造 HttpClient 时显式传入。本字段仅作 PoolConfig/ConnectionConfig
+    /// 互转的配置镜像,避免误以为改 PoolConfig 会改变 HTTP 握手超时。
     pub connect_timeout_secs: u64,
     /// 是否启用 HTTP/2
     pub enable_http2: bool,
@@ -113,31 +118,34 @@ impl ConnectionPool {
         }
     }
 
-    /// 获取主机级别的信号量(无锁读取)
+    /// 获取主机级别的信号量
+    ///
+    /// 审计 H-06:统一走 entry API,避免 get-miss 与 insert 之间被 cleanup 插入另一实例。
     fn host_semaphore(&self, host: &str) -> Arc<Semaphore> {
-        if let Some(sem) = self.host_semaphores.get(host) {
-            return sem.clone();
-        }
         self.host_semaphores
             .entry(host.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_per_host as usize)))
             .clone()
     }
 
-    /// 获取连接许可(全局 + 主机级别双重限制)
+    /// 获取连接许可(主机 + 全局双重限制)
+    ///
+    /// 审计 HTTP-16:必须先 await host 许可,再 await global。
+    /// 旧实现先占 global 再等 host,导致 host 饱和的 waiter 占用 global 名额,
+    /// 饿死其他空闲 host 的请求(跨 host head-of-line blocking)。
     #[tracing::instrument(skip(self), fields(host = %host))]
     pub async fn acquire(&self, host: &str) -> Result<ConnectionPermit, DownloadError> {
+        let host_sem = self.host_semaphore(host);
+        let host_permit = host_sem
+            .acquire_owned()
+            .await
+            .map_err(|_| DownloadError::Network("主机连接信号量已关闭".into()))?;
         let global_permit = self
             .global_semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| DownloadError::Network("全局连接信号量已关闭".into()))?;
-        let host_sem = self.host_semaphore(host);
-        let host_permit = host_sem
-            .acquire_owned()
-            .await
-            .map_err(|_| DownloadError::Network("主机连接信号量已关闭".into()))?;
         self.active_count.fetch_add(1, Ordering::Relaxed);
 
         // W-09: 当主机信号量条目超过阈值时自动清理空闲条目,防止内存泄漏
@@ -152,9 +160,16 @@ impl ConnectionPool {
         })
     }
 
-    /// 当前活跃连接数
-    pub fn active_connections(&self) -> u32 {
+    /// 当前活跃请求数(持有许可的请求,非 TCP socket 数)
+    ///
+    /// 审计 A-02:优先使用本命名;历史 `active_connections` 为兼容别名。
+    pub fn active_requests(&self) -> u32 {
         self.active_count.load(Ordering::Relaxed)
+    }
+
+    /// 当前活跃连接数(历史名;语义同 `active_requests`)
+    pub fn active_connections(&self) -> u32 {
+        self.active_requests()
     }
 
     /// 获取配置
@@ -162,13 +177,22 @@ impl ConnectionPool {
         &self.config
     }
 
-    /// 清理没有活跃连接的主机信号量
+    /// 清理没有活跃请求的主机信号量
     ///
-    /// 遍历所有主机信号量,移除那些所有许可都可用(即无活跃连接)的条目。
-    /// 建议在下载任务完成后定期调用,避免内存泄漏。
+    /// 审计 H-06:仅当 map 是该 `Arc<Semaphore>` 的**唯一**持有者且全部许可可用时才删除。
+    /// 若外部仍持有 clone(含:已 acquire 的 permit 内嵌 Arc、await 中的 waiter、或
+    /// 刚从 `host_semaphore` clone 尚未 acquire 的引用),删除后同 host 再 insert
+    /// 会新建第二个信号量,使 per-host 上限被绕过。
     pub fn cleanup_idle_hosts(&self) {
-        self.host_semaphores
-            .retain(|_, sem| sem.available_permits() < self.config.max_per_host as usize);
+        let max = self.config.max_per_host as usize;
+        self.host_semaphores.retain(|_, sem| {
+            // strong_count > 1: 有 permit/waiter/临时 clone,必须保留
+            if Arc::strong_count(sem) > 1 {
+                return true;
+            }
+            // 仅 map 持有:仍有未归还许可则保留;全部可用才清理
+            sem.available_permits() < max
+        });
     }
 
     /// 当前跟踪的主机数量
@@ -176,15 +200,10 @@ impl ConnectionPool {
         self.host_semaphores.len()
     }
 
-    /// A-05: 获取指定主机的活跃连接数(已消耗的许可数)
+    /// 指定主机活跃请求数(已消耗的许可数)
     ///
-    /// 返回 `max_per_host - available_permits`,即当前正在使用的连接数。
-    /// 用于监控和诊断连接池状态。
-    ///
-    /// 使用 `saturating_sub` 防御性地避免下溢:即使出现 `available_permits`
-    /// 超过 `max_per_host` 的异常(如未来配置热更新与信号量重建之间的竞态),
-    /// 也会返回 0 而非 panic(debug)或 wrap 到 `usize::MAX`(release)。
-    pub fn host_active_connections(&self, host: &str) -> u32 {
+    /// 审计 A-02:优先 `host_active_requests`;`host_active_connections` 为兼容别名。
+    pub fn host_active_requests(&self, host: &str) -> u32 {
         self.host_semaphores
             .get(host)
             .map(|sem| {
@@ -194,7 +213,15 @@ impl ConnectionPool {
             })
             .unwrap_or(0)
     }
+
+    /// 指定主机活跃连接数(历史名;语义同 `host_active_requests`)
+    pub fn host_active_connections(&self, host: &str) -> u32 {
+        self.host_active_requests(host)
+    }
 }
+
+/// 审计 A-02:诚实类型名 — 并发许可器(非 TCP 连接池)
+pub type ConcurrencyLimiter = ConnectionPool;
 
 /// 连接许可,Drop 时自动归还连接
 pub struct ConnectionPermit {
@@ -391,11 +418,130 @@ mod tests {
         assert_eq!(pool.active_connections(), 0);
     }
 
+    /// 审计 A-02:ConcurrencyLimiter 别名与 active_requests 一致
+    #[tokio::test]
+    async fn test_a02_concurrency_limiter_alias_and_active_requests() {
+        let limiter: ConcurrencyLimiter = ConnectionPool::new(PoolConfig {
+            max_per_host: 2,
+            max_global: 4,
+            ..Default::default()
+        });
+        assert_eq!(limiter.active_requests(), 0);
+        let _p = limiter.acquire("a.example").await.unwrap();
+        assert_eq!(limiter.active_requests(), 1);
+        assert_eq!(limiter.active_connections(), 1);
+        assert_eq!(limiter.host_active_requests("a.example"), 1);
+        assert_eq!(limiter.host_active_connections("a.example"), 1);
+    }
+
     #[tokio::test]
     async fn test_active_connections_with_permits() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let _permit = pool.acquire("example.com").await.unwrap();
         assert_eq!(pool.active_connections(), 1);
+    }
+
+    /// 审计 HTTP-16:host 饱和 waiter 不得占住 global 阻塞其他 host。
+    /// max_global=2, max_per_host=1:
+    /// - A 持有 1 许可
+    /// - 第二个 A 等待 host
+    /// - B 必须仍能 acquire(不应被 A 的第二个 waiter 占 global 饿死)
+    #[tokio::test]
+    async fn test_acquire_host_first_avoids_cross_host_hol() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 2,
+            ..Default::default()
+        }));
+        let _a_hold = pool.acquire("host-a").await.expect("A first");
+        let pool_a = Arc::clone(&pool);
+        let a_waiter = tokio::spawn(async move {
+            // 第二个 A:会等 host-a 许可
+            pool_a.acquire("host-a").await
+        });
+        // 让 A waiter 进入等待
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // B 必须在超时内拿到许可(若 global-first,A waiter 已占 global,B 可能被饿死当 global=2 且还有别的)
+        // 用 max_global=2: A_hold 占 1, 错误实现下 A_waiter 占 global 第 2,B 无法获得。
+        let b = tokio::time::timeout(Duration::from_millis(200), pool.acquire("host-b")).await;
+        assert!(b.is_ok(), "B 不应被 A 的 host 等待饿死");
+        assert!(b.unwrap().is_ok(), "B acquire 应成功");
+        // 释放 A 让 waiter 完成,避免 drop 时挂起
+        drop(_a_hold);
+        let _ = tokio::time::timeout(Duration::from_millis(200), a_waiter).await;
+    }
+
+    /// 审计 H-06:持有 host 信号量 Arc 时 cleanup 不得删除该 host
+    #[tokio::test]
+    async fn test_cleanup_does_not_remove_host_while_arc_held() {
+        let pool = ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 10,
+            enable_http2: false, // 避免默认 16→100 提升干扰
+            ..Default::default()
+        });
+        // 先创建 host 条目
+        {
+            let _p = pool.acquire("held.com").await.unwrap();
+        }
+        assert_eq!(pool.host_count(), 1);
+        // 外部再 clone 一次(模拟 acquire 前持有/竞态窗口)
+        let held = pool.host_semaphore("held.com");
+        assert!(Arc::strong_count(&held) >= 2);
+        pool.cleanup_idle_hosts();
+        assert_eq!(
+            pool.host_count(),
+            1,
+            "外部仍持有 Arc 时 cleanup 不得删除 host 信号量"
+        );
+        // 与 map 内是同一实例
+        let again = pool.host_semaphore("held.com");
+        assert!(
+            Arc::ptr_eq(&held, &again),
+            "cleanup 后同 host 必须仍是同一 Semaphore 实例"
+        );
+        drop(held);
+        drop(again);
+        pool.cleanup_idle_hosts();
+        assert_eq!(pool.host_count(), 0, "Arc 全释放后 idle host 应可清理");
+    }
+
+    /// 审计 H-06:若错误地在 Arc 仍存活时删条目再 insert,会形成双信号量。
+    /// 回归:cleanup 后并发 acquire 仍受 max_per_host 约束(通过 host_active 观测)。
+    #[tokio::test]
+    async fn test_host_semaphore_identity_stable_across_cleanup_race() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 10,
+            enable_http2: false,
+            ..Default::default()
+        }));
+        let sem_before = pool.host_semaphore("race.com");
+        // 并发:一端持有 clone 并 cleanup,一端反复 host_semaphore
+        let pool2 = Arc::clone(&pool);
+        let join = tokio::spawn(async move {
+            for _ in 0..50 {
+                pool2.cleanup_idle_hosts();
+                let _ = pool2.host_semaphore("race.com");
+                tokio::task::yield_now().await;
+            }
+        });
+        for _ in 0..50 {
+            let s = pool.host_semaphore("race.com");
+            assert!(
+                Arc::ptr_eq(&sem_before, &s),
+                "持有外部 clone 期间同 host 不得换新 Semaphore"
+            );
+            pool.cleanup_idle_hosts();
+            tokio::task::yield_now().await;
+        }
+        join.await.unwrap();
+        drop(sem_before);
+        // 全部释放后可清理
+        pool.cleanup_idle_hosts();
+        assert_eq!(pool.host_count(), 0);
     }
 
     #[tokio::test]

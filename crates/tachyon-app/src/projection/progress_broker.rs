@@ -6,7 +6,6 @@
 //! - ChunkReaderPool 通过 mark_dirty + Notify 唤醒 aggregator
 //! - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,12 +15,15 @@ use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::Notify;
 
-use tokio::sync::watch;
+use tokio::sync::broadcast;
 
 use crate::commands::{ProgressEvent, TaskProgress};
 use crate::repository::TaskRepository;
 use crate::runtime::chunk_reader_pool::ProgressDelta;
 use tachyon_core::types::DownloadState;
+
+/// 审计 M-03:broadcast 容量;过小会在慢订阅者下 lag 丢事件
+const PROGRESS_BROADCAST_CAPACITY: usize = 64;
 
 /// 任务终态通知 payload
 ///
@@ -69,7 +71,7 @@ const AGGREGATOR_INTERVAL_MS: u64 = 250;
 /// - 250ms 超时兜底：确保无通知时也能更新
 /// - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
 pub struct ProgressBroker {
-    progress_tx: watch::Sender<ProgressEvent>,
+    progress_tx: broadcast::Sender<ProgressEvent>,
     /// 需要聚合的任务列表引用
     task_repository: TaskRepository,
     /// aggregator 是否已 spawn（幂等防护）
@@ -93,7 +95,7 @@ impl ProgressBroker {
     /// 尚未就绪的上下文（如 Tauri Builder::manage 同步阶段）。
     /// 生产环境应在 Tauri `setup` 钩子中调用 `spawn_aggregator()`。
     pub fn start(task_repository: TaskRepository) -> Self {
-        let progress_tx = watch::Sender::new(HashMap::new());
+        let (progress_tx, _) = broadcast::channel(PROGRESS_BROADCAST_CAPACITY);
         Self {
             progress_tx,
             task_repository,
@@ -165,7 +167,7 @@ impl ProgressBroker {
     ///
     /// 仅用于测试环境，避免在测试中 spawn 长期运行的定时器。
     pub fn new_no_aggregator(task_repository: TaskRepository) -> Self {
-        let progress_tx = watch::Sender::new(HashMap::new());
+        let (progress_tx, _) = broadcast::channel(PROGRESS_BROADCAST_CAPACITY);
         Self {
             progress_tx,
             task_repository,
@@ -251,12 +253,12 @@ impl ProgressBroker {
     /// 获取订阅 receiver
     ///
     /// 供 `subscribe_progress` Tauri command 使用。
-    pub fn subscribe(&self) -> watch::Receiver<ProgressEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<ProgressEvent> {
         self.progress_tx.subscribe()
     }
 
     /// 获取 sender 的引用（用于内部传播）
-    pub fn sender(&self) -> &watch::Sender<ProgressEvent> {
+    pub fn sender(&self) -> &broadcast::Sender<ProgressEvent> {
         &self.progress_tx
     }
 }
@@ -474,8 +476,10 @@ mod tests {
         );
 
         broker.broadcast_all();
-        rx.changed().await.unwrap();
-        let snapshot = rx.borrow_and_update().clone();
+        let snapshot = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("应收到 broadcast")
+            .expect("broadcast 不应关闭");
         assert_eq!(snapshot.len(), 1);
         assert!(snapshot.contains_key("t1"));
     }
@@ -490,7 +494,7 @@ mod tests {
         // 短暂等待确认不会收到事件
         let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
             tokio::select! {
-                _ = rx.changed() => true,
+                r = rx.recv() => r.is_ok(),
                 _ = tokio::time::sleep(Duration::from_millis(100)) => false,
             }
         });
@@ -530,7 +534,7 @@ mod tests {
         );
 
         // 应在 AGGREGATOR_INTERVAL_MS 内收到事件
-        let result = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         assert!(result.is_ok(), "aggregator 应在 500ms 内发送事件");
     }
 
@@ -570,8 +574,7 @@ mod tests {
         );
 
         // 消费 insert 触发的初始广播
-        let _ = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
-        let _ = rx.borrow_and_update();
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         let version_before = repository.version();
 
         // 模拟 chunk_reader_pool 的进度更新路径:get_mut 改字段,不调 update_status
@@ -589,12 +592,12 @@ mod tests {
         );
 
         // aggregator 仍必须在下一个 tick 广播出新值
-        let result = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         assert!(
             result.is_ok(),
             "进度字段通过 get_mut 更新后,aggregator 必须广播(不能依赖 version 短路)"
         );
-        let snapshot = rx.borrow_and_update().clone();
+        let snapshot = result.unwrap().expect("broadcast 不应关闭");
         let tp = snapshot.get("t1").expect("t1 应在快照中");
         assert_eq!(tp.downloaded, 512);
         assert_eq!(tp.speed, 100);
@@ -637,7 +640,7 @@ mod tests {
         );
 
         // 应仍能收到事件(证明至少一个 aggregator 在运行)
-        let result = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         assert!(result.is_ok(), "幂等 spawn 后应仍有 aggregator 运行");
 
         // 验证标志位已置位
@@ -813,5 +816,65 @@ mod tests {
         repository.insert("t5".to_string(), make_completed_task("t5", "x.bin"));
         // 未注入 emitter 时 broadcast 不应 panic
         broker.broadcast_all();
+    }
+
+    /// 审计 M-03:连续两次 broadcast 带不同 completed_delta,订阅者必须都能收到
+    /// (watch 只会保留最后一次,导致第一次 delta 永久丢失)
+    #[tokio::test]
+    async fn test_m03_consecutive_broadcasts_preserve_completed_deltas() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let mut rx = broker.subscribe();
+
+        repository.insert(
+            "t-delta".to_string(),
+            TaskInfo {
+                id: "t-delta".to_string(),
+                url: "https://example.com/d.bin".to_string(),
+                file_name: "d.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 256,
+                speed: 10,
+                status: DownloadState::Downloading,
+                progress: 0.25,
+                fragments_total: 4,
+                fragments_done: 1,
+                active_concurrency: 1,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+
+        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(0)));
+        broker.broadcast_all();
+        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(1)));
+        broker.broadcast_all();
+
+        let e1 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("e1 timeout")
+            .expect("e1 closed");
+        let e2 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("e2 timeout")
+            .expect("e2 closed");
+
+        let d1 = e1.get("t-delta").unwrap().completed_delta.clone();
+        let d2 = e2.get("t-delta").unwrap().completed_delta.clone();
+        assert_eq!(
+            d1,
+            vec![0],
+            "第一次 broadcast 的 completed_delta 不得被覆盖丢失"
+        );
+        assert_eq!(
+            d2,
+            vec![1],
+            "第二次 broadcast 的 completed_delta 必须独立到达"
+        );
     }
 }

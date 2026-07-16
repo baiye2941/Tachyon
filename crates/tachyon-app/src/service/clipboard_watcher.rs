@@ -12,6 +12,7 @@
 //! - 默认关闭,用户需在设置中开启 `clipboard.enable_watch`
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tachyon_core::config::AppConfig;
@@ -24,6 +25,12 @@ use tracing::debug;
 use crate::commands::resource_type_to_string;
 use crate::commands::validate_download_url;
 use crate::service::SnifferService;
+
+/// 审计 A-14:轮询 start 幂等 CAS;true=首次占用。
+fn claim_start_slot(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 /// 剪贴板 URL 检测事件 payload
 ///
@@ -49,6 +56,8 @@ pub struct ClipboardWatcher {
     sniffer_service: Arc<SnifferService>,
     /// 上次读取的剪贴板内容,用于去重
     last_text: Arc<Mutex<Option<String>>>,
+    /// 审计 A-14:start 幂等,避免双 spawn 轮询
+    loop_started: AtomicBool,
 }
 
 impl ClipboardWatcher {
@@ -63,27 +72,37 @@ impl ClipboardWatcher {
             config,
             sniffer_service,
             last_text: Arc::new(Mutex::new(None)),
+            loop_started: AtomicBool::new(false),
         }
     }
 
-    /// 启动后台剪贴板轮询任务
+    /// 是否已 spawn 轮询循环(测试/观测)
+    pub fn is_loop_started(&self) -> bool {
+        self.loop_started.load(Ordering::Acquire)
+    }
+
+    /// 尝试占用 start 槽位(幂等 CAS)。true=首次,false=已启动。
+    fn claim_loop_start(&self) -> bool {
+        claim_start_slot(&self.loop_started)
+    }
+
+    /// 启动后台剪贴板轮询任务(幂等)
     ///
     /// 必须在 Tokio reactor 上下文中调用(如 Tauri `setup` 钩子的 `block_on` 内)。
-    /// 若 `clipboard.enable_watch` 为 false,则不启动。
-    /// 轮询间隔由 `clipboard.poll_interval_ms` 控制(默认 1000ms)。
-    ///
-    /// P1-23-A 已知限制:监听仅在应用启动时根据配置决定是否拉起,运行时通过
-    /// update_config 启用 `enable_watch` 不会动态 spawn 轮询任务(需重启应用)。
-    /// 未来改进:实现 start-on-demand,在配置变更时检测 false→true 转换并拉起任务。
-    /// 前端 SettingsPanel 在启用时已提示“需要重启应用以启用剪贴板监听”。
+    /// 审计 A-14:即使 `enable_watch` 初始为 false 也 spawn 循环;
+    /// 循环内按配置门禁,`update_config` 将 false→true 无需重启即可生效。
+    /// 轮询间隔取启动时 `poll_interval_ms`(默认 1000ms,最小 100);
+    /// 间隔热改仍为诚实非目标。
     pub async fn start(&self) {
-        let cfg = self.config.lock().await;
-        if !cfg.clipboard.enable_watch {
-            debug!("剪贴板监听未启用,跳过启动");
+        if !self.claim_loop_start() {
+            debug!("剪贴板轮询已启动,跳过重复 start");
             return;
         }
-        let interval_ms = cfg.clipboard.poll_interval_ms.max(100);
-        drop(cfg);
+
+        let interval_ms = {
+            let cfg = self.config.lock().await;
+            cfg.clipboard.poll_interval_ms.max(100)
+        };
 
         let handle = self.app_handle.clone();
         let config = self.config.clone();
@@ -124,13 +143,13 @@ impl ClipboardWatcher {
                 // 评估:校验 + 识别 + 过滤
                 let capture_config = sniffer.capture_config().await;
                 if let Some(detected) = evaluate_clipboard_text(&text, &capture_config) {
-                    debug!(url = %detected.url, r#type = %detected.resource_type, "剪贴板检测到可下载 URL");
+                    debug!(url = %tachyon_core::redact_url_for_log(&detected.url), r#type = %detected.resource_type, "剪贴板检测到可下载 URL");
                     let _ = handle.emit("clipboard://url-detected", &detected);
                 }
             }
         });
 
-        debug!(interval_ms, "剪贴板监听已启动");
+        debug!(interval_ms, "剪贴板轮询循环已启动(enable_watch 运行时门禁)");
     }
 }
 
@@ -262,5 +281,14 @@ mod tests {
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().resource_type, "video");
+    }
+
+    /// 审计 A-14:start 槽位 CAS 幂等
+    #[test]
+    fn test_a14_claim_start_slot_is_idempotent() {
+        let flag = AtomicBool::new(false);
+        assert!(claim_start_slot(&flag), "首次 claim 应成功");
+        assert!(!claim_start_slot(&flag), "二次 claim 应失败");
+        assert!(flag.load(Ordering::Acquire));
     }
 }

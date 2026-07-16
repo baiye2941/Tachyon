@@ -26,11 +26,13 @@ ignore = [
     "RUSTSEC-2025-0060",
     # instant — librqbit 兼容库,Rust 1.59+ 已原生支持,已停止维护
     "RUSTSEC-2024-0384",
-    # quick-xml — librqbit-upnp 依赖,二次时间复杂度解析重复属性名(DoS)
-    # 仅用于 UPnP 设备描述解析(局域网),非外部用户输入,风险可控
+    # quick-xml — 两条独立传递链,均命中 RUSTSEC-2026-0194/0195(DoS):
+    #   1) librqbit → librqbit-upnp → quick-xml 0.37.x(BT UPnP 设备描述,局域网)
+    #   2) Tauri/plist/wayland-scanner 等平台链 → quick-xml 0.39.x
+    # 现有 CI 全局 ignore 遮蔽两条链;升级目标均为 quick-xml >=0.41。
+    # 在上游升级前保留 ignore,并在 enable_upnp 默认 false 降低 UPnP 暴露面。
+    # 审计 A-10:不得再写「仅 librqbit/UPnP」掩盖 Tauri 链。
     "RUSTSEC-2026-0194",
-    # quick-xml — librqbit-upnp 依赖,无界 namespace 分配导致内存耗尽 DoS
-    # 同上,仅 UPnP 局域网场景,等 librqbit 上游升级 quick-xml
     "RUSTSEC-2026-0195",
     # glib — gtk-rs GTK3 绑定,Tauri v2 Linux 依赖,等 v3 迁 GTK4
     "RUSTSEC-2026-0190",

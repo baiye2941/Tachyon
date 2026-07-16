@@ -1,188 +1,83 @@
 //! 嗅探器应用服务
 //!
-//! 封装嗅探器相关的业务规则，从 AppState 和 Tauri command 层提取的纯逻辑层。
-//! 不直接依赖 Tauri 框架，可被 CLI/daemon/headless API 复用。
-//!
-//! SnifferService 封装资源和过滤器的存储与校验逻辑，
-//! AppState 仅持有 `Arc<SnifferService>` 而非直接暴露 sniffer 字段。
+//! 审计 A-07:资源与 CaptureConfig 的唯一 owner 是 `tachyon_sniffer::ResourceManager`。
+//! 本服务仅作 Tauri/async 适配层,禁止再持有第二份资源/配置存储。
 
 use std::sync::Arc;
 
-use tachyon_core::safety::extract_filename_from_url;
-use tachyon_sniffer::capture::{CaptureConfig, identify_resource, should_capture};
-use tachyon_sniffer::{SnifferResource, redact_sensitive_params};
-use tokio::sync::{Mutex, RwLock};
-use uuid::Uuid;
+use tachyon_sniffer::capture::CaptureConfig;
+use tachyon_sniffer::{ResourceManager, SnifferResource};
 
-use crate::commands::{AppError, resource_type_to_string};
+use crate::commands::AppError;
 
-/// 过滤规则长度上限(与 add_filter 一致)
-const MAX_FILTER_LENGTH: usize = 256;
-/// 过滤规则数量上限(与 add_filter 一致)
-const MAX_FILTER_COUNT: usize = 100;
-
-/// 嗅探器应用服务
-///
-/// 负责嗅探器相关的业务逻辑：
-/// - 资源管理：添加资源（去重、限数量、脱敏）
-/// - 捕获配置：类型白名单、最小文件大小、URL 过滤器（含去重/限长/限数量校验）
-/// - 查询：获取资源列表
-///
-/// 由 Tauri command 层调用，command 层只负责参数解析和错误序列化。
+/// 嗅探器应用服务(薄适配层)
 pub struct SnifferService {
-    /// 已捕获的资源列表
-    resources: Arc<Mutex<Vec<SnifferResource>>>,
-    /// 捕获规则配置(类型白名单、min_size、url_filters)
-    capture_config: RwLock<CaptureConfig>,
+    manager: Arc<ResourceManager>,
 }
 
 impl SnifferService {
-    /// 创建新的 SnifferService
+    /// 创建新的 SnifferService(内嵌默认 ResourceManager)
     pub fn new() -> Self {
         Self {
-            resources: Arc::new(Mutex::new(Vec::new())),
-            capture_config: RwLock::new(CaptureConfig::default()),
+            manager: Arc::new(ResourceManager::default()),
         }
+    }
+
+    /// 注入已有 ResourceManager(测试/共享)
+    pub fn from_manager(manager: Arc<ResourceManager>) -> Self {
+        Self { manager }
+    }
+
+    /// 底层唯一 owner(供高级路径/测试)
+    pub fn manager(&self) -> Arc<ResourceManager> {
+        Arc::clone(&self.manager)
     }
 
     /// 获取当前捕获配置的克隆
     pub async fn capture_config(&self) -> CaptureConfig {
-        self.capture_config.read().await.clone()
+        self.manager.config()
     }
 
-    /// 更新捕获配置
-    ///
-    /// 与 [`add_filter`](Self::add_filter) 应用相同的校验规则,避免
-    /// set_capture_config 旁路绕过单条过滤器的长度/数量/重复约束(P1-22-5):
-    /// - 每条 url_filter 非空且长度 <= MAX_FILTER_LENGTH
-    /// - url_filters 总数 <= MAX_FILTER_COUNT
-    /// - url_filters 无重复
-    /// - min_size 非负(u64 天然 >= 0,保留显式校验以明确语义)
+    /// 更新捕获配置(校验在 ResourceManager 内)
     pub async fn set_capture_config(&self, config: CaptureConfig) -> Result<(), AppError> {
-        for f in &config.url_filters {
-            if f.is_empty() {
-                return Err(AppError::Config("过滤规则不能为空".to_string()));
-            }
-            if f.len() > MAX_FILTER_LENGTH {
-                return Err(AppError::Config(format!(
-                    "过滤规则长度不能超过 {MAX_FILTER_LENGTH} 字符"
-                )));
-            }
-        }
-        if config.url_filters.len() > MAX_FILTER_COUNT {
-            return Err(AppError::Config(format!(
-                "过滤规则数量已达上限 {MAX_FILTER_COUNT}"
-            )));
-        }
-        // 去重检查:O(n^2) 在 MAX_FILTER_COUNT=100 下可接受,避免额外哈希分配
-        let mut seen = std::collections::HashSet::with_capacity(config.url_filters.len());
-        for f in &config.url_filters {
-            if !seen.insert(f.as_str()) {
-                return Err(AppError::Config("过滤规则已存在".to_string()));
-            }
-        }
-        // min_size 为 u64,天然 >= 0;显式校验语义清晰(未来若改 i64 需拦截负数)
-        if config.min_size > i64::MAX as u64 {
-            return Err(AppError::Config("最小文件大小值非法".to_string()));
-        }
-        *self.capture_config.write().await = config;
-        Ok(())
+        self.manager
+            .set_config(config)
+            .map_err(|e| AppError::Config(e.to_string()))
+    }
+
+    /// 按 id 取资源
+    pub async fn get_resource_by_id(&self, id: &str) -> Option<SnifferResource> {
+        self.manager.get_by_id(id)
     }
 
     /// 获取所有资源（按发现时间倒序）
     pub async fn get_resources(&self) -> Vec<SnifferResource> {
-        let store = self.resources.lock().await;
-        store.iter().rev().cloned().collect()
+        self.manager.get_all()
     }
 
-    /// 添加嗅探器资源
-    ///
-    /// 业务规则：
-    /// - URL 必须通过 `should_capture`（类型白名单 + URL 过滤器子串匹配）
-    /// - 去重：已存在的 URL 不重复添加
-    /// - 限数量：超过 MAX_SNIFFER_RESOURCES 时移除最早的资源
-    /// - URL 脱敏后存储
-    ///
-    /// 返回值：成功添加时返回 `Some(资源)`；被过滤或去重时返回 `None`，
-    /// 供 command 层决定是否 emit 事件。
+    /// 添加嗅探资源(手动 URL;无 size → 不应用 min_size)
     pub async fn add_resource(&self, url: String) -> Option<SnifferResource> {
-        let config = self.capture_config.read().await;
-        if !should_capture(&url, &config) {
-            return None;
+        let res = self.manager.add_url(&url);
+        if let Some(ref r) = res {
+            tracing::info!(
+                url = %tachyon_core::redact_url_for_log(&url),
+                resource_type = %r.resource_type,
+                "捕获新资源"
+            );
         }
-        drop(config);
-
-        let resource_type = identify_resource(&url);
-        let file_name = extract_filename_from_url(&url);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let redacted_url = redact_sensitive_params(&url);
-        let resource = SnifferResource {
-            id: Uuid::new_v4().to_string(),
-            url: redacted_url.clone(),
-            download_url: url.clone(),
-            file_name,
-            resource_type: resource_type_to_string(resource_type).to_string(),
-            file_size: None,
-            content_type: None,
-            discovered_at: now,
-            source_page: None,
-        };
-
-        let mut store = self.resources.lock().await;
-
-        if store.iter().any(|r| r.url == redacted_url) {
-            return None;
-        }
-
-        const MAX_SNIFFER_RESOURCES: usize = 1000;
-        if store.len() >= MAX_SNIFFER_RESOURCES {
-            store.remove(0);
-        }
-
-        tracing::info!(url = %tachyon_core::redact_url_for_log(&url), resource_type = %resource.resource_type, "捕获新资源");
-        store.push(resource.clone());
-        Some(resource)
+        res
     }
 
     /// 添加过滤规则
-    ///
-    /// 业务规则：
-    /// - 规则不能为空
-    /// - 规则长度不能超过 MAX_FILTER_LENGTH
-    /// - 规则数量不能超过 MAX_FILTER_COUNT
-    /// - 规则不能重复
-    ///
-    /// 规则存入 `CaptureConfig.url_filters`,`add_resource` 经 `should_capture` 使用。
     pub async fn add_filter(&self, filter: String) -> Result<(), AppError> {
-        if filter.is_empty() {
-            return Err(AppError::Config("过滤规则不能为空".to_string()));
-        }
-        if filter.len() > MAX_FILTER_LENGTH {
-            return Err(AppError::Config(format!(
-                "过滤规则长度不能超过 {MAX_FILTER_LENGTH} 字符"
-            )));
-        }
-        let mut config = self.capture_config.write().await;
-        if config.url_filters.len() >= MAX_FILTER_COUNT {
-            return Err(AppError::Config(format!(
-                "过滤规则数量已达上限 {MAX_FILTER_COUNT}"
-            )));
-        }
-        if config.url_filters.contains(&filter) {
-            return Err(AppError::Config("过滤规则已存在".to_string()));
-        }
-        tracing::info!(filter = %filter, "添加嗅探过滤规则");
-        config.url_filters.push(filter);
-        Ok(())
+        self.manager
+            .add_filter(filter)
+            .map_err(|e| AppError::Config(e.to_string()))
     }
 
     /// 清空所有资源
     pub async fn clear_resources(&self) {
-        let mut store = self.resources.lock().await;
-        store.clear();
+        self.manager.clear();
     }
 }
 
@@ -342,7 +237,6 @@ mod tests {
     #[tokio::test]
     async fn test_add_resource_respects_disabled_type() {
         let service = SnifferService::new();
-        // 禁用 Video 类型后,视频 URL 不应被捕获
         let mut cfg = service.capture_config().await;
         cfg.enabled_types
             .remove(&tachyon_sniffer::capture::ResourceType::Video);
@@ -357,14 +251,30 @@ mod tests {
     #[tokio::test]
     async fn test_add_resource_allows_enabled_type() {
         let service = SnifferService::new();
-        // 默认配置启用 Video,视频应被捕获
         let result = service
             .add_resource("http://example.com/movie.mp4".to_string())
             .await;
         assert!(result.is_some(), "默认配置应捕获视频");
     }
 
-    // P1-22-5: set_capture_config 必须与 add_filter 应用相同校验,禁止旁路绕过
+    /// A-07:adapter 与 ResourceManager 是同一 owner
+    #[tokio::test]
+    async fn test_a07_service_uses_single_resource_manager() {
+        let service = SnifferService::new();
+        service
+            .add_resource("http://example.com/a.zip".to_string())
+            .await;
+        assert_eq!(service.manager().count(), 1);
+        assert_eq!(service.get_resources().await.len(), 1);
+        // 直接经 manager 添加也应可见
+        service
+            .manager()
+            .add_url("http://example.com/b.mp4")
+            .expect("manager 添加");
+        assert_eq!(service.get_resources().await.len(), 2);
+    }
+
+    // P1-22-5: set_capture_config 必须与 add_filter 应用相同校验
 
     #[tokio::test]
     async fn test_set_capture_config_rejects_empty_filter() {
@@ -400,24 +310,9 @@ mod tests {
     async fn test_set_capture_config_rejects_duplicate_filters() {
         let service = SnifferService::new();
         let mut cfg = service.capture_config().await;
-        cfg.url_filters = vec!["cdn.example.com".to_string(), "cdn.example.com".to_string()];
+        cfg.url_filters = vec!["same".into(), "same".into()];
         let result = service.set_capture_config(cfg).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("已存在"));
-    }
-
-    #[tokio::test]
-    async fn test_set_capture_config_accepts_valid() {
-        let service = SnifferService::new();
-        let mut cfg = service.capture_config().await;
-        cfg.url_filters = vec![
-            "cdn.example.com".to_string(),
-            "cdn2.example.com".to_string(),
-        ];
-        cfg.min_size = 4096;
-        service.set_capture_config(cfg.clone()).await.unwrap();
-        let got = service.capture_config().await;
-        assert_eq!(got.url_filters, cfg.url_filters);
-        assert_eq!(got.min_size, 4096);
     }
 }

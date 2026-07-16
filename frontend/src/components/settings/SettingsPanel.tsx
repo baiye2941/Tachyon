@@ -12,7 +12,7 @@ import { api } from "../../api/invoke";
 import { $config, $configLoading } from "../../stores/settings";
 import { addToast } from "../../stores/toast";
 import { refreshTaskList } from "../../stores/downloads";
-import type { AppConfig, ConfigPatch, HfSourceMode } from "../../types";
+import type { AppConfig, ConfigPatch, HfSourceMode, IoStrategy } from "../../types";
 import { CloseIcon } from "../icons";
 import ConfirmDialog from "../ConfirmDialog";
 import Button from "../../shared/ui/Button";
@@ -54,6 +54,10 @@ export interface ConfigDraft {
     verifyChecksum: boolean;
     /** 限速(bytes/sec);null 表示不限速 */
     rateLimitBytesPerSec: number | null;
+    /** HTTP 代理 URL;null 表示未显式配置(回退系统环境变量) */
+    proxy: string | null;
+    /** I/O 后端策略 */
+    ioStrategy: IoStrategy;
   };
   connection: {
     maxConnectionsPerHost: number;
@@ -161,6 +165,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       requestTimeoutSecs: 60,
       verifyChecksum: true,
       rateLimitBytesPerSec: null,
+      proxy: null,
+      ioStrategy: "standard",
     },
     connection: {
       maxConnectionsPerHost: 4,
@@ -220,6 +226,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         requestTimeoutSecs: cfg.download.requestTimeoutSecs,
         verifyChecksum: cfg.download.verifyChecksum,
         rateLimitBytesPerSec: cfg.download.rateLimitBytesPerSec ?? null,
+        proxy: cfg.download.proxy ?? null,
+        ioStrategy: (cfg.download.ioStrategy as IoStrategy | undefined) ?? "standard",
       },
       connection: {
         maxConnectionsPerHost: cfg.connection.maxConnectionsPerHost,
@@ -294,6 +302,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         requestTimeoutSecs: draft.download.requestTimeoutSecs,
         verifyChecksum: draft.download.verifyChecksum,
         rateLimitBytesPerSec: draft.download.rateLimitBytesPerSec,
+        proxy: draft.download.proxy,
+        ioStrategy: draft.download.ioStrategy,
       },
       connection: {
         maxConnectionsPerHost: draft.connection.maxConnectionsPerHost,
@@ -360,7 +370,13 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({ directory: true, multiple: false });
       if (typeof selected === "string") {
-        setDraft("download", "downloadDir", selected);
+        // 审计 SEC-002:设置里选目录也须先授权,update_config 才能通过 download_dir 校验
+        try {
+          const authorized = await api.authorizeDownloadDirectory(selected);
+          setDraft("download", "downloadDir", authorized);
+        } catch (authErr) {
+          addToast(tr("toast.configSaveFailed", { error: errorMessage(authErr) }), "error");
+        }
       }
     } catch (e) {
       addToast(tr("toast.openDirPickerFailed", { error: errorMessage(e) }), "error");
@@ -370,8 +386,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
   const handleExportBackup = async () => {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
+      // 审计 SEC-006:默认落到已授权 downloadDir 下,任意路径会被后端拒绝
+      const defaultPath = `${draft.download.downloadDir || "."}/tachyon-backup.json`;
       const path = await save({
-        defaultPath: "tachyon-backup.json",
+        defaultPath,
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (typeof path !== "string") {

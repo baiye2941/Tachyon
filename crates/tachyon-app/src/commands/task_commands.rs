@@ -7,9 +7,9 @@ use tachyon_core::config::{AppConfig, DownloadConfig};
 use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log};
 use tachyon_core::traits::{Protocol, TaskRunner};
 use tachyon_core::types::{DownloadState, FileMetadata};
+use tachyon_engine::BufferPool;
+use tachyon_engine::ConnectionPool;
 use tachyon_engine::DownloadTask;
-use tachyon_engine::connection::ConnectionPool;
-use tachyon_io::BufferPool;
 use tokio::sync::watch;
 use url::Url;
 
@@ -75,7 +75,7 @@ pub(crate) async fn validate_and_prepare_url(
     };
 
     // 磁力链接没有 host，用占位符代替（仅用于日志）
-    let host = if url.starts_with("magnet:?") {
+    let host = if tachyon_core::looks_like_magnet_url(url) {
         "magnet".to_string()
     } else {
         match download_url.host_str() {
@@ -127,15 +127,17 @@ pub(crate) async fn validate_and_prepare_url(
                 return None;
             }
             ResumeOrCancel::Timeout => {
+                // 审计 M-05:执行前 pause 超时保持 Paused(可后续 Resume 重启),
+                // 不再误映射为 Cancelled。
                 tracing::warn!(
                     task_id = %task_id,
                     timeout_secs = pause_timeout_secs,
-                    "暂停等待超时,取消任务"
+                    "暂停等待超时,保持 Paused"
                 );
                 update_task_status(
                     &state.domain.task_repository,
                     task_id,
-                    DownloadState::Cancelled,
+                    DownloadState::Paused,
                 );
                 cleanup_runtime(state, task_id);
                 return None;
@@ -172,10 +174,12 @@ pub(crate) async fn build_download_task(
     download_config: DownloadConfig,
     connection_pool: Arc<ConnectionPool>,
     buffer_pool: Arc<BufferPool>,
+    global_rate_limiter: Arc<tachyon_engine::RateLimiter>,
+    scheduler_config: tachyon_core::config::SchedulerConfig,
     mirror_urls: Option<Vec<String>>,
     #[cfg(feature = "magnet")] bt_session: Option<Arc<tachyon_engine::BtSession>>,
 ) -> Result<Box<dyn TaskRunner>, ()> {
-    let is_magnet = url.starts_with("magnet:?");
+    let is_magnet = tachyon_core::looks_like_magnet_url(url);
     let has_mirrors = mirror_urls.as_ref().is_some_and(|v| !v.is_empty());
 
     // P2SP 路由:按 is_magnet × has_mirrors 分四路。
@@ -183,9 +187,10 @@ pub(crate) async fn build_download_task(
     //   - magnet(纯 BT):with_pool_and_scheduler(传 bt_session)
     //   - http + mirrors:多源镜像
     //   - http(单源):with_pool_and_scheduler(bt_session=None)
-    use tachyon_scheduler::AdaptiveDownloadScheduler;
+    // 审计 A-04:使用 AppConfig.scheduler,禁止 default_config 忽略 UI 配置
+    // 审计 A-01/A-04:经 engine 工厂构造调度器,禁止 app 直连 tachyon-scheduler
     let scheduler: Arc<dyn tachyon_core::traits::DownloadScheduler> =
-        Arc::new(AdaptiveDownloadScheduler::default_config());
+        tachyon_engine::create_adaptive_scheduler(scheduler_config.clone());
 
     let task_result = if is_magnet && has_mirrors {
         #[cfg(feature = "magnet")]
@@ -238,6 +243,10 @@ pub(crate) async fn build_download_task(
     match task_result {
         Ok(mut t) => {
             t.set_buffer_pool(buffer_pool.clone());
+            // 审计 A-03:注入全局共享限速器(跨任务总上限)
+            t.set_rate_limiter(global_rate_limiter);
+            // 审计 A-04:规划参数与 AdaptiveDownloadScheduler 同源
+            t.set_scheduler_config(scheduler_config);
             Ok(Box::new(t))
         }
         Err(e) => {
@@ -920,7 +929,7 @@ pub(crate) async fn probe_filename_inner(
     // (probe 无 storage_factory,下载有 factory → 不同 cache key)。
     // 若不 pause+delete,会留下无所有者的 session torrent 持续联网。
     #[cfg(feature = "magnet")]
-    if url.starts_with("magnet:?") {
+    if tachyon_core::looks_like_magnet_url(&url) {
         let bt_session = state.infra.bt_session.lock().await.clone();
         if let Some(session) = bt_session {
             let protocol = tachyon_engine::MagnetProtocol::new(
@@ -946,9 +955,19 @@ pub(crate) async fn probe_filename_inner(
         return Ok(extract_magnet_fallback_name(&url));
     }
 
-    // HTTP/FTP:构造 DownloadTask 做 HEAD 探测
-    let download_config = DownloadConfig::default();
-    match DownloadTask::new(url.clone(), download_config).await {
+    // HTTP:使用 AppConfig 同源 DownloadConfig(proxy/UA/timeouts/io_strategy),
+    // 避免 DownloadConfig::default() 与正式任务配置分叉(A-06 partial)。
+    // 审计 A-04/A-14:调度器与正式任务同源,不用 DownloadTask::new 的 default_config。
+    // probe 为轻量 HEAD,不注入全局限速器/连接池。
+    let (download_config, scheduler_cfg) = {
+        let cfg = state.domain.config.lock().await;
+        (
+            build_download_config(&cfg, &cfg.download.download_dir),
+            cfg.scheduler.clone(),
+        )
+    };
+    let scheduler = tachyon_engine::create_adaptive_scheduler(scheduler_cfg);
+    match DownloadTask::with_scheduler(url.clone(), download_config, scheduler).await {
         Ok(mut task) => match task.probe().await {
             Ok(meta) => Ok(meta.file_name.clone()),
             Err(_) => {
@@ -1073,8 +1092,12 @@ pub(crate) async fn create_task_inner(
 }
 
 pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
+    // 审计 H-02:同一任务 pause/resume/cancel 串行,避免 TaskInfo 与 watch 交错
+    let lock = state.runtime.supervisor.task_command_lock(&task_id);
+    let _guard = lock.lock().await;
     state.service.task_service.pause_task(&task_id).await?;
-    state
+    // 有运行中 task 时发送 Pause;无 channel 时仅改仓库状态(恢复任务未启动)
+    let _ = state
         .runtime
         .supervisor
         .send_command(&task_id, TaskCommand::Pause);
@@ -1082,24 +1105,32 @@ pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Resul
 }
 
 pub(crate) async fn resume_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
+    let lock = state.runtime.supervisor.task_command_lock(&task_id);
+    let _guard = lock.lock().await;
+
     // task_service.resume_task 仅改状态(Pending/Paused -> Downloading)并持久化快照,
     // 不负责激活下载。激活逻辑由下方根据 supervisor 是否有运行中的 task_fn 决定。
     state.service.task_service.resume_task(&task_id).await?;
 
     // 若任务已有运行中的 task_fn(存在 control channel),直接发 Resume 信号。
-    // 这覆盖「运行中被暂停(Paused)」的场景:task_fn 仍在等待 Resume。
+    // 审计 H-03/H-02:send 失败(receiver 已关)不得伪成功,必须 restart。
     if state.runtime.supervisor.has_running_task(&task_id) {
-        state
+        if state
             .runtime
             .supervisor
-            .send_command(&task_id, TaskCommand::Resume);
-        return Ok(());
+            .send_command(&task_id, TaskCommand::Resume)
+        {
+            return Ok(());
+        }
+        tracing::warn!(
+            task_id = %task_id,
+            "Resume 控制通道已关闭,改走 restart_download"
+        );
+        // 清掉僵死 channel,避免 has_running_task 继续为 true
+        state.runtime.supervisor.cleanup(&task_id);
     }
 
-    // 无运行 task_fn(应用启动恢复的任务、task_fn 已退出的任务):
-    // send_command 对这种任务会静默返回 false,Resume 信号会丢失。
-    // 因此必须重新 start_download 激活 task_fn——新 task_fn 启动后通过
-    // inject_resume_snapshot 从磁盘快照注入已完成分片,实现断点续传。
+    // 无运行 task_fn 或 Resume 发送失败:重新 start_download
     restart_download(state, &task_id).await
 }
 
@@ -1148,8 +1179,10 @@ async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppErro
 }
 
 pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
+    let lock = state.runtime.supervisor.task_command_lock(&task_id);
+    let _guard = lock.lock().await;
     state.service.task_service.cancel_task(&task_id).await?;
-    state
+    let _ = state
         .runtime
         .supervisor
         .send_command(&task_id, TaskCommand::Cancel);
@@ -1161,17 +1194,31 @@ pub(crate) async fn delete_task_inner(
     task_id: String,
     delete_local_file: bool,
 ) -> Result<(), AppError> {
-    // 先发送 Cancel 命令停止活跃下载,再从仓库删除记录。
-    // 对于终态任务 Cancel 命令会被忽略(无活跃 handle),不影响正确性。
+    // 审计 H-04:Cancel → await JoinHandle quiesce → 再删文件/快照/仓库。
+    // 旧实现仅 send Cancel 后立刻 delete+cleanup(drop handle),后台 worker 可能仍在写盘。
+    // 终态/无 handle 时 wait_for_handle 立即返回 None,不影响正确性。
     state
         .runtime
         .supervisor
         .send_command(&task_id, TaskCommand::Cancel);
+    let waited = state
+        .runtime
+        .supervisor
+        .wait_for_handle(
+            &task_id,
+            crate::runtime::download_supervisor::DownloadSupervisor::DELETE_QUIESCE_TIMEOUT,
+        )
+        .await;
+    if waited.is_none() {
+        // 无 handle 或超时 abort 后继续删除;超时已 warn
+        tracing::debug!(task_id = %task_id, "delete: 无活跃 handle 或已超时 abort");
+    }
     state
         .service
         .task_service
         .delete_task(&task_id, delete_local_file)
         .await?;
+    // wait_for_handle 已移除 handle/channel;再 cleanup 兜底并发路径残留
     state.runtime.supervisor.cleanup(&task_id);
     Ok(())
 }
@@ -1263,6 +1310,16 @@ pub(crate) async fn reorder_tasks_inner(
 
 /// 备份文件 schema 版本号
 const BACKUP_SCHEMA_VERSION: u32 = 1;
+/// 审计 SEC-011:备份文件最大字节数(与网络元数据上限对齐)
+#[cfg(not(test))]
+const MAX_BACKUP_FILE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+const MAX_BACKUP_FILE_BYTES: u64 = 64 * 1024;
+/// 审计 SEC-011:单份备份最多任务数
+#[cfg(not(test))]
+const MAX_BACKUP_TASKS: usize = 10_000;
+#[cfg(test)]
+const MAX_BACKUP_TASKS: usize = 8;
 
 /// 导出的备份文件结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1316,6 +1373,8 @@ pub async fn import_backup(
 /// 导出备份的内部实现(便于测试直接使用 AppState)
 pub(crate) async fn export_backup_inner(state: &AppState, path: String) -> Result<(), AppError> {
     let config = { state.domain.config.lock().await.clone() };
+    // 审计 SEC-006:备份路径必须在 authorized_dirs 下
+    crate::commands::config_commands::path_under_authorized_dirs(&config, &path)?;
     let (tasks, corrupt_keys) = state
         .infra
         .task_store
@@ -1360,12 +1419,37 @@ pub(crate) async fn import_backup_inner(
     path: String,
     overwrite: bool,
 ) -> Result<usize, AppError> {
+    {
+        let config = state.domain.config.lock().await;
+        crate::commands::config_commands::path_under_authorized_dirs(&config, &path)?;
+    }
     let path_buf = std::path::PathBuf::from(path);
     let backup: Backup = tokio::task::spawn_blocking(move || {
+        let meta = std::fs::metadata(&path_buf)
+            .map_err(|e| AppError::Config(format!("读取备份文件元数据失败: {e}")))?;
+        let len = meta.len();
+        if len > MAX_BACKUP_FILE_BYTES {
+            return Err(AppError::Config(format!(
+                "备份文件过大: {len} > 最大允许 {MAX_BACKUP_FILE_BYTES} 字节"
+            )));
+        }
         let json = std::fs::read_to_string(&path_buf)
             .map_err(|e| AppError::Config(format!("读取备份文件失败: {e}")))?;
-        serde_json::from_str::<Backup>(&json)
-            .map_err(|e| AppError::Config(format!("备份文件格式无效: {e}")))
+        if json.len() as u64 > MAX_BACKUP_FILE_BYTES {
+            return Err(AppError::Config(format!(
+                "备份内容过大: {} > 最大允许 {MAX_BACKUP_FILE_BYTES} 字节",
+                json.len()
+            )));
+        }
+        let backup: Backup = serde_json::from_str(&json)
+            .map_err(|e| AppError::Config(format!("备份文件格式无效: {e}")))?;
+        if backup.tasks.len() > MAX_BACKUP_TASKS {
+            return Err(AppError::Config(format!(
+                "备份任务数过多: {} > 最大允许 {MAX_BACKUP_TASKS}",
+                backup.tasks.len()
+            )));
+        }
+        Ok(backup)
     })
     .await
     .map_err(|e| AppError::Config(format!("导入备份任务失败: {e}")))??;
@@ -1524,11 +1608,13 @@ mod tests {
             let pool_handle = state.infra.connection_pool.clone();
             // 切片2 夹具修复:task_fn 新签名增加 buffer_pool 参数,
             // 从 AppState.infra.buffer_pool 取池注入,使 worker 用池化 buffer。
-            let buffer_pool = state.infra.buffer_pool.clone();
+            // 审计 A-14:与连接池一样,启动时读锁 clone 当前池快照。
+            let buffer_pool_handle = state.infra.buffer_pool.clone();
             let task_id = task_id.clone();
             async move {
                 let _ = start_rx.await;
                 let connection_pool = pool_handle.read().await.clone();
+                let buffer_pool = buffer_pool_handle.read().await.clone();
                 task_fn(
                     state,
                     task_id,
@@ -1991,6 +2077,66 @@ mod tests {
         .unwrap();
         cancel_task_inner(&state, id.clone()).await.unwrap();
         delete_task_inner(&state, id.clone(), false).await.unwrap();
+        assert!(get_task_detail_inner(&state, id).await.is_err());
+    }
+
+    /// 审计 H-04:delete 必须 await 活跃 JoinHandle,不能仅 cancel 后立刻删记录
+    #[tokio::test]
+    async fn test_delete_task_inner_waits_for_running_handle() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::watch;
+
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/h04-quiesce.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 注入仍在运行的 handle(模拟下载 worker 尚未退出)
+        let (tx, mut rx) = watch::channel(TaskCommand::Start);
+        state
+            .runtime
+            .supervisor
+            .command_channels
+            .insert(id.clone(), tx);
+        let handle = tokio::spawn(async move {
+            // 收到 Cancel 后再延迟退出,模拟协作式取消后的 drain
+            loop {
+                if matches!(*rx.borrow(), TaskCommand::Cancel) {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+        state.runtime.supervisor.handles.insert(id.clone(), handle);
+
+        let started = Instant::now();
+        delete_task_inner(&state, id.clone(), false)
+            .await
+            .expect("delete 应在 quiesce 后成功");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "delete 应等待 handle 退出, elapsed={elapsed:?}"
+        );
+        assert!(
+            !state.runtime.supervisor.handles.contains_key(&id),
+            "handle 应已移除"
+        );
+        assert!(
+            !state.runtime.supervisor.command_channels.contains_key(&id),
+            "command channel 应已移除"
+        );
         assert!(get_task_detail_inner(&state, id).await.is_err());
     }
 
@@ -2565,6 +2711,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_h02_resume_closed_channel_restarts_download() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "http://example.com/h02-closed.bin".to_string(),
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 模拟 session 已退出但 command channel entry 仍在:
+        // drop 唯一 receiver,保留 sender entry,使 has_running_task=true 但 send 失败
+        {
+            let tx = state
+                .runtime
+                .supervisor
+                .command_channels
+                .get(&id)
+                .expect("应有 control channel")
+                .clone();
+            // 先暂停状态机到 Paused,再制造 closed receiver
+            pause_task_inner(&state, id.clone()).await.unwrap();
+            // 取出并替换为新的 sender,drop 其 receiver
+            let (new_tx, new_rx) = watch::channel(TaskCommand::Pause);
+            drop(new_rx);
+            state
+                .runtime
+                .supervisor
+                .command_channels
+                .insert(id.clone(), new_tx);
+            drop(tx);
+        }
+
+        // Resume:不得伪成功停在无 worker;应走 restart 路径
+        resume_task_inner(&state, id.clone()).await.unwrap();
+        let task = state.domain.task_repository.get(&id).unwrap();
+        assert_eq!(task.status, DownloadState::Downloading);
+        // restart 后应有新的 channel/handle
+        assert!(
+            state.runtime.supervisor.has_running_task(&id),
+            "H-02/H-03: send 失败后必须 restart,恢复有 worker 的运行态"
+        );
+    }
+
+    #[tokio::test]
     async fn test_concurrent_pause_resume_no_deadlock() {
         let state = test_state();
 
@@ -2976,7 +3171,11 @@ mod tests {
         drop(tx);
         assert!(result.is_none());
         let task = state.domain.task_repository.get(&task_id).unwrap();
-        assert_eq!(task.status, DownloadState::Cancelled);
+        assert_eq!(
+            task.status,
+            DownloadState::Paused,
+            "M-05: 执行前 pause 超时应保持 Paused,不映射为 Cancelled"
+        );
     }
 
     #[tokio::test]
@@ -3067,7 +3266,7 @@ mod tests {
     #[tokio::test]
     async fn test_download_session_new_accepts_buffer_pool() {
         let state = test_state();
-        let capacity = state.infra.buffer_pool.capacity();
+        let capacity = state.infra.buffer_pool.read().await.clone().capacity();
         let download_config = {
             let cfg = state.domain.config.lock().await;
             build_download_config(&cfg, "/tmp/tachyon-slice2-unused")
@@ -3085,7 +3284,7 @@ mod tests {
             "/tmp/tachyon-slice2-unused".to_string(),
             download_config,
             connection_pool,
-            state.infra.buffer_pool.clone(),
+            state.infra.buffer_pool.read().await.clone(),
             control_rx,
             None,
             None,
@@ -3093,7 +3292,7 @@ mod tests {
 
         // 构造只是存储 Arc<BufferPool>,不应消费任何许可。
         assert_eq!(
-            state.infra.buffer_pool.available(),
+            state.infra.buffer_pool.read().await.clone().available(),
             capacity,
             "DownloadSession::new 构造不应消费 buffer_pool 许可"
         );
@@ -3112,7 +3311,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_fn_construct_failure_does_not_consume_buffer_pool() {
         let state = test_state();
-        let capacity = state.infra.buffer_pool.capacity();
+        let capacity = state.infra.buffer_pool.read().await.clone().capacity();
         let task_id = "slice2-construct-fail-no-bp-consume".to_string();
         let download_root = tempfile::tempdir().unwrap();
         let download_dir = download_root.path().to_string_lossy().to_string();
@@ -3156,7 +3355,7 @@ mod tests {
 
         // 构造失败路径在 set_buffer_pool 之前返回,buffer_pool 不应被消费
         assert_eq!(
-            state.infra.buffer_pool.available(),
+            state.infra.buffer_pool.read().await.clone().available(),
             capacity,
             "构造失败路径不应消费 buffer_pool 许可(无泄漏)"
         );
@@ -3173,7 +3372,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_download_task_accepts_buffer_pool() {
         let state = test_state();
-        let capacity = state.infra.buffer_pool.capacity();
+        let capacity = state.infra.buffer_pool.read().await.clone().capacity();
         let download_config = {
             let cfg = state.domain.config.lock().await;
             build_download_config(&cfg, "/tmp/tachyon-slice2-bdt-unused")
@@ -3188,7 +3387,9 @@ mod tests {
             "ftp://example.com/slice2-bdt.bin",
             download_config,
             connection_pool,
-            state.infra.buffer_pool.clone(),
+            state.infra.buffer_pool.read().await.clone(),
+            state.infra.global_rate_limiter.clone(),
+            tachyon_core::config::SchedulerConfig::default(),
             None,
             #[cfg(feature = "magnet")]
             None,
@@ -3202,7 +3403,7 @@ mod tests {
 
         // 构造失败在 set_buffer_pool 之前返回,buffer_pool 不应被消费
         assert_eq!(
-            state.infra.buffer_pool.available(),
+            state.infra.buffer_pool.read().await.clone().available(),
             capacity,
             "build_download_task 构造失败不应消费 buffer_pool 许可"
         );
@@ -3218,7 +3419,7 @@ mod tests {
     #[cfg(feature = "magnet")]
     async fn test_build_download_task_p2sp_missing_bt_session_returns_err() {
         let state = test_state();
-        let capacity = state.infra.buffer_pool.capacity();
+        let capacity = state.infra.buffer_pool.read().await.clone().capacity();
         let download_config = {
             let cfg = state.domain.config.lock().await;
             build_download_config(&cfg, "/tmp/tachyon-task8-p2sp-unused")
@@ -3232,7 +3433,9 @@ mod tests {
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
             download_config,
             connection_pool,
-            state.infra.buffer_pool.clone(),
+            state.infra.buffer_pool.read().await.clone(),
+            state.infra.global_rate_limiter.clone(),
+            tachyon_core::config::SchedulerConfig::default(),
             Some(vec!["https://mirror.example.com/file.bin".to_string()]),
             #[cfg(feature = "magnet")]
             None,
@@ -3246,7 +3449,7 @@ mod tests {
 
         // 错误路径在 set_buffer_pool 之前返回,buffer_pool 不应被消费
         assert_eq!(
-            state.infra.buffer_pool.available(),
+            state.infra.buffer_pool.read().await.clone().available(),
             capacity,
             "P2SP 路由错误路径不应消费 buffer_pool 许可"
         );
@@ -3333,6 +3536,7 @@ mod tests {
     ) -> tachyon_store::TaskSnapshot {
         tachyon_store::TaskSnapshot {
             schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: id.to_string(),
             url: url.to_string(),
             save_path: format!("/downloads/{id}.bin"),
@@ -3358,6 +3562,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_backup_rejects_path_outside_authorized_dirs() {
+        let state = test_state();
+        let outside = std::env::temp_dir()
+            .join("tachyon-sec006-outside-export.json")
+            .to_string_lossy()
+            .to_string();
+        let err = export_backup_inner(&state, outside).await.unwrap_err();
+        assert!(
+            err.to_string().contains("authorized_dirs")
+                || err.to_string().contains("未授权")
+                || err.to_string().contains("不在"),
+            "应拒绝授权目录外备份: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_rejects_unlisted_explicit_download_dir() {
+        let state = test_state();
+        let outside = std::env::temp_dir()
+            .join("tachyon-sec002-unlisted-dl")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::create_dir_all(&outside);
+        let err = create_task_inner(
+            &state,
+            "https://example.com/sec002.bin".to_string(),
+            Some(outside),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("未授权") || msg.contains("授权") || msg.contains("authorized"),
+            "应拒绝自动授权外目录: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_export_import_roundtrip() {
         let state = test_state();
         let snapshot =
@@ -3368,12 +3614,32 @@ mod tests {
             crate::task_store::snapshot_to_task_info(&snapshot),
         );
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_string_lossy().to_string();
+        // 审计 SEC-006:备份路径须在 authorized_dirs 下
+        let auth_dir = {
+            let cfg = state.domain.config.lock().await;
+            cfg.download.authorized_dirs[0].clone()
+        };
+        let path = std::path::Path::new(&auth_dir)
+            .join("backup-roundtrip.json")
+            .to_string_lossy()
+            .to_string();
         export_backup_inner(&state, path.clone()).await.unwrap();
 
         let new_state = test_state();
-        let count = import_backup_inner(&new_state, path, false).await.unwrap();
+        // 将备份复制到 new_state 授权目录(路径不同)
+        let new_auth = {
+            let cfg = new_state.domain.config.lock().await;
+            cfg.download.authorized_dirs[0].clone()
+        };
+        let new_path = std::path::Path::new(&new_auth)
+            .join("backup-roundtrip.json")
+            .to_string_lossy()
+            .to_string();
+        let bytes = std::fs::read(&path).expect("读导出备份");
+        std::fs::write(&new_path, bytes).expect("写到新授权目录");
+        let count = import_backup_inner(&new_state, new_path, false)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
 
         let task = get_task_detail_inner(&new_state, "snap-1".to_string())
@@ -3384,13 +3650,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_import_backup_rejects_oversized_file() {
+        let state = test_state();
+        let path = {
+            let cfg = state.domain.config.lock().await;
+            std::path::Path::new(&cfg.download.authorized_dirs[0])
+                .join("oversized-backup.bin")
+                .to_string_lossy()
+                .to_string()
+        };
+        std::fs::write(&path, vec![b'x'; (MAX_BACKUP_FILE_BYTES as usize) + 1]).unwrap();
+        let err = import_backup_inner(&state, path, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("过大"),
+            "应拒绝超大备份文件: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_backup_rejects_too_many_tasks() {
+        let state = test_state();
+        let path = {
+            let cfg = state.domain.config.lock().await;
+            std::path::Path::new(&cfg.download.authorized_dirs[0])
+                .join("too-many-tasks-backup.json")
+                .to_string_lossy()
+                .to_string()
+        };
+        let tasks: Vec<tachyon_store::TaskSnapshot> = (0..MAX_BACKUP_TASKS + 1)
+            .map(|i| {
+                make_test_snapshot(
+                    &format!("t{i}"),
+                    &format!("https://example.com/{i}.bin"),
+                    DownloadState::Paused,
+                )
+            })
+            .collect();
+        let backup = Backup {
+            version: BACKUP_SCHEMA_VERSION,
+            config: AppConfig::default(),
+            tasks,
+        };
+        let json = serde_json::to_string(&backup).unwrap();
+        assert!(
+            (json.len() as u64) <= MAX_BACKUP_FILE_BYTES,
+            "测试夹具 JSON 应小于文件上限,否则先撞 size 门: {}",
+            json.len()
+        );
+        std::fs::write(&path, json).unwrap();
+        let err = import_backup_inner(&state, path, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("任务数过多"),
+            "应拒绝超多任务备份: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_import_corrupt_json_returns_error() {
         let state = test_state();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "not valid json").unwrap();
+        let path = {
+            let cfg = state.domain.config.lock().await;
+            std::path::Path::new(&cfg.download.authorized_dirs[0])
+                .join("corrupt-backup.json")
+                .to_string_lossy()
+                .to_string()
+        };
+        std::fs::write(&path, "not valid json").unwrap();
 
-        let result =
-            import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), false).await;
+        let result = import_backup_inner(&state, path, false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("备份文件格式无效"));
     }
@@ -3419,12 +3746,16 @@ mod tests {
             config: AppConfig::default(),
             tasks: vec![imported],
         };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+        let path = {
+            let cfg = state.domain.config.lock().await;
+            std::path::Path::new(&cfg.download.authorized_dirs[0])
+                .join("merge-dup-backup.json")
+                .to_string_lossy()
+                .to_string()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&backup).unwrap()).unwrap();
 
-        let count = import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), false)
-            .await
-            .unwrap();
+        let count = import_backup_inner(&state, path, false).await.unwrap();
         assert_eq!(count, 0);
         assert!(
             get_task_detail_inner(&state, "existing".to_string())
@@ -3453,12 +3784,16 @@ mod tests {
             config: AppConfig::default(),
             tasks: vec![new],
         };
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), serde_json::to_string_pretty(&backup).unwrap()).unwrap();
+        let path = {
+            let cfg = state.domain.config.lock().await;
+            std::path::Path::new(&cfg.download.authorized_dirs[0])
+                .join("overwrite-backup.json")
+                .to_string_lossy()
+                .to_string()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&backup).unwrap()).unwrap();
 
-        let count = import_backup_inner(&state, tmp.path().to_string_lossy().to_string(), true)
-            .await
-            .unwrap();
+        let count = import_backup_inner(&state, path, true).await.unwrap();
         assert_eq!(count, 1);
         assert!(
             get_task_detail_inner(&state, "old".to_string())

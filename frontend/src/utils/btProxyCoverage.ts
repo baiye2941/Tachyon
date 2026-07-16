@@ -1,4 +1,4 @@
-import type { MagnetConfig, ProxyCoverage } from "../types"
+import type { MagnetConfig, ProxyCoverage, BtProxyCoverageReport } from "../types"
 
 /** FIX-16 所需的最小配置子集(避免与 ConfigDraft.magnet 字段全集耦合) */
 export interface BtProxyCoverageInput {
@@ -7,28 +7,14 @@ export interface BtProxyCoverageInput {
   enableUpnp: boolean
 }
 
-export type { ProxyCoverage }
+export type { ProxyCoverage, BtProxyCoverageReport }
 
 /**
  * FIX-16:前端纯函数,镜像后端 `bt_proxy_coverage_status`,根据 MagnetConfig 计算
  * BT 各流量类别相对 SOCKS 代理的覆盖状态(隐私可见性)。
  *
- * 审计指出:应用侧已注入 socks_proxy_url、过滤 UDP tracker、禁用 DHT,但 librqbit
- * 内部对 peer TCP / HTTP(S) tracker / UDP tracker / DHT / uTP / UPnP 各路径是否走
- * SOCKS 不可从应用代码证明。本函数在 UI 层展示隐私边界,让用户知晓哪些流量经代理、
- * 哪些可能绕过(uTP/UPnP 基于 UDP/局域网,SOCKS5 不代理)。
- *
- * 与后端 `tachyon_engine::bt_proxy_coverage_status` 逻辑保持一致。
+ * 审计 A-09:此函数仅预测 draft 配置;运行时事实以 `api.getBtProxyCoverage` 为准。
  */
-export interface BtProxyCoverageReport {
-  socksEnabled: boolean
-  peerTcp: ProxyCoverage
-  httpTracker: ProxyCoverage
-  udpTrackerDht: ProxyCoverage
-  utp: ProxyCoverage
-  upnp: ProxyCoverage
-}
-
 export function computeBtProxyCoverage(config: BtProxyCoverageInput): BtProxyCoverageReport {
   const socksEnabled = config.socksProxyUrl != null && config.socksProxyUrl !== ""
   const upnp = config.enableUpnp
@@ -45,6 +31,8 @@ export function computeBtProxyCoverage(config: BtProxyCoverageInput): BtProxyCov
       udpTrackerDht: "Direct",
       utp: "Direct",
       upnp,
+      socksSource: "none",
+      socksEndpointRedacted: null,
     }
   }
 
@@ -57,6 +45,8 @@ export function computeBtProxyCoverage(config: BtProxyCoverageInput): BtProxyCov
     udpTrackerDht: config.disableDhtWhenSocks ? "Blocked" : "MayBypass",
     utp: "MayBypass",
     upnp,
+    socksSource: "explicit",
+    socksEndpointRedacted: null,
   }
 }
 

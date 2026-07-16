@@ -51,6 +51,28 @@ pub fn default_blake3_verifier() -> VerifierKind {
     Arc::new(CpuVerifier::blake3())
 }
 
+/// 创建默认的 sha256 CPU 校验器(HF LFS 等)
+pub fn default_sha256_verifier() -> VerifierKind {
+    Arc::new(CpuVerifier::sha256())
+}
+
+/// 审计 A-01:本地文件 sha256(HF LFS 等);app 不直接依赖 tachyon-crypto
+pub async fn sha256_file(
+    path: &std::path::Path,
+    chunk_size: usize,
+) -> tachyon_core::DownloadResult<String> {
+    CpuVerifier::sha256()
+        .compute_hash_from_path(path, chunk_size)
+        .await
+}
+
+/// 审计 A-01:由 engine 构造自适应调度器,app 不直接依赖 tachyon-scheduler
+pub fn create_adaptive_scheduler(
+    config: tachyon_core::config::SchedulerConfig,
+) -> Arc<dyn DownloadScheduler> {
+    Arc::new(AdaptiveDownloadScheduler::new(config))
+}
+
 pub type StorageKind = DynStorage;
 
 /// L-9: verify() 分块读取文件的 chunk 大小 (8 MiB)。
@@ -146,12 +168,10 @@ use crate::fragment::FragmentRecord;
 use tachyon_core::test_harness::harness::MockProtocol as MockProto;
 
 /// URL 路径(去 query/fragment)是否以 HLS playlist 扩展名结尾。
+///
+/// 审计 A-06:委托 core 单一实现,禁止 engine/app 各自维护副本。
 fn looks_like_hls_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    let path = parsed.path().to_ascii_lowercase();
-    path.ends_with(".m3u8") || path.ends_with(".m3u")
+    tachyon_core::looks_like_hls_url(url)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,11 +231,10 @@ pub struct DownloadTask {
     /// 具体 MagnetProtocol 引用(与 protocol 同源),用于 preferred 同步与生命周期清理
     #[cfg(feature = "magnet")]
     bt_magnet: Option<std::sync::Arc<tachyon_protocol::MagnetProtocol>>,
-    /// BitTorrent Session（可选，仅磁力链接任务需要）
-    #[cfg(feature = "magnet")]
-    #[allow(dead_code)]
-    bt_session: Option<Arc<crate::bt_session::BtSession>>,
     /// BT fallback 协议(P2SP 混合下载时持有,HTTP 全熔断后接管)
+    ///
+    /// 审计 A-13:不再在任务上保留 `bt_session` 字段;Session 仅在构造期
+    /// 用于创建 MagnetProtocol / bt_fallback,协议对象自身持有 Session Arc。
     ///
     /// 仅 `with_hybrid_sources` 构造时填充;纯 BT/纯 HTTP 路径为 None。
     /// 由 `run_inner` 步骤 4 的 fallback 触发逻辑读取(`should_try_bt_fallback` +
@@ -245,6 +264,27 @@ impl WriteBuf {
             WriteBuf::Owned(b) => b,
         }
     }
+}
+
+/// 审计 HTTP-15:经全局注册表获取/共享 HttpClient(同身份复用 TCP/TLS/H2)
+fn shared_http_client(
+    config: &DownloadConfig,
+    pool: &Option<Arc<ConnectionPool>>,
+) -> DownloadResult<HttpClient> {
+    let conn = pool
+        .as_ref()
+        .map(|p| tachyon_core::config::ConnectionConfig::from(p.config().clone()));
+    let arc = crate::http_client_registry::global_http_client_registry().get_or_create(
+        &config.user_agent,
+        config.proxy.as_deref(),
+        config.connect_timeout_secs,
+        config.request_timeout_secs,
+        conn.as_ref(),
+        &config.headers,
+        config.auth_bearer.as_deref(),
+    )?;
+    // HttpClient 是 Clone(内层 reqwest::Client 为 Arc);auth_bearer 已在 registry 注入
+    Ok((*arc).clone())
 }
 
 impl DownloadTask {
@@ -318,106 +358,90 @@ impl DownloadTask {
     ) -> DownloadResult<Self> {
         let _parsed = url::Url::parse(&url)?;
 
-        let protocol: Arc<dyn Protocol> = if url.starts_with("http://")
-            || url.starts_with("https://")
-        {
-            // 注入超时:connect 超时防"连不上"(黑洞 IP),
-            // read 超时防"连上后静默断流"。read 用配置的 request_timeout_secs,
-            // 它限制的是单次读取空闲间隔上限,不会误杀正常的大文件长下载。
-            //
-            // 连接池调优:若有 ConnectionPool,用其 max_per_host 参数化 reqwest
-            // 空闲连接池大小,使 reqwest 连接复用与信号量并发上限对齐。
-            let http = if let Some(ref p) = pool {
-                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
-                HttpClient::with_connection_config(
-                    &conn_config,
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )?
+        let protocol: Arc<dyn Protocol> =
+            if url.starts_with("http://") || url.starts_with("https://") {
+                // 注入超时:connect 超时防"连不上"(黑洞 IP),
+                // read 超时防"连上后静默断流"。read 用配置的 request_timeout_secs,
+                // 它限制的是单次读取空闲间隔上限,不会误杀正常的大文件长下载。
+                //
+                // 连接池调优:若有 ConnectionPool,用其 max_per_host 参数化 reqwest
+                // 空闲连接池大小,使 reqwest 连接复用与信号量并发上限对齐。
+                let http = shared_http_client(&config, &pool)?;
+                // P0-7: .m3u8/.m3u URL 走 HlsProtocol(VOD 媒体分片),否则 HttpClient
+                if looks_like_hls_url(&url) {
+                    Arc::new(tachyon_protocol::hls::HlsProtocol::new(
+                        std::sync::Arc::new(http),
+                    ))
+                } else {
+                    Arc::new(http)
+                }
+            } else if tachyon_core::looks_like_magnet_url(&url) {
+                #[cfg(feature = "magnet")]
+                {
+                    use crate::bt_storage::TachyonStorageFactory;
+                    use tachyon_protocol::MagnetProtocol;
+                    let session = bt_session.as_ref().ok_or_else(|| {
+                        DownloadError::Config("BitTorrent Session 未初始化".into())
+                    })?;
+                    // P2-4: 注入自定义 StorageFactory,消除双存储写放大
+                    // librqbit 直接写到 Tachyon 的 AsyncStorage(目标文件),
+                    // 跳过 FilesystemStorage 中间层
+                    use librqbit::storage::StorageFactoryExt;
+                    let factory = TachyonStorageFactory::new(
+                        tokio::runtime::Handle::current(),
+                        config.io_strategy,
+                        std::path::PathBuf::from(&config.download_dir),
+                    );
+                    let magnet_arc = Arc::new(
+                        MagnetProtocol::new(
+                            session.session(),
+                            session.config().clone(),
+                            session.download_dir().clone(),
+                            session.handle_cache(),
+                        )
+                        .with_ops_gate(session.ops_gate())
+                        .with_storage_factory(factory.clone().boxed()),
+                    );
+                    let protocol: Arc<dyn Protocol> = magnet_arc.clone();
+                    // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
+                    return Ok(Self {
+                        id: TaskId::new_v4(),
+                        url,
+                        config,
+                        protocol,
+                        storage: None,
+                        scheduler_config: SchedulerConfig::default(),
+                        scheduler,
+                        pool,
+                        buffer_pool: None,
+                        control_rx: None,
+                        state: DownloadState::Pending,
+                        metadata: None,
+                        fragments: Vec::new(),
+                        progress_tx: None,
+                        verifier: default_blake3_verifier(),
+                        completed_fragments: Vec::new(),
+                        partial_fragments: HashMap::new(),
+                        resume_object_identity: None,
+                        rate_limiter: None,
+                        metrics: None,
+                        circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+                        has_mirrors: false,
+                        preferred_file_name: None,
+                        bt_storage_factory: Some(factory),
+                        bt_magnet: Some(magnet_arc),
+                        bt_fallback: None,
+                    });
+                }
+                #[cfg(not(feature = "magnet"))]
+                {
+                    return Err(DownloadError::Config(format!(
+                        "磁力链接需要启用 magnet feature: {url}"
+                    )));
+                }
             } else {
-                HttpClient::with_timeouts(
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )?
+                return Err(DownloadError::Config(format!("不支持的协议: {url}")));
             };
-            // P0-7: .m3u8/.m3u URL 走 HlsProtocol(VOD 媒体分片),否则 HttpClient
-            if looks_like_hls_url(&url) {
-                Arc::new(tachyon_protocol::hls::HlsProtocol::new(
-                    std::sync::Arc::new(http),
-                ))
-            } else {
-                Arc::new(http)
-            }
-        } else if url.starts_with("magnet:?") {
-            #[cfg(feature = "magnet")]
-            {
-                use crate::bt_storage::TachyonStorageFactory;
-                use tachyon_protocol::MagnetProtocol;
-                let session = bt_session
-                    .as_ref()
-                    .ok_or_else(|| DownloadError::Config("BitTorrent Session 未初始化".into()))?;
-                // P2-4: 注入自定义 StorageFactory,消除双存储写放大
-                // librqbit 直接写到 Tachyon 的 AsyncStorage(目标文件),
-                // 跳过 FilesystemStorage 中间层
-                use librqbit::storage::StorageFactoryExt;
-                let factory = TachyonStorageFactory::new(
-                    tokio::runtime::Handle::current(),
-                    config.io_strategy,
-                    std::path::PathBuf::from(&config.download_dir),
-                );
-                let magnet_arc = Arc::new(
-                    MagnetProtocol::new(
-                        session.session(),
-                        session.config().clone(),
-                        session.download_dir().clone(),
-                        session.handle_cache(),
-                    )
-                    .with_ops_gate(session.ops_gate())
-                    .with_storage_factory(factory.clone().boxed()),
-                );
-                let protocol: Arc<dyn Protocol> = magnet_arc.clone();
-                // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
-                return Ok(Self {
-                    id: TaskId::new_v4(),
-                    url,
-                    config,
-                    protocol,
-                    storage: None,
-                    scheduler_config: SchedulerConfig::default(),
-                    scheduler,
-                    pool,
-                    buffer_pool: None,
-                    control_rx: None,
-                    state: DownloadState::Pending,
-                    metadata: None,
-                    fragments: Vec::new(),
-                    progress_tx: None,
-                    verifier: default_blake3_verifier(),
-                    completed_fragments: Vec::new(),
-                    partial_fragments: HashMap::new(),
-                    resume_object_identity: None,
-                    rate_limiter: None,
-                    metrics: None,
-                    circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
-                    has_mirrors: false,
-                    preferred_file_name: None,
-                    bt_storage_factory: Some(factory),
-                    bt_magnet: Some(magnet_arc),
-                    bt_session,
-                    bt_fallback: None,
-                });
-            }
-            #[cfg(not(feature = "magnet"))]
-            {
-                return Err(DownloadError::Config(format!(
-                    "磁力链接需要启用 magnet feature: {url}"
-                )));
-            }
-        } else {
-            return Err(DownloadError::Config(format!("不支持的协议: {url}")));
-        };
 
         // 存储延迟到 probe() 之后初始化,使用真实文件名 + validate_save_path
         Ok(Self {
@@ -448,8 +472,6 @@ impl DownloadTask {
             bt_storage_factory: None,
             #[cfg(feature = "magnet")]
             bt_magnet: None,
-            #[cfg(feature = "magnet")]
-            bt_session,
             #[cfg(feature = "magnet")]
             bt_fallback: None,
         })
@@ -503,23 +525,7 @@ impl DownloadTask {
         // P2:镜像路径复用连接池配置(对齐 with_pool_and_scheduler:247-256)
         // pool 存在时用 with_connection_config 透传 max_per_host/keep_alive/http2,
         // 使每镜像的 reqwest 连接池与全局并发控制对齐;否则回退 with_timeouts。
-        let build_http = || -> DownloadResult<HttpClient> {
-            if let Some(ref p) = pool {
-                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
-                HttpClient::with_connection_config(
-                    &conn_config,
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )
-            } else {
-                HttpClient::with_timeouts(
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )
-            }
-        };
+        let build_http = || -> DownloadResult<HttpClient> { shared_http_client(&config, &pool) };
 
         let primary = Arc::new(build_http()?);
 
@@ -572,8 +578,6 @@ impl DownloadTask {
             #[cfg(feature = "magnet")]
             bt_magnet: None,
             #[cfg(feature = "magnet")]
-            bt_session: None,
-            #[cfg(feature = "magnet")]
             bt_fallback: None,
         })
     }
@@ -612,23 +616,7 @@ impl DownloadTask {
         // HTTP 镜像主源:塞入 MirrorProtocol(least-in-flight 调度)
         // P2:pool 存在时用 with_connection_config 透传连接池配置(对齐单源路径),
         // 否则回退 with_timeouts
-        let build_http = || -> DownloadResult<HttpClient> {
-            if let Some(ref p) = pool {
-                let conn_config = tachyon_core::config::ConnectionConfig::from(p.config().clone());
-                HttpClient::with_connection_config(
-                    &conn_config,
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )
-            } else {
-                HttpClient::with_timeouts(
-                    config.connect_timeout_secs,
-                    config.request_timeout_secs,
-                    config.proxy.as_deref(),
-                )
-            }
-        };
+        let build_http = || -> DownloadResult<HttpClient> { shared_http_client(&config, &pool) };
         let primary = Arc::new(build_http()?);
         let mirrors: Vec<(String, Arc<dyn Protocol>)> = http_mirrors
             .iter()
@@ -689,8 +677,6 @@ impl DownloadTask {
             #[cfg(feature = "magnet")]
             bt_magnet: None,
             #[cfg(feature = "magnet")]
-            bt_session: Some(bt_session),
-            #[cfg(feature = "magnet")]
             bt_fallback: Some(bt_fallback),
         })
     }
@@ -730,8 +716,6 @@ impl DownloadTask {
             bt_storage_factory: None,
             #[cfg(feature = "magnet")]
             bt_magnet: None,
-            #[cfg(feature = "magnet")]
-            bt_session: None,
             #[cfg(feature = "magnet")]
             bt_fallback: None,
         }
@@ -776,8 +760,6 @@ impl DownloadTask {
             #[cfg(feature = "magnet")]
             bt_magnet: None,
             #[cfg(feature = "magnet")]
-            bt_session: None,
-            #[cfg(feature = "magnet")]
             bt_fallback: None,
         }
     }
@@ -817,10 +799,10 @@ impl DownloadTask {
         self.resume_object_identity = identity;
     }
 
-    /// 设置调度器配置(供 bench 调整 sampling_interval_secs 等参数)
+    /// 设置调度器配置(规划参数 / sampling_interval 等)。
     ///
-    /// 必须在 `run()` 之前调用。生产代码从 DownloadConfig 构造时使用默认值。
-    #[cfg(any(test, feature = "test-harness"))]
+    /// 必须在 `run()` 之前调用。审计 A-04:生产路径从 `AppConfig.scheduler` 注入,
+    /// 禁止永远落在 `SchedulerConfig::default()`。
     pub fn set_scheduler_config(&mut self, config: SchedulerConfig) {
         self.scheduler_config = config;
     }
@@ -896,8 +878,17 @@ impl DownloadTask {
     }
 
     fn request_host(&self) -> DownloadResult<String> {
+        // 审计 HTTP-13:优先使用 probe/range 后的最终 host(重定向后的 CDN)
+        if let Some(host) = self
+            .metadata
+            .as_ref()
+            .and_then(|m| m.resolved_host.as_ref())
+            .filter(|h| !h.is_empty())
+        {
+            return Ok(host.clone());
+        }
         // 磁力链接没有 host，返回占位符
-        if self.url.starts_with("magnet:?") {
+        if tachyon_core::looks_like_magnet_url(&self.url) {
             return Ok("magnet".to_string());
         }
         let parsed = url::Url::parse(&self.url)?;
@@ -905,6 +896,26 @@ impl DownloadTask {
             .host_str()
             .map(ToString::to_string)
             .ok_or_else(|| DownloadError::Config("URL 主机为空".into()))
+    }
+
+    /// 审计 HTTP-13:把协议层最近 final host 写回 metadata,供后续 per-host acquire
+    fn refresh_resolved_host_from_protocol(&mut self) {
+        let Some(host) = self.protocol.last_resolved_host() else {
+            return;
+        };
+        if host.is_empty() {
+            return;
+        }
+        if let Some(meta) = self.metadata.as_mut()
+            && meta.resolved_host.as_deref() != Some(host.as_str())
+        {
+            tracing::debug!(
+                previous = ?meta.resolved_host,
+                new = %host,
+                "HTTP-13:更新 resolved_host 为协议 final host"
+            );
+            meta.resolved_host = Some(host);
+        }
     }
 
     // ----- 步骤 1: 探测 -----
@@ -917,7 +928,7 @@ impl DownloadTask {
         if let Some(ref meta) = self.metadata {
             return Ok(meta);
         }
-        info!(url = %self.url, "开始探测文件元数据");
+        info!(url = %tachyon_core::redact_url_for_log(&self.url), "开始探测文件元数据");
         // 测量 probe 耗时作为 RTT 上界估计(DNS+TCP+TLS+HTTP 往返)。
         // 偏大的 RTT 估计使 BDP 偏大(倾向更多并发),比偏小(管道未满)安全。
         // observe_rtt 内部会过滤异常值(>10s),正常 probe 耗时 50ms-2s 均有效。
@@ -947,7 +958,7 @@ impl DownloadTask {
             let remote = ObjectIdentity::from_metadata(&metadata);
             if !snap.compatible_for_resume(&remote) {
                 warn!(
-                    url = %self.url,
+                    url = %tachyon_core::redact_url_for_log(&self.url),
                     snap_etag = ?snap.etag,
                     remote_etag = ?remote.etag,
                     "对象身份与断点快照不兼容,丢弃已完成/部分分片并全量重下"
@@ -1081,6 +1092,24 @@ impl DownloadTask {
             .map(|info| FragmentRecord::new(info.clone(), self.config.max_retries))
             .collect();
 
+        // 审计 BT-17:BT custom storage 的 piece truth 由 librqbit 维护。
+        // 若按 HTTP snapshot 的 completed index 跳过 FileStream,损坏/漂移分片可能被标 Completed。
+        // protocol_managed_storage 时丢弃 snapshot 跳过,强制走 range/stream 路径由 piece 校验推进。
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.protocol_managed_storage)
+            && (!self.completed_fragments.is_empty() || !self.partial_fragments.is_empty())
+        {
+            warn!(
+                completed = self.completed_fragments.len(),
+                partial = self.partial_fragments.len(),
+                "BT protocol_managed_storage:忽略 snapshot 分片跳过(piece truth 优先)"
+            );
+            self.completed_fragments.clear();
+            self.partial_fragments.clear();
+        }
+
         // 断点续传:把已完成分片标记为 Done 并跳过后续下载
         if !self.completed_fragments.is_empty() {
             let mut resumed = 0u32;
@@ -1207,9 +1236,68 @@ impl DownloadTask {
     /// 整块下载(不支持 Range 或单分片)
     ///
     /// 以流式方式逐块写入存储,峰值内存仅含单个 chunk,避免大文件整块进内存。
+    ///
+    /// 审计 HTTP-09:与分片路径同构,可重试错误按 `max_retries` 退避重试;
+    /// 每次 attempt 从 offset 0 重写,并用 `allocate` 重置存储长度,避免半写污染。
     async fn execute_full_download(&mut self) -> DownloadResult<()> {
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
+        let max_retries = self.config.max_retries;
+        let mut attempt = 0u32;
+        loop {
+            match self.execute_full_download_once(pause_timeout).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // 暂停超时是控制语义,不是瞬态网络故障;禁止纳入 max_retries 退避
+                    // (否则 1s 暂停超时 × 默认 3 次重试会远超调用方等待窗口)。
+                    if e.is_retryable()
+                        && !Self::is_pause_timeout_error(&e)
+                        && attempt < max_retries
+                    {
+                        let backoff = match &e {
+                            DownloadError::Throttled {
+                                retry_after_secs: Some(secs),
+                            } => Duration::from_secs((*secs).min(1024)),
+                            _ => {
+                                let base = 1u64 << attempt.min(10);
+                                Duration::from_secs(base.max(1))
+                            }
+                        };
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries,
+                            ?backoff,
+                            error = %e,
+                            "整块下载可重试失败,退避后重试"
+                        );
+                        // 重置存储,防止半写残留污染下次 attempt
+                        if let Some(storage) = self.storage.as_ref() {
+                            let size = self
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.file_size)
+                                .unwrap_or(0);
+                            let _ = storage.allocate(size).await;
+                        }
+                        self.protocol.clear_selected().await;
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// 控制通道「暂停超过 N 秒」超时(非网络 Timeout)
+    fn is_pause_timeout_error(err: &DownloadError) -> bool {
+        matches!(err, DownloadError::Timeout(msg) if msg.starts_with("暂停超过"))
+    }
+
+    /// 单次整块流式下载 attempt(无重试)
+    async fn execute_full_download_once(&mut self, pause_timeout: Duration) -> DownloadResult<()> {
         Self::wait_control(&mut self.control_rx, pause_timeout).await?;
+        self.refresh_resolved_host_from_protocol();
         let host = self.request_host()?;
         // P1:镜像路径跳过主 host 的 pool.acquire,改由 MirrorProtocol
         // (已注入同一 pool)按真实命中镜像 host acquire,使各镜像能各自
@@ -1251,9 +1339,7 @@ impl DownloadTask {
         let mut pos: u64 = 0;
         tokio::pin!(stream);
         // B11:改裸 `while let stream.next().await` 为 `loop { select!{...} }`,
-        // 使取消信号能在"无 chunk 到达"时(如死连接静默挂起)穿透到检查点,
-        // 与 download_single_fragment:1762 的 select! 同构。cancel-safe:
-        // StreamExt::next 仅持 &mut stream,被 select! 取消时无部分状态。
+        // 使取消信号能在"无 chunk 到达"时(如死连接静默挂起)穿透到检查点。
         loop {
             let chunk_result = if let Some(rx) = self.control_rx.as_mut() {
                 tokio::select! {
@@ -1272,32 +1358,46 @@ impl DownloadTask {
                     None => break,
                 }
             };
-            // chunk 间隙快速响应暂停/取消(降频检查已在 select! 覆盖死连接场景,
-            // 此处补充 Paused 等非取消状态在 chunk 间隙的快速响应)
+            // chunk 间隙快速响应暂停/取消
             if let Some(rx) = self.control_rx.as_mut() {
                 Self::wait_control_rx(rx, pause_timeout).await?;
             }
             let chunk = chunk_result?;
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|_| DownloadError::Config("整块下载 chunk 长度溢出".into()))?;
-            if expected_size.is_none() {
-                let attempted = pos.checked_add(chunk_len).ok_or_else(|| {
-                    DownloadError::Config(format!(
-                        "未知大小整块下载长度溢出: written={pos}, chunk={chunk_len}"
-                    ))
-                })?;
-                if attempted > self.config.max_full_stream_bytes {
-                    return Err(DownloadError::Config(format!(
-                        "未知大小整块下载超过上限: 上限 {} 字节, 本次将写入 {} 字节",
-                        self.config.max_full_stream_bytes, attempted
+            let attempted = pos.checked_add(chunk_len).ok_or_else(|| {
+                DownloadError::Config(format!(
+                    "整块下载长度溢出: written={pos}, chunk={chunk_len}"
+                ))
+            })?;
+            // 审计 HTTP-15:已知长度也必须写前拒绝越界,避免先扩文件后才报错
+            if let Some(expected) = expected_size {
+                if attempted > expected {
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "整块下载响应超过声明长度: expected={expected}, 将写入到 {attempted}"
+                        ),
                     )));
                 }
+            } else if attempted > self.config.max_full_stream_bytes {
+                return Err(DownloadError::Config(format!(
+                    "未知大小整块下载超过上限: 上限 {} 字节, 本次将写入 {} 字节",
+                    self.config.max_full_stream_bytes, attempted
+                )));
             }
-            let written = storage.write_at(pos, chunk).await?;
-            pos += written as u64;
-            // 实时令牌桶限速
+            // 审计 P1 full-stream short write
+            let written =
+                Self::write_all_at(storage, pos, chunk, &mut self.control_rx, pause_timeout)
+                    .await?;
+            if written != chunk_len {
+                return Err(DownloadError::Fragment(format!(
+                    "整块下载短写未完成: offset={pos}, expected={chunk_len}, written={written}"
+                )));
+            }
+            pos += written;
             if let Some(ref limiter) = rate_limiter {
-                limiter.acquire(written as u64).await;
+                limiter.acquire(written).await;
             }
         }
         debug!(written = pos, "整块流式下载写入完成");
@@ -1310,6 +1410,9 @@ impl DownloadTask {
                 format!("下载数据不完整: 预期 {expected_size} 字节, 实际写入 {pos} 字节"),
             )));
         }
+
+        // 审计 P0-3:整块路径在标 Completed 前 durable sync,避免快照/状态领先于落盘
+        storage.sync().await?;
 
         if let Some(frag) = self.fragments.first_mut() {
             if frag.state == crate::fragment::FragmentState::Pending {
@@ -1403,6 +1506,10 @@ impl DownloadTask {
                     continue;
                 }
 
+                // 审计 HTTP-01:每次 attempt 清空 write_buf。
+                // 半缓冲失败(未达 WRITE_BATCH 阈值)会留下残留字节;若不 clear,
+                // 下次成功 attempt 的首批数据会与污染前缀拼接写盘。
+                write_buf.as_mut().clear();
                 let result = Self::download_single_fragment(
                     &frag_protocol,
                     &frag_storage,
@@ -1434,7 +1541,10 @@ impl DownloadTask {
                         break Ok((frag_index, downloaded, duration, computed_hash));
                     }
                     Err(e) => {
-                        if !e.is_retryable() || attempt >= max_retries {
+                        if !e.is_retryable()
+                            || Self::is_pause_timeout_error(&e)
+                            || attempt >= max_retries
+                        {
                             if let Some(ref m) = frag_metrics {
                                 m.inc_error();
                             }
@@ -1571,6 +1681,7 @@ impl DownloadTask {
         let protocol = self.protocol.clone();
         let pool = self.pool.clone();
         let buffer_pool = self.buffer_pool.clone();
+        self.refresh_resolved_host_from_protocol();
         let host = self.request_host()?;
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
         let control_rx = self.control_rx.clone();
@@ -1768,7 +1879,19 @@ impl DownloadTask {
                                             ),
                                         },
                                     );
-                                    let _ = steal_tx.try_send(spec);
+                                    // 审计 H-01:steal 队列满时必须回滚 split,否则 effective_end
+                                    // 已缩小且新分片无人执行,原 worker 少写、新区间永不下载。
+                                    if steal_tx.try_send(spec).is_err() {
+                                        if let Some(stolen) = self.fragments.pop() {
+                                            self.fragments[slow_idx]
+                                                .revert_split_after_failed_dispatch(&stolen);
+                                        }
+                                        warn!(
+                                            slow_idx,
+                                            new_idx = new_index,
+                                            "work-stealing: steal 队列满,已回滚 split"
+                                        );
+                                    }
                                 }
                                 Ok(None) => {} // 无法拆分(剩余太小等)
                                 Err(e) => {
@@ -1953,6 +2076,19 @@ impl DownloadTask {
         // 显式关闭存储后端,close() 内部已调用 sync_data() 保证数据落盘,
         // 无需额外 sync() 避免双重 fsync 导致的 Flush Storm
         storage.close().await?;
+
+        // 审计 BT-17:protocol_managed 时 FileStream 读完 ≠ piece truth 完成。
+        // 在标 Completed 前等待 librqbit wait_until_completed(带 peer_wait 看门狗)。
+        #[cfg(feature = "magnet")]
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.protocol_managed_storage)
+            && let Some(magnet) = self.bt_magnet.as_ref().or(self.bt_fallback.as_ref())
+        {
+            info!("BT protocol_managed:等待 piece truth 完成(BT-17)");
+            magnet.wait_torrent_completed(&self.url).await?;
+        }
 
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");
@@ -2175,6 +2311,41 @@ impl DownloadTask {
             remaining = remaining.slice(advance..);
         }
         Ok(total_written)
+    }
+
+    /// 审计 H-01:按 effective_end 裁剪待写 batch,禁止 write_buf 越过 steal 边界。
+    ///
+    /// `end_inclusive` 为当前分片允许写入的最后字节偏移。返回 None 表示无可写字节
+    /// (已越过边界);同时清空 `write_buf` 中的越界数据。
+    fn take_clamped_write_buf(
+        pos: u64,
+        end_inclusive: u64,
+        write_buf: &mut AlignedBuf,
+    ) -> Option<bytes::Bytes> {
+        if write_buf.is_empty() {
+            return None;
+        }
+        if pos > end_inclusive {
+            write_buf.clear();
+            return None;
+        }
+        let max = match end_inclusive
+            .checked_sub(pos)
+            .and_then(|d| d.checked_add(1))
+        {
+            Some(m) => m as usize,
+            None => {
+                write_buf.clear();
+                return None;
+            }
+        };
+        let batch = write_buf.split().freeze();
+        if batch.len() <= max {
+            Some(batch)
+        } else {
+            // 越界尾部丢弃:steal worker 负责 [end_inclusive+1, …]
+            Some(batch.slice(..max))
+        }
     }
 
     /// 刷写一个 batch 到存储,统一处理「流式哈希 update + 越界检查 + 写入 + 偏移推进 + 限速」。
@@ -2412,8 +2583,8 @@ impl DownloadTask {
             // 零拷贝优化: 大 chunk 直接写入,跳过 AlignedBuf 聚合
             if chunk.len() >= WRITE_BATCH_BYTES {
                 // 先刷写 write_buf 中累积的残余数据(可能因小 chunk 累积未满阈值)
-                if !write_buf.is_empty() {
-                    let batch = write_buf.split().freeze();
+                // 审计 H-01:按 effective_end 裁剪,避免 steal 后缓冲越界写
+                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
                     let (new_pos, w) = Self::flush_batch(
                         storage,
                         pos,
@@ -2434,6 +2605,19 @@ impl DownloadTask {
                         .realtime_downloaded
                         .fetch_add(w, std::sync::atomic::Ordering::Release);
                 }
+                if pos > current_end {
+                    break;
+                }
+                // write_buf 可能已推进 pos:重新按 current_end 裁剪大 chunk
+                let max_chunk = current_end.saturating_sub(pos).saturating_add(1) as usize;
+                if max_chunk == 0 {
+                    break;
+                }
+                let chunk = if chunk.len() > max_chunk {
+                    chunk.slice(..max_chunk)
+                } else {
+                    chunk
+                };
                 // chunk 本就是 owned Bytes,直接传入 flush_batch,消除
                 // 旧路径 BytesMut::from(chunk) 的 256KiB memcpy + 堆分配。
                 let (new_pos, w) = Self::flush_batch(
@@ -2464,52 +2648,98 @@ impl DownloadTask {
             }
             // 容量不足时先刷写已有数据(AlignedBuf 固定容量不自动扩容,与 BytesMut 不同)
             if !write_buf.is_empty() && write_buf.len() + chunk.len() > WRITE_BATCH_BYTES {
-                let batch = write_buf.split().freeze();
-                let (new_pos, w) = Self::flush_batch(
-                    storage,
-                    pos,
-                    batch,
-                    &mut hasher,
-                    frag_index,
-                    total_written,
-                    expected_len,
-                    &rate_limiter,
-                    &mut control_rx,
-                    pause_timeout,
-                    skip_write,
-                )
-                .await?;
-                pos = new_pos;
-                total_written += w;
-                shared
-                    .realtime_downloaded
-                    .fetch_add(w, std::sync::atomic::Ordering::Release);
+                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                    let (new_pos, w) = Self::flush_batch(
+                        storage,
+                        pos,
+                        batch,
+                        &mut hasher,
+                        frag_index,
+                        total_written,
+                        expected_len,
+                        &rate_limiter,
+                        &mut control_rx,
+                        pause_timeout,
+                        skip_write,
+                    )
+                    .await?;
+                    pos = new_pos;
+                    total_written += w;
+                    shared
+                        .realtime_downloaded
+                        .fetch_add(w, std::sync::atomic::Ordering::Release);
+                }
+                if pos > current_end {
+                    break;
+                }
             }
+            // 若当前 pos 已越过 steal 边界,丢弃本 chunk 并停止
+            if pos > current_end {
+                write_buf.clear();
+                break;
+            }
+            // 再截断 chunk 到剩余允许写入长度(含已缓冲)
+            let remaining_allowed = current_end
+                .saturating_sub(pos)
+                .saturating_add(1)
+                .saturating_sub(write_buf.len() as u64)
+                as usize;
+            if remaining_allowed == 0 {
+                // write_buf 已占满允许区间,先 flush 再结束
+                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                    let (new_pos, w) = Self::flush_batch(
+                        storage,
+                        pos,
+                        batch,
+                        &mut hasher,
+                        frag_index,
+                        total_written,
+                        expected_len,
+                        &rate_limiter,
+                        &mut control_rx,
+                        pause_timeout,
+                        skip_write,
+                    )
+                    .await?;
+                    pos = new_pos;
+                    total_written += w;
+                    shared
+                        .realtime_downloaded
+                        .fetch_add(w, std::sync::atomic::Ordering::Release);
+                }
+                break;
+            }
+            let chunk = if chunk.len() > remaining_allowed {
+                chunk.slice(..remaining_allowed)
+            } else {
+                chunk
+            };
             write_buf.extend_from_slice(&chunk);
             progress_report_countdown = progress_report_countdown.saturating_sub(1);
             // 达到阈值时批量刷写
             if write_buf.len() >= WRITE_BATCH_BYTES {
                 // split().freeze() 零拷贝:split_to 调整指针,freeze 转 Bytes(Arc inc)
-                let batch = write_buf.split().freeze();
-                let (new_pos, w) = Self::flush_batch(
-                    storage,
-                    pos,
-                    batch,
-                    &mut hasher,
-                    frag_index,
-                    total_written,
-                    expected_len,
-                    &rate_limiter,
-                    &mut control_rx,
-                    pause_timeout,
-                    skip_write,
-                )
-                .await?;
-                pos = new_pos;
-                total_written += w;
-                shared
-                    .realtime_downloaded
-                    .fetch_add(w, std::sync::atomic::Ordering::Release);
+                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                    let (new_pos, w) = Self::flush_batch(
+                        storage,
+                        pos,
+                        batch,
+                        &mut hasher,
+                        frag_index,
+                        total_written,
+                        expected_len,
+                        &rate_limiter,
+                        &mut control_rx,
+                        pause_timeout,
+                        skip_write,
+                    )
+                    .await?;
+                    pos = new_pos;
+                    total_written += w;
+                    shared
+                        .realtime_downloaded
+                        .fetch_add(w, std::sync::atomic::Ordering::Release);
+                }
             }
             // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
             // countdown 也能正常重置,避免 u64 下溢 panic
@@ -2518,10 +2748,12 @@ impl DownloadTask {
                 progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
             }
         }
-        // 刷写剩余数据
-        if !write_buf.is_empty() {
+        // 刷写剩余数据(按 final effective_end 裁剪)
+        let tail_end = shared
+            .effective_end
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(batch) = Self::take_clamped_write_buf(pos, tail_end, write_buf) {
             // split().freeze() 零拷贝转 Bytes
-            let batch = write_buf.split().freeze();
             let (_new_pos, w) = Self::flush_batch(
                 storage,
                 pos,
@@ -2570,6 +2802,13 @@ impl DownloadTask {
         }
 
         let elapsed = start_instant.elapsed();
+
+        // 审计 P0-3:在发送 completed 触发上层 snapshot 之前,先把本分片已写字节 durable sync。
+        // skip_write(BT protocol_managed) 时引擎未写 storage,由协议层 storage/piece 语义负责落盘。
+        // 不做每 batch fsync(避免 Flush Storm);仅在分片完成边界 group-commit 一次。
+        if !skip_write {
+            storage.sync().await?;
+        }
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx
@@ -2737,9 +2976,9 @@ impl DownloadTask {
     ///
     /// 依次执行: 探测 -> 规划 -> 预分配 -> 下载 -> 校验
     /// 任一步骤失败将标记任务为 `Failed` 并返回错误。
-    #[tracing::instrument(skip(self), fields(url = %self.url))]
+    #[tracing::instrument(skip(self), fields(url = %tachyon_core::redact_url_for_log(&self.url)))]
     pub async fn run(&mut self) -> DownloadResult<()> {
-        info!(url = %self.url, "启动下载任务");
+        info!(url = %tachyon_core::redact_url_for_log(&self.url), "启动下载任务");
 
         let result = self.run_inner().await;
 
@@ -2758,7 +2997,7 @@ impl DownloadTask {
     /// cancel/fail/complete 时 pause+delete(保留文件)+清 cache;暂停超时保持 Paused 不清理
     #[cfg(feature = "magnet")]
     async fn cleanup_bt_torrent_if_needed(&self, result: &DownloadResult<()>) {
-        if !self.url.starts_with("magnet:?") {
+        if !tachyon_core::looks_like_magnet_url(&self.url) {
             return;
         }
         let should_cleanup = match result {
@@ -2783,18 +3022,31 @@ impl DownloadTask {
     }
 
     fn apply_terminal_error(&mut self, error: &DownloadError) {
-        // P1: 暂停态的 pause_timeout 超时不应升级为 Failed。
-        // 用户显式 Pause 后,若超过 pause_timeout_secs,wait_control_rx 返回 Timeout,
-        // 原 apply_terminal_error 会把 Paused 强制转为 Failed,违反"暂停可恢复"语义
-        // (用户离开片刻回来发现任务变 Failed)。此处对 Paused 态的 Timeout 降级:
-        // 保持 Paused,仅记录 warn,不进入终态。用户可后续 Resume 或 Cancel。
-        if self.state == DownloadState::Paused && matches!(error, DownloadError::Timeout(_)) {
-            warn!(
-                state = ?self.state,
-                error = %error,
-                "暂停态收到 Timeout,保持 Paused 不升级为 Failed(用户暂停语义优先)"
-            );
-            return;
+        // P1 / 审计 M-05:暂停超时应保持 Paused。
+        // wait_control_rx 观察 Pause 时历史上不把 DownloadTask.state 设为 Paused
+        // (仍为 Downloading),导致仅凭 state==Paused 的分支不可达。
+        // 以控制通道最新命令为准:若仍是 Pause,则 Timeout 保持/恢复为 Paused。
+        if matches!(error, DownloadError::Timeout(_)) {
+            let control_paused = self
+                .control_rx
+                .as_ref()
+                .is_some_and(|rx| matches!(*rx.borrow(), TaskCommand::Pause));
+            if self.state == DownloadState::Paused || control_paused {
+                if self.state != DownloadState::Paused {
+                    if let Ok(s) = self.state.try_transition(DownloadState::Paused) {
+                        self.state = s;
+                    } else {
+                        // 非法转换时仍强制对齐,避免 pause-timeout 误报 Failed
+                        self.state = DownloadState::Paused;
+                    }
+                }
+                warn!(
+                    state = ?self.state,
+                    error = %error,
+                    "暂停态收到 Timeout,保持 Paused 不升级为 Failed(用户暂停语义优先)"
+                );
+                return;
+            }
         }
 
         let target = if matches!(error, DownloadError::Cancelled)
@@ -3817,6 +4069,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let protocol: Arc<dyn Protocol> = Arc::new(
@@ -3911,6 +4164,7 @@ mod tests {
             last_modified: None,
             file_layout: Some(layout.clone()),
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         // MockProto:分片按 (start,end) 精确返回对应全局字节切片
@@ -3980,6 +4234,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let frag_a = Bytes::from(vec![0x11; frag_size as usize]);
@@ -4036,6 +4291,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let overlong_frag_a = Bytes::from(vec![0x11; frag_size as usize + 1]);
@@ -4094,6 +4350,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let overlong_frag_a = Bytes::from(vec![0x33; frag_size as usize + 1]);
@@ -4214,6 +4471,159 @@ mod tests {
         }
     }
 
+    /// 审计 H-01:write_buf 越过 effective_end 时必须裁剪/丢弃
+    #[test]
+    fn test_take_clamped_write_buf_truncates_past_effective_end() {
+        let mut buf = AlignedBuf::new(256).unwrap();
+        buf.extend_from_slice(&[1u8; 100]);
+        // pos=10, end_inclusive=59 => 最多写 50 字节
+        let batch =
+            DownloadTask::take_clamped_write_buf(10, 59, &mut buf).expect("应产出裁剪后的 batch");
+        assert_eq!(batch.len(), 50);
+        assert!(buf.is_empty(), "split 后 write_buf 应空");
+    }
+
+    #[test]
+    fn test_take_clamped_write_buf_clears_when_pos_past_end() {
+        let mut buf = AlignedBuf::new(64).unwrap();
+        buf.extend_from_slice(&[9u8; 16]);
+        assert!(DownloadTask::take_clamped_write_buf(100, 50, &mut buf).is_none());
+        assert!(buf.is_empty());
+    }
+
+    /// 审计 P0-3:分片 completed 进度事件前必须先 storage.sync,避免 snapshot 领先未落盘字节
+    #[tokio::test]
+    async fn test_fragment_completed_syncs_before_progress_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSyncStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for CountingSyncStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.sync()
+            }
+        }
+
+        // 两个分片,强制走 fragmented 路径(单分片会路由到 full download)
+        let frag_size = 32 * 1024u64;
+        let total = frag_size * 2;
+        let first = bytes::Bytes::from(vec![0xAB; frag_size as usize]);
+        let second = bytes::Bytes::from(vec![0xCD; frag_size as usize]);
+        let meta = FileMetadata {
+            file_name: "durable.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"strong-etag\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_range_data(0, frag_size - 1, first.clone())
+                .with_range_data(frag_size, total - 1, second.clone()),
+        );
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let storage = StorageKind::new(CountingSyncStorage {
+            inner: MemStorage::with_capacity(total as usize),
+            syncs: syncs.clone(),
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentProgress>(32);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/durable.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 2,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+        task.set_progress_sender(tx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        assert!(
+            task.fragments.len() >= 2,
+            "应规划为多分片: {}",
+            task.fragments.len()
+        );
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("下载应成功");
+
+        let mut completed_events = 0u32;
+        while let Ok(ev) = rx.try_recv() {
+            if let FragmentProgress::Chunk {
+                completed: true, ..
+            } = ev
+            {
+                completed_events += 1;
+            }
+        }
+        assert!(
+            completed_events >= 2,
+            "应收到每个分片的 completed 事件, actual={completed_events}"
+        );
+        // 每个完成分片至少一次 sync(+最终 close 一次)
+        assert!(
+            syncs.load(Ordering::SeqCst) >= completed_events as usize,
+            "completed 前应至少每分片一次 storage.sync, syncs={}, completed={}",
+            syncs.load(Ordering::SeqCst),
+            completed_events
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_fragmented_download_handles_storage_short_writes() {
         let frag_size = 128u64;
@@ -4230,6 +4640,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol: Arc<dyn Protocol> = Arc::new(
             MockProto::new(meta)
@@ -4447,6 +4858,241 @@ mod tests {
         assert_eq!(storage.data(), vec![0xA5u8; total], "数据应完整落盘");
     }
 
+    /// 审计 residual:write_all_at(Bytes 路径)同样应对短写循环到写完
+    #[tokio::test]
+    async fn test_write_all_at_retries_short_write() {
+        let total = 2048usize;
+        let storage = ShortWriteStorage::with_capacity(total, 13);
+        let ss = StorageSet::single(StorageKind::new(storage.clone()));
+        let batch = bytes::Bytes::from(vec![0x5Au8; total]);
+        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(written, total as u64);
+        assert_eq!(storage.data(), vec![0x5Au8; total]);
+    }
+
+    /// 审计 HTTP-09:整块路径应对可重试错误做 max_retries,且半写后重试不污染
+    #[tokio::test]
+    async fn test_full_download_retries_after_stream_error() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+        struct FullFailOnce {
+            meta: FileMetadata,
+            calls: Arc<AtomicU32>,
+            payload: Bytes,
+        }
+
+        impl Protocol for FullFailOnce {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>,
+            > {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let payload = self.payload.clone();
+                Box::pin(async move { Ok(payload.slice(start as usize..(end as usize + 1))) })
+            }
+
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let this_payload = self.payload.clone();
+                Box::pin(async move {
+                    let data = this_payload.slice(start as usize..(end as usize + 1));
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let payload = self.payload.clone();
+                Box::pin(async move { Ok(payload) })
+            }
+
+            fn download_full_stream(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let payload = self.payload.clone();
+                Box::pin(async move {
+                    if n == 0 {
+                        // 先吐半包再失败,模拟 RST 中途
+                        let half = payload.slice(0..payload.len() / 2);
+                        let err = DownloadError::Network("模拟整块流中途失败".into());
+                        Ok(Box::pin(futures::stream::iter(vec![Ok(half), Err(err)])) as ByteStream)
+                    } else {
+                        Ok(Box::pin(futures::stream::once(async move { Ok(payload) }))
+                            as ByteStream)
+                    }
+                })
+            }
+        }
+
+        let payload = Bytes::from(vec![0x5Au8; 100]);
+        let meta = FileMetadata {
+            file_name: "full-retry.bin".into(),
+            file_size: Some(payload.len() as u64),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol = Arc::new(FullFailOnce {
+            meta,
+            calls: Arc::new(AtomicU32::new(0)),
+            payload: payload.clone(),
+        });
+        let memory = MemStorage::with_capacity(payload.len());
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/full-retry.bin".into(),
+            DownloadConfig {
+                max_retries: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol as Arc<dyn Protocol>,
+            StorageKind::new(memory.clone()),
+        );
+        task.run().await.expect("full download 应在重试后成功");
+        assert_eq!(&memory.get_data()[..payload.len()], payload.as_ref());
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
+    /// 审计 HTTP-15:已知长度下响应超写必须在 write 前失败
+    #[tokio::test]
+    async fn test_full_download_rejects_oversized_known_length() {
+        let oversize = Bytes::from_static(b"hello"); // 5 bytes
+        let meta = FileMetadata {
+            file_name: "oversize.bin".into(),
+            file_size: Some(4),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(oversize));
+        let memory = MemStorage::with_capacity(16);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/oversize.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol as Arc<dyn Protocol>,
+            StorageKind::new(memory.clone()),
+        );
+        let err = task.run().await.expect_err("超长 body 应失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("超过声明长度") || msg.contains("expected") || msg.contains("不完整"),
+            "应写前拒绝超写: {msg}"
+        );
+        let data = memory.get_data();
+        let written_nonzero = data.iter().filter(|&&b| b != 0).count();
+        assert!(
+            written_nonzero < 5,
+            "不得完整写入超长 body, actual nonzero={written_nonzero}"
+        );
+    }
+
+    /// 审计 BT-17:protocol_managed_storage 时 plan 忽略 snapshot completed
+    #[tokio::test]
+    async fn test_plan_ignores_snapshot_skip_for_protocol_managed_storage() {
+        let meta = FileMetadata {
+            file_name: "t.bin".into(),
+            file_size: Some(4096),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: true,
+            resolved_host: None,
+        };
+        let protocol =
+            Arc::new(MockProto::new(meta.clone()).with_default_data(Bytes::from(vec![0u8; 4096])));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/t.bin".into(),
+            test_config(),
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory_with_capacity(4096),
+        );
+        task.set_completed_fragments(vec![0, 1]);
+        task.metadata = Some(meta);
+        let frags = task.plan().expect("plan");
+        assert!(!frags.is_empty());
+        for f in &task.fragments {
+            assert_eq!(
+                f.state,
+                crate::fragment::FragmentState::Pending,
+                "BT managed storage 不得跳过 snapshot 分片"
+            );
+        }
+        assert!(
+            task.completed_fragments.is_empty(),
+            "plan 后应清空 completed_fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_download_survives_storage_short_write() {
+        let data = Bytes::from(vec![0xCCu8; 300]);
+        let meta = FileMetadata {
+            file_name: "short-write-full.bin".into(),
+            file_size: Some(data.len() as u64),
+            content_type: None,
+            supports_range: false, // 强制走 execute_full_download
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
+        let storage = ShortWriteStorage::with_capacity(data.len(), 17);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/short-write-full.bin".into(),
+            test_config(),
+            protocol,
+            StorageKind::new(storage.clone()),
+        );
+        task.run().await.expect("full download 应在短写下完成");
+        assert_eq!(storage.data(), data.as_ref());
+        assert_eq!(task.state(), DownloadState::Completed);
+    }
+
     /// write_all_at_mut 计时基准:256KiB batch(对齐 WRITE_BATCH_BYTES),NoopStorage
     ///
     /// NoopStorage.write_at 零拷贝返回 len,隔离出 freeze/clone/slice 的纯逻辑开销。
@@ -4493,6 +5139,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
@@ -5208,6 +5855,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta));
         let storage = StorageKind::memory();
@@ -5243,6 +5891,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta));
         let storage = StorageKind::memory();
@@ -5453,8 +6102,144 @@ mod tests {
 
     // ------ 补充: 分片重试韧性(第一次失败,第二次成功) ------
 
-    /// 验证:协议首次调用失败后,重试可以成功
-    /// 模拟 DownloadTask 的 run() 失败后,用户重试 run() 成功的场景
+    /// 审计 HTTP-01:半缓冲失败后 retry 不得把旧 write_buf 拼进下一次 attempt
+    #[tokio::test]
+    async fn test_fragment_retry_clears_write_buf_between_attempts() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+        struct PartialThenOk {
+            meta: FileMetadata,
+            calls: Arc<AtomicU32>,
+            payload: Bytes,
+        }
+
+        impl PartialThenOk {
+            fn clone_inner(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    calls: Arc::clone(&self.calls),
+                    payload: self.payload.clone(),
+                }
+            }
+        }
+
+        impl Protocol for PartialThenOk {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>,
+            > {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+
+            fn download_range(
+                &self,
+                url: &str,
+                start: u64,
+                end: u64,
+                identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let this = self.clone_inner();
+                let url = url.to_owned();
+                Box::pin(async move {
+                    let mut stream = this
+                        .download_range_stream(&url, start, end, identity)
+                        .await?;
+                    use futures::StreamExt;
+                    let mut out = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        out.extend_from_slice(&chunk?);
+                    }
+                    Ok(Bytes::from(out))
+                })
+            }
+
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let payload = self.payload.clone();
+                let len = (end - start + 1) as usize;
+                Box::pin(async move {
+                    if n == 0 {
+                        // 半缓冲:小 chunk 后失败,模拟 write_buf 残留
+                        let partial = Bytes::from(vec![0xEE; 64.min(len)]);
+                        let err = DownloadError::Network("模拟半缓冲后失败".into());
+                        Ok(Box::pin(futures::stream::iter(vec![Ok(partial), Err(err)]))
+                            as ByteStream)
+                    } else {
+                        let data = payload.slice(start as usize..(end as usize + 1));
+                        Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                    }
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let payload = self.payload.clone();
+                Box::pin(async move { Ok(payload) })
+            }
+        }
+
+        let payload = Bytes::from(vec![0xA5u8; 200]);
+        let meta = FileMetadata {
+            file_name: "pollute.bin".into(),
+            file_size: Some(payload.len() as u64),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol = Arc::new(PartialThenOk {
+            meta: meta.clone(),
+            calls: Arc::new(AtomicU32::new(0)),
+            payload: payload.clone(),
+        });
+        let memory = MemStorage::with_capacity(payload.len());
+        let storage = StorageKind::new(memory.clone());
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/pollute.bin".into(),
+            DownloadConfig {
+                max_retries: 3,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol as Arc<dyn Protocol>,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: 50,
+            max_fragment_size: 80,
+            ..Default::default()
+        };
+        task.run().await.expect("retry 后应成功");
+        let data = memory.get_data();
+        assert_eq!(
+            &data[..payload.len()],
+            payload.as_ref(),
+            "retry 后文件必须等于原件,不得含 0xEE 污染前缀"
+        );
+        assert!(
+            !data.windows(3).any(|w| w == [0xEE, 0xEE, 0xEE]),
+            "不应残留失败 attempt 的 0xEE 序列"
+        );
+    }
+
     #[tokio::test]
     async fn test_fragment_retry_resilience() {
         struct FailOnceProtocol {
@@ -5828,6 +6613,68 @@ mod tests {
             task.state,
             DownloadState::Paused,
             "暂停态收到 pause_timeout 不应升级为 Failed,保持 Paused(用户暂停语义优先)"
+        );
+    }
+
+    /// 审计 M-05:state 仍为 Downloading 但 control=Pause 时,Timeout 也应保持 Paused
+    #[test]
+    fn test_apply_terminal_error_control_pause_timeout_keeps_paused() {
+        use tachyon_core::DownloadError;
+
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(test_metadata("ctrl-pause.bin", 100)).with_range_data(
+                0,
+                99,
+                Bytes::from(vec![0x22; 100]),
+            ),
+        );
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/ctrl-pause.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                pause_timeout_secs: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            StorageKind::memory_with_capacity(100),
+        );
+
+        task.state = DownloadState::Downloading;
+        let (_tx, rx) = watch::channel(TaskCommand::Pause);
+        task.set_control_rx(rx);
+
+        let err = DownloadError::Timeout("暂停超过 1 秒".into());
+        task.apply_terminal_error(&err);
+
+        assert_eq!(
+            task.state,
+            DownloadState::Paused,
+            "M-05: control=Pause + Timeout 时即使 state 仍是 Downloading 也必须保持/落为 Paused"
+        );
+    }
+
+    #[test]
+    fn test_apply_terminal_error_paused_network_fails() {
+        use tachyon_core::DownloadError;
+
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(test_metadata("paused-net.bin", 100)).with_range_data(
+                0,
+                99,
+                Bytes::from(vec![0x11; 100]),
+            ),
+        );
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/paused-net.bin".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 1,
+                pause_timeout_secs: 1,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            StorageKind::memory_with_capacity(100),
         );
 
         // 对照:其他错误(如 Network)在 Paused 态应正常转 Failed
@@ -6547,6 +7394,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory_with_capacity(data.len());
@@ -6584,6 +7432,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
         let storage = StorageKind::memory();
@@ -6859,6 +7708,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory_with_capacity(data.len());
@@ -7803,6 +8653,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data));
         let storage = StorageKind::memory_with_capacity(total_size as usize);
@@ -7848,6 +8699,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
         let storage = StorageKind::memory();
@@ -9293,6 +10145,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
         let protocol: Arc<dyn Protocol> = Arc::new(StallingFullProtocol { meta });
         let storage = StorageKind::memory_with_capacity(100);
@@ -9646,6 +10499,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         // 分片 1(中间)配置 chunk_delay 模拟慢源
@@ -9716,6 +10570,7 @@ mod tests {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         };
 
         let protocol: Arc<dyn Protocol> = Arc::new(

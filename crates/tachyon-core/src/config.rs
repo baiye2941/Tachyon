@@ -203,6 +203,13 @@ pub struct DownloadConfig {
     pub user_agent: String,
     /// 自定义请求头
     pub headers: std::collections::HashMap<String, String>,
+    /// 运行时注入的 Bearer token(仅官方 HF host 发送;不序列化落盘)
+    ///
+    /// 审计:私有仓库下载需要 Authorization,但不得经 DownloadConfig.headers
+    /// 配置通道写入(该通道禁止 authorization 敏感头)。由 app 层从 HubConfig.token
+    /// 注入,HttpClient 按请求 host 门禁附加。
+    #[serde(skip)]
+    pub auth_bearer: Option<String>,
     /// 暂停状态最大持续时间(秒)
     pub pause_timeout_secs: u64,
     /// 后端允许写入的下载目录列表
@@ -219,6 +226,10 @@ pub struct DownloadConfig {
     /// 显式代理 URL,如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`。
     /// None 时 reqwest 读取系统环境变量(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`),
     /// 与 BT 侧 `detect_socks_proxy` 的“自动嗅探系统代理”语义对齐。
+    ///
+    /// 审计 SEC-007:启用代理后,目标域名解析与最终可达 IP 由代理决定;
+    /// 直连路径的 `PublicDnsResolver`/`reject_forbidden_ip` **不覆盖**代理后端。
+    /// 将代理视为 SSRF 信任边界,仅使用可信代理。
     #[serde(default)]
     pub proxy: Option<String>,
     /// work-stealing/动态拆分请求开关(配置兼容字段)。
@@ -288,6 +299,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             verify_strategy: value.verify_strategy,
             user_agent: value.user_agent,
             headers: value.headers,
+            auth_bearer: None,
             pause_timeout_secs: value.pause_timeout_secs,
             rate_limit_bytes_per_sec: value.rate_limit_bytes_per_sec,
             max_full_stream_bytes: value.max_full_stream_bytes,
@@ -320,6 +332,7 @@ impl Default for DownloadConfig {
             verify_strategy: VerifyStrategy::BestEffort,
             user_agent: USER_AGENT.to_string(),
             headers: std::collections::HashMap::new(),
+            auth_bearer: None,
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
             max_full_stream_bytes: default_max_full_stream_bytes(),
@@ -347,10 +360,11 @@ pub struct MagnetConfig {
     /// 启用后可脱离 tracker 发现 peer，显著提升磁力链接解析速度。
     #[serde(default = "default_true")]
     pub enable_dht: bool,
-    /// 是否启用 UPnP 端口转发（默认启用）
+    /// 是否启用 UPnP 端口转发（默认关闭）
     ///
-    /// UPnP 可自动在路由器上开放监听端口，允许入站 peer 连接，加速下载。
-    #[serde(default = "default_true")]
+    /// 审计 SEC-012:UPnP XML 解析依赖 quick-xml,默认关闭缩小局域网 DoS 面。
+    /// 需要入站加速时可在配置中显式开启。
+    #[serde(default)]
     pub enable_upnp: bool,
     /// 全局 tracker 服务器列表
     ///
@@ -428,6 +442,13 @@ pub struct MagnetConfig {
     /// 格式:`host:port`。从磁力链接 `&pe=` 参数解析 + 用户手动配置合并。
     #[serde(default)]
     pub peer_addrs: Vec<String>,
+    /// 高隐私模式(审计 BT-11 最小缓解)
+    ///
+    /// 启用后 Session 强制禁用 DHT、禁用 UPnP、不注入全局/公共 tracker。
+    /// **诚实边界**:librqbit 在拿到 metadata 前无法知道 private 标志,仍可能按 non-private
+    /// 路径做 discovery;本开关是应用层最大程度隔离,不能 100% 阻止 private info-hash 泄漏。
+    #[serde(default)]
+    pub high_privacy: bool,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
@@ -600,7 +621,7 @@ impl Default for MagnetConfig {
             metadata_timeout_secs: 120,
             download_timeout_secs: 0,
             enable_dht: true,
-            enable_upnp: true,
+            enable_upnp: false,
             trackers: default_trackers(),
             stall_timeout_secs: default_stall_timeout_secs(),
             disable_dht_persistence: false,
@@ -612,6 +633,7 @@ impl Default for MagnetConfig {
             defer_writes_up_to_mb: default_defer_writes_up_to_mb(),
             disable_dht_when_socks: true,
             peer_addrs: Vec::new(),
+            high_privacy: false,
         }
     }
 }
@@ -832,7 +854,9 @@ pub struct ConnectionConfig {
     pub connect_timeout_secs: u64,
     /// 是否启用 HTTP/2
     pub enable_http2: bool,
-    /// 是否启用 QUIC
+    /// 是否启用 QUIC/HTTP3 意图
+    ///
+    /// 仅在编译启用 `http3`+`reqwest_unstable` 时可能生效;默认 false(诚实默认)。
     pub enable_quic: bool,
 }
 
@@ -844,10 +868,10 @@ impl Default for ConnectionConfig {
             keep_alive_timeout_secs: 30,
             connect_timeout_secs: 10,
             enable_http2: true,
-            // 默认启用 QUIC 意图:运行期声明优先使用 HTTP/3。
-            // 实际是否生效取决于编译期是否启用 tachyon-protocol 的 `http3` feature
-            // (及 reqwest_unstable cfg)——未启用时静默降级 HTTP/2,见 http.rs。
-            enable_quic: true,
+            // 审计 HTTP-10:默认 false,避免「enable_quic=true 但未编 http3」的能力谎言。
+            // 真 HTTP/3 需要 tachyon-protocol `http3` feature + `RUSTFLAGS=--cfg reqwest_unstable`
+            // 且运行期 enable_quic=true;可用 tachyon_protocol::http3_compiled() 查询编译态。
+            enable_quic: false,
         }
     }
 }
@@ -1204,6 +1228,7 @@ pub struct MagnetPatch {
     pub defer_writes_up_to_mb: Option<u64>,
     pub disable_dht_when_socks: Option<bool>,
     pub peer_addrs: Option<Vec<String>>,
+    pub high_privacy: Option<bool>,
 }
 
 /// 调度器配置白名单补丁
@@ -1273,6 +1298,9 @@ impl MagnetPatch {
         }
         if let Some(v) = &self.peer_addrs {
             base.peer_addrs = v.clone();
+        }
+        if let Some(v) = self.high_privacy {
+            base.high_privacy = v;
         }
     }
 }
@@ -1596,7 +1624,7 @@ mod tests {
         assert_eq!(config.keep_alive_timeout_secs, 30);
         assert_eq!(config.connect_timeout_secs, 10);
         assert!(config.enable_http2);
-        assert!(config.enable_quic); // 默认 true(运行期意图;编译期 http3 feature 可用时生效)
+        assert!(!config.enable_quic); // 审计 HTTP-10:默认 false(诚实)
     }
 
     #[test]
@@ -1629,6 +1657,19 @@ mod tests {
         assert_eq!(
             deserialized.max_concurrent_fragments,
             config.max_concurrent_fragments
+        );
+    }
+
+    #[test]
+    fn test_auth_bearer_not_serialized() {
+        let mut cfg = DownloadConfig::default();
+        cfg.auth_bearer = Some("hf_secret_token".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("hf_secret_token")
+                && !json.contains("authBearer")
+                && !json.contains("auth_bearer"),
+            "auth_bearer 不得序列化: {json}"
         );
     }
 
@@ -2358,7 +2399,7 @@ mod tests {
         assert_eq!(config.metadata_timeout_secs, 120);
         assert_eq!(config.download_timeout_secs, 0);
         assert!(config.enable_dht, "DHT 应默认启用");
-        assert!(config.enable_upnp, "UPnP 应默认启用");
+        assert!(!config.enable_upnp, "UPnP 应默认关闭(SEC-012)");
         assert!(!config.trackers.is_empty(), "默认 tracker 列表不应为空");
         assert_eq!(config.stall_timeout_secs, 60, "stall 超时默认 60 秒");
     }
@@ -2483,7 +2524,7 @@ mod tests {
         assert_eq!(base.metadata_timeout_secs, 60);
         assert_eq!(base.download_timeout_secs, 0); // None -> 保留原值
         assert!(!base.enable_dht);
-        assert!(base.enable_upnp); // None -> 保留原值
+        assert!(!base.enable_upnp); // None -> 保留默认 false
         assert_eq!(base.trackers.len(), 1);
         assert_eq!(base.trackers[0], "udp://new.example.com:1337/announce");
     }
@@ -2715,7 +2756,7 @@ mod tests {
         let json = r#"{"trackers":[]}"#;
         let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.enable_dht, "default_true 应让 enable_dht 默认 true");
-        assert!(cfg.enable_upnp, "default_true 应让 enable_upnp 默认 true");
+        assert!(!cfg.enable_upnp, "enable_upnp 应默认 false(SEC-012)");
     }
 
     #[test]
@@ -2864,7 +2905,7 @@ mod tests {
         assert_eq!(cfg.keep_alive_timeout_secs, 30);
         assert_eq!(cfg.connect_timeout_secs, 10);
         assert!(cfg.enable_http2);
-        assert!(cfg.enable_quic);
+        assert!(!cfg.enable_quic); // HTTP-10 默认 false
     }
 
     #[test]
@@ -2968,6 +3009,7 @@ mod tests {
             defer_writes_up_to_mb: Some(32),
             disable_dht_when_socks: Some(false),
             peer_addrs: Some(vec!["1.2.3.4:6881".into()]),
+            high_privacy: None,
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.metadata_timeout_secs, 200);

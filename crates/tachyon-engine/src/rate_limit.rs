@@ -21,11 +21,11 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// 单次 acquire 最大等待时间(秒)
+/// 单次 sleep 切片上限(秒)
 ///
-/// 超过此阈值的等待会被截断并记录警告,防止在高并发场景下
-/// 个别请求因令牌长期不足而被无限期饿死。
-const MAX_ACQUIRE_WAIT_SECS: f64 = 5.0;
+/// 审计 HTTP-05:必要等待不得因 5s 截断而提前放行(否则限速上限失效)。
+/// 仍按切片 sleep,便于取消检查点;总等待覆盖完整 deficit。
+const MAX_SLEEP_SLICE_SECS: f64 = 5.0;
 
 /// 令牌桶限速器
 ///
@@ -106,15 +106,20 @@ impl RateLimiter {
 
         if total_debt > allowed {
             let deficit = total_debt - allowed;
-            let wait_ns = (deficit as u128 * 1_000_000_000 / rate as u128) as u64;
-            let clamped = wait_ns.min((MAX_ACQUIRE_WAIT_SECS * 1e9) as u64);
+            let mut remaining_ns = (deficit as u128 * 1_000_000_000 / rate as u128) as u64;
+            let slice_ns = (MAX_SLEEP_SLICE_SECS * 1e9) as u64;
 
             // CancelSafeSleep:在 sleep 完成后解除 guard,否则在 drop 时回滚 debt
             let cancel_guard = CancelGuard {
                 debt: &self.debt,
                 bytes: Some(bytes),
             };
-            tokio::time::sleep(Duration::from_nanos(clamped)).await;
+            // 审计 HTTP-05:分片 sleep 覆盖完整 deficit,禁止 5s 截断后立即放行
+            while remaining_ns > 0 {
+                let step = remaining_ns.min(slice_ns);
+                tokio::time::sleep(Duration::from_nanos(step)).await;
+                remaining_ns -= step;
+            }
             // sleep 正常完成,解除 guard 防止 drop 时回滚
             cancel_guard.disarm();
         }
@@ -282,6 +287,26 @@ mod tests {
         assert!(
             elapsed.as_secs_f64() < 7.0,
             "并发请求不应过度等待,实际: {:.2}s",
+            elapsed.as_secs_f64()
+        );
+    }
+
+    /// 审计 HTTP-05:必要等待远超 5s 时仍须完整等待,不得 5s 截断放行
+    ///
+    /// RateLimiter 内部用 std Instant 计算 deficit,但 sleep 走 tokio::time;
+    /// start_paused 下用 tokio Instant 度量虚拟等待时长。
+    #[tokio::test(start_paused = true)]
+    async fn acquire_long_deficit_waits_full_duration() {
+        // 10 bytes/sec, 初始突发约 10 字节
+        let limiter = RateLimiter::new(10);
+        limiter.acquire(10).await;
+        // 再要 100 字节 → 约 10 秒(旧实现会截断为 5s)
+        let start = tokio::time::Instant::now();
+        limiter.acquire(100).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() >= 9.0,
+            "完整 deficit 应等待约 10s,实际: {:.2}s(截断 5s 会失败)",
             elapsed.as_secs_f64()
         );
     }

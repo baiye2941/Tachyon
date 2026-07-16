@@ -1,22 +1,28 @@
-# Checkpoint — P0-6/7/8
+# Checkpoint — residual 继续(自动不间断)
 
-- Status: **DONE**（含 residual: probe lifecycle + ops_gate）
-- 临时垃圾文件 `NUL` / `bin_api_probe_tmp.rs` 已删除
+- Status: **GREEN**
+- Latest Spec: `docs/aegis/specs/2026-07-16-a14-clipboard-probe-scheduler.md`
 
-## Progress
+## 本轮闭环
 
-| 切片 | 状态 |
-|---|---|
-| P0-6 Object identity | **DONE** |
-| P0-7 HLS wiring + e2e | **DONE** |
-| P0-8 BT lifecycle + probe + ops_gate | **DONE** |
+| ID | 项 | 状态 |
+|---|---|---|
+| A-14 | ClipboardWatcher 幂等 spawn + enable_watch 即时门禁 | DONE |
+| A-14 | 前端去掉 clipboard 重启误导文案 | DONE |
+| A-04/A-14 | probe_filename 使用 AppConfig.scheduler | DONE |
+| A-13/A-14 BufferPool 热重建(先前) | DONE |
 
-## Residual (honest)
+## Verification
 
-1. session pause/delete 后台 spawn + 5s 超时；ops_gate 保证 add 等待 cleanup
-2. raw URL 兼容键仍在 preferred=None 时写入
-3. 未提交：需用户明确要求才 commit
+```
+clipboard_watcher 9 + probe + a14 buffer = 13 PASS
+clippy app clean
+```
 
-## ResumeStateHint
+## 诚实残余
 
-本工作流完成。可选：`git commit` 或开启新切片。
+- poll_interval_ms 热改非目标
+- A-12 超大文件拆分
+- A-10 quick-xml 升级
+- openat2 / Authenticode / AsyncCancel
+- residual 自 36ea0ed **仍未提交**

@@ -612,6 +612,7 @@ pub mod harness {
             last_modified: None,
             file_layout: None,
             protocol_managed_storage: false,
+            resolved_host: None,
         }
     }
 
@@ -655,6 +656,7 @@ pub mod harness {
             verify_strategy: crate::config::VerifyStrategy::BestEffort,
             user_agent: "Tachyon-Test/0.1.0".into(),
             headers: HashMap::new(),
+            auth_bearer: None,
             pause_timeout_secs: 300,
             rate_limit_bytes_per_sec: None,
             max_full_stream_bytes: crate::config::default_max_full_stream_bytes(),

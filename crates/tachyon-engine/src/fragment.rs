@@ -243,7 +243,7 @@ impl FragmentRecord {
         self.info.end = split_point - 1;
         self.info.size = split_point - start;
 
-        // 缩小 effective_end:原 worker 下次 flush_batch 前检查到此值,
+        // 缩小 effective_end:原 worker 下次 flush 前检查到此值,
         // 提前停止下载,避免与 steal worker 并发写 [split_point, end] 区域
         self.effective_end.store(split_point - 1, Ordering::Release);
 
@@ -265,6 +265,17 @@ impl FragmentRecord {
         };
 
         Ok(Some(new_record))
+    }
+
+    /// 审计 H-01:steal 队列入队失败时回滚 `try_split`。
+    ///
+    /// `stolen` 为刚拆出的新分片;`self` 为原慢分片。恢复原 end/size/effective_end。
+    pub fn revert_split_after_failed_dispatch(&mut self, stolen: &FragmentRecord) {
+        let original_end = stolen.info.end;
+        let start = self.info.start;
+        self.info.end = original_end;
+        self.info.size = original_end.saturating_sub(start).saturating_add(1);
+        self.effective_end.store(original_end, Ordering::Release);
     }
 
     /// 是否已完成
@@ -1086,6 +1097,36 @@ mod tests {
         // 在 100KB 处拆分,剩余 28KB < 64KB
         let result = record.try_split(100 * 1024, 1).unwrap();
         assert!(result.is_none(), "剩余太小不应拆分");
+    }
+
+    /// 审计 H-01:steal 入队失败回滚后,原分片 end/size/effective_end 恢复
+    #[test]
+    fn test_revert_split_after_failed_dispatch_restores_bounds() {
+        let info = make_frag(0, 1024 * 1024);
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+        let original_end = record.info.end;
+        let original_size = record.info.size;
+
+        let split_point = 512 * 1024;
+        let stolen = record
+            .try_split(split_point, 99)
+            .unwrap()
+            .expect("应拆分成功");
+        assert_eq!(record.info.end, split_point - 1);
+        assert_eq!(
+            record.effective_end.load(Ordering::Acquire),
+            split_point - 1
+        );
+
+        record.revert_split_after_failed_dispatch(&stolen);
+        assert_eq!(record.info.end, original_end);
+        assert_eq!(record.info.size, original_size);
+        assert_eq!(
+            record.effective_end.load(Ordering::Acquire),
+            original_end,
+            "H-01:回滚后 effective_end 必须恢复,否则原 worker 永久少写"
+        );
     }
 }
 

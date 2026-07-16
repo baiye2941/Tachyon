@@ -6,6 +6,7 @@
 //! - 配置类型
 
 pub mod config;
+pub mod download_source;
 pub mod error;
 pub mod safety;
 #[cfg(any(test, feature = "test-harness"))]
@@ -22,11 +23,16 @@ pub use config::DownloadPatch;
 pub use config::IoStrategy;
 pub use config::SchedulerConfig;
 pub use config::USER_AGENT;
+pub use download_source::{
+    DownloadSource, DownloadSourceKind, classify_download_url, looks_like_hls_url,
+    looks_like_magnet_url, parse_download_source,
+};
 pub use error::{DownloadError, DownloadResult};
 pub use safety::{
     extract_filename, extract_filename_from_url, parse_content_disposition, redact_url_for_log,
-    reject_forbidden_ip, sanitize_filename, validate_multi_save_paths, validate_public_http_url,
-    validate_redirect, validate_resolved_ip, validate_save_path,
+    reject_forbidden_ip, reject_symlink_or_reparse_components, sanitize_filename,
+    validate_multi_save_paths, validate_public_http_url, validate_redirect, validate_resolved_ip,
+    validate_save_path,
 };
 pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{
@@ -49,6 +55,7 @@ fn app_config() {
         verify_strategy: config::VerifyStrategy::BestEffort,
         user_agent: "Tachyon/Test".to_string(),
         headers: std::collections::HashMap::new(),
+        auth_bearer: None,
         pause_timeout_secs: 300,
         rate_limit_bytes_per_sec: None,
         max_full_stream_bytes: config::default_max_full_stream_bytes(),

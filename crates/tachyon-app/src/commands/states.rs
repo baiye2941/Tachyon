@@ -15,8 +15,8 @@ use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, RwLock};
 
 use tachyon_core::config::AppConfig;
-use tachyon_engine::connection::ConnectionPool;
-use tachyon_io::BufferPool;
+use tachyon_engine::BufferPool;
+use tachyon_engine::ConnectionPool;
 
 use crate::projection::ProgressBroker;
 use crate::repository::TaskRepository;
@@ -34,16 +34,19 @@ pub struct DomainState {
 /// 基础设施状态：连接、存储、I/O 池
 #[derive(Clone)]
 pub struct InfraState {
-    /// 全局连接池(热替换句柄)
+    /// 全局并发许可器(历史名 ConnectionPool;审计 A-02 语义为 ConcurrencyLimiter)
+    ///
+    /// **不**持有 TCP 连接。TCP/TLS/H2 复用由 reqwest Client + HttpClientRegistry 负责。
+    /// 本字段只限制 per-host / 全局并发请求许可。
     ///
     /// 外层 `Arc<RwLock<...>>` 用于在 `update_config` 时热重建:
     /// - 写路径(update_config):写锁内替换内层 `Arc<ConnectionPool>`,
-    ///   重建出携带新配置的新 pool;
+    ///   重建出携带新配置的新许可器;
     /// - 读路径(task_fn 启动 / supervisor.start_download):读锁内 clone
-    ///   出当前 `Arc<ConnectionPool>` 传入任务。
+    ///   出当前 `Arc` 传入任务。
     ///
-    /// 运行中的任务持有旧 pool 的 Arc clone,旧 pool 自然存活至最后一个引用释放,
-    /// 新任务拿到新 pool,实现配置变更对运行中任务零干扰、对新任务即时生效。
+    /// 运行中的任务持有旧 Arc,自然存活至引用释放;新任务拿新许可器。
+    /// 注意:许可器热替换与 HttpClient 配置生命周期独立(见 HTTP-15 注册表)。
     pub connection_pool: Arc<RwLock<Arc<ConnectionPool>>>,
     pub task_store: Arc<TaskStore>,
     /// 收藏 KV 存储（独立目录，与任务存储分离）
@@ -51,7 +54,15 @@ pub struct InfraState {
     pub chunk_reader_pool: Arc<ChunkReaderPool>,
     /// 全局 buffer 池：供下载 worker 复用写盘 buffer,带 Semaphore 反压。
     /// 容量 = max_concurrent_tasks × max_concurrent_fragments,buffer_size = WRITE_BATCH_BYTES。
-    pub buffer_pool: Arc<BufferPool>,
+    ///
+    /// 审计 A-14:外层 `Arc<RwLock<...>>` 支持 `update_config` 热重建容量;
+    /// 运行中任务持有旧 `Arc<BufferPool>`,新任务读锁 clone 当前池。
+    pub buffer_pool: Arc<RwLock<Arc<BufferPool>>>,
+    /// 审计 A-03:跨任务共享的全局令牌桶限速器。
+    ///
+    /// 所有 `build_download_task` 注入同一 `Arc`;`update_config` 调用 `update_rate`
+    /// 即时生效。`rate_limit_bytes_per_sec=None` 时速率为 0(不限速)。
+    pub global_rate_limiter: Arc<tachyon_engine::RateLimiter>,
     /// BitTorrent Session (magnet:? 链接下载)
     ///
     /// 使用 `Arc<Mutex<Option<...>>>` 包装,原因:

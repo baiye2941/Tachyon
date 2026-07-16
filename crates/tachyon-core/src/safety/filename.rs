@@ -157,19 +157,83 @@ fn normalize_logical_path(path: &std::path::Path) -> std::path::PathBuf {
     stack.iter().collect()
 }
 
+/// 审计 SEC-010: 从 `base` 到 `path`(含)逐段检查已存在组件是否为 symlink/reparse。
+///
+/// 不消除 validate→open 竞态(需 openat2/句柄化);在校验时刻拒绝已观察到的中间目录逃逸。
+pub fn reject_symlink_or_reparse_components(
+    base: &std::path::Path,
+    path: &std::path::Path,
+) -> crate::DownloadResult<()> {
+    let mut cursor = base.to_path_buf();
+    // 始终检查 base 本身
+    ensure_path_not_symlink_or_reparse(&cursor)?;
+
+    let Ok(rel) = path.strip_prefix(base) else {
+        // path 可能是绝对但尚未以 base 为前缀的逻辑路径;仅检查 path 自身
+        return ensure_path_not_symlink_or_reparse(path);
+    };
+
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                cursor.push(name);
+                if cursor.exists() {
+                    ensure_path_not_symlink_or_reparse(&cursor)?;
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if cursor.pop() => {}
+            std::path::Component::ParentDir => {
+                return Err(crate::DownloadError::Config("路径逃逸基目录".into()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_path_not_symlink_or_reparse(path: &std::path::Path) -> crate::DownloadResult<()> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        crate::DownloadError::Config(format!("无法读取路径元数据 {}: {e}", path.display()))
+    })?;
+    if is_symlink_or_reparse_meta(&meta) {
+        return Err(crate::DownloadError::Config(format!(
+            "路径组件是符号链接/重解析点,拒绝: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn is_symlink_or_reparse_meta(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_symlink_or_reparse_meta(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::{FileTypeExt, MetadataExt};
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file_type = metadata.file_type();
+    file_type.is_symlink_dir()
+        || file_type.is_symlink_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 pub fn validate_save_path(
     final_path: &std::path::Path,
     expected_base: &std::path::Path,
 ) -> crate::DownloadResult<std::path::PathBuf> {
-    // 安全模型说明(FIX-09): 本函数 canonicalize 基目录与父目录、检查已观察到的链接逃逸，
-    // 返回 canonical_parent.join(file_name)。但路径字符串校验不能消除「validate 与最终 open
-    // 之间目录项被替换为符号链接/重解析点」的 TOCTOU。下游 TokioFile/WinFile 的最终 open
-    // 已加 no-follow 标志(Unix: O_NOFOLLOW;Windows: FILE_FLAG_OPEN_REPARSE_POINT)关闭最终
-    // 组件的跟随。残留风险:中间目录被替换为符号链接需 openat/句柄化打开，当前未覆盖。
+    // 安全模型说明(FIX-09 + SEC-010): canonicalize 基目录与父目录,并对 base→parent 路径上
+    // 已存在中间组件做 symlink/reparse 拒绝。路径字符串校验仍不能完全消除 validate→open TOCTOU;
+    // 最终组件由 TokioFile/WinFile no-follow 保护。完整句柄化 openat2 仍属残留。
     // 1. 确保基目录存在且可 canonicalize
     let canonical_base = expected_base
         .canonicalize()
         .map_err(|e| crate::DownloadError::Config(format!("下载目录不存在或无法访问: {e}")))?;
+
+    // SEC-010: 拒绝 base 与已存在祖先中的 symlink/reparse(含中间目录)
+    reject_symlink_or_reparse_components(&canonical_base, &canonical_base)?;
 
     // 2. 统一通过父目录 canonicalize + 文件名拼接
     //    避免 TOCTOU 竞态: 不检查 final_path.exists(),防止检查与 canonicalize 之间
@@ -178,12 +242,23 @@ pub fn validate_save_path(
         .parent()
         .ok_or_else(|| crate::DownloadError::Config("无效的文件路径: 无父目录".into()))?;
 
+    // SEC-010: 对 final_path 的已存在祖先(相对 expected_base)拒绝中间 symlink
+    if let Ok(rel_parent) = parent.strip_prefix(expected_base) {
+        let check = expected_base.join(rel_parent);
+        reject_symlink_or_reparse_components(expected_base, &check)?;
+    } else if parent.exists() {
+        // parent 已是绝对存在路径时仍检查其自身 metadata
+        ensure_path_not_symlink_or_reparse(parent)?;
+    }
+
     // 3. 先做逻辑路径校验,再创建目录(防止 create_dir_all 副作用在校验失败时残留)
     //    当父目录不存在时,先通过逻辑路径拼接做逃逸检查,再创建目录
     if parent.exists() {
         let canonical_parent = parent
             .canonicalize()
             .map_err(|e| crate::DownloadError::Config(format!("无法解析父目录: {e}")))?;
+
+        reject_symlink_or_reparse_components(&canonical_base, &canonical_parent)?;
 
         if !canonical_parent.starts_with(&canonical_base) {
             return Err(crate::DownloadError::Config(format!(
@@ -243,6 +318,9 @@ pub fn validate_save_path(
         let canonical_parent = parent
             .canonicalize()
             .map_err(|e| crate::DownloadError::Config(format!("创建目录后无法解析父目录: {e}")))?;
+
+        // 创建后再次检查中间组件(SEC-010)
+        reject_symlink_or_reparse_components(&canonical_base, &canonical_parent)?;
 
         Ok(canonical_parent.join(file_name))
     }
@@ -817,6 +895,34 @@ mod tests {
 
         let result = validate_save_path(&final_path, &base);
         assert!(result.is_ok(), "Unicode 文件名应通过校验");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_save_path_rejects_middle_symlink() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let mid_link = base.join("mid");
+        symlink(&outside, &mid_link).unwrap();
+        // 中间目录是 symlink,目标文件在 symlink 下
+        let final_path = mid_link.join("file.bin");
+        let result = validate_save_path(&final_path, &base);
+        assert!(result.is_err(), "中间目录 symlink 应被拒绝: {result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reject_symlink_or_reparse_components_ok_on_normal() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        std::fs::create_dir(&base).unwrap();
+        let sub = base.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        reject_symlink_or_reparse_components(&base, &sub).unwrap();
     }
 
     #[test]

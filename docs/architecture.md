@@ -45,7 +45,7 @@ graph TB
     end
 
     subgraph ENGINE["引擎层"]
-        ENG["tachyon-engine<br/>DownloadTask 编排 / ConnectionPool<br/>MirrorProtocol 多源竞速 / RateLimiter"]
+        ENG["tachyon-engine<br/>DownloadTask 编排 / ConcurrencyLimiter<br/>MirrorProtocol 多源竞速 / RateLimiter"]
         SCH["tachyon-scheduler<br/>AdaptiveDownloadScheduler<br/>HoltLinearPredictor 双指数平滑"]
     end
 
@@ -95,7 +95,7 @@ graph TB
 | Crate | 职责 | 关键文件 |
 |------|------|----------|
 | `tachyon-core` | 所有 crate 共享的公共接口：类型、trait 抽象、错误体系、配置与安全校验 | `src/{config,error,traits,types,safety,utils}.rs` |
-| `tachyon-engine` | 分片引擎、连接池、多源竞速、限速器、下载任务编排 | `src/{downloader,connection,fragment,mirror,circuit_breaker,rate_limit,storage_adapter}.rs` |
+| `tachyon-engine` | 分片引擎、并发许可器、多源竞速、限速器、下载任务编排 | `src/{downloader,connection,fragment,mirror,circuit_breaker,rate_limit,storage_adapter}.rs` |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 | `src/{scheduler,predictor,download_scheduler}.rs` |
 | `tachyon-io` | 跨平台异步文件 I/O，多后端自动选择 | `src/{iouring,iocp,winio,tokio_file,buffer,storage}.rs` |
 | `tachyon-protocol` | HTTP/HTTPS/QUIC/BitTorrent Magnet 协议统一抽象 | `src/{http,magnet}.rs` |
@@ -217,7 +217,7 @@ rate_limiter, metrics, circuit_breakers
 
 | 模块 | 说明 |
 |------|------|
-| `ConnectionPool` | 全局连接池，`Semaphore` 按 host 和全局两级限流 |
+| `ConnectionPool` | 全局**并发许可器**（非 TCP 池），`Semaphore` 按 host/全局限并发请求；真连接池在 reqwest Client |
 | `MirrorProtocol` | 多镜像源适配器，主源失败自动 fallback |
 | `FragmentRecord` | 分片记录，含 `FragmentState` 状态机和 `BandwidthTracker` |
 | `RateLimiter` | 无锁令牌桶限速器，支持多任务共享 |
@@ -303,7 +303,7 @@ Tauri 层暴露的 HF 命令包括：浏览仓库文件、获取下载 URL、获
 
 ### 4.10 tachyon-app - Tauri 应用入口
 
-> **已知技术债（分层）**：`tachyon-app` 当前直接依赖 `tachyon-io::BufferPool`、`tachyon-scheduler::AdaptiveDownloadScheduler`、`tachyon-crypto::CpuVerifier`，绕过 `tachyon-engine` 封装。按 AGENTS.md 分层规则（core > {protocol,io,crypto,scheduler} > engine > app），这些组装应经 `tachyon-engine` 的工厂/配置化入口暴露，避免应用层跨层选具体部件。后续重构应收敛为一个引擎拥有的组装入口。
+> **分层（A-01 已收敛）**：`tachyon-app` 不再直接依赖 `tachyon-io` / `tachyon-scheduler` / `tachyon-crypto`。`BufferPool`、`create_adaptive_scheduler`、`sha256_file` 等由 `tachyon-engine` 门面再导出；app 只依赖 core/engine/hub/sniffer/store。
 
 **注册的 Tauri IPC 命令**（当前 41 个）：
 
@@ -500,6 +500,8 @@ flowchart LR
     PERSIST --> KV
 ```
 
+> **SEC-007 代理信任边界**:直连路径由 `PublicDnsResolver`/`reject_forbidden_ip` 过滤私网目标;启用 HTTP/SOCKS 代理后,目标域名解析与可达 IP 由代理决定,本地过滤器不覆盖代理后端。仅使用可信代理。
+
 ### 6.2 下载任务状态机
 
 ```mermaid
@@ -543,15 +545,18 @@ stateDiagram-v2
 
 ## 7. 关键机制
 
-### 7.1 ConnectionPool
+### 7.1 ConnectionPool（并发许可器）
 
-- 两级 `Semaphore`：`max_per_host` 限制单 host 并发，`max_global` 限制全局并发。
-- 使用 `DashMap` 维护 host 级信号量，避免多个任务重复建立连接。
+- **诚实命名（A-02）**：历史类型名 `ConnectionPool`，语义实为 `ConcurrencyLimiter`（`pub type ConcurrencyLimiter = ConnectionPool`）。
+- **不持有 TCP 连接**。TCP/TLS/H2 连接复用由 reqwest `Client` 与进程级 `HttpClientRegistry` 负责。
+- 两级 `Semaphore`：`max_per_host` 限制单 host **并发请求许可**，`max_global` 限制全局并发。
+- 指标：`active_requests()` / `host_active_requests()`（历史别名 `active_connections` 仍可用，但表示许可占用而非 socket 数）。
+- 使用 `DashMap` 维护 host 级信号量索引，降低高并发下的锁竞争。
 - 关闭时返回错误而非 panic。
 
 ### 7.2 RateLimiter
 
-- 无锁令牌桶，支持跨任务共享全局限速。
+- 无锁令牌桶，支持跨任务共享全局限速（`InfraState.global_rate_limiter` 注入所有任务）。
 - 每个分片在写入前尝试获取令牌，不足时异步等待。
 
 ### 7.3 SourceCircuitBreakers

@@ -251,7 +251,7 @@ mod tests {
             );
             // 往返:反序列化必须还原
             let deserialized: FileCategory =
-                serde_json::from_str(&expected_json).expect("反序列化失败");
+                serde_json::from_str(expected_json).expect("反序列化失败");
             assert_eq!(deserialized, variant, "反序列化 {expected_json} 失配");
         }
     }

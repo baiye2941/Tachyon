@@ -137,6 +137,17 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
                     )));
                 }
             };
+            // 审计 HLS-08:仅 identity KEYFORMAT(或缺省)支持 AES-128
+            if method == EncryptionMethod::Aes128 {
+                match attrs.get("KEYFORMAT").map(|s| s.as_str()) {
+                    None | Some("identity") => {}
+                    Some(fmt) => {
+                        return Err(DownloadError::Protocol(format!(
+                            "不支持的 EXT-X-KEY KEYFORMAT={fmt}(仅 identity/缺省); line={line}"
+                        )));
+                    }
+                }
+            }
             let uri = attrs.get("URI").cloned();
             // FIX-18.2:密钥 URI 必须相对播放列表 base_url 解析(与分片 URI 一致),
             // 否则相对密钥地址(如 URI="key.bin")会被 reqwest::Url::parse 拒绝。
@@ -158,6 +169,15 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
                     global_encryption = Some(key);
                 }
             }
+        } else if line.starts_with("#EXT-X-MAP:") || line.starts_with("#EXT-X-MAP") {
+            // 审计 HLS-03:未实现 MAP/fMP4,硬拒绝避免静默产出坏文件
+            return Err(DownloadError::Protocol(
+                "不支持 EXT-X-MAP(fMP4/初始化段);当前仅支持简单 TS/AES-128 VOD".into(),
+            ));
+        } else if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Err(DownloadError::Protocol(
+                "不支持 EXT-X-BYTERANGE;当前仅支持整段 TS 分片".into(),
+            ));
         } else if line.starts_with("#EXT-X-ENDLIST") {
             is_vod = true;
         } else if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
@@ -252,6 +272,9 @@ fn resolve_uri(uri: &str, base_url: Option<&str>) -> DownloadResult<String> {
 
 // ── HLS 协议实现 ────────────────────────────────────────────────────
 
+/// HLS segment/key 可重试次数(额外 attempt,总次数 = 1 + N)
+const HLS_SEGMENT_MAX_RETRIES: u32 = 3;
+
 /// AES-128-CBC 解密 HLS 加密分片
 ///
 /// # 参数
@@ -280,7 +303,9 @@ async fn decrypt_aes128(
         .uri
         .as_ref()
         .ok_or_else(|| DownloadError::Protocol("AES-128 密钥缺少 URI".into()))?;
-    let key_bytes = http.get_bytes(key_uri).await?;
+    let key_bytes = http
+        .get_bytes_with_retry(key_uri, HLS_SEGMENT_MAX_RETRIES)
+        .await?;
     if key_bytes.len() != 16 {
         return Err(DownloadError::Protocol(format!(
             "AES-128 密钥长度非法: 预期 16 字节, 实际 {}",
@@ -329,6 +354,24 @@ async fn decrypt_aes128(
     Ok(Bytes::from(plaintext.to_vec()))
 }
 
+/// 审计 HLS-05:将 playlist URL 的默认产物名改为媒体后缀。
+///
+/// 下载内容是 TS 分片拼接,不是 m3u8 文本;扩展名与 content_type 对齐为 .ts。
+fn hls_output_filename(url: &str) -> String {
+    let name = extract_filename(url, None);
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".m3u8") {
+        format!("{}.ts", &name[..name.len() - 5])
+    } else if lower.ends_with(".m3u") {
+        format!("{}.ts", &name[..name.len() - 4])
+    } else if lower.ends_with(".ts") {
+        name
+    } else {
+        // 无已知后缀:追加 .ts,避免写成 playlist 名
+        format!("{name}.ts")
+    }
+}
+
 /// HLS 协议客户端
 pub struct HlsProtocol {
     http: Arc<HttpClient>,
@@ -364,24 +407,26 @@ impl HlsProtocol {
         self: &Arc<Self>,
         url: &str,
     ) -> DownloadResult<(Playlist, String)> {
-        let content = self.http.get_text(url, &[]).await?;
-        let playlist = parse_m3u8(&content, Some(url))?;
+        // 审计 HLS-09:用重定向后 final URL 作为相对 URI 基址
+        let (content, final_url) = self.http.get_text_with_final_url(url, &[]).await?;
+        let playlist = parse_m3u8(&content, Some(&final_url))?;
         match playlist {
             Playlist::Master { .. } => {
                 let best = Self::select_best_variant(&playlist)
                     .ok_or_else(|| DownloadError::Protocol("master playlist 无 variant".into()))?;
-                // 解析为绝对 URI(parse_m3u8 已基于 base_url 解析)
-                let best_uri = resolve_uri(best, Some(url))?;
-                let content = self.http.get_text(&best_uri, &[]).await?;
-                let media = parse_m3u8(&content, Some(&best_uri))?;
+                // 解析为绝对 URI:基址为 master 的 final_url
+                let best_uri = resolve_uri(best, Some(&final_url))?;
+                let (content, media_final) =
+                    self.http.get_text_with_final_url(&best_uri, &[]).await?;
+                let media = parse_m3u8(&content, Some(&media_final))?;
                 match media {
-                    Playlist::Media { .. } => Ok((media, best_uri)),
+                    Playlist::Media { .. } => Ok((media, media_final)),
                     _ => Err(DownloadError::Protocol(
                         "variant URI 不是 media playlist".into(),
                     )),
                 }
             }
-            Playlist::Media { .. } => Ok((playlist, url.to_string())),
+            Playlist::Media { .. } => Ok((playlist, final_url)),
         }
     }
 }
@@ -408,7 +453,8 @@ impl Protocol for HlsProtocol {
                     // Some(file_size) 当作精确 EOF 后置条件(pos != expected_size -> Err),
                     // 导致码率估算与真实长度不符时正确下载被误判失败。
                     // 正确做法:file_size 为 None(大小未知),引擎对未知大小走宽松完成路径。
-                    let file_name = extract_filename(&url, None);
+                    // 审计 HLS-05:VOD 产物是 TS concat,文件名不应保留 .m3u8
+                    let file_name = hls_output_filename(&url);
                     Ok(FileMetadata {
                         file_name,
                         file_size: None,
@@ -418,6 +464,7 @@ impl Protocol for HlsProtocol {
                         last_modified: None,
                         file_layout: None,
                         protocol_managed_storage: false,
+                        resolved_host: None,
                     })
                 }
                 _ => Err(DownloadError::Protocol(
@@ -473,7 +520,10 @@ impl Protocol for HlsProtocol {
                 } => {
                     let mut buf = Vec::new();
                     for (i, seg) in segments.iter().enumerate() {
-                        let data = hls.http.get_bytes(&seg.uri).await?;
+                        let data = hls
+                            .http
+                            .get_bytes_with_retry(&seg.uri, HLS_SEGMENT_MAX_RETRIES)
+                            .await?;
                         // FIX-18.3:download_full 必须与 download_full_stream 一致地对
                         // AES-128 分片解密(旧实现直接拼接密文,两个 API 结果不同)。
                         let data = match &seg.encryption {
@@ -539,7 +589,10 @@ impl Protocol for HlsProtocol {
                                 None
                             } else {
                                 let (uri, encryption) = &segs[i];
-                                match http.get_bytes(uri).await {
+                                match http
+                                    .get_bytes_with_retry(uri, HLS_SEGMENT_MAX_RETRIES)
+                                    .await
+                                {
                                     Ok(data) => {
                                         // AES-128-CBC 解密(若分片已加密)
                                         let data = match encryption {
@@ -912,6 +965,16 @@ plain.ts
             meta.file_size.is_none(),
             "HLS probe 的 file_size 必须为 None(大小未知),不得用码率估算值"
         );
+        // 审计 HLS-05:产物名应是 .ts 而非 .m3u8
+        assert!(
+            meta.file_name.ends_with(".ts"),
+            "HLS 产物文件名应为 .ts,实际: {}",
+            meta.file_name
+        );
+        assert!(
+            !meta.file_name.to_ascii_lowercase().ends_with(".m3u8"),
+            "不得保留 playlist 扩展名"
+        );
     }
 
     #[tokio::test]
@@ -1172,5 +1235,170 @@ plain.ts
             cipher.as_slice(),
             "结果不得等于密文(旧 bug:download_full 直接拼接密文)"
         );
+    }
+
+    /// 审计 HLS-06:segment 首次 503 后重试成功
+    #[tokio::test]
+    async fn test_hls_segment_retries_on_transient_error() {
+        use wiremock::MockServer;
+        use wiremock::matchers::path;
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let m3u8 = format!(
+            "#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:1.0,
+{base}/seg0.ts
+#EXT-X-ENDLIST
+"
+        );
+        Mock::given(method("GET"))
+            .and(path("/pl.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(m3u8))
+            .mount(&server)
+            .await;
+        // 第一次 503,第二次 200
+        Mock::given(method("GET"))
+            .and(path("/seg0.ts"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/seg0.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SEGDATA".to_vec()))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        let data = hls
+            .download_full(&format!("{base}/pl.m3u8"))
+            .await
+            .expect("503 后应重试成功");
+        assert_eq!(data.as_ref(), b"SEGDATA");
+    }
+
+    #[test]
+    fn test_parse_rejects_ext_x_map() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:1.0,
+seg.m4s
+#EXT-X-ENDLIST
+"#;
+        let err = parse_m3u8(content, Some("https://cdn.example/p.m3u8")).unwrap_err();
+        assert!(
+            err.to_string().contains("EXT-X-MAP") || err.to_string().contains("MAP"),
+            "应拒绝 MAP: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_ext_x_byterange() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:4
+#EXTINF:1.0,
+#EXT-X-BYTERANGE:1000@0
+seg.ts
+#EXT-X-ENDLIST
+"#;
+        let err = parse_m3u8(content, Some("https://cdn.example/p.m3u8")).unwrap_err();
+        assert!(
+            err.to_string().contains("BYTERANGE") || err.to_string().contains("字节"),
+            "应拒绝 BYTERANGE: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hls_output_filename_replaces_m3u8() {
+        assert_eq!(
+            super::hls_output_filename("https://cdn.example/v/movie.m3u8?token=1"),
+            "movie.ts"
+        );
+        assert_eq!(super::hls_output_filename("https://x/a.m3u"), "a.ts");
+        assert_eq!(super::hls_output_filename("https://x/a.ts"), "a.ts");
+    }
+
+    #[test]
+    fn test_parse_rejects_non_identity_keyformat() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin",KEYFORMAT="com.apple.streamingkeydelivery"
+#EXTINF:1.0,
+seg.ts
+#EXT-X-ENDLIST
+"#;
+        let err = parse_m3u8(content, Some("https://cdn.example/p.m3u8")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KEYFORMAT") || msg.contains("keyformat") || msg.contains("不支持"),
+            "应拒绝非 identity KEYFORMAT: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_accepts_identity_keyformat() {
+        let content = r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin",KEYFORMAT="identity"
+#EXTINF:1.0,
+seg.ts
+#EXT-X-ENDLIST
+"#;
+        let pl = parse_m3u8(content, Some("https://cdn.example/p.m3u8")).expect("identity 应接受");
+        match pl {
+            Playlist::Media { segments, .. } => {
+                assert_eq!(segments.len(), 1);
+                assert!(segments[0].encryption.is_some());
+            }
+            _ => panic!("expected media"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hls_relative_segment_uses_redirect_final_url() {
+        use wiremock::MockServer;
+        use wiremock::matchers::path;
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        // /entry.m3u8 -> 302 /nested/media.m3u8
+        Mock::given(method("GET"))
+            .and(path("/entry.m3u8"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{base}/nested/media.m3u8")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nested/media.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:1.0,
+seg.ts
+#EXT-X-ENDLIST
+",
+            ))
+            .mount(&server)
+            .await;
+        // 相对 seg.ts 必须解析到 /nested/seg.ts
+        Mock::given(method("GET"))
+            .and(path("/nested/seg.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OKNEST".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        let data = hls
+            .download_full(&format!("{base}/entry.m3u8"))
+            .await
+            .expect("redirect 后相对 URI 应基于 final URL");
+        assert_eq!(data.as_ref(), b"OKNEST");
     }
 }

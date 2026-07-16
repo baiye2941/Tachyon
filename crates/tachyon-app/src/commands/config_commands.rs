@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tachyon_core::config::{AppConfig, ConfigPatch};
+use tachyon_engine::BufferPool;
 
 use super::{AppError, AppState};
 
@@ -46,6 +47,101 @@ pub async fn update_config(
     update_config_inner(&state, patch).await
 }
 
+/// 审计 SEC-002:显式授权下载目录(需确认令牌),禁止 create_task 静默扩权
+#[tauri::command]
+pub async fn authorize_download_directory(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    confirmation_token: Option<String>,
+) -> Result<String, AppError> {
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "authorize_download_directory")?;
+        }
+        None => {
+            return Err(AppError::Config(
+                "授权下载目录需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    authorize_download_directory_inner(&state, path).await
+}
+
+pub(crate) async fn authorize_download_directory_inner(
+    state: &AppState,
+    path: String,
+) -> Result<String, AppError> {
+    let validated = validate_explicit_download_dir(&path)?;
+    let mut cfg = state.domain.config.lock().await;
+    if !cfg.download.authorized_dirs.iter().any(|d| d == &validated) {
+        cfg.download.authorized_dirs.push(validated.clone());
+    }
+    let to_save = cfg.clone();
+    drop(cfg);
+    tokio::task::spawn_blocking(move || persist_config(&to_save))
+        .await
+        .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
+    tracing::info!(dir = %validated, "已授权下载目录");
+    Ok(validated)
+}
+
+/// 路径是否落在任一 authorized_dirs 之下(SEC-006 备份路径门禁)
+pub(crate) fn path_under_authorized_dirs(
+    config: &AppConfig,
+    path: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    let requested = std::path::Path::new(path);
+    if requested.as_os_str().is_empty() {
+        return Err(AppError::Config("路径不能为空".into()));
+    }
+    if !requested.is_absolute() {
+        return Err(AppError::Config(format!(
+            "路径必须是绝对路径: {}",
+            requested.display()
+        )));
+    }
+    if requested
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Config(format!(
+            "路径不能包含 .. : {}",
+            requested.display()
+        )));
+    }
+    let roots = canonical_authorized_roots(config)?;
+    if roots.is_empty() {
+        return Err(AppError::Config("authorized_dirs 为空,拒绝路径操作".into()));
+    }
+    // 文件可能尚不存在:校验 parent 的 deepest existing ancestor
+    let check_path = if requested.exists() {
+        requested.to_path_buf()
+    } else {
+        requested
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| requested.to_path_buf())
+    };
+    let existing = deepest_existing_ancestor(&check_path)
+        .ok_or_else(|| AppError::Config(format!("路径无效: {}", requested.display())))?;
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|_| AppError::Config(format!("路径无法解析: {}", requested.display())))?;
+    let under = roots
+        .iter()
+        .any(|root| canonical_existing == *root || canonical_existing.starts_with(root));
+    if !under {
+        return Err(AppError::Config(format!(
+            "路径不在 authorized_dirs 下: {}",
+            requested.display()
+        )));
+    }
+    Ok(requested.to_path_buf())
+}
+
 // ---------------------------------------------------------------------------
 // Inner implementations
 // ---------------------------------------------------------------------------
@@ -70,6 +166,9 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
 
     // 在写入新配置前记录新的 download_dir(避免写后读竞态)
     let new_download_dir = updated.download.download_dir.clone();
+    let old_download_dir = cfg.download.download_dir.clone();
+    // 审计 A-08:download_dir 变化也必须重建 BtSession(Session 固化 default_output_folder)
+    let download_dir_changed = new_download_dir != old_download_dir;
     // 检查 magnet 配置是否有变更,必须在 drop(cfg) 前完成比较
     let magnet_changed = updated.magnet != cfg.magnet;
     let magnet_config = updated.magnet.clone();
@@ -79,6 +178,23 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     let old_connection = cfg.connection.clone();
     let new_connection = updated.connection.clone();
     let connection_changed = !connection_eq(&old_connection, &new_connection);
+
+    // 审计 A-08:先构造新 BtSession,成功后再提交配置,避免"配置已保存但 Session 仍用旧目录"。
+    #[cfg(feature = "magnet")]
+    let pending_bt_session = if bt_session_needs_rebuild(magnet_changed, download_dir_changed) {
+        let download_dir = std::path::PathBuf::from(&new_download_dir);
+        match tachyon_engine::BtSession::new(download_dir, magnet_config).await {
+            Ok(new_session) => Some(Arc::new(new_session)),
+            Err(e) => {
+                return Err(AppError::Config(format!(
+                    "BtSession 重建失败,配置未更新: {e}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     *cfg = updated;
     // 将配置变更持久化到磁盘,避免重启后丢失
     let config_to_save = cfg.clone();
@@ -97,25 +213,16 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
     tracing::info!("应用配置已更新并持久化(白名单补丁模式)");
 
-    // BtSession 热切换:magnet 配置变更时重建 Session
+    // BtSession 热切换:提交已预构建的 Session
     #[cfg(feature = "magnet")]
-    if magnet_changed {
-        let download_dir = {
-            let cfg = state.domain.config.lock().await;
-            std::path::PathBuf::from(&cfg.download.download_dir)
-        };
-        match tachyon_engine::BtSession::new(download_dir, magnet_config).await {
-            Ok(new_session) => {
-                let mut bt_session = state.infra.bt_session.lock().await;
-                *bt_session = Some(Arc::new(new_session));
-                tracing::info!("BitTorrent Session 已热切换(磁力链接配置变更)");
-            }
-            Err(e) => {
-                // Session 重建失败:配置已持久化但 Session 未更新
-                // 下次启动会用新配置创建 Session,记录警告而非返回错误
-                tracing::warn!(error = %e, "BtSession 热切换失败,下次启动时生效");
-            }
-        }
+    if let Some(new_session) = pending_bt_session {
+        let mut bt_session = state.infra.bt_session.lock().await;
+        *bt_session = Some(new_session);
+        tracing::info!(
+            magnet_changed,
+            download_dir_changed,
+            "BitTorrent Session 已热切换"
+        );
     }
 
     // 连接池热重建:连接配置变更时重建 ConnectionPool。
@@ -123,11 +230,39 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
     // 故采用「外层句柄热替换」:写锁内用新配置构造新 pool 替换内层 Arc<ConnectionPool>。
     // 运行中任务持有的旧 pool Arc clone 自然存活至引用归零,新任务拿到新 pool。
     if connection_changed {
-        use tachyon_engine::connection::{ConnectionPool, PoolConfig};
+        use tachyon_engine::{ConnectionPool, PoolConfig};
         let new_pool = Arc::new(ConnectionPool::new(PoolConfig::from(new_connection)));
         let mut pool_guard = state.infra.connection_pool.write().await;
         *pool_guard = new_pool;
         tracing::info!("ConnectionPool 已热重建(连接配置变更)");
+    }
+
+    // 审计 A-03:全局限速即时更新(None → 0 表示不限速)
+    let (new_rate, new_tasks, new_frags) = {
+        let cfg = state.domain.config.lock().await;
+        (
+            cfg.download.rate_limit_bytes_per_sec.unwrap_or(0),
+            cfg.max_concurrent_tasks,
+            cfg.download.max_concurrent_fragments,
+        )
+    };
+    state.infra.global_rate_limiter.update_rate(new_rate);
+
+    // 审计 A-14:并发上限变更时热重建 BufferPool(容量=任务×分片)。
+    // 与 ConnectionPool 同模式:旧池 Arc 由运行中任务持有至引用归零,新任务读锁拿新池。
+    let desired_capacity = (new_tasks as usize).saturating_mul(new_frags as usize);
+    {
+        let mut pool_guard = state.infra.buffer_pool.write().await;
+        if pool_guard.capacity() != desired_capacity {
+            *pool_guard = Arc::new(BufferPool::new(
+                tachyon_core::config::WRITE_BATCH_BYTES,
+                desired_capacity.max(1),
+            ));
+            tracing::info!(
+                capacity = desired_capacity,
+                "BufferPool 已热重建(并发配置变更)"
+            );
+        }
     }
 
     Ok(())
@@ -147,6 +282,11 @@ fn connection_eq(
         && a.connect_timeout_secs == b.connect_timeout_secs
         && a.enable_http2 == b.enable_http2
         && a.enable_quic == b.enable_quic
+}
+
+/// 审计 A-08:BtSession 是否需要因配置变更重建
+fn bt_session_needs_rebuild(magnet_changed: bool, download_dir_changed: bool) -> bool {
+    magnet_changed || download_dir_changed
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +801,7 @@ mod tests {
                 verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
+                auth_bearer: None,
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
                 max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
@@ -722,6 +863,129 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_a08_bt_session_needs_rebuild_matrix() {
+        assert!(!bt_session_needs_rebuild(false, false));
+        assert!(bt_session_needs_rebuild(true, false));
+        assert!(bt_session_needs_rebuild(false, true));
+        assert!(bt_session_needs_rebuild(true, true));
+    }
+
+    /// 审计 A-03:update_config 应即时更新全局 RateLimiter 速率
+    #[tokio::test]
+    async fn test_a03_update_config_updates_global_rate_limiter() {
+        let state = test_state();
+        assert_eq!(state.infra.global_rate_limiter.bytes_per_sec(), 0);
+
+        let patch = ConfigPatch {
+            download: Some(DownloadPatch {
+                download_dir: None,
+                max_concurrent_fragments: None,
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: Some(Some(1_048_576)),
+                io_strategy: None,
+                proxy: None,
+                enable_work_stealing: None,
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, patch).await.unwrap();
+        assert_eq!(
+            state.infra.global_rate_limiter.bytes_per_sec(),
+            1_048_576,
+            "A-03:配置限速变更后 global_rate_limiter 必须 update_rate"
+        );
+
+        // None → 0 不限速
+        let clear = ConfigPatch {
+            download: Some(DownloadPatch {
+                download_dir: None,
+                max_concurrent_fragments: None,
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: Some(None),
+                io_strategy: None,
+                proxy: None,
+                enable_work_stealing: None,
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, clear).await.unwrap();
+        assert_eq!(
+            state.infra.global_rate_limiter.bytes_per_sec(),
+            0,
+            "A-03:限速关闭后速率应为 0"
+        );
+    }
+
+    /// 审计 A-14:并发配置变更后 BufferPool 容量热重建
+    #[tokio::test]
+    async fn test_a14_update_config_rebuilds_buffer_pool() {
+        let state = test_state();
+        let old_pool = state.infra.buffer_pool.read().await.clone();
+        let old_cap = old_pool.capacity();
+        assert_eq!(old_cap, 5 * 16, "test_state 默认 5×16");
+
+        let patch = ConfigPatch {
+            max_concurrent_tasks: Some(10),
+            download: Some(DownloadPatch {
+                download_dir: None,
+                max_concurrent_fragments: Some(32),
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: None,
+                io_strategy: None,
+                proxy: None,
+                enable_work_stealing: None,
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, patch).await.unwrap();
+
+        let new_pool = state.infra.buffer_pool.read().await.clone();
+        assert_eq!(
+            new_pool.capacity(),
+            10 * 32,
+            "A-14:BufferPool 容量应=新 max_tasks×max_fragments"
+        );
+        assert_ne!(
+            Arc::as_ptr(&old_pool),
+            Arc::as_ptr(&new_pool),
+            "A-14:容量变化必须替换为新 Arc,旧任务可继续持有旧池"
+        );
+        // 旧池对象仍可用(运行中任务语义)
+        assert_eq!(old_pool.capacity(), old_cap);
+    }
+
+    /// 审计 A-04:SchedulerConfig 可通过 ConfigPatch 持久化且可被读取(生产注入源)
+    #[tokio::test]
+    async fn test_a04_scheduler_config_patch_persists() {
+        let state = test_state();
+        let patch = ConfigPatch {
+            scheduler: Some(tachyon_core::config::SchedulerPatch {
+                min_fragment_size: Some(2 * 1024 * 1024),
+                max_fragment_size: Some(32 * 1024 * 1024),
+                ewma_alpha: Some(0.5),
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, patch).await.unwrap();
+        let cfg = get_config_inner(&state).await.unwrap();
+        assert_eq!(cfg.scheduler.min_fragment_size, 2 * 1024 * 1024);
+        assert_eq!(cfg.scheduler.max_fragment_size, 32 * 1024 * 1024);
+        assert!((cfg.scheduler.ewma_alpha - 0.5).abs() < f64::EPSILON);
+    }
+
     #[tokio::test]
     async fn test_get_config_returns_defaults() {
         let state = test_state();
@@ -729,7 +993,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_tasks, 5);
         assert_eq!(cfg.download.max_concurrent_fragments, 16);
         assert_eq!(cfg.connection.max_connections_per_host, 16);
-        assert!(cfg.connection.enable_quic); // 默认 true(运行期意图开关)
+        assert!(!cfg.connection.enable_quic); // 审计 HTTP-10:默认 false
         assert!(cfg.download.verify_checksum);
     }
 
@@ -778,6 +1042,73 @@ mod tests {
         assert_eq!(cfg.connection.max_connections_per_host, 8);
         assert!(cfg.connection.enable_quic);
         assert!(!cfg.download.verify_checksum);
+    }
+
+    /// 审计 A-08:仅修改 download_dir(magnet 不变)也必须重建 BtSession 目录绑定
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_a08_download_dir_change_rebuilds_bt_session() {
+        let state = test_state();
+        let existing_auth_dir = std::env::temp_dir().join("tachyon-test-downloads");
+        let _ = std::fs::create_dir_all(&existing_auth_dir);
+
+        let dir_a = existing_auth_dir.join("bt-a08-a");
+        let dir_b = existing_auth_dir.join("bt-a08-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // 种子:先设 dir_a 并预置一个 Session,模拟生产已初始化
+        let patch_a = ConfigPatch {
+            download: Some(DownloadPatch {
+                download_dir: Some(dir_a.to_string_lossy().into()),
+                max_concurrent_fragments: None,
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: None,
+                io_strategy: None,
+                proxy: None,
+                enable_work_stealing: None,
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, patch_a).await.unwrap();
+        {
+            let session = state.infra.bt_session.lock().await;
+            let s = session.as_ref().expect("dir_a 更新后应有 BtSession");
+            assert_eq!(s.download_dir(), &dir_a);
+        }
+
+        // 仅改 download_dir → dir_b,magnet 不变
+        let patch_b = ConfigPatch {
+            download: Some(DownloadPatch {
+                download_dir: Some(dir_b.to_string_lossy().into()),
+                max_concurrent_fragments: None,
+                max_retries: None,
+                request_timeout_secs: None,
+                connect_timeout_secs: None,
+                verify_checksum: None,
+                pause_timeout_secs: None,
+                rate_limit_bytes_per_sec: None,
+                io_strategy: None,
+                proxy: None,
+                enable_work_stealing: None,
+            }),
+            ..Default::default()
+        };
+        update_config_inner(&state, patch_b).await.unwrap();
+
+        let cfg = get_config_inner(&state).await.unwrap();
+        assert_eq!(cfg.download.download_dir, dir_b.to_string_lossy());
+        let session = state.infra.bt_session.lock().await;
+        let s = session.as_ref().expect("dir_b 更新后应有 BtSession");
+        assert_eq!(
+            s.download_dir(),
+            &dir_b,
+            "A-08:仅 download_dir 变化也必须重建 Session 到新目录"
+        );
     }
 
     #[tokio::test]
@@ -864,6 +1195,8 @@ mod tests {
             .insert("Authorization".to_string(), "Bearer token".to_string());
         cfg.download.pause_timeout_secs = 42;
         cfg.download.authorized_dirs = vec!["/allowed".to_string()];
+        cfg.download.proxy = Some("socks5://127.0.0.1:1080".to_string());
+        cfg.download.io_strategy = tachyon_core::config::IoStrategy::Iocp;
 
         let download = build_download_config(&cfg, "/chosen");
 
@@ -877,6 +1210,16 @@ mod tests {
         );
         assert_eq!(download.pause_timeout_secs, 42);
         assert_eq!(download.authorized_dirs, vec!["/allowed".to_string()]);
+        assert_eq!(
+            download.proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080"),
+            "A-06/UI:proxy 必须从 AppConfig 进入 DownloadConfig"
+        );
+        assert_eq!(
+            download.io_strategy,
+            tachyon_core::config::IoStrategy::Iocp,
+            "BT-19/UI:io_strategy 必须从 AppConfig 进入 DownloadConfig"
+        );
     }
 
     #[tokio::test]
@@ -948,6 +1291,7 @@ mod tests {
                 verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
                 user_agent: USER_AGENT.to_string(),
                 headers: std::collections::HashMap::new(),
+                auth_bearer: None,
                 pause_timeout_secs: 300,
                 rate_limit_bytes_per_sec: None,
                 max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),

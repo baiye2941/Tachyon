@@ -1,1 +1,18 @@
-{"$schema": "../gen/schemas/desktop-schema.json", "identifier": "default", "description": "Tachyon 主窗口默认权限: 授予核心事件监听、窗口管理、应用生命周期和剪贴板读取权限", "windows": ["main"], "permissions": ["core:default", "core:window:allow-minimize", "core:window:allow-maximize", "core:window:allow-toggle-maximize", "core:window:allow-close", "core:window:allow-is-maximized", "core:window:allow-start-dragging", "dialog:allow-open", "clipboard-manager:allow-read-text"]}
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Tachyon 主窗口默认权限:核心事件/窗口/对话框;剪贴板由后端 ClipboardWatcher 读取,不向 WebView 暴露 clipboard-manager:allow-read-text(SEC-009)",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-dragging",
+    "dialog:allow-open"
+  ]
+}

@@ -1,5 +1,5 @@
 import type { SetStoreFunction } from "solid-js/store";
-import { For, Show } from "solid-js";
+import { For, Show, createResource, createMemo } from "solid-js";
 import { tr } from "../../../i18n";
 import { addToast } from "../../../stores/toast";
 import NumberInput from "../items/NumberInput";
@@ -8,8 +8,9 @@ import ToggleItem from "../items/ToggleItem";
 import TrackerList from "../items/TrackerList";
 import { PRESET_TRACKERS } from "../constants";
 import { computeBtProxyCoverage, type BtProxyCoverageReport } from "../../../utils/btProxyCoverage";
-import type { ProxyCoverage } from "../../../types";
+import type { ProxyCoverage, SocksProxySource } from "../../../types";
 import type { ConfigDraft } from "../SettingsPanel";
+import { api } from "../../../api/invoke";
 
 export interface MagnetTabProps {
   draft: ConfigDraft;
@@ -162,12 +163,53 @@ export default function MagnetTab(props: MagnetTabProps) {
   );
 }
 
-/// FIX-16:BT 代理流量覆盖状态面板。展示各流量类别(peer TCP / HTTP tracker / UDP tracker+DHT /
-/// uTP / UPnP)相对 SOCKS 代理的覆盖状态,让用户知晓隐私边界与可能绕过的流量。
+/// 审计 A-09:BT 代理流量覆盖面板。优先展示后端 Session 运行时 effective SOCKS;
+/// draft 仅作未应用预测,避免环境代理实际生效时 UI 隐藏面板。
 function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
   const t = tr;
-  const report = (): BtProxyCoverageReport =>
-    computeBtProxyCoverage(props.draft.magnet);
+  const [runtime] = createResource(async () => {
+    try {
+      return await api.getBtProxyCoverage();
+    } catch {
+      return null;
+    }
+  });
+
+  const draftReport = createMemo((): BtProxyCoverageReport =>
+    computeBtProxyCoverage(props.draft.magnet),
+  );
+
+  const report = createMemo((): BtProxyCoverageReport => {
+    const rt = runtime();
+    if (rt && rt.socksEnabled) return rt;
+    // 运行时未启用 SOCKS 时,仍展示 draft 预测(用户编辑中的待应用配置)
+    return draftReport();
+  });
+
+  const isDraftOnly = createMemo(() => {
+    const rt = runtime();
+    const d = draftReport();
+    // 草稿有 SOCKS 但运行时无/未加载 → 待应用
+    if (d.socksEnabled && !(rt && rt.socksEnabled)) return true;
+    // 草稿 endpoint 与运行时不同 → 待应用提示
+    if (rt && rt.socksEnabled && d.socksEnabled) {
+      const draftUrl = (props.draft.magnet.socksProxyUrl ?? "").trim();
+      // 仅显式 draft URL 与 runtime 来源比较:环境来源时 draft 为空不标 pending
+      if (draftUrl !== "" && rt.socksSource === "environment") return true;
+    }
+    return false;
+  });
+
+  const sourceLabel = (s?: SocksProxySource): string => {
+    switch (s) {
+      case "explicit":
+        return t("settings.magnet.coverageSourceExplicit");
+      case "environment":
+        return t("settings.magnet.coverageSourceEnvironment");
+      default:
+        return t("settings.magnet.coverageSourceNone");
+    }
+  };
 
   const rows = (): Array<{ label: string; status: ProxyCoverage }> => [
     { label: t("settings.magnet.coveragePeerTcp"), status: report().peerTcp },
@@ -211,6 +253,31 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
         <div style={{ "font-size": "12px", "font-weight": 600, "margin-bottom": "4px" }}>
           {t("settings.magnet.coverageTitle")}
         </div>
+        <Show when={report().socksSource || report().socksEndpointRedacted}>
+          <div
+            style={{
+              "font-size": "11px",
+              color: "var(--color-text-secondary, #888)",
+              "margin-bottom": "4px",
+            }}
+          >
+            {t("settings.magnet.coverageSource")}: {sourceLabel(report().socksSource)}
+            <Show when={report().socksEndpointRedacted}>
+              {(ep) => <> · {ep()}</>}
+            </Show>
+          </div>
+        </Show>
+        <Show when={isDraftOnly()}>
+          <div
+            style={{
+              "font-size": "11px",
+              color: "var(--color-warning, #f59e0b)",
+              "margin-bottom": "4px",
+            }}
+          >
+            {t("settings.magnet.coveragePendingApply")}
+          </div>
+        </Show>
         <For each={rows()}>
           {(row) => (
             <div
@@ -218,7 +285,7 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
                 display: "flex",
                 "justify-content": "space-between",
                 "font-size": "11px",
-                "margin-top": "2px",
+                "line-height": "1.7",
               }}
             >
               <span>{row.label}</span>
@@ -226,7 +293,14 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
             </div>
           )}
         </For>
-        <div style={{ "font-size": "10px", "color": "var(--color-text-secondary)", "margin-top": "4px" }}>
+        <div
+          style={{
+            "font-size": "10px",
+            color: "var(--color-text-tertiary)",
+            "margin-top": "4px",
+            "line-height": "1.4",
+          }}
+        >
           {t("settings.magnet.coverageHint")}
         </div>
       </div>

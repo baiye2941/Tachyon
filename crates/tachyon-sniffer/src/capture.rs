@@ -94,13 +94,13 @@ pub fn identify_resource(url: &str) -> ResourceType {
 pub fn should_capture(url: &str, config: &CaptureConfig) -> bool {
     let resource_type = identify_resource(url);
     if !config.enabled_types.contains(&resource_type) {
-        tracing::debug!(url, resource_type = ?resource_type, accepted = false, "资源被过滤");
+        tracing::debug!(url = %tachyon_core::redact_url_for_log(url), resource_type = ?resource_type, accepted = false, "资源被过滤");
         return false;
     }
     if !config.url_filters.is_empty() {
         let has_match = config.url_filters.iter().any(|f| url.contains(f.as_str()));
         if !has_match {
-            tracing::debug!(url, accepted = false, "资源被过滤");
+            tracing::debug!(url = %tachyon_core::redact_url_for_log(url), accepted = false, "资源被过滤");
             return false;
         }
     }

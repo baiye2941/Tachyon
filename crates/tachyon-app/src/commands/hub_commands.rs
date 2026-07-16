@@ -229,20 +229,17 @@ async fn compute_verify_status(job: VerifyJob) -> (String, VerifyStatus) {
             if !Path::new(&save_path).exists() {
                 return (file_path, VerifyStatus::Failed("文件不存在".to_string()));
             }
-            let verifier = tachyon_crypto::cpu::CpuVerifier::sha256();
-            let status = match verifier
-                .compute_hash_from_path(std::path::Path::new(&save_path), 8192)
-                .await
-            {
-                Ok(hash) => {
-                    if hash.eq_ignore_ascii_case(&oid) {
-                        VerifyStatus::Verified
-                    } else {
-                        VerifyStatus::Failed(format!("sha256 不匹配: 期望 {oid}, 实际 {hash}"))
+            let status =
+                match tachyon_engine::sha256_file(std::path::Path::new(&save_path), 8192).await {
+                    Ok(hash) => {
+                        if hash.eq_ignore_ascii_case(&oid) {
+                            VerifyStatus::Verified
+                        } else {
+                            VerifyStatus::Failed(format!("sha256 不匹配: 期望 {oid}, 实际 {hash}"))
+                        }
                     }
-                }
-                Err(e) => VerifyStatus::Failed(format!("校验计算失败: {e}")),
-            };
+                    Err(e) => VerifyStatus::Failed(format!("校验计算失败: {e}")),
+                };
             (file_path, status)
         }
         VerifyJob::Size {

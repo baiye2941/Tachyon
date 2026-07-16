@@ -14,7 +14,7 @@ use crate::kv::KvStore;
 /// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
 /// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
 /// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 
 /// 下载任务快照（用于断点续传）
 ///
@@ -32,6 +32,9 @@ pub struct TaskSnapshot {
     /// 旧 JSON 不含此字段时默认为 0,加载后可检测并补填。
     #[serde(default)]
     pub schema_version: u32,
+    /// 审计 H-05:单调 revision。full-save / patch 成功后 +1;旧 revision 不得覆盖新值。
+    #[serde(default)]
+    pub revision: u64,
     pub id: String,
     pub url: String,
     pub save_path: String,
@@ -114,6 +117,7 @@ impl From<TaskRecord> for TaskSnapshot {
     fn from(r: TaskRecord) -> Self {
         Self {
             schema_version: 0, // 旧记录无 schema 版本,标记为 0 表示需要迁移
+            revision: 0,
             id: r.task_id,
             url: r.url,
             save_path: r.save_path.clone(),
@@ -167,8 +171,11 @@ pub struct RecoveryResult {
 /// (fsync 数据文件 + 目录),以满足崩溃恢复承诺(见 [`Self::save_task_snapshot`])。
 pub struct RecoveryManager {
     store: KvStore,
-    /// 序列化 read-modify-write 操作,防止并发分片进度更新丢失
+    /// 序列化所有快照 mutation(full-save / patch / delete),防止并发覆盖
     progress_lock: std::sync::Mutex<()>,
+    /// 审计 H-05:删除 tombstone。key=task_id, value=删除时磁盘 revision。
+    /// 之后任何 `revision <= tombstone` 的 save 拒绝,防止旧 full-save 复活已删任务。
+    delete_tombstones: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl RecoveryManager {
@@ -177,6 +184,7 @@ impl RecoveryManager {
         Self {
             store,
             progress_lock: std::sync::Mutex::new(()),
+            delete_tombstones: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -199,8 +207,54 @@ impl RecoveryManager {
     /// 限频(批量 + 时间间隔双维度节流),Durable 的 fsync 开销被摊薄到可控频率,
     /// 不会成为每分片的热点。
     pub fn save_task_snapshot(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
-        self.store
-            .put_durable(&format!("task_{}", snapshot.id), snapshot)
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.save_task_snapshot_locked(snapshot)
+    }
+
+    /// 撤销删除等显式恢复路径:清除 tombstone 后强制写入。
+    pub fn restore_task_snapshot(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut tombs) = self.delete_tombstones.lock() {
+            tombs.remove(&snapshot.id);
+        }
+        self.save_task_snapshot_locked(snapshot)
+    }
+
+    fn save_task_snapshot_locked(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
+        let key = format!("task_{}", snapshot.id);
+
+        // tombstone:拒绝基于删除前状态的旧写
+        if let Ok(tombs) = self.delete_tombstones.lock()
+            && let Some(&tomb_rev) = tombs.get(&snapshot.id)
+            && snapshot.revision <= tomb_rev
+        {
+            tracing::warn!(
+                task_id = %snapshot.id,
+                incoming_revision = snapshot.revision,
+                tombstone_revision = tomb_rev,
+                "拒绝写入已删除任务快照(H-05 tombstone)"
+            );
+            return Ok(());
+        }
+
+        let existing = self.load_task_snapshot_by_key(&key)?;
+        let base_rev = existing.as_ref().map(|s| s.revision).unwrap_or(0);
+        if snapshot.revision < base_rev {
+            tracing::warn!(
+                task_id = %snapshot.id,
+                incoming_revision = snapshot.revision,
+                disk_revision = base_rev,
+                "拒绝过期快照写入(H-05 revision CAS)"
+            );
+            return Ok(());
+        }
+
+        let mut to_write = snapshot.clone();
+        to_write.revision = base_rev.saturating_add(1);
+        if to_write.schema_version < SNAPSHOT_SCHEMA_VERSION {
+            to_write.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        }
+        self.store.put_durable(&key, &to_write)
     }
 
     /// 加载任务快照
@@ -253,9 +307,20 @@ impl RecoveryManager {
         Ok(self.load_task_snapshot(task_id)?.map(TaskRecord::from))
     }
 
-    /// 删除任务记录
+    /// 删除任务记录(审计 H-05:持锁 + tombstone 防旧 save 复活)
     pub fn remove_task(&self, task_id: &str) -> std::io::Result<bool> {
-        self.store.delete(&format!("task_{task_id}"))
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let key = format!("task_{task_id}");
+        let existing_rev = self
+            .load_task_snapshot_by_key(&key)?
+            .map(|s| s.revision)
+            .unwrap_or(0);
+        let deleted = self.store.delete(&key)?;
+        if let Ok(mut tombs) = self.delete_tombstones.lock() {
+            // 即便 key 本就不存在,也记 tombstone,挡住 in-flight 的旧 full-save
+            tombs.insert(task_id.to_string(), existing_rev);
+        }
+        Ok(deleted)
     }
 
     /// 恢复所有未完成的任务
@@ -338,8 +403,11 @@ impl RecoveryManager {
             snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION;
         }
 
-        self.save_task_snapshot(&snapshot)?;
-        Ok(Some(snapshot))
+        // 已持 progress_lock,走 locked save(revision CAS + bump)
+        self.save_task_snapshot_locked(&snapshot)?;
+        // 返回磁盘最终 revision
+        let final_snap = self.load_task_snapshot_by_key(&key)?;
+        Ok(final_snap)
     }
 }
 
@@ -363,6 +431,7 @@ mod tests {
     fn make_snapshot(id: &str, status: tachyon_core::DownloadState) -> TaskSnapshot {
         TaskSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: id.to_string(),
             url: format!("https://example.com/{id}.zip"),
             save_path: format!("/downloads/{id}.zip"),
@@ -445,7 +514,10 @@ mod tests {
         let snap = make_snapshot("s1", tachyon_core::DownloadState::Downloading);
         mgr.save_task_snapshot(&snap).unwrap();
         let loaded = mgr.load_task_snapshot("s1").unwrap().unwrap();
-        assert_eq!(loaded, snap);
+        // save 会 bump revision:0 -> 1
+        let mut expected = snap;
+        expected.revision = 1;
+        assert_eq!(loaded, expected);
     }
 
     #[test]
@@ -524,7 +596,9 @@ mod tests {
         let snap = make_snapshot("empty", tachyon_core::DownloadState::Downloading);
         mgr.save_task_snapshot(&snap).unwrap();
         let loaded = mgr.load_task_snapshot("empty").unwrap().unwrap();
-        assert_eq!(loaded, snap);
+        let mut expected = snap;
+        expected.revision = 1;
+        assert_eq!(loaded, expected);
     }
 
     #[test]
@@ -556,6 +630,7 @@ mod tests {
     fn test_task_snapshot_serializes_typed_status_and_metadata() {
         let snapshot = TaskSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: "task-1".to_string(),
             url: "https://example.com/file.bin".to_string(),
             save_path: "/downloads/file.bin".to_string(),
@@ -712,7 +787,9 @@ mod tests {
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);
         let loaded = mgr.load_task_snapshot("crash").unwrap().unwrap();
-        assert_eq!(loaded, snap);
+        let mut expected = snap;
+        expected.revision = 1;
+        assert_eq!(loaded, expected);
     }
 
     /// B7: `update_snapshot` 同样走 Durable 路径(经 save_task_snapshot),
@@ -792,5 +869,74 @@ mod tests {
         let updated = mgr.update_snapshot("old-schema", |_| {}).unwrap().unwrap();
 
         assert_eq!(updated.schema_version, SNAPSHOT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_h05_stale_full_save_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let mut paused = make_snapshot("h05", tachyon_core::DownloadState::Paused);
+        mgr.save_task_snapshot(&paused).unwrap();
+        let on_disk = mgr.load_task_snapshot("h05").unwrap().unwrap();
+        assert_eq!(on_disk.revision, 1);
+        assert_eq!(on_disk.status, tachyon_core::DownloadState::Paused);
+
+        // 模拟较新 full-save(Downloading)先基于 rev1 写出
+        let mut downloading = on_disk.clone();
+        downloading.status = tachyon_core::DownloadState::Downloading;
+        mgr.save_task_snapshot(&downloading).unwrap();
+        let mid = mgr.load_task_snapshot("h05").unwrap().unwrap();
+        assert_eq!(mid.revision, 2);
+        assert_eq!(mid.status, tachyon_core::DownloadState::Downloading);
+
+        // 旧的 Paused full-save(仍带 rev1)后到,必须拒绝
+        paused.revision = 1;
+        paused.status = tachyon_core::DownloadState::Paused;
+        mgr.save_task_snapshot(&paused).unwrap();
+        let final_snap = mgr.load_task_snapshot("h05").unwrap().unwrap();
+        assert_eq!(final_snap.revision, 2);
+        assert_eq!(
+            final_snap.status,
+            tachyon_core::DownloadState::Downloading,
+            "过期 full-save 不得覆盖较新状态"
+        );
+    }
+
+    #[test]
+    fn test_h05_remove_then_stale_save_does_not_resurrect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let snap = make_snapshot("gone", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&snap).unwrap();
+        let on_disk = mgr.load_task_snapshot("gone").unwrap().unwrap();
+        assert!(mgr.remove_task("gone").unwrap());
+        assert!(mgr.load_task_snapshot("gone").unwrap().is_none());
+
+        // 旧 in-flight save 带着删除前 revision,不得复活
+        mgr.save_task_snapshot(&on_disk).unwrap();
+        assert!(
+            mgr.load_task_snapshot("gone").unwrap().is_none(),
+            "删除后旧 save 不得复活快照"
+        );
+    }
+
+    #[test]
+    fn test_h05_restore_after_delete_clears_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let snap = make_snapshot("undo", tachyon_core::DownloadState::Paused);
+        mgr.save_task_snapshot(&snap).unwrap();
+        let on_disk = mgr.load_task_snapshot("undo").unwrap().unwrap();
+        assert!(mgr.remove_task("undo").unwrap());
+        mgr.restore_task_snapshot(&on_disk).unwrap();
+        let restored = mgr.load_task_snapshot("undo").unwrap().unwrap();
+        assert_eq!(restored.status, tachyon_core::DownloadState::Paused);
+        assert!(restored.revision >= 1);
     }
 }

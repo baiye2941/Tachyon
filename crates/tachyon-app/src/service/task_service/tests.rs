@@ -1015,6 +1015,7 @@ fn make_task_with_order(
 fn empty_snapshot() -> TaskSnapshot {
     TaskSnapshot {
         schema_version: 0,
+        revision: 0,
         id: String::new(),
         url: String::new(),
         save_path: String::new(),

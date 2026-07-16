@@ -105,6 +105,37 @@ fn new_http_client() -> Result<HttpClient, tachyon_core::DownloadError> {
         .map_err(|e| tachyon_core::DownloadError::Config(format!("创建 Hub HTTP 客户端失败: {e}")))
 }
 
+/// 审计 SEC-004:HF token 仅允许发往官方 huggingface.co 主机。
+///
+/// `hf-mirror.com` 等第三方镜像不得接收 `Authorization: Bearer`（否则构成凭据披露）。
+fn endpoint_allows_hf_token(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(host) => {
+            let h = host.to_ascii_lowercase();
+            h == "huggingface.co" || h.ends_with(".huggingface.co")
+        }
+        None => false,
+    }
+}
+
+/// 解析后的 token 是否应附着到该 endpoint。
+fn token_for_endpoint(endpoint: &str, token: Option<String>) -> Option<String> {
+    match token {
+        Some(t) if endpoint_allows_hf_token(endpoint) => Some(t),
+        Some(_) => {
+            tracing::warn!(
+                endpoint = %endpoint,
+                "SEC-004:第三方/非官方 HF endpoint 不发送 HF token(已剥离 Authorization)"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 impl HubApi {
     /// 从 HubConfig 创建客户端(配置驱动,符合 AGENTS.md:92)
     ///
@@ -119,8 +150,9 @@ impl HubApi {
             url::Url::parse(&endpoint).map_err(tachyon_core::DownloadError::UrlParse)?;
         tachyon_core::validate_public_http_url(&url)?;
         Ok(Self {
-            endpoint,
-            token: hub.token.clone(),
+            endpoint: endpoint.clone(),
+            // 审计 SEC-004:仅官方 host 保留 token
+            token: token_for_endpoint(&endpoint, hub.token.clone()),
             http: new_http_client()?,
         })
     }
@@ -145,9 +177,28 @@ impl HubApi {
         &self.endpoint
     }
 
-    /// 是否有认证 Token
+    /// 是否有认证 Token(且已通过 endpoint audience 绑定)
     pub fn is_authenticated(&self) -> bool {
         self.token.is_some()
+    }
+
+    /// 构建可选 Authorization 头;再次校验 audience(纵深防御)。
+    fn push_auth_header<'a>(
+        &'a self,
+        headers: &mut Vec<(&'a str, &'a str)>,
+        auth_buf: &'a mut String,
+    ) {
+        if let Some(ref token) = self.token {
+            if !endpoint_allows_hf_token(&self.endpoint) {
+                tracing::error!(
+                    endpoint = %self.endpoint,
+                    "SEC-004 内部不变量破坏:token 存在于非官方 endpoint,已拒绝发送"
+                );
+                return;
+            }
+            *auth_buf = format!("Bearer {token}");
+            headers.push(("Authorization", auth_buf.as_str()));
+        }
     }
 
     /// 列出仓库文件树
@@ -158,11 +209,8 @@ impl HubApi {
         tracing::info!(url = %url, "获取 HF 仓库文件树");
 
         let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
-        let auth;
-        if let Some(ref token) = self.token {
-            auth = format!("Bearer {token}");
-            headers.push(("Authorization", &auth));
-        }
+        let mut auth = String::new();
+        self.push_auth_header(&mut headers, &mut auth);
 
         let body = self.http.get_text(&url, &headers).await?;
         let files: Vec<HfFile> =
@@ -191,11 +239,8 @@ impl HubApi {
         tracing::info!(url = %url, repo_id = %repo_id, "获取 HF 模型元数据");
 
         let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
-        let auth;
-        if let Some(ref token) = self.token {
-            auth = format!("Bearer {token}");
-            headers.push(("Authorization", &auth));
-        }
+        let mut auth = String::new();
+        self.push_auth_header(&mut headers, &mut auth);
 
         let body = self.http.get_text(&url, &headers).await?;
         let info: HfModelInfo =
@@ -217,11 +262,8 @@ impl HubApi {
         tracing::info!(url = %url, query = %query, "搜索 HF 模型");
 
         let mut headers: Vec<(&str, &str)> = vec![("User-Agent", "tachyon-hub/0.1.0")];
-        let auth;
-        if let Some(ref token) = self.token {
-            auth = format!("Bearer {token}");
-            headers.push(("Authorization", &auth));
-        }
+        let mut auth = String::new();
+        self.push_auth_header(&mut headers, &mut auth);
 
         let body = self.http.get_text(&url, &headers).await?;
         let models: Vec<HfModelInfo> =
@@ -257,6 +299,53 @@ impl HubApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计 SEC-004:镜像 endpoint 不得携带 token
+    #[test]
+    fn test_sec004_mirror_strips_token() {
+        let hub = tachyon_core::config::HubConfig {
+            source_mode: tachyon_core::config::HfSourceMode::Mirror,
+            token: Some("hf_secret_should_not_go_to_mirror".into()),
+        };
+        let api = HubApi::from_config(&hub).expect("from_config");
+        assert_eq!(api.endpoint(), "https://hf-mirror.com");
+        assert!(!api.is_authenticated(), "Mirror 模式必须剥离 HF token");
+    }
+
+    /// 审计 SEC-004:官方 endpoint 可保留 token
+    #[test]
+    fn test_sec004_official_keeps_token() {
+        let hub = tachyon_core::config::HubConfig {
+            source_mode: tachyon_core::config::HfSourceMode::Official,
+            token: Some("hf_official_ok".into()),
+        };
+        let api = HubApi::from_config(&hub).expect("from_config");
+        assert_eq!(api.endpoint(), "https://huggingface.co");
+        assert!(api.is_authenticated(), "Official 模式应保留 token");
+    }
+
+    /// 审计 SEC-004:Race 浏览端点是镜像,同样剥离 token
+    #[test]
+    fn test_sec004_race_list_endpoint_strips_token() {
+        let hub = tachyon_core::config::HubConfig {
+            source_mode: tachyon_core::config::HfSourceMode::Race,
+            token: Some("hf_race_mirror".into()),
+        };
+        let api = HubApi::from_config(&hub).expect("from_config");
+        assert_eq!(api.endpoint(), "https://hf-mirror.com");
+        assert!(!api.is_authenticated());
+    }
+
+    #[test]
+    fn test_endpoint_allows_hf_token_hosts() {
+        assert!(endpoint_allows_hf_token("https://huggingface.co"));
+        assert!(endpoint_allows_hf_token("https://huggingface.co/"));
+        assert!(!endpoint_allows_hf_token("https://hf-mirror.com"));
+        assert!(!endpoint_allows_hf_token(
+            "https://evil.example/huggingface.co"
+        ));
+        assert!(!endpoint_allows_hf_token("not-a-url"));
+    }
 
     /// M-17: with_endpoint 构造测试
     #[test]

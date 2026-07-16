@@ -43,6 +43,11 @@ pub struct BtSession {
     inner: Arc<Session>,
     config: MagnetConfig,
     download_dir: PathBuf,
+    /// 审计 A-09:构建时解析的 effective SOCKS(显式或环境检测),供覆盖报告。
+    /// 不热检测环境变化;仅 Session 创建/重建时解析。
+    effective_socks_proxy: Option<String>,
+    /// 审计 A-09:effective SOCKS 来源
+    socks_source: SocksProxySource,
     /// 跨 MagnetProtocol 实例共享的 handle 缓存。
     ///
     /// 同一 binding(download_dir + factory + preferred + url)的多次 probe/run
@@ -69,7 +74,7 @@ impl BtSession {
         download_dir: PathBuf,
         config: MagnetConfig,
     ) -> tachyon_core::DownloadResult<Self> {
-        let opts = Self::build_session_options(&config);
+        let (opts, effective_socks_proxy, socks_source) = Self::build_session_options(&config);
 
         let session = Session::new_with_opts(download_dir.clone(), opts)
             .await
@@ -81,38 +86,63 @@ impl BtSession {
             inner: session,
             config,
             download_dir,
+            effective_socks_proxy,
+            socks_source,
             handle_cache: Arc::new(DashMap::new()),
             ops_gate: Arc::new(DashMap::new()),
         })
     }
 
-    /// 根据 MagnetConfig 构造 SessionOptions(纯函数,可独立测试)
+    /// 根据 MagnetConfig 构造 SessionOptions + effective SOCKS(纯函数,可独立测试)
     ///
     /// 填充:peer_opts(connect/read_write 超时)、defer_writes_up_to、
     /// SOCKS5 代理 + DHT 联动、tracker 注入(SOCKS5 下过滤 UDP,追加 HTTPS)。
-    fn build_session_options(config: &MagnetConfig) -> SessionOptions {
+    ///
+    /// 返回 `(SessionOptions, effective_socks, socks_source)`。
+    fn build_session_options(
+        config: &MagnetConfig,
+    ) -> (SessionOptions, Option<String>, SocksProxySource) {
         // SOCKS5 检测:用户配置优先,否则自动检测系统代理
-        let socks_proxy = config.socks_proxy_url.clone().or_else(|| {
-            tachyon_core::config::detect_socks_proxy().inspect(|proxy| {
-                tracing::info!(
-                    proxy = %redact_socks_proxy_for_log(proxy),
-                    "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)"
-                );
-            })
-        });
+        let (socks_proxy, socks_source) = if let Some(ref explicit) = config.socks_proxy_url {
+            (Some(explicit.clone()), SocksProxySource::Explicit)
+        } else if let Some(detected) = tachyon_core::config::detect_socks_proxy() {
+            tracing::info!(
+                proxy = %redact_socks_proxy_for_log(&detected),
+                "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)"
+            );
+            (Some(detected), SocksProxySource::Environment)
+        } else {
+            (None, SocksProxySource::None)
+        };
         let socks_enabled = socks_proxy.is_some();
 
-        // DHT:SOCKS5 下按 disable_dht_when_socks 决定(UDP 不可达)
-        let disable_dht = if socks_enabled && config.disable_dht_when_socks {
+        // 审计 BT-11:high_privacy 强制禁 DHT/UPnP/公共 tracker 注入
+        let high_privacy = config.high_privacy;
+        if high_privacy {
+            tracing::info!(
+                "BT 高隐私模式启用:禁 DHT、禁 UPnP、不注入全局 tracker(metadata 阶段依赖限制见文档)"
+            );
+        }
+
+        // DHT:high_privacy 强制禁用;否则 SOCKS5 下按 disable_dht_when_socks 决定
+        let disable_dht = if high_privacy {
+            true
+        } else if socks_enabled && config.disable_dht_when_socks {
             tracing::info!("SOCKS5 启用且 disable_dht_when_socks=true,禁用 DHT(UDP 不可达)");
             true
         } else {
             !config.enable_dht
         };
 
+        let enable_upnp = if high_privacy {
+            false
+        } else {
+            config.enable_upnp
+        };
+
         let mut opts = SessionOptions {
             disable_dht,
-            enable_upnp_port_forwarding: config.enable_upnp,
+            enable_upnp_port_forwarding: enable_upnp,
             disable_dht_persistence: config.disable_dht_persistence,
             // peer 连接超时调优(快速淘汰死 peer,腾出 128 槽位)
             peer_opts: Some(PeerConnectionOptions {
@@ -134,12 +164,20 @@ impl BtSession {
             opts.socks_proxy_url = Some(proxy.clone());
             tracing::info!(
                 proxy = %redact_socks_proxy_for_log(proxy),
+                source = ?socks_source,
                 "BT SOCKS5 代理已启用"
             );
         }
 
-        // tracker 注入:SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
+        // tracker 注入:high_privacy 完全跳过(不注入公共/全局 tracker)
+        // SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
+        if high_privacy {
+            tracing::info!("高隐私模式:跳过 Session 全局 tracker 注入");
+        }
         for tracker_url in &config.trackers {
+            if high_privacy {
+                break;
+            }
             let is_udp = tracker_url.starts_with("udp://");
             if socks_enabled && is_udp {
                 tracing::debug!(tracker = %tracker_url, "SOCKS5 启用,跳过 UDP tracker(不可达)");
@@ -149,7 +187,7 @@ impl BtSession {
                 opts.trackers.insert(url);
             }
         }
-        if socks_enabled {
+        if socks_enabled && !high_privacy {
             const HTTPS_TRACKERS_FOR_PROXY: &[&str] = &[
                 "https://tracker.tamersunion.org:443/announce",
                 "https://tracker.gbitt.info:443/announce",
@@ -162,18 +200,34 @@ impl BtSession {
             tracing::info!("SOCKS5 启用,追加 HTTPS tracker(经代理可达)");
         }
 
-        opts
+        (opts, socks_proxy, socks_source)
     }
 
     /// FIX-16:报告 BT 各流量类别在当前配置下的代理覆盖状态(隐私可见性)。
     ///
-    /// 审计指出:应用侧已注入 socks_proxy_url、过滤 UDP tracker、禁用 DHT,但 librqbit
-    /// 内部对 peer TCP / HTTP(S) tracker / UDP tracker / DHT / uTP / UPnP 各路径是否走
-    /// SOCKS 不可从应用代码证明。本函数在应用层对「已配置状态」做可见性汇总,供前端展示
-    /// 隐私边界。注意:ViaProxy 表示「应用已配置走代理」,不等于「已证实全程未泄漏」--
-    /// librqbit 内部行为需外部抓包验证。
+    /// 审计 A-09:基于 Session 构建时解析的 **effective** SOCKS(显式或环境检测),
+    /// 而非仅看 MagnetConfig.socks_proxy_url。环境变化不热检测——仅创建/重建时解析。
     pub fn proxy_coverage_status(&self) -> ProxyCoverageReport {
-        bt_proxy_coverage_status(&self.config)
+        bt_proxy_coverage_status_effective(
+            &self.config,
+            self.effective_socks_proxy.is_some(),
+            self.socks_source,
+            self.effective_socks_proxy
+                .as_deref()
+                .map(redact_socks_proxy_for_log),
+        )
+    }
+
+    /// 审计 A-09:测试/调试 — 当前 Session 的 effective SOCKS 来源
+    pub fn socks_source(&self) -> SocksProxySource {
+        self.socks_source
+    }
+
+    /// 审计 A-09:测试/调试 — 脱敏 effective endpoint
+    pub fn effective_socks_redacted(&self) -> Option<String> {
+        self.effective_socks_proxy
+            .as_deref()
+            .map(redact_socks_proxy_for_log)
     }
 
     /// 获取内部 Session 引用
@@ -222,8 +276,9 @@ pub enum ProxyCoverage {
 
 /// FIX-16:BT 各流量类别的代理覆盖报告(隐私可见性)。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProxyCoverageReport {
-    /// 是否已启用 SOCKS5 代理(显式配置或自动检测)。
+    /// 是否已启用 SOCKS5 代理(显式配置或构建时环境检测)。
     pub socks_enabled: bool,
     /// 对等 TCP 连接(librqbit peer TCP,经 socks_proxy_url)。
     pub peer_tcp: ProxyCoverage,
@@ -235,15 +290,52 @@ pub struct ProxyCoverageReport {
     pub utp: ProxyCoverage,
     /// UPnP(局域网端口映射,不走 SOCKS,可能绕过)。
     pub upnp: ProxyCoverage,
+    /// 审计 A-09:运行时 SOCKS 来源(none/explicit/environment)
+    pub socks_source: SocksProxySource,
+    /// 审计 A-09:脱敏后的 effective SOCKS endpoint(无凭据);未启用时为 None
+    pub socks_endpoint_redacted: Option<String>,
+}
+
+/// 审计 A-09:Session 构建时解析的 SOCKS 代理来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SocksProxySource {
+    /// 未启用 SOCKS
+    None,
+    /// MagnetConfig.socks_proxy_url 显式配置
+    Explicit,
+    /// detect_socks_proxy() 环境/系统检测
+    Environment,
 }
 
 /// FIX-16:根据 MagnetConfig 计算 BT 各流量类别的代理覆盖状态(纯函数,可独立测试)。
 ///
-/// 与 `build_session_options` 对齐:socks_proxy_url 注入 peer TCP + HTTP tracker;
-/// disable_dht_when_socks 控制 UDP tracker/DHT;uTP/UPnP 因 UDP/局域网性质标记 MayBypass/Disabled。
-/// 注意:detect_socks_proxy() 依赖环境变量,本函数仅看显式配置 socks_proxy_url(确定性测试)。
+/// 兼容层:仅看显式 `socks_proxy_url`(确定性测试)。生产路径请用
+/// [`bt_proxy_coverage_status_effective`] 传入 Session 构建时的 effective SOCKS。
 pub fn bt_proxy_coverage_status(config: &MagnetConfig) -> ProxyCoverageReport {
     let socks_enabled = config.socks_proxy_url.is_some();
+    let source = if socks_enabled {
+        SocksProxySource::Explicit
+    } else {
+        SocksProxySource::None
+    };
+    let endpoint = config
+        .socks_proxy_url
+        .as_deref()
+        .map(redact_socks_proxy_for_log);
+    bt_proxy_coverage_status_effective(config, socks_enabled, source, endpoint)
+}
+
+/// 审计 A-09:基于 effective SOCKS 计算覆盖报告。
+///
+/// `socks_enabled` 来自 Session 构建时注入值(显式或 detect_socks_proxy),
+/// 可与 config.socks_proxy_url=None 但环境代理生效的情况对齐。
+pub fn bt_proxy_coverage_status_effective(
+    config: &MagnetConfig,
+    socks_enabled: bool,
+    socks_source: SocksProxySource,
+    socks_endpoint_redacted: Option<String>,
+) -> ProxyCoverageReport {
     if !socks_enabled {
         // 无 SOCKS:所有流量直连(UPnP 按开关区分 Direct/Disabled)
         let upnp = if config.enable_upnp {
@@ -258,6 +350,8 @@ pub fn bt_proxy_coverage_status(config: &MagnetConfig) -> ProxyCoverageReport {
             udp_tracker_dht: ProxyCoverage::Direct,
             utp: ProxyCoverage::Direct,
             upnp,
+            socks_source: SocksProxySource::None,
+            socks_endpoint_redacted: None,
         };
     }
     // SOCKS 启用
@@ -286,6 +380,8 @@ pub fn bt_proxy_coverage_status(config: &MagnetConfig) -> ProxyCoverageReport {
         udp_tracker_dht,
         utp,
         upnp,
+        socks_source,
+        socks_endpoint_redacted,
     }
 }
 
@@ -311,7 +407,7 @@ mod tests {
         let mut config = test_config();
         config.peer_connect_timeout_secs = 5;
         config.peer_read_write_timeout_secs = 7;
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         let peer_opts = opts.peer_opts.expect("peer_opts 应为 Some(由 config 填充)");
         assert_eq!(
@@ -330,7 +426,7 @@ mod tests {
     fn test_defer_writes_filled_when_nonzero() {
         let mut config = test_config();
         config.defer_writes_up_to_mb = 32;
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
         assert_eq!(
             opts.defer_writes_up_to,
             Some(32),
@@ -342,7 +438,7 @@ mod tests {
     fn test_defer_writes_disabled_when_zero() {
         let mut config = test_config();
         config.defer_writes_up_to_mb = 0;
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
         assert_eq!(
             opts.defer_writes_up_to, None,
             "defer_writes_up_to=0 应映射为 None(禁用)"
@@ -372,7 +468,7 @@ mod tests {
             }
         }
 
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         // 恢复环境变量
         for (v, val) in saved {
@@ -407,6 +503,40 @@ mod tests {
     }
 
     #[test]
+    fn test_high_privacy_disables_dht_upnp_and_trackers() {
+        let mut config = MagnetConfig::default();
+        config.high_privacy = true;
+        config.enable_dht = true;
+        config.enable_upnp = true;
+        config.trackers = vec!["https://tracker.example/announce".into()];
+        config.socks_proxy_url = None;
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
+        assert!(opts.disable_dht, "high_privacy 应禁用 DHT");
+        assert!(
+            !opts.enable_upnp_port_forwarding,
+            "high_privacy 应禁用 UPnP"
+        );
+        assert!(
+            opts.trackers.is_empty(),
+            "high_privacy 不得注入全局 tracker"
+        );
+    }
+
+    #[test]
+    fn test_high_privacy_skips_socks_https_tracker_injection() {
+        let mut config = MagnetConfig::default();
+        config.high_privacy = true;
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.trackers = vec!["udp://tracker.example:6969/announce".into()];
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
+        assert!(opts.disable_dht);
+        assert!(
+            opts.trackers.is_empty(),
+            "high_privacy+SOCKS 不得追加 HTTPS 公共 tracker"
+        );
+    }
+
+    #[test]
     fn test_socks_filters_udp_trackers_and_appends_https() {
         // SOCKS5 启用(通过显式配置,确定性,不依赖环境变量)
         let mut config = test_config();
@@ -417,7 +547,7 @@ mod tests {
             "https://tracker.example.org:443/announce".into(),
         ];
 
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         // SOCKS5 代理 URL 注入
         assert_eq!(
@@ -465,7 +595,7 @@ mod tests {
         config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
         config.disable_dht_when_socks = false;
 
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         assert!(
             !opts.disable_dht,
@@ -477,7 +607,7 @@ mod tests {
     fn test_default_config_has_peer_opts_and_defer_writes() {
         // 默认配置应产出非空 peer_opts 与非 None defer_writes
         let config = MagnetConfig::default();
-        let opts = BtSession::build_session_options(&config);
+        let (opts, _effective, _source) = BtSession::build_session_options(&config);
         let peer_opts = opts.peer_opts.expect("默认配置 peer_opts 应为 Some");
         assert_eq!(
             peer_opts.connect_timeout,
@@ -602,5 +732,55 @@ mod tests {
         config.enable_upnp = false;
         let report = bt_proxy_coverage_status(&config);
         assert_eq!(report.upnp, ProxyCoverage::Disabled);
+    }
+
+    /// 审计 A-09:effective SOCKS(环境检测)在 config 显式 None 时仍标记 ViaProxy
+    #[test]
+    fn test_a09_effective_env_socks_enables_coverage() {
+        let mut config = test_config();
+        config.socks_proxy_url = None;
+        config.disable_dht_when_socks = true;
+        config.enable_upnp = false;
+        let report = bt_proxy_coverage_status_effective(
+            &config,
+            true,
+            SocksProxySource::Environment,
+            Some("socks5://127.0.0.1:7890".into()),
+        );
+        assert!(report.socks_enabled);
+        assert_eq!(report.socks_source, SocksProxySource::Environment);
+        let ep = report.socks_endpoint_redacted.expect("endpoint");
+        assert!(ep.contains("127.0.0.1:7890"), "ep={ep}");
+        assert_eq!(report.peer_tcp, ProxyCoverage::ViaProxy);
+        assert_eq!(report.http_tracker, ProxyCoverage::ViaProxy);
+        assert_eq!(report.udp_tracker_dht, ProxyCoverage::Blocked);
+    }
+
+    /// 审计 A-09:build_session_options 返回 explicit 来源
+    #[test]
+    fn test_a09_build_session_options_explicit_source() {
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://user:pass@127.0.0.1:1080".into());
+        let (opts, effective, source) = BtSession::build_session_options(&config);
+        assert_eq!(source, SocksProxySource::Explicit);
+        assert_eq!(
+            effective.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        assert_eq!(
+            opts.socks_proxy_url.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        // 报告脱敏
+        let report = bt_proxy_coverage_status_effective(
+            &config,
+            true,
+            source,
+            effective.as_deref().map(redact_socks_proxy_for_log),
+        );
+        let ep = report.socks_endpoint_redacted.expect("redacted");
+        assert!(ep.contains("127.0.0.1:1080"), "ep={ep}");
+        assert!(!ep.contains("user"), "脱敏后不得含用户名: {ep}");
+        assert!(!ep.contains("pass"), "脱敏后不得含密码: {ep}");
     }
 }

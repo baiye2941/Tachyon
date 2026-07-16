@@ -25,6 +25,13 @@ impl TaskStore {
             .map_err(|e| AppError::Config(format!("保存任务快照失败: {e}")))
     }
 
+    /// 撤销删除等显式恢复:清 tombstone 后写入
+    pub fn restore_snapshot(&self, snapshot: &TaskSnapshot) -> Result<(), AppError> {
+        self.manager
+            .restore_task_snapshot(snapshot)
+            .map_err(|e| AppError::Config(format!("恢复任务快照失败: {e}")))
+    }
+
     pub fn load_snapshot(&self, task_id: &str) -> Result<Option<TaskSnapshot>, AppError> {
         self.manager
             .load_task_snapshot(task_id)
@@ -156,6 +163,7 @@ pub fn task_info_to_snapshot(
     let now = chrono::Local::now().to_rfc3339();
     TaskSnapshot {
         schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+        revision: 0,
         id: task.id.clone(),
         url: task.url.clone(),
         save_path,
@@ -193,6 +201,7 @@ mod tests {
     fn test_snapshot_to_task_info_preserves_status() {
         let snapshot = TaskSnapshot {
             schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: "task-1".to_string(),
             url: "https://example.com/file.bin".to_string(),
             save_path: "/downloads/file.bin".to_string(),
@@ -228,6 +237,7 @@ mod tests {
         let store = TaskStore::open(temp.path()).unwrap();
         let snapshot = TaskSnapshot {
             schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: "task-1".to_string(),
             url: "https://example.com/file.bin".to_string(),
             save_path: "/downloads/file.bin".to_string(),
@@ -266,6 +276,7 @@ mod tests {
         // 写入一个正常快照
         let good = TaskSnapshot {
             schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
             id: "good".to_string(),
             url: "https://example.com/good.bin".to_string(),
             save_path: "/downloads/good.bin".to_string(),
