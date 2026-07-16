@@ -483,6 +483,7 @@ const zhCN = {
   "settings.connection.keepAliveTimeoutValue": "{n} 秒",
   "settings.connection.enableHttp2": "启用 HTTP/2",
   "settings.connection.enableQuic": "启用 QUIC",
+  "settings.connection.quicNotCompiled": "当前构建未编译 HTTP/3 支持,已降级使用 HTTP/2",
   "settings.scheduler.minFragmentSize": "最小分片大小",
   "settings.scheduler.maxFragmentSize": "最大分片大小",
   "settings.scheduler.ewmaAlpha": "EWMA 平滑系数",

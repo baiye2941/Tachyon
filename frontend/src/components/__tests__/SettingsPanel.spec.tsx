@@ -18,6 +18,11 @@ vi.mock('../../api/invoke', () => ({
     exportBackup: vi.fn(),
     importBackup: vi.fn(),
     getBtProxyCoverage: vi.fn().mockResolvedValue(null),
+    getQuicCapability: vi.fn().mockResolvedValue({
+      enableQuic: false,
+      effectiveQuic: false,
+      http3Compiled: false,
+    }),
   },
 }))
 

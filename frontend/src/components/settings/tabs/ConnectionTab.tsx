@@ -1,5 +1,7 @@
 import type { SetStoreFunction } from "solid-js/store";
+import { createResource, Show } from "solid-js";
 import { tr } from "../../../i18n";
+import { api } from "../../../api/invoke";
 import SliderItem from "../items/SliderItem";
 import ToggleItem from "../items/ToggleItem";
 import type { ConfigDraft } from "../SettingsPanel";
@@ -11,6 +13,8 @@ export interface ConnectionTabProps {
 
 export default function ConnectionTab(props: ConnectionTabProps) {
   const t = tr;
+  // 审计 HTTP-10:QUIC 能力可见性——读取编译期能力,提示用户降级
+  const [quicCap] = createResource(() => api.getQuicCapability().catch(() => null));
   return (
     <div class="flex flex-col gap-5">
       <SliderItem
@@ -65,6 +69,14 @@ export default function ConnectionTab(props: ConnectionTabProps) {
         value={props.draft.connection.enableQuic}
         onChange={(v) => props.setDraft("connection", "enableQuic", v)}
       />
+      {/* 审计 HTTP-10:enable_quic=true 但未编译 http3 时提示降级 */}
+      <Show when={quicCap()}>{(cap) => (
+        <Show when={cap().enableQuic && !cap().effectiveQuic}>
+          <div style={{ "font-size": "11px", color: "var(--color-warning, #f59e0b)", "margin-top": "-8px" }}>
+            {t("settings.connection.quicNotCompiled")}
+          </div>
+        </Show>
+      )}</Show>
     </div>
   );
 }

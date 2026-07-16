@@ -502,6 +502,7 @@ const enUS = {
   "settings.connection.keepAliveTimeoutValue": "{n}s",
   "settings.connection.enableHttp2": "Enable HTTP/2",
   "settings.connection.enableQuic": "Enable QUIC",
+  "settings.connection.quicNotCompiled": "This build has no HTTP/3 support compiled in; downgraded to HTTP/2",
   "settings.scheduler.minFragmentSize": "Min fragment size",
   "settings.scheduler.maxFragmentSize": "Max fragment size",
   "settings.scheduler.ewmaAlpha": "EWMA smoothing factor",

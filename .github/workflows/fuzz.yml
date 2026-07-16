@@ -19,8 +19,9 @@ jobs:
     name: Fuzz 测试
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Fuzz 是探索性测试,crash 不应阻断 CI
-    continue-on-error: true
+    # 审计 F1:fuzz crash 必须阻断 CI。移除 job 级 continue-on-error,
+    # crash 由步骤退出码自然失败。个别 target 失败仍继续后续 target
+    # (脚本内 || true),但最终汇总若任一 target crash 则 step 失败。
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
@@ -50,12 +51,18 @@ jobs:
       - name: 运行 fuzz target
         working-directory: fuzz
         run: |
+          set +e
+          crash=0
           for target in config_parse file_metadata http_headers ipc_deserialize magnet_parse url_safety; do
             echo "::group::Fuzz target: $target"
-            # 每个 target 运行 60 秒,crash 不中断后续 target
-            cargo fuzz run "$target" -- -max_total_time=60 || true
+            # 每个 target 运行 60 秒;crash 不中断后续 target,但记录失败
+            if ! cargo fuzz run "$target" -- -max_total_time=60; then
+              echo "::error::Fuzz target $target crashed"
+              crash=1
+            fi
             echo "::endgroup::"
           done
+          exit $crash
       - name: 上传 crash artifact
         if: always()
         uses: actions/upload-artifact@v4

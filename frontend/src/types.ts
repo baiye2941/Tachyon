@@ -347,6 +347,13 @@ export interface AppInfo {
   name: string
 }
 
+/** 审计 HTTP-10:QUIC 能力可见性 */
+export interface QuicCapability {
+  enableQuic: boolean
+  effectiveQuic: boolean
+  http3Compiled: boolean
+}
+
 /** HF 模型元数据 — 与后端 HfModelInfo 对齐 */
 export interface HfModelInfo {
   id: string

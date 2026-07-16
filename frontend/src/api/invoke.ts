@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, QuicCapability, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask } from '../stores/mockData'
@@ -81,6 +81,8 @@ export const api = {
   getAppInfo: () => invoke<AppInfo>('get_app_info'),
   /** 获取支持的协议列表 */
   getSupportedProtocols: () => invoke<string[]>('supported_protocols'),
+  /** 审计 HTTP-10:QUIC 能力可见性(enable 配置意图 vs effective 实际生效) */
+  getQuicCapability: () => invoke<QuicCapability>('get_quic_capability'),
   /** 拉取启动恢复告警(P1-22-3):setup 阶段 emit 的事件前端会漏接,主动拉取补全 */
   getRecoveryWarning: () => invoke<RecoveryWarningPayload | null>('get_recovery_warning'),
   /** 创建下载任务 */

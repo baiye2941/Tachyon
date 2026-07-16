@@ -77,7 +77,9 @@ pub fn run() {
         Err(e) => {
             tracing::error!(error = %e, "AppState 初始化失败,应用退出");
             eprintln!("Tachyon 启动失败: {e}");
-            eprintln!("若已有 Tachyon 实例在运行,请先关闭后再试(数据目录锁: ~/.tachyon/store/.lock)。");
+            eprintln!(
+                "若已有 Tachyon 实例在运行,请先关闭后再试(数据目录锁: ~/.tachyon/store/.lock)。"
+            );
             std::process::exit(1);
         }
     };
@@ -163,6 +165,8 @@ pub fn run() {
             // 应用信息
             get_app_info,
             supported_protocols,
+            // 审计 HTTP-10:QUIC 能力可见性
+            get_quic_capability,
             // 确认令牌(P1-11b)
             request_confirmation,
             // 启动恢复告警(P1-22-3)

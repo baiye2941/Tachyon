@@ -40,8 +40,10 @@ pub use bt_session::{
 };
 #[cfg(feature = "magnet")]
 pub use tachyon_protocol::MagnetProtocol;
+// 审计 HTTP-10:QUIC 能力可见性 re-export(app 不直接依赖 tachyon-protocol)
 #[cfg(feature = "magnet")]
 pub use tachyon_protocol::magnet::validate_magnet_uri;
+pub use tachyon_protocol::{effective_quic_enabled, http3_compiled};
 
 // 验证测试:放在 crate 根级别,以便 `--exact` 匹配
 

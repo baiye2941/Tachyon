@@ -531,6 +531,34 @@ pub fn get_app_info() -> AppInfo {
     }
 }
 
+/// 审计 HTTP-10:QUIC 能力可见性。
+///
+/// `enable_quic` 是配置意图,`effective_quic` 是 want-and-compile 交集(实际能否生效)。
+/// 前端据此提示用户「enable_quic=true 但当前构建未编译 http3,已降级 HTTP/2」。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuicCapability {
+    /// 配置意图(用户设置)
+    pub enable_quic: bool,
+    /// 实际生效(want && compiled)
+    pub effective_quic: bool,
+    /// http3 是否编译期可用
+    pub http3_compiled: bool,
+}
+
+#[tauri::command]
+pub async fn get_quic_capability(
+    state: tauri::State<'_, AppState>,
+) -> Result<QuicCapability, AppError> {
+    let cfg = state.domain.config.lock().await;
+    let enable_quic = cfg.connection.enable_quic;
+    Ok(QuicCapability {
+        enable_quic,
+        effective_quic: tachyon_engine::effective_quic_enabled(enable_quic),
+        http3_compiled: tachyon_engine::http3_compiled(),
+    })
+}
+
 #[tauri::command]
 #[allow(unused_mut)]
 pub fn supported_protocols() -> Vec<&'static str> {
@@ -1127,6 +1155,18 @@ pub(crate) mod tests {
             err.to_string().contains("最大并发任务数"),
             "错误应说明并发限制: {err}"
         );
+    }
+
+    /// 审计 HTTP-10:get_quic_capability 返回配置意图与实际生效交集
+    #[tokio::test]
+    async fn test_http10_get_quic_capability_reflects_config() {
+        let state = test_state();
+        // 默认配置 enable_quic=false
+        let cfg = state.domain.config.lock().await;
+        let enable_quic = cfg.connection.enable_quic;
+        assert!(!enable_quic);
+        // effective = want && compiled;默认 false 故 effective 必 false
+        assert!(!tachyon_engine::effective_quic_enabled(enable_quic));
     }
 
     #[test]

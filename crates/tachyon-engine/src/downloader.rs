@@ -1250,7 +1250,7 @@ impl DownloadTask {
         let mut attempt = 0u32;
         loop {
             match self.execute_full_download_once(pause_timeout).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => break,
                 Err(e) => {
                     // 暂停超时是控制语义,不是瞬态网络故障;禁止纳入 max_retries 退避
                     // (否则 1s 暂停超时 × 默认 3 次重试会远超调用方等待窗口)。
@@ -1292,6 +1292,31 @@ impl DownloadTask {
                 }
             }
         }
+
+        // 审计 BT-17:单分片 BT 文件走 full-stream 路径时,FileStream 读完 ≠ piece
+        // truth 完成。标 Completed 前同样需要等待 librqbit wait_until_completed。
+        #[cfg(feature = "magnet")]
+        self.wait_bt_piece_truth_if_protocol_managed().await?;
+
+        Ok(())
+    }
+
+    /// 审计 BT-17:protocol_managed_storage 时等待 librqbit piece truth 完成。
+    ///
+    /// 单分片与多分片 BT 路径共用。仅在 `protocol_managed_storage` 且持有
+    /// `bt_magnet`/`bt_fallback` 时等待,否则空操作。
+    #[cfg(feature = "magnet")]
+    async fn wait_bt_piece_truth_if_protocol_managed(&self) -> DownloadResult<()> {
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.protocol_managed_storage)
+            && let Some(magnet) = self.bt_magnet.as_ref().or(self.bt_fallback.as_ref())
+        {
+            info!("BT protocol_managed:等待 piece truth 完成(BT-17)");
+            magnet.wait_torrent_completed(&self.url).await?;
+        }
+        Ok(())
     }
 
     /// 控制通道「暂停超过 N 秒」超时(非网络 Timeout)
@@ -2085,15 +2110,7 @@ impl DownloadTask {
         // 审计 BT-17:protocol_managed 时 FileStream 读完 ≠ piece truth 完成。
         // 在标 Completed 前等待 librqbit wait_until_completed(带 peer_wait 看门狗)。
         #[cfg(feature = "magnet")]
-        if self
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.protocol_managed_storage)
-            && let Some(magnet) = self.bt_magnet.as_ref().or(self.bt_fallback.as_ref())
-        {
-            info!("BT protocol_managed:等待 piece truth 完成(BT-17)");
-            magnet.wait_torrent_completed(&self.url).await?;
-        }
+        self.wait_bt_piece_truth_if_protocol_managed().await?;
 
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");

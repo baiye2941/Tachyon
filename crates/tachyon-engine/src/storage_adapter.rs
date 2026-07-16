@@ -137,6 +137,15 @@ fn available_disk_space_inner(dir: &Path) -> Option<u64> {
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn available_bytes_from_statvfs(stat: &libc::statvfs) -> u64 {
+    // 审计 SEC-001:编译时 ABI 断言,防止未来回归手写短结构。
+    // libc 提供的完整 statvfs 必须 >= Rust 端使用字段所需宽度。
+    // 静态断言 f_bavail/f_frsize 的 size_of 与 u64 兼容(至少不小于 4 字节),
+    // 并确保 statvfs 结构大小合理(> 0,含必需字段)。
+    const _: () = assert!(
+        std::mem::size_of::<libc::statvfs>()
+            >= std::mem::size_of::<u64>() * 2 + std::mem::size_of::<u32>(),
+        "libc::statvfs 结构过小,FFI 输出可能越界"
+    );
     // libc 字段的目标 ABI 整数别名不同：Linux 两字段同型，macOS 的 f_bavail 为 u32；
     // 统一直接转为 u64，避免制造并不存在的可失败转换，且允许范围仅限本函数。
     (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
