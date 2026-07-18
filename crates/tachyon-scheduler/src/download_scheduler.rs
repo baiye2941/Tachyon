@@ -150,14 +150,25 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
                 1
             };
             let max_c = max_concurrency.max(1);
-            let holt = bandwidth_based
+            let mut holt = bandwidth_based
                 .max(bdp_concurrency)
                 .min(fragments_for_file as u32)
                 .min(max_c)
                 .max(1);
-            // 慢启动:早期样本 holt 常卡在 1,用 ramp 抬升(1→2→4…);
-            // 样本充足后交给 Holt/BDP(隔离测试与稳态语义)。
-            // 爬坡期由分片完成路径 sample-driven re-recommend 驱动,不依赖 5s 定时器。
+            // 多连接下限:当 frag 未触达 max_fragment_size 时 bandwidth_based 常坍成 1
+            // (frag ≈ bw * target_secs ⇒ 单片即可"占满"预测带宽)。单 TCP 无法突破
+            // CDN/对端限流;对多分片文件用 default_target_fragments 作下限。
+            // holt 已 >1 时不抬(保留 isolation/BDP 测试语义)。
+            if holt <= 1 && fragments_for_file > 1 {
+                let floor = self
+                    .config
+                    .default_target_fragments
+                    .min(fragments_for_file as u32)
+                    .min(max_c)
+                    .max(1);
+                holt = holt.max(floor);
+            }
+            // 慢启动:早期样本用 ramp 抬升;样本充足后用 holt(+多连接下限)。
             const RAMP_SAMPLE_THRESHOLD: u64 = 8;
             let samples = self.predictor.read().sample_count();
             if samples < RAMP_SAMPLE_THRESHOLD {
@@ -676,6 +687,35 @@ mod tests {
         assert_eq!(
             rec.concurrency, 3,
             "高 RTT 下 bdp_concurrency(3) 应抬高 bandwidth_based(1) 到 3,实际: {}",
+            rec.concurrency
+        );
+    }
+
+    /// 中等带宽 + 未触达 max_fragment_size 时,不得把并发压成 1。
+    ///
+    /// 10MB/s × 3s = 30MB frag(未 clamp 到 64MB)⇒ 旧公式 bandwidth_based=1。
+    /// 1GB 文件仍有 ~34 片;多连接下限应抬到 default_target_fragments(16)。
+    #[test]
+    fn test_recommend_multi_conn_floor_when_bandwidth_based_collapses() {
+        let sched = AdaptiveDownloadScheduler::default_config();
+        for _ in 0..20 {
+            sched.observe_bandwidth(10 * 1024 * 1024); // 10MB/s
+        }
+        let rec = sched.recommend(1024 * 1024 * 1024, 32); // 1GB, max=32
+        // frag 约 30MB(未触达 64MB max)
+        assert!(
+            rec.fragment_size < SchedulerConfig::default().max_fragment_size,
+            "本测试要求 frag 未触达 max,实际 {}",
+            rec.fragment_size
+        );
+        assert!(
+            rec.concurrency >= 8,
+            "多分片文件中等带宽时并发不得坍成 1,实际 {}",
+            rec.concurrency
+        );
+        assert!(
+            rec.concurrency <= 32,
+            "不得超过 max_concurrency,实际 {}",
             rec.concurrency
         );
     }
