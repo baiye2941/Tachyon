@@ -207,6 +207,8 @@ pub struct DownloadTask {
     partial_fragments: HashMap<u32, u64>,
     /// 断点续传快照中的对象身份
     resume_object_identity: Option<ObjectIdentity>,
+    /// 断点快照中的 supports_range(None=未知/旧快照,Some(false)=强制整块)
+    resume_supports_range: Option<bool>,
     /// 外部共享限速器(跨任务全局限速)。
     /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -432,6 +434,7 @@ impl DownloadTask {
                         completed_fragments: Vec::new(),
                         partial_fragments: HashMap::new(),
                         resume_object_identity: None,
+                        resume_supports_range: None,
                         rate_limiter: None,
                         metrics: None,
                         circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -474,6 +477,7 @@ impl DownloadTask {
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
+            resume_supports_range: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -582,6 +586,7 @@ impl DownloadTask {
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
+            resume_supports_range: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -683,6 +688,7 @@ impl DownloadTask {
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
+            resume_supports_range: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -725,6 +731,7 @@ impl DownloadTask {
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
+            resume_supports_range: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -770,6 +777,7 @@ impl DownloadTask {
             completed_fragments: Vec::new(),
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
+            resume_supports_range: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -819,6 +827,11 @@ impl DownloadTask {
     /// 设置断点续传快照对象身份(须在 plan 前;probe 后会与远端比较)
     pub fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
         self.resume_object_identity = identity;
+    }
+
+    /// 注入断点快照中的 supports_range(probe 后覆盖远端声明)
+    pub fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
+        self.resume_supports_range = supports_range;
     }
 
     /// 设置调度器配置(规划参数 / sampling_interval 等)。
@@ -988,7 +1001,16 @@ impl DownloadTask {
                 self.completed_fragments.clear();
                 self.partial_fragments.clear();
                 self.resume_object_identity = None;
+                self.resume_supports_range = None;
             }
+        }
+        // 历史 200-fallback 快照:强制 supports_range=false,避免 resume 再走分片
+        if self.resume_supports_range == Some(false) {
+            warn!(
+                url = %tachyon_core::redact_url_for_log(&self.url),
+                "断点快照标记 supports_range=false,覆盖探测结果为整块路径"
+            );
+            metadata.supports_range = false;
         }
         self.metadata = Some(metadata);
         self.metadata
@@ -2098,6 +2120,10 @@ impl DownloadTask {
             url = %tachyon_core::redact_url_for_log(&self.url),
             "服务器不支持 Range 请求,降级为整块下载(execute_full_download)"
         );
+        // 审计 batch2:持久化 supports_range=false,避免 resume 再次走分片路径
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.supports_range = false;
+        }
         // 中止所有在途分片任务 + drain 已完成结果(进度对齐)
         Self::abort_remaining_fragment_tasks(handles).await;
         if let Err(e) = Self::drain_completed_channel(self, completed_rx) {
@@ -3499,6 +3525,10 @@ impl tachyon_core::traits::TaskRunner for DownloadTask {
 
     fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
         self.set_resume_object_identity(identity);
+    }
+
+    fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
+        self.set_resume_supports_range(supports_range);
     }
 
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
@@ -11022,6 +11052,11 @@ mod tests {
             1,
             "RangeNotSupported 降级应转 execute_full_download,download_full_stream \
              仅调用 1 次(整块传输),而非每片重复触发 200 fallback"
+        );
+        assert_eq!(
+            task.metadata().map(|m| m.supports_range),
+            Some(false),
+            "降级后 metadata.supports_range 必须为 false(供快照持久化)"
         );
         // 3. 终态 + 数据正确
         assert_eq!(task.state(), DownloadState::Completed);

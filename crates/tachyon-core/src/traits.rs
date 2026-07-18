@@ -284,6 +284,11 @@ pub trait TaskRunner: Send + Sync {
     /// 注入断点快照对象身份(ETag/Last-Modified/size)
     fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>);
 
+    /// 注入断点快照 supports_range(Some(false) 时 probe 后强制整块路径)
+    fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
+        let _ = supports_range;
+    }
+
     /// 注入分片进度发送端
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>);
 
@@ -320,6 +325,10 @@ impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
 
     fn set_resume_object_identity(&mut self, identity: Option<ObjectIdentity>) {
         (**self).set_resume_object_identity(identity)
+    }
+
+    fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
+        (**self).set_resume_supports_range(supports_range)
     }
 
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<crate::FragmentProgress>) {

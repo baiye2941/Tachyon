@@ -14,7 +14,11 @@ use crate::kv::KvStore;
 /// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
 /// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
 /// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+
+fn default_supports_range_true() -> bool {
+    true
+}
 
 /// 下载任务快照（用于断点续传）
 ///
@@ -58,6 +62,10 @@ pub struct TaskSnapshot {
     pub last_modified: Option<String>,
     #[serde(default)]
     pub content_length: Option<u64>,
+    /// 服务端是否支持 Range(HTTP 200 fallback 降级后为 false)。
+    /// 缺字段默认 true:旧快照按可分片续传,与历史行为一致。
+    #[serde(default = "default_supports_range_true")]
+    pub supports_range: bool,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -136,6 +144,7 @@ impl From<TaskRecord> for TaskSnapshot {
             etag: None,
             last_modified: None,
             content_length: r.file_size,
+            supports_range: true,
             created_at: String::new(),
             updated_at: String::new(),
             fail_reason: None,
@@ -446,6 +455,7 @@ mod tests {
             etag: None,
             last_modified: None,
             content_length: Some(1024),
+            supports_range: true,
             created_at: String::new(),
             updated_at: String::new(),
             fail_reason: None,
@@ -645,6 +655,7 @@ mod tests {
             etag: Some("\"abc\"".to_string()),
             last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
             content_length: Some(1024),
+            supports_range: true,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
@@ -663,6 +674,21 @@ mod tests {
     }
 
     // ── schema_version 兼容性测试 ──
+
+    #[test]
+    fn snapshot_old_json_defaults_supports_range_true() {
+        // 缺 supportsRange 字段的旧 JSON 默认 true(可分片续传)
+        let old_json = r#"{
+            "id":"t1","url":"https://e.com/a","savePath":"/a","fileName":"a",
+            "fileSize":1,"downloaded":0,"completedFragments":[],"totalFragments":1,
+            "fragmentSize":1,"status":"paused","createdAt":"","updatedAt":""
+        }"#;
+        let snapshot: TaskSnapshot = serde_json::from_str(old_json).unwrap();
+        assert!(
+            snapshot.supports_range,
+            "旧快照缺字段时 supports_range 默认 true"
+        );
+    }
 
     #[test]
     fn snapshot_old_json_without_schema_version_deserializes() {
