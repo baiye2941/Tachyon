@@ -125,3 +125,18 @@
   background: var(--color-text-tertiary);
 }
 
+
+/* ============================================
+   Sparkline 峰值标记:历史速度最高点光斑
+   ============================================ */
+.sparkline-peak {
+  fill: var(--color-accent-primary);
+  filter: drop-shadow(0 0 3px var(--color-accent-glow-strong));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sparkline-peak {
+    filter: none;
+  }
+}
+

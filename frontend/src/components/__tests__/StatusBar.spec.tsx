@@ -3,6 +3,7 @@ import type { JSX } from "solid-js";
 import { render, cleanup, fireEvent, screen } from "@solidjs/testing-library";
 import { I18nProvider, i18n } from "../../i18n";
 import StatusBar from "../StatusBar";
+import { pushSpeed, clearHistory } from "../../stores/speedHistory";
 
 const THEME_KEY = "tachyon-theme";
 
@@ -83,5 +84,33 @@ describe("StatusBar 主题切换按钮", () => {
     const btn = screen.getByLabelText("切换明暗主题");
     expect(btn.className).toContain("icon-btn-sm");
     expect(btn.className).toContain("btn-icon-sm");
+  });
+});
+
+describe("StatusBar sparkline 峰值标记", () => {
+  beforeEach(() => {
+    clearHistory();
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearHistory();
+  });
+
+  it("速度 sparkline 标记历史峰值点", () => {
+    pushSpeed(100);
+    pushSpeed(500);
+    pushSpeed(200);
+
+    const { container } = renderStatusBar({
+      isIdle: false,
+      totalSpeed: 1024,
+      activeCount: 1,
+      pausedCount: 0,
+      totalCount: 1,
+    });
+
+    const peak = container.querySelector(".sparkline-peak");
+    expect(peak).toBeTruthy();
   });
 });

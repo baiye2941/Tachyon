@@ -1,4 +1,4 @@
-import { createMemo } from 'solid-js'
+import { createMemo, Show } from 'solid-js'
 
 interface SparklineProps {
   data: number[]
@@ -35,6 +35,20 @@ export default function Sparkline(props: SparklineProps) {
     return { line, area }
   })
 
+  // 历史峰值点:无数据/全 0 时不渲染(与 pathD 同一套坐标换算)
+  const peakPoint = createMemo(() => {
+    const data = props.data
+    if (data.length < 2) return null
+    const peak = Math.max(...data)
+    if (peak <= 0) return null
+    const maxVal = Math.max(peak, 1)
+    const peakIndex = data.indexOf(peak)
+    return {
+      x: (peakIndex / (data.length - 1)) * width(),
+      y: height() - (peak / maxVal) * height(),
+    }
+  })
+
   return (
     <svg
       width={width()}
@@ -56,6 +70,11 @@ export default function Sparkline(props: SparklineProps) {
         stroke-linecap="round"
         stroke-linejoin="round"
       />
+      <Show when={peakPoint()}>
+        {(pt) => (
+          <circle class="sparkline-peak" cx={pt().x} cy={pt().y} r={2} />
+        )}
+      </Show>
     </svg>
   )
 }
