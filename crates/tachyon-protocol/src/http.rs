@@ -65,6 +65,26 @@ pub fn check_response_size_limit(content_length: Option<u64>) -> DownloadResult<
     Ok(())
 }
 
+/// BT-13:把 `socks5://` URL 转为 `socks5h://` 以强制 reqwest 远程解析目标域名。
+///
+/// reqwest 对 `socks5://` 默认在客户端解析目标域名(Local DNS),会泄漏本地 DNS:
+/// 走代理的 HTTP(S) tracker 请求的目标域名会先经本地系统 DNS 解析,再连代理。
+/// `socks5h://` 表示 hostname 由代理服务器解析(RFC 1928 的 "h" 变体),
+/// 目标域名不在本地泄漏。
+///
+/// BT 侧 librqbit 的 `SocksProxyConfig` 只认 `socks5://` scheme(不识别 `socks5h://`),
+/// 故 `tachyon-core::config::detect_socks_proxy()` 把 `socks5h://` 规范化为 `socks5://`。
+/// HTTP 客户端使用代理前必须再次转回 `socks5h://`,以恢复远程 DNS 语义。
+///
+/// 非 socks5 scheme(http/https)原样返回。
+fn http_proxy_remote_dns(proxy_url: &str) -> String {
+    if let Some(rest) = proxy_url.strip_prefix("socks5://") {
+        format!("socks5h://{rest}")
+    } else {
+        proxy_url.to_string()
+    }
+}
+
 /// 协议保留头:用户自定义 headers 不得覆盖,否则破坏 Range/If-Range/Host 等引擎语义。
 fn is_reserved_request_header(name: &str) -> bool {
     matches!(
@@ -310,13 +330,17 @@ impl HttpClient {
         // 审计 SEC-007:走代理时 PublicDnsResolver 只解析代理主机,目标域名由代理解析;
         // 本地 reject_forbidden_ip 不覆盖代理后端——代理即 SSRF 信任边界。
         if let Some(proxy_url) = proxy {
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            // BT-13:把 socks5:// 转 socks5h:// 让 reqwest 远程解析目标域名,
+            // 防止走代理的 HTTP(S) tracker 请求在本地 DNS 泄漏目标域名。
+            // (BT peer 路径仍用 socks5://,librqbit 不识别 socks5h://)
+            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 // 安全:proxy URL 可能含 user:pass@,错误信息须脱敏避免凭据泄露到前端。
                 // 用 redact_proxy_url 保留 scheme/host/port(代理诊断需要端口),
                 // 剥离 userinfo(凭据)。
                 DownloadError::Config(format!(
                     "无效的代理 URL '{}': {}",
-                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    tachyon_core::config::redact_proxy_url(&proxy_url),
                     e
                 ))
             })?;
@@ -457,10 +481,12 @@ impl HttpClient {
             .http2_prior_knowledge();
 
         if let Some(proxy_url) = proxy {
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
+            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 DownloadError::Config(format!(
                     "无效的代理 URL '{}': {}",
-                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    tachyon_core::config::redact_proxy_url(&proxy_url),
                     e
                 ))
             })?;
@@ -506,10 +532,12 @@ impl HttpClient {
             .http1_only();
 
         if let Some(proxy_url) = proxy {
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
+            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 DownloadError::Config(format!(
                     "无效的代理 URL '{}': {}",
-                    tachyon_core::config::redact_proxy_url(proxy_url),
+                    tachyon_core::config::redact_proxy_url(&proxy_url),
                     e
                 ))
             })?;
@@ -1969,6 +1997,36 @@ mod tests {
             client.is_ok(),
             "socks5 代理构造失败: {}",
             client.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// BT-13:验证 `http_proxy_remote_dns` 把 `socks5://` 转为 `socks5h://`,
+    /// 让 reqwest 远程解析目标域名,防止本地 DNS 泄漏。
+    #[test]
+    fn test_http_proxy_remote_dns_converts_socks5_to_socks5h() {
+        // socks5:// → socks5h://(强制远程 DNS)
+        assert_eq!(
+            super::http_proxy_remote_dns("socks5://127.0.0.1:1080"),
+            "socks5h://127.0.0.1:1080"
+        );
+        // 带凭据的 socks5:// 也应正确转换
+        assert_eq!(
+            super::http_proxy_remote_dns("socks5://user:pass@127.0.0.1:1080"),
+            "socks5h://user:pass@127.0.0.1:1080"
+        );
+        // 已经是 socks5h:// 的不变(已是远程 DNS)
+        assert_eq!(
+            super::http_proxy_remote_dns("socks5h://127.0.0.1:1080"),
+            "socks5h://127.0.0.1:1080"
+        );
+        // http:// 与 https:// 不变(非 socks scheme)
+        assert_eq!(
+            super::http_proxy_remote_dns("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            super::http_proxy_remote_dns("https://proxy.example.com:443"),
+            "https://proxy.example.com:443"
         );
     }
 
@@ -3615,10 +3673,9 @@ mod tests {
                 .and(header("Range", "bytes=0-0"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .insert_header("Content-Length", "1024")
                         .insert_header("Accept-Ranges", "bytes")
                         .insert_header("Content-Type", "application/octet-stream")
-                        .set_body_raw(b"x", "application/octet-stream"),
+                        .set_body_raw(vec![0u8; 1024], "application/octet-stream"),
                 )
                 .mount(&server)
                 .await;
