@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 
 use tokio::sync::broadcast;
 
-use crate::commands::{ProgressEvent, TaskProgress};
+use crate::commands::{FragmentByteProgress, ProgressEvent, TaskProgress};
 use crate::repository::TaskRepository;
 use crate::runtime::chunk_reader_pool::ProgressDelta;
 use tachyon_core::types::DownloadState;
@@ -83,8 +83,7 @@ pub struct ProgressBroker {
     /// 每任务本周期新开始下载分片索引增量
     pub(crate) pending_started: Arc<DashMap<String, Vec<u32>>>,
     /// 每任务本周期活跃分片字节进度快照(仅 downloading_set 中的分片)
-    pub(crate) pending_fragment_bytes:
-        Arc<DashMap<String, Vec<crate::commands::FragmentByteProgress>>>,
+    pub(crate) pending_fragment_bytes: Arc<DashMap<String, Vec<FragmentByteProgress>>>,
     /// 任务终态通知发射器(在 Tauri setup 中注入)
     notification_emitter: Arc<Mutex<Option<Arc<dyn NotificationEmitter>>>>,
     /// 已发送通知的任务终态,用于同一任务同一终态去重
@@ -216,11 +215,13 @@ impl ProgressBroker {
     ///
     /// fragment_bytes 为快照式覆盖:每次调用覆盖该任务本周期的字节快照。
     /// 空 Vec 表示无活跃分片(终态或全部完成)。
+    /// "已完成分片不出现在快照"由 broker 层强制:Completed(idx) 到达时即使生产者
+    /// 传入的快照滞后仍含 idx,也在此过滤,不只依赖生产者的 frag_bytes.remove。
     pub fn mark_dirty_with_delta(
         &self,
         task_id: &str,
         delta: Option<ProgressDelta>,
-        fragment_bytes: Vec<crate::commands::FragmentByteProgress>,
+        mut fragment_bytes: Vec<FragmentByteProgress>,
     ) {
         if let Some(d) = delta {
             match d {
@@ -235,10 +236,8 @@ impl ProgressBroker {
                     if let Some(mut started) = self.pending_started.get_mut(task_id) {
                         started.retain(|&x| x != idx);
                     }
-                    // 完成的分片不再出现在字节快照中(过滤掉)
-                    if let Some(mut bytes) = self.pending_fragment_bytes.get_mut(task_id) {
-                        bytes.retain(|e| e.index != idx);
-                    }
+                    // broker 层强制:完成的分片从传入快照中过滤(生产者快照可能滞后)
+                    fragment_bytes.retain(|e| e.index != idx);
                     self.pending_completed
                         .entry(task_id.to_string())
                         .or_default()
@@ -246,6 +245,10 @@ impl ProgressBroker {
                 }
             }
         }
+        // 排序稳定:生产者 frag_bytes 是 HashMap,迭代序不稳定;
+        // compute_progress_delta 靠 TaskProgress 整体 PartialEq,
+        // 同内容不同序会被误判为变化,每 250ms 触发冗余推送
+        fragment_bytes.sort_unstable_by_key(|e| e.index);
         // 字节快照覆盖式写入(空 Vec 也写入,表示清空)
         self.pending_fragment_bytes
             .insert(task_id.to_string(), fragment_bytes);
@@ -291,7 +294,7 @@ fn build_progress_event(
     task_repository: &TaskRepository,
     pending_completed: &DashMap<String, Vec<u32>>,
     pending_started: &DashMap<String, Vec<u32>>,
-    pending_fragment_bytes: &DashMap<String, Vec<crate::commands::FragmentByteProgress>>,
+    pending_fragment_bytes: &DashMap<String, Vec<FragmentByteProgress>>,
 ) -> ProgressEvent {
     task_repository
         .iter()
@@ -946,11 +949,11 @@ mod tests {
             "t-bytes",
             None,
             vec![
-                crate::commands::FragmentByteProgress {
+                FragmentByteProgress {
                     index: 0,
                     downloaded: 256,
                 },
-                crate::commands::FragmentByteProgress {
+                FragmentByteProgress {
                     index: 1,
                     downloaded: 128,
                 },
@@ -980,36 +983,14 @@ mod tests {
     #[tokio::test]
     async fn test_fragment_bytes_cleared_after_terminal() {
         let repository = make_test_repository();
-        repository.insert(
-            "t-term".to_string(),
-            TaskInfo {
-                id: "t-term".to_string(),
-                url: "https://example.com/a.bin".to_string(),
-                file_name: "a.bin".to_string(),
-                file_size: Some(1024),
-                downloaded: 1024,
-                speed: 0,
-                status: DownloadState::Completed,
-                progress: 1.0,
-                fragments_total: 4,
-                fragments_done: 4,
-                active_concurrency: 0,
-                created_at: "2025-01-01T00:00:00+08:00".to_string(),
-                save_path: String::new(),
-                error_reason: None,
-                retry_count: 0,
-                tags: vec![],
-                hf_meta: None,
-                display_order: 0,
-            },
-        );
+        repository.insert("t-term".to_string(), make_completed_task("t-term", "a.bin"));
         let broker = ProgressBroker::new_no_aggregator(repository.clone());
         let mut rx = broker.subscribe();
 
         broker.mark_dirty_with_delta(
             "t-term",
             None,
-            vec![crate::commands::FragmentByteProgress {
+            vec![FragmentByteProgress {
                 index: 0,
                 downloaded: 256,
             }],
@@ -1023,5 +1004,144 @@ mod tests {
             .expect("broadcast 不应关闭");
         let tp = event.get("t-term").expect("t-term 应在事件中");
         assert!(tp.fragment_bytes.is_empty(), "终态后 fragment_bytes 应为空");
+    }
+
+    /// Completed delta 到达时,即使传入快照滞后含该 idx,broker 也应过滤掉
+    #[tokio::test]
+    async fn test_fragment_bytes_completed_index_filtered() {
+        let repository = make_test_repository();
+        repository.insert(
+            "t-x".to_string(),
+            TaskInfo {
+                id: "t-x".to_string(),
+                url: "https://example.com/a.bin".to_string(),
+                file_name: "a.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 384,
+                speed: 100,
+                status: DownloadState::Downloading,
+                progress: 0.375,
+                fragments_total: 4,
+                fragments_done: 1,
+                active_concurrency: 1,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let mut rx = broker.subscribe();
+
+        // 生产者快照滞后:Completed(1) 到达时快照仍含 index=1
+        broker.mark_dirty_with_delta(
+            "t-x",
+            Some(ProgressDelta::Completed(1)),
+            vec![
+                FragmentByteProgress {
+                    index: 0,
+                    downloaded: 256,
+                },
+                FragmentByteProgress {
+                    index: 1,
+                    downloaded: 128,
+                },
+            ],
+        );
+        broker.broadcast_all();
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("应收到 broadcast")
+            .expect("broadcast 不应关闭");
+        let tp = event.get("t-x").expect("t-x 应在事件中");
+        assert_eq!(
+            tp.fragment_bytes.len(),
+            1,
+            "已完成分片 index=1 不应出现在字节快照中"
+        );
+        assert_eq!(tp.fragment_bytes[0].index, 0);
+        assert_eq!(tp.fragment_bytes[0].downloaded, 256);
+    }
+
+    /// 快照顺序稳定:同集合不同序传入,两次 broadcast 的 TaskProgress 应相等,
+    /// 否则 compute_progress_delta 会每 250ms 误判变化触发冗余推送
+    #[tokio::test]
+    async fn test_fragment_bytes_order_stable_for_delta() {
+        let repository = make_test_repository();
+        repository.insert(
+            "t-ord".to_string(),
+            TaskInfo {
+                id: "t-ord".to_string(),
+                url: "https://example.com/a.bin".to_string(),
+                file_name: "a.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 384,
+                speed: 100,
+                status: DownloadState::Downloading,
+                progress: 0.375,
+                fragments_total: 4,
+                fragments_done: 0,
+                active_concurrency: 2,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let mut rx = broker.subscribe();
+
+        broker.mark_dirty_with_delta(
+            "t-ord",
+            None,
+            vec![
+                FragmentByteProgress {
+                    index: 0,
+                    downloaded: 256,
+                },
+                FragmentByteProgress {
+                    index: 1,
+                    downloaded: 128,
+                },
+            ],
+        );
+        broker.broadcast_all();
+        // 同集合不同序(HashMap 迭代序不稳定的模拟)
+        broker.mark_dirty_with_delta(
+            "t-ord",
+            None,
+            vec![
+                FragmentByteProgress {
+                    index: 1,
+                    downloaded: 128,
+                },
+                FragmentByteProgress {
+                    index: 0,
+                    downloaded: 256,
+                },
+            ],
+        );
+        broker.broadcast_all();
+
+        let e1 = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("e1 应收到")
+            .expect("e1 不应关闭");
+        let e2 = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("e2 应收到")
+            .expect("e2 不应关闭");
+        assert_eq!(
+            e1.get("t-ord"),
+            e2.get("t-ord"),
+            "同集合不同序传入,TaskProgress 应相等(快照需排序稳定)"
+        );
     }
 }
