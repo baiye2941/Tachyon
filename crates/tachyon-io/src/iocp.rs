@@ -1093,63 +1093,10 @@ impl crate::storage::AsyncStorage for IoCpStorage {
         Box::pin(async move {
             let file = self.clone_ready_file()?;
             tokio::task::spawn_blocking(move || {
-                // 先 set_len 扩展文件逻辑大小(EOF)
-                file.set_len(size).map_err(DownloadError::Io)?;
-                // 使用 SetFileInformationByHandle(FileAllocationInfo) 真正预分配物理磁盘块,
-                // 避免稀疏文件仅扩展逻辑大小而不分配空间。
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                    let info = windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO {
-                        AllocationSize: size as i64,
-                    };
-                    // Safety:
-                    // - handle 来自合法的 File 句柄(通过 clone_ready_file 获取)
-                    // - info 指针指向有效的 FILE_ALLOCATION_INFO 结构
-                    // - FileAllocationInfo 是 Windows 定义的标准信息类
-                    // - 失败时通过 last_os_error 返回错误,不破坏文件已有状态
-                    let result = unsafe {
-                        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
-                            handle,
-                            windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
-                            &info as *const _ as *const std::ffi::c_void,
-                            std::mem::size_of::<
-                                windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO,
-                            >() as u32,
-                        )
-                    };
-                    if result == 0 {
-                        return Err(DownloadError::Io(std::io::Error::last_os_error()));
-                    }
-                }
-                // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
-                // 失败时静默回退(文件已通过 set_len 正确扩展,只是较慢)
-                // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
-                // 但下载数据会立即覆盖,安全风险极低。
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                    // Safety:
-                    // - handle 来自合法的 File 句柄(通过 clone_ready_file 获取)
-                    // - size 由调用方传入,来自文件元数据的合法大小值
-                    // - 内核保证:失败时不影响文件已有状态
-                    let result = unsafe {
-                        windows_sys::Win32::Storage::FileSystem::SetFileValidData(
-                            handle,
-                            size as i64,
-                        )
-                    };
-                    if result == 0 {
-                        // SetFileValidData 失败(通常因权限不足),静默回退
-                        tracing::debug!(
-                            size,
-                            "SetFileValidData 失败(需 SE_MANAGE_VOLUME_NAME),回退到零填充模式"
-                        );
-                    }
-                }
-                Ok(())
+                // F-14: 改调统一 helper,集中处理 i64 溢出检查 + rollback。
+                // helper 内部:set_len + SetFileInformationByHandle(FileAllocationInfo)
+                // + SetFileValidData(静默回退),SetFileInfo 失败时 rollback 到旧大小。
+                crate::alloc::allocate_windows(&file, size)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
@@ -1168,7 +1115,17 @@ impl crate::storage::AsyncStorage for IoCpStorage {
     }
 
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
-        Box::pin(async move { self.sync().await })
+        Box::pin(async move {
+            self.sync().await?;
+            // F-15:持久化父目录项(Windows:验证可打开,NTFS 日志保证持久)
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sync_parent_dir(&path).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))??;
+            Ok(())
+        })
     }
 
     /// P1-05: IOCP 覆盖 write_at_mut

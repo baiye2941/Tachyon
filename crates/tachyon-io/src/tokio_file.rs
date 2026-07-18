@@ -183,59 +183,10 @@ impl AsyncStorage for TokioFile {
         Box::pin(async move {
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
-                // 先设置文件逻辑大小(EOF)
-                file.set_len(size).map_err(DownloadError::Io)?;
-                // 使用 SetFileInformationByHandle(FileAllocationInfo) 真正预分配物理磁盘块,
-                // 避免稀疏文件仅扩展逻辑大小而不分配空间。
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                    let info = windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO {
-                        AllocationSize: size as i64,
-                    };
-                    // Safety:
-                    // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
-                    // - info 指针指向有效的 FILE_ALLOCATION_INFO 结构
-                    // - FileAllocationInfo 是 Windows 定义的标准信息类
-                    // - 失败时通过 last_os_error 返回错误,不破坏文件已有状态
-                    let result = unsafe {
-                        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
-                            handle,
-                            windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
-                            &info as *const _ as *const std::ffi::c_void,
-                            std::mem::size_of::<
-                                windows_sys::Win32::Storage::FileSystem::FILE_ALLOCATION_INFO,
-                            >() as u32,
-                        )
-                    };
-                    if result == 0 {
-                        return Err(DownloadError::Io(std::io::Error::last_os_error()));
-                    }
-                }
-                // 尝试 SetFileValidData 跳过零填充(需要 SE_MANAGE_VOLUME_NAME 权限)
-                // 注意:成功时文件扩展区域包含磁盘残留数据(非零填充),
-                // 但下载数据会立即覆盖,安全风险极低。
-                {
-                    use std::os::windows::io::AsRawHandle;
-                    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                    // Safety:
-                    // - handle 来自合法的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
-                    // - size 由调用方传入,来自文件元数据的合法大小值
-                    // - 内核保证:失败时不影响文件已有状态
-                    let result = unsafe {
-                        windows_sys::Win32::Storage::FileSystem::SetFileValidData(
-                            handle,
-                            size as i64,
-                        )
-                    };
-                    if result == 0 {
-                        tracing::debug!(
-                            size,
-                            "SetFileValidData 失败(需 SE_MANAGE_VOLUME_NAME),回退到零填充模式"
-                        );
-                    }
-                }
-                Ok(())
+                // F-14: 改调统一 helper,集中处理 i64 溢出检查 + rollback。
+                // helper 内部:set_len + SetFileInformationByHandle(FileAllocationInfo)
+                // + SetFileValidData(静默回退),SetFileInfo 失败时 rollback 到旧大小。
+                crate::alloc::allocate_windows(&file, size)
             })
             .await
             .map_err(|e| DownloadError::Io(e.into()))?
@@ -256,9 +207,15 @@ impl AsyncStorage for TokioFile {
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
-            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                file.sync_data().map_err(DownloadError::Io)?;
+                // F-15:文件 fsync 后 sync 父目录(防断电丢目录项)
+                crate::sync_parent_dir(&path).map_err(DownloadError::Io)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
         })
     }
 }
@@ -339,6 +296,18 @@ impl AsyncStorage for TokioFile {
 
     fn allocate(&self, size: u64) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
+            // F-14: fallocate 的 len 参数为 i64(off_t)。若 size > i64::MAX,
+            // `size as i64` 会静默截断为负数,导致 fallocate 行为未定义或 EINVAL。
+            // 入口处显式校验,拒绝溢出的 size(参照 iouring.rs:1685 模式)。
+            libc::off_t::try_from(size).map_err(|_| {
+                DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "tokio_file allocate size {size} 超过 i64 最大值 {},fallocate 无法处理",
+                        i64::MAX
+                    ),
+                ))
+            })?;
             let file = self.file.clone();
             tokio::task::spawn_blocking(move || {
                 use std::os::fd::AsRawFd;
@@ -371,9 +340,13 @@ impl AsyncStorage for TokioFile {
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
-            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                file.sync_data().map_err(DownloadError::Io)?;
+                crate::sync_parent_dir(&path).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
         })
     }
 }
@@ -475,9 +448,13 @@ impl AsyncStorage for TokioFile {
     fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
         Box::pin(async move {
             let file = self.file.clone();
-            tokio::task::spawn_blocking(move || file.sync_data().map_err(DownloadError::Io))
-                .await
-                .map_err(|e| DownloadError::Io(e.into()))?
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                file.sync_data().map_err(DownloadError::Io)?;
+                crate::sync_parent_dir(&path).map_err(DownloadError::Io)
+            })
+            .await
+            .map_err(|e| DownloadError::Io(e.into()))?
         })
     }
 }

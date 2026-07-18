@@ -418,7 +418,11 @@ async fn driver_task(
 
         // 处理第一个命令
         match cmd {
-            DriverCmd::Shutdown => break,
+            DriverCmd::Shutdown => {
+                // F-04: 正常退出前 reset pool,回收异常路径泄漏的索引。
+                pool.reset();
+                break;
+            }
             DriverCmd::Write(req) => pending_writes.push(req),
             DriverCmd::Read(req) => pending_reads.push(req),
             DriverCmd::Sync { done } => pending_syncs.push(done),
@@ -744,6 +748,21 @@ impl BufferIndexPool {
         // 且 idx < buffer_count 时 word_idx 一定在位图范围内。
         self.bitmap[word_idx].fetch_and(!(1u64 << bit), Ordering::Relaxed);
     }
+
+    /// 重置所有槽位为空闲,一次性回收异常路径泄漏的索引。
+    ///
+    /// 将 bitmap 所有 word 置 0(包括 `build_buffer_bitmap` 预占的越界高位)。
+    /// reset 后 `alloc` 内部的 `idx >= buffer_count` 兜底校验仍防止越界分配,
+    /// 故高位被清零不会导致分配到越界索引。
+    ///
+    /// 用于 driver Shutdown 和 IoUringStorage::drop 路径,回收 submit_and_wait
+    /// 失败、CQE 缺失、driver panic/abort 等异常路径泄漏的索引。幂等:重复
+    /// 调用不产生副作用,保证 drop + shutdown 双路径都调用 reset 不相互干扰。
+    fn reset(&self) {
+        for word in &self.bitmap {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// RAII 守卫,管理 io_uring fixed buffer 索引在调用方一侧的生命周期。
@@ -798,6 +817,12 @@ impl IoUringBufferGuard {
     /// send 失败(driver 已关闭,消息未入队)时显式回收。
     ///
     /// 调用后 `submitted=false`,后续 Drop 不再 double-free。
+    ///
+    /// 注意:tokio 1.52 的 `Permit::send` 返回 `()` 而非 `Result`,
+    /// reserve 成功即保证 channel 未关闭,故当前 lib 代码中不再调用本方法
+    /// (send 不会失败)。保留是为兼容 H-07 取消语义分析与测试覆盖,以及
+    /// 未来若改用 `try_send` 等返回 Result 的 API 时复用。
+    #[allow(dead_code)]
     fn reclaim_unsent(&mut self) {
         if self.submitted {
             self.pool.free(self.buf_idx);
@@ -1130,27 +1155,24 @@ impl IoUringStorage {
 
         // 审计 H-07:先 reserve 拿到 channel 容量,再 mark_submitted + 同步 send。
         // reserve 等待期间若被外层 select! 取消,guard 仍 unsubmitted,Drop 回收槽位。
+        //
+        // tokio 1.52 的 `Permit::send(self, value: T)` 返回 `()` 而非 `Result`
+        // (与 `Sender::send` 不同)。Permit 已保证容量,reserve 成功即代表
+        // channel 未关闭(否则 reserve 返回 Err),故 send 不可能因 channel 关闭
+        // 失败——若调用者担心 reserve 后 driver task 退出,可在 done_rx.await
+        // 时捕获 RecvError(driver 退出时 drop done_tx,await 返回 Err)。
         let permit =
             ring_handle.cmd_tx.reserve().await.map_err(|_| {
                 DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭"))
             })?;
         guard.mark_submitted();
-        if permit
-            .send(DriverCmd::Read(ReadReq {
-                offset,
-                read_len,
-                fd,
-                buf_idx,
-                done: done_tx,
-            }))
-            .is_err()
-        {
-            // receiver 关闭:消息未入队,显式回收(mark 后 Drop 不会 free)
-            guard.reclaim_unsent();
-            return Err(DownloadError::Io(std::io::Error::other(
-                "io_uring driver task 已关闭",
-            )));
-        }
+        permit.send(DriverCmd::Read(ReadReq {
+            offset,
+            read_len,
+            fd,
+            buf_idx,
+            done: done_tx,
+        }));
 
         let read_result: Vec<u8> = done_rx
             .await
@@ -1225,7 +1247,50 @@ impl IoUringStorage {
         .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
     }
 
-    /// 提交写入操作到 io_uring (Linux)
+    /// F-05-1: 把文件截断到 `expected_size`(若当前更大)。
+    ///
+    /// io_uring O_DIRECT 非对齐尾块的 RMW 慢速路径会把内部 buffer 填充到对齐
+    /// 边界再整块写回,导致文件 EOF 被扩展到对齐边界(例:写 10001 字节,
+    /// padded 到 12288 整块写回,EOF 变 12288)。此方法在 padded write 完成后
+    /// 调用 `ftruncate(expected_size)` 把文件截回用户声明的真实大小。
+    ///
+    /// 仅对"尾块"(padded write 末尾超过 expected_size 的情形)截断;非尾块
+    /// RMW(padded write 末尾在文件内部)不截短,避免破坏后续已写数据。
+    /// 调用方传入的 `expected_size` 是用户视角的写后文件大小
+    /// (即 `_offset + _data.len()`)。
+    ///
+    /// 用 `spawn_blocking` 调 ftruncate(同步 syscall),与 close 中 sync_all
+    /// 的处理一致,避免阻塞 tokio 工作线程。
+    #[cfg(target_os = "linux")]
+    async fn truncate_to(&self, expected_size: u64) -> DownloadResult<()> {
+        let file_guard = match &self.file_fd {
+            Some(f) => f.clone(),
+            None => {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "文件未打开",
+                )));
+            }
+        };
+
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            let fd = file_guard.as_raw_fd();
+            // SAFETY:
+            // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活
+            // - ftruncate 的 length 参数为 i64(off_t);expected_size <= i64::MAX
+            //   由调用方保证(write_at 中 expected_size = offset + data.len(),
+            //   均 usize 范围内,且 allocate 入口已校验 size <= i64::MAX)
+            // - ftruncate 把文件截断到指定长度,不破坏 Rust 内存安全
+            let ret = unsafe { libc::ftruncate(fd, expected_size as libc::off_t) };
+            if ret != 0 {
+                return Err(DownloadError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
+    }
     ///
     /// P1-04: 通过 driver task channel 发送写入请求。
     /// 调用方先分配 buffer 索引并将数据复制到 fixed buffer，
@@ -1293,26 +1358,21 @@ impl IoUringStorage {
 
         // 审计 H-07:先 reserve 拿到 channel 容量,再 mark_submitted + 同步 send。
         // 数据已拷入 fixed buffer;若在 reserve 等待时取消,guard Drop 回收槽位。
+        //
+        // tokio 1.52 的 `Permit::send(self, value: T)` 返回 `()` 而非 `Result`
+        // (详见 submit_read 同段注释)。reserve 成功即保证 channel 未关闭。
         let permit =
             ring_handle.cmd_tx.reserve().await.map_err(|_| {
                 DownloadError::Io(std::io::Error::other("io_uring driver task 已关闭"))
             })?;
         guard.mark_submitted();
-        if permit
-            .send(DriverCmd::Write(WriteReq {
-                offset,
-                len,
-                fd,
-                buf_idx,
-                done: done_tx,
-            }))
-            .is_err()
-        {
-            guard.reclaim_unsent();
-            return Err(DownloadError::Io(std::io::Error::other(
-                "io_uring driver task 已关闭",
-            )));
-        }
+        permit.send(DriverCmd::Write(WriteReq {
+            offset,
+            len,
+            fd,
+            buf_idx,
+            done: done_tx,
+        }));
 
         let result = done_rx
             .await
@@ -1383,6 +1443,11 @@ impl Drop for IoUringStorage {
             }
         }
 
+        // F-04: abort + 等待循环后 reset pool,回收 driver 异常路径
+        // (submit_and_wait 失败、CQE 缺失、driver panic/abort)泄漏的索引。
+        // 若 driver 已正常退出(Shutdown 分支),reset 是幂等的二次调用,无副作用。
+        handle.pool.reset();
+
         tracing::debug!("io_uring storage 已 drop,驱动 task 清理完成");
     }
 }
@@ -1414,7 +1479,15 @@ impl AsyncStorage for IoUringStorage {
                             _offset.is_multiple_of(align) && data_len.is_multiple_of(align);
 
                         if is_aligned {
-                            // 快速路径:已对齐,直接写入
+                            // 快速路径:已对齐,直接写入。
+                            //
+                            // F-05-3 修复:此前 fast write 不持 write_lock,与并发 RMW
+                            // 落同一对齐块时,RMW 的"读"读到 fast write 之前的旧数据,
+                            // 然后"写回"覆盖 fast write 的结果,产生 lost-update。
+                            // 单次 submit_write 对内核原子,但 RMW 是读-改-写非原子序列,
+                            // 需与 fast write 互斥。fast write 也持 write_lock,与 RMW
+                            // 共享同一临界区,确保同块的 fast write 与 RMW 串行执行。
+                            let _fast_guard = self.write_lock.lock().await;
                             validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
                             return self.submit_write(_offset, &_data).await;
                         }
@@ -1429,7 +1502,7 @@ impl AsyncStorage for IoUringStorage {
                         // B1 修复:RMW 是非原子序列(读块→改→写块),两个并发 RMW 落
                         // 同一对齐块会产生 lost-update(A 读→B 读→A 写→B 写,B 覆盖 A)。
                         // 用 write_lock 串行化整个 RMW 临界区,持锁从 submit_read 到
-                        // submit_write 完成。对齐快速路径单次 submit_write 原子,不加锁。
+                        // submit_write 完成。
                         let _rmw_guard = self.write_lock.lock().await;
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
@@ -1448,17 +1521,38 @@ impl AsyncStorage for IoUringStorage {
                         }
 
                         let mut buf = vec![0u8; padded_len];
-                        // 读回对齐块现有内容。短读/错误(文件尚未扩展到此区间)可忽略:
-                        // 未读回的尾部保持 0,这是文件真实 EOF 之后的扩展区,写回时
-                        // 由 O_DIRECT 扩展文件语义处理,不覆盖邻近已写数据。
-                        // 持有 _rmw_guard 保证此读不会被另一并发 RMW 的写回覆盖。
-                        let _ = self.submit_read(aligned_offset, &mut buf).await;
+                        // F-05-2:读回对齐块现有内容,错误必须传播(不静默零填充)。
+                        //
+                        // submit_read 可能因真实 I/O 错误(EIO、驱动关闭、通道断开)
+                        // 失败;若静默吞掉,padding 区保持零,写回时会用零覆盖文件中
+                        // 已有真实数据(数据破坏),且调用方误以为写入成功。
+                        //
+                        // 例外:文件 EOF 之后的扩展区(尚未分配)读会返回短读或
+                        // EINVAL/ENODATA,此时 padding 区保持零是正确的(文件真实
+                        // 状态即全零),不应作为错误阻断写入。submit_read 内部对
+                        // ReadFixed 的短读(bytes_read < read_len)只复制实际读取
+                        // 字节,不返回错误——短读属正常 EOF 行为;只有 cqe.result() < 0
+                        // (真实 I/O 错误)才返回 Err。故此处传播错误不会误捕 EOF
+                        // 短读,安全。
+                        self.submit_read(aligned_offset, &mut buf).await?;
                         // 仅覆盖用户数据区间,padding 区保留读回的真实旧数据
                         buf[front_pad..front_pad + _data.len()].copy_from_slice(&_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
-                        // 锁释放在此(drop _rmw_guard)——RMW 临界区结束。
+                        // F-05-1:若 padded write 超过用户声明的文件大小
+                        // (offset + data.len()),O_DIRECT 整块写回会把 EOF 扩展到
+                        // 对齐边界(例:10001 -> 12288)。ftruncate 把文件截回真实大小。
+                        // 审计交叉验证 P1:truncate 必须在 RMW 临界区内执行,
+                        // 否则与并发 fast write 竞态可截掉他人刚写入的数据。
+                        let expected_size = _offset + _data.len() as u64;
+                        if written.saturating_sub(front_pad) >= _data.len() {
+                            let padded_end = aligned_offset + padded_len as u64;
+                            if padded_end > expected_size {
+                                self.truncate_to(expected_size).await?;
+                            }
+                        }
+                        // 锁释放在此(drop _rmw_guard)——RMW 临界区结束(truncate 已在锁内完成)。
                         drop(_rmw_guard);
                         // submit_write 返回整块写入量(含 padding),调用方期望用户数据字节数。
                         // O_DIRECT 对齐写入通常一次完成(padded 全部写入),此时用户数据完整
@@ -1497,6 +1591,9 @@ impl AsyncStorage for IoUringStorage {
                             _offset.is_multiple_of(align) && data_len.is_multiple_of(align);
 
                         if is_aligned {
+                            // F-05-3:fast write 持 write_lock,与并发 RMW 互斥。
+                            // 详见 write_at fast path 注释。
+                            let _fast_guard = self.write_lock.lock().await;
                             validate_fixed_buffer_write_len(_data.len(), self.config.buffer_size)?;
                             return self.submit_write(_offset, _data).await;
                         }
@@ -1506,8 +1603,7 @@ impl AsyncStorage for IoUringStorage {
                         // 零覆盖邻近已写数据并撑大文件。详见 write_at 慢速路径注释。
                         //
                         // B1 修复:RMW 非原子,并发同块 lost-update。write_lock 串行化
-                        // 整个 RMW 临界区(submit_read → 改 → submit_write)。对齐快速
-                        // 路径单次 submit_write 原子,不加锁。
+                        // 整个 RMW 临界区(submit_read → 改 → submit_write)。
                         let _rmw_guard = self.write_lock.lock().await;
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
@@ -1525,11 +1621,22 @@ impl AsyncStorage for IoUringStorage {
                         }
 
                         let mut buf = vec![0u8; padded_len];
-                        let _ = self.submit_read(aligned_offset, &mut buf).await;
+                        // F-05-2:RMW 读错误传播(不静默零填充),详见 write_at 注释。
+                        self.submit_read(aligned_offset, &mut buf).await?;
                         buf[front_pad..front_pad + _data.len()].copy_from_slice(_data);
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
+                        // F-05-1:ftruncate 收尾。审计交叉验证 P1:truncate 必须在
+                        // RMW 临界区内执行(锁释放前),否则与并发 fast write 竞态可
+                        // 截掉他人刚写入的数据。详见 write_at 注释。
+                        let expected_size = _offset + _data.len() as u64;
+                        if written.saturating_sub(front_pad) >= _data.len() {
+                            let padded_end = aligned_offset + padded_len as u64;
+                            if padded_end > expected_size {
+                                self.truncate_to(expected_size).await?;
+                            }
+                        }
                         drop(_rmw_guard);
                         let user_written = written.saturating_sub(front_pad).min(_data.len());
                         Ok(user_written)
@@ -1667,9 +1774,15 @@ impl AsyncStorage for IoUringStorage {
                         // S-15: sync_all() 是阻塞操作(fsync 系统调用),
                         // 直接在 async 上下文中调用会阻塞 tokio 工作线程。
                         // 移至 spawn_blocking 在独立线程中执行。
+                        // F-15:文件 fsync 后 sync 父目录(防断电丢目录项)。
+                        let path = self.file_path.clone();
                         if let Some(file) = self.file_fd.clone() {
                             tokio::task::spawn_blocking(move || {
-                                file.sync_all().map_err(DownloadError::Io)
+                                file.sync_all().map_err(DownloadError::Io)?;
+                                if let Some(ref p) = path {
+                                    crate::sync_parent_dir(p).map_err(DownloadError::Io)?;
+                                }
+                                Ok(())
                             })
                             .await
                             .map_err(|e| {
@@ -2402,5 +2515,510 @@ mod tests {
             );
             storage.close().await.expect("close");
         }
+    }
+
+    /// F-05-1: 非对齐尾块写入后文件大小应等于声明大小(无 EOF 扩展)。
+    ///
+    /// io_uring 的 O_DIRECT 要求 offset/len 按 4096 对齐。当用户写入非对齐尾块
+    /// (例:10001 字节,offset=0,len=10001)时,慢速路径 RMW 会把内部 buffer 填充
+    /// 到 12288 字节(3 * 4096)再整块写回。O_DIRECT 的整块写入会把文件 EOF
+    /// 扩展到 12288,导致文件比用户声明的大小多出 2287 字节的"伪尾"。
+    ///
+    /// 期望行为:写入完成后,文件大小必须等于用户写入的字节总数(10001),
+    /// 不能被 padded write 扩展到对齐边界。实现应在 padded write 完成后调用
+    /// `ftruncate(expected_size)` 把文件截断到真实大小。
+    ///
+    /// 本测试 RED:当前实现无 ftruncate 收尾,文件大小为 12288 而非 10001。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_iouring_non_aligned_write_does_not_extend_file() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_eof_extend.bin");
+
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        storage.init().expect("io_uring init 应成功");
+        // 预分配 12288 字节(覆盖 padded 写入的最大范围),避免 write 因文件
+        // 未分配而失败;allocate 是 fallocate,不会撑大逻辑 EOF
+        storage.allocate(12288).await.expect("预分配应成功");
+
+        // 写入 10001 字节(非 4096 对齐):10001 = 2*4096 + 1809
+        // RMW 慢速路径会填充到 12288(3*4096)再整块写回
+        const EXPECTED_SIZE: usize = 10001;
+        let data = Bytes::from(vec![0xABu8; EXPECTED_SIZE]);
+        let written = storage.write_at(0, data).await.expect("非对齐写入应成功");
+        assert_eq!(
+            written, EXPECTED_SIZE,
+            "write_at 应返回用户数据字节数(非 padded 长度)"
+        );
+
+        storage.sync().await.expect("sync 应成功");
+
+        // 读回文件大小:必须等于 10001,不能是 12288
+        let actual_size = storage.file_size().await.expect("file_size 应成功");
+        assert_eq!(
+            actual_size, EXPECTED_SIZE as u64,
+            "非对齐尾块写入后文件大小应等于用户声明大小 {EXPECTED_SIZE},\
+             实际 {actual_size}(padded O_DIRECT write 把 EOF 扩展到对齐边界,F-05-1)"
+        );
+
+        // 双重确认:用 std::fs::metadata 独立读取,绕过 io_uring 路径
+        let metadata_size = std::fs::metadata(&path).expect("metadata 应可读").len();
+        assert_eq!(
+            metadata_size, EXPECTED_SIZE as u64,
+            "std::fs::metadata 报告的文件大小也应为 {EXPECTED_SIZE},\
+             实际 {metadata_size}(EOF 被扩展,F-05-1)"
+        );
+
+        storage.close().await.expect("close");
+    }
+
+    /// F-05-2: RMW 读错误不应被静默吞掉当零填充。
+    ///
+    /// 当前慢速路径 `let _ = self.submit_read(aligned_offset, &mut buf).await;`
+    /// 把 submit_read 的所有错误(EIO、驱动关闭、通道断开)都静默忽略,
+    /// 未读回的区间保持零。这有两个风险:
+    ///   1. 若 submit_read 因 EIO 失败,而该对齐块在文件中已有真实数据,
+    ///      零填充会覆盖用户区间外的既有字节(数据破坏)。
+    ///   2. 错误被吞掉,调用方以为写入成功,实际可能损坏数据。
+    ///
+    /// 期望行为:RMW 读错误应传播为 write_at 的 Err,或至少不覆盖用户区间外
+    /// 的既有数据。本测试验证契约:若 submit_read 返回错误,write_at 不应
+    /// 静默成功,且用户区间外数据应保持不变。
+    ///
+    /// 策略:无法直接注入 EIO,但可构造"RMW 必须读回既有数据"的场景——
+    /// 先写入对齐块 A(4096 字节,0xCC),再写非对齐尾块覆盖同块的后半段。
+    /// 若 RMW 读错误被静默吞掉,读回的 padding 区会是 0 而非 0xCC,
+    /// 导致 padding 区被错误地写为零。读回验证 padding 区仍为 0xCC。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_iouring_rmw_read_error_propagates_not_silently_zeroed() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_rmw_read_silent.bin");
+
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        storage.init().expect("io_uring init 应成功");
+        storage.allocate(8192).await.expect("预分配应成功");
+
+        // 步骤 1:先写满整个 4096 对齐块(块 0)为 0xCC
+        let block_a = Bytes::from(vec![0xCCu8; 4096]);
+        storage
+            .write_at(0, block_a)
+            .await
+            .expect("对齐写入块 A 应成功");
+        storage.sync().await.expect("sync 应成功");
+
+        // 步骤 2:写非对齐尾块到同块的后半段:offset=3000, len=200
+        // 此时 RMW 必须读回 offset=0..4096 的内容(应为 0xCC),
+        // 覆盖 [3000..3200] 为 0xDD,再整块写回。
+        // 若 submit_read 被静默当零填充,padding 区 [0..3000] 会被写成 0
+        // 而非保留 0xCC。
+        let tail = Bytes::from(vec![0xDDu8; 200]);
+        let written = storage
+            .write_at(3000, tail)
+            .await
+            .expect("非对齐尾块 RMW 写入应成功");
+        assert_eq!(written, 200, "应返回用户数据字节数");
+        storage.sync().await.expect("sync 应成功");
+
+        // 步骤 3:读回整个块,验证 padding 区 [0..3000] 仍为 0xCC,
+        // 用户区 [3000..3200] 为 0xDD
+        let mut block = vec![0u8; 4096];
+        storage
+            .read_at(0, &mut block)
+            .await
+            .expect("read_at 应成功");
+
+        // padding 区(用户区间外):应为 0xCC,不能被静默零填充
+        let padding = &block[0..3000];
+        let zeroed_count = padding.iter().filter(|&&b| b == 0).count();
+        assert_eq!(
+            zeroed_count, 0,
+            "RMW padding 区(用户区间外)应保留原 0xCC,不能被静默零填充(F-05-2);\
+             但 [0..3000) 区间发现 {zeroed_count} 个零字节"
+        );
+        let cc_count = padding.iter().filter(|&&b| b == 0xCC).count();
+        assert_eq!(
+            cc_count, 3000,
+            "RMW padding 区 [0..3000) 应全部为 0xCC(保留读回的旧数据),\
+             实际只有 {cc_count} 个 0xCC(F-05-2: submit_read 错误被静默吞掉)"
+        );
+
+        // 用户区:应为 0xDD
+        let user = &block[3000..3200];
+        assert!(
+            user.iter().all(|&b| b == 0xDD),
+            "用户数据区间 [3000..3200) 应为 0xDD,实际 {user:?}"
+        );
+
+        storage.close().await.expect("close");
+    }
+
+    /// F-05-3: fast write(对齐 4KiB)与邻接 RMW(非对齐尾块)落同一对齐块时
+    /// 不应产生 lost-update。
+    ///
+    /// 当前对齐快速路径 `is_aligned` 分支不持有 `write_lock`,只调用单次
+    /// `submit_write`。单次 submit_write 对内核是原子的(单条 SQE),但与
+    /// 并发的 RMW(读-改-写)落同一对齐块时,RMW 的"读"可能读到 fast write
+    /// 之前的旧数据,然后"写回"覆盖 fast write 的结果,产生 lost-update。
+    ///
+    /// 场景:同一 4096 对齐块(块 0):
+    ///   - 并发 A:fast write,offset=0, len=4096, 数据 0xAA(对齐快速路径)
+    ///   - 并发 B:RMW,offset=10, len=20, 数据 0xBB(非对齐慢速路径)
+    /// 若 fast write 与 RMW 不互斥,B 的 RMW 可能读到全零(块初始态),
+    /// 覆盖 [10..30] 为 0xBB,再整块写回 → A 的 0xAA 全部丢失,
+    /// 只剩 [10..30] 为 0xBB,其余为零。
+    ///
+    /// 期望:两者数据都正确落盘——offset=0..4096 为 0xAA(被 fast write),
+    /// 其中 [10..30] 被 RMW 覆盖为 0xBB。最终文件应同时包含两者数据。
+    ///
+    /// 参考 `test_iouring_concurrent_rmw_same_block_no_lost_update`(RMW×RMW),
+    /// 本测试补 fast×RMW 组合。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_iouring_fast_write_and_rmw_same_block_no_lost_update() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        const ROUNDS: usize = 30;
+        for round in 0..ROUNDS {
+            let path = dir.path().join(format!("iouring_fast_rmw_{round}.bin"));
+            let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+            storage.init().expect("io_uring init 应成功");
+            storage.allocate(4096).await.expect("预分配应成功");
+            let storage = std::sync::Arc::new(storage);
+
+            // 并发写同一 4096 对齐块:
+            // - h1:对齐 fast write(offset=0, len=4096, 全 0xAA)
+            // - h2:非对齐 RMW(offset=10, len=20, 全 0xBB)
+            let s1 = storage.clone();
+            let h1 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xAAu8; 4096]);
+                s1.write_at(0, data).await
+            });
+            let s2 = storage.clone();
+            let h2 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xBBu8; 20]);
+                s2.write_at(10, data).await
+            });
+            let (r1, r2) = tokio::join!(h1, h2);
+            r1.expect("task1 join").expect("fast write_at(0) 应成功");
+            r2.expect("task2 join").expect("rmw write_at(10) 应成功");
+
+            // 读回验证:无 lost-update。
+            // - 若 fast write 被 RMW 覆盖:[0..10] 为 0, [30..4096] 为 0(BAD)
+            // - 若 RMW 被 fast write 覆盖:[10..30] 为 0xAA 而非 0xBB(BAD)
+            // - 正确:fast write 的 0xAA 落盘,RMW 的 0xBB 叠加在 [10..30]
+            let mut block = vec![0u8; 4096];
+            storage
+                .read_at(0, &mut block)
+                .await
+                .expect("read_at(0) 对齐块");
+
+            // 1) fast write 的数据应大面积存在(整个块应基本全是 0xAA,
+            //    除被 RMW 覆盖的 [10..30])
+            let aa_outside = &block[0..10];
+            assert!(
+                aa_outside.iter().all(|&b| b == 0xAA),
+                "round {round}: [0..10) 应为 0xAA(fast write 应落盘),\
+                 实际 {aa_outside:?}(fast write 被 RMW lost-update 覆盖,F-05-3)"
+            );
+            let aa_tail = &block[30..4096];
+            let aa_count = aa_tail.iter().filter(|&&b| b == 0xAA).count();
+            assert_eq!(
+                aa_count,
+                4096 - 30,
+                "round {round}: [30..4096) 应全为 0xAA(fast write 应落盘),\
+                 实际只有 {aa_count} 个 0xAA(F-05-3: fast write lost-update)"
+            );
+
+            // 2) RMW 的数据应叠加在 [10..30]
+            let bb = &block[10..30];
+            assert!(
+                bb.iter().all(|&b| b == 0xBB),
+                "round {round}: [10..30) 应为 0xBB(RMW 应落盘),\
+                 实际 {bb:?}(RMW 被 fast write lost-update 覆盖,F-05-3)"
+            );
+
+            storage.close().await.expect("close");
+        }
+    }
+
+    // =====================================================================
+    // F-04 RED 测试:io_uring driver 异常槽位回收
+    //
+    // 审计发现:
+    // - submit_and_wait 失败(iouring.rs:581-605)不回收 buf_idx
+    // - CQE 缺失(iouring.rs:667-685)不回收
+    // - driver 退出(iouring.rs:689-691)不回收 inflight
+    // - 16 slot 耗尽后 alloc_buffer_index() 返回 None,后端不可用
+    // - BufferIndexPool 无 reset() 方法
+    //
+    // 期望契约:
+    // 1. BufferIndexPool 新增 `fn reset(&self)`:bitmap 全部置 0
+    // 2. driver task 正常退出(Shutdown)前调 pool.reset()
+    // 3. IoUringStorage::Drop 中 abort 后 reset
+    // 4. 异常退出仅 tracing::error!,storage 进入 IoUringState::Unavailable 状态
+    //
+    // RED 状态:reset() 方法尚未实现,以下测试编译失败。
+    // =====================================================================
+
+    /// F-04: BufferIndexPool::reset 清空所有槽位,使耗尽的池可重新分配。
+    ///
+    /// 契约:`reset(&self)` 原子地将 bitmap 所有 word 置 0(包括 build_buffer_bitmap
+    /// 预占的越界高位——reset 后高位也被清零,但 alloc 内部仍受 `idx >= buffer_count`
+    /// 兜底校验保护,不会越界分配)。
+    ///
+    /// 场景:16 个 slot 全部分配后池耗尽,reset 后应能再次分配 16 个索引。
+    /// 这覆盖 submit_and_wait 失败 / CQE 缺失 / driver 退出三类异常路径泄漏后,
+    /// 通过 reset 一次性回收所有槽位的能力。
+    ///
+    /// 预期失败原因:`BufferIndexPool::reset` 方法不存在,编译错误:
+    /// `no method named reset found for struct BufferIndexPool`。
+    #[test]
+    fn test_buffer_index_pool_reset_clears_all_slots() {
+        let pool = BufferIndexPool::new(16);
+        // 占满 16 个有效槽
+        for i in 0..16 {
+            assert_eq!(pool.alloc(), Some(i), "顺序分配 idx {i}");
+        }
+        assert!(pool.alloc().is_none(), "16 槽占满后应返回 None");
+
+        // reset 清空所有槽位(包括异常路径泄漏的索引)
+        pool.reset();
+
+        // reset 后应能再次分配 16 个索引
+        for i in 0..16 {
+            assert_eq!(
+                pool.alloc(),
+                Some(i),
+                "reset 后应能再次顺序分配 idx {i}(异常槽位回收)"
+            );
+        }
+        assert!(pool.alloc().is_none(), "再次占满后应返回 None");
+    }
+
+    /// F-04: reset 多次调用幂等,不 panic,bitmap 仍全 0。
+    ///
+    /// 契约:reset 是幂等操作——重复调用不产生副作用(不 panic、不 double-free、
+    /// 不改变 bitmap 全 0 状态)。这保证 IoUringStorage::drop 和 driver Shutdown
+    /// 两条路径都调用 reset 时不会相互干扰。
+    ///
+    /// 预期失败原因:`BufferIndexPool::reset` 方法不存在,编译错误。
+    #[test]
+    fn test_pool_reset_idempotent() {
+        let pool = BufferIndexPool::new(8);
+        // 占满 8 个槽
+        for i in 0..8 {
+            assert_eq!(pool.alloc(), Some(i));
+        }
+        assert!(pool.alloc().is_none());
+
+        // 连续 reset 多次(模拟 drop + shutdown 双路径都调用)
+        pool.reset();
+        pool.reset();
+        pool.reset();
+
+        // 仍可分配 8 个索引
+        for i in 0..8 {
+            assert_eq!(
+                pool.alloc(),
+                Some(i),
+                "多次 reset 后应仍可分配 idx {i}(幂等性)"
+            );
+        }
+        assert!(pool.alloc().is_none(), "8 槽占满后应返回 None");
+    }
+
+    /// F-04: driver task 收到 Shutdown 命令正常退出前应调用 pool.reset()。
+    ///
+    /// 契约:`driver_task` 的 `DriverCmd::Shutdown` 分支在 break 之前调用
+    /// `pool.reset()`,使所有因异常路径(submit_and_wait 失败、CQE 缺失、
+    /// driver panic)泄漏的 buffer 索引被回收。
+    ///
+    /// 测试方式:启动真实 driver_task,分配 2 个索引不释放(模拟异常路径泄漏),
+    /// 发送 Shutdown,等待 driver 退出,检查 pool 可重新分配到 idx=0(证明 reset 被调用)。
+    ///
+    /// 预期失败原因:driver_task 未调用 pool.reset(),泄漏的 2 个索引未被回收,
+    /// reset 后 pool.alloc() 仍返回 Some(2) 而非 Some(0)。
+    ///
+    /// 注:此测试需要真实 io_uring 内核支持,仅在 Linux 上编译运行。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_driver_shutdown_resets_pool() {
+        use io_uring::IoUring;
+        let ring = IoUring::builder().build(8).expect("构建 io_uring 应成功");
+        let buffers: std::sync::Arc<Vec<AlignedBuffer>> =
+            std::sync::Arc::new(vec![aligned_alloc(4096, 4096)]);
+        let pool = std::sync::Arc::new(BufferIndexPool::new(4));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DriverCmd>(8);
+        let driver_pool = pool.clone();
+        let handle = tokio::spawn(async move {
+            driver_task(ring, cmd_rx, buffers, driver_pool).await;
+        });
+
+        // 模拟异常路径泄漏:分配 2 个索引不释放(无对应 CQE 回收)
+        let leaked_a = pool.alloc().expect("分配 A");
+        let leaked_b = pool.alloc().expect("分配 B");
+        assert_eq!([leaked_a, leaked_b], [0, 1]);
+
+        // 发送 Shutdown 命令,driver 应在 break 前 reset pool
+        cmd_tx
+            .send(DriverCmd::Shutdown)
+            .await
+            .expect("发送 Shutdown 应成功");
+        handle.await.expect("driver task join 应成功");
+
+        // driver 退出前应 reset pool,泄漏的索引被回收
+        // reset 后应能再次分配到 idx=0(而非 idx=2)
+        let next = pool.alloc().expect("driver shutdown reset 后应可重新分配");
+        assert_eq!(
+            next, 0,
+            "driver Shutdown 退出前应调用 pool.reset(),回收泄漏索引;\
+             实际分配到 idx={next}(索引未被回收,F-04)"
+        );
+    }
+
+    /// F-04: IoUringStorage::drop 应在 abort driver task 后调用 pool.reset()。
+    ///
+    /// 契约:`Drop for IoUringStorage` 在 abort driver task 后,对 pool 调用
+    /// `reset()`,确保 driver 异常路径(submit_and_wait 失败、CQE 缺失、driver
+    /// panic、abort 强制取消)泄漏的 buffer 索引被回收。这避免 storage 重建时
+    /// 复用问题,也让 pool bitmap 反映真实可用状态。
+    ///
+    /// 测试方式:初始化 storage,clone 出 pool Arc 引用,分配 3 个索引模拟泄漏,
+    /// drop storage,检查 pool 可重新分配到 idx=0(证明 reset 被调用)。
+    ///
+    /// 预期失败原因:Drop 实现未调用 pool.reset(),泄漏的 3 个索引未被回收,
+    /// pool.alloc() 返回 Some(3) 而非 Some(0)。
+    ///
+    /// 注:此测试需要真实 io_uring 内核支持,仅在 Linux 上编译运行。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_iouring_storage_drop_resets_pool() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_drop_reset.bin");
+
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        storage.init().expect("io_uring init 应成功");
+
+        // 取出 pool 引用(用于 drop 后检查 bitmap 状态)
+        let ring_handle = storage.ring.as_ref().expect("init 后 ring 应存在").clone();
+        let pool = ring_handle.pool.clone();
+
+        // 模拟异常路径泄漏:分配 3 个索引不释放(无对应 CQE 回收)
+        for i in 0..3 {
+            assert_eq!(pool.alloc(), Some(i), "模拟泄漏 idx {i}");
+        }
+
+        // drop storage:应 abort driver 并 reset pool
+        drop(storage);
+
+        // drop 后 pool 应被 reset,可重新分配到 idx=0
+        let next = pool.alloc().expect("drop 后 pool 应被 reset,可重新分配");
+        assert_eq!(
+            next, 0,
+            "IoUringStorage::drop 应调用 pool.reset(),回收所有泄漏索引;\
+             实际分配到 idx={next}(索引未被回收,F-04)"
+        );
+    }
+
+    /// F-04: storage 进入 Unavailable 状态后,write_at 应返回错误(不 panic)。
+    ///
+    /// 契约:异常退出路径(driver panic、submit_and_wait 反复失败、init 失败)
+    /// 将 storage 状态置为 `IoUringState::Unavailable`,后续 `write_at` 在 match
+    /// 中显式覆盖 Unavailable 分支,返回 `NotConnected` Io 错误而非 panic 或
+    /// 静默成功。这保证后端不可用时调用方得到明确错误,可降级到其他存储后端。
+    ///
+    /// 注:`IoUringState::Unavailable` 变体已存在(line 113),write_at 的
+    /// `_ =>` 分支已返回 NotConnected 错误。此测试作为契约守卫,确保未来
+    /// 重构 match 时 Unavailable 路径不退化为 panic/unreachable。
+    ///
+    /// 预期失败原因:无(此测试当前应 PASS,作为 GREEN 守卫)。若未来实现将
+    /// Unavailable 分支改为 panic 或 unreachable,此测试会失败。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_unavailable_state_returns_error_on_write() {
+        let storage = IoUringStorage {
+            config: IoUringConfig::default(),
+            file_path: PathBuf::from("/tmp/iouring_unavailable.bin"),
+            file_fd: None,
+            state: IoUringState::Unavailable,
+            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            ring: None,
+        };
+
+        let result = storage.write_at(0, Bytes::from_static(b"test")).await;
+        assert!(
+            result.is_err(),
+            "Unavailable 状态下 write_at 必须返回错误,不能 panic 或静默成功"
+        );
+
+        // 错误应为 Io 错误(NotConnected),而非其他类型
+        match result.unwrap_err() {
+            DownloadError::Io(io_err) => {
+                assert!(
+                    matches!(io_err.kind(), std::io::ErrorKind::NotConnected)
+                        || io_err.to_string().contains("未初始化")
+                        || io_err.to_string().contains("Unavailable"),
+                    "Unavailable 状态 write_at 应返回 NotConnected 错误,实际: {io_err}"
+                );
+            }
+            other => panic!("应返回 Io 错误,实际: {other}"),
+        }
+    }
+
+    // ── F-15(父目录 sync)RED 测试 ──
+    //
+    // 审计 F-15:IoUringStorage::close 仅 fsync 文件本身(sync_all),不 sync
+    // 父目录。Unix 断电后文件数据落盘但目录项创建未持久化,文件可能消失。
+    // 多文件 torrent 需逐层新目录持久化。
+    //
+    // 期望:IoUringStorage::close() 末尾(在 sync_all 之后)调用
+    //   `crate::sync_parent_dir(&self.path)`(在 spawn_blocking 闭包内)。
+    //
+    // 本测试为 RED:函数尚不存在 → E0425。实现后,close 内部调用
+    // sync_parent_dir,测试断言:
+    // 1. close() 不 panic 且返回 Ok
+    // 2. close 后父目录可被 std::fs::File::open 打开(metadata 可读)
+    // 3. 显式调用 crate::sync_parent_dir(parent) 验证函数已导出(契约验证)
+
+    /// F-15 契约:IoUringStorage::close() MUST 调用 sync_parent_dir 持久化父目录。
+    ///
+    /// 预期失败原因:`crate::sync_parent_dir` 函数尚不存在,编译失败(E0425)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_iouring_close_syncs_parent_directory() {
+        use crate::storage::AsyncStorage;
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_f15_parent_sync.bin");
+        let parent: &Path = path.parent().expect("文件应有父目录");
+
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        storage.init().expect("io_uring init 应成功");
+        storage.allocate(4096).await.expect("预分配应成功");
+        storage
+            .write_at(
+                0,
+                Bytes::from_static(b"f15-parent-sync-padded-to-4096-bytes!!"),
+            )
+            .await
+            .expect("write_at 应成功");
+        storage
+            .close()
+            .await
+            .expect("close 应成功(含 sync_parent_dir)");
+
+        // 1. close 后父目录 metadata 应可读(目录项存在)
+        let parent_meta = std::fs::metadata(parent).expect("close 后父目录 metadata 应可读");
+        assert!(parent_meta.is_dir(), "父目录应为目录");
+
+        // 2. 契约验证:sync_parent_dir 已导出且对真实父目录工作
+        // (RED hook:函数不存在时此行触发 E0425)
+        let sync_result = crate::sync_parent_dir(&path);
+        assert!(
+            sync_result.is_ok(),
+            "sync_parent_dir 对已存在文件的父目录应返回 Ok: {:?}",
+            sync_result.err()
+        );
     }
 }

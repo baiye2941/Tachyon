@@ -13,7 +13,9 @@
 //! 无法证明接入收益。如需重新引入,应先补跨文件接入与 >10% 收益的 bench 证据。
 
 pub mod aligned_buf;
+pub mod alloc;
 pub mod buffer;
+pub mod dir_sync;
 pub mod iocp;
 pub mod iouring;
 pub mod storage;
@@ -22,6 +24,7 @@ pub mod winio;
 
 pub use aligned_buf::AlignedBuf;
 pub use buffer::{BufferGuard, BufferPool, BufferPoolStats};
+pub use dir_sync::sync_parent_dir;
 pub use iocp::IoCpStorage;
 pub use iouring::{IoUringConfig, IoUringState, IoUringStorage};
 pub use storage::AsyncStorage;
