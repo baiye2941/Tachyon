@@ -82,6 +82,9 @@ pub struct ProgressBroker {
     pub(crate) pending_completed: Arc<DashMap<String, Vec<u32>>>,
     /// 每任务本周期新开始下载分片索引增量
     pub(crate) pending_started: Arc<DashMap<String, Vec<u32>>>,
+    /// 每任务本周期活跃分片字节进度快照(仅 downloading_set 中的分片)
+    pub(crate) pending_fragment_bytes:
+        Arc<DashMap<String, Vec<crate::commands::FragmentByteProgress>>>,
     /// 任务终态通知发射器(在 Tauri setup 中注入)
     notification_emitter: Arc<Mutex<Option<Arc<dyn NotificationEmitter>>>>,
     /// 已发送通知的任务终态,用于同一任务同一终态去重
@@ -103,6 +106,7 @@ impl ProgressBroker {
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
+            pending_fragment_bytes: Arc::new(DashMap::new()),
             notification_emitter: Arc::new(Mutex::new(None)),
             notified_states: Arc::new(DashMap::new()),
         }
@@ -122,6 +126,7 @@ impl ProgressBroker {
         let notify = self.notify.clone();
         let pending_completed = self.pending_completed.clone();
         let pending_started = self.pending_started.clone();
+        let pending_fragment_bytes = self.pending_fragment_bytes.clone();
         let notification_emitter = self.notification_emitter.clone();
         let notified_states = self.notified_states.clone();
 
@@ -150,6 +155,7 @@ impl ProgressBroker {
                     &task_repository_ref,
                     &pending_completed,
                     &pending_started,
+                    &pending_fragment_bytes,
                 );
                 let _ = tx.send(event);
 
@@ -175,6 +181,7 @@ impl ProgressBroker {
             notify: Arc::new(Notify::new()),
             pending_completed: Arc::new(DashMap::new()),
             pending_started: Arc::new(DashMap::new()),
+            pending_fragment_bytes: Arc::new(DashMap::new()),
             notification_emitter: Arc::new(Mutex::new(None)),
             notified_states: Arc::new(DashMap::new()),
         }
@@ -202,11 +209,19 @@ impl ProgressBroker {
         self.notify.notify_one();
     }
 
-    /// 标记任务进度变化,并记录分片状态变更增量(started/completed)
+    /// 标记任务进度变化,记录分片状态变更增量(started/completed)+ 活跃分片字节快照
     ///
     /// 竞态消除:当 Completed(idx) 到达时,从 pending_started 中移除 idx(若存在),
     /// 避免同一分片的 Started 增量在跨窗口场景下被推送给前端导致"幽灵 downloading"。
-    pub fn mark_dirty_with_delta(&self, task_id: &str, delta: Option<ProgressDelta>) {
+    ///
+    /// fragment_bytes 为快照式覆盖:每次调用覆盖该任务本周期的字节快照。
+    /// 空 Vec 表示无活跃分片(终态或全部完成)。
+    pub fn mark_dirty_with_delta(
+        &self,
+        task_id: &str,
+        delta: Option<ProgressDelta>,
+        fragment_bytes: Vec<crate::commands::FragmentByteProgress>,
+    ) {
         if let Some(d) = delta {
             match d {
                 ProgressDelta::Started(idx) => {
@@ -220,6 +235,10 @@ impl ProgressBroker {
                     if let Some(mut started) = self.pending_started.get_mut(task_id) {
                         started.retain(|&x| x != idx);
                     }
+                    // 完成的分片不再出现在字节快照中(过滤掉)
+                    if let Some(mut bytes) = self.pending_fragment_bytes.get_mut(task_id) {
+                        bytes.retain(|e| e.index != idx);
+                    }
                     self.pending_completed
                         .entry(task_id.to_string())
                         .or_default()
@@ -227,6 +246,9 @@ impl ProgressBroker {
                 }
             }
         }
+        // 字节快照覆盖式写入(空 Vec 也写入,表示清空)
+        self.pending_fragment_bytes
+            .insert(task_id.to_string(), fragment_bytes);
         self.notify.notify_one();
     }
 
@@ -239,6 +261,7 @@ impl ProgressBroker {
             &self.task_repository,
             &self.pending_completed,
             &self.pending_started,
+            &self.pending_fragment_bytes,
         );
         let _ = self.progress_tx.send(event);
 
@@ -268,6 +291,7 @@ fn build_progress_event(
     task_repository: &TaskRepository,
     pending_completed: &DashMap<String, Vec<u32>>,
     pending_started: &DashMap<String, Vec<u32>>,
+    pending_fragment_bytes: &DashMap<String, Vec<crate::commands::FragmentByteProgress>>,
 ) -> ProgressEvent {
     task_repository
         .iter()
@@ -279,6 +303,10 @@ fn build_progress_event(
                 .map(|mut d| std::mem::take(&mut *d))
                 .unwrap_or_default();
             let started_delta = pending_started
+                .get_mut(id)
+                .map(|mut d| std::mem::take(&mut *d))
+                .unwrap_or_default();
+            let fragment_bytes = pending_fragment_bytes
                 .get_mut(id)
                 .map(|mut d| std::mem::take(&mut *d))
                 .unwrap_or_default();
@@ -297,7 +325,7 @@ fn build_progress_event(
                     completed_delta,
                     started_delta,
                     error_reason: t.error_reason.clone(),
-                    fragment_bytes: vec![],
+                    fragment_bytes,
                 },
             )
         })
@@ -378,7 +406,7 @@ mod tests {
         let repository = make_test_repository();
         let completed = DashMap::new();
         let started = DashMap::new();
-        let event = build_progress_event(&repository, &completed, &started);
+        let event = build_progress_event(&repository, &completed, &started, &DashMap::new());
         assert!(event.is_empty());
     }
 
@@ -432,7 +460,12 @@ mod tests {
             },
         );
 
-        let event = build_progress_event(&repository, &DashMap::new(), &DashMap::new());
+        let event = build_progress_event(
+            &repository,
+            &DashMap::new(),
+            &DashMap::new(),
+            &DashMap::new(),
+        );
         assert_eq!(event.len(), 2);
 
         let tp1 = event.get("t1").unwrap();
@@ -851,9 +884,9 @@ mod tests {
             },
         );
 
-        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(0)));
+        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(0)), vec![]);
         broker.broadcast_all();
-        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(1)));
+        broker.mark_dirty_with_delta("t-delta", Some(ProgressDelta::Completed(1)), vec![]);
         broker.broadcast_all();
 
         let e1 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
@@ -877,5 +910,118 @@ mod tests {
             vec![1],
             "第二次 broadcast 的 completed_delta 必须独立到达"
         );
+    }
+
+    /// 字节级进度:mark_dirty_with_delta 携带的 fragment_bytes 应出现在 broadcast 事件中
+    #[tokio::test]
+    async fn test_fragment_bytes_propagated_to_broadcast() {
+        let repository = make_test_repository();
+        repository.insert(
+            "t-bytes".to_string(),
+            TaskInfo {
+                id: "t-bytes".to_string(),
+                url: "https://example.com/a.bin".to_string(),
+                file_name: "a.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 4,
+                fragments_done: 0,
+                active_concurrency: 2,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let mut rx = broker.subscribe();
+
+        broker.mark_dirty_with_delta(
+            "t-bytes",
+            None,
+            vec![
+                crate::commands::FragmentByteProgress {
+                    index: 0,
+                    downloaded: 256,
+                },
+                crate::commands::FragmentByteProgress {
+                    index: 1,
+                    downloaded: 128,
+                },
+            ],
+        );
+        broker.broadcast_all();
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("应收到 broadcast")
+            .expect("broadcast 不应关闭");
+        let tp = event.get("t-bytes").expect("t-bytes 应在事件中");
+        assert_eq!(
+            tp.fragment_bytes.len(),
+            2,
+            "fragment_bytes 应含 2 个活跃分片"
+        );
+        let mut entries = tp.fragment_bytes.clone();
+        entries.sort_by_key(|e| e.index);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[0].downloaded, 256);
+        assert_eq!(entries[1].index, 1);
+        assert_eq!(entries[1].downloaded, 128);
+    }
+
+    /// 终态后 fragment_bytes 应被清空(活跃分片 0 个)
+    #[tokio::test]
+    async fn test_fragment_bytes_cleared_after_terminal() {
+        let repository = make_test_repository();
+        repository.insert(
+            "t-term".to_string(),
+            TaskInfo {
+                id: "t-term".to_string(),
+                url: "https://example.com/a.bin".to_string(),
+                file_name: "a.bin".to_string(),
+                file_size: Some(1024),
+                downloaded: 1024,
+                speed: 0,
+                status: DownloadState::Completed,
+                progress: 1.0,
+                fragments_total: 4,
+                fragments_done: 4,
+                active_concurrency: 0,
+                created_at: "2025-01-01T00:00:00+08:00".to_string(),
+                save_path: String::new(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+        let broker = ProgressBroker::new_no_aggregator(repository.clone());
+        let mut rx = broker.subscribe();
+
+        broker.mark_dirty_with_delta(
+            "t-term",
+            None,
+            vec![crate::commands::FragmentByteProgress {
+                index: 0,
+                downloaded: 256,
+            }],
+        );
+        broker.mark_dirty_with_delta("t-term", None, vec![]);
+        broker.broadcast_all();
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("应收到 broadcast")
+            .expect("broadcast 不应关闭");
+        let tp = event.get("t-term").expect("t-term 应在事件中");
+        assert!(tp.fragment_bytes.is_empty(), "终态后 fragment_bytes 应为空");
     }
 }

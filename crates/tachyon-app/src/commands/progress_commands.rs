@@ -416,4 +416,24 @@ mod tests {
         let changed = delta.get("t1").unwrap();
         assert_eq!(changed.file_size, Some(1024));
     }
+
+    /// 初始全量快照不应携带活跃分片字节快照(订阅前无下载活动)
+    #[tokio::test]
+    async fn test_build_initial_progress_event_has_empty_fragment_bytes() {
+        let state = test_state();
+        let _id = create_task_inner(
+            &state,
+            "https://example.com/init.bin".to_string(),
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let event = build_initial_progress_event(&state.domain.task_repository);
+        let tp = event.values().next().expect("应至少一个任务");
+        assert!(tp.fragment_bytes.is_empty());
+    }
 }
