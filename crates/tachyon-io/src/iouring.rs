@@ -1779,10 +1779,8 @@ impl AsyncStorage for IoUringStorage {
                         if let Some(file) = self.file_fd.clone() {
                             tokio::task::spawn_blocking(move || {
                                 file.sync_all().map_err(DownloadError::Io)?;
-                                if let Some(ref p) = path {
-                                    crate::sync_parent_dir(p).map_err(DownloadError::Io)?;
-                                }
-                                Ok(())
+                                crate::sync_parent_dir(&path).map_err(DownloadError::Io)?;
+                                Ok::<(), DownloadError>(())
                             })
                             .await
                             .map_err(|e| {

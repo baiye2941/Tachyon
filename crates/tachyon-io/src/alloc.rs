@@ -46,6 +46,9 @@ pub fn allocate_windows(file: &std::fs::File, size: u64) -> DownloadResult<()> {
     })?;
 
     // 2. 记录旧逻辑大小作为 rollback 目标。
+    // Windows 路径在 SetFileInformationByHandle 失败时 rollback 到 old_size;
+    // Linux 路径由 fallocate 原子分配无需 rollback,old_size 在 Linux 未使用。
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     let old_size = file.metadata().map_err(DownloadError::Io)?.len();
 
     // 3. 设置文件逻辑大小(EOF)。set_len 成功后,文件逻辑大小已扩展;
