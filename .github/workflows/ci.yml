@@ -242,7 +242,7 @@ jobs:
       - name: Miri 检测 tachyon-core
         run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip test_validate_multi_save_paths --skip proptests
       - name: Miri 检测 tachyon-io (非平台特定代码)
-        run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring --skip pipeline --skip tokio_file --skip winio --skip write_pipeline
+        run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring --skip pipeline --skip tokio_file --skip winio --skip write_pipeline --skip dir_sync
 
   bench:
     name: 性能基准采样
