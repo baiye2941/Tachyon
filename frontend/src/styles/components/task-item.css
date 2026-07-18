@@ -2,6 +2,9 @@
    Task Row (premium feel: horizontal hover gradient + selected left 2px bamboo stripe + micro lift)
    ============================================ */
 .task-row {
+  /* 显式定位:光迹(.task-item-light-trail, absolute)的包含块,
+     不依赖 contain: paint 的规范副作用 */
+  position: relative;
   background: transparent;
   box-shadow: inset 2px 0 0 transparent;
   transition:
