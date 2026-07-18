@@ -200,6 +200,22 @@ describe("TaskItem", () => {
     expect(trail).toBeTruthy();
   });
 
+  it("非下载中任务行不渲染微型光迹", () => {
+    const { container } = renderWithI18n(() => (
+      <TaskItem
+        task={{ ...task, status: "completed", progress: 1 }}
+        index={0}
+        isSelected={false}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    expect(container.querySelector(".task-item-light-trail")).toBeNull();
+  });
+
   it("作为 listbox option 时，选中行应设置 aria-selected=true", () => {
     renderWithI18n(() => (
       <TaskItem

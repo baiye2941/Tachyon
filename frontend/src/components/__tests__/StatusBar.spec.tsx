@@ -112,5 +112,21 @@ describe("StatusBar sparkline 峰值标记", () => {
 
     const peak = container.querySelector(".sparkline-peak");
     expect(peak).toBeTruthy();
+    // 峰值 500 在索引 1:cx = 1/(3-1) × 80(默认宽) = 40
+    expect(peak?.getAttribute("cx")).toBe("40");
+  });
+
+  it("数据不足 2 个点时不渲染峰值标记", () => {
+    pushSpeed(100);
+
+    const { container } = renderStatusBar({
+      isIdle: false,
+      totalSpeed: 100,
+      activeCount: 1,
+      pausedCount: 0,
+      totalCount: 1,
+    });
+
+    expect(container.querySelector(".sparkline-peak")).toBeNull();
   });
 });

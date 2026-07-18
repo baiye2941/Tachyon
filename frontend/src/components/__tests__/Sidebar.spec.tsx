@@ -128,4 +128,17 @@ describe("Sidebar 选中速度线", () => {
       activeItem?.classList.contains("sidebar-nav-indicator--active"),
     ).toBe(true);
   });
+
+  it("非选中 nav item 的 indicator 无速度线 class", () => {
+    const { container } = render(() => <Sidebar />);
+    const inactiveIndicators = container.querySelectorAll(
+      ".sidebar-nav-item:not(.is-active) .sidebar-nav-indicator",
+    );
+    expect(inactiveIndicators.length).toBeGreaterThan(0);
+    for (const el of inactiveIndicators) {
+      expect(el.classList.contains("sidebar-nav-indicator--active")).toBe(
+        false,
+      );
+    }
+  });
 });

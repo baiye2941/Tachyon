@@ -42,6 +42,7 @@ export default function Sparkline(props: SparklineProps) {
     const peak = Math.max(...data)
     if (peak <= 0) return null
     const maxVal = Math.max(peak, 1)
+    // 多峰值并列时 indexOf 取最左(最早)峰值,直观对应「首次达到峰值」
     const peakIndex = data.indexOf(peak)
     return {
       x: (peakIndex / (data.length - 1)) * width(),
