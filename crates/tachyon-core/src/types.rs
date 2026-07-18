@@ -306,6 +306,23 @@ pub struct FileLayout {
     files: Vec<FileSpan>,
 }
 
+/// `FileLayout::try_from_spans` 的校验错误类型(F-09)
+///
+/// 区分五种不变量违反,便于调用方精确报告布局损坏原因:
+/// - `FileIdGap`:file_id 缺号(如 0,2 缺 1)
+/// - `FileIdDuplicate`:file_id 重复(如 0,0)
+/// - `OffsetGap`:全局 offset 出现空洞(段间未紧接)
+/// - `OffsetOverlap`:全局 offset 重叠(段间相互覆盖)
+/// - `LenOverflow`:`global_offset + len` 溢出 u64
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutError {
+    FileIdGap,
+    FileIdDuplicate,
+    OffsetGap,
+    OffsetOverlap,
+    LenOverflow,
+}
+
 /// FileLayout 中的一个文件段
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSpan {
@@ -333,9 +350,52 @@ impl FileLayout {
     }
 
     /// 从文件段列表构造(会按 global_offset 排序,确保升序不变量)
+    ///
+    /// 保留旧行为(仅排序,不校验)以兼容需要绕过校验构造畸形 layout 的场景
+    /// (如 debug_assert 测试)。生产代码 SHOULD 用 `try_from_spans` 获取
+    /// 结构化错误,本方法仅用于调用方已确保 spans 合法的快速路径。
     pub fn from_spans(mut spans: Vec<FileSpan>) -> Self {
         spans.sort_by_key(|s| s.global_offset);
         Self { files: spans }
+    }
+
+    /// F-09:从文件段列表构造并做边界校验
+    ///
+    /// 校验规则(排序后逐段比对):
+    /// 1. `file_id` 从 0 递增,缺号 → `FileIdGap`,回退/重复 → `FileIdDuplicate`
+    /// 2. `global_offset` 严格紧接上一段末尾(首段可从任意 offset 起),
+    ///    空洞 → `OffsetGap`,重叠 → `OffsetOverlap`
+    /// 3. `global_offset + len` 不得溢出,否则 `LenOverflow`
+    ///
+    /// 空列表通过校验(退化为零长度布局,`total_len == 0`)。
+    pub fn try_from_spans(mut spans: Vec<FileSpan>) -> Result<Self, LayoutError> {
+        spans.sort_by_key(|s| s.global_offset);
+        // expected_offset = None 表示首段,首段可从任意 global_offset 起(不强制 0),
+        // 后续段必须紧接上一段末尾。这允许单文件布局起始 offset 非 0(合法),
+        // 同时拒绝多文件间的 offset 空洞/重叠。
+        let mut expected_offset: Option<u64> = None;
+        for (expected_file_id, span) in spans.iter().enumerate() {
+            if span.file_id != expected_file_id {
+                if span.file_id < expected_file_id {
+                    return Err(LayoutError::FileIdDuplicate);
+                }
+                return Err(LayoutError::FileIdGap);
+            }
+            if let Some(expected) = expected_offset
+                && span.global_offset != expected
+            {
+                if span.global_offset > expected {
+                    return Err(LayoutError::OffsetGap);
+                }
+                return Err(LayoutError::OffsetOverlap);
+            }
+            let end = span
+                .global_offset
+                .checked_add(span.len)
+                .ok_or(LayoutError::LenOverflow)?;
+            expected_offset = Some(end);
+        }
+        Ok(Self { files: spans })
     }
 
     /// 全局总长
@@ -358,6 +418,14 @@ impl FileLayout {
     /// 供 `validate_multi_save_paths` 取各文件 relative_filename 做落盘路径校验。
     pub fn file_names(&self) -> Vec<String> {
         self.files.iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// 按排序后的完整文件段列表(只读视图)
+    ///
+    /// 供调用方(如 `StorageSet::multi`)在构造时复用已校验的 spans,
+    /// 或将已校验 layout 转回 `Vec<FileSpan>` 重新走 `try_from_spans`。
+    pub fn file_spans(&self) -> &[FileSpan] {
+        &self.files
     }
 
     /// 把全局闭区间 `[start, end]` 拆成各文件内的段
@@ -1156,6 +1224,161 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("invariant"));
+    }
+
+    // ===== F-09: FileLayout::try_from_spans 边界校验(RED) =====
+    //
+    // 审计 F-09 指出 from_spans(types.rs:336-339)仅排序,
+    // 不验证 file_id 连续性/offset 空洞/重叠/溢出。下列测试要求新增:
+    //   - enum LayoutError { FileIdGap, FileIdDuplicate, OffsetGap, OffsetOverlap, LenOverflow }
+    //   - FileLayout::try_from_spans(spans: Vec<FileSpan>) -> Result<Self, LayoutError>
+
+    /// 合法布局(双文件 file_id=0,1; offset=0,1000; len=1000,500)应 Ok
+    #[test]
+    fn test_try_from_spans_accepts_valid_layout() {
+        let spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1000,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 1000,
+                len: 500,
+                name: "b".into(),
+            },
+        ];
+        let layout = FileLayout::try_from_spans(spans).expect("合法双文件布局应通过校验");
+        assert_eq!(layout.file_count(), 2);
+        assert_eq!(layout.total_len(), 1500);
+    }
+
+    /// file_id 出现 0,2(缺 1)应 Err(FileIdGap)
+    #[test]
+    fn test_try_from_spans_rejects_file_id_gap() {
+        let spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 100,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 2,
+                global_offset: 100,
+                len: 100,
+                name: "c".into(),
+            },
+        ];
+        let err = FileLayout::try_from_spans(spans).expect_err("file_id 缺号 1 必须拒绝");
+        assert!(
+            matches!(err, LayoutError::FileIdGap),
+            "缺号应返回 FileIdGap,实际: {err:?}"
+        );
+    }
+
+    /// file_id 重复(0,0)应 Err(FileIdDuplicate)
+    #[test]
+    fn test_try_from_spans_rejects_duplicate_file_id() {
+        let spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 100,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 0,
+                global_offset: 100,
+                len: 100,
+                name: "a2".into(),
+            },
+        ];
+        let err = FileLayout::try_from_spans(spans).expect_err("重复 file_id=0 必须拒绝");
+        assert!(
+            matches!(err, LayoutError::FileIdDuplicate),
+            "重复 file_id 应返回 FileIdDuplicate,实际: {err:?}"
+        );
+    }
+
+    /// offset 出现空洞(span0=[0,500), span1=[1000,1500))应 Err(OffsetGap)
+    #[test]
+    fn test_try_from_spans_rejects_offset_gap() {
+        let spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 500,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 1000,
+                len: 500,
+                name: "b".into(),
+            },
+        ];
+        let err = FileLayout::try_from_spans(spans).expect_err("offset 500-1000 空洞必须拒绝");
+        assert!(
+            matches!(err, LayoutError::OffsetGap),
+            "offset 空洞应返回 OffsetGap,实际: {err:?}"
+        );
+    }
+
+    /// offset 重叠(span0=[0,1000), span1=[500,1500))应 Err(OffsetOverlap)
+    #[test]
+    fn test_try_from_spans_rejects_offset_overlap() {
+        let spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1000,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 1,
+                global_offset: 500,
+                len: 1000,
+                name: "b".into(),
+            },
+        ];
+        let err = FileLayout::try_from_spans(spans).expect_err("offset 500-1000 重叠必须拒绝");
+        assert!(
+            matches!(err, LayoutError::OffsetOverlap),
+            "offset 重叠应返回 OffsetOverlap,实际: {err:?}"
+        );
+    }
+
+    /// global_offset + len 溢出(offset=1, len=u64::MAX)应 Err(LenOverflow)
+    #[test]
+    fn test_try_from_spans_rejects_len_overflow() {
+        let spans = vec![FileSpan {
+            file_id: 0,
+            global_offset: 1,
+            len: u64::MAX,
+            name: "overflow.bin".into(),
+        }];
+        let err = FileLayout::try_from_spans(spans).expect_err("offset+len 溢出必须拒绝");
+        assert!(
+            matches!(err, LayoutError::LenOverflow),
+            "offset+len 溢出应返回 LenOverflow,实际: {err:?}"
+        );
+    }
+
+    /// 单文件合法 span 应 Ok
+    #[test]
+    fn test_try_from_spans_accepts_single_file() {
+        let spans = vec![FileSpan {
+            file_id: 0,
+            global_offset: 0,
+            len: 8192,
+            name: "single.bin".into(),
+        }];
+        let layout = FileLayout::try_from_spans(spans).expect("合法单文件布局应通过校验");
+        assert_eq!(layout.file_count(), 1);
+        assert_eq!(layout.total_len(), 8192);
     }
 }
 

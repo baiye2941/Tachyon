@@ -82,6 +82,9 @@ pub mod harness {
         },
         /// Io/Other 等不可 Clone 变体的降级表示
         DowngradedNetwork(String),
+        /// 服务器不支持 Range 请求(对 GET Range 返回 200 而非 206),
+        /// engine 层据此降级为整块下载。可 Clone,完整保留类型。
+        RangeNotSupported,
     }
 
     impl PreservedError {
@@ -112,6 +115,7 @@ pub mod harness {
                     status: *status,
                     reason: reason.clone(),
                 },
+                DownloadError::RangeNotSupported => PreservedError::RangeNotSupported,
                 // 不可 Clone 的变体降级为 Network
                 DownloadError::Io(_)
                 | DownloadError::Other(_)
@@ -150,6 +154,7 @@ pub mod harness {
                     reason: reason.clone(),
                 },
                 PreservedError::DowngradedNetwork(s) => DownloadError::Network(s.clone()),
+                PreservedError::RangeNotSupported => DownloadError::RangeNotSupported,
             }
         }
     }
@@ -645,6 +650,7 @@ pub mod harness {
     }
 
     /// 创建测试用的默认下载配置
+    #[allow(deprecated)]
     pub fn test_config() -> DownloadConfig {
         DownloadConfig {
             download_dir: std::env::temp_dir().to_string_lossy().to_string(),
@@ -866,6 +872,8 @@ mod tests {
             DownloadError::Other("other".into()),
             DownloadError::UrlParse(url::ParseError::EmptyHost),
             DownloadError::Serialization(serde_json::from_str::<()>("bad").unwrap_err()),
+            // 可 Clone 降级触发变体:engine 层捕获后转整块下载
+            DownloadError::RangeNotSupported,
         ];
         for err in cases {
             // err 将被 move 进 failing,先记录判据

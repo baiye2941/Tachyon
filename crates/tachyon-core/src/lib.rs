@@ -37,13 +37,14 @@ pub use safety::{
 pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{
     DownloadState, DownloadStateChange, FileLayout, FileMetadata, FileSpan, FragmentInfo,
-    FragmentProgress, ObjectIdentity, TaskCommand, TaskId, TaskProgress,
+    FragmentProgress, LayoutError, ObjectIdentity, TaskCommand, TaskId, TaskProgress,
 };
 pub use utils::{Metrics, hex_encode};
 
 /// 验证统一配置类型存在且序列化往返正确
 #[cfg(test)]
 #[test]
+#[allow(deprecated)]
 fn app_config() {
     let cfg = config::DownloadConfig {
         download_dir: "/tmp/test".to_string(),

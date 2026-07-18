@@ -20,13 +20,16 @@ use crate::predictor::HoltLinearPredictor;
 pub struct AdaptiveDownloadScheduler {
     predictor: RwLock<HoltLinearPredictor>,
     config: SchedulerConfig,
-    /// 估计的链路往返时延(RTT),用于 BDP(带宽延迟积)计算。
+    /// 最近一次观测到的网络时延(RTT),用于 BDP(带宽延迟积)计算。
     ///
-    /// 默认 50ms(典型公网 RTT)。可通过 [`DownloadScheduler::observe_rtt`]
-    /// 在 probe 阶段注入实测 RTT(如 TCP 握手 + TTFB),使 BDP 估计更贴合
-    /// 真实链路。高延迟链路(跨国 200ms+、卫星 600ms+)下,准确的 RTT 能
-    /// 避免分片过小导致 TCP 窗口未打满、并发度不足导致管道空闲。
+    /// 默认 50ms(典型国内 RTT)。可通过 [`DownloadScheduler::observe_rtt`]
+    /// 在 probe 阶段注入实测 RTT(含 TCP 握手 + TTFB),使 BDP 估计更贴近
+    /// 真实链路。对高延迟链路(跨境 200ms+、卫星 600ms+)时,准确的 RTT 能
+    /// 避免分片过小导致 TCP 窗口未填满、并发度不足导致管道空闲。
     rtt: RwLock<Duration>,
+    /// 慢启动爬坡水位:无样本时为 cold_start_initial;每次 observe 后
+    /// `min(prev * ramp_factor, max_concurrency)`,稳态后由 Holt 预测接管。
+    ramp_concurrency: RwLock<u32>,
 }
 
 /// 默认 RTT,冷启动无实测样本时的回退值。
@@ -38,6 +41,7 @@ const DEFAULT_RTT: Duration = Duration::from_millis(50);
 impl AdaptiveDownloadScheduler {
     /// 创建新的自适应调度器
     pub fn new(config: SchedulerConfig) -> Self {
+        let initial = config.cold_start_initial_concurrency.max(1);
         Self {
             predictor: RwLock::new(HoltLinearPredictor::new(
                 config.ewma_alpha,
@@ -45,6 +49,7 @@ impl AdaptiveDownloadScheduler {
             )),
             config,
             rtt: RwLock::new(DEFAULT_RTT),
+            ramp_concurrency: RwLock::new(initial),
         }
     }
 
@@ -57,8 +62,19 @@ impl AdaptiveDownloadScheduler {
 impl DownloadScheduler for AdaptiveDownloadScheduler {
     fn observe_bandwidth(&self, bytes_per_sec: u64) {
         tracing::info!(bandwidth = bytes_per_sec, "带宽分配更新");
-        let mut pred = self.predictor.write();
-        pred.observe(bytes_per_sec as f64);
+        {
+            let mut pred = self.predictor.write();
+            pred.observe(bytes_per_sec as f64);
+        }
+        // 慢启动:每次带宽样本后指数爬坡;硬上限 256 防止无界乘爆。
+        // 实际 concurrency 仍由 recommend 的 max_concurrency 裁剪。
+        const RAMP_HARD_CAP: u32 = 256;
+        let factor = self.config.cold_start_ramp_factor.clamp(1.0, 8.0);
+        let mut ramp = self.ramp_concurrency.write();
+        if *ramp < RAMP_HARD_CAP {
+            let next = ((*ramp as f64) * factor).ceil() as u32;
+            *ramp = next.clamp(1, RAMP_HARD_CAP);
+        }
     }
 
     fn observe_rtt(&self, rtt: Duration) {
@@ -133,16 +149,29 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             } else {
                 1
             };
-            bandwidth_based
+            let max_c = max_concurrency.max(1);
+            let holt = bandwidth_based
                 .max(bdp_concurrency)
                 .min(fragments_for_file as u32)
-                .min(max_concurrency)
-                .max(1) // 至少 1 个并发
+                .min(max_c)
+                .max(1);
+            // 慢启动:早期样本 holt 常卡在 1,用 ramp 抬升(1→2→4…);
+            // 样本充足后交给 Holt/BDP(隔离测试与稳态语义)。
+            // 爬坡期由分片完成路径 sample-driven re-recommend 驱动,不依赖 5s 定时器。
+            const RAMP_SAMPLE_THRESHOLD: u64 = 8;
+            let samples = self.predictor.read().sample_count();
+            if samples < RAMP_SAMPLE_THRESHOLD {
+                let ramp = (*self.ramp_concurrency.read()).min(max_c).max(1);
+                holt.max(ramp).min(max_c)
+            } else {
+                holt
+            }
         } else {
-            // 冷启动(无带宽样本):回退到调用方传入的 max_concurrency,
-            // 代表用户配置意图;下游 downloader 仍会 min(config.max_concurrent_fragments),
-            // 且实际 spawn 的分片数受 fragment_specs 长度限制,不会过度并发。
-            max_concurrency.max(1)
+            // 冷启动(无带宽样本):从 cold_start_initial_concurrency 起步,
+            // 避免瞬时打满连接触发 429/限速;样本到位后由 ramp 爬坡。
+            (*self.ramp_concurrency.read())
+                .min(max_concurrency.max(1))
+                .max(1)
         };
 
         let recommendation = ScheduleRecommendation {
@@ -179,10 +208,13 @@ mod tests {
 
     #[test]
     fn test_recommend_with_no_data() {
-        let sched = AdaptiveDownloadScheduler::default_config();
+        let sched = AdaptiveDownloadScheduler::new(SchedulerConfig {
+            cold_start_initial_concurrency: 1,
+            ..Default::default()
+        });
         let rec = sched.recommend(100 * 1024 * 1024, 8);
-        // 冷启动(无带宽样本)时应回退到 max_concurrency,充分利用用户配置的并发上限
-        assert_eq!(rec.concurrency, 8);
+        // 冷启动(无带宽样本):slow start 从 cold_start_initial_concurrency 起步
+        assert_eq!(rec.concurrency, 1);
         assert_eq!(
             rec.fragment_size,
             SchedulerConfig::default().min_fragment_size
@@ -192,13 +224,16 @@ mod tests {
 
     #[test]
     fn test_recommend_cold_start_respects_max_concurrency() {
-        let sched = AdaptiveDownloadScheduler::default_config();
-        // 冷启动时并发度应等于传入的 max_concurrency
+        let sched = AdaptiveDownloadScheduler::new(SchedulerConfig {
+            cold_start_initial_concurrency: 1,
+            ..Default::default()
+        });
+        // 冷启动并发度 = min(cold_start_initial, max_concurrency)
         let rec_4 = sched.recommend(100 * 1024 * 1024, 4);
-        assert_eq!(rec_4.concurrency, 4);
+        assert_eq!(rec_4.concurrency, 1);
 
         let rec_16 = sched.recommend(100 * 1024 * 1024, 16);
-        assert_eq!(rec_16.concurrency, 16);
+        assert_eq!(rec_16.concurrency, 1);
 
         // max_concurrency 为 0 时应至少保证 1 并发
         let rec_0 = sched.recommend(100 * 1024 * 1024, 0);
@@ -644,6 +679,91 @@ mod tests {
             rec.concurrency
         );
     }
+
+    // ── 冷启动 slow start(渐进爬坡)RED 测试 ──────────────────────────
+    //
+    // 审计发现(download_scheduler.rs:142-145):无带宽样本时 recommend
+    // 回退到 `max_concurrency`,冷启动直接开满,可能瞬时打满带宽或触发
+    // 服务端限流。slow start 方案 A 要求冷启动从 `cold_start_initial_concurrency`
+    // 开始,随 observe_bandwidth 样本累积爬坡。此处仅写测试(RED),字段尚不存在,
+    // 编译应失败,以驱动实现。
+
+    /// 冷启动(无带宽样本)时 recommend.concurrency 应等于 `cold_start_initial_concurrency`(默认 1),
+    /// 而非 max_concurrency(8)。
+    ///
+    /// 行为:`AdaptiveDownloadScheduler::default_config()` 在无任何 observe_bandwidth
+    /// 调用时,`recommend(file_size, 8).concurrency == 1`。
+    ///
+    /// 当前实现(行 142-145)返回 `max_concurrency.max(1)`,即 8,会冷启动开满。
+    /// slow start 实现应将冷启动分支改为返回 `config.cold_start_initial_concurrency`。
+    ///
+    /// 注意:此测试与现有 `test_recommend_with_no_data`(断言 concurrency == 8)
+    /// 冲突,slow start 实现需同步更新该旧测试(冷启动语义已变)。
+    #[test]
+    fn test_recommend_cold_start_returns_initial_concurrency() {
+        let sched = AdaptiveDownloadScheduler::new(SchedulerConfig {
+            cold_start_initial_concurrency: 1,
+            ..Default::default()
+        });
+        let rec = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec.concurrency, 1,
+            "冷启动(无样本)时应返回 cold_start_initial_concurrency(1),而非 max_concurrency(8)"
+        );
+    }
+
+    /// observe_bandwidth 后 recommend 应按爬坡因子(默认 2.0)渐进提升并发度,
+    /// 而非跳变到 max_concurrency。
+    ///
+    /// 行为序列:
+    ///   1. 冷启动:recommend → concurrency == 1
+    ///   2. observe_bandwidth(10MB/s) → recommend → concurrency == 2  (1 * 2.0)
+    ///   3. observe_bandwidth(10MB/s) → recommend → concurrency == 4  (2 * 2.0)
+    ///   4. observe_bandwidth(10MB/s) → recommend → concurrency == 8  (4 * 2.0,触及 max)
+    ///
+    /// 设计:每次样本累积后 recommend 按 `min(prev * ramp_factor, max_concurrency)`
+    /// 爬坡,模拟 TCP slow start 的指数增长;达到 max 后切换到稳态(由 Holt 预测主导)。
+    /// 调用方(ConcurrencyController)需在 set_target 后将 prev_concurrency 缓存,
+    /// 供下次 recommend 计算 ramp。本测试仅验证 recommend 输出序列。
+    ///
+    /// 注:爬坡所需的上一次并发度状态需要调度器内部维护(如 RwLock<u32> last_concurrency),
+    /// 或由调用方注入。本测试假设调度器内部维护该状态。
+    #[test]
+    fn test_recommend_after_sample_ramps_up() {
+        let sched = AdaptiveDownloadScheduler::new(SchedulerConfig {
+            cold_start_initial_concurrency: 1,
+            cold_start_ramp_factor: 2.0,
+            ..Default::default()
+        });
+
+        // 1. 冷启动:concurrency == 1
+        let rec0 = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(rec0.concurrency, 1, "冷启动应为 1");
+
+        // 2. 首个样本后:1 * 2.0 = 2
+        sched.observe_bandwidth(10 * 1024 * 1024);
+        let rec1 = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec1.concurrency, 2,
+            "首次 observe_bandwidth 后应爬坡到 2(1 * ramp_factor 2.0)"
+        );
+
+        // 3. 第二个样本后:2 * 2.0 = 4
+        sched.observe_bandwidth(10 * 1024 * 1024);
+        let rec2 = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec2.concurrency, 4,
+            "第二次 observe_bandwidth 后应爬坡到 4(2 * ramp_factor 2.0)"
+        );
+
+        // 4. 第三个样本后:4 * 2.0 = 8,触及 max_concurrency
+        sched.observe_bandwidth(10 * 1024 * 1024);
+        let rec3 = sched.recommend(100 * 1024 * 1024, 8);
+        assert_eq!(
+            rec3.concurrency, 8,
+            "第三次 observe_bandwidth 后应爬坡到 8(4 * ramp_factor 2.0,受 max 限制)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -695,17 +815,21 @@ mod proptests {
             prop_assert!(rec.confidence >= 0.0 && rec.confidence <= 1.0);
         }
 
-        // 冷启动(无带宽样本)时,分片大小为最小值,并发度为 max_concurrency
+        // 冷启动(无带宽样本)时,分片大小为最小值,并发度为 cold_start_initial
         #[test]
         fn test_cold_start_recommend(
             file_size in 1u64..2 * 1024 * 1024 * 1024u64,
             max_concurrency in 1u32..64,
         ) {
-            let config = SchedulerConfig::default();
+            let config = SchedulerConfig {
+                cold_start_initial_concurrency: 1,
+                ..Default::default()
+            };
+            let initial = config.cold_start_initial_concurrency.max(1);
             let sched = AdaptiveDownloadScheduler::new(config);
             let rec = sched.recommend(file_size, max_concurrency);
 
-            prop_assert_eq!(rec.concurrency, max_concurrency);
+            prop_assert_eq!(rec.concurrency, initial.min(max_concurrency).max(1));
             prop_assert_eq!(rec.fragment_size, SchedulerConfig::default().min_fragment_size);
             prop_assert!((rec.confidence - 0.0).abs() < f64::EPSILON);
         }

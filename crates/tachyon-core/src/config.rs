@@ -232,11 +232,12 @@ pub struct DownloadConfig {
     /// 将代理视为 SSRF 信任边界,仅使用可信代理。
     #[serde(default)]
     pub proxy: Option<String>,
-    /// work-stealing/动态拆分请求开关(配置兼容字段)。
+    /// work-stealing/动态拆分请求开关(配置兼容字段,已 deprecated)。
     ///
     /// Phase0 运行时 hard-disable:`true` 仅表示 requested,DownloadTask 不会动态 split
     /// 慢分片,也不会改变初始静态 topology。字段保留用于配置/备份兼容与后续阶段恢复。
-    /// 默认 `false`(缺字段反序列化亦为 `false`)。
+    /// 默认 `false`(缺字段反序列化亦为 `false`)。读取处已忽略其值。
+    #[deprecated(note = "work-stealing 已硬关删除,true 被静默忽略,后续阶段恢复前勿依赖此字段")]
     #[serde(default)]
     pub enable_work_stealing: bool,
 }
@@ -283,6 +284,7 @@ pub const fn default_max_full_stream_bytes() -> u64 {
 }
 
 impl From<DownloadConfigSerde> for DownloadConfig {
+    #[allow(deprecated)]
     fn from(value: DownloadConfigSerde) -> Self {
         // 空列表也回退到默认值,防止显式传入 "authorizedDirs": [] 绕过路径检查
         let authorized_dirs = value
@@ -312,6 +314,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
 }
 
 impl Default for DownloadConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         let download_dir = dirs()
             .map(|d| d.join("Downloads").to_string_lossy().to_string())
@@ -906,6 +909,17 @@ pub struct SchedulerConfig {
     /// A-04: 中等带宽阈值(字节/秒),超过此值时分片大小增加 50%
     #[serde(default = "default_medium_bw_threshold")]
     pub medium_bandwidth_threshold: u64,
+    /// 冷启动初始并发度(无带宽样本时 recommend 起点)
+    ///
+    /// 默认 4:兼顾冷启动保护与管道填充;显式设 1 可最保守探路。
+    /// 由 observe_bandwidth 样本驱动指数爬坡至 max_concurrency。
+    #[serde(default = "default_cold_start_initial_concurrency")]
+    pub cold_start_initial_concurrency: u32,
+    /// 冷启动爬坡因子(每次带宽样本后 concurrency *= factor)
+    ///
+    /// 默认 2.0:模拟 TCP slow start 指数增长(1→2→4→8…)。
+    #[serde(default = "default_cold_start_ramp_factor")]
+    pub cold_start_ramp_factor: f64,
 }
 
 fn default_high_bw_threshold() -> u64 {
@@ -920,6 +934,14 @@ fn default_target_fragments() -> u32 {
     16
 }
 
+fn default_cold_start_initial_concurrency() -> u32 {
+    4
+}
+
+fn default_cold_start_ramp_factor() -> f64 {
+    2.0
+}
+
 /// SchedulerConfig.ewma_beta 的默认值
 ///
 /// 保持与旧代码 `ewma_alpha * 0.3` 在 alpha=0.3 时的行为一致。
@@ -927,9 +949,12 @@ fn default_ewma_beta() -> f64 {
     0.09
 }
 
-/// SchedulerConfig.sampling_interval_secs 的默认值(当前未生效,保留兼容)
+/// SchedulerConfig.sampling_interval_secs 的默认值
+///
+/// 已接线至 `execute_fragmented_download` re-recommend 周期;默认 5s 以兼顾
+/// 短任务动态并发收益与抖动控制(最小生效 2s)。
 fn default_sampling_interval_secs() -> u64 {
-    60
+    5
 }
 
 impl Default for SchedulerConfig {
@@ -937,12 +962,14 @@ impl Default for SchedulerConfig {
         Self {
             min_fragment_size: 1024 * 1024,      // 1MB
             max_fragment_size: 64 * 1024 * 1024, // 64MB
-            sampling_interval_secs: 60,
+            sampling_interval_secs: default_sampling_interval_secs(),
             ewma_alpha: 0.3,
             ewma_beta: default_ewma_beta(),
             default_target_fragments: 16,
             high_bandwidth_threshold: default_high_bw_threshold(),
             medium_bandwidth_threshold: default_medium_bw_threshold(),
+            cold_start_initial_concurrency: default_cold_start_initial_concurrency(),
+            cold_start_ramp_factor: default_cold_start_ramp_factor(),
         }
     }
 }
@@ -1103,6 +1130,12 @@ impl SchedulerConfig {
         if self.sampling_interval_secs == 0 {
             return Err(e("sampling_interval_secs 必须 >= 1"));
         }
+        if self.cold_start_initial_concurrency == 0 {
+            return Err(e("cold_start_initial_concurrency 必须 >= 1"));
+        }
+        if !(1.0..=8.0).contains(&self.cold_start_ramp_factor) {
+            return Err(e("cold_start_ramp_factor 必须在 1.0 ~ 8.0 之间"));
+        }
         Ok(())
     }
 }
@@ -1233,8 +1266,8 @@ pub struct MagnetPatch {
 
 /// 调度器配置白名单补丁
 ///
-/// 仅暴露 UI 可编辑字段。`sampling_interval_secs`(当前未生效)、
-/// `default_target_fragments`、`high/medium_bandwidth_threshold` 为内部调参字段,
+/// 仅暴露 UI 可编辑字段。`sampling_interval_secs`、`default_target_fragments`、
+/// `high/medium_bandwidth_threshold`、`cold_start_*` 为内部调参字段,
 /// 不暴露给前端(与 `headers`/`authorized_dirs` 排除理由一致)。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1365,6 +1398,7 @@ impl ConfigPatch {
 
 impl DownloadPatch {
     /// 将下载补丁应用到现有 DownloadConfig,仅更新 Some 字段
+    #[allow(deprecated)]
     pub fn apply_to(&self, base: &mut DownloadConfig) {
         if let Some(v) = &self.download_dir {
             base.download_dir = v.clone();
@@ -1632,7 +1666,7 @@ mod tests {
         let config = SchedulerConfig::default();
         assert_eq!(config.min_fragment_size, 1024 * 1024);
         assert_eq!(config.max_fragment_size, 64 * 1024 * 1024);
-        assert_eq!(config.sampling_interval_secs, 60);
+        assert_eq!(config.sampling_interval_secs, 5);
         assert!((config.ewma_alpha - 0.3).abs() < f64::EPSILON);
         assert_eq!(config.default_target_fragments, 16);
     }
@@ -1718,6 +1752,7 @@ mod tests {
 
     /// 缺字段时 enable_work_stealing 必须反序列化为 false(配置契约)。
     #[test]
+    #[allow(deprecated)]
     fn test_enable_work_stealing_missing_field_deserializes_false() {
         let json = r#"{
             "downloadDir":"/tmp",
@@ -1734,6 +1769,7 @@ mod tests {
 
     /// 显式 true 必须保留为 requested=true(Phase0 运行时 hard-disable 不改 schema 语义)。
     #[test]
+    #[allow(deprecated)]
     fn test_enable_work_stealing_explicit_true_deserializes() {
         let json = r#"{
             "downloadDir":"/tmp",
@@ -1754,6 +1790,7 @@ mod tests {
 
     /// 序列化输出必须包含 camelCase 字段 enableWorkStealing。
     #[test]
+    #[allow(deprecated)]
     fn test_enable_work_stealing_serializes_camel_case() {
         let mut config = DownloadConfig::default();
         config.enable_work_stealing = true;
@@ -1766,6 +1803,7 @@ mod tests {
 
     /// DownloadPatch::apply_to 必须写入 enable_work_stealing requested 值。
     #[test]
+    #[allow(deprecated)]
     fn test_download_patch_enable_work_stealing_apply_true() {
         let mut base = DownloadConfig::default();
         assert!(
@@ -2353,6 +2391,43 @@ mod tests {
         assert!(SchedulerConfig::default().validate().is_ok());
     }
 
+    // ── 冷启动 slow start(渐进爬坡)RED 测试 ─────────────────────────
+    //
+    // 审计发现:冷启动无样本时 recommend 返回 max_concurrency,直接开满并发,
+    // 可能瞬时打满带宽/触发服务端限流。slow start 方案 A 引入两个配置字段,
+    // 使冷启动从低并发开始,随观测样本爬坡。此处仅写测试(RED),字段尚不存在,
+    // 编译应失败,以驱动实现。
+
+    /// 冷启动初始并发度默认值应为 1。
+    ///
+    /// 行为:`SchedulerConfig::default().cold_start_initial_concurrency == 4`。
+    /// 设计:默认 1 表示"最保守起点",由首个分片完成的 observe_bandwidth
+    /// 触发 recommend 爬坡(1 → 2 → 4 → 8 → ...),逐步探测链路容量,
+    /// 避免冷启动瞬时打满带宽。
+    #[test]
+    fn test_cold_start_initial_concurrency_default_is_4() {
+        let config = SchedulerConfig::default();
+        assert_eq!(
+            config.cold_start_initial_concurrency, 4,
+            "冷启动初始并发度默认应为 4(兼顾探路与吞吐)"
+        );
+    }
+
+    /// 冷启动爬坡因子默认值应为 2.0。
+    ///
+    /// 行为:`SchedulerConfig::default().cold_start_ramp_factor == 2.0`。
+    /// 设计:每次 recommend 爬坡时 `concurrency = min(concurrency * ramp_factor, max)`。
+    /// 默认 2.0 对应经典 TCP slow start 的指数爬坡(1→2→4→8→...),
+    /// 在探测到稳定带宽后由 Holt 预测主导,切换到稳态推荐。
+    #[test]
+    fn test_cold_start_ramp_factor_default_is_2() {
+        let config = SchedulerConfig::default();
+        assert!(
+            (config.cold_start_ramp_factor - 2.0).abs() < f64::EPSILON,
+            "冷启动爬坡因子默认应为 2.0(指数爬坡)"
+        );
+    }
+
     #[test]
     fn test_app_config_validate_max_concurrent_tasks_zero() {
         let mut cfg = AppConfig::default();
@@ -2877,7 +2952,9 @@ mod tests {
         assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
         assert!((cfg.ewma_alpha - 0.3).abs() < 1e-9);
         assert!((cfg.ewma_beta - 0.09).abs() < 1e-9);
-        assert_eq!(cfg.sampling_interval_secs, 60);
+        assert_eq!(cfg.sampling_interval_secs, 5);
+        assert_eq!(cfg.cold_start_initial_concurrency, 4);
+        assert!((cfg.cold_start_ramp_factor - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2893,7 +2970,9 @@ mod tests {
         assert_eq!(cfg.high_bandwidth_threshold, 100 * 1024 * 1024);
         assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
         assert!((cfg.ewma_beta - 0.09).abs() < 1e-9);
-        assert_eq!(cfg.sampling_interval_secs, 60);
+        assert_eq!(cfg.sampling_interval_secs, 5);
+        assert_eq!(cfg.cold_start_initial_concurrency, 4);
+        assert!((cfg.cold_start_ramp_factor - 2.0).abs() < 1e-9);
     }
 
     #[test]

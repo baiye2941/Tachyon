@@ -60,6 +60,14 @@ pub enum DownloadError {
 
     #[error("其他错误: {0}")]
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// 服务器不支持 Range 请求(对 GET Range 返回 200 而非 206)。
+    ///
+    /// 不可重试:重试仍会收到 200,无意义。engine 层捕获此错误后降级为
+    /// 单分片整块下载(`execute_full_download`),避免 N 片各自走 200 fallback
+    /// 导致总传输量 ≈ S*N/2 的带宽浪费。
+    #[error("服务器不支持 Range 请求")]
+    RangeNotSupported,
 }
 
 impl serde::Serialize for DownloadError {
@@ -107,6 +115,7 @@ impl DownloadError {
             DownloadError::UrlParse(_) => "UrlParse",
             DownloadError::Serialization(_) => "Serialization",
             DownloadError::Other(_) => "Other",
+            DownloadError::RangeNotSupported => "RangeNotSupported",
         }
     }
 
@@ -176,7 +185,8 @@ impl DownloadError {
             | DownloadError::TaskNotFound(_)
             | DownloadError::Config(_)
             | DownloadError::UrlParse(_)
-            | DownloadError::Serialization(_) => false,
+            | DownloadError::Serialization(_)
+            | DownloadError::RangeNotSupported => false,
 
             // HTTP 4xx 客户端错误不可重试 (429/408 除外)
             DownloadError::Http { status, .. } => {
