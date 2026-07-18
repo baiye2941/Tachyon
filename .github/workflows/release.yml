@@ -420,6 +420,10 @@ jobs:
       - uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # SEC-013: Tauri updater ed25519 签名(本地密钥对,私钥入 GH secret)
+          # 缺失时 tauri-action 跳过 .sig 生成,不报错
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Tachyon ${{ github.ref_name }}'
@@ -450,6 +454,10 @@ jobs:
     if: success() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
+      # SEC-013: cosign keyless 需 OIDC token 签发权限
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -471,6 +479,35 @@ jobs:
               sha256sum "$file" > "$file.sha256"
               echo "SHA256 校验文件已生成: $file.sha256"
             fi
+          done
+
+      # SEC-013: sigstore cosign keyless 签名(零密钥管理,GH OIDC → Fulcio 短期证书)
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: 对产物进行 sigstore keyless 签名(bundle)
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.msi *.deb *.dmg *.AppImage; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --bundle "$f.bundle" "$f"
+            echo "已签名: $f -> $f.bundle"
+          done
+
+      - name: 上传签名 bundle 到 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          cd dist
+          for b in *.bundle; do
+            [ -f "$b" ] || continue
+            gh release upload "$TAG" "$b" --repo "${{ github.repository }}" --clobber
           done
 
       - name: 将 draft release 发布为 public

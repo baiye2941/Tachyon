@@ -39,5 +39,15 @@
       "icons/icon.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/baiye2941/ai-model-downloader/releases/latest/download/latest.json"
+      ],
+      "pubkey": "PLACEHOLDER_GENERATE_WITH_TAURI_SIGNER",
+      "dialog": true
+    }
   }
 }

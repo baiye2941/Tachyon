@@ -73,6 +73,16 @@ impl DownloadSupervisor {
         mirror_urls: Option<Vec<String>>,
         preferred_file_name: Option<String>,
     ) {
+        // C-03: 方案 A — abort 同 id 旧 handle,清理旧控制面,防 ABA。
+        // 旧 JoinHandle drop 不 abort task_fn,需显式 abort 防止后台泄漏;
+        // 同步清理旧 command channel / lock,旧 session 后续 cleanup
+        // 因通道已被替换而只影响新 session。
+        if let Some((_, old_handle)) = self.handles.remove(task_id) {
+            old_handle.abort();
+        }
+        self.command_channels.remove(task_id);
+        self.command_locks.remove(task_id);
+
         let (control_tx, control_rx) = watch::channel(TaskCommand::Start);
         self.command_channels
             .insert(task_id.to_string(), control_tx);
@@ -187,6 +197,12 @@ impl DownloadSupervisor {
 
     /// 删除路径默认等待活跃下载 quiesce 的上限
     pub const DELETE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// 取消路径默认等待活跃下载 quiesce 的上限(审计 H-04)
+    ///
+    /// Cancel 后 await JoinHandle quiesce,避免旧 task 仍在写盘/联网,
+    /// 与 restart 产生竞态。超时后 wait_for_handle 内部 abort + 2s grace。
+    pub const CANCEL_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 }
 
 #[cfg(test)]
@@ -228,5 +244,322 @@ mod tests {
     fn test_send_command_returns_false_for_unknown_task() {
         let supervisor = empty_supervisor();
         assert!(!supervisor.send_command("missing", TaskCommand::Cancel));
+    }
+
+    // ========================================================================
+    // C-03: supervisor ABA 防护测试(RED — 当前实现不 abort 旧 handle,应失败)
+    //
+    // 审计发现:start_download 不检查同 id 已运行,直接 insert 覆盖旧 handle,
+    // 旧 JoinHandle drop 不 abort,导致旧 task_fn 漂在 runtime 上。
+    // Cancel→Undo→restart 路径可致旧 session 的 cleanup 误删新 session 控制面,
+    // 留下不可取消的后台任务。
+    //
+    // 方案 A(轻量 abort)契约:
+    //   start_download 开头:`if let Some((_, old)) = self.handles.remove(task_id) {
+    //       old.abort();
+    //   }` 并清 command_channels / command_locks 中同 id 的旧条目。
+    //   保证旧 handle 必定 abort,旧 session 后续 cleanup 因通道已被替换而只影响新 session。
+    // ========================================================================
+
+    use crate::commands::tests::test_state;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tachyon_core::config::DownloadConfig;
+
+    /// 构造"假 handle"——长任务空转,持续递增共享计数器。
+    /// abort 后任务立即停止,计数器不再增长,以此间接验证 handle 已 abort。
+    /// 不依赖 JoinHandle 所有权(因 insert 后所有权转移给 DashMap,无法再观察)。
+    fn stale_handle(heartbeat: Arc<AtomicUsize>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                heartbeat.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    }
+
+    /// 等待计数器出现至少一次递增(证明任务已启动),带超时
+    async fn wait_heartbeat_started(heartbeat: &AtomicUsize) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while heartbeat.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// 在窗口期内观察计数器是否仍在增长。
+    /// 返回 true 表示仍在增长(未 abort);false 表示已停止(已 abort)。
+    async fn is_still_running(heartbeat: &AtomicUsize) -> bool {
+        let before = heartbeat.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = heartbeat.load(Ordering::Relaxed);
+        after > before
+    }
+
+    /// C-03-1: start_download 必须先 abort 同 task_id 的旧 JoinHandle
+    ///
+    /// 行为:预先在 `handles` 中插入一个长任务假 handle,调用 start_download,
+    /// 验证旧 handle 已被 abort(共享计数器停止增长)。
+    ///
+    /// 预期失败原因:当前 start_download 直接 `handles.insert` 覆盖,
+    /// 旧 handle 的 JoinHandle 被 drop 但 task_fn 仍在 runtime 上运行,
+    /// 计数器持续增长,is_still_running 返回 true,断言失败。
+    #[tokio::test]
+    async fn test_start_download_aborts_stale_handle() {
+        let state = test_state();
+        let supervisor = &state.runtime.supervisor;
+        let task_id = "c03-abort-stale";
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+
+        // 预置旧假 handle(长任务,模拟正在运行的 task_fn)
+        let old_handle = stale_handle(heartbeat.clone());
+        supervisor.handles.insert(task_id.to_string(), old_handle);
+
+        // 等待旧任务启动(至少一次心跳),证明 handle 确实在运行
+        assert!(
+            wait_heartbeat_started(&heartbeat).await,
+            "旧 handle 必须已启动才能验证 abort"
+        );
+
+        // 调用 start_download(内部应先 abort 旧 handle)
+        // 使用 ftp:// URL,task_fn 在 probe 阶段即快速失败,不干扰断言
+        let download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        let download_config = DownloadConfig {
+            download_dir: download_dir.clone(),
+            authorized_dirs: vec![download_dir.clone()],
+            ..DownloadConfig::default()
+        };
+        supervisor.start_download(
+            state.clone(),
+            task_id,
+            "ftp://c03.invalid/stale.bin".to_string(),
+            download_dir,
+            download_config,
+            None,
+            None,
+        );
+
+        // 验证旧 handle 已被 abort(计数器停止增长)
+        let still_running = is_still_running(&heartbeat).await;
+        assert!(
+            !still_running,
+            "C-03: start_download 必须 abort 同 id 旧 handle,旧 handle 仍运行(ABA 风险)"
+        );
+
+        // 清理新 session,避免泄漏到其他测试
+        if let Some((_, new_handle)) = supervisor.handles.remove(task_id) {
+            new_handle.abort();
+        }
+        supervisor.command_channels.remove(task_id);
+        supervisor.command_locks.remove(task_id);
+    }
+
+    /// C-03-2: start_download 必须清除同 task_id 的旧 command channel
+    ///
+    /// 行为:预先在 `command_channels` 中插入一个旧 watch::Sender,
+    /// 调用 start_download,验证旧 Sender 已被移除(被新的替换),
+    /// 旧 session 的 receiver 不会收到新 session 发送的命令(无信号串扰)。
+    ///
+    /// 预期失败原因:当前 start_download 无条件 insert 覆盖,
+    /// 旧 Sender 被 drop 但旧 task_fn 仍持有旧 control_rx。
+    /// 此测试在当前实现下可能"意外通过"(因 insert 覆盖了条目,旧 Sender 被 drop),
+    /// 但配合 test_start_download_aborts_stale_handle 可暴露根因:
+    /// 旧 handle 仍在运行,持有已关闭的旧 receiver,可能仍在写状态。
+    /// 这里通过验证"旧 receiver 未收到新 session 的命令"来约束信号隔离。
+    #[tokio::test]
+    async fn test_start_download_clears_old_command_channel() {
+        let state = test_state();
+        let supervisor = &state.runtime.supervisor;
+        let task_id = "c03-clear-old-channel";
+
+        // 预置旧 command channel(receiver 存活,模拟旧 session)
+        let (old_tx, old_rx) = watch::channel(TaskCommand::Start);
+        // 记录旧 receiver 初始观察到的值(Start)
+        let old_initial = *old_rx.borrow();
+        supervisor
+            .command_channels
+            .insert(task_id.to_string(), old_tx);
+
+        // 调用 start_download
+        let download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        let download_config = DownloadConfig {
+            download_dir: download_dir.clone(),
+            authorized_dirs: vec![download_dir.clone()],
+            ..DownloadConfig::default()
+        };
+        supervisor.start_download(
+            state.clone(),
+            task_id,
+            "ftp://c03.invalid/channel.bin".to_string(),
+            download_dir,
+            download_config,
+            None,
+            None,
+        );
+
+        // 验证:新通道可用(send_command 返回 true)
+        let ok = supervisor.send_command(task_id, TaskCommand::Pause);
+        assert!(ok, "C-03: start_download 后新 command channel 必须可用");
+
+        // 旧 receiver 不应收到 Pause(因为已被新 Sender 替换)。
+        // watch::Sender::send 广播到所有克隆的 receiver,但旧 old_tx 已被 drop,
+        // 新的 Sender 是独立 channel,旧 old_rx 不会收到本次 Pause。
+        // 若旧 Sender 未被 drop(泄漏)且被复用,old_rx 会收到 Pause —— 这是 bug。
+        let old_current = *old_rx.borrow();
+        assert_ne!(
+            old_current,
+            TaskCommand::Pause,
+            "C-03: 旧 command channel 必须被清除,旧 receiver 不应收到新 session 的命令(ABA 信号串扰)。旧 receiver 当前值: {:?}, 初始: {:?}",
+            old_current,
+            old_initial
+        );
+
+        // 清理
+        if let Some((_, new_handle)) = supervisor.handles.remove(task_id) {
+            new_handle.abort();
+        }
+        supervisor.command_channels.remove(task_id);
+        supervisor.command_locks.remove(task_id);
+    }
+
+    /// C-03-3: start_download 必须清除同 task_id 的旧 command lock
+    ///
+    /// 行为:预先在 `command_locks` 中插入一个旧 Arc<Mutex>,
+    /// 调用 start_download,验证旧 lock 已被移除,当前 entry 是新的 Arc。
+    ///
+    /// 预期失败原因:当前 start_download 不清理 command_locks,
+    /// task_command_lock 用 or_insert_with 复用旧条目,旧 session 持有的
+    /// Arc<Mutex> 仍是同一个,旧 session 可通过它阻塞新 session 的控制命令。
+    #[tokio::test]
+    async fn test_start_download_clears_old_command_lock() {
+        let state = test_state();
+        let supervisor = &state.runtime.supervisor;
+        let task_id = "c03-clear-old-lock";
+
+        // 预置旧 command lock(模拟旧 session 持有)
+        let old_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        supervisor
+            .command_locks
+            .insert(task_id.to_string(), old_lock.clone());
+
+        // 调用 start_download
+        let download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        let download_config = DownloadConfig {
+            download_dir: download_dir.clone(),
+            authorized_dirs: vec![download_dir.clone()],
+            ..DownloadConfig::default()
+        };
+        supervisor.start_download(
+            state.clone(),
+            task_id,
+            "ftp://c03.invalid/lock.bin".to_string(),
+            download_dir,
+            download_config,
+            None,
+            None,
+        );
+
+        // 验证:task_command_lock 返回的必须是新的 Arc,而非旧的
+        let new_lock = supervisor.task_command_lock(task_id);
+        assert_ne!(
+            Arc::as_ptr(&new_lock),
+            Arc::as_ptr(&old_lock),
+            "C-03: start_download 必须清除旧 command lock,旧 session 不应阻塞新 session"
+        );
+
+        // 清理
+        if let Some((_, new_handle)) = supervisor.handles.remove(task_id) {
+            new_handle.abort();
+        }
+        supervisor.command_channels.remove(task_id);
+        supervisor.command_locks.remove(task_id);
+    }
+
+    /// C-03-4: 旧 session 的 cleanup 不应影响新 session 的控制面
+    ///
+    /// 行为:start_download(A) → start_download(B)(同 task_id 覆盖)→
+    /// 验证 A 的 handle 已 abort(B 之前),B 的 handle/channel 仍活跃。
+    ///
+    /// 这模拟 Cancel→Undo→restart 路径:start_download(B) 必须先 abort A,
+    /// 使得即使 A 的 cleanup 被调用,也无法删除 B 的控制面(因 A 持有的
+    /// receiver 已关闭,B 持有的是新通道)。
+    ///
+    /// 预期失败原因:当前 start_download 不 abort A 的 handle,
+    /// A 的 task_fn 仍持有旧 control_rx,B 的 send_command 信号串扰到 A,
+    /// 或 A 的 handle 永久漂在 runtime 上(计数器持续增长)。
+    #[tokio::test]
+    async fn test_cleanup_after_restart_preserves_new_session() {
+        let state = test_state();
+        let supervisor = &state.runtime.supervisor;
+        let task_id = "c03-restart-preserve";
+        let download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        let download_config = DownloadConfig {
+            download_dir: download_dir.clone(),
+            authorized_dirs: vec![download_dir.clone()],
+            ..DownloadConfig::default()
+        };
+        let heartbeat_a = Arc::new(AtomicUsize::new(0));
+
+        // 第一次 start_download(A):先预置一个心跳 handle 模拟 A 的 task_fn
+        let handle_a = stale_handle(heartbeat_a.clone());
+        supervisor.handles.insert(task_id.to_string(), handle_a);
+        // 同时预置 A 的 command channel 和 lock(模拟 A 的完整控制面)
+        let (tx_a, _rx_a) = watch::channel(TaskCommand::Start);
+        supervisor
+            .command_channels
+            .insert(task_id.to_string(), tx_a);
+        let lock_a = Arc::new(tokio::sync::Mutex::new(()));
+        supervisor.command_locks.insert(task_id.to_string(), lock_a);
+
+        // 等待 A 启动
+        assert!(
+            wait_heartbeat_started(&heartbeat_a).await,
+            "A 的 handle 必须已启动才能验证 abort"
+        );
+
+        // 第二次 start_download(B)——必须先 abort A 的 handle
+        supervisor.start_download(
+            state.clone(),
+            task_id,
+            "ftp://c03.invalid/session-b.bin".to_string(),
+            download_dir.clone(),
+            download_config,
+            None,
+            None,
+        );
+
+        // 验证 B 的控制面已注册(handle/channel/lock 均为新 session 的)。
+        // 必须在等待 A abort 之前同步检查:B 的 task_fn 探测 ftp://c03.invalid
+        // 会在首个 await 点后快速失败并 self-cleanup,届时 handles 会被清空。
+        // C-03 的契约是"start_download(B) 同步注册新控制面",而非"B 永久存活"。
+        assert!(
+            supervisor.handles.contains_key(task_id),
+            "C-03: restart 后新 session 的 handle 必须已注册"
+        );
+        assert!(
+            supervisor.command_channels.contains_key(task_id),
+            "C-03: restart 后新 session 的 command channel 必须已注册"
+        );
+        // 新通道与旧通道隔离:send_command 走新通道(返回 true 表示新通道可用)
+        let ok = supervisor.send_command(task_id, TaskCommand::Cancel);
+        assert!(
+            ok,
+            "C-03: restart 后新 session 的 command channel 必须可发送"
+        );
+
+        // 验证 A 的 handle 已被 abort(计数器停止增长)
+        let still_running_a = is_still_running(&heartbeat_a).await;
+        assert!(
+            !still_running_a,
+            "C-03: start_download(B) 必须 abort A 的 handle,A 仍运行(后台泄漏)"
+        );
+
+        // 清理 B
+        if let Some((_, handle_b)) = supervisor.handles.remove(task_id) {
+            handle_b.abort();
+        }
+        supervisor.command_channels.remove(task_id);
+        supervisor.command_locks.remove(task_id);
     }
 }

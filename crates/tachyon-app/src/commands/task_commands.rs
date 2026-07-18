@@ -219,11 +219,13 @@ pub(crate) async fn build_download_task(
     } else if has_mirrors {
         let mirrors = mirror_urls.unwrap();
         tracing::info!(task_id = %task_id, mirrors = mirrors.len(), "使用镜像源下载");
+        // 审计:镜像路径必须注入 AppConfig 调度器,禁止 default_config 旁路
         DownloadTask::with_mirrors(
             url.to_string(),
             mirrors,
             download_config,
             Some(connection_pool),
+            scheduler,
         )
         .await
     } else {
@@ -1186,6 +1188,17 @@ pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Resu
         .runtime
         .supervisor
         .send_command(&task_id, TaskCommand::Cancel);
+    // 审计 H-04:Cancel 后 await JoinHandle quiesce,避免旧 task 仍在写盘/联网,
+    // 与 restart 产生竞态。wait_for_handle 内部超时 abort + 2s grace。
+    // 终态/无 handle 时立即返回 None,不影响正确性。
+    let _ = state
+        .runtime
+        .supervisor
+        .wait_for_handle(
+            &task_id,
+            crate::runtime::download_supervisor::DownloadSupervisor::CANCEL_QUIESCE_TIMEOUT,
+        )
+        .await;
     Ok(())
 }
 
@@ -2889,6 +2902,186 @@ mod tests {
         })
         .await
         .expect("取消后后台任务应有序退出并清理句柄");
+    }
+
+    /// 审计 H-04 (RED): cancel_task_inner 在 send Cancel 后必须 wait_for_handle quiesce,
+    /// 不能直接返回 Ok,否则旧 task 仍在写盘/联网,与 restart 产生竞态。
+    /// 当前实现未调用 wait_for_handle,本测试在 cancel 返回时 handle 应已结束,
+    /// 但当前实现会失败(handle 仍存活)。
+    #[tokio::test]
+    async fn test_cancel_task_waits_for_handle_quiesce() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::watch;
+
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/h04-cancel-quiesce.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 注入一个仍在运行的 handle:收到 Cancel 后短暂 drain 再退出,
+        // 模拟协作式取消后的写盘收尾。cancel_task_inner 必须等待此 handle 结束。
+        let (tx, mut rx) = watch::channel(TaskCommand::Start);
+        state
+            .runtime
+            .supervisor
+            .command_channels
+            .insert(id.clone(), tx);
+        let cancel_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_seen_clone = cancel_seen.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if matches!(*rx.borrow(), TaskCommand::Cancel) {
+                    cancel_seen_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            // 模拟 drain:cancel 后再延迟 120ms 退出
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        });
+        state.runtime.supervisor.handles.insert(id.clone(), handle);
+
+        let started = Instant::now();
+        cancel_task_inner(&state, id.clone())
+            .await
+            .expect("cancel 应在 quiesce 后成功");
+        let elapsed = started.elapsed();
+
+        // 期望行为:cancel 返回前 handle 已被 wait_for_handle 移除
+        assert!(
+            !state.runtime.supervisor.handles.contains_key(&id),
+            "H-04: cancel 返回前应已移除 handle, elapsed={elapsed:?}"
+        );
+        assert!(
+            !state.runtime.supervisor.command_channels.contains_key(&id),
+            "H-04: cancel 返回前应已移除 command channel, elapsed={elapsed:?}"
+        );
+        // 期望行为:cancel 应等待 drain(>=120ms)。当前实现不等待,会远小于 120ms
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "H-04: cancel 应等待 handle quiesce, elapsed={elapsed:?}"
+        );
+        // 取消信号确实送达
+        assert!(
+            cancel_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "H-04: cancel 应送达 Cancel 信号"
+        );
+    }
+
+    /// 审计 H-04 (RED): cancel 一个卡住的 task(不响应 Cancel)→ CANCEL_QUIESCE_TIMEOUT
+    /// 后 wait_for_handle 内部 abort + 2s grace。当前实现不调 wait_for_handle,
+    /// cancel 立即返回,handle 仍存活 → 测试失败。
+    #[tokio::test]
+    async fn test_cancel_task_timeout_aborts_handle() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::watch;
+
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/h04-cancel-stuck.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 注入一个不响应 Cancel 的 task:while 循环不检查 watch,模拟死 swarm/卡死 worker
+        let (tx, _rx) = watch::channel(TaskCommand::Start);
+        state
+            .runtime
+            .supervisor
+            .command_channels
+            .insert(id.clone(), tx);
+        let stuck_handle = tokio::spawn(async move {
+            // 永远不退出,也不读 watch。只有 abort 才能终止
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        state
+            .runtime
+            .supervisor
+            .handles
+            .insert(id.clone(), stuck_handle);
+
+        let started = Instant::now();
+        // 期望行为:cancel 在 CANCEL_QUIESCE_TIMEOUT(5s) + 2s grace 内 abort 并返回。
+        // 为避免真实等 5s,这里给 8s 上限(超时值 + grace + 余量)。
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            cancel_task_inner(&state, id.clone()).await
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "H-04: cancel 应在 quiesce 超时 abort 后返回,不应永久挂起"
+        );
+        let elapsed = started.elapsed();
+
+        // 期望行为:cancel 应等待至少 CANCEL_QUIESCE_TIMEOUT(5s) - 1s 余量 才返回
+        // 当前实现不等待,elapsed 远小于 5s
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "H-04: cancel 卡住 task 应等待 CANCEL_QUIESCE_TIMEOUT 后 abort, elapsed={elapsed:?}"
+        );
+        // 期望行为:abort 后 handle 已移除
+        assert!(
+            !state.runtime.supervisor.handles.contains_key(&id),
+            "H-04: cancel 超时 abort 后应移除 handle"
+        );
+        assert!(
+            !state.runtime.supervisor.command_channels.contains_key(&id),
+            "H-04: cancel 超时 abort 后应移除 command channel"
+        );
+    }
+
+    /// 审计 H-04 (RED): cancel 不存在的 task(无 handle)→ 应立即返回,不阻塞。
+    /// 当前实现虽不等待,但行为正确。此测试应通过,作为契约保护。
+    #[tokio::test]
+    async fn test_cancel_task_no_handle_returns_quickly() {
+        use std::time::{Duration, Instant};
+
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/h04-cancel-no-handle.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        // 不注入 handle,无运行中 task_fn
+
+        let started = Instant::now();
+        cancel_task_inner(&state, id.clone())
+            .await
+            .expect("cancel 无 handle 的 task 应成功");
+        let elapsed = started.elapsed();
+
+        // 无 handle 时 wait_for_handle 立即返回 None,整体应 < 500ms
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "H-04: cancel 无 handle 的 task 应立即返回, elapsed={elapsed:?}"
+        );
+        // 状态应为 Cancelled
+        let task = get_task_detail_inner(&state, id).await.unwrap();
+        assert_eq!(task.status, DownloadState::Cancelled);
     }
 
     #[tokio::test]

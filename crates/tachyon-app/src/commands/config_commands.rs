@@ -789,40 +789,43 @@ mod tests {
         enable_quic: bool,
         verify_checksum: bool,
     ) -> AppConfig {
-        AppConfig {
-            max_concurrent_tasks,
-            download: tachyon_core::config::DownloadConfig {
-                download_dir: download_dir.to_string(),
-                max_concurrent_fragments,
-                max_retries: 3,
-                request_timeout_secs: 30,
-                connect_timeout_secs: 10,
-                verify_checksum,
-                verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
-                user_agent: USER_AGENT.to_string(),
-                headers: std::collections::HashMap::new(),
-                auth_bearer: None,
-                pause_timeout_secs: 300,
-                rate_limit_bytes_per_sec: None,
-                max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
-                authorized_dirs: vec![download_dir.to_string()],
-                io_strategy: IoStrategy::default(),
-                proxy: None,
-                enable_work_stealing: false,
-            },
-            connection: tachyon_core::config::ConnectionConfig {
-                max_connections_per_host,
-                max_global_connections: 256,
-                keep_alive_timeout_secs: 30,
-                connect_timeout_secs: 10,
-                enable_http2: true,
-                enable_quic,
-            },
-            scheduler: tachyon_core::config::SchedulerConfig::default(),
-            magnet: tachyon_core::config::MagnetConfig::default(),
-            hub: tachyon_core::config::HubConfig::default(),
-            clipboard: tachyon_core::config::ClipboardConfig::default(),
-            notifications: tachyon_core::config::NotificationsConfig::default(),
+        #[allow(deprecated)]
+        {
+            AppConfig {
+                max_concurrent_tasks,
+                download: tachyon_core::config::DownloadConfig {
+                    download_dir: download_dir.to_string(),
+                    max_concurrent_fragments,
+                    max_retries: 3,
+                    request_timeout_secs: 30,
+                    connect_timeout_secs: 10,
+                    verify_checksum,
+                    verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+                    user_agent: USER_AGENT.to_string(),
+                    headers: std::collections::HashMap::new(),
+                    auth_bearer: None,
+                    pause_timeout_secs: 300,
+                    rate_limit_bytes_per_sec: None,
+                    max_full_stream_bytes: tachyon_core::config::default_max_full_stream_bytes(),
+                    authorized_dirs: vec![download_dir.to_string()],
+                    io_strategy: IoStrategy::default(),
+                    proxy: None,
+                    enable_work_stealing: false,
+                },
+                connection: tachyon_core::config::ConnectionConfig {
+                    max_connections_per_host,
+                    max_global_connections: 256,
+                    keep_alive_timeout_secs: 30,
+                    connect_timeout_secs: 10,
+                    enable_http2: true,
+                    enable_quic,
+                },
+                scheduler: tachyon_core::config::SchedulerConfig::default(),
+                magnet: tachyon_core::config::MagnetConfig::default(),
+                hub: tachyon_core::config::HubConfig::default(),
+                clipboard: tachyon_core::config::ClipboardConfig::default(),
+                notifications: tachyon_core::config::NotificationsConfig::default(),
+            }
         }
     }
 
@@ -1278,6 +1281,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_app_config_serialization_roundtrip() {
         let cfg = AppConfig {
             max_concurrent_tasks: 3,
