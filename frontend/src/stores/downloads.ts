@@ -286,10 +286,17 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       }
 
       // 合并分片 delta 到 fragment store
+      // fragmentBytes 每 tick 推送(有活跃分片时),delta 为空也需触发合并
       const hasCompleted = p.completedDelta && p.completedDelta.length > 0;
       const hasStarted = p.startedDelta && p.startedDelta.length > 0;
-      if (hasCompleted || hasStarted) {
-        mergeFragmentDelta(id, p.completedDelta ?? [], p.startedDelta ?? []);
+      const hasFragmentBytes = p.fragmentBytes && p.fragmentBytes.length > 0;
+      if (hasCompleted || hasStarted || hasFragmentBytes) {
+        mergeFragmentDelta(
+          id,
+          p.completedDelta ?? [],
+          p.startedDelta ?? [],
+          p.fragmentBytes,
+        );
       }
 
       // fragmentsTotal 从 0 变非 0:PlanComplete 到达,DetailPanel 若已打开需重拉。

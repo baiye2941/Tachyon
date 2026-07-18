@@ -257,6 +257,12 @@ export interface ClipboardUrlDetected {
   resourceType: string
 }
 
+/** 单个活跃分片的字节级进度(与后端 FragmentByteProgress 对齐) */
+export interface FragmentByteProgress {
+  index: number
+  downloaded: number
+}
+
 export interface ProgressPayload {
   id: string
   progress: number
@@ -271,6 +277,8 @@ export interface ProgressPayload {
   completedDelta?: number[]
   /** 本周期新开始下载的分片索引增量(后端 Started 事件累积) */
   startedDelta?: number[]
+  /** 活跃分片字节级进度快照(仅 downloading 中的分片)。每 250ms tick 覆盖式推送,缺失/空 = 无活跃字节进度 */
+  fragmentBytes?: FragmentByteProgress[]
   /** 任务失败原因。Failed 终态时由后端写入,UI 无需等待 get_task_list 全量刷新即可展示错误详情(P1-22-4) */
   errorReason?: string | null
 }

@@ -295,6 +295,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (
@@ -327,6 +328,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (
@@ -353,6 +355,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (
@@ -394,6 +397,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (
@@ -414,6 +418,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
 
@@ -433,6 +438,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (
@@ -453,6 +459,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 20,
         doneSet: new Set([0, 1, 2, 3, 4, 5, 6, 7]),
         downloadingSet: new Set([8, 9, 10, 11, 12]),
+        bytesMap: new Map(),
         finalized: false,
       });
 
@@ -476,6 +483,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         total: 10_000,
         doneSet: new Set(Array.from({ length: 5000 }, (_, i) => i)),
         downloadingSet: new Set([5000, 5001, 5002]),
+        bytesMap: new Map(),
         finalized: false,
       });
       render(() => (

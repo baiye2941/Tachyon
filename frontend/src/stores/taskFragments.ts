@@ -6,6 +6,8 @@ export interface TaskFragmentData {
   total: number;
   doneSet: Set<number>;
   downloadingSet: Set<number>;
+  /** 活跃分片字节进度快照(仅 downloading 中的分片):index → downloaded bytes */
+  bytesMap: Map<number, number>;
   /** 终态标记:true 时拒绝合并 downloading delta,防止延迟事件导致幽灵格子 */
   finalized: boolean;
 }
@@ -41,10 +43,12 @@ export async function loadTaskFragments(taskId: string) {
       const mergedDone = new Set(snapshotDone);
       for (const idx of data.doneSet) mergedDone.add(idx);
       // downloadingSet 以快照为准(后端 authoritative)
+      // bytesMap 保留已有本地快照:首拉快照不含字节进度,保留 delta 合并结果
       next.set(taskId, {
         total: view.total,
         doneSet: mergedDone,
         downloadingSet: snapshotDownloading,
+        bytesMap: data.bytesMap,
         finalized: data.finalized,
       });
     } else {
@@ -52,6 +56,7 @@ export async function loadTaskFragments(taskId: string) {
         total: view.total,
         doneSet: snapshotDone,
         downloadingSet: snapshotDownloading,
+        bytesMap: new Map(),
         finalized: false,
       });
     }
@@ -81,12 +86,20 @@ export function mergeFragmentDelta(
   taskId: string,
   completedDelta: number[],
   startedDelta: number[],
+  fragmentBytes?: { index: number; downloaded: number }[],
 ) {
   setFragmentMap((prev) => {
     const data = prev.get(taskId);
     if (!data) return prev; // DetailPanel 未打开,忽略(后续首拉拿完整快照)
-    // delta 均为空时短路:无状态变更,避免不必要的 Set 拷贝
-    if (completedDelta.length === 0 && startedDelta.length === 0) return prev;
+    // delta 与字节快照均为空时短路:无状态变更,避免不必要的 Set 拷贝。
+    // 注意:fragmentBytes 缺失/空数组且无意 delta 时不清空 bytesMap(保持现状),
+    // 终态清空由 clearTaskFragmentDownloading 负责,这是有意设计。
+    if (
+      completedDelta.length === 0 &&
+      startedDelta.length === 0 &&
+      (!fragmentBytes || fragmentBytes.length === 0)
+    )
+      return prev;
     // finalized 时只处理 completed,跳过所有 started
     const effectiveStarted = data.finalized ? [] : startedDelta;
     const next = new Map(prev);
@@ -101,10 +114,21 @@ export function mergeFragmentDelta(
     for (const idx of effectiveStarted) {
       if (!newDone.has(idx)) newDownloading.add(idx);
     }
+    // 字节快照:快照覆盖式重建。completedDelta 的分片不在新快照中(已移除)
+    const newBytesMap = new Map<number, number>();
+    if (fragmentBytes) {
+      for (const entry of fragmentBytes) {
+        // 跳过已完成的(防御:后端已完成分片不应出现在快照,但前端兜底)
+        if (!newDone.has(entry.index)) {
+          newBytesMap.set(entry.index, entry.downloaded);
+        }
+      }
+    }
     next.set(taskId, {
       ...data,
       doneSet: newDone,
       downloadingSet: newDownloading,
+      bytesMap: newBytesMap,
     });
     return next;
   });
@@ -123,7 +147,12 @@ export function clearTaskFragmentDownloading(taskId: string) {
     const data = prev.get(taskId);
     if (!data || (data.downloadingSet.size === 0 && data.finalized)) return prev;
     const next = new Map(prev);
-    next.set(taskId, { ...data, downloadingSet: new Set(), finalized: true });
+    next.set(taskId, {
+      ...data,
+      downloadingSet: new Set(),
+      bytesMap: new Map(),
+      finalized: true,
+    });
     return next;
   });
 }
