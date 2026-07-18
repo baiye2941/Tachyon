@@ -296,7 +296,14 @@ fn bench_disk_io_backends(c: &mut Criterion) {
             let mut config = test_config();
             config.download_dir = dir.path().to_string_lossy().to_string();
             config.authorized_dirs = vec![config.download_dir.clone()];
-            config.io_strategy = tachyon_core::config::IoStrategy::default();
+            // CI 模式下 Linux 默认 IoUring 的 O_DIRECT 对齐限制会导致非对齐写入失败,
+            // CI bench 目的是测下载路径而非磁盘后端,故 CI 模式下用 Standard 后端。
+            // 完整 bench 在本地环境跑 default(可能 IoUring/IOCP)。
+            if support::smoke_mode() {
+                config.io_strategy = tachyon_core::config::IoStrategy::Standard;
+            } else {
+                config.io_strategy = tachyon_core::config::IoStrategy::default();
+            }
             let mut task =
                 DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
             task.set_buffer_pool(aligned_pool.clone());
@@ -370,7 +377,13 @@ fn bench_large_file_fragmented(c: &mut Criterion) {
             let mut config = test_config();
             config.download_dir = dir.path().to_string_lossy().to_string();
             config.authorized_dirs = vec![config.download_dir.clone()];
-            config.io_strategy = tachyon_core::config::IoStrategy::default();
+            // CI 模式下 Linux 默认 IoUring 的 O_DIRECT 对齐限制会导致非对齐写入失败,
+            // CI bench 目的是测下载路径而非磁盘后端,故 CI 模式下用 Standard 后端。
+            if support::smoke_mode() {
+                config.io_strategy = tachyon_core::config::IoStrategy::Standard;
+            } else {
+                config.io_strategy = tachyon_core::config::IoStrategy::default();
+            }
             let mut task =
                 DownloadTask::new_for_test_no_storage(url.clone(), config, protocol.clone());
             task.set_buffer_pool(aligned_pool.clone());

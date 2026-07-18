@@ -3953,9 +3953,10 @@ mod tests {
             "https://example.com/dup.bin",
             DownloadState::Completed,
         );
+        let backup_config = state.domain.config.lock().await.clone();
         let backup = Backup {
             version: BACKUP_SCHEMA_VERSION,
-            config: AppConfig::default(),
+            config: backup_config,
             tasks: vec![imported],
         };
         let path = {
@@ -3991,9 +3992,10 @@ mod tests {
             "https://example.com/new.bin",
             DownloadState::Completed,
         );
+        let backup_config = state.domain.config.lock().await.clone();
         let backup = Backup {
             version: BACKUP_SCHEMA_VERSION,
-            config: AppConfig::default(),
+            config: backup_config,
             tasks: vec![new],
         };
         let path = {

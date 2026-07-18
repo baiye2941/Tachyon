@@ -915,6 +915,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore = "tempfile tempdir 在 Miri 下不支持 fs::create_dir")]
     #[test]
     fn test_reject_symlink_or_reparse_components_ok_on_normal() {
         let temp = tempfile::tempdir().unwrap();

@@ -82,10 +82,7 @@ fn existing_ancestor(dir: &Path) -> Option<&Path> {
         if cur.is_dir() {
             return Some(cur);
         }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return None,
-        }
+        cur = cur.parent()?;
     }
 }
 
@@ -967,7 +964,7 @@ mod tests {
         storage.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_dyn_storage_open_with_strategy_iouring() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::IoUring)
