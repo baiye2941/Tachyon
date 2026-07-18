@@ -1816,7 +1816,10 @@ impl DownloadTask {
         // 1. 消除 dispatcher round-robin try-send 逻辑(无 per-worker channel)
         // 2. Semaphore permits 即真实并发上限(add_permits 可运行时提升)
         // 3. 每个 fragment task 独立 spawn,无固定 worker 数量限制
-        let (frag_tx, mut frag_rx) = mpsc::channel::<FragmentSpec>(effective_concurrency * 2);
+        // 容量留余量给 rebalance 重入队(慢片拆分后的尾片)
+        let (frag_tx_raw, mut frag_rx) =
+            mpsc::channel::<FragmentSpec>((effective_concurrency * 2).max(8));
+        let mut frag_tx = Some(frag_tx_raw);
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<FragmentTaskResult>();
 
         // 入队前检查暂停/取消信号,避免在暂停状态下无意义地启动
@@ -1843,13 +1846,16 @@ impl DownloadTask {
             }
             pending_specs.push(spec.clone());
         }
+        // 初始入队用 clone 的 sender;主循环保留 Option<Sender> 供 rebalance 重入队。
+        // 全部初始分片入队后不 drop 主 sender,避免 rebalance 无法再 enqueue。
+        let frag_tx_enqueue = frag_tx.as_ref().expect("frag_tx 刚创建").clone();
         let enqueue_handle = tokio::spawn(async move {
             for spec in pending_specs {
-                if frag_tx.send(spec).await.is_err() {
+                if frag_tx_enqueue.send(spec).await.is_err() {
                     break; // 主循环退出,frag_rx 已 drop
                 }
             }
-            // frag_tx 在此 drop,frag_rx.recv() 在消费完后返回 None
+            // frag_tx_enqueue drop;主循环仍持有 frag_tx(Option)
         });
 
         // 主循环:同时充当 dispatcher(从 frag_rx 拉取 spec + spawn task)和结果收集器
@@ -1907,6 +1913,11 @@ impl DownloadTask {
                             "闭环并发度调整"
                         );
                     }
+                    // 安全 rebalance:拆最慢未完成分片的剩余区间,await 入队
+                    // (不用 try_send,避免旧 work-stealing 丢尾片)
+                    if let Some(tx) = frag_tx.as_ref() {
+                        let _ = self.try_rebalance_slowest_fragment(tx).await;
+                    }
                 }
                 // dispatcher:从中央队列拉取分片,acquire permit 后 spawn task
                 // 闭环并发控制:仅当 active < target 时才拉取新分片(可降并发)
@@ -1956,10 +1967,13 @@ impl DownloadTask {
                             }
                         }
                         None => {
-                            // 中央队列已空,所有分片已 spawn。
-                            // 释放原始 completed_tx,使 completed_rx 在所有 task 完成后能返回 None。
-                            completed_tx.take();
-                            // 继续等待已完成的结果(completed_rx / join_next 分支)。
+                            // 初始队列耗尽。若仍有在途 task,保留 frag_tx 供 rebalance;
+                            // 仅当无在途且无 rebalance 可能时再 drop sender + completed_tx。
+                            if handles.is_empty() {
+                                frag_tx.take();
+                                completed_tx.take();
+                            }
+                            // 否则继续等待 completed / rebalance 重入队。
                         }
                     }
                 }
@@ -2069,6 +2083,9 @@ impl DownloadTask {
             // 但 select! 可能先消费 join_next(虚拟信号)而非 completed_rx,
             // 导致 break 时 completed_rx 仍有未消费结果。必须先 drain 再 break。
             if handles.is_empty() && frag_rx.is_empty() {
+                // 无在途且队列空:释放 sender,确保 completed_rx 可 EOF
+                frag_tx.take();
+                completed_tx.take();
                 Self::drain_completed_channel(&mut *self, &mut completed_rx)?;
                 break;
             }
@@ -2096,6 +2113,95 @@ impl DownloadTask {
         Ok(())
     }
 
+    /// 安全慢片 rebalance:拆分下载中最慢分片的未完成尾部,await 入队。
+    ///
+    /// 相对已删除的 work-stealing:
+    /// - 使用 `send().await` 而非 `try_send`(不丢尾片)
+    /// - 入队失败则 `revert_split` 回滚
+    /// - 不依赖 steal_rx / 额外 completed_tx 生命周期
+    ///
+    /// 最慢片剩余 >= 2*MIN_SPLIT_SIZE 即可拆(含最后一片 straggler)。
+    async fn try_rebalance_slowest_fragment(
+        &mut self,
+        frag_tx: &mpsc::Sender<FragmentSpec>,
+    ) -> DownloadResult<bool> {
+        use crate::fragment::{FragmentState, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+
+        let mut best: Option<(usize, f64, u64)> = None; // (idx, progress, realtime)
+        for (i, frag) in self.fragments.iter().enumerate() {
+            if frag.state != FragmentState::Downloading {
+                continue;
+            }
+            let size = frag.info.size.max(1);
+            let rt = frag.realtime_downloaded.load(Ordering::Acquire);
+            let eff_end = frag.effective_end.load(Ordering::Acquire);
+            let remaining = eff_end
+                .saturating_add(1)
+                .saturating_sub(frag.info.start + rt);
+            if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
+                continue;
+            }
+            let progress = rt as f64 / size as f64;
+            match best {
+                None => best = Some((i, progress, rt)),
+                Some((_, bp, _)) if progress < bp => best = Some((i, progress, rt)),
+                _ => {}
+            }
+        }
+        let Some((idx, _prog, realtime)) = best else {
+            return Ok(false);
+        };
+
+        let frag = &self.fragments[idx];
+        let start = frag.info.start;
+        let eff_end = frag.effective_end.load(Ordering::Acquire);
+        let done_abs = start.saturating_add(realtime);
+        let remaining = eff_end.saturating_add(1).saturating_sub(done_abs);
+        if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
+            return Ok(false);
+        }
+        let split_point = done_abs.saturating_add(remaining / 2);
+        if split_point <= done_abs || split_point > eff_end {
+            return Ok(false);
+        }
+
+        let new_index = self.fragments.len() as u32;
+        let stolen = {
+            let frag = &mut self.fragments[idx];
+            match frag.try_split(split_point, new_index)? {
+                Some(s) => s,
+                None => return Ok(false),
+            }
+        };
+
+        let spec: FragmentSpec = (
+            stolen.info.index,
+            stolen.info.start,
+            stolen.info.end,
+            stolen.resume_offset,
+            stolen.info.hash.is_some(),
+            FragmentShared {
+                effective_end: Arc::clone(&stolen.effective_end),
+                realtime_downloaded: Arc::clone(&stolen.realtime_downloaded),
+            },
+        );
+
+        match frag_tx.send(spec).await {
+            Ok(()) => {
+                info!(
+                    slow_index = idx,
+                    new_index, split_point, "rebalance:拆分慢片尾部并重入队"
+                );
+                self.fragments.push(stolen);
+                Ok(true)
+            }
+            Err(_) => {
+                self.fragments[idx].revert_split_after_failed_dispatch(&stolen);
+                Ok(false)
+            }
+        }
+    }
     /// 审计 H2(200 fallback 运行时降级):服务器忽略 Range 返回 200 时,
     /// `download_range`/`download_range_stream` 返回 `RangeNotSupported`。
     /// `execute_fragmented_download` 在分片 worker 失败路径捕获此错误,
@@ -11068,5 +11174,84 @@ mod tests {
             .await
             .expect("读存储应成功");
         assert_eq!(&buf[..], full_data.as_ref(), "整块降级后数据应完整写入");
+    }
+
+    /// 安全 rebalance:慢片剩余足够时 try_split + await 入队成功,fragments 增长 1
+    #[tokio::test]
+    async fn test_rebalance_splits_slow_fragment_and_enqueues() {
+        use crate::fragment::{FragmentRecord, FragmentState, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let size = MIN_SPLIT_SIZE * 8; // 足够大
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            // 仅下载 10%,剩余很大
+            r.realtime_downloaded.store(size / 10, Ordering::Release);
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("rebalance.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/rebalance.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        task.metadata = Some(test_metadata("rebalance.bin", size));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx)
+            .await
+            .expect("rebalance 不应 Err");
+        assert!(did, "应拆分慢片");
+        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
+        assert_eq!(task.fragments[0].state, FragmentState::Downloading);
+        assert_eq!(task.fragments[1].state, FragmentState::Downloading);
+        // 原片 end 缩小
+        assert!(task.fragments[0].info.end < size - 1, "原片 end 应缩小");
+        // 队列收到新 spec
+        let spec = rx.try_recv().expect("应入队新分片 spec");
+        assert_eq!(spec.0, 1, "新分片 index=1");
+        assert!(spec.1 > 0, "新分片 start > 0");
+    }
+
+    /// rebalance:剩余不足时不拆分
+    #[tokio::test]
+    async fn test_rebalance_skips_when_remaining_too_small() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let size = MIN_SPLIT_SIZE; // 太小
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded.store(0, Ordering::Release);
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("tiny.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/tiny.bin".into(),
+            test_config(),
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(!did);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.fragments.len(), 1);
     }
 }
