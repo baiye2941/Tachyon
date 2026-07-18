@@ -1443,8 +1443,12 @@ impl Protocol for MagnetProtocol {
                             Ok(mut stream) => {
                                 match stream.seek(std::io::SeekFrom::Start(local_start)).await {
                                     Ok(_) => {
-                                        let reader =
-                                            tokio::io::BufReader::new(stream.take(local_len));
+                                        // BT-20:移除多余 BufReader。
+                                        // `make_chunk_stream` 内部已分配 64KiB buf 做 read,
+                                        // FileStream 自身有 piece 缓冲层;BufReader 再加 8KB
+                                        // 缓冲是冗余的一次内存拷贝,移除后零功能损失、零拷贝。
+                                        // `stream.take(local_len)` 限制读取范围至本段长度。
+                                        let reader = stream.take(local_len);
                                         Box::pin(make_chunk_stream(
                                             reader,
                                             stall_timeout,
