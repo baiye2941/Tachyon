@@ -942,6 +942,7 @@ async fn add_magnet_to_session(
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
     ops_gate: &SessionOpsGate,
     socks_active: bool,
+    only_files: Option<Vec<usize>>,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
     // SOCKS 下剥离 magnet 内嵌 UDP tracker(审计 privacy)
     let url_owned = strip_udp_trackers_from_magnet(url, socks_active);
@@ -961,6 +962,8 @@ async fn add_magnet_to_session(
                 Some(initial_peers)
             },
             storage_factory,
+            // BT-16: so= 选择文件 → librqbit only_files(0-based file_id)
+            only_files,
             ..Default::default()
         };
         // tokio::time::timeout 包裹 add_torrent:librqbit 对 magnet URL 即使
@@ -1177,13 +1180,13 @@ impl Protocol for MagnetProtocol {
                 if let Some(entry) = hit {
                     let handle = Arc::clone(&entry.handle);
                     let layout = entry.layout.clone();
-                    let (file_name, file_size) = handle
+                    // 缓存 layout 已按 so= 过滤;file_size 必须用 layout.total_len
+                    let file_size = layout.total_len();
+                    let file_name = handle
                         .with_metadata(|m| {
-                            let name = m
-                                .name
+                            m.name
                                 .clone()
-                                .unwrap_or_else(|| "unknown_torrent".to_string());
-                            (name, m.lengths.total_length())
+                                .unwrap_or_else(|| "unknown_torrent".to_string())
                         })
                         .map_err(|e| {
                             DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}"))
@@ -1223,6 +1226,8 @@ impl Protocol for MagnetProtocol {
             let socks_active = config.socks_proxy_url.is_some()
                 || tachyon_core::config::detect_socks_proxy().is_some();
             let metadata_timeout = Duration::from_secs(config.metadata_timeout_secs);
+            // BT-16: 解析 so= 并贯通到 librqbit only_files + layout 过滤
+            let only_files = parse_so_from_magnet(&url);
             let handle = add_magnet_to_session(
                 &session,
                 &url,
@@ -1233,6 +1238,7 @@ impl Protocol for MagnetProtocol {
                 storage_factory.as_ref().map(|f| f.clone_box()),
                 &ops_gate,
                 socks_active,
+                only_files.clone(),
             )
             .await?;
 
@@ -1250,14 +1256,20 @@ impl Protocol for MagnetProtocol {
             // 提取元数据：文件名、大小、文件布局
             // 单/多文件 torrent 均走 range 路径(FileStream 按 file_id 流式读),
             // download_range_stream 用 FileLayout 把全局 range 拆到各文件段。
+            let only_files_ref = only_files.as_deref();
             let (file_name, file_size, layout) = handle
                 .with_metadata(|m| {
                     let name = m
                         .name
                         .clone()
                         .unwrap_or_else(|| "unknown_torrent".to_string());
-                    let size = m.lengths.total_length();
-                    let layout = Self::layout_from_file_infos(&m.file_infos, None);
+                    let layout = Self::layout_from_file_infos(&m.file_infos, only_files_ref);
+                    // so= 选中时 file_size = 选中文件长度之和; 否则用 torrent 总长
+                    let size = if only_files_ref.is_some() {
+                        layout.total_len()
+                    } else {
+                        m.lengths.total_length()
+                    };
                     (name, size, layout)
                 })
                 .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
@@ -1377,11 +1389,13 @@ impl Protocol for MagnetProtocol {
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
                     socks_active,
+                    parse_so_from_magnet(&url),
                 )
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
+                let so = parse_so_from_magnet(&url);
                 let layout = h
-                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, None))
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, so.as_deref()))
                     .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
                 {
                     let entry = CachedTorrent {
@@ -1508,11 +1522,13 @@ impl Protocol for MagnetProtocol {
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
                     socks_active,
+                    parse_so_from_magnet(&url),
                 )
                 .await?;
-                // 回退路径:构造单文件默认 layout(metadata 已就绪时)
+                // 回退路径:layout 同样应用 so= 过滤
+                let so = parse_so_from_magnet(&url);
                 let layout = h
-                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, None))
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, so.as_deref()))
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
                 {
                     let entry = CachedTorrent {
@@ -1600,23 +1616,12 @@ impl Protocol for MagnetProtocol {
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
                     socks_active,
+                    parse_so_from_magnet(&url),
                 )
                 .await?;
+                let so = parse_so_from_magnet(&url);
                 let layout = h
-                    .with_metadata(|m| {
-                        let spans: Vec<FileSpan> = m
-                            .file_infos
-                            .iter()
-                            .enumerate()
-                            .map(|(fid, fi)| FileSpan {
-                                file_id: fid,
-                                global_offset: fi.offset_in_torrent,
-                                len: fi.len,
-                                name: fi.relative_filename.to_string_lossy().into_owned(),
-                            })
-                            .collect();
-                        FileLayout::from_spans(spans)
-                    })
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, so.as_deref()))
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
                 {
                     let entry = CachedTorrent {
