@@ -294,8 +294,15 @@ impl DownloadSession {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let broker = self.state.runtime.progress_broker.clone();
         let on_progress: crate::runtime::chunk_reader_pool::ProgressCallback =
-            Arc::new(move |task_id, delta| {
-                broker.mark_dirty_with_delta(task_id, delta);
+            Arc::new(move |task_id, delta, bytes| {
+                let fb: Vec<crate::commands::FragmentByteProgress> = bytes
+                    .iter()
+                    .map(|e| crate::commands::FragmentByteProgress {
+                        index: e.index,
+                        downloaded: e.downloaded,
+                    })
+                    .collect();
+                broker.mark_dirty_with_delta(task_id, delta, fb);
             });
         let job = ChunkReaderJob {
             task_id: self.task_id.clone(),

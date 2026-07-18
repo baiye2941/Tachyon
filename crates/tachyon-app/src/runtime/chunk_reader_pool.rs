@@ -23,8 +23,17 @@ pub enum ProgressDelta {
     Completed(u32),
 }
 
-/// 进度变化回调:参数为 (task_id, delta),None 表示非状态变更事件(增量字节进度)
-pub type ProgressCallback = Arc<dyn Fn(&str, Option<ProgressDelta>) + Send + Sync>;
+/// 活跃分片字节进度条目(传给 ProgressCallback 的切片元素)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FragmentByteEntry {
+    pub index: u32,
+    pub downloaded: u64,
+}
+
+/// 进度变化回调:参数为 (task_id, delta, fragment_bytes),
+/// fragment_bytes 为当前所有活跃分片(downloading_set 中)的字节快照切片。
+pub type ProgressCallback =
+    Arc<dyn Fn(&str, Option<ProgressDelta>, &[FragmentByteEntry]) + Send + Sync>;
 
 use crate::repository::TaskRepository;
 use crate::task_store::TaskStore;
@@ -46,7 +55,8 @@ pub struct ChunkReaderJob {
     /// 完成通知：当 job 处理完毕后发送信号
     pub done_tx: oneshot::Sender<()>,
     /// Callback to notify ProgressBroker of progress changes
-    /// 第二参数: 新完成分片 index; None = 非完成事件(增量进度)
+    /// 参数: (task_id, delta, fragment_bytes); delta None = 非状态变更事件(增量进度),
+    /// fragment_bytes = 当前活跃分片字节快照切片
     pub on_progress: Option<ProgressCallback>,
     /// 分片状态存储(PlanComplete/Chunk 事件更新)
     pub fragment_state_store: crate::projection::FragmentStateStore,
@@ -285,7 +295,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 completed = completed_indices.into_iter().collect();
                 // 触发广播(让前端拿到正确 total + concurrency)
                 if let Some(ref callback) = on_progress {
-                    callback(&task_id, None);
+                    callback(&task_id, None, &[]);
                 }
                 tracing::info!(
                     task_id = %task_id,
@@ -303,7 +313,18 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 }
                 // 通知 broker 产生了 started delta,由 aggregator 推送给前端
                 if let Some(ref callback) = on_progress {
-                    callback(&task_id, Some(ProgressDelta::Started(fragment_index)));
+                    let bytes_snapshot: Vec<FragmentByteEntry> = frag_bytes
+                        .iter()
+                        .map(|(&k, &v)| FragmentByteEntry {
+                            index: k,
+                            downloaded: v,
+                        })
+                        .collect();
+                    callback(
+                        &task_id,
+                        Some(ProgressDelta::Started(fragment_index)),
+                        &bytes_snapshot,
+                    );
                 }
             }
             FragmentProgress::Chunk {
@@ -384,7 +405,16 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 }
 
                 // Notify ProgressBroker of progress change
+                // 构造活跃分片字节快照(frag_bytes 当前状态),传给 ProgressBroker。
+                // 完成事件已先 remove 该分片,故快照不含刚完成的分片。
                 if let Some(ref callback) = on_progress {
+                    let bytes_snapshot: Vec<FragmentByteEntry> = frag_bytes
+                        .iter()
+                        .map(|(&k, &v)| FragmentByteEntry {
+                            index: k,
+                            downloaded: v,
+                        })
+                        .collect();
                     callback(
                         &task_id,
                         if chunk_completed {
@@ -392,6 +422,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                         } else {
                             None
                         },
+                        &bytes_snapshot,
                     );
                 }
 
@@ -929,6 +960,79 @@ mod tests {
 
         drop(progress_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+    }
+
+    /// 验证 ProgressCallback 第三参数接收到活跃分片字节快照
+    #[tokio::test]
+    async fn test_callback_receives_fragment_bytes() {
+        use std::sync::Mutex;
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "test-cb-bytes".to_string();
+
+        task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.bin".to_string(),
+                file_name: "file.bin".to_string(),
+                file_size: Some(1000),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Downloading,
+                progress: 0.0,
+                fragments_total: 2,
+                fragments_done: 0,
+                active_concurrency: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+            },
+        );
+
+        let captured: Arc<Mutex<Vec<FragmentByteEntry>>> = Arc::new(Mutex::new(vec![]));
+        let captured_clone = captured.clone();
+        let on_progress: ProgressCallback = Arc::new(move |_tid, _delta, bytes| {
+            let mut g = captured_clone.lock().unwrap();
+            g.clear();
+            g.extend_from_slice(bytes);
+        });
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: Some(on_progress),
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: false,
+                fragment_downloaded: 300,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let g = captured.lock().unwrap();
+        assert!(
+            g.iter().any(|e| e.index == 0 && e.downloaded == 300),
+            "callback 应收到分片 0 字节 300,实际: {g:?}"
+        );
     }
 
     async fn wait_for_active_concurrency(
