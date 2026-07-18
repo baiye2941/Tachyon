@@ -29,6 +29,7 @@ interface ChunkMatrixProps {
 const AGGREGATE_THRESHOLD = 200;
 const AGGREGATE_BLOCKS = 100;
 const EMPTY_SET = new Set<number>();
+const EMPTY_BYTES_MAP = new Map<number, number>();
 const MAX_BLOCKS_PER_ROW = 25;
 const MIN_BLOCKS_PER_ROW = 8;
 const BLOCK_SIZE = 14;
@@ -137,6 +138,55 @@ export function buildBlocks(
   }
 
   return blocks;
+}
+
+/**
+ * 计算每个聚合 block 的平均字节进度(仅统计 bytesMap 中的活跃分片)。
+ *
+ * 分母用整片预估大小(fileSize/total)× block 内活跃分片数,结果 clamp 到 [0,1];
+ * fileSize 未知或参数非法时返回全 0(诚实不画深度,与 DOM 端充能条行为一致)。
+ * blockIdx 映射公式与 buildBlocks 保持一致。
+ * 时间复杂度 O(|bytesMap| + blockCount),bytesMap 仅含活跃分片(上限为并发分片数)。
+ */
+export function buildBlockProgress(
+  total: number,
+  blockCount: number,
+  bytesMap: Map<number, number>,
+  fileSize: number | null | undefined,
+): number[] {
+  const size = Math.max(0, blockCount);
+  const progress = new Array<number>(size).fill(0);
+  if (!fileSize || fileSize <= 0 || total <= 0 || size === 0) return progress;
+  const perFragSize = fileSize / total;
+  const totalBytes = new Array<number>(size).fill(0);
+  const counts = new Array<number>(size).fill(0);
+  for (const [idx, downloaded] of bytesMap) {
+    if (idx < 0 || idx >= total) continue;
+    const blockIdx = Math.floor((idx * size) / total);
+    totalBytes[blockIdx]! += downloaded;
+    counts[blockIdx]! += 1;
+  }
+  for (let i = 0; i < size; i++) {
+    if (counts[i]! > 0) {
+      const blockExpected = perFragSize * counts[i]!;
+      progress[i] = Math.min(1, totalBytes[i]! / blockExpected);
+    }
+  }
+  return progress;
+}
+
+/**
+ * 把 resolveToken 解析出的 #rrggbb 颜色转为带透明度的 rgba() 字符串。
+ * 非 hex 输入(异常主题值)原样返回,保证 addColorStop 不抛错。
+ */
+function withAlpha(color: string, alpha: number): string {
+  const match = /^#([0-9a-f]{6})$/i.exec(color.trim());
+  if (!match) return color;
+  const value = parseInt(match[1]!, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function statusLabelForChunk(status: ChunkBlock["status"]): string {
@@ -330,6 +380,21 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     return buildBlocks(props.fragmentsTotal, doneSet, downloadingSet);
   });
 
+  /**
+   * 每个聚合 block 的平均字节进度(仅 downloading 活跃分片),Canvas 渐变深度填充用。
+   * bytesMap 随 250ms 快照更新;重算代价 O(|活跃分片| + blockCount),与 buildBlocks 同级。
+   */
+  const blockProgress = createMemo(() => {
+    const data = fragData();
+    const bytesMap = data?.bytesMap ?? EMPTY_BYTES_MAP;
+    return buildBlockProgress(
+      props.fragmentsTotal,
+      blocks().length,
+      bytesMap,
+      props.fileSize,
+    );
+  });
+
   // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
   createEffect(() => {
     const data = fragData();
@@ -387,6 +452,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     const radius = 5;
     const perRow = blocksPerRow();
     const selected = selectedIndex();
+    const progressByBlock = blockProgress();
     const hasMotion = !prefersReducedMotion();
     const accentColor = resolveToken("--color-accent-primary");
     const sweepPhase = hasMotion ? (phase * 2) % 1 : 0;
@@ -425,6 +491,23 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
       ctx.fill();
       ctx.globalAlpha = 1;
+
+      // 下载中块渐变深度:宽度 = BLOCK_SIZE × 块平均字节进度,
+      // 颜色取 downloading token 解析色的两档低透明度,与 DOM 端充能条同语义;
+      // 非动画效果,reduced-motion 下同样绘制。
+      if (block.status === "downloading") {
+        const depth = progressByBlock[i] ?? 0;
+        if (depth > 0) {
+          const fillW = BLOCK_SIZE * depth;
+          const grad = ctx.createLinearGradient(x, y, x + fillW, y);
+          grad.addColorStop(0, withAlpha(fillColor, 0.25));
+          grad.addColorStop(1, withAlpha(fillColor, 0.55));
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.roundRect(x, y, fillW, BLOCK_SIZE, radius);
+          ctx.fill();
+        }
+      }
 
       // 3) 完成态内发光 + 顶部高光
       if (block.status === "done") {

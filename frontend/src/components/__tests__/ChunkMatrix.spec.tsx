@@ -13,7 +13,7 @@ import {
   cleanup,
   fireEvent,
 } from "@solidjs/testing-library";
-import ChunkMatrix, { buildBlocks } from "../ChunkMatrix";
+import ChunkMatrix, { buildBlocks, buildBlockProgress } from "../ChunkMatrix";
 import * as taskFragments from "../../stores/taskFragments";
 import type { TaskFragmentData } from "../../stores/taskFragments";
 
@@ -243,6 +243,57 @@ describe("ChunkMatrix 分片矩阵", () => {
 
       expect(blocks.length).toBe(100);
       expect(elapsed).toBeLessThan(200); // 并行测试满载时 CPU 会有波动，放宽阈值保证稳定性
+    });
+  });
+
+  describe("buildBlockProgress 块字节进度", () => {
+    it("bytesMap 为空时全为 0", () => {
+      const progress = buildBlockProgress(250, 100, new Map(), 1_000_000);
+      expect(progress.length).toBe(100);
+      expect(progress.every((p) => p === 0)).toBe(true);
+    });
+
+    it("fileSize 未知或非法时全为 0", () => {
+      const bytesMap = new Map([[0, 2000]]);
+      expect(buildBlockProgress(250, 100, bytesMap, null)[0]).toBe(0);
+      expect(buildBlockProgress(250, 100, bytesMap, undefined)[0]).toBe(0);
+      expect(buildBlockProgress(250, 100, bytesMap, 0)[0]).toBe(0);
+      expect(buildBlockProgress(250, 100, bytesMap, -1)[0]).toBe(0);
+    });
+
+    it("total 或 blockCount 非法时返回对应长度全 0 数组", () => {
+      expect(buildBlockProgress(0, 100, new Map([[0, 1]]), 1000)).toEqual(
+        new Array(100).fill(0),
+      );
+      expect(buildBlockProgress(250, 0, new Map([[0, 1]]), 1000)).toEqual([]);
+    });
+
+    it("按 block 内活跃分片字节和 ÷ 预估总大小计算平均进度", () => {
+      // 250 片 / 100 块:block 0 覆盖分片 0-1;每片预估 1_000_000/250 = 4000B
+      const bytesMap = new Map([
+        [0, 2000],
+        [1, 2000],
+      ]);
+      const progress = buildBlockProgress(250, 100, bytesMap, 1_000_000);
+      // (2000+2000) / (4000*2) = 0.5
+      expect(progress[0]).toBeCloseTo(0.5);
+      expect(progress[1]).toBe(0);
+    });
+
+    it("字节数超过预估大小时 clamp 到 1", () => {
+      const bytesMap = new Map([[0, 999_999]]);
+      const progress = buildBlockProgress(250, 100, bytesMap, 1_000_000);
+      expect(progress[0]).toBe(1);
+    });
+
+    it("越界分片索引被忽略", () => {
+      const bytesMap = new Map([
+        [-1, 100],
+        [250, 100],
+        [9999, 100],
+      ]);
+      const progress = buildBlockProgress(250, 100, bytesMap, 1_000_000);
+      expect(progress.every((p) => p === 0)).toBe(true);
     });
   });
 
@@ -759,6 +810,143 @@ describe("ChunkMatrix 分片矩阵", () => {
       expect(document.querySelector(".chunk-tooltip-value")?.textContent).toBe(
         "60%",
       );
+    });
+  });
+
+  describe("Canvas 聚合块字节进度渐变", () => {
+    /**
+     * 用持有引用的 mock ctx 替换 getContext,便于断言绘制调用。
+     * 测试结束后恢复 beforeAll 安装的全局 mock,避免泄漏到其他用例。
+     */
+    function withMockContext<T>(
+      run: (ctx: {
+        createLinearGradient: ReturnType<typeof vi.fn>;
+        addColorStop: ReturnType<typeof vi.fn>;
+        fillRect: ReturnType<typeof vi.fn>;
+      }) => T,
+    ): T {
+      const addColorStop = vi.fn();
+      const grad = { addColorStop } as unknown as CanvasGradient;
+      const ctx = {
+        setTransform: vi.fn(),
+        clearRect: vi.fn(),
+        beginPath: vi.fn(),
+        roundRect: vi.fn(),
+        fill: vi.fn(),
+        stroke: vi.fn(),
+        createLinearGradient: vi.fn().mockReturnValue(grad),
+        save: vi.fn(),
+        restore: vi.fn(),
+        clip: vi.fn(),
+        fillRect: vi.fn(),
+      } as unknown as CanvasRenderingContext2D;
+      const prev = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function () {
+        return ctx;
+      } as unknown as typeof HTMLCanvasElement.prototype.getContext;
+      try {
+        return run({
+          createLinearGradient: ctx.createLinearGradient as ReturnType<
+            typeof vi.fn
+          >,
+          addColorStop,
+          fillRect: ctx.fillRect as unknown as ReturnType<typeof vi.fn>,
+        });
+      } finally {
+        HTMLCanvasElement.prototype.getContext = prev;
+      }
+    }
+
+    it("分片数 > 200 时 Canvas 正常绘制(无字节数据不画渐变)", () => {
+      withMockContext(({ fillRect, createLinearGradient }) => {
+        mockMatchMedia(true);
+        const { container } = render(() => (
+          <ChunkMatrix
+            taskId="t-canvas"
+            fragmentsTotal={250}
+            fragmentsDone={0}
+            progress={0}
+            fileSize={1_000_000}
+          />
+        ));
+        const canvas = container.querySelector("canvas");
+        expect(canvas).toBeTruthy();
+        // 块底色/高光路径已执行
+        expect(fillRect.mock.calls.length).toBeGreaterThan(0);
+        // 无 downloading 块 + reduced-motion 下无扫描光带,不应创建渐变
+        expect(createLinearGradient).not.toHaveBeenCalled();
+      });
+    });
+
+    it("downloading block 按平均字节进度画渐变填充", () => {
+      withMockContext(({ createLinearGradient, addColorStop }) => {
+        // reduced-motion:屏蔽扫描光带的 createLinearGradient,
+        // 此时唯一的渐变来源即字节进度深度填充
+        mockMatchMedia(true);
+        // 250 片 / 100 块:分片 0-1 落在 block 0,注入字节使其平均进度 0.5
+        setFragmentData("t-canvas", {
+          total: 250,
+          doneSet: new Set(),
+          downloadingSet: new Set([0, 1, 2, 3]),
+          bytesMap: new Map([
+            [0, 2000],
+            [1, 2000],
+            [2, 1000],
+            [3, 0],
+          ]),
+          finalized: false,
+        });
+        render(() => (
+          <ChunkMatrix
+            taskId="t-canvas"
+            fragmentsTotal={250}
+            fragmentsDone={0}
+            progress={0}
+            fileSize={1_000_000}
+          />
+        ));
+        expect(createLinearGradient).toHaveBeenCalled();
+        // 渐变为 downloading token 同色的两档低透明度(0.25 → 0.55)
+        const stops = addColorStop.mock.calls.map(
+          (call) => [call[0] as number, call[1] as string] as const,
+        );
+        expect(
+          stops.some(
+            ([offset, color]) => offset === 0 && color.includes("0.25"),
+          ),
+        ).toBe(true);
+        expect(
+          stops.some(
+            ([offset, color]) => offset === 1 && color.includes("0.55"),
+          ),
+        ).toBe(true);
+      });
+    });
+
+    it("fileSize 未知(null)时 downloading block 不画渐变深度", () => {
+      withMockContext(({ createLinearGradient }) => {
+        mockMatchMedia(true);
+        setFragmentData("t-canvas", {
+          total: 250,
+          doneSet: new Set(),
+          downloadingSet: new Set([0, 1]),
+          bytesMap: new Map([
+            [0, 2000],
+            [1, 2000],
+          ]),
+          finalized: false,
+        });
+        render(() => (
+          <ChunkMatrix
+            taskId="t-canvas"
+            fragmentsTotal={250}
+            fragmentsDone={0}
+            progress={0}
+            fileSize={null}
+          />
+        ));
+        expect(createLinearGradient).not.toHaveBeenCalled();
+      });
     });
   });
 });
