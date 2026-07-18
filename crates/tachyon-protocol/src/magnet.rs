@@ -3397,13 +3397,10 @@ mod tests {
         }
     }
 
-    // ===== BT-16: magnet so= 选择文件(RED 测试,实现待补) =====
+    // ===== BT-16: magnet so= 选择文件(已实现,回归测试) =====
     //
-    // 审计发现:librqbit 解析 so= 并设 only_files,但 Tachyon probe 不感知,
-    // engine 按全部文件规划,未选文件分片永远不完成。下方测试覆盖:
-    //   - parse_so_from_magnet: 解析 BEP 9 so= 参数为 0-based file_id 列表
-    //   - layout_from_file_infos: 增加 only_files 过滤参数
-    // 当前两者尚未实现,以下测试应编译失败(RED)。
+    // BT-16:parse_so_from_magnet + layout only_files + add_magnet only_files 已贯通。
+    // 下方测试覆盖解析、过滤与越界容错。
 
     /// 单文件 so=0 → Some(vec![0])
     #[test]

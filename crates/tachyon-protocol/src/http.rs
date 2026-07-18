@@ -3577,7 +3577,7 @@ mod tests {
             assert!(!host_allows_hf_token("example.com"));
         }
 
-        // ── 200 fallback 运行时降级(RED 测试,方案 A+B)──────────────────────
+        // ── 200 fallback 运行时降级(回归测试,方案 A+B)──────────────────────
         //
         // 审计发现:服务器忽略 Range 返回 200 时,当前实现走 make_200_fallback_stream
         // 流式截取请求区间,导致 N 片下载总传输量 ≈ S*N/2(1GB/16片≈8.5GB 浪费)。

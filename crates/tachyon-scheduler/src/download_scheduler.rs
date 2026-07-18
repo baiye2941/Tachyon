@@ -680,15 +680,12 @@ mod tests {
         );
     }
 
-    // ── 冷启动 slow start(渐进爬坡)RED 测试 ──────────────────────────
+    // ── 冷启动 slow start(渐进爬坡)回归测试 ──────────────────────────
     //
-    // 审计发现(download_scheduler.rs:142-145):无带宽样本时 recommend
-    // 回退到 `max_concurrency`,冷启动直接开满,可能瞬时打满带宽或触发
-    // 服务端限流。slow start 方案 A 要求冷启动从 `cold_start_initial_concurrency`
-    // 开始,随 observe_bandwidth 样本累积爬坡。此处仅写测试(RED),字段尚不存在,
-    // 编译应失败,以驱动实现。
+    // 冷启动从 cold_start_initial_concurrency 起步,observe 后按 ramp_factor 爬坡;
+    // 样本充足后交 Holt/BDP。下列断言锁定该契约。
 
-    /// 冷启动(无带宽样本)时 recommend.concurrency 应等于 `cold_start_initial_concurrency`(默认 1),
+    /// 冷启动(无带宽样本)时 recommend.concurrency 应等于配置的 cold_start_initial_concurrency,
     /// 而非 max_concurrency(8)。
     ///
     /// 行为:`AdaptiveDownloadScheduler::default_config()` 在无任何 observe_bandwidth

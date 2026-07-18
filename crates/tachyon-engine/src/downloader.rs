@@ -5818,7 +5818,7 @@ mod tests {
     /// `computed_hash`,强制走读盘计算路径;每个分片读盘时 sleep 5ms,使并发可见。
     /// 断言并发峰值 >= 2(证明至少 2 个分片读盘并行)。
     ///
-    /// 该测试在当前串行 verify 下为 **RED**(peak=1 < 2),用于驱动 JoinSet +
+    /// 回归:并行 verify 读盘峰值应 >= 2(JoinSet +
     /// Semaphore 并行化改造;并行化实现后应转为 GREEN。
     #[tokio::test]
     async fn test_verify_parallel_concurrent_reads() {
@@ -5885,7 +5885,7 @@ mod tests {
         // 全部分片数据正确,verify 应成功
         task.verify().await.expect("数据正确时校验应通过");
 
-        // 断言读盘并发峰值 >= 2(串行 verify 下为 RED:peak=1)
+        // 断言读盘并发峰值 >= 2
         let peak = counting.peak();
         assert!(
             peak >= 2,
@@ -9373,7 +9373,7 @@ mod tests {
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
-    /// abort 泄漏回归测试(切片3 RED):
+    /// abort 泄漏回归测试(切片3):
     ///
     /// 当一个分片失败触发 `abort_remaining_fragment_tasks` 取消其他正在运行
     /// 的 worker 时,被取消的 worker future 直接丢弃,其持有的 `write_buf`
@@ -9390,7 +9390,7 @@ mod tests {
     ///   的 worker future -> 分片 1 的 `release` 不执行 -> buffer 泄漏
     ///
     /// 断言 `pool.available() == pool.capacity()`(修复后期望):
-    /// - 当前(裸 alloc/release):泄漏使 available 停在 1 != 2 -> FAIL = RED
+    /// - 池化路径:abort 后 available 必须恢复到 capacity
     /// - 修复后(BufferGuard RAII,Drop 在 future cancel 时执行):available 恢复
     ///   到 2 == 2 -> PASS = GREEN
     #[tokio::test]
@@ -9435,7 +9435,7 @@ mod tests {
         assert!(result.is_err(), "首分片失败应导致执行失败");
         assert_eq!(task.state(), DownloadState::Failed);
 
-        // RED:abort 路径下分片 1 的 buffer 泄漏,available 无法恢复到 capacity。
+        // abort 路径不得泄漏 buffer,available 必须恢复到 capacity。
         // GREEN(Coder 用 BufferGuard 修复后):Drop 在 future cancel 时归还,
         // available 恢复到 capacity。
         assert_eq!(
@@ -10909,7 +10909,7 @@ mod tests {
         assert_eq!(&buf[..], &expected[..]);
     }
 
-    // ===== 200 fallback 运行时降级(RED 测试,方案 A+B)=========================
+    // ===== 200 fallback 运行时降级(已实现,回归测试 A+B)=========================
 
     /// 方案 B:当 `execute_fragmented_download` 在分片 spawn worker 内调用
     /// `download_range_stream` 时,若协议层返回 `Err(DownloadError::RangeNotSupported)`
@@ -10926,7 +10926,7 @@ mod tests {
     /// - 要么 `download_full_stream` 调用 0 次(直接 propagate 错误,任务 Failed);
     /// - 要么调用 N 次(每片都触发 200 fallback,带宽浪费,即审计发现的根因)。
     ///
-    /// 测试引用尚不存在的 `DownloadError::RangeNotSupported` 变体,编译失败(RED)。
+    /// 回归:RangeNotSupported 变体与 engine 降级路径已落地。
     #[tokio::test]
     async fn test_execute_fragmented_download_falls_back_to_full_on_range_not_supported() {
         /// 协议:probe 宣称 supports_range=true(强制走分片路径),
