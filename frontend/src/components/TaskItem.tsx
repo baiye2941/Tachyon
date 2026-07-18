@@ -162,6 +162,10 @@ export default function TaskItem(props: TaskItemProps) {
       onKeyDown={handleKeyDown}
       onContextMenu={(e) => props.onContextMenu?.(e, props.task.id)}
     >
+      {/* 下载中微型光迹:与详情页矩阵视觉语言一致,纯装饰 */}
+      <Show when={props.task.status === "downloading"}>
+        <div class="task-item-light-trail" aria-hidden="true" />
+      </Show>
       <For each={$taskColumns.visibleColumns()}>
         {(col) => (
           <div

@@ -177,6 +177,29 @@ describe("TaskItem", () => {
     expect(activeSpeedCell).not.toBeNull();
   });
 
+  it("下载中任务行渲染微型光迹元素", () => {
+    const { container } = renderWithI18n(() => (
+      <TaskItem
+        task={{
+          ...task,
+          status: "downloading",
+          progress: 0.5,
+          downloaded: 512,
+          speed: 100,
+        }}
+        index={0}
+        isSelected={false}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    const trail = container.querySelector(".task-item-light-trail");
+    expect(trail).toBeTruthy();
+  });
+
   it("作为 listbox option 时，选中行应设置 aria-selected=true", () => {
     renderWithI18n(() => (
       <TaskItem
