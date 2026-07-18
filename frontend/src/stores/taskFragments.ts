@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { api } from "../api/invoke";
+import type { FragmentByteProgress } from "../types";
 
 // 单任务分片数据:真实 doneSet + downloadingSet
 export interface TaskFragmentData {
@@ -86,13 +87,13 @@ export function mergeFragmentDelta(
   taskId: string,
   completedDelta: number[],
   startedDelta: number[],
-  fragmentBytes?: { index: number; downloaded: number }[],
+  fragmentBytes?: FragmentByteProgress[],
 ) {
   setFragmentMap((prev) => {
     const data = prev.get(taskId);
     if (!data) return prev; // DetailPanel 未打开,忽略(后续首拉拿完整快照)
     // delta 与字节快照均为空时短路:无状态变更,避免不必要的 Set 拷贝。
-    // 注意:fragmentBytes 缺失/空数组且无意 delta 时不清空 bytesMap(保持现状),
+    // 注意:fragmentBytes 缺失/空数组且无 delta 时不清空 bytesMap(保持现状),
     // 终态清空由 clearTaskFragmentDownloading 负责,这是有意设计。
     if (
       completedDelta.length === 0 &&
