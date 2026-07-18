@@ -159,6 +159,9 @@ struct FragmentSpawnCtx<'a> {
     pause_timeout: Duration,
     skip_write: bool,
     object_identity: Option<ObjectIdentity>,
+    /// 崩溃一致性级别:控制分片完成时是否 fsync。`Loose` 跳过分片 sync(仅在 close 时落盘),
+    /// 牺牲断电耐久性换吞吐;`EveryFragment`(默认)每分片 fsync 一次。
+    sync_mode: tachyon_core::config::CrashConsistencyMode,
 }
 
 use crate::connection::ConnectionPool;
@@ -1562,6 +1565,7 @@ impl DownloadTask {
         let max_retries = ctx.max_retries;
         let pause_timeout = ctx.pause_timeout;
         let skip_write = ctx.skip_write;
+        let frag_sync_mode = ctx.sync_mode;
         let frag_object_identity = ctx.object_identity.clone();
 
         handles.spawn(async move {
@@ -1611,6 +1615,7 @@ impl DownloadTask {
                     compute_hash,
                     write_buf.as_mut(),
                     skip_write,
+                    frag_sync_mode,
                     &shared,
                     frag_object_identity.clone(),
                 )
@@ -1945,6 +1950,7 @@ impl DownloadTask {
                                 max_retries,
                                 pause_timeout,
                                 skip_write,
+                                sync_mode: self.config.crash_consistency_mode,
                                 object_identity: self
                                     .metadata
                                     .as_ref()
@@ -2615,6 +2621,7 @@ impl DownloadTask {
         compute_hash: bool,
         write_buf: &mut AlignedBuf,
         skip_write: bool,
+        sync_mode: tachyon_core::config::CrashConsistencyMode,
         shared: &FragmentShared,
         object_identity: Option<ObjectIdentity>,
     ) -> DownloadResult<(u64, Duration, Option<String>)> {
@@ -2970,7 +2977,9 @@ impl DownloadTask {
         // 审计 P0-3:在发送 completed 触发上层 snapshot 之前,先把本分片已写字节 durable sync。
         // skip_write(BT protocol_managed) 时引擎未写 storage,由协议层 storage/piece 语义负责落盘。
         // 不做每 batch fsync(避免 Flush Storm);仅在分片完成边界 group-commit 一次。
-        if !skip_write {
+        // CrashConsistencyMode::Loose:跳过分片 sync,仅在 close() 时落盘(NVMe/UPS 极致吞吐场景)。
+        // CrashConsistencyMode::EveryFragment(默认):每分片 fsync,断电后 resume 跳过已 sync 分片。
+        if !skip_write && sync_mode == tachyon_core::config::CrashConsistencyMode::EveryFragment {
             storage.sync().await?;
         }
 
@@ -4790,6 +4799,118 @@ mod tests {
             "completed 前应至少每分片一次 storage.sync, syncs={}, completed={}",
             syncs.load(Ordering::SeqCst),
             completed_events
+        );
+    }
+
+    /// CrashConsistencyMode::Loose 模式下,分片完成时不得调用 storage.sync,
+    /// 仅在 close() 时落盘。验证 HDD/NVMe 极致吞吐场景的 fsync 跳过逻辑。
+    #[tokio::test]
+    async fn test_crash_consistency_loose_skips_fragment_sync() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSyncStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for CountingSyncStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.sync()
+            }
+        }
+
+        let frag_size = 32 * 1024u64;
+        let total = frag_size * 2;
+        let first = bytes::Bytes::from(vec![0xAB; frag_size as usize]);
+        let second = bytes::Bytes::from(vec![0xCD; frag_size as usize]);
+        let meta = FileMetadata {
+            file_name: "loose.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"strong-etag\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_range_data(0, frag_size - 1, first.clone())
+                .with_range_data(frag_size, total - 1, second.clone()),
+        );
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let storage = StorageKind::new(CountingSyncStorage {
+            inner: MemStorage::with_capacity(total as usize),
+            syncs: syncs.clone(),
+        });
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/loose.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 2,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::Loose,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("下载应成功");
+
+        // Loose 模式:分片完成时不 sync,仅在 close() 时 sync 一次。
+        // 若分片 sync 仍触发,syncs 会 ≥ 3(2 分片 + 1 close)。
+        let final_syncs = syncs.load(Ordering::SeqCst);
+        assert_eq!(
+            final_syncs, 1,
+            "Loose 模式应仅在 close() 时 sync 一次,实际 syncs={final_syncs}(应=1,close 触发)"
         );
     }
 
@@ -11267,6 +11388,117 @@ mod tests {
         assert!(!did);
         assert!(rx.try_recv().is_err());
         assert_eq!(task.fragments.len(), 1);
+    }
+
+    /// rebalance 边界:剩余刚好等于 2*MIN_SPLIT_SIZE(128KiB)时应可拆;
+    /// 剩余 < 2*MIN_SPLIT_SIZE 时不得拆。审计 P0-4.5 残留:补边界值测试。
+    #[tokio::test]
+    async fn test_rebalance_boundary_exactly_2x_min_split_size() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        // 剩余刚好 = 2 * MIN_SPLIT_SIZE = 128 KiB,应可拆
+        // 构造:total=3*MIN_SPLIT_SIZE, 已下载=MIN_SPLIT_SIZE, 剩余=2*MIN_SPLIT_SIZE
+        let size = MIN_SPLIT_SIZE * 3;
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            // 下载 1/3,剩余 2*MIN_SPLIT_SIZE(刚好达到门槛)
+            r.realtime_downloaded
+                .store(MIN_SPLIT_SIZE, Ordering::Release);
+            // 回拨 start_time 越过 1s 年龄门槛
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("boundary.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/boundary.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        task.metadata = Some(test_metadata("boundary.bin", size));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        // 剩余 = 2*MIN_SPLIT_SIZE 刚好达到门槛(条件是 < 2*MIN 才跳过,等于不跳过)
+        assert!(did, "剩余=2*MIN_SPLIT_SIZE(128KiB)应可拆分");
+        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
+        let _spec = rx.try_recv().expect("应入队新分片 spec");
+    }
+
+    /// rebalance 边界:剩余刚好小于 2*MIN_SPLIT_SIZE 时不得拆分。
+    #[tokio::test]
+    async fn test_rebalance_boundary_below_2x_min_split_size() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        // 剩余 = 2*MIN_SPLIT_SIZE - 1,应跳过
+        let size = MIN_SPLIT_SIZE * 3;
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            // 下载 MIN_SPLIT_SIZE + 1,剩余 = 2*MIN_SPLIT_SIZE - 1(刚好不足门槛)
+            r.realtime_downloaded
+                .store(MIN_SPLIT_SIZE + 1, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("below.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/below.bin".into(),
+            test_config(),
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(!did, "剩余 < 2*MIN_SPLIT_SIZE(128KiB)时不得拆分");
+        assert_eq!(task.fragments.len(), 1, "不应新增分片");
+    }
+
+    /// rebalance 1s 年龄门槛:刚 spawn 的分片(< 1s)不得立即拆分,
+    /// 避免频繁拆分开销。审计 P0-4.5:补年龄门槛测试。
+    #[tokio::test]
+    async fn test_rebalance_skips_fresh_fragment_under_1s_age() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded.store(size / 10, Ordering::Release);
+            // start_time 默认是现在(刚 spawn),不回拨 → 年龄 < 1s
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("fresh.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/fresh.bin".into(),
+            test_config(),
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(!did, "刚 spawn 的分片(< 1s)不得立即拆分");
+        assert_eq!(task.fragments.len(), 1, "不应新增分片");
     }
 
     /// rebalance 开启后多分片下载仍正确完成(不回归)
