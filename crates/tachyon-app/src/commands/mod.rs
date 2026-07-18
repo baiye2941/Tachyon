@@ -756,6 +756,7 @@ pub(crate) async fn persist_task_snapshot(
             std::collections::HashMap::new(),
             None,
             None,
+            true,
         );
         if let Some(existing) = existing {
             snapshot.fragment_size = existing.fragment_size;
@@ -763,6 +764,7 @@ pub(crate) async fn persist_task_snapshot(
             snapshot.partial_fragments = existing.partial_fragments;
             snapshot.etag = existing.etag;
             snapshot.last_modified = existing.last_modified;
+            snapshot.supports_range = existing.supports_range;
             snapshot.retry_count = existing.retry_count;
             snapshot.revision = existing.revision;
         }

@@ -37,6 +37,7 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
         etag: Some("etag123".to_string()),
         last_modified: Some("2026-01-01T00:00:00Z".to_string()),
         content_length: Some(1024 * 1024),
+        supports_range: true,
         created_at: String::new(),
         updated_at: String::new(),
         fail_reason: None,

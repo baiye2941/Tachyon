@@ -377,6 +377,15 @@ pub(crate) async fn inject_resume_snapshot(
             );
             task.set_resume_object_identity(Some(identity));
         }
+        // 审计 batch2:历史 200-fallback 后 supports_range=false 必须注入,
+        // 否则 resume 会再次按分片规划浪费带宽。
+        if !snapshot.supports_range {
+            tracing::info!(
+                task_id = %task_id,
+                "断点续传:注入 supports_range=false(强制整块路径)"
+            );
+            task.set_resume_supports_range(Some(false));
+        }
     }
 }
 
@@ -454,6 +463,7 @@ pub(crate) async fn probe_and_save_metadata(
                     std::collections::HashMap::new(),
                     meta.etag.clone(),
                     meta.last_modified.clone(),
+                    meta.supports_range,
                 );
                 // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
                 // spawn_blocking 包裹避免阻塞 tokio worker,错误仅记录警告。
@@ -3744,6 +3754,7 @@ mod tests {
             etag: None,
             last_modified: None,
             content_length: Some(1024),
+            supports_range: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             fail_reason: None,

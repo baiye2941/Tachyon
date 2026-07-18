@@ -151,6 +151,7 @@ pub fn normalize_recovered_status(status: DownloadState) -> DownloadState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn task_info_to_snapshot(
     task: &TaskInfo,
     save_path: String,
@@ -159,6 +160,7 @@ pub fn task_info_to_snapshot(
     partial_fragments: HashMap<u32, u64>,
     etag: Option<String>,
     last_modified: Option<String>,
+    supports_range: bool,
 ) -> TaskSnapshot {
     let now = chrono::Local::now().to_rfc3339();
     TaskSnapshot {
@@ -178,6 +180,7 @@ pub fn task_info_to_snapshot(
         etag,
         last_modified,
         content_length: task.file_size,
+        supports_range,
         created_at: task.created_at.clone(),
         updated_at: now,
         // 保留 TaskInfo 上的失败原因与重试计数,避免持久化时丢失
@@ -216,6 +219,7 @@ mod tests {
             etag: None,
             last_modified: None,
             content_length: Some(1000),
+            supports_range: true,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
@@ -252,6 +256,7 @@ mod tests {
             etag: None,
             last_modified: None,
             content_length: Some(1000),
+            supports_range: true,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             updated_at: "2026-05-29T00:00:01Z".to_string(),
             fail_reason: None,
@@ -291,6 +296,7 @@ mod tests {
             etag: None,
             last_modified: None,
             content_length: Some(100),
+            supports_range: true,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             updated_at: "2026-05-29T00:00:00Z".to_string(),
             fail_reason: None,
@@ -380,6 +386,7 @@ mod tests {
             HashMap::new(),
             Some("\"abc\"".to_string()),
             None,
+            true,
         );
 
         assert_eq!(snapshot.content_length, Some(1024));
@@ -418,6 +425,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
+            true,
         );
         assert_eq!(
             snapshot.tags,

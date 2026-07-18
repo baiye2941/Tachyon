@@ -451,6 +451,7 @@ impl TaskService {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                true,
             );
             // task_store 底层为 FileStore 同步 I/O(含 fsync),用 spawn_blocking 包裹避免
             // 阻塞 tokio worker。此处 await 以保证 create_task 返回前快照已落盘
@@ -968,6 +969,7 @@ impl TaskService {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                true,
             );
             if let Some(existing) = existing {
                 snapshot.fragment_size = existing.fragment_size;
@@ -975,6 +977,7 @@ impl TaskService {
                 snapshot.partial_fragments = existing.partial_fragments;
                 snapshot.etag = existing.etag;
                 snapshot.last_modified = existing.last_modified;
+                snapshot.supports_range = existing.supports_range;
                 snapshot.retry_count = existing.retry_count;
                 snapshot.fail_reason = existing.fail_reason;
                 // 审计 H-05:full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序

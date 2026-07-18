@@ -1263,6 +1263,7 @@ mod tests {
             std::collections::HashMap::new(),
             None,
             None,
+            true,
         );
         state
             .infra

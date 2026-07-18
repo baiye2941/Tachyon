@@ -881,6 +881,7 @@ async fn test_undo_delete_restores_task_and_snapshot() {
         std::collections::HashMap::new(),
         None,
         None,
+        true,
     );
     service.task_store.save_snapshot(&snapshot).unwrap();
     assert!(service.task_store.load_snapshot("t1").unwrap().is_some());
@@ -918,6 +919,7 @@ async fn test_undo_delete_timeout_fails() {
             std::collections::HashMap::new(),
             None,
             None,
+            true,
         ))
         .unwrap();
 
@@ -1030,6 +1032,7 @@ fn empty_snapshot() -> TaskSnapshot {
         etag: None,
         last_modified: None,
         content_length: None,
+        supports_range: true,
         created_at: String::new(),
         updated_at: String::new(),
         fail_reason: None,
