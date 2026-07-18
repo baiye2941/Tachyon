@@ -417,13 +417,19 @@ async fn test_create_task_success() {
     let creation = result.unwrap();
     assert!(!creation.task_id.is_empty());
     assert_eq!(creation.url, url);
-    // Windows canonicalize 返回 \\?\ 前缀(UNC 路径),断言用 ends_with 容忍平台差异
-    let dir_str = dir.path().to_string_lossy().to_string();
-    assert!(
-        creation.download_dir.ends_with(&dir_str) || dir_str.ends_with(&creation.download_dir),
+    // Windows 上路径可能同时出现:
+    // - canonicalize 的 \\?\ 前缀
+    // - 8.3 短路径(C:\Users\RUNNER~1\...)
+    // 字符串 ends_with 对不上。两边都 canonicalize 后再比 PathBuf。
+    let expected = std::fs::canonicalize(dir.path()).expect("临时目录应可 canonicalize");
+    let actual = std::fs::canonicalize(&creation.download_dir)
+        .unwrap_or_else(|_| PathBuf::from(&creation.download_dir));
+    assert_eq!(
+        actual,
+        expected,
         "download_dir 应匹配临时目录,实际: {} vs {}",
         creation.download_dir,
-        dir_str
+        dir.path().display()
     );
     // 任务应在仓库中
     assert!(service.task_repository.contains_key(&creation.task_id));

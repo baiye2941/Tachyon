@@ -1218,6 +1218,10 @@ impl IoUringStorage {
     /// 预分配文件空间 (Linux)
     ///
     /// 使用 `fallocate` 系统调用预分配磁盘空间，避免写入时的动态扩展开销。
+    ///
+    /// 使用 `FALLOC_FL_KEEP_SIZE`:只预留物理块,不扩展逻辑 EOF。这样
+    /// RMW 尾块的 ftruncate 收尾仍以用户写入末尾为准,不会把 allocate 的
+    /// 预分配尺寸误当成"已有数据大小"而拒绝截掉 padding。
     #[cfg(target_os = "linux")]
     async fn submit_allocate(&self, size: u64) -> DownloadResult<()> {
         let file_guard = match &self.file_fd {
@@ -1235,9 +1239,10 @@ impl IoUringStorage {
             let fd = file_guard.as_raw_fd();
             // Safety:
             // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活,确保 fd 有效
-            // - mode=0、offset=0、len=size 均为合法的 fallocate 参数
+            // - mode=FALLOC_FL_KEEP_SIZE、offset=0、len=size 均为合法的 fallocate 参数
             // - 内核负责实际的磁盘空间预分配,不破坏 Rust 内存安全
-            let ret = unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) };
+            let ret =
+                unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, size as libc::off_t) };
             if ret != 0 {
                 return Err(DownloadError::Io(std::io::Error::last_os_error()));
             }
@@ -1247,22 +1252,21 @@ impl IoUringStorage {
         .map_err(|e| DownloadError::Io(std::io::Error::other(e.to_string())))?
     }
 
-    /// F-05-1: 把文件截断到 `expected_size`(若当前更大)。
+    /// F-05-1: 把文件截断到 `target_size`(若当前更大)。
     ///
     /// io_uring O_DIRECT 非对齐尾块的 RMW 慢速路径会把内部 buffer 填充到对齐
     /// 边界再整块写回,导致文件 EOF 被扩展到对齐边界(例:写 10001 字节,
     /// padded 到 12288 整块写回,EOF 变 12288)。此方法在 padded write 完成后
-    /// 调用 `ftruncate(expected_size)` 把文件截回用户声明的真实大小。
+    /// 调用 `ftruncate(target_size)` 把文件截回真实大小。
     ///
-    /// 仅对"尾块"(padded write 末尾超过 expected_size 的情形)截断;非尾块
-    /// RMW(padded write 末尾在文件内部)不截短,避免破坏后续已写数据。
-    /// 调用方传入的 `expected_size` 是用户视角的写后文件大小
-    /// (即 `_offset + _data.len()`)。
+    /// 调用方 MUST 传入 `max(write_前文件大小, offset + data.len())`,禁止把
+    /// 已有更大文件截小——否则 concurrent fast write / allocate 扩展的内容
+    /// 会被 RMW 尾截断冲掉(F-05-3)。
     ///
     /// 用 `spawn_blocking` 调 ftruncate(同步 syscall),与 close 中 sync_all
     /// 的处理一致,避免阻塞 tokio 工作线程。
     #[cfg(target_os = "linux")]
-    async fn truncate_to(&self, expected_size: u64) -> DownloadResult<()> {
+    async fn truncate_to(&self, target_size: u64) -> DownloadResult<()> {
         let file_guard = match &self.file_fd {
             Some(f) => f.clone(),
             None => {
@@ -1278,11 +1282,11 @@ impl IoUringStorage {
             let fd = file_guard.as_raw_fd();
             // SAFETY:
             // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活
-            // - ftruncate 的 length 参数为 i64(off_t);expected_size <= i64::MAX
-            //   由调用方保证(write_at 中 expected_size = offset + data.len(),
+            // - ftruncate 的 length 参数为 i64(off_t);target_size <= i64::MAX
+            //   由调用方保证(write_at 中 target = max(size_before, offset+len),
             //   均 usize 范围内,且 allocate 入口已校验 size <= i64::MAX)
             // - ftruncate 把文件截断到指定长度,不破坏 Rust 内存安全
-            let ret = unsafe { libc::ftruncate(fd, expected_size as libc::off_t) };
+            let ret = unsafe { libc::ftruncate(fd, target_size as libc::off_t) };
             if ret != 0 {
                 return Err(DownloadError::Io(std::io::Error::last_os_error()));
             }
@@ -1504,6 +1508,10 @@ impl AsyncStorage for IoUringStorage {
                         // 用 write_lock 串行化整个 RMW 临界区,持锁从 submit_read 到
                         // submit_write 完成。
                         let _rmw_guard = self.write_lock.lock().await;
+                        // F-05-3:写前记录逻辑大小。padded write 之后只能截掉"本次
+                        // 扩展出的 padding",绝不能把写前已有内容(含 concurrent
+                        // fast write / 更大 allocate 结果)截小。
+                        let size_before = self.file_size().await.unwrap_or(0);
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
@@ -1540,16 +1548,16 @@ impl AsyncStorage for IoUringStorage {
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
-                        // F-05-1:若 padded write 超过用户声明的文件大小
-                        // (offset + data.len()),O_DIRECT 整块写回会把 EOF 扩展到
-                        // 对齐边界(例:10001 -> 12288)。ftruncate 把文件截回真实大小。
-                        // 审计交叉验证 P1:truncate 必须在 RMW 临界区内执行,
-                        // 否则与并发 fast write 竞态可截掉他人刚写入的数据。
-                        let expected_size = _offset + _data.len() as u64;
+                        // F-05-1 + F-05-3:若 padded write 把 EOF 撑过用户写入末尾,
+                        // 只截掉 padding 扩展。target = max(写前大小, 用户写入末尾),
+                        // 避免 concurrent fast write 的数据被 truncate 冲掉。
+                        // truncate 必须在 RMW 临界区内执行。
+                        let write_end = _offset + _data.len() as u64;
                         if written.saturating_sub(front_pad) >= _data.len() {
                             let padded_end = aligned_offset + padded_len as u64;
-                            if padded_end > expected_size {
-                                self.truncate_to(expected_size).await?;
+                            let target = size_before.max(write_end);
+                            if padded_end > target {
+                                self.truncate_to(target).await?;
                             }
                         }
                         // 锁释放在此(drop _rmw_guard)——RMW 临界区结束(truncate 已在锁内完成)。
@@ -1605,6 +1613,8 @@ impl AsyncStorage for IoUringStorage {
                         // B1 修复:RMW 非原子,并发同块 lost-update。write_lock 串行化
                         // 整个 RMW 临界区(submit_read → 改 → submit_write)。
                         let _rmw_guard = self.write_lock.lock().await;
+                        // F-05-3:写前记录逻辑大小,详见 write_at 注释。
+                        let size_before = self.file_size().await.unwrap_or(0);
                         let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
@@ -1627,14 +1637,13 @@ impl AsyncStorage for IoUringStorage {
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
-                        // F-05-1:ftruncate 收尾。审计交叉验证 P1:truncate 必须在
-                        // RMW 临界区内执行(锁释放前),否则与并发 fast write 竞态可
-                        // 截掉他人刚写入的数据。详见 write_at 注释。
-                        let expected_size = _offset + _data.len() as u64;
+                        // F-05-1 + F-05-3:只截 padding,不截写前已有内容。详见 write_at。
+                        let write_end = _offset + _data.len() as u64;
                         if written.saturating_sub(front_pad) >= _data.len() {
                             let padded_end = aligned_offset + padded_len as u64;
-                            if padded_end > expected_size {
-                                self.truncate_to(expected_size).await?;
+                            let target = size_before.max(write_end);
+                            if padded_end > target {
+                                self.truncate_to(target).await?;
                             }
                         }
                         drop(_rmw_guard);
@@ -2542,7 +2551,7 @@ mod tests {
             return;
         }
         // 预分配 12288 字节(覆盖 padded 写入的最大范围),避免 write 因文件
-        // 未分配而失败;allocate 是 fallocate,不会撑大逻辑 EOF
+        // 未分配而失败。allocate 使用 FALLOC_FL_KEEP_SIZE,不撑大逻辑 EOF。
         storage.allocate(12288).await.expect("预分配应成功");
 
         // 写入 10001 字节(非 4096 对齐):10001 = 2*4096 + 1809
@@ -2663,20 +2672,22 @@ mod tests {
     /// F-05-3: fast write(对齐 4KiB)与邻接 RMW(非对齐尾块)落同一对齐块时
     /// 不应产生 lost-update。
     ///
-    /// 当前对齐快速路径 `is_aligned` 分支不持有 `write_lock`,只调用单次
-    /// `submit_write`。单次 submit_write 对内核是原子的(单条 SQE),但与
-    /// 并发的 RMW(读-改-写)落同一对齐块时,RMW 的"读"可能读到 fast write
-    /// 之前的旧数据,然后"写回"覆盖 fast write 的结果,产生 lost-update。
+    /// 两处失败模式:
+    /// 1. 互斥缺失:对齐快速路径不持 `write_lock` 时,RMW 可能读到 fast write
+    ///    之前的旧数据再整块写回,覆盖 fast write 结果。
+    /// 2. 错误 truncate:即使已互斥,RMW 在 padded write 后若无条件
+    ///    `truncate_to(offset+len)`,会把 concurrent fast write 已扩展到 4096
+    ///    的文件截回 30;随后 O_DIRECT 读 4096 在 EOF 之后填零,表现为
+    ///    [0..10)=0xAA,[10..30)=0xBB,[30..4096)=0 —— aa_count=0。
     ///
     /// 场景:同一 4096 对齐块(块 0):
     ///   - 并发 A:fast write,offset=0, len=4096, 数据 0xAA(对齐快速路径)
     ///   - 并发 B:RMW,offset=10, len=20, 数据 0xBB(非对齐慢速路径)
-    /// 若 fast write 与 RMW 不互斥,B 的 RMW 可能读到全零(块初始态),
-    /// 覆盖 [10..30] 为 0xBB,再整块写回 → A 的 0xAA 全部丢失,
-    /// 只剩 [10..30] 为 0xBB,其余为零。
     ///
-    /// 期望:两者数据都正确落盘——offset=0..4096 为 0xAA(被 fast write),
-    /// 其中 [10..30] 被 RMW 覆盖为 0xBB。最终文件应同时包含两者数据。
+    /// 期望(在 RMW 后于 fast write 的串行顺序下,最常见的 composition):
+    /// offset=0..4096 为 0xAA,其中 [10..30] 被 RMW 覆盖为 0xBB。
+    /// 若 RMW 先于 fast write,fast write 会整块覆盖 RMW 区间,此时 BB 不保留
+    /// ——本测试用多轮提高检出"互斥/截断"类 bug 的概率。
     ///
     /// 参考 `test_iouring_concurrent_rmw_same_block_no_lost_update`(RMW×RMW),
     /// 本测试补 fast×RMW 组合。
