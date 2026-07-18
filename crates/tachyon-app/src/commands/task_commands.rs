@@ -1089,15 +1089,19 @@ pub(crate) async fn create_task_inner(
     // auto_start=false 时保持 Pending,不激活下载;后续可调用 resume_task 启动
     if creation.auto_start {
         let state_arc = Arc::new(state.clone_for_task());
-        state.runtime.supervisor.start_download(
-            state_arc,
-            &creation.task_id,
-            creation.url,
-            creation.download_dir,
-            creation.download_config,
-            creation.mirror_urls,
-            creation.preferred_file_name,
-        );
+        state
+            .runtime
+            .supervisor
+            .start_download(
+                state_arc,
+                &creation.task_id,
+                creation.url,
+                creation.download_dir,
+                creation.download_config,
+                creation.mirror_urls,
+                creation.preferred_file_name,
+            )
+            .await;
     }
 
     Ok(creation.task_id)
@@ -1177,15 +1181,19 @@ async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppErro
     };
 
     let state_arc = Arc::new(state.clone_for_task());
-    state.runtime.supervisor.start_download(
-        state_arc,
-        task_id,
-        task.url,
-        download_dir,
-        download_config,
-        None, // mirror_urls 无法从快照恢复,单源续传
-        None, // preferred_file_name 无需覆盖,probe 复用既有文件名
-    );
+    state
+        .runtime
+        .supervisor
+        .start_download(
+            state_arc,
+            task_id,
+            task.url,
+            download_dir,
+            download_config,
+            None, // mirror_urls 无法从快照恢复,单源续传
+            None, // preferred_file_name 无需覆盖,probe 复用既有文件名
+        )
+        .await;
     tracing::info!(task_id = %task_id, "重启 task_fn 激活断点续传");
     Ok(())
 }

@@ -62,8 +62,15 @@ impl DownloadSupervisor {
     /// `start_tx/start_rx` 确保任务在所有资源注册完成后才开始执行。
     /// `preferred_file_name` 为用户在「新建任务」中显式传入的重命名(已 sanitize),
     /// 透传给引擎以在 probe 后覆盖协议侧文件名。
+    /// 重启/覆盖同 id 任务时,abort 后 drain 旧 generation 的上限。
+    ///
+    /// 审计 Phase1:仅 abort 不够——旧 task 可能仍短暂持有写句柄/网络。
+    /// 策略:先 abort(立即停写),再 timeout(grace) await JoinHandle drain,再 spawn 新 generation。
+    /// grace 实际上限见 start_download 内 `min(RESTART_QUIESCE_TIMEOUT, 500ms)`。
+    pub const RESTART_QUIESCE_TIMEOUT: Duration = Duration::from_secs(3);
+
     #[allow(clippy::too_many_arguments)]
-    pub fn start_download(
+    pub async fn start_download(
         &self,
         state: Arc<AppState>,
         task_id: &str,
@@ -73,12 +80,14 @@ impl DownloadSupervisor {
         mirror_urls: Option<Vec<String>>,
         preferred_file_name: Option<String>,
     ) {
-        // C-03: 方案 A — abort 同 id 旧 handle,清理旧控制面,防 ABA。
-        // 旧 JoinHandle drop 不 abort task_fn,需显式 abort 防止后台泄漏;
-        // 同步清理旧 command channel / lock,旧 session 后续 cleanup
-        // 因通道已被替换而只影响新 session。
-        if let Some((_, old_handle)) = self.handles.remove(task_id) {
+        // C-03 + Phase1 join-before-restart:
+        // 1) 先 abort 旧 generation(立即停写盘/联网),再短等 drain
+        // 2) 清理旧 command channel / lock,防 ABA
+        // 注意:不能先 wait 满超时再 abort——会让每次 restart 卡 RESTART_QUIESCE_TIMEOUT。
+        if let Some((_, mut old_handle)) = self.handles.remove(task_id) {
             old_handle.abort();
+            let grace = Self::RESTART_QUIESCE_TIMEOUT.min(Duration::from_millis(500));
+            let _ = tokio::time::timeout(grace, &mut old_handle).await;
         }
         self.command_channels.remove(task_id);
         self.command_locks.remove(task_id);
@@ -330,15 +339,17 @@ mod tests {
             authorized_dirs: vec![download_dir.clone()],
             ..DownloadConfig::default()
         };
-        supervisor.start_download(
-            state.clone(),
-            task_id,
-            "ftp://c03.invalid/stale.bin".to_string(),
-            download_dir,
-            download_config,
-            None,
-            None,
-        );
+        supervisor
+            .start_download(
+                state.clone(),
+                task_id,
+                "ftp://c03.invalid/stale.bin".to_string(),
+                download_dir,
+                download_config,
+                None,
+                None,
+            )
+            .await;
 
         // 验证旧 handle 已被 abort(计数器停止增长)
         let still_running = is_still_running(&heartbeat).await;
@@ -388,15 +399,17 @@ mod tests {
             authorized_dirs: vec![download_dir.clone()],
             ..DownloadConfig::default()
         };
-        supervisor.start_download(
-            state.clone(),
-            task_id,
-            "ftp://c03.invalid/channel.bin".to_string(),
-            download_dir,
-            download_config,
-            None,
-            None,
-        );
+        supervisor
+            .start_download(
+                state.clone(),
+                task_id,
+                "ftp://c03.invalid/channel.bin".to_string(),
+                download_dir,
+                download_config,
+                None,
+                None,
+            )
+            .await;
 
         // 验证:新通道可用(send_command 返回 true)
         let ok = supervisor.send_command(task_id, TaskCommand::Pause);
@@ -450,15 +463,17 @@ mod tests {
             authorized_dirs: vec![download_dir.clone()],
             ..DownloadConfig::default()
         };
-        supervisor.start_download(
-            state.clone(),
-            task_id,
-            "ftp://c03.invalid/lock.bin".to_string(),
-            download_dir,
-            download_config,
-            None,
-            None,
-        );
+        supervisor
+            .start_download(
+                state.clone(),
+                task_id,
+                "ftp://c03.invalid/lock.bin".to_string(),
+                download_dir,
+                download_config,
+                None,
+                None,
+            )
+            .await;
 
         // 验证:task_command_lock 返回的必须是新的 Arc,而非旧的
         let new_lock = supervisor.task_command_lock(task_id);
@@ -519,15 +534,17 @@ mod tests {
         );
 
         // 第二次 start_download(B)——必须先 abort A 的 handle
-        supervisor.start_download(
-            state.clone(),
-            task_id,
-            "ftp://c03.invalid/session-b.bin".to_string(),
-            download_dir.clone(),
-            download_config,
-            None,
-            None,
-        );
+        supervisor
+            .start_download(
+                state.clone(),
+                task_id,
+                "ftp://c03.invalid/session-b.bin".to_string(),
+                download_dir.clone(),
+                download_config,
+                None,
+                None,
+            )
+            .await;
 
         // 验证 B 的控制面已注册(handle/channel/lock 均为新 session 的)。
         // 必须在等待 A abort 之前同步检查:B 的 task_fn 探测 ftp://c03.invalid
@@ -558,6 +575,69 @@ mod tests {
         // 清理 B
         if let Some((_, handle_b)) = supervisor.handles.remove(task_id) {
             handle_b.abort();
+        }
+        supervisor.command_channels.remove(task_id);
+        supervisor.command_locks.remove(task_id);
+    }
+
+    /// Phase1: start_download 必须在 spawn 新 generation 前 await 旧 JoinHandle 退出
+    /// (不仅 abort)。旧任务若在 drop 后仍短暂运行,新任务会与旧写盘/联网竞态。
+    ///
+    /// 行为:预置一个"abort 后仍 sleep 再心跳"的假 handle;
+    /// start_download 完成后,在 RESTART 窗口内旧任务不得再有心跳。
+    #[tokio::test]
+    async fn test_start_download_awaits_old_generation_before_spawn() {
+        let state = test_state();
+        let supervisor = &state.runtime.supervisor;
+        let task_id = "c03-join-before-restart";
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let hb = heartbeat.clone();
+
+        // 旧 generation:收到 abort 后仍 sleep 80ms 再打一次心跳
+        // (模拟 abort 后尚未完全退出的写盘窗口)
+        let old_handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        hb.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        supervisor.handles.insert(task_id.to_string(), old_handle);
+        assert!(
+            wait_heartbeat_started(&heartbeat).await,
+            "旧 generation 必须先启动"
+        );
+
+        let download_dir = std::env::temp_dir().to_string_lossy().to_string();
+        let download_config = DownloadConfig {
+            download_dir: download_dir.clone(),
+            authorized_dirs: vec![download_dir.clone()],
+            ..DownloadConfig::default()
+        };
+        supervisor
+            .start_download(
+                state.clone(),
+                task_id,
+                "ftp://c03.invalid/join.bin".to_string(),
+                download_dir,
+                download_config,
+                None,
+                None,
+            )
+            .await;
+
+        // start_download 返回后旧 generation 必须已 quiesce(不再心跳)
+        let still = is_still_running(&heartbeat).await;
+        assert!(
+            !still,
+            "Phase1: start_download 返回后旧 generation 不得仍在运行(需 join-before-restart)"
+        );
+
+        if let Some((_, h)) = supervisor.handles.remove(task_id) {
+            h.abort();
         }
         supervisor.command_channels.remove(task_id);
         supervisor.command_locks.remove(task_id);
