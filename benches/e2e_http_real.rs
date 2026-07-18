@@ -44,7 +44,7 @@ fn bench_http_range_real_loopback(c: &mut Criterion) {
             for i in 0..4u64 {
                 let start = i * 256 * 1024;
                 let end = start + 256 * 1024 - 1;
-                let bytes = client.download_range(&url, start, end).await.unwrap();
+                let bytes = client.download_range(&url, start, end, None).await.unwrap();
                 assert_eq!(bytes.len(), 256 * 1024);
             }
         });
@@ -212,6 +212,9 @@ fn bench_mirror_aggregation(c: &mut Criterion) {
                 mirror_urls.clone(),
                 config,
                 Some(pool.clone()),
+                tachyon_engine::create_adaptive_scheduler(
+                    tachyon_core::config::SchedulerConfig::default(),
+                ),
             )
             .await
             .expect("with_mirrors 构造失败");
@@ -458,7 +461,8 @@ fn bench_http2_vs_http1_multiplexing(c: &mut Criterion) {
                         let url = h2_url.clone();
                         let client = client.clone();
                         async move {
-                            let bytes = client.download_range(&url, start, end).await.unwrap();
+                            let bytes =
+                                client.download_range(&url, start, end, None).await.unwrap();
                             assert_eq!(bytes.len() as u64, end - start + 1);
                         }
                     })
@@ -505,7 +509,8 @@ fn bench_http2_vs_http1_multiplexing(c: &mut Criterion) {
                         let url = h1_url.clone();
                         let client = client.clone();
                         async move {
-                            let bytes = client.download_range(&url, start, end).await.unwrap();
+                            let bytes =
+                                client.download_range(&url, start, end, None).await.unwrap();
                             assert_eq!(bytes.len() as u64, end - start + 1);
                         }
                     })
@@ -544,7 +549,8 @@ fn bench_http2_vs_http1_multiplexing(c: &mut Criterion) {
                         let url = h1_url.clone();
                         let client = client.clone();
                         async move {
-                            let bytes = client.download_range(&url, start, end).await.unwrap();
+                            let bytes =
+                                client.download_range(&url, start, end, None).await.unwrap();
                             assert_eq!(bytes.len() as u64, end - start + 1);
                         }
                     })

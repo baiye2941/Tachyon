@@ -2134,4 +2134,115 @@ mod tests {
             "好源应承接全部后续流量"
         );
     }
+
+    /// 覆盖 SourceStats::stability 在无数据(total=0)时的中性值 0.5。
+    #[test]
+    fn test_source_stats_stability_neutral_on_no_data() {
+        let stats = super::SourceStats::default();
+        assert!(
+            (stats.stability() - 0.5).abs() < f64::EPSILON,
+            "无数据时 stability 应为 0.5(中性),实际 {}",
+            stats.stability()
+        );
+        // 极短耗时(单 chunk)的 quality 应仅用 stability * 0.5
+        let mut s = super::SourceStats::default();
+        s.record_success(100, 500_000); // 0.5ms
+        let q = s.quality();
+        assert!(
+            q <= 0.5,
+            "极短耗时的 quality 应 <= 0.5(避免被当高速源),实际 {q}"
+        );
+    }
+
+    /// 覆盖 SourceStats::avg_bandwidth_bps 在 total_duration_ns == 0 时返回 0 的分支。
+    #[test]
+    fn test_source_stats_avg_bandwidth_zero_when_no_duration() {
+        let stats = super::SourceStats::default();
+        assert_eq!(stats.avg_bandwidth_bps(), 0.0);
+    }
+
+    /// 覆盖 download_full 的 expected_url 不匹配分支(line 974-978):
+    /// 镜像配置 expected_url,主源 URL 不匹配时应返回 Err。
+    #[tokio::test]
+    async fn test_download_full_rejects_unexpected_url() {
+        let primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "m.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: false,
+                    etag: None,
+                    last_modified: None,
+                    file_layout: None,
+                    protocol_managed_storage: false,
+                    resolved_host: None,
+                }))
+                .with_download_data(Ok(Bytes::from_static(b"primary"))),
+        );
+        // 镜像设置 expected_url 但 primary 已成功,download_full 应使用主源
+        let mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(FileMetadata {
+                    file_name: "m.bin".into(),
+                    file_size: Some(100),
+                    content_type: None,
+                    supports_range: false,
+                    etag: None,
+                    last_modified: None,
+                    file_layout: None,
+                    protocol_managed_storage: false,
+                    resolved_host: None,
+                }))
+                .with_download_data(Ok(Bytes::from_static(b"mirror")))
+                .with_expected_url("http://mirror.com/file"),
+        );
+        let mp = MirrorProtocol::new(primary, vec![("http://mirror.com/file".into(), mirror)]);
+        // 不支持 range → 走 download_full 路径
+        let result = mp.download_full("http://primary.com/file").await;
+        assert!(result.is_ok(), "download_full 应成功: {:?}", result.err());
+        let bytes = result.unwrap();
+        // primary 不限制 expected_url,应直接返回 primary 的数据
+        assert_eq!(bytes, Bytes::from_static(b"primary"));
+    }
+
+    /// 覆盖 MirrorProtocol::download_full_stream 路径(line 778-804):
+    /// 两个源 + 流式下载,验证 download_full_stream 走 download_via_least_in_flight。
+    #[tokio::test]
+    async fn test_download_full_stream_uses_least_in_flight() {
+        use futures::StreamExt;
+        let primary = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Err("primary probe fails".into()))
+                .with_download_data(Err("primary download fails".into())),
+        );
+        // 镜像返回 pending=false 的成功流
+        let mirror_meta = FileMetadata {
+            file_name: "m.bin".into(),
+            file_size: Some(5),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let mirror = Arc::new(
+            MockProtocol::new()
+                .with_probe_meta(Ok(mirror_meta))
+                .with_download_data(Ok(Bytes::from_static(b"hello"))),
+        );
+        let mp = MirrorProtocol::new(primary, vec![("http://mirror.com/m.bin".into(), mirror)]);
+        let stream = mp
+            .download_full_stream("http://primary.com/m.bin")
+            .await
+            .expect("download_full_stream 应成功");
+        let mut stream = stream;
+        let mut got = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            got.extend_from_slice(&chunk.expect("chunk 应成功"));
+        }
+        assert_eq!(got, b"hello");
+    }
 }

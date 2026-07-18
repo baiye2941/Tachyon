@@ -453,9 +453,28 @@ impl StorageSet {
         Self::Single(storage)
     }
 
-    /// 多文件构造
-    pub fn multi(storages: Vec<DynStorage>, layout: tachyon_core::FileLayout) -> Self {
-        Self::Multi { storages, layout }
+    /// 多文件构造(F-09:返回 `Result`,内部校验 layout)
+    ///
+    /// 校验步骤:
+    /// 1. `FileLayout::try_from_spans(spans)` → file_id 连续 / offset 紧接 / 无溢出
+    /// 2. `layout.file_count() == storages.len()` → storage 数量与 layout 一致
+    ///
+    /// 任一步失败返回 `DownloadError::Config`(带中文说明),避免后续 `storages[file_id]`
+    /// 在 metadata 损坏时 panic。
+    pub fn multi(
+        storages: Vec<DynStorage>,
+        spans: Vec<tachyon_core::FileSpan>,
+    ) -> Result<Self, DownloadError> {
+        let layout = tachyon_core::FileLayout::try_from_spans(spans)
+            .map_err(|e| DownloadError::Config(format!("多文件布局校验失败: {e:?}")))?;
+        if layout.file_count() != storages.len() {
+            return Err(DownloadError::Config(format!(
+                "storage 数量({})与 layout 文件数({})不一致",
+                storages.len(),
+                layout.file_count()
+            )));
+        }
+        Ok(Self::Multi { storages, layout })
     }
 
     /// 是否为单文件
@@ -485,6 +504,11 @@ impl StorageSet {
                     byte_cursor += seg_len;
                     let mut local_pos = local_start;
                     while !remaining.is_empty() {
+                        debug_assert!(
+                            file_id < storages.len(),
+                            "file_id {file_id} 越界 storages.len()={}",
+                            storages.len()
+                        );
                         let written = storages[file_id]
                             .write_at(local_pos, remaining.clone())
                             .await?;
@@ -534,6 +558,11 @@ impl StorageSet {
                     let mut local_pos = local_start;
                     // 段内短写重试:slice 引用计数,不复制
                     while !remaining_chunk.is_empty() {
+                        debug_assert!(
+                            file_id < storages.len(),
+                            "file_id {file_id} 越界 storages.len()={}",
+                            storages.len()
+                        );
                         let written = storages[file_id]
                             .write_at(local_pos, remaining_chunk.clone())
                             .await?;
@@ -573,6 +602,11 @@ impl StorageSet {
             Self::Multi { storages, layout } => {
                 // size 是全局总长;各文件长度由 layout 决定,按 (file_id, len) 分配
                 for (file_id, len) in layout_split_iter(layout) {
+                    debug_assert!(
+                        file_id < storages.len(),
+                        "file_id {file_id} 越界 storages.len()={}",
+                        storages.len()
+                    );
                     storages[file_id].allocate(len).await?;
                 }
                 let _ = size; // 总长仅作校验用,实际按各文件长度分配
@@ -639,6 +673,11 @@ async fn read_multi(
     let mut total_read = 0usize;
     for (file_id, local_start, local_end) in segments {
         let seg_len = (local_end - local_start + 1) as usize;
+        debug_assert!(
+            file_id < storages.len(),
+            "file_id {file_id} 越界 storages.len()={}",
+            storages.len()
+        );
         let read = storages[file_id]
             .read_at(local_start, &mut buf[total_read..total_read + seg_len])
             .await?;
@@ -996,8 +1035,9 @@ mod tests {
         let (later, later_calls) = RecordingStorage::new();
         let storage = StorageSet::multi(
             vec![DynStorage::new(broken), DynStorage::new(later)],
-            two_single_byte_file_layout(),
-        );
+            two_single_byte_file_layout().file_spans().to_vec(),
+        )
+        .expect("合法双文件布局应构造成功");
 
         let error = storage
             .write_at(0, Bytes::from_static(b"ab"))
@@ -1021,8 +1061,9 @@ mod tests {
         let (later, later_calls) = RecordingStorage::new();
         let storage = StorageSet::multi(
             vec![DynStorage::new(broken), DynStorage::new(later)],
-            two_single_byte_file_layout(),
-        );
+            two_single_byte_file_layout().file_spans().to_vec(),
+        )
+        .expect("合法双文件布局应构造成功");
         let mut data = BytesMut::from(&b"ab"[..]);
 
         let error = storage
@@ -1058,7 +1099,7 @@ mod tests {
                 name: "b".into(),
             },
         ]);
-        StorageSet::multi(storages, layout)
+        StorageSet::multi(storages, layout.file_spans().to_vec()).expect("合法双文件布局应构造成功")
     }
 
     #[tokio::test]
@@ -1149,8 +1190,7 @@ mod tests {
                 name: format!("f{file_id}"),
             })
             .collect();
-        let layout = tachyon_core::FileLayout::from_spans(spans);
-        StorageSet::multi(storages, layout)
+        StorageSet::multi(storages, spans).expect("合法多文件布局应构造成功")
     }
 
     #[tokio::test]
@@ -1421,5 +1461,140 @@ mod tests {
         );
         // 边界:file_size = 0 → margin = 0
         assert_eq!(disk_space_margin(0), 0, "0 字节文件的 margin 应为 0");
+    }
+
+    // ===== F-09: StorageSet::Multi 越界防护(RED) =====
+    //
+    // 审计 F-09 指出 storage_adapter.rs 四处 storages[file_id] 裸索引
+    // 在 metadata 损坏时 panic。期望:
+    //   1. 构造时用 try_from_spans 校验 layout,file_id 与 storage 数量错配
+    //      返回 DownloadError 而非 panic(见 rejects_invalid_layout_at_construction)
+    //   2. 热路径保留 debug_assert!(file_id < storages.len()) 兜底
+    //      (见 debug_asserts_file_id_bounds)
+
+    /// 合法 Multi 在 write_at 正常 file_id 下不 panic;越界 file_id 在 debug
+    /// 构建下应触发 debug_assert(用 catch_unwind 捕获)。
+    ///
+    /// 构造合法 layout(file0 [0,1), file1 [1,2)),各 1 字节 storage;
+    /// 再用畸形 layout(file_id=5,storage 只有 2 个)通过 from_spans 绕过校验
+    /// 后调 write_at,期望 debug_assert 触发 panic。release 构建无 debug_assert,
+    /// 测试自动忽略(避免误绿)。
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_storage_set_multi_debug_asserts_file_id_bounds() {
+        use std::panic;
+
+        // 合法 layout:file0 [0,1), file1 [1,2)
+        let good_spans = vec![
+            tachyon_core::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1,
+                name: "a".into(),
+            },
+            tachyon_core::FileSpan {
+                file_id: 1,
+                global_offset: 1,
+                len: 1,
+                name: "b".into(),
+            },
+        ];
+        let storage = StorageSet::multi(
+            vec![
+                DynStorage::memory_with_capacity(1),
+                DynStorage::memory_with_capacity(1),
+            ],
+            good_spans,
+        )
+        .expect("合法双文件布局应构造成功");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            storage.allocate(2).await.unwrap();
+            let _ = storage
+                .write_at(0, Bytes::from_static(b"ab"))
+                .await
+                .unwrap();
+        });
+
+        // 畸形 layout:file_id=5 越界(>storages.len()=2)。
+        // from_spans 仅排序不校验,绕过构造期校验;write_at 跨边界触发
+        // storages[5] 裸索引,debug_assert 实装后应在索引前触发更清晰的 panic。
+        let bad_spans = vec![
+            tachyon_core::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1,
+                name: "a".into(),
+            },
+            tachyon_core::FileSpan {
+                file_id: 5,
+                global_offset: 1,
+                len: 1,
+                name: "x".into(),
+            },
+        ];
+        // 通过 from_spans + 直接构造 StorageSet::Multi 绕过 multi 校验,
+        // 模拟 metadata 损坏已渗入热路径的场景。
+        let bad_layout = tachyon_core::FileLayout::from_spans(bad_spans);
+        let bad_storage = StorageSet::Multi {
+            storages: vec![
+                DynStorage::memory_with_capacity(1),
+                DynStorage::memory_with_capacity(1),
+            ],
+            layout: bad_layout,
+        };
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let _ = bad_storage.write_at(0, Bytes::from_static(b"ab")).await;
+            });
+        }));
+        assert!(
+            result.is_err(),
+            "越界 file_id 在 debug 构建下应触发 debug_assert panic"
+        );
+    }
+
+    /// 畸形 layout(file_id 缺号)构造 StorageSet::multi 应返回 Err 而非 panic。
+    ///
+    /// 实现契约:StorageSet::multi 返回 Result,内部调
+    /// FileLayout::try_from_spans 校验,再校验 storage 数量匹配。
+    #[test]
+    fn test_storage_set_multi_rejects_invalid_layout_at_construction() {
+        use tachyon_core::{FileLayout, FileSpan, LayoutError};
+
+        // 畸形:file_id=0,2(缺 1),offset 连续但 file_id 不连续
+        let bad_spans = vec![
+            FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 100,
+                name: "a".into(),
+            },
+            FileSpan {
+                file_id: 2,
+                global_offset: 100,
+                len: 100,
+                name: "c".into(),
+            },
+        ];
+        // 先确认 layout 本身被 try_from_spans 拒绝(红线:FileIdGap)
+        let layout_err = FileLayout::try_from_spans(bad_spans.clone())
+            .expect_err("畸形 spans 必须被 try_from_spans 拒绝");
+        assert!(
+            matches!(layout_err, LayoutError::FileIdGap),
+            "缺号 file_id 应返回 FileIdGap,实际: {layout_err:?}"
+        );
+
+        // StorageSet::multi 接收畸形 spans 也应返回 Err 而非 panic
+        let storages = vec![
+            DynStorage::memory_with_capacity(100),
+            DynStorage::memory_with_capacity(100),
+        ];
+        let result = StorageSet::multi(storages, bad_spans);
+        assert!(
+            result.is_err(),
+            "畸形 layout 构造 StorageSet 必须返回 Err 而非 panic"
+        );
     }
 }

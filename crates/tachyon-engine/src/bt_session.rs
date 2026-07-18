@@ -169,6 +169,16 @@ impl BtSession {
             );
         }
 
+        // BT-15:enable_upnp=true 时自动设 listen_port_range(默认 6881..6889),
+        // 否则 librqbit 不创建 TCP listener,UPnP 静默不启动,无入站 peer。
+        // high_privacy=true 时 enable_upnp=false,不触发自动设端口。
+        if enable_upnp && opts.listen_port_range.is_none() {
+            opts.listen_port_range = Some(6881..6889);
+            tracing::info!(
+                "enable_upnp=true 自动启用 BT listen_port_range=6881..6889(入站 peer + UPnP)"
+            );
+        }
+
         // tracker 注入:high_privacy 完全跳过(不注入公共/全局 tracker)
         // SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
         if high_privacy {
@@ -633,6 +643,17 @@ mod tests {
         let config = test_config();
         let session = BtSession::new(dir.path().to_path_buf(), config).await;
         assert!(session.is_ok(), "BtSession 应创建成功: {:?}", session.err());
+        // 覆盖 getter:session / config / download_dir / handle_cache / ops_gate /
+        // proxy_coverage_status / socks_source / effective_socks_redacted
+        let session = session.unwrap();
+        let _session_arc = session.session();
+        let _config_ref = session.config();
+        let _download_dir = session.download_dir();
+        let _handle_cache = session.handle_cache();
+        let _ops_gate = session.ops_gate();
+        let _proxy_report = session.proxy_coverage_status();
+        let _socks_source = session.socks_source();
+        let _effective_redacted = session.effective_socks_redacted();
     }
 
     #[test]
@@ -782,5 +803,51 @@ mod tests {
         assert!(ep.contains("127.0.0.1:1080"), "ep={ep}");
         assert!(!ep.contains("user"), "脱敏后不得含用户名: {ep}");
         assert!(!ep.contains("pass"), "脱敏后不得含密码: {ep}");
+    }
+
+    /// BT-15:enable_upnp=true 时 MUST 自动设 listen_port_range(默认 6881..6889),
+    /// 否则 librqbit 不创建 TCP listener,UPnP 静默不启动,无入站 peer。
+    #[test]
+    fn test_build_session_options_sets_listen_port_when_upnp_enabled() {
+        let mut config = MagnetConfig::default();
+        config.enable_upnp = true;
+        let (opts, _eff, _src) = BtSession::build_session_options(&config);
+        assert!(
+            opts.listen_port_range.is_some(),
+            "enable_upnp=true 时 MUST 设 listen_port_range"
+        );
+        let range = opts.listen_port_range.unwrap();
+        assert_eq!(range.start, 6881, "默认 BT listen 端口起始 6881");
+        assert_eq!(range.end, 6889, "默认 BT listen 端口结束 6889");
+    }
+
+    /// BT-15:enable_upnp=false(默认)时 MUST 不设 listen_port_range(不主动开 listener)。
+    #[test]
+    fn test_build_session_options_no_listen_port_when_upnp_disabled() {
+        let config = MagnetConfig::default();
+        // 默认 enable_upnp=false
+        assert!(!config.enable_upnp);
+        let (opts, _eff, _src) = BtSession::build_session_options(&config);
+        assert!(
+            opts.listen_port_range.is_none(),
+            "enable_upnp=false 时 MUST 不设 listen_port_range"
+        );
+    }
+
+    /// BT-15:high_privacy=true 优先,即使 enable_upnp=true 也不设 listen_port_range。
+    #[test]
+    fn test_build_session_options_high_privacy_overrides_upnp() {
+        let mut config = MagnetConfig::default();
+        config.high_privacy = true;
+        config.enable_upnp = true;
+        let (opts, _eff, _src) = BtSession::build_session_options(&config);
+        assert!(
+            opts.listen_port_range.is_none(),
+            "high_privacy=true 优先,不设 listen_port_range"
+        );
+        assert!(
+            !opts.enable_upnp_port_forwarding,
+            "high_privacy=true 同时禁用 UPnP forwarding"
+        );
     }
 }

@@ -280,4 +280,91 @@ mod tests {
         assert!(b.has_auth_bearer());
         assert!(!a.has_auth_bearer());
     }
+
+    /// 空 UA 应回退到全局默认 USER_AGENT,避免下游用空 UA 请求。
+    /// 覆盖 from_parts 的 `user_agent.is_empty()` 分支。
+    #[test]
+    fn test_registry_empty_ua_falls_back_to_default_user_agent() {
+        let reg = HttpClientRegistry::new();
+        let headers = HashMap::new();
+        let a = reg
+            .get_or_create("", None, 5, 10, None, &headers, None)
+            .unwrap();
+        // 再次用空 UA,应复用同一 client(身份键用默认 UA)
+        let b = reg
+            .get_or_create("", None, 5, 10, None, &headers, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "空 UA 应映射到默认 UA,复用 client");
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// conn=Some 时走 with_connection_config_and_headers 路径。
+    /// 覆盖 from_parts 的 conn=Some 分支 + get_or_create 的 conn=Some 构建分支。
+    #[test]
+    fn test_registry_with_connection_config_builds_client() {
+        use tachyon_core::config::ConnectionConfig;
+        let reg = HttpClientRegistry::new();
+        let headers = HashMap::new();
+        let conn = ConnectionConfig {
+            enable_http2: true,
+            enable_quic: false,
+            max_connections_per_host: 8,
+            max_global_connections: 256,
+            keep_alive_timeout_secs: 90,
+            connect_timeout_secs: 10,
+        };
+        let a = reg
+            .get_or_create("UA-Conn", None, 5, 10, Some(&conn), &headers, None)
+            .unwrap();
+        // 相同 conn 应复用
+        let b = reg
+            .get_or_create("UA-Conn", None, 5, 10, Some(&conn), &headers, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "同 conn 身份应复用 client");
+        // 不同 conn 参数(pool_max_idle_per_host 不同)应分离
+        let conn2 = ConnectionConfig {
+            enable_http2: true,
+            enable_quic: false,
+            max_connections_per_host: 16,
+            max_global_connections: 256,
+            keep_alive_timeout_secs: 90,
+            connect_timeout_secs: 10,
+        };
+        let c = reg
+            .get_or_create("UA-Conn", None, 5, 10, Some(&conn2), &headers, None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &c), "pool_max_idle_per_host 不同应分离");
+    }
+
+    /// headers 不同应分离(覆盖 headers 排序 + hash 路径)。
+    #[test]
+    fn test_registry_separates_different_headers() {
+        let reg = HttpClientRegistry::new();
+        let mut h1 = HashMap::new();
+        h1.insert("X-Custom".to_string(), "v1".to_string());
+        let mut h2 = HashMap::new();
+        h2.insert("X-Custom".to_string(), "v2".to_string());
+        let a = reg
+            .get_or_create("UA", None, 5, 10, None, &h1, None)
+            .unwrap();
+        let b = reg
+            .get_or_create("UA", None, 5, 10, None, &h2, None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "headers 不同应分离 client");
+    }
+
+    /// is_empty 应在空注册表返回 true,有条目后返回 false。
+    /// 覆盖 is_empty 分支。
+    #[test]
+    fn test_registry_is_empty_and_len() {
+        let reg = HttpClientRegistry::new();
+        assert!(reg.is_empty(), "新注册表应 is_empty");
+        assert_eq!(reg.len(), 0);
+        let headers = HashMap::new();
+        let _ = reg
+            .get_or_create("UA", None, 5, 10, None, &headers, None)
+            .unwrap();
+        assert!(!reg.is_empty(), "有条目后应非空");
+        assert_eq!(reg.len(), 1);
+    }
 }
