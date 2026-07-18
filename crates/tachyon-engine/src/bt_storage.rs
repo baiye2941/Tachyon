@@ -287,37 +287,15 @@ impl TachyonStorageFactory {
             .as_deref()
             .or(metadata.name.as_deref())
             .unwrap_or("unknown_torrent");
-
-        let multi_file = file_infos.len() > 1;
-        let mut storages = Vec::with_capacity(file_infos.len());
-        if multi_file {
-            // 多文件:用 validate_multi_save_paths 确保路径与 init_storage 完全一致
-            let file_names: Vec<String> = file_infos
-                .iter()
-                .map(|fi| fi.relative_filename.to_string_lossy().into_owned())
-                .collect();
-            let paths = tachyon_core::validate_multi_save_paths(
-                &self.download_dir,
-                torrent_name,
-                &file_names,
-            )
-            .map_err(|e| anyhow::anyhow!("多文件路径校验失败: {e}"))?;
-            for path in &paths {
-                // 多文件 factory 在 librqbit async 上下文同步 create;禁止嵌套 Handle::block_on。
-                let (file, backend) = self.open_storage_for_path(path)?;
-                #[cfg(test)]
-                {
-                    *self.last_open_backend.lock() = Some(backend);
-                }
-                let _ = backend;
-                storages.push(file);
-            }
-        } else {
-            // 单文件:download_dir/<name>,与 init_storage 的单文件路径一致
-            let final_path = self.download_dir.join(torrent_name);
-            let canonical_path = tachyon_core::validate_save_path(&final_path, &self.download_dir)
-                .map_err(|e| anyhow::anyhow!("单文件路径校验失败: {e}"))?;
-            let (file, backend) = self.open_storage_for_path(&canonical_path)?;
+        let file_names: Vec<String> = file_infos
+            .iter()
+            .map(|fi| fi.relative_filename.to_string_lossy().into_owned())
+            .collect();
+        let paths = Self::compute_storage_paths(&self.download_dir, torrent_name, &file_names)?;
+        let mut storages = Vec::with_capacity(paths.len());
+        for path in &paths {
+            // 多文件 factory 在 librqbit async 上下文同步 create;禁止嵌套 Handle::block_on。
+            let (file, backend) = self.open_storage_for_path(path)?;
             #[cfg(test)]
             {
                 *self.last_open_backend.lock() = Some(backend);
@@ -326,6 +304,33 @@ impl TachyonStorageFactory {
             storages.push(file);
         }
         Ok(storages)
+    }
+
+    /// 计算每个文件对应的最终存储路径(单/多文件统一入口)。
+    ///
+    /// 抽出为独立静态方法便于单元测试覆盖单/多文件路径计算逻辑
+    /// (避免依赖 librqbit `TorrentMetadata`/`ManagedTorrentShared` 的复杂构造)。
+    ///
+    /// - 单文件(file_names 长度 ≤ 1): `download_dir/<sanitize(torrent_name)>`
+    /// - 多文件: `download_dir/<sanitize(torrent_name)>/<sanitize(relative_filename)>` 逐项
+    pub(crate) fn compute_storage_paths(
+        download_dir: &Path,
+        torrent_name: &str,
+        file_names: &[String],
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let multi_file = file_names.len() > 1;
+        if multi_file {
+            let paths =
+                tachyon_core::validate_multi_save_paths(download_dir, torrent_name, file_names)
+                    .map_err(|e| anyhow::anyhow!("多文件路径校验失败: {e}"))?;
+            Ok(paths)
+        } else {
+            // 单文件:download_dir/<name>,与 init_storage 的单文件路径一致
+            let final_path = download_dir.join(torrent_name);
+            let canonical_path = tachyon_core::validate_save_path(&final_path, download_dir)
+                .map_err(|e| anyhow::anyhow!("单文件路径校验失败: {e}"))?;
+            Ok(vec![canonical_path])
+        }
     }
 
     /// 审计 BT-19:按 io_strategy 同步打开 AsyncStorage。
@@ -919,10 +924,16 @@ mod tests {
             ),
             "多文件打开路径应保留禁止嵌套 block_on 的契约注释"
         );
+        // 找函数体边界:从 `fn open_storages_from_metadata` 到下一个顶层 `    fn `(4 空格缩进)
+        // 的前一个字符。避免硬编码字节长度(函数体长度随重构变化)。
         let start = src
             .find("fn open_storages_from_metadata")
             .expect("open_storages_from_metadata");
-        let body = &src[start..start + 3500];
+        let next_fn = src[start + 10..]
+            .find("\n    fn ")
+            .map(|p| start + 10 + p)
+            .unwrap_or(src.len());
+        let body = &src[start..next_fn];
         assert!(
             !body.contains("block_on(tachyon_io::TokioFile::open"),
             "open_storages_from_metadata 不得嵌套 block_on 打开 TokioFile 异步路径"
@@ -1346,6 +1357,166 @@ mod tests {
         assert_eq!(
             backend, "Iocp",
             "Windows 上 Iocp 策略应打开 Iocp 后端(非回退)"
+        );
+    }
+
+    /// 覆盖 `compute_storage_paths` 单文件路径:
+    /// 单文件应返回 `download_dir/<torrent_name>` 且经过 canonicalize。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_compute_storage_paths_single_file_canonicalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        // 先创建文件使 canonicalize 可解析父目录(validate_save_path 要求父目录存在)
+        let file_path = dir.path().join("movie.mp4");
+        std::fs::write(&file_path, b"").unwrap();
+        let paths = TachyonStorageFactory::compute_storage_paths(
+            dir.path(),
+            "movie.mp4",
+            &["movie.mp4".to_string()],
+        )
+        .expect("单文件路径计算应成功");
+        assert_eq!(paths.len(), 1, "单文件应返回 1 条路径");
+        // validate_save_path 返回 canonical_parent.join(file_name),在不同平台上可能带 UNC 前缀,
+        // 故仅断言文件名与父目录而非完整 canonical 路径。
+        assert_eq!(
+            paths[0].file_name().and_then(|s| s.to_str()),
+            Some("movie.mp4"),
+            "单文件路径应保留文件名 movie.mp4: {}",
+            paths[0].display()
+        );
+        // 父目录应 canonicalize 解析为 download_dir(canonicalize 后)
+        let parent = paths[0].parent().expect("路径应有父目录");
+        let parent_canon = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        let dir_canon = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        assert_eq!(
+            parent_canon,
+            dir_canon,
+            "单文件路径父目录应 canonicalize 为 download_dir: {}",
+            paths[0].display()
+        );
+    }
+
+    /// 覆盖 `compute_storage_paths` 多文件路径:
+    /// 多文件应按 `download_dir/<root>/<relative>` 模式逐项返回,与 init_storage 对齐。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_compute_storage_paths_multi_file_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        // 多文件根目录 <root> 需存在(validate_multi_save_paths 检查父目录)
+        let root = dir.path().join("my_torrent");
+        std::fs::create_dir_all(&root).unwrap();
+        let file_names = vec![
+            "subdir/a.bin".to_string(),
+            "subdir/b.bin".to_string(),
+            "c.bin".to_string(),
+        ];
+        let paths =
+            TachyonStorageFactory::compute_storage_paths(dir.path(), "my_torrent", &file_names)
+                .expect("多文件路径计算应成功");
+        assert_eq!(paths.len(), 3, "多文件应按文件数返回路径");
+        // 文件名保留(validate_save_path 不改写文件名)
+        assert_eq!(
+            paths[0].file_name().and_then(|s| s.to_str()),
+            Some("a.bin"),
+            "路径[0] 应保留文件名 a.bin: {}",
+            paths[0].display()
+        );
+        assert_eq!(
+            paths[1].file_name().and_then(|s| s.to_str()),
+            Some("b.bin"),
+            "路径[1] 应保留文件名 b.bin: {}",
+            paths[1].display()
+        );
+        assert_eq!(
+            paths[2].file_name().and_then(|s| s.to_str()),
+            Some("c.bin"),
+            "路径[2] 应保留文件名 c.bin: {}",
+            paths[2].display()
+        );
+        // 父目录都在 <root>/subdir 或 <root> 下(避免 UNC 前缀差异,用 ends_with)
+        assert!(
+            paths[0]
+                .parent()
+                .map(|p| p.ends_with("subdir"))
+                .unwrap_or(false),
+            "路径[0] 父目录应以 subdir 结尾: {}",
+            paths[0].display()
+        );
+        assert!(
+            paths[2]
+                .parent()
+                .map(|p| p.ends_with("my_torrent"))
+                .unwrap_or(false),
+            "路径[2] 父目录应以 my_torrent 结尾: {}",
+            paths[2].display()
+        );
+    }
+
+    /// 覆盖 `compute_storage_paths` 多文件路径校验失败:
+    /// 含 `..` 的 relative_filename 应被 validate_multi_save_paths 拒绝。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_compute_storage_paths_multi_file_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_names = vec!["a.bin".to_string(), "../escape.bin".to_string()];
+        let err = TachyonStorageFactory::compute_storage_paths(dir.path(), "root", &file_names)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("多文件路径校验失败"),
+            "路径穿越应返回多文件路径校验失败错误: {err}"
+        );
+    }
+
+    /// 覆盖 `compute_storage_paths` 单文件路径校验失败:
+    /// 空文件名不应产生有效 canonical 路径。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_compute_storage_paths_single_file_empty_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // 空名 → join 得到 download_dir 本身,validate_save_path 对目录应失败
+        let err =
+            TachyonStorageFactory::compute_storage_paths(dir.path(), "", &["ignored".to_string()])
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("单文件路径校验失败"),
+            "空 torrent_name 应返回单文件路径校验失败: {err}"
+        );
+    }
+
+    /// 覆盖 `open_storage_for_path` 的非本平台回退分支:
+    /// 在非 Windows 上 WinAligned 应回退 Standard(已存在的
+    /// test_bt19_cross_platform_strategy_falls_back_to_standard 覆盖 IoUring/Iocp 跨平台,
+    /// 此处补 WinAligned 在非 Windows 的回退分支)。
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt19_winaligned_falls_back_to_standard_on_non_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let factory =
+            TachyonStorageFactory::new(handle, IoStrategy::WinAligned, dir.path().to_path_buf());
+        let path = dir.path().join("fallback_winaligned.bin");
+        let (_storage, backend) = factory.open_storage_for_path(&path).unwrap();
+        assert_eq!(
+            backend, "Standard",
+            "WinAligned 在非 Windows 平台必须回退 Standard,backend={backend}"
+        );
+    }
+
+    /// 覆盖 `open_storage_for_path` 的 IoUring 在非 Linux 回退分支:
+    /// 在 Windows 上 IoUring 应回退 Standard。
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt19_iouring_falls_back_to_standard_on_non_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let factory =
+            TachyonStorageFactory::new(handle, IoStrategy::IoUring, dir.path().to_path_buf());
+        let path = dir.path().join("fallback_iouring.bin");
+        let (_storage, backend) = factory.open_storage_for_path(&path).unwrap();
+        assert_eq!(
+            backend, "Standard",
+            "IoUring 在非 Linux 平台必须回退 Standard,backend={backend}"
         );
     }
 }
