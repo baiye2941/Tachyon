@@ -2002,6 +2002,10 @@ impl DownloadTask {
                             if (new_target > old || rec.confidence > 0.5) && new_target != old {
                                 concurrency_ctrl.set_target(new_target);
                             }
+                            // 快片完成后立刻 rebalance 慢片,不必等 reschedule_timer
+                            if let Some(tx) = frag_tx.as_ref() {
+                                let _ = self.try_rebalance_slowest_fragment(tx).await;
+                            }
                         }
                         Err((failed_index, e)) => {
                             // H2: 捕获 RangeNotSupported(协议层对 GET Range 返回 200
@@ -2140,6 +2144,14 @@ impl DownloadTask {
                 .saturating_add(1)
                 .saturating_sub(frag.info.start + rt);
             if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
+                continue;
+            }
+            // 新 spawn 的片至少跑 1s 再评估,避免刚启动就被拆
+            let age_ok = frag
+                .start_time
+                .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+                .unwrap_or(false);
+            if !age_ok {
                 continue;
             }
             let progress = rt as f64 / size as f64;
@@ -11190,6 +11202,8 @@ mod tests {
             r.start_download().unwrap();
             // 仅下载 10%,剩余很大
             r.realtime_downloaded.store(size / 10, Ordering::Release);
+            // 回拨 start_time 以越过 rebalance 1s 年龄门槛
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
             r
         };
         let protocol = Arc::new(MockProto::new(test_metadata("rebalance.bin", size)));
@@ -11253,5 +11267,40 @@ mod tests {
         assert!(!did);
         assert!(rx.try_recv().is_err());
         assert_eq!(task.fragments.len(), 1);
+    }
+
+    /// rebalance 开启后多分片下载仍正确完成(不回归)
+    #[tokio::test]
+    async fn test_rebalance_path_multi_fragment_completes() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let frag_size = MIN_SPLIT_SIZE * 4;
+        let total = frag_size * 4;
+        let data = bytes::Bytes::from(vec![0xABu8; total as usize]);
+        let protocol =
+            Arc::new(MockProto::new(test_metadata("rebal-e2e.bin", total)).with_default_data(data));
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/rebal-e2e.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 2,
+            ..Default::default()
+        };
+        task.run().await.expect("rebalance 路径下载应完成");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!(
+            task.fragments.iter().all(|f| f.is_done()),
+            "所有分片应 Done"
+        );
     }
 }

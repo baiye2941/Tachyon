@@ -282,10 +282,24 @@ pub mod harness {
         ) -> Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>> {
             let this = self.clone();
             Box::pin(async move {
-                let data = this.range_data.lock().unwrap();
-                data.get(&(start, end))
-                    .cloned()
-                    .ok_or_else(|| DownloadError::Network(format!("未找到范围数据: {start}-{end}")))
+                // 精确命中 range_data;否则从 default_data 切片(支持 rebalance 动态 split)
+                {
+                    let data = this.range_data.lock().unwrap();
+                    if let Some(bytes) = data.get(&(start, end)) {
+                        return Ok(bytes.clone());
+                    }
+                }
+                if let Some(ref full) = this.default_data {
+                    let len = full.len() as u64;
+                    if end < len && start <= end {
+                        let s = start as usize;
+                        let e = (end as usize).min(full.len().saturating_sub(1));
+                        return Ok(full.slice(s..=e));
+                    }
+                }
+                Err(DownloadError::Network(format!(
+                    "未找到范围数据: {start}-{end}"
+                )))
             })
         }
 
