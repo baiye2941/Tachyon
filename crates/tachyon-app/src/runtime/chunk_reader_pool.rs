@@ -31,7 +31,7 @@ pub struct FragmentByteEntry {
 }
 
 /// 进度变化回调:参数为 (task_id, delta, fragment_bytes),
-/// fragment_bytes 为当前所有活跃分片(downloading_set 中)的字节快照切片。
+/// fragment_bytes 为已产生字节进度的活跃分片快照切片(刚 Started 尚无 Chunk 事件的分片不在其中)。
 pub type ProgressCallback =
     Arc<dyn Fn(&str, Option<ProgressDelta>, &[FragmentByteEntry]) + Send + Sync>;
 
