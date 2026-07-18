@@ -811,6 +811,7 @@ mod tests {
                     io_strategy: IoStrategy::default(),
                     proxy: None,
                     enable_work_stealing: false,
+                    crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::default(),
                 },
                 connection: tachyon_core::config::ConnectionConfig {
                     max_connections_per_host,
@@ -852,6 +853,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host,
@@ -893,6 +895,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             ..Default::default()
         };
@@ -917,6 +920,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             ..Default::default()
         };
@@ -950,6 +954,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             ..Default::default()
         };
@@ -1025,6 +1030,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),
@@ -1074,6 +1080,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             ..Default::default()
         };
@@ -1098,6 +1105,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             ..Default::default()
         };
@@ -1133,6 +1141,7 @@ mod tests {
                 io_strategy: None,
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             connection: None,
             magnet: None,
@@ -1304,6 +1313,7 @@ mod tests {
                 io_strategy: IoStrategy::default(),
                 proxy: None,
                 enable_work_stealing: false,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::default(),
             },
             connection: tachyon_core::config::ConnectionConfig {
                 max_connections_per_host: 4,
@@ -1483,6 +1493,7 @@ mod tests {
                 io_strategy: Some(IoStrategy::WinAligned),
                 proxy: None,
                 enable_work_stealing: None,
+                crash_consistency_mode: None,
             }),
             connection: Some(ConnectionPatch {
                 max_connections_per_host: Some(8),

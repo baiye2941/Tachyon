@@ -688,6 +688,7 @@ pub mod harness {
             io_strategy: IoStrategy::Standard,
             proxy: None,
             enable_work_stealing: false,
+            crash_consistency_mode: crate::config::CrashConsistencyMode::default(),
         }
     }
 

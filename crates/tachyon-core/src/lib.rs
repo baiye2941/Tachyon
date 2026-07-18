@@ -64,6 +64,7 @@ fn app_config() {
         io_strategy: config::IoStrategy::default(),
         proxy: None,
         enable_work_stealing: false,
+        crash_consistency_mode: config::CrashConsistencyMode::default(),
     };
     assert_eq!(cfg.download_dir, "/tmp/test");
     assert_eq!(cfg.max_concurrent_fragments, 8);

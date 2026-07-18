@@ -180,6 +180,23 @@ pub enum VerifyStrategy {
     Skip,
 }
 
+/// 崩溃一致性级别:控制下载过程中 fsync 的频率,平衡耐久性与吞吐。
+///
+/// - `EveryFragment`(默认):每个分片完成时 fsync 数据+父目录,断电后 resume 跳过已 sync 分片。
+///   适合 HDD/SSD 通用场景。HDD 上对 100MB/s 下载吞吐影响 < 5%(每分片 ~5-10ms fsync)。
+/// - `Loose`:仅在 close() 时 fsync 数据+目录,不在分片边界 fsync。崩溃可能丢失所有
+///   未 close 的分片重传。适合临时文件/缓存场景,或 NVMe+UPS 用户追求极致吞吐。
+///
+/// 设计:`Batch` 模式因多任务并发分片需要共享计数器(锁开销可能抵消 fsync 节省),
+/// 暂未实现。如需 Batch 语义,默认 `EveryFragment` + 大分片(8-16MB)已能控制 fsync 频率。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CrashConsistencyMode {
+    #[default]
+    EveryFragment,
+    Loose,
+}
+
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "DownloadConfigSerde")]
@@ -240,6 +257,11 @@ pub struct DownloadConfig {
     #[deprecated(note = "work-stealing 已硬关删除,true 被静默忽略,后续阶段恢复前勿依赖此字段")]
     #[serde(default)]
     pub enable_work_stealing: bool,
+    /// 崩溃一致性级别:控制分片完成时 fsync 频率,平衡耐久性与吞吐。
+    /// 默认 `EveryFragment`(每分片完成 fsync 一次,断电后 resume 跳过已 sync 分片)。
+    /// HDD 用户若追求吞吐可改 `Batch` 或 `Loose`(牺牲断电耐久性换 fsync 次数)。
+    #[serde(default)]
+    pub crash_consistency_mode: CrashConsistencyMode,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +291,8 @@ struct DownloadConfigSerde {
     proxy: Option<String>,
     #[serde(default)]
     enable_work_stealing: bool,
+    #[serde(default)]
+    crash_consistency_mode: CrashConsistencyMode,
 }
 
 fn default_pause_timeout_secs() -> u64 {
@@ -309,6 +333,7 @@ impl From<DownloadConfigSerde> for DownloadConfig {
             io_strategy: value.io_strategy,
             proxy: value.proxy,
             enable_work_stealing: value.enable_work_stealing,
+            crash_consistency_mode: value.crash_consistency_mode,
         }
     }
 }
@@ -343,6 +368,7 @@ impl Default for DownloadConfig {
             io_strategy: IoStrategy::default(),
             proxy: None,
             enable_work_stealing: false,
+            crash_consistency_mode: CrashConsistencyMode::default(),
         }
     }
 }
@@ -1258,6 +1284,8 @@ pub struct DownloadPatch {
     /// Phase0 运行时 hard-disable:`Some(true)` 仅写入 requested 状态,DownloadTask
     /// 不会动态 split。字段保留用于配置/备份兼容与后续阶段恢复。
     pub enable_work_stealing: Option<bool>,
+    /// 崩溃一致性级别补丁(可选)。
+    pub crash_consistency_mode: Option<CrashConsistencyMode>,
 }
 
 /// 连接配置白名单补丁
@@ -1472,6 +1500,9 @@ impl DownloadPatch {
         if let Some(v) = self.enable_work_stealing {
             base.enable_work_stealing = v;
         }
+        if let Some(v) = self.crash_consistency_mode {
+            base.crash_consistency_mode = v;
+        }
     }
 }
 
@@ -1618,6 +1649,64 @@ mod tests {
         assert!(
             dir.contains("Downloads") || dir.contains("tachyon-downloads"),
             "unexpected download_dir: {dir}"
+        );
+        // crash_consistency_mode 默认 EveryFragment
+        assert_eq!(
+            config.download.crash_consistency_mode,
+            CrashConsistencyMode::EveryFragment,
+            "默认崩溃一致性级别应为 EveryFragment"
+        );
+    }
+
+    #[test]
+    fn test_crash_consistency_mode_serde_roundtrip() {
+        // EveryFragment 默认
+        let json = serde_json::to_string(&CrashConsistencyMode::EveryFragment).unwrap();
+        assert_eq!(json, "\"everyFragment\"");
+        let m: CrashConsistencyMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, CrashConsistencyMode::EveryFragment);
+
+        // Loose
+        let json = serde_json::to_string(&CrashConsistencyMode::Loose).unwrap();
+        assert_eq!(json, "\"loose\"");
+        let m: CrashConsistencyMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, CrashConsistencyMode::Loose);
+    }
+
+    #[test]
+    fn test_download_config_crash_consistency_serde_roundtrip() {
+        let mut cfg = DownloadConfig::default();
+        cfg.crash_consistency_mode = CrashConsistencyMode::Loose;
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains("\"crashConsistencyMode\":\"loose\""),
+            "JSON 应含 crashConsistencyMode:loose, json={json}"
+        );
+        let restored: DownloadConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.crash_consistency_mode,
+            CrashConsistencyMode::Loose,
+            "序列化往返后 crash_consistency_mode 应保持 Loose"
+        );
+    }
+
+    #[test]
+    fn test_download_patch_crash_consistency_applies() {
+        let mut base = DownloadConfig::default();
+        assert_eq!(
+            base.crash_consistency_mode,
+            CrashConsistencyMode::EveryFragment,
+            "默认应为 EveryFragment"
+        );
+        let patch = DownloadPatch {
+            crash_consistency_mode: Some(CrashConsistencyMode::Loose),
+            ..Default::default()
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(
+            base.crash_consistency_mode,
+            CrashConsistencyMode::Loose,
+            "patch 应将 crash_consistency_mode 改为 Loose"
         );
     }
 
@@ -3688,6 +3777,7 @@ mod tests {
             io_strategy: None,
             proxy: Some(Some("http://127.0.0.1:7890".into())),
             enable_work_stealing: None,
+            crash_consistency_mode: None,
         };
         patch.apply_to(&mut cfg);
 
@@ -3718,6 +3808,7 @@ mod tests {
             io_strategy: None,
             proxy: None,
             enable_work_stealing: None,
+            crash_consistency_mode: None,
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.download_dir, original.download_dir);
@@ -3873,6 +3964,7 @@ mod tests {
             io_strategy: Some(IoStrategy::Standard),
             proxy: Some(Some("http://127.0.0.1:7890".into())),
             enable_work_stealing: None,
+            crash_consistency_mode: None,
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.download_dir, "/patched");
@@ -4468,6 +4560,7 @@ mod proptests {
                     io_strategy: None,
                     proxy: None,
             enable_work_stealing: None,
+            crash_consistency_mode: None,
                 }),
                 connection: None,
                 magnet: None,
