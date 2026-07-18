@@ -823,6 +823,7 @@ describe("ChunkMatrix 分片矩阵", () => {
         createLinearGradient: ReturnType<typeof vi.fn>;
         addColorStop: ReturnType<typeof vi.fn>;
         fillRect: ReturnType<typeof vi.fn>;
+        roundRect: ReturnType<typeof vi.fn>;
       }) => T,
     ): T {
       const addColorStop = vi.fn();
@@ -851,6 +852,7 @@ describe("ChunkMatrix 分片矩阵", () => {
           >,
           addColorStop,
           fillRect: ctx.fillRect as unknown as ReturnType<typeof vi.fn>,
+          roundRect: ctx.roundRect as unknown as ReturnType<typeof vi.fn>,
         });
       } finally {
         HTMLCanvasElement.prototype.getContext = prev;
@@ -879,11 +881,13 @@ describe("ChunkMatrix 分片矩阵", () => {
     });
 
     it("downloading block 按平均字节进度画渐变填充", () => {
-      withMockContext(({ createLinearGradient, addColorStop }) => {
+      withMockContext(({ createLinearGradient, addColorStop, roundRect }) => {
         // reduced-motion:屏蔽扫描光带的 createLinearGradient,
         // 此时唯一的渐变来源即字节进度深度填充
         mockMatchMedia(true);
-        // 250 片 / 100 块:分片 0-1 落在 block 0,注入字节使其平均进度 0.5
+        // jsdom 布局下 blockCount 非 100:分片 0-2 落同一块,分片 3 落邻块。
+        // 每片预估 1000000/250=4000 字节,目标块注入字节和 5000、活跃 3 片,
+        // 进度 = 5000/(4000×3) ≈ 0.4167,填充宽 = 14×0.4167 ≈ 5.8333
         setFragmentData("t-canvas", {
           total: 250,
           doneSet: new Set(),
@@ -906,6 +910,10 @@ describe("ChunkMatrix 分片矩阵", () => {
           />
         ));
         expect(createLinearGradient).toHaveBeenCalled();
+        // 宽度映射:渐变填充的 roundRect 宽 = BLOCK_SIZE(14) × 块进度(≈0.4167)
+        const widths = roundRect.mock.calls.map((call) => call[2] as number);
+        const expected = 14 * (5000 / (4000 * 3));
+        expect(widths.some((w) => Math.abs(w - expected) < 1e-6)).toBe(true);
         // 渐变为 downloading token 同色的两档低透明度(0.25 → 0.55)
         const stops = addColorStop.mock.calls.map(
           (call) => [call[0] as number, call[1] as string] as const,

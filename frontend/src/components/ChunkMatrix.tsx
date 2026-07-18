@@ -169,7 +169,7 @@ export function buildBlockProgress(
   for (let i = 0; i < size; i++) {
     if (counts[i]! > 0) {
       const blockExpected = perFragSize * counts[i]!;
-      progress[i] = Math.min(1, totalBytes[i]! / blockExpected);
+      progress[i] = Math.min(1, Math.max(0, totalBytes[i]! / blockExpected));
     }
   }
   return progress;
