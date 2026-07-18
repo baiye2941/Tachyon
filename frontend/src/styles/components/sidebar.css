@@ -97,6 +97,45 @@
   transform: translateY(-50%) scaleY(1);
 }
 
+/* 速度线:active 时顶部光点向下流动(抽象赛道速度隐喻)。
+   只动 transform/opacity,纯 CSS 无 JS 定时器 */
+.sidebar-nav-indicator--active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 30%;
+  background: linear-gradient(
+    180deg,
+    var(--color-accent-primary-hover) 0%,
+    transparent 100%
+  );
+  border-radius: inherit;
+  animation: sidebar-velocity 1.2s var(--ease-standard) infinite;
+}
+
+@keyframes sidebar-velocity {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(330%);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-nav-indicator--active::after {
+    animation: none;
+    display: none;
+  }
+}
+
 .sidebar-nav-content {
   display: flex;
   align-items: center;

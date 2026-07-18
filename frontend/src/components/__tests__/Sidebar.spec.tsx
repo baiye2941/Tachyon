@@ -112,3 +112,20 @@ describe("Sidebar 双轨伸缩(Iteration 12/13)", () => {
     expect(collapsedPanel).not.toBeUndefined();
   });
 });
+
+describe("Sidebar 选中速度线", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("选中态 nav item 的 indicator 有速度线流动 class", () => {
+    const { container } = render(() => <Sidebar />);
+    const activeItem = container.querySelector(
+      ".sidebar-nav-item.is-active .sidebar-nav-indicator",
+    );
+    expect(activeItem).toBeTruthy();
+    expect(
+      activeItem?.classList.contains("sidebar-nav-indicator--active"),
+    ).toBe(true);
+  });
+});

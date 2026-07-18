@@ -100,7 +100,11 @@ const NavItem = (p: NavItemProps) => {
       aria-label={label()}
       title={label()}
     >
-      <span class="sidebar-nav-indicator" aria-hidden="true" />
+      <span
+        class="sidebar-nav-indicator"
+        classList={{ "sidebar-nav-indicator--active": p.active }}
+        aria-hidden="true"
+      />
       <div class="sidebar-nav-content">
         <div class="sidebar-nav-icon">
           <Icon />
