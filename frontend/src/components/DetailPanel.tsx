@@ -911,6 +911,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                   fragmentsTotal={task()!.fragmentsTotal}
                   fragmentsDone={task()!.fragmentsDone}
                   progress={task()!.progress}
+                  fileSize={task()!.fileSize}
                 />
               </Suspense>
             </div>

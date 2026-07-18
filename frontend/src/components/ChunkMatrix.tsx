@@ -15,12 +15,15 @@ import {
   mergeFragmentDelta,
   type TaskFragmentData,
 } from "../stores/taskFragments";
+import FragmentFill from "./FragmentFill";
 
 interface ChunkMatrixProps {
   taskId: string;
   fragmentsTotal: number;
   fragmentsDone: number;
   progress: number;
+  /** 文件总字节数;用于把分片字节进度换算为充能比例,未知时充能条不渲染 */
+  fileSize?: number | null;
 }
 
 const AGGREGATE_THRESHOLD = 200;
@@ -37,6 +40,15 @@ function setsEqual(a: Set<number>, b: Set<number>): boolean {
   if (a.size !== b.size) return false;
   for (const x of a) {
     if (!b.has(x)) return false;
+  }
+  return true;
+}
+
+/** 比较两个字节进度快照的内容是否一致,用于稳定 memo 引用。 */
+function bytesMapEqual(a: Map<number, number>, b: Map<number, number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    if (b.get(k) !== v) return false;
   }
   return true;
 }
@@ -280,6 +292,9 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
    * taskFragments store 每次 merge delta 都会产生新的 TaskFragmentData 对象与新的 Set,
    * 但多数 progress tick 只是 fragmentsDone/fragmentsTotal 等数字变化,分片集合内容并未变。
    * 通过内容比对返回相同引用,避免下游 memo 与 DOM 单元格随每次 tick 全量重建。
+   *
+   * bytesMap 必须参与比对:下载中的 tick 往往只有字节数变化(集合不变),
+   * 漏比会让 FragmentFill 充能条与 tooltip 百分比冻结在首个快照。
    */
   let lastFragData: TaskFragmentData | undefined;
   const fragData = createMemo(() => {
@@ -293,7 +308,8 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       lastFragData.total === current.total &&
       lastFragData.finalized === current.finalized &&
       setsEqual(lastFragData.doneSet, current.doneSet) &&
-      setsEqual(lastFragData.downloadingSet, current.downloadingSet)
+      setsEqual(lastFragData.downloadingSet, current.downloadingSet) &&
+      bytesMapEqual(lastFragData.bytesMap, current.bytesMap)
     ) {
       return lastFragData;
     }
@@ -615,7 +631,18 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       : isDownloading
         ? "downloading"
         : "pending";
-    const percent = isDone ? 100 : isDownloading ? 50 : 0;
+    // 真实字节进度:downloading 分片按 bytesMap / 整片预估值换算,
+    // 替代原先写死的 50%;fileSize 未知时诚实显示 0。
+    const downloaded = isDownloading ? (data?.bytesMap.get(idx) ?? 0) : 0;
+    const fragmentSize =
+      props.fileSize && props.fragmentsTotal > 0
+        ? props.fileSize / props.fragmentsTotal
+        : 0;
+    const percent = isDone
+      ? 100
+      : isDownloading && fragmentSize > 0
+        ? Math.min(100, Math.round((downloaded / fragmentSize) * 100))
+        : 0;
     return {
       type: "chunk" as const,
       idx,
@@ -725,6 +752,23 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                     if (downloadingSet.has(index)) return "downloading";
                     return "pending";
                   });
+                  // 该分片的字节进度比例(仅 downloading 状态有值)
+                  const fillProgress = createMemo(() => {
+                    const data = fragData();
+                    if (!data) return 0;
+                    const index = idx();
+                    if (!data.downloadingSet.has(index)) return 0;
+                    const downloaded = data.bytesMap.get(index) ?? 0;
+                    if (downloaded === 0) return 0;
+                    // 用整片预估大小作分母(分片大小可能不均,clamp 到 1;
+                    // 下载中渐增有活感)
+                    const total =
+                      props.fileSize && props.fragmentsTotal > 0
+                        ? props.fileSize / props.fragmentsTotal
+                        : 0;
+                    if (total <= 0) return 0;
+                    return Math.min(1, downloaded / total);
+                  });
                   const isSelected = createMemo(
                     () => selectedIndex() === idx(),
                   );
@@ -754,7 +798,18 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
                         )
                       }
                       onKeyDown={(e) => handleKeyDown(e, idx())}
-                    />
+                    >
+                      <Show
+                        when={
+                          status() === "downloading" && fillProgress() > 0
+                        }
+                      >
+                        <FragmentFill
+                          progress={fillProgress()}
+                          reducedMotion={prefersReducedMotion()}
+                        />
+                      </Show>
+                    </div>
                   );
                 }}
               </Index>

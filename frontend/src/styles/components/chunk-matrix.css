@@ -118,6 +118,28 @@
   background-size: 4px 4px;
 }
 
+/* 分片半填充充能条:absolute 覆盖 chunk-cell,从左到右 scaleX 填充 */
+.chunk-cell-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transform-origin: left center;
+  pointer-events: none;
+  z-index: 0;
+  /* 顶部高光:模拟液面反光 */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  will-change: transform;
+}
+
+/* 充能条与 chunk-cell 层级:chunk-cell 内容在 fill 之上 */
+.chunk-cell--downloading .chunk-cell-fill {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-status-downloading) 70%, transparent) 0%,
+    var(--color-status-downloading) 100%
+  );
+}
+
 .chunk-cell--selected {
   transform: scale(1.06);
   box-shadow:

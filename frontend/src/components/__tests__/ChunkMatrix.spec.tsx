@@ -604,4 +604,161 @@ describe("ChunkMatrix 分片矩阵", () => {
       expect(canvas).not.toBeNull();
     });
   });
+
+  describe("分片字节进度充能条(FragmentFill)", () => {
+    it("downloading 分片有字节进度且 fileSize 已知时渲染充能条", () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const cell = document.querySelector("[data-index='3']");
+      expect(cell?.querySelector(".chunk-cell-fill")).not.toBeNull();
+      // 非 downloading 格子不渲染充能条
+      const pending = document.querySelector("[data-index='4']");
+      expect(pending?.querySelector(".chunk-cell-fill")).toBeNull();
+    });
+
+    it("fileSize 未知(null)时不渲染充能条", () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={null}
+        />
+      ));
+      const cell = document.querySelector("[data-index='3']");
+      expect(cell?.querySelector(".chunk-cell-fill")).toBeNull();
+    });
+
+    it("reduced-motion 下充能条为静态 transform,比例为 bytes/整片预估值", () => {
+      mockMatchMedia(true);
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const fill = document.querySelector<HTMLElement>(
+        "[data-index='3'] .chunk-cell-fill",
+      );
+      expect(fill).not.toBeNull();
+      // 1000B / 10 片 = 每片 100B,已下 30B → 0.3
+      expect(fill!.style.transform).toContain("scaleX(0.3)");
+    });
+
+    it("tooltip 显示真实字节百分比,不再写死 50%", () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const cell = document.querySelector<HTMLElement>("[data-index='3']")!;
+      fireEvent.focus(cell);
+      const percent = document.querySelector(".chunk-tooltip-value");
+      expect(percent?.textContent).toBe("30%");
+    });
+
+    it("字节数超过整片预估值时 tooltip 百分比 clamp 到 100%", () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 250]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const cell = document.querySelector<HTMLElement>("[data-index='3']")!;
+      fireEvent.focus(cell);
+      const percent = document.querySelector(".chunk-tooltip-value");
+      expect(percent?.textContent).toBe("100%");
+    });
+
+    it("仅 bytesMap 更新(集合不变)时充能进度不冻结", async () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const cell = document.querySelector<HTMLElement>("[data-index='3']")!;
+      fireEvent.focus(cell);
+      expect(document.querySelector(".chunk-tooltip-value")?.textContent).toBe(
+        "30%",
+      );
+
+      // 模拟 250ms tick:集合内容不变,仅字节数增长
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 60]]),
+        finalized: false,
+      });
+      await Promise.resolve();
+
+      expect(document.querySelector(".chunk-tooltip-value")?.textContent).toBe(
+        "60%",
+      );
+    });
+  });
 });
