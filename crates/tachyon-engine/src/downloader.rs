@@ -1376,9 +1376,10 @@ impl DownloadTask {
             self.protocol.download_full_stream(&self.url).await?
         };
 
+        // clone Arc 后释放 self 的不可变借用,便于循环内 note_goodput_bytes(&mut self)
         let storage = self
             .storage
-            .as_ref()
+            .clone()
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
         let expected_size = self.metadata.as_ref().and_then(|md| md.file_size);
 
@@ -1434,9 +1435,14 @@ impl DownloadTask {
                 )));
             }
             // 审计 P1 full-stream short write
-            let written =
-                Self::write_all_at(storage, pos, chunk, &mut self.control_rx, pause_timeout)
-                    .await?;
+            let written = Self::write_all_at(
+                storage.as_ref(),
+                pos,
+                chunk,
+                &mut self.control_rx,
+                pause_timeout,
+            )
+            .await?;
             if written != chunk_len {
                 return Err(DownloadError::Fragment(format!(
                     "整块下载短写未完成: offset={pos}, expected={chunk_len}, written={written}"
@@ -1446,6 +1452,14 @@ impl DownloadTask {
             if let Some(ref limiter) = rate_limiter {
                 limiter.acquire(written).await;
             }
+            // 整块路径同样喂聚合 goodput,供跨任务/后续 re-plan 学习
+            if let Some(bps) = self.note_goodput_bytes(written) {
+                self.scheduler.observe_bandwidth(bps);
+            }
+        }
+        // 冲刷未满窗口,避免短文件零样本
+        if let Some(bps) = self.flush_goodput_window() {
+            self.scheduler.observe_bandwidth(bps);
         }
         debug!(written = pos, "整块流式下载写入完成");
 
@@ -1459,7 +1473,7 @@ impl DownloadTask {
         }
 
         // 审计 P0-3:整块路径在标 Completed 前 durable sync,避免快照/状态领先于落盘
-        storage.sync().await?;
+        storage.as_ref().sync().await?;
 
         if let Some(frag) = self.fragments.first_mut() {
             if frag.state == crate::fragment::FragmentState::Pending {
