@@ -297,6 +297,7 @@ fn build_progress_event(
                     completed_delta,
                     started_delta,
                     error_reason: t.error_reason.clone(),
+                    fragment_bytes: vec![],
                 },
             )
         })
