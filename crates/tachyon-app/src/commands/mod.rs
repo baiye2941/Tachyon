@@ -248,6 +248,18 @@ pub struct DownloadProgress {
     pub active_concurrency: u32,
 }
 
+/// 单个活跃分片的字节级进度快照(仅含 downloading_set 中的分片)
+///
+/// 每 250ms aggregator tick 随 progress-update 发送。已完成分片不在其中
+/// (它们进 completed_delta / doneSet),未开始分片进度为 0 也不在其中。
+/// 数量 = 当前活跃并发数 N(通常 ≤ 16),非分片总数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FragmentByteProgress {
+    pub index: u32,
+    pub downloaded: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskProgress {
@@ -274,6 +286,10 @@ pub struct TaskProgress {
     /// 避免 UI 依赖 get_task_list 全量刷新才能展示错误详情(P1-22-4)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<String>,
+    /// 活跃分片字节级进度快照(仅 downloading_set 中的分片)。
+    /// 快照式:前端无状态、幂等、丢包自愈。空时 skip 以省带宽。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fragment_bytes: Vec<FragmentByteProgress>,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -1613,5 +1629,79 @@ pub(crate) mod tests {
             deps.contains("tachyon-engine"),
             "A-01:app 应经 tachyon-engine 门面"
         );
+    }
+}
+
+#[cfg(test)]
+mod fragment_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn fragment_byte_progress_serializes_camel_case() {
+        let entry = FragmentByteProgress {
+            index: 3,
+            downloaded: 524288,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"index\""));
+        assert!(json.contains("\"downloaded\""));
+        assert!(
+            !json.contains("fragment_index"),
+            "应是 camelCase index 而非 fragment_index"
+        );
+    }
+
+    #[test]
+    fn task_progress_fragment_bytes_default_empty() {
+        let tp = TaskProgress {
+            id: "t1".to_string(),
+            progress: 0.0,
+            speed: 0,
+            downloaded: 0,
+            status: DownloadState::Pending,
+            fragments_done: 0,
+            fragments_total: 0,
+            active_concurrency: 0,
+            file_size: None,
+            completed_delta: vec![],
+            started_delta: vec![],
+            error_reason: None,
+            fragment_bytes: vec![],
+        };
+        let json = serde_json::to_string(&tp).unwrap();
+        // skip_serializing_if = Vec::is_empty,空时不应出现在 JSON
+        assert!(
+            !json.contains("fragmentBytes"),
+            "空 fragment_bytes 应被 skip"
+        );
+    }
+
+    #[test]
+    fn task_progress_fragment_bytes_serialized_when_non_empty() {
+        let tp = TaskProgress {
+            id: "t1".to_string(),
+            progress: 0.5,
+            speed: 100,
+            downloaded: 512,
+            status: DownloadState::Downloading,
+            fragments_done: 1,
+            fragments_total: 4,
+            active_concurrency: 2,
+            file_size: Some(1024),
+            completed_delta: vec![],
+            started_delta: vec![],
+            error_reason: None,
+            fragment_bytes: vec![FragmentByteProgress {
+                index: 1,
+                downloaded: 256,
+            }],
+        };
+        let json = serde_json::to_string(&tp).unwrap();
+        assert!(
+            json.contains("fragmentBytes"),
+            "非空 fragment_bytes 应序列化"
+        );
+        assert!(json.contains("\"index\":1"));
+        assert!(json.contains("\"downloaded\":256"));
     }
 }
