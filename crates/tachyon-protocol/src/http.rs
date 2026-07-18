@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{StreamExt, TryStreamExt, future};
+use futures::StreamExt;
+#[cfg(test)]
+use futures::future;
 use reqwest::Client;
 
 // ---------------------------------------------------------------------------
@@ -1333,12 +1335,18 @@ async fn probe_via_get_range(
                 "{url_context} 返回 HTML 页面而非可下载文件,请确认链接是否正确"
             )));
         }
-        let metadata = metadata_from_headers(&final_url, response.headers(), false);
+        // 审计 H2(200 fallback 运行时降级):GET Range:0-0 收到 200(非 206)
+        // 即表明服务端未按 Range 处理。此时即便响应携带 `Accept-Ranges: bytes`,
+        // 也不得信任该头宣称 Range 支持——否则 engine 会走分片路径,N 片各自
+        // 触发 200 fallback,总传输量 ≈ S*N/2(1GB/16 片 ≈ 8.5GB 浪费)。
+        // 强制 supports_range=false,让 engine 路由到 execute_full_download。
+        let mut metadata = metadata_from_headers(&final_url, response.headers(), false);
+        metadata.supports_range = false;
         info!(
             url = %tachyon_core::redact_url_for_log(&final_url),
             file_size = ?metadata.file_size,
             supports_range = metadata.supports_range,
-            "GET Range 探测完成(200,服务端忽略 Range)"
+            "GET Range 探测完成(200,服务端忽略 Range,强制 supports_range=false)"
         );
         return Ok(metadata);
     }
@@ -1352,11 +1360,17 @@ async fn probe_via_get_range(
 
 /// 对任意字节流应用"200 回退"扫描:跳过前 `start` 字节,截取 `need` 字节。
 ///
-/// B-1/B-2 修复的核心逻辑,从 `make_200_fallback_stream` 拆出以便单元测试
-/// (用 `futures::stream::iter` 构造 mock 流,无需 mock HTTP server)。
+/// 历史遗留:B-1/B-2 修复期曾用于 `make_200_fallback_stream` 的流式截取回退路径。
+/// 审计 H2(200 fallback 运行时降级)后,该路径已废弃:服务器忽略 Range 返回 200
+/// 时,`download_range`/`download_range_stream` 改为返回 `RangeNotSupported`,
+/// 由 engine 层降级为整块下载(`execute_full_download`)。
+///
+/// 函数保留仅供单元测试验证流式跳过/截取算法的正确性(未来若需复用此逻辑可
+/// 直接启用)。`#[cfg(test)]` 避免在 release 构建中产生 dead code 警告。
 ///
 /// - **不 OOM**:逐 chunk 跳过/截取,内存上限 = 单个 chunk 大小。
 /// - **不浪费带宽**:`need` 取满后返回 `None` 终止流(drop 上游 → reqwest 中断读取)。
+#[cfg(test)]
 fn apply_200_fallback_scan(stream: ByteStream, start: usize, need: usize) -> ByteStream {
     let limited = stream.scan((start, need), |state: &mut (usize, usize), chunk| {
         let mut data = match chunk {
@@ -1393,18 +1407,6 @@ fn apply_200_fallback_scan(stream: ByteStream, start: usize, need: usize) -> Byt
         future::ready(!is_empty)
     });
     Box::pin(exact)
-}
-
-/// 构造"服务器忽略 Range 返回 200"的回退流:跳过前 `start` 字节,截取 `[start, end]`。
-///
-/// B-1/B-2 修复:统一的 200 回退流式实现,被 `download_range`(收集为 Bytes)
-/// 和 `download_range_stream`(直接返回流)共用。
-fn make_200_fallback_stream(response: reqwest::Response, start: u64, end: u64) -> ByteStream {
-    let need = end.saturating_add(1).saturating_sub(start) as usize;
-    let stream = response.bytes_stream().map(|result| {
-        result.map_err(|e| DownloadError::Network(format!("读取 200 响应流失败: {e}")))
-    });
-    apply_200_fallback_scan(Box::pin(stream), start as usize, need)
 }
 
 impl Protocol for HttpClient {
@@ -1519,40 +1521,16 @@ impl Protocol for HttpClient {
                         "对象版本已变更(If-Range 返回 200),拒绝续传拼接".into(),
                     ));
                 }
-                // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
-                // B-1 修复:改用流式回退(make_200_fallback_stream)收集为 Bytes,
-                // 避免原 `response.bytes()` 把整个响应体载入内存导致大文件 OOM。
-                // 流式实现只缓冲单个 chunk + 取满即终止,内存上限 = 分片大小。
+                // 审计 H2(200 fallback 运行时降级):服务器忽略 Range 头返回 200
+                // 表明该源不支持 Range。返回 RangeNotSupported 让 engine 层降级为
+                // 整块下载(execute_full_download),避免原 make_200_fallback_stream
+                // 流式截取请求区间导致 N 片下载总传输量 ≈ S*N/2 的带宽浪费。
                 info!(
                     url = %tachyon_core::redact_url_for_log(&url),
                     start, end,
-                    "HTTP 200 回退:流式截取请求区间(避免整文件载入内存)"
+                    "HTTP 200 回退放弃:返回 RangeNotSupported,交由 engine 降级整块下载"
                 );
-                let stream = make_200_fallback_stream(response, start, end);
-                let chunks: Vec<Bytes> = stream.try_collect().await?;
-                let total: usize = chunks.iter().map(|b| b.len()).sum();
-                let need = end.saturating_add(1).saturating_sub(start) as usize;
-                if total < need {
-                    warn!(
-                        url = %tachyon_core::redact_url_for_log(&url),
-                        start, end, received = total, need,
-                        "服务器返回 200 但响应体不足以覆盖请求区间"
-                    );
-                    return Err(DownloadError::Protocol(format!(
-                        "服务器返回 200 但响应体长度({total})不足以覆盖请求区间 [{start},{end}]"
-                    )));
-                }
-                // 合并 chunks 为单个 Bytes(分片通常不超过 max_fragment_size=64MB)
-                let result = if chunks.len() == 1 {
-                    chunks.into_iter().next().unwrap()
-                } else {
-                    let mut buf = bytes::BytesMut::with_capacity(total);
-                    for chunk in &chunks {
-                        buf.extend_from_slice(chunk);
-                    }
-                    buf.freeze()
-                };
-                return Ok(result);
+                return Err(DownloadError::RangeNotSupported);
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "Range 请求返回非预期状态码");
@@ -1620,15 +1598,16 @@ impl Protocol for HttpClient {
                         "对象版本已变更(If-Range 返回 200),拒绝续传拼接".into(),
                     ));
                 }
-                // 服务器忽略 Range 头返回完整内容(常见于小文件、CDN、对象存储)。
-                // B-2 修复:委托 make_200_fallback_stream 统一实现流式回退,
-                // 取满即终止流,避免浪费剩余带宽。download_range 路径也复用此函数。
+                // 审计 H2(200 fallback 运行时降级):服务器忽略 Range 头返回 200
+                // 表明该源不支持 Range。返回 RangeNotSupported 让 engine 层降级为
+                // 整块下载(execute_full_download),避免原 make_200_fallback_stream
+                // 流式截取请求区间导致 N 片下载总传输量 ≈ S*N/2 的带宽浪费。
                 info!(
                     url = %tachyon_core::redact_url_for_log(&url),
                     start, end,
-                    "服务器忽略 Range 头返回 200,流式回退:跳过 start 字节后截取请求区间"
+                    "HTTP 200 流式回退放弃:返回 RangeNotSupported,交由 engine 降级整块下载"
                 );
-                return Ok(make_200_fallback_stream(response, start, end));
+                return Err(DownloadError::RangeNotSupported);
             }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 warn!(url = %tachyon_core::redact_url_for_log(&url), status = %status, "流式 Range 请求返回非预期状态码");
@@ -3307,7 +3286,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_download_range_200_fallback_truncates() {
+        async fn test_download_range_200_fallback_returns_range_not_supported() {
             let server = MockServer::start().await;
             // 服务端忽略 Range,返回完整文件(200)
             let full_body = b"hello world".to_vec();
@@ -3323,9 +3302,15 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/no-range", server.uri());
-            // 请求 0-4,服务端返回完整 11 字节,应截取前 5 字节
-            let bytes = client.download_range(&url, 0, 4, None).await.unwrap();
-            assert_eq!(bytes, Bytes::from_static(b"hello"));
+            // H2(200 fallback 运行时降级):服务器忽略 Range 返回 200 时,
+            // download_range 必须返回 RangeNotSupported,交由 engine 层降级
+            // 为整块下载,不再走 make_200_fallback_stream 截取请求区间。
+            let result = client.download_range(&url, 0, 4, None).await;
+            assert!(result.is_err(), "200 响应应返回错误而非截取");
+            match result {
+                Err(DownloadError::RangeNotSupported) => {}
+                other => panic!("应返回 RangeNotSupported,实际: {other:?}"),
+            }
         }
 
         #[tokio::test]
@@ -3395,7 +3380,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_download_range_stream_200_fallback_streams_truncated() {
+        async fn test_download_range_stream_200_returns_range_not_supported() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/stream200"))
@@ -3409,17 +3394,19 @@ mod tests {
 
             let client = test_client();
             let url = format!("{}/stream200", server.uri());
-            // 请求 2-5,服务端返回完整 10 字节,应流式截取 [2,5]
-            let stream = client
-                .download_range_stream(&url, 2, 5, None)
-                .await
-                .unwrap();
-            let mut s = Box::pin(stream);
-            let mut collected = Vec::new();
-            while let Some(chunk) = s.next().await {
-                collected.extend_from_slice(&chunk.unwrap());
+            // H2(200 fallback 运行时降级):服务器忽略 Range 返回 200 时,
+            // download_range_stream 必须返回 RangeNotSupported,交由 engine 层
+            // 降级为整块下载,不再走 make_200_fallback_stream 截取请求区间。
+            let result = client.download_range_stream(&url, 2, 5, None).await;
+            assert!(
+                result.is_err(),
+                "download_range_stream 收到 200 时必须返回错误,不得走 fallback stream"
+            );
+            match result {
+                Err(DownloadError::RangeNotSupported) => {}
+                Ok(_) => panic!("应返回错误,实际返回流"),
+                Err(e) => panic!("错误必须是 RangeNotSupported,实际: {e:?}"),
             }
-            assert_eq!(&collected, b"2345");
         }
 
         #[tokio::test]
@@ -3588,6 +3575,111 @@ mod tests {
             assert!(!host_allows_hf_token("hf-mirror.com"));
             assert!(!host_allows_hf_token("evil-huggingface.co"));
             assert!(!host_allows_hf_token("example.com"));
+        }
+
+        // ── 200 fallback 运行时降级(RED 测试,方案 A+B)──────────────────────
+        //
+        // 审计发现:服务器忽略 Range 返回 200 时,当前实现走 make_200_fallback_stream
+        // 流式截取请求区间,导致 N 片下载总传输量 ≈ S*N/2(1GB/16片≈8.5GB 浪费)。
+        //
+        // 期望行为(方案 A+B):
+        //   A1. probe:GET Range:0-0 返回 200(非 206)时,无论 Accept-Ranges 头为何,
+        //       必须标记 supports_range=false(200 即服务端未按 Range 处理)
+        //   A2. download_range_stream:收到 200 时返回 Err(RangeNotSupported),
+        //       不再走 make_200_fallback_stream 截取
+        //   B.  engine 层捕获 RangeNotSupported,re-plan 为单分片转 execute_full_download
+        //
+        // 以下两个测试引用尚不存在的 DownloadError::RangeNotSupported 变体,编译失败(RED)。
+
+        /// 方案 A1:HEAD 失败回退 GET Range:0-0 时,若服务端返回 200(忽略 Range),
+        /// probe 必须标记 supports_range=false。即便响应携带 `Accept-Ranges: bytes`,
+        /// 200 响应已表明服务端未按 Range 处理,不得信任该头宣称 Range 支持。
+        ///
+        /// 当前实现(http.rs:1336)调 `metadata_from_headers(.., false)`,从
+        /// `Accept-Ranges` 头取 supports_range。服务端返回 200 + `Accept-Ranges: bytes`
+        /// 时会被误判为 supports_range=true,导致 engine 走分片路径,触发 N 片全对象
+        /// 重复传输的带宽浪费。
+        #[tokio::test]
+        async fn test_probe_returns_supports_range_false_on_200() {
+            let server = MockServer::start().await;
+            // HEAD 被拒(模拟签名 CDN),触发 GET Range:0-0 回退
+            Mock::given(method("HEAD"))
+                .and(path("/no-range.bin"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            // GET Range:0-0 返回 200(服务端忽略 Range),且携带 Accept-Ranges: bytes
+            // 此组合是误判陷阱:头宣称支持,但实际未按 Range 处理
+            Mock::given(method("GET"))
+                .and(path("/no-range.bin"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "1024")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .insert_header("Content-Type", "application/octet-stream")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/no-range.bin", server.uri());
+            let meta = client.probe(&url).await.expect("probe 应成功");
+            assert_eq!(
+                meta.file_size,
+                Some(1024),
+                "200 响应应从 Content-Length 取文件大小"
+            );
+            // 关键断言:200 响应必须标记 supports_range=false,
+            // 即便携带 Accept-Ranges: bytes 也不可信
+            assert!(
+                !meta.supports_range,
+                "GET Range:0-0 返回 200(非 206)时必须 supports_range=false, \
+                 即便响应携带 Accept-Ranges: bytes(服务端未按 Range 处理即不支持)"
+            );
+        }
+
+        /// 方案 A2:download_range_stream 收到 200 时应返回
+        /// `Err(DownloadError::RangeNotSupported)`,而非走 make_200_fallback_stream
+        /// 流式截取(后者会导致 N 片下载总传输量 ≈ S*N/2 的带宽浪费)。
+        ///
+        /// 当前实现(http.rs:1631)返回 `Ok(make_200_fallback_stream(...))`,
+        /// 仅在 If-Range 失配时返回错误。本测试要求无条件对 200 返回
+        /// RangeNotSupported,让 engine 层据此降级为整块下载。
+        #[tokio::test]
+        async fn test_download_range_stream_returns_range_not_supported_on_200() {
+            let server = MockServer::start().await;
+            // 服务端忽略 Range 头,返回完整内容(200)
+            let full_body: Vec<u8> = (0..100).map(|_| 0xABu8).collect();
+            Mock::given(method("GET"))
+                .and(path("/ignored-range.bin"))
+                .and(header("Range", "bytes=10-19"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "100")
+                        .set_body_raw(full_body, "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/ignored-range.bin", server.uri());
+            let result = client.download_range_stream(&url, 10, 19, None).await;
+            assert!(
+                result.is_err(),
+                "download_range_stream 收到 200 时必须返回错误,不得走 fallback stream"
+            );
+            // ByteStream: Pin<Box<dyn Stream<Item = DownloadResult<Bytes>>>>
+            // 未实现 Debug,unwrap_err 不可用。用 match 取出错误。
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => unreachable!(),
+            };
+            assert!(
+                matches!(err, DownloadError::RangeNotSupported),
+                "错误必须是 RangeNotSupported 变体(供 engine 层匹配降级),实际: {err:?}"
+            );
         }
     }
 }

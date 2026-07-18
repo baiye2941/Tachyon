@@ -411,11 +411,19 @@ impl MagnetProtocol {
     /// 从 librqbit 的 file_infos 构造 FileLayout(消除 DUP-1:四处重复的闭包)
     ///
     /// 单文件退化为单元素,多文件按 file_infos 各文件段(file_id=索引,
-    /// global_offset=offset_in_torrent,len=fi.len,name=relative_filename)。
-    fn layout_from_file_infos(file_infos: &[FileInfo]) -> FileLayout {
-        let spans: Vec<FileSpan> = file_infos
+    /// global_offset=offset_in_torrent,len=fi.len,name=relative_name)。
+    ///
+    /// `only_files` 为 `Some(ids)` 时仅保留 `ids` 中包含的 file_id(支持 BT-16 so= 选择
+    /// 文件);越界 file_id 静默跳过(容错,与 BEP 9 一致)。`None` 表示下载全部文件。
+    ///
+    /// 过滤后选中文件段在虚拟字节空间内重新紧凑排列(global_offset 从 0 起连续累加),
+    /// 使 `total_len` 等于选中文件长度之和(而非原 torrent 全局末尾偏移)。
+    /// file_id 保留原 torrent 内索引(不重新映射),供下游日志/状态展示对齐元数据。
+    fn layout_from_file_infos(file_infos: &[FileInfo], only_files: Option<&[usize]>) -> FileLayout {
+        let mut spans: Vec<FileSpan> = file_infos
             .iter()
             .enumerate()
+            .filter(|(id, _)| only_files.is_none_or(|ids| ids.contains(id)))
             .map(|(file_id, fi)| FileSpan {
                 file_id,
                 global_offset: fi.offset_in_torrent,
@@ -423,6 +431,14 @@ impl MagnetProtocol {
                 name: fi.relative_filename.to_string_lossy().into_owned(),
             })
             .collect();
+        // 选中子集时重新紧凑排列 global_offset(从 0 起连续),保证 total_len 为选中长度之和
+        if only_files.is_some() {
+            let mut cursor: u64 = 0;
+            for span in &mut spans {
+                span.global_offset = cursor;
+                cursor = cursor.saturating_add(span.len);
+            }
+        }
         FileLayout::from_spans(spans)
     }
 
@@ -607,6 +623,33 @@ pub fn parse_pe_from_magnet(uri: &str) -> Vec<SocketAddr> {
                 .and_then(|addr| addr.parse::<SocketAddr>().ok())
         })
         .collect()
+}
+
+/// 从磁力链接解析 `&so=` 参数为 0-based file_id 列表(BEP 9 选择文件)
+///
+/// magnet URI 可含一个 `so=` 参数,值为逗号分隔的 0-based file_id。
+/// 非数字项跳过(容错,与 `parse_pe_from_magnet` 风格一致)。
+/// - 无 `so=` 或 `so=` 为空 → `None`(等价未选,下载全部)
+/// - 全部项无效 → `None`
+/// - 大小写不敏感(`SO=` 等价 `so=`)
+pub fn parse_so_from_magnet(uri: &str) -> Option<Vec<usize>> {
+    if !tachyon_core::looks_like_magnet_url(uri) {
+        return None;
+    }
+    for param in uri[8..].split('&') {
+        let lower = param.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("so=") {
+            if value.is_empty() {
+                return None;
+            }
+            let ids: Vec<usize> = value
+                .split(',')
+                .filter_map(|s| s.parse::<usize>().ok())
+                .collect();
+            return if ids.is_empty() { None } else { Some(ids) };
+        }
+    }
+    None
 }
 
 #[test]
@@ -1214,7 +1257,7 @@ impl Protocol for MagnetProtocol {
                         .clone()
                         .unwrap_or_else(|| "unknown_torrent".to_string());
                     let size = m.lengths.total_length();
-                    let layout = Self::layout_from_file_infos(&m.file_infos);
+                    let layout = Self::layout_from_file_infos(&m.file_infos, None);
                     (name, size, layout)
                 })
                 .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
@@ -1338,7 +1381,7 @@ impl Protocol for MagnetProtocol {
                 .await?;
                 // 未走 probe 的回退路径:从 metadata 构造 layout
                 let layout = h
-                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, None))
                     .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
                 {
                     let entry = CachedTorrent {
@@ -1469,7 +1512,7 @@ impl Protocol for MagnetProtocol {
                 .await?;
                 // 回退路径:构造单文件默认 layout(metadata 已就绪时)
                 let layout = h
-                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos))
+                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, None))
                     .unwrap_or_else(|_| FileLayout::single("unknown".into(), 0));
                 {
                     let entry = CachedTorrent {
@@ -1936,7 +1979,7 @@ mod tests {
 
         // 从 handle 的 file_infos 构造 FileLayout(与 probe 路径一致)
         let layout = handle
-            .with_metadata(|m| MagnetProtocol::layout_from_file_infos(&m.file_infos))
+            .with_metadata(|m| MagnetProtocol::layout_from_file_infos(&m.file_infos, None))
             .map_err(|e| DownloadError::Protocol(format!("获取元数据失败: {e}")))?;
 
         let config = MagnetConfig::default();
@@ -3314,5 +3357,224 @@ mod tests {
         t1.await.unwrap();
         t2.await.unwrap();
         assert_eq!(order.load(Ordering::SeqCst), 2);
+    }
+
+    /// BT-08 防回归:peer_wait=0(映射为 MAX)+ 无 peer(unhealthy)+ finite stall
+    /// 必须短路产出 Err(Timeout),不永久循环。
+    ///
+    /// 审计 BT-08:magnet.rs:818-826 已加 `wait == Duration::MAX` 短路。本测试
+    /// 验证短路逻辑保持有效:若实现回退(删除短路),测试应在 timeout(5s)内失败。
+    #[tokio::test]
+    async fn test_peer_wait_zero_with_no_peer_does_not_hang() {
+        use futures::StreamExt;
+        let health: Arc<dyn PeerHealthSource> = Arc::new(MockPeerHealth::new(false));
+        // peer_wait=0 → 映射为 Duration::MAX(magnet.rs:1301-1302)
+        let peer_wait = Duration::MAX;
+        // stall=1s(finite),peer_wait=MAX
+        let stall = Duration::from_secs(1);
+        let stream = make_chunk_stream(PendingReader, stall, peer_wait, Some(health));
+        let mut s = Box::pin(stream);
+        // 若短路失效,会永久 Pending;timeout(5s) 保证测试不挂起
+        let result = tokio::time::timeout(Duration::from_secs(5), s.next()).await;
+        assert!(
+            result.is_ok(),
+            "peer_wait=0 + 无 peer 应短路产出 Timeout,不永久挂起"
+        );
+        let item = result.unwrap().expect("流应产出项");
+        match item {
+            Err(DownloadError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("无可用 peer") && msg.contains("peer_wait 已禁用"),
+                    "应产出'无可用 peer,且 peer_wait 已禁用'Timeout,实际: {msg}"
+                );
+            }
+            other => panic!("应产出 Timeout,实际: {other:?}"),
+        }
+    }
+
+    // ===== BT-16: magnet so= 选择文件(RED 测试,实现待补) =====
+    //
+    // 审计发现:librqbit 解析 so= 并设 only_files,但 Tachyon probe 不感知,
+    // engine 按全部文件规划,未选文件分片永远不完成。下方测试覆盖:
+    //   - parse_so_from_magnet: 解析 BEP 9 so= 参数为 0-based file_id 列表
+    //   - layout_from_file_infos: 增加 only_files 过滤参数
+    // 当前两者尚未实现,以下测试应编译失败(RED)。
+
+    /// 单文件 so=0 → Some(vec![0])
+    #[test]
+    fn test_parse_so_from_magnet_single_file() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=0";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, Some(vec![0]));
+    }
+
+    /// 多文件 so=0,2,5 → Some(vec![0,2,5])(BEP 9 逗号分隔 0-based)
+    #[test]
+    fn test_parse_so_from_magnet_multiple_files() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=0,2,5";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, Some(vec![0, 2, 5]));
+    }
+
+    /// 空 so=(&so=) 等价无 so= → None
+    #[test]
+    fn test_parse_so_from_magnet_empty_so() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, None);
+    }
+
+    /// 无 so= 参数 → None
+    #[test]
+    fn test_parse_so_from_magnet_no_so() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, None);
+    }
+
+    /// so= 含无效项时跳过无效项保留有效项(容错,与 parse_pe 风格一致)
+    ///
+    /// so=abc,1 中 abc 非数字,跳过;1 有效 → Some(vec![1])
+    #[test]
+    fn test_parse_so_from_magnet_invalid_so() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&so=abc,1";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, Some(vec![1]));
+    }
+
+    /// so= 大小写不敏感(SO= 等价 so=,与 xt=urn:btih: 大小写不敏感一致)
+    #[test]
+    fn test_parse_so_from_magnet_case_insensitive() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&SO=3,7";
+        let so = parse_so_from_magnet(uri);
+        assert_eq!(so, Some(vec![3, 7]));
+    }
+
+    /// only_files=Some(&[0,2]) → layout 只含 file_id 0 和 2,
+    /// file_size(total_len) = file0.len + file2.len
+    ///
+    /// 注意:过滤后 file_id 保留原 torrent 内索引(0 和 2),不重新映射;
+    /// global_offset 保留原值。FileLayout::from_spans 不要求 file_id 连续,
+    /// 仅按 global_offset 升序排序。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_layout_from_file_infos_with_only_files() {
+        // 3 文件:100 / 200 / 400 字节
+        let (protocol, url, _contents, _global, _dir) =
+            make_offline_multi_protocol(&[100, 200, 400], 256)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        // 从缓存 handle 提取 file_infos(与生产 probe 路径同源)
+        let key = protocol.binding_key_for(&url);
+        let file_infos: Vec<FileInfo> = {
+            let entry = protocol
+                .handle_cache
+                .get(&key)
+                .expect("from_handle 应写入 binding key");
+            entry
+                .handle
+                .with_metadata(|m| m.file_infos.clone())
+                .expect("元数据应可读")
+        };
+        assert_eq!(file_infos.len(), 3, "应构造 3 个文件");
+
+        // 仅选 file_id 0 和 2
+        let only = &[0usize, 2];
+        let layout = MagnetProtocol::layout_from_file_infos(&file_infos, Some(only));
+
+        let spans = layout.file_spans();
+        assert_eq!(
+            spans.len(),
+            2,
+            "only_files 过滤后 layout 只含 2 个文件段,实际: {spans:?}"
+        );
+
+        // file_id 保留原索引(不重新映射为 0/1)
+        let file_ids: Vec<usize> = spans.iter().map(|s| s.file_id).collect();
+        assert_eq!(file_ids, vec![0, 2], "file_id 应保留原 torrent 索引");
+
+        // total_len = file0.len + file2.len = 100 + 400 = 500
+        assert_eq!(
+            layout.total_len(),
+            file_infos[0].len + file_infos[2].len,
+            "total_len 应为选中文件长度之和"
+        );
+        assert_eq!(layout.total_len(), 500);
+
+        // 未选中的 file_id=1 不应出现
+        assert!(
+            !spans.iter().any(|s| s.file_id == 1),
+            "未选中的 file_id=1 不应在 layout 中"
+        );
+    }
+
+    /// only_files=None → layout 含全部文件(回归)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_layout_from_file_infos_without_only_files() {
+        // 3 文件:50 / 150 / 300 字节
+        let (protocol, url, _contents, global, _dir) =
+            make_offline_multi_protocol(&[50, 150, 300], 128)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        let key = protocol.binding_key_for(&url);
+        let file_infos: Vec<FileInfo> = {
+            let entry = protocol
+                .handle_cache
+                .get(&key)
+                .expect("from_handle 应写入 binding key");
+            entry
+                .handle
+                .with_metadata(|m| m.file_infos.clone())
+                .expect("元数据应可读")
+        };
+        assert_eq!(file_infos.len(), 3);
+
+        let layout = MagnetProtocol::layout_from_file_infos(&file_infos, None);
+
+        let spans = layout.file_spans();
+        assert_eq!(spans.len(), 3, "only_files=None 应保留全部文件");
+        let file_ids: Vec<usize> = spans.iter().map(|s| s.file_id).collect();
+        assert_eq!(file_ids, vec![0, 1, 2], "file_id 应为 0,1,2 连续");
+
+        // total_len = 全局流长度(三文件拼接)
+        assert_eq!(
+            layout.total_len(),
+            global.len() as u64,
+            "total_len 应等于全部文件长度之和"
+        );
+        assert_eq!(layout.total_len(), 500);
+    }
+
+    /// only_files 含越界 file_id 时跳过越界项,保留有效项(容错)
+    ///
+    /// 3 文件,only_files=&[0, 99] → 99 越界跳过,layout 只含 file_id 0
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_layout_from_file_infos_with_out_of_range_only_files() {
+        let (protocol, url, _contents, _global, _dir) =
+            make_offline_multi_protocol(&[100, 200, 400], 256)
+                .await
+                .expect("构造多文件离线 protocol 失败");
+
+        let key = protocol.binding_key_for(&url);
+        let file_infos: Vec<FileInfo> = {
+            let entry = protocol
+                .handle_cache
+                .get(&key)
+                .expect("from_handle 应写入 binding key");
+            entry
+                .handle
+                .with_metadata(|m| m.file_infos.clone())
+                .expect("元数据应可读")
+        };
+
+        // 99 越界,应被跳过
+        let only = &[0usize, 99];
+        let layout = MagnetProtocol::layout_from_file_infos(&file_infos, Some(only));
+
+        let spans = layout.file_spans();
+        assert_eq!(spans.len(), 1, "越界 file_id 应被跳过,只保留 file_id 0");
+        assert_eq!(spans[0].file_id, 0);
+        assert_eq!(layout.total_len(), file_infos[0].len);
     }
 }
