@@ -169,14 +169,21 @@ impl BtSession {
             );
         }
 
-        // BT-15:enable_upnp=true 时自动设 listen_port_range(默认 6881..6889),
-        // 否则 librqbit 不创建 TCP listener,UPnP 静默不启动,无入站 peer。
+        // BT-15:enable_upnp=true 时自动设 listen_port_range,否则 librqbit
+        // 不创建 TCP listener,UPnP 静默不启动,无入站 peer。
+        // 端口优先用 MagnetConfig.listen_port_start/end;都未设时回退 6881..6889。
         // high_privacy=true 时 enable_upnp=false,不触发自动设端口。
         if enable_upnp && opts.listen_port_range.is_none() {
-            opts.listen_port_range = Some(6881..6889);
+            let range = match (config.listen_port_start, config.listen_port_end) {
+                (Some(start), Some(end)) => start..end,
+                _ => 6881..6889,
+            };
             tracing::info!(
-                "enable_upnp=true 自动启用 BT listen_port_range=6881..6889(入站 peer + UPnP)"
+                start = range.start,
+                end = range.end,
+                "enable_upnp=true 自动启用 BT listen_port_range(入站 peer + UPnP)"
             );
+            opts.listen_port_range = Some(range);
         }
 
         // tracker 注入:high_privacy 完全跳过(不注入公共/全局 tracker)
@@ -819,6 +826,19 @@ mod tests {
         let range = opts.listen_port_range.unwrap();
         assert_eq!(range.start, 6881, "默认 BT listen 端口起始 6881");
         assert_eq!(range.end, 6889, "默认 BT listen 端口结束 6889");
+    }
+
+    /// BT-15:自定义 listen_port_start/end 覆盖默认 6881..6889
+    #[test]
+    fn test_build_session_options_custom_listen_port_range() {
+        let mut config = MagnetConfig::default();
+        config.enable_upnp = true;
+        config.listen_port_start = Some(7000);
+        config.listen_port_end = Some(7010);
+        let (opts, _eff, _src) = BtSession::build_session_options(&config);
+        let range = opts.listen_port_range.expect("自定义端口应生效");
+        assert_eq!(range.start, 7000);
+        assert_eq!(range.end, 7010);
     }
 
     /// BT-15:enable_upnp=false(默认)时 MUST 不设 listen_port_range(不主动开 listener)。

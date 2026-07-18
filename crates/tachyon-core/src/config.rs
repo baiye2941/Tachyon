@@ -452,6 +452,16 @@ pub struct MagnetConfig {
     /// 路径做 discovery;本开关是应用层最大程度隔离,不能 100% 阻止 private info-hash 泄漏。
     #[serde(default)]
     pub high_privacy: bool,
+    /// BT TCP listen 端口起始(可选,审计 BT-15)
+    ///
+    /// `enable_upnp=true` 且本字段为 Some 时,与 `listen_port_end` 组成
+    /// `listen_port_range` 传给 librqbit;两端都为 None 时回退默认 6881..6889。
+    /// 仅一端为 Some 时校验失败。
+    #[serde(default)]
+    pub listen_port_start: Option<u16>,
+    /// BT TCP listen 端口结束(半开区间上界,与 librqbit Range.end 一致)
+    #[serde(default)]
+    pub listen_port_end: Option<u16>,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
@@ -637,6 +647,8 @@ impl Default for MagnetConfig {
             disable_dht_when_socks: true,
             peer_addrs: Vec::new(),
             high_privacy: false,
+            listen_port_start: None,
+            listen_port_end: None,
         }
     }
 }
@@ -803,6 +815,25 @@ impl MagnetConfig {
                 "defer_writes_up_to_mb 不能超过 256,实际: {}",
                 self.defer_writes_up_to_mb
             )));
+        }
+        // BT-15: listen_port_start/end 要么都 None,要么都 Some 且 start < end
+        match (self.listen_port_start, self.listen_port_end) {
+            (None, None) => {}
+            (Some(start), Some(end)) => {
+                if start == 0 || end == 0 {
+                    return Err(e("listen_port_start/end 不能为 0"));
+                }
+                if start >= end {
+                    return Err(e(&format!(
+                        "listen_port_start({start}) 必须 < listen_port_end({end})(半开区间)"
+                    )));
+                }
+            }
+            _ => {
+                return Err(e(
+                    "listen_port_start 与 listen_port_end 必须同时设置或同时为空",
+                ));
+            }
         }
         // socks_proxy_url:Some 时校验 scheme 为 socks5(与 librqbit SocksProxyConfig 一致)
         // 修复 B12-config:错误信息用脱敏后的 URL,避免明文打印 user:pass 凭据。
@@ -1262,6 +1293,8 @@ pub struct MagnetPatch {
     pub disable_dht_when_socks: Option<bool>,
     pub peer_addrs: Option<Vec<String>>,
     pub high_privacy: Option<bool>,
+    pub listen_port_start: Option<Option<u16>>,
+    pub listen_port_end: Option<Option<u16>>,
 }
 
 /// 调度器配置白名单补丁
@@ -1334,6 +1367,12 @@ impl MagnetPatch {
         }
         if let Some(v) = self.high_privacy {
             base.high_privacy = v;
+        }
+        if let Some(ref v) = self.listen_port_start {
+            base.listen_port_start = *v;
+        }
+        if let Some(ref v) = self.listen_port_end {
+            base.listen_port_end = *v;
         }
     }
 }
@@ -2391,17 +2430,15 @@ mod tests {
         assert!(SchedulerConfig::default().validate().is_ok());
     }
 
-    // ── 冷启动 slow start(渐进爬坡)RED 测试 ─────────────────────────
+    // ── 冷启动 slow start(渐进爬坡)回归测试 ─────────────────────────
     //
-    // 审计发现:冷启动无样本时 recommend 返回 max_concurrency,直接开满并发,
-    // 可能瞬时打满带宽/触发服务端限流。slow start 方案 A 引入两个配置字段,
-    // 使冷启动从低并发开始,随观测样本爬坡。此处仅写测试(RED),字段尚不存在,
-    // 编译应失败,以驱动实现。
+    // SchedulerConfig.cold_start_initial_concurrency / cold_start_ramp_factor
+    // 默认 4 / 2.0,驱动 recommend 从低并发指数爬坡。
 
-    /// 冷启动初始并发度默认值应为 1。
+    /// 冷启动初始并发度默认值应为 4。
     ///
     /// 行为:`SchedulerConfig::default().cold_start_initial_concurrency == 4`。
-    /// 设计:默认 1 表示"最保守起点",由首个分片完成的 observe_bandwidth
+    /// 设计:默认 4 兼顾探路与吞吐,由 observe_bandwidth
     /// 触发 recommend 爬坡(1 → 2 → 4 → 8 → ...),逐步探测链路容量,
     /// 避免冷启动瞬时打满带宽。
     #[test]
@@ -2466,6 +2503,69 @@ mod tests {
     #[test]
     fn test_app_config_validate_valid() {
         assert!(AppConfig::default().validate().is_ok());
+    }
+
+    /// BT-15:默认 listen_port_start/end 均为 None(使用 6881..6889 回退)
+    #[test]
+    fn test_listen_port_range_both_none_default() {
+        let cfg = MagnetConfig::default();
+        assert!(cfg.listen_port_start.is_none());
+        assert!(cfg.listen_port_end.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// BT-15:两端都设且 start < end 合法
+    #[test]
+    fn test_listen_port_range_valid_pair() {
+        let mut cfg = MagnetConfig::default();
+        cfg.listen_port_start = Some(7000);
+        cfg.listen_port_end = Some(7010);
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// BT-15:仅一端 Some 非法
+    #[test]
+    fn test_listen_port_range_partial_pair_rejected() {
+        let mut cfg = MagnetConfig::default();
+        cfg.listen_port_start = Some(7000);
+        assert!(cfg.validate().is_err());
+        cfg.listen_port_start = None;
+        cfg.listen_port_end = Some(7010);
+        assert!(cfg.validate().is_err());
+    }
+
+    /// BT-15:start >= end 非法
+    #[test]
+    fn test_listen_port_range_start_ge_end_rejected() {
+        let mut cfg = MagnetConfig::default();
+        cfg.listen_port_start = Some(7010);
+        cfg.listen_port_end = Some(7000);
+        assert!(cfg.validate().is_err());
+        cfg.listen_port_start = Some(7000);
+        cfg.listen_port_end = Some(7000);
+        assert!(cfg.validate().is_err());
+    }
+
+    /// BT-15:MagnetPatch 可写入/清空端口
+    #[test]
+    fn test_magnet_patch_listen_port_applies() {
+        let mut base = MagnetConfig::default();
+        let patch = MagnetPatch {
+            listen_port_start: Some(Some(7100)),
+            listen_port_end: Some(Some(7110)),
+            ..Default::default()
+        };
+        patch.apply_to(&mut base);
+        assert_eq!(base.listen_port_start, Some(7100));
+        assert_eq!(base.listen_port_end, Some(7110));
+        let clear = MagnetPatch {
+            listen_port_start: Some(None),
+            listen_port_end: Some(None),
+            ..Default::default()
+        };
+        clear.apply_to(&mut base);
+        assert!(base.listen_port_start.is_none());
+        assert!(base.listen_port_end.is_none());
     }
 
     #[test]
@@ -3089,6 +3189,8 @@ mod tests {
             disable_dht_when_socks: Some(false),
             peer_addrs: Some(vec!["1.2.3.4:6881".into()]),
             high_privacy: None,
+            listen_port_start: Some(Some(6881)),
+            listen_port_end: Some(Some(6889)),
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.metadata_timeout_secs, 200);
@@ -3109,6 +3211,8 @@ mod tests {
         assert_eq!(cfg.defer_writes_up_to_mb, 32);
         assert!(!cfg.disable_dht_when_socks);
         assert_eq!(cfg.peer_addrs, vec!["1.2.3.4:6881"]);
+        assert_eq!(cfg.listen_port_start, Some(6881));
+        assert_eq!(cfg.listen_port_end, Some(6889));
     }
 
     #[test]
