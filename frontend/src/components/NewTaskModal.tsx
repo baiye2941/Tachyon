@@ -102,6 +102,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
     const repoId = parsed.repoId;
     const revision = parsed.revision ?? undefined;
 
+    // eslint-disable-next-line solid/reactivity -- 防抖闭包内读取最新值是有意为之(非响应式追踪)
     hfDebounceTimer = window.setTimeout(async () => {
       try {
         const info = await getModelInfo(repoId, revision);

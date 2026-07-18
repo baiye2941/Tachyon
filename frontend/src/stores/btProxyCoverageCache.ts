@@ -37,6 +37,7 @@ export function getBtProxyCoverageResource(): Resource<
 > {
   if (_resource === null || _actions === null) {
     const [res, actions] = createResource(fetcher, { initialValue: null });
+    // eslint-disable-next-line solid/reactivity -- 模块级单例 resource,使用方在调用 getBtProxyCoverageResource() 时读取
     _resource = res;
     _actions = actions as unknown as ResourceActions;
   }
