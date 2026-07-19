@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# SEC-013 产物签名验证脚本(配置检查,RED 测试)
+# SEC-013 产物签名验证脚本(配置检查)
 #
 # 由于 CI 配置无法用 `cargo test` 测,本脚本以静态检查方式验证
 # release.yml 与 tauri.conf.json 是否已加入产物签名相关配置。
-#
-# 当前仓库未加签名配置,脚本应失败(RED),Implement Agent 加入
-# Tauri updater ed25519 + sigstore cosign keyless 后转为 GREEN。
 #
 # 用法:
 #   bash .github/scripts/verify-signature-config.sh
 #
 # 退出码:
 #   0 = 全部检查通过(签名配置已就位)
-#   1 = 至少一项检查失败(签名配置缺失)
+#   1 = 至少一项检查失败(签名配置缺失/仍为 PLACEHOLDER)
+#
+# 硬化规则:
+#   - updater.pubkey 含 PLACEHOLDER 必须 FAIL（禁止假绿）
+#   - endpoints 必须为非空 URL 数组（python/jq 可靠解析，禁止仅看字段名）
 
 set -euo pipefail
 
@@ -24,54 +25,57 @@ errors=0
 pass_list=()
 fail_list=()
 
+pass() {
+  pass_list+=("$1")
+}
+
+fail() {
+  fail_list+=("$1")
+  errors=$((errors + 1))
+}
+
 check() {
   # check "检查项名称" "期望出现的文件路径(相对仓库根)" "grep 模式"
   local name="$1"
   local file="$2"
   local pattern="$3"
   if [ ! -f "$file" ]; then
-    fail_list+=("$name: 文件不存在 $file")
-    errors=$((errors + 1))
+    fail "$name: 文件不存在 $file"
     return
   fi
   if grep -Eq -- "$pattern" "$file"; then
-    pass_list+=("$name")
+    pass "$name"
   else
-    fail_list+=("$name: 在 $file 中未匹配 /$pattern/")
-    errors=$((errors + 1))
+    fail "$name: 在 $file 中未匹配 /$pattern/"
   fi
 }
 
-check_jq() {
-  # check_jq "检查项名称" "json 文件路径" "jq 查询表达式" "说明"
-  local name="$1"
-  local file="$2"
-  local expr="$3"
-  if [ ! -f "$file" ]; then
-    fail_list+=("$name: 文件不存在 $file")
-    errors=$((errors + 1))
-    return
-  fi
-  local val
-  if command -v jq >/dev/null 2>&1; then
-    if ! val=$(jq -r "$expr" "$file" 2>/dev/null) || [ -z "$val" ] || [ "$val" = "null" ]; then
-      fail_list+=("$name: jq 查询 $expr 在 $file 未命中")
-      errors=$((errors + 1))
-    else
-      pass_list+=("$name ($val)")
-    fi
+# 用 python 可靠解析 JSON（Windows/Linux 均常见；不依赖 jq）
+json_get() {
+  # json_get <file> <python-expr-on-data>
+  local file="$1"
+  local expr="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    PY=python3
+  elif command -v python >/dev/null 2>&1; then
+    PY=python
   else
-    # jq 不可用:回退到 grep 非空字段检查(粗粒度,仅看字段名存在)
-    # 提取表达式末段 key 作为 grep 模式,例如 .plugins.updater.pubkey -> pubkey
-    local key
-    key="$(printf '%s' "$expr" | sed -E 's/^.*\.([a-zA-Z0-9_]+)$/\1/')"
-    if grep -Eq -- "\"$key\"" "$file"; then
-      pass_list+=("$name (grep 回退,字段 $key 存在)")
-    else
-      fail_list+=("$name: jq 不可用且 grep 未在 $file 命中字段 $key")
-      errors=$((errors + 1))
-    fi
+    return 2
   fi
+  "$PY" - "$file" <<PY
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+val = $expr
+if val is None:
+    sys.exit(3)
+if isinstance(val, (list, dict)):
+    import json as _j
+    print(_j.dumps(val, ensure_ascii=False))
+else:
+    print(val)
+PY
 }
 
 release_yml=".github/workflows/release.yml"
@@ -82,53 +86,70 @@ echo "仓库根: $repo_root"
 echo ""
 
 # ── A. Tauri updater ed25519 ──────────────────────────────
-# 1) tauri.conf.json 含 plugins.updater.pubkey 字段
-check_jq \
-  "A1 tauri.conf.json 含 updater.pubkey" \
-  "$tauri_json" \
-  '.plugins.updater.pubkey' \
-  "Tauri updater ed25519 公钥"
+# A1: pubkey 存在且非 PLACEHOLDER
+a1_name="A1 tauri.conf.json updater.pubkey 已配置且非 PLACEHOLDER"
+if [ ! -f "$tauri_json" ]; then
+  fail "$a1_name: 文件不存在 $tauri_json"
+else
+  if pubkey_val="$(json_get "$tauri_json" "data.get('plugins', {}).get('updater', {}).get('pubkey')")"; then
+    if [ -z "$pubkey_val" ] || [ "$pubkey_val" = "null" ]; then
+      fail "$a1_name: pubkey 为空"
+    elif printf '%s' "$pubkey_val" | grep -Eqi 'PLACEHOLDER'; then
+      fail "$a1_name: pubkey 仍为 PLACEHOLDER（禁止发布假绿）: $pubkey_val"
+    else
+      # 不打印完整公钥，仅提示长度
+      pass "$a1_name (len=${#pubkey_val})"
+    fi
+  else
+    fail "$a1_name: 无法解析 JSON（需要 python/python3）"
+  fi
+fi
 
-# 2) tauri.conf.json 含 plugins.updater.endpoints 数组(非空)
-check_jq \
-  "A2 tauri.conf.json 含 updater.endpoints" \
-  "$tauri_json" \
-  '.plugins.updater.endpoints[0]' \
-  "Tauri updater 端点 URL"
+# A2: endpoints 非空且首项为 http(s) URL
+a2_name="A2 tauri.conf.json updater.endpoints 非空 URL"
+if [ ! -f "$tauri_json" ]; then
+  fail "$a2_name: 文件不存在 $tauri_json"
+else
+  if endpoints_json="$(json_get "$tauri_json" "data.get('plugins', {}).get('updater', {}).get('endpoints')")"; then
+    if first_ep="$(json_get "$tauri_json" "(data.get('plugins', {}).get('updater', {}).get('endpoints') or [None])[0]")"; then
+      if [ -z "$first_ep" ] || [ "$first_ep" = "null" ]; then
+        fail "$a2_name: endpoints 为空"
+      elif printf '%s' "$first_ep" | grep -Eq '^https?://'; then
+        pass "$a2_name ($first_ep)"
+      else
+        fail "$a2_name: 首项不是 http(s) URL: $first_ep"
+      fi
+    else
+      fail "$a2_name: endpoints 为空或不可解析 ($endpoints_json)"
+    fi
+  else
+    fail "$a2_name: 无法解析 endpoints"
+  fi
+fi
 
-# 3) release.yml tauri-action step 注入 TAURI_SIGNING_PRIVATE_KEY
+# A3/A4: release.yml 注入签名私钥相关 env
 check \
   "A3 release.yml 含 TAURI_SIGNING_PRIVATE_KEY env" \
   "$release_yml" \
   "TAURI_SIGNING_PRIVATE_KEY"
 
-# 4) release.yml 注入 TAURI_SIGNING_PRIVATE_KEY_PASSWORD(或显式缺省为空)
 check \
   "A4 release.yml 含 TAURI_SIGNING_PRIVATE_KEY_PASSWORD env" \
   "$release_yml" \
   "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
 
-# 5) 产物 .sig 旁路文件生成(Tauri action 自动产生,签名配置生效后产物目录含 .sig)
-#    这里仅校验配置端,.sig 文件级校验交给 install-smoke / publish-release
-#    配置层不直接 grep .sig(易误伤),故 A5 略
-
-# ── B. 签名产物存在性(配置层留空,文件层由 install-smoke 覆盖) ──
-
 # ── C. sigstore cosign keyless ─────────────────────────────
-# 6) publish-release job 声明 id-token: write(OIDC keyless 前提)
 check \
   "C1 release.yml 含 id-token: write 权限" \
   "$release_yml" \
   "id-token:[[:space:]]*write"
 
-# 7) 使用 sigstore/cosign-installer setup action
 check \
   "C2 release.yml 引用 sigstore/cosign-installer" \
   "$release_yml" \
   "sigstore/cosign-installer"
 
-# 8) cosign sign-blob --bundle：允许内联在 release.yml，或经 SSOT 脚本间接调用
-#    Task 3 后 cosign 迁到 scripts/ci/sign-release-artifacts.sh，C3 不能再只扫 yml
+# C3: cosign sign-blob --bundle（内联或 SSOT 脚本）
 sign_script="scripts/ci/sign-release-artifacts.sh"
 c3_name="C3 cosign sign-blob --bundle（release.yml 内联或 SSOT 脚本）"
 c3_ok=0
@@ -140,10 +161,9 @@ elif [ -f "$release_yml" ] && [ -f "$sign_script" ] \
   c3_ok=1
 fi
 if [ "$c3_ok" -eq 1 ]; then
-  pass_list+=("$c3_name")
+  pass "$c3_name"
 else
-  fail_list+=("$c3_name: release.yml 未内联 cosign sign-blob --bundle，且未引用含该调用的 $sign_script")
-  errors=$((errors + 1))
+  fail "$c3_name: release.yml 未内联 cosign sign-blob --bundle，且未引用含该调用的 $sign_script"
 fi
 
 # ── 输出 ───────────────────────────────────────────────────
