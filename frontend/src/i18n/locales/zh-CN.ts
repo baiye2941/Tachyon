@@ -640,12 +640,6 @@ const zhCN = {
   "speedChart.now": "现在",
   "speedChart.ago": "{seconds}秒前",
 
-  // —— 带宽迷你曲线 ——
-  "bandwidthSparkline.title": "速度趋势",
-  "bandwidthSparkline.waiting": "等待速度数据...",
-  "bandwidthSparkline.expand": "展开速度趋势",
-  "bandwidthSparkline.collapse": "收起速度趋势",
-
   // —— 分片矩阵 ——
   "chunk.sectionLabel": "分片分布",
   "chunk.infoHint":

@@ -46,7 +46,6 @@ import { useIsNarrowScreen } from "../hooks/useMediaQuery";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr, type MessageKey } from "../i18n";
 import SpeedChart from "./SpeedChart";
-import BandwidthSparkline from "./BandwidthSparkline";
 import InfoRow from "./DetailInfoRow";
 import Button from "../shared/ui/Button";
 import LiquidProgress from "./LiquidProgress";
@@ -783,7 +782,8 @@ export default function DetailPanel(props: DetailPanelProps) {
             )}
           </Show>
 
-          {/* Activity Metrics — 仅保留不重复的信息:剩余时间 + 并发分片 + mini 带宽曲线 */}
+          {/* Activity Metrics — 仅保留不重复的信息:剩余时间 + 并发分片。
+              速度趋势只保留下方 SpeedChart 大图表一处,不再重复 mini 曲线 */}
           <Show when={isActive()}>
             <div class="detail-section">
               <div class="metric-grid">
@@ -799,10 +799,6 @@ export default function DetailPanel(props: DetailPanelProps) {
                   hint={t("detail.label.concurrency")}
                 />
               </div>
-              <BandwidthSparkline
-                taskId={task()!.id}
-                status={task()?.status}
-              />
             </div>
           </Show>
 

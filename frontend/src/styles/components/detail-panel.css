@@ -601,64 +601,6 @@
   white-space: nowrap;
 }
 
-/* ============================================
-   Bandwidth Sparkline — Activity Metrics mini chart
-   ============================================ */
-.bandwidth-sparkline {
-  margin-top: 8px;
-  border-radius: var(--radius-md);
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-subtle);
-  overflow: hidden;
-}
-
-.bandwidth-sparkline-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 8px 12px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  color: var(--color-text-secondary);
-  transition: color 150ms ease, background 150ms ease;
-}
-
-.bandwidth-sparkline-toggle:hover {
-  color: var(--color-text-primary);
-  background: var(--color-bg-hover);
-}
-
-.bandwidth-sparkline-toggle:focus-visible {
-  outline: 2px solid var(--color-accent-primary);
-  outline-offset: -2px;
-  border-radius: var(--radius-md);
-}
-
-.bandwidth-sparkline-chevron {
-  flex-shrink: 0;
-  transition: transform 180ms ease;
-}
-
-.bandwidth-sparkline-chevron--open {
-  transform: rotate(180deg);
-}
-
-.bandwidth-sparkline-body {
-  padding: 0 12px 10px;
-  min-height: 40px;
-}
-
-.bandwidth-sparkline-empty {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 40px;
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-}
-
 .detail-tag:hover {
   background: var(--color-bg-active);
 }

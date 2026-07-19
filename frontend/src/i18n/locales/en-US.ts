@@ -663,12 +663,6 @@ const enUS = {
   "speedChart.now": "Now",
   "speedChart.ago": "{seconds}s ago",
 
-  // —— Bandwidth sparkline ——
-  "bandwidthSparkline.title": "Speed Trend",
-  "bandwidthSparkline.waiting": "Waiting for speed data...",
-  "bandwidthSparkline.expand": "Expand speed trend",
-  "bandwidthSparkline.collapse": "Collapse speed trend",
-
   // —— Chunk matrix ——
   "chunk.sectionLabel": "Fragment Distribution",
   "chunk.infoHint":
