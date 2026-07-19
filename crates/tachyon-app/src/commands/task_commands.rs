@@ -2544,13 +2544,16 @@ mod tests {
             cfg.download.download_dir = test_dir_str.clone();
             cfg.download.authorized_dirs = vec![test_dir_str];
         }
+        // auto_start=false 保持 Pending:门控对 Pending+Downloading 同样计数,
+        // 且避免 auto_start 后任务因真实网络环境(CI 直连 example.com 可能
+        // 秒级完成/失败)在第三次 create 前移出计数状态,导致断言环境敏感
         let _id1 = create_task_inner(
             &state,
             "http://example.com/file1.bin".into(),
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await
@@ -2561,7 +2564,7 @@ mod tests {
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await
@@ -2572,7 +2575,7 @@ mod tests {
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await;
