@@ -2,9 +2,10 @@
 //!
 //! 将后端任务进度状态投影为前端可消费的 ProgressEvent。
 //! 职责：
-//! - 全局 progress aggregator：事件驱动 + 250ms 超时兜底扫描
+//! - 全局 progress aggregator：事件驱动 + 250ms 无脏通知时的兜底 tick
 //! - ChunkReaderPool 通过 mark_dirty + Notify 唤醒 aggregator
 //! - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
+//! - 订阅侧 Lagged 时由 `build_lagged_resync_event` 合成权威全量，保证 delta 最终一致
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,8 +23,10 @@ use crate::repository::TaskRepository;
 use crate::runtime::chunk_reader_pool::ProgressDelta;
 use tachyon_core::types::DownloadState;
 
-/// 审计 M-03:broadcast 容量;过小会在慢订阅者下 lag 丢事件
-const PROGRESS_BROADCAST_CAPACITY: usize = 64;
+/// 审计 M-03:broadcast 容量;过小会在慢订阅者下 lag 丢事件。
+/// 64 在多分片高频 tick 下易触发 Lagged；抬到 256 降低 resync 频率。
+/// 即便仍 Lagged，`subscribe_progress` 也会合成权威全量 resync 保证最终一致。
+const PROGRESS_BROADCAST_CAPACITY: usize = 256;
 
 /// 任务终态通知 payload
 ///
@@ -61,15 +64,20 @@ impl NotificationEmitter for tauri::AppHandle {
     }
 }
 
-/// 聚合扫描间隔（毫秒）
+/// 无脏通知时的兜底 tick 间隔（毫秒）。
+///
+/// **不是**最小发送间隔：有 `mark_dirty`/`Notify` 时会立即唤醒聚合；
+/// 本值仅在安静期保证进度字段仍能刷新。Lagged 恢复不依赖该间隔，
+/// 由 `subscribe_progress` 的权威 resync 保证 delta 最终一致。
 const AGGREGATOR_INTERVAL_MS: u64 = 250;
 
 /// 进度事件代理
 ///
 /// 全局 progress aggregator：
 /// - 事件驱动：ChunkReaderPool 通过 mark_dirty + Notify 唤醒 aggregator
-/// - 250ms 超时兜底：确保无通知时也能更新
+/// - 250ms 兜底 tick：无脏通知时仍刷新进度字段（非最小发送间隔）
 /// - 合并后发送单个 ProgressEvent，替代每个任务独立的 500ms monitor
+/// - 订阅侧 Lagged 时合成权威 resync，保证分片 delta 最终一致
 pub struct ProgressBroker {
     progress_tx: broadcast::Sender<ProgressEvent>,
     /// 需要聚合的任务列表引用
@@ -114,7 +122,8 @@ impl ProgressBroker {
     /// 启动全局 event-driven aggregator
     ///
     /// **必须在 Tokio reactor 上下文中调用**（如 Tauri `setup` 钩子内）。
-    /// aggregator 由 ChunkReaderPool 的 mark_dirty 通知唤醒，辅以 250ms 超时兜底。
+    /// aggregator 由 ChunkReaderPool 的 mark_dirty 通知唤醒，辅以 250ms 无脏通知兜底 tick
+    ///（非最小发送间隔；Lagged 恢复见 `subscribe_progress` 权威 resync）。
     /// 幂等：多次调用只启动一个 aggregator（通过 AtomicBool 防重复）。
     pub fn spawn_aggregator(&self) {
         if self.aggregator_spawned.swap(true, Ordering::AcqRel) {

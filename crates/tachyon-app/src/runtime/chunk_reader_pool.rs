@@ -281,10 +281,6 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
             } => {
                 // 覆盖真实分片数(替代 probe 估算)
                 total_frags = total;
-                if let Some(mut task) = task_repository.get_mut(&task_id) {
-                    task.fragments_total = total;
-                    task.active_concurrency = initial_concurrency;
-                }
                 // 初始化 FragmentStateStore
                 let state = crate::projection::TaskFragmentState::from_plan(
                     total,
@@ -293,13 +289,87 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 fragment_state_store.init(&task_id, state);
                 // 初始化 completed 集合(续传已完成分片)
                 completed = completed_indices.into_iter().collect();
-                // 触发广播(让前端拿到正确 total + concurrency)
+
+                // 从快照种子 total_downloaded / frag_bytes,避免续传后进度回退与双重计数。
+                // 有 snapshot 时用 snap.downloaded + partial_fragments;
+                // 无 snapshot 时 fallback 到 task_repository 中现有 downloaded。
+                match task_store.load_snapshot(&task_id) {
+                    Ok(Some(snap)) => {
+                        // 一致性校验:快照已完成分片必须 ⊆ PlanComplete 宣告的
+                        // completed_indices。引擎在对象身份不兼容等场景会丢弃
+                        // 续传数据全量重下,此时 completed_indices 不含快照分片;
+                        // 照收快照种子会让 total_downloaded 虚高(种子+重下双计),
+                        // 且 checkpoint 会把虚高值写回快照。校验失败退回 fallback。
+                        let snapshot_matches_plan = snap
+                            .completed_fragments
+                            .iter()
+                            .all(|idx| completed.contains(idx));
+                        if snapshot_matches_plan {
+                            frag_bytes = snap.partial_fragments;
+                            total_downloaded = snap.downloaded;
+                        } else {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                snap_completed = snap.completed_fragments.len(),
+                                plan_completed = completed.len(),
+                                "快照与 PlanComplete 续传决策不一致,放弃快照种子"
+                            );
+                            total_downloaded = task_repository
+                                .get(&task_id)
+                                .map(|t| t.downloaded)
+                                .unwrap_or(0);
+                        }
+                    }
+                    Ok(None) => {
+                        total_downloaded = task_repository
+                            .get(&task_id)
+                            .map(|t| t.downloaded)
+                            .unwrap_or(0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "PlanComplete 加载快照失败,fallback 到 repository downloaded"
+                        );
+                        total_downloaded = task_repository
+                            .get(&task_id)
+                            .map(|t| t.downloaded)
+                            .unwrap_or(0);
+                    }
+                }
+
+                let frags_done = completed.len() as u32;
+                if let Some(mut task) = task_repository.get_mut(&task_id) {
+                    task.downloaded = total_downloaded;
+                    task.fragments_done = frags_done;
+                    task.fragments_total = total;
+                    task.active_concurrency = initial_concurrency;
+                    // 与 Chunk 分支同一进度公式
+                    if let Some(file_size) = task.file_size.filter(|&s| s > 0) {
+                        task.progress =
+                            (total_downloaded as f64 / file_size as f64).clamp(0.0, 1.0);
+                    } else if total_frags > 0 {
+                        task.progress = (frags_done as f64 / total_frags as f64).clamp(0.0, 1.0);
+                    }
+                }
+
+                // 触发广播(delta=None + 当前 frag_bytes 快照)
                 if let Some(ref callback) = on_progress {
-                    callback(&task_id, None, &[]);
+                    let bytes_snapshot: Vec<FragmentByteEntry> = frag_bytes
+                        .iter()
+                        .map(|(&k, &v)| FragmentByteEntry {
+                            index: k,
+                            downloaded: v,
+                        })
+                        .collect();
+                    callback(&task_id, None, &bytes_snapshot);
                 }
                 tracing::info!(
                     task_id = %task_id,
                     total_frags,
+                    total_downloaded,
+                    frags_done,
                     "PlanComplete 已处理"
                 );
             }
@@ -521,14 +591,91 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use crate::commands::TaskInfo;
     use crate::repository::TaskRepository;
     use tachyon_core::types::DownloadState;
+    use tachyon_store::TaskSnapshot;
 
     /// 创建测试用 TaskStore
     fn test_task_store() -> Arc<TaskStore> {
         let tmp = tempfile::tempdir().unwrap();
         Arc::new(TaskStore::open(tmp.path()).unwrap())
+    }
+
+    /// 创建带生命周期的 TaskStore(持有 TempDir 防止目录被清理)
+    fn test_task_store_kept() -> (Arc<TaskStore>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(tmp.path()).unwrap());
+        (store, tmp)
+    }
+
+    fn make_task_info(
+        id: &str,
+        file_size: u64,
+        downloaded: u64,
+        fragments_total: u32,
+        fragments_done: u32,
+    ) -> TaskInfo {
+        TaskInfo {
+            id: id.to_string(),
+            url: format!("https://example.com/{id}.bin"),
+            file_name: format!("{id}.bin"),
+            file_size: Some(file_size),
+            downloaded,
+            speed: 0,
+            status: DownloadState::Downloading,
+            progress: if file_size > 0 {
+                downloaded as f64 / file_size as f64
+            } else {
+                0.0
+            },
+            fragments_total,
+            fragments_done,
+            active_concurrency: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            save_path: format!("/tmp/{id}.bin"),
+            error_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
+
+    fn make_resume_snapshot(
+        task: &TaskInfo,
+        completed_fragments: Vec<u32>,
+        partial_fragments: HashMap<u32, u64>,
+        fragment_size: u64,
+    ) -> TaskSnapshot {
+        TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: task.id.clone(),
+            url: task.url.clone(),
+            save_path: task.save_path.clone(),
+            file_name: task.file_name.clone(),
+            file_size: task.file_size,
+            downloaded: task.downloaded,
+            completed_fragments,
+            partial_fragments,
+            total_fragments: task.fragments_total,
+            fragment_size,
+            status: task.status,
+            etag: None,
+            last_modified: None,
+            content_length: task.file_size,
+            supports_range: true,
+            created_at: task.created_at.clone(),
+            updated_at: task.created_at.clone(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+        }
     }
 
     #[tokio::test]
@@ -1051,5 +1198,405 @@ mod tests {
             .map(|t| t.active_concurrency)
             .unwrap_or(u32::MAX);
         panic!("active_concurrency 未在预期时间内达到 {expected}, 实际 {actual}");
+    }
+
+    async fn wait_for_downloaded(task_repository: &TaskRepository, task_id: &str, expected: u64) {
+        for _ in 0..50 {
+            if task_repository.get(task_id).map(|t| t.downloaded) == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PlanComplete 应从 TaskStore 快照种子 total_downloaded,
+    /// 续传后新 Chunk 在种子值上累加,进度不回退。
+    #[tokio::test]
+    async fn plan_complete_seeds_downloaded_from_snapshot() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-seed-dl".to_string();
+
+        // 续传场景: 已完成 2 片(250+250) + partial 片 2 的 50 字节 = 750
+        let task = make_task_info(&task_id, 1000, 750, 4, 2);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let mut partial = HashMap::new();
+        partial.insert(2, 50_u64);
+        let snapshot = make_resume_snapshot(&task, vec![0, 1], partial, 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![0, 1],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 续传后新分片 3 上报 10 字节: 在种子 750 基础上 +10 = 760
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 3,
+                fragment_downloaded: 10,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 760).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 760,
+            "PlanComplete 应从 snapshot 种子 downloaded=750, 再 +Chunk(10) => 760; 实际 {}",
+            task.downloaded
+        );
+        assert_eq!(
+            task.fragments_done, 2,
+            "completed_indices 应反映 fragments_done=2"
+        );
+        assert!(
+            (task.progress - 0.76).abs() < 0.001,
+            "progress 应约 0.76, 实际 {}",
+            task.progress
+        );
+    }
+
+    /// PlanComplete 应种子 partial_fragments,后续 Chunk 按差量累加,不双重计数。
+    #[tokio::test]
+    async fn plan_complete_seeds_partial_bytes_no_double_count() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-seed-partial".to_string();
+
+        // 续传: 完成片 0(250) + partial 片 1 的 100 = 350 / 500
+        let task = make_task_info(&task_id, 500, 350, 2, 1);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let mut partial = HashMap::new();
+        partial.insert(1, 100_u64);
+        let snapshot = make_resume_snapshot(&task, vec![0], partial, 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 2,
+                completed_indices: vec![0],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+
+        // 片 1 从已种子的 100 推进到 150: delta=50, 期望 350+50=400
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                fragment_downloaded: 150,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 400).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 400,
+            "partial 已种子 100 时 Chunk(150) 只应 +50 => 400; 实际 {}",
+            task.downloaded
+        );
+    }
+
+    /// 快照与引擎续传决策失配时不得采用快照种子。
+    ///
+    /// 场景:对象身份不兼容,引擎丢弃续传数据全量重下,PlanComplete 的
+    /// completed_indices 为空;磁盘快照仍是旧的(completed=[0,1],
+    /// downloaded=750)。若照收快照种子,total_downloaded 虚高
+    /// (750 + 重下字节),后续 checkpoint 还会把虚高值写回快照。
+    /// 期望:放弃快照种子,退回 repository 现有 downloaded(此处 0)。
+    #[tokio::test]
+    async fn plan_complete_rejects_snapshot_seed_when_plan_discards_resume() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-seed-mismatch".to_string();
+
+        // 全量重下:repository 中任务从 0 开始;旧快照仍为 750
+        let task = make_task_info(&task_id, 1000, 0, 4, 0);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let mut stale_task = task.clone();
+        stale_task.downloaded = 750;
+        let mut partial = HashMap::new();
+        partial.insert(2, 50_u64);
+        let snapshot = make_resume_snapshot(&stale_task, vec![0, 1], partial, 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        // 引擎未采纳任何续传分片:completed_indices 为空
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 重下的分片 0 上报 100 字节:应从 0 起 +100 = 100,而非种子 750+100=850
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 100,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 100).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 100,
+            "快照 completed=[0,1] 不在 PlanComplete completed_indices=[] 内,应放弃快照种子; \
+             期望 0+100=100, 实际 {}",
+            task.downloaded
+        );
+        assert_eq!(
+            task.fragments_done, 0,
+            "completed_indices 为空时 fragments_done 应为 0"
+        );
+    }
+
+    /// 无快照时 fallback 到 repository 现有 downloaded,而非从 0 起算。
+    ///
+    /// 场景:快照文件丢失/未写入,但任务列表已有累计字节(如内存态恢复)。
+    /// 期望:PlanComplete 后 downloaded 保持 repository 值,Chunk 在其上累加。
+    #[tokio::test]
+    async fn plan_complete_falls_back_to_repository_downloaded_without_snapshot() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-no-snapshot".to_string();
+
+        // 不写任何快照;repository 已有 300 字节
+        let task = make_task_info(&task_id, 1000, 300, 4, 1);
+        task_repository.insert(task_id.clone(), task);
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![0],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 分片 1 上报 50 字节: 应在 fallback 300 上 +50 = 350
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                fragment_downloaded: 50,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 350).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 350,
+            "无快照应 fallback 到 repository downloaded=300, 再 +50 => 350; 实际 {}",
+            task.downloaded
+        );
+    }
+
+    /// 快照 partial 为空但 completed 非空时,按快照 downloaded 正常种子。
+    ///
+    /// 场景:上次退出时所有 partial 已刷成完整分片。期望:种子 500,
+    /// 后续 Chunk 在其上累加,frag_bytes 从空集开始。
+    #[tokio::test]
+    async fn plan_complete_seeds_with_empty_partial_and_nonempty_completed() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-empty-partial".to_string();
+
+        // 已完成 2 片共 500,无 partial
+        let task = make_task_info(&task_id, 1000, 500, 4, 2);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let snapshot = make_resume_snapshot(&task, vec![0, 1], HashMap::new(), 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![0, 1],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 新分片 2 上报 100 字节: 种子 500 + 100 = 600
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 2,
+                fragment_downloaded: 100,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 600).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 600,
+            "partial 为空 + completed=[0,1] 应种子 500, 再 +100 => 600; 实际 {}",
+            task.downloaded
+        );
+        assert_eq!(task.fragments_done, 2);
+    }
+
+    /// snap.downloaded==0 且 completed 非空时,按快照原值种子 0,不编造字节数。
+    ///
+    /// 场景:快照 completed_fragments 已写入但 downloaded 字段未刷(异常退出
+    /// 窗口期)。期望:total_downloaded 取快照原值 0,不从
+    /// completed.len()×fragment_size 推算虚构字节。
+    #[tokio::test]
+    async fn plan_complete_seeds_zero_downloaded_without_fabricating_size() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-zero-downloaded".to_string();
+
+        // 快照 completed=[0,1] 但 downloaded=0
+        let task = make_task_info(&task_id, 1000, 0, 4, 2);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let snapshot = make_resume_snapshot(&task, vec![0, 1], HashMap::new(), 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![0, 1],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 0,
+            "snap.downloaded==0 时应按原值种子 0, 不应编造 2×250=500; 实际 {}",
+            task.downloaded
+        );
+        assert_eq!(
+            task.fragments_done, 2,
+            "completed_indices=[0,1] 仍应反映 fragments_done=2"
+        );
     }
 }
