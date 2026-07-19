@@ -1410,6 +1410,9 @@ impl DownloadTask {
 
         // 逐块消费并写入,顺序追加偏移
         let mut pos: u64 = 0;
+        // 与分片路径同一节流模式:每 PROGRESS_REPORT_CHUNK_INTERVAL 个 chunk
+        // 上报一次增量,避免高频上报放大下游 checkpoint(fsync)开销
+        let mut progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
         tokio::pin!(stream);
         // B11:改裸 `while let stream.next().await` 为 `loop { select!{...} }`,
         // 使取消信号能在"无 chunk 到达"时(如死连接静默挂起)穿透到检查点。
@@ -1474,6 +1477,14 @@ impl DownloadTask {
                 )));
             }
             pos += written;
+            // 整块路径进度:与分片路径同一 countdown 节流,每
+            // PROGRESS_REPORT_CHUNK_INTERVAL 个 chunk 按累计写入字节上报一次增量;
+            // 终态 completed Chunk 在 durable sync 后单独发送,不经过此节流
+            progress_report_countdown = progress_report_countdown.saturating_sub(1);
+            if progress_report_countdown == 0 {
+                Self::report_progress(0, pos, &self.progress_tx);
+                progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
+            }
             if let Some(ref limiter) = rate_limiter {
                 limiter.acquire(written).await;
             }
@@ -1499,6 +1510,15 @@ impl DownloadTask {
 
         // 审计 P0-3:整块路径在标 Completed 前 durable sync,避免快照/状态领先于落盘
         storage.as_ref().sync().await?;
+
+        // 成功路径：durable 后发 completed:true，错误返回路径不发送
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.try_send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: true,
+                fragment_downloaded: pos,
+            });
+        }
 
         if let Some(frag) = self.fragments.first_mut() {
             if frag.state == crate::fragment::FragmentState::Pending {
@@ -10796,6 +10816,196 @@ mod tests {
         assert!(
             matches!(result, Err(DownloadError::Cancelled)),
             "B11: stalled 流下取消应返回 Cancelled,实际: {result:?}"
+        );
+    }
+
+    // ===== Task 5: execute_full_download 整块路径进度上报 =====
+
+    /// 多块整块流协议:probe 成功(不支持 Range),download_full_stream 产出 N 块。
+    /// 供整块路径进度上报相关测试复用。
+    struct MultiChunkFullProtocol {
+        meta: FileMetadata,
+        chunks: Vec<Bytes>,
+    }
+    impl Clone for MultiChunkFullProtocol {
+        fn clone(&self) -> Self {
+            Self {
+                meta: self.meta.clone(),
+                chunks: self.chunks.clone(),
+            }
+        }
+    }
+    impl Protocol for MultiChunkFullProtocol {
+        fn probe(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>> {
+            let meta = self.meta.clone();
+            Box::pin(async move { Ok(meta) })
+        }
+        fn download_range(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+            _identity: Option<ObjectIdentity>,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+            Box::pin(async { Err(DownloadError::Protocol("不应调用 download_range".into())) })
+        }
+        fn download_range_stream(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end: u64,
+            _identity: Option<ObjectIdentity>,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+            Box::pin(async {
+                Err(DownloadError::Protocol(
+                    "不应调用 download_range_stream".into(),
+                ))
+            })
+        }
+        fn download_full(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+            // 不会到达:execute_full_download 走 download_full_stream
+            Box::pin(async { Err(DownloadError::Protocol("不应调用 download_full".into())) })
+        }
+        fn download_full_stream(
+            &self,
+            _url: &str,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+            let chunks = self.chunks.clone();
+            Box::pin(async move {
+                let items: Vec<DownloadResult<Bytes>> = chunks.into_iter().map(Ok).collect();
+                Ok(Box::pin(futures::stream::iter(items)) as ByteStream)
+            })
+        }
+    }
+
+    /// 构造不支持 Range 的整块下载(chunk_count × chunk_size 字节),跑完整下载
+    /// 并收集全部 FragmentProgress 事件
+    async fn run_full_download_collect_events(
+        chunk_count: usize,
+        chunk_size: usize,
+    ) -> Vec<FragmentProgress> {
+        let total = (chunk_size * chunk_count) as u64;
+        let chunks: Vec<Bytes> = (0..chunk_count)
+            .map(|i| Bytes::from(vec![0xA0 + i as u8; chunk_size]))
+            .collect();
+        // 不支持 Range → 走 execute_full_download 路径
+        let meta = FileMetadata {
+            file_name: "full-progress.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(MultiChunkFullProtocol { meta, chunks });
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/full-progress.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<FragmentProgress>(64);
+        task.set_progress_sender(progress_tx);
+
+        task.run().await.expect("整块多 chunk 下载应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(50), progress_rx.recv()).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 统计增量 Chunk(completed:false 且字节数>0)与终态 Chunk(completed:true)事件数
+    fn count_full_progress_events(events: &[FragmentProgress]) -> (usize, usize) {
+        let incremental = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    FragmentProgress::Chunk {
+                        completed: false,
+                        fragment_downloaded,
+                        ..
+                    } if *fragment_downloaded > 0
+                )
+            })
+            .count();
+        let completed = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    FragmentProgress::Chunk {
+                        completed: true,
+                        fragment_index: 0,
+                        ..
+                    }
+                )
+            })
+            .count();
+        (incremental, completed)
+    }
+
+    /// 整块路径(supports_range=false → execute_full_download_once)必须报告 Chunk 进度。
+    ///
+    /// 与分片路径对齐:增量 Chunk 按 PROGRESS_REPORT_CHUNK_INTERVAL(5)个 chunk
+    /// 节流上报,终态 completed:true 单独发送不节流。
+    ///
+    /// 构造 7×100 字节多块流(超过节流间隔,保证至少 1 条增量);跑完整下载。
+    /// 期望:至少 1 条增量 Chunk(completed:false, fragment_downloaded>0),
+    /// 以及恰好 1 条终态 Chunk(completed:true, fragment_index=0)。
+    #[tokio::test]
+    async fn full_download_reports_chunk_progress() {
+        let events = run_full_download_collect_events(7, 100).await;
+        let (incremental, completed) = count_full_progress_events(&events);
+        assert!(
+            incremental >= 1,
+            "整块路径应至少报告 1 条增量 Chunk(completed:false, fragment_downloaded>0), \
+             实际 events={events:?}"
+        );
+        assert_eq!(
+            completed, 1,
+            "整块路径应恰好报告 1 条 fragment_index=0 的 completed:true Chunk, \
+             实际 events={events:?}"
+        );
+    }
+
+    /// 整块路径增量进度必须按 PROGRESS_REPORT_CHUNK_INTERVAL 节流(与分片路径
+    /// 同一 countdown 模式),否则下游 chunk reader 每 20 事件触发一次
+    /// put_durable(fsync)checkpoint,fsync 频率可达分片路径 20-80 倍。
+    ///
+    /// 构造 12×100 字节流:12 个网络 chunk 应恰好产生 12/5=2 条增量 Chunk,
+    /// 外加 1 条不节流的终态 completed Chunk。
+    #[tokio::test]
+    async fn full_download_throttles_chunk_progress() {
+        let events = run_full_download_collect_events(12, 100).await;
+        let (incremental, completed) = count_full_progress_events(&events);
+        assert_eq!(
+            incremental, 2,
+            "12 个网络 chunk 按间隔 5 节流应产生 2 条增量 Chunk, 实际 events={events:?}"
+        );
+        assert_eq!(
+            completed, 1,
+            "终态 completed Chunk 不节流,应恰好 1 条, 实际 events={events:?}"
         );
     }
 
