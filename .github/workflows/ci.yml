@@ -370,15 +370,48 @@ jobs:
     # bench 已移出关键路径（main 采样保留，失败不阻断 ci-pass）
     # 审计 C2:MSRV 必须纳入汇总,否则 1.85 编译失败仍可能显示 CI 全绿
     # skipped 视为通过：path filter 跳过的重 job 不阻断
+    # 注意：needs.*.result 在 GHA 中不会展开为各 job 结果列表（会变成字面量 "Array"），
+    # 必须逐个引用 needs.<job>.result，否则 failure 会被静默放过（假绿）。
     needs: [changes, fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, frontend, msrv]
     steps:
       - name: 检查所有 CI 作业是否成功
+        env:
+          R_CHANGES: ${{ needs.changes.result }}
+          R_FMT: ${{ needs.fmt.result }}
+          R_CLIPPY: ${{ needs.clippy.result }}
+          R_TEST: ${{ needs.test.result }}
+          R_DOCS: ${{ needs.docs.result }}
+          R_AUDIT: ${{ needs.audit.result }}
+          R_CARGO_AUDIT: ${{ needs.cargo-audit.result }}
+          R_TAPLO: ${{ needs.taplo.result }}
+          R_COVERAGE: ${{ needs.coverage.result }}
+          R_MIRI: ${{ needs.miri.result }}
+          R_FRONTEND: ${{ needs.frontend.result }}
+          R_MSRV: ${{ needs.msrv.result }}
         run: |
-          jobs="${{ needs.*.result }}"
-          for result in $jobs; do
+          set -euo pipefail
+          failed=0
+          check() {
+            local name="$1" result="$2"
+            echo "$name=$result"
             if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "::error::CI 作业失败或被取消: $result"
-              exit 1
+              echo "::error::CI 作业失败或被取消: $name=$result"
+              failed=1
             fi
-          done
+          }
+          check changes "$R_CHANGES"
+          check fmt "$R_FMT"
+          check clippy "$R_CLIPPY"
+          check test "$R_TEST"
+          check docs "$R_DOCS"
+          check audit "$R_AUDIT"
+          check cargo-audit "$R_CARGO_AUDIT"
+          check taplo "$R_TAPLO"
+          check coverage "$R_COVERAGE"
+          check miri "$R_MIRI"
+          check frontend "$R_FRONTEND"
+          check msrv "$R_MSRV"
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
           echo "所有 CI 作业通过（skipped 允许）"

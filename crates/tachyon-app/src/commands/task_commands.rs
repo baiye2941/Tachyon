@@ -2533,7 +2533,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_concurrent_tasks_rejects() {
-        let state = AppState::new();
+        // 必须用 test_state()（独立临时 store），禁止 AppState::new()：
+        // 全局 ~/.tachyon/store 在 nextest 并行下会锁冲突。
+        let state = test_state();
         {
             let mut cfg = state.domain.config.lock().await;
             cfg.max_concurrent_tasks = 2;
