@@ -284,7 +284,11 @@ pub struct TaskProgress {
     pub started_delta: Vec<u32>,
     /// 任务失败原因。Failed 终态时由后端写入,通过进度事件同步到前端,
     /// 避免 UI 依赖 get_task_list 全量刷新才能展示错误详情(P1-22-4)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// 三态 wire 编码:None 显式序列化为 "errorReason":null(不加 skip)。
+    /// 前端 FT-04 分支依赖显式 null 清空残留错误文案;若字段缺失,
+    /// 前端会保持旧值,失败任务 cancel 后错误文案将永远清不掉。
+    #[serde(default)]
     pub error_reason: Option<String>,
     /// 活跃分片字节级进度快照(仅 downloading_set 中的分片)。
     /// 快照式:前端无状态、幂等、丢包自愈。空时 skip 以省带宽。
@@ -1036,6 +1040,54 @@ pub(crate) mod tests {
         assert_eq!(deserialized.id, "test-id");
         assert_eq!(deserialized.file_size, Some(1024));
         assert!((deserialized.progress - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// 构造测试用 TaskProgress,减少字面量样板
+    fn make_progress(error_reason: Option<&str>) -> TaskProgress {
+        TaskProgress {
+            id: "t1".to_string(),
+            progress: 0.0,
+            speed: 0,
+            downloaded: 0,
+            status: DownloadState::Cancelled,
+            fragments_done: 0,
+            fragments_total: 0,
+            active_concurrency: 0,
+            file_size: None,
+            completed_delta: vec![],
+            started_delta: vec![],
+            error_reason: error_reason.map(String::from),
+            fragment_bytes: vec![],
+        }
+    }
+
+    #[test]
+    fn test_task_progress_error_reason_none_serializes_explicit_null() {
+        // BUG G:三态 wire 编码。error_reason=None 必须序列化为 "errorReason":null,
+        // 前端 FT-04 分支(downloads.ts updateProgress)依赖显式 null 清空残留
+        // 错误文案;字段缺失(旧 skip 行为)会被前端当作「保持不变」,
+        // 失败任务 cancel 后错误文案永远清不掉。
+        let json = serde_json::to_string(&make_progress(None)).unwrap();
+        assert!(
+            json.contains(r#""errorReason":null"#),
+            "error_reason=None 应序列化为 \"errorReason\":null,实际: {json}"
+        );
+    }
+
+    #[test]
+    fn test_task_progress_error_reason_some_serializes_value() {
+        let json = serde_json::to_string(&make_progress(Some("HTTP 404"))).unwrap();
+        assert!(
+            json.contains(r#""errorReason":"HTTP 404""#),
+            "error_reason=Some 应序列化原始值,实际: {json}"
+        );
+        // 反序列化兼容:值往返不变
+        let decoded: TaskProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.error_reason.as_deref(), Some("HTTP 404"));
+        // 旧版 JSON(无 errorReason 字段)经 #[serde(default)] 反序列化为 None
+        let legacy = r#"{"id":"t1","progress":0.0,"speed":0,"downloaded":0,"status":"cancelled","fragmentsDone":0}"#;
+        let decoded: TaskProgress = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.error_reason, None);
     }
 
     #[tokio::test]

@@ -803,6 +803,70 @@ async fn test_undo_cancel_restores_previous_status() {
 }
 
 #[tokio::test]
+async fn test_undo_cancel_from_failed_restores_error_reason() {
+    // BUG G:失败任务 cancel 会双写清除 error_reason(内存 + 快照),
+    // undo_cancel 恢复 Failed 状态时必须一并恢复原始失败原因,
+    // 否则前端诊断面板只剩 Failed 状态而无错误详情。
+    let (service, _dir) = make_service();
+    let mut task = make_task("t1", "f.bin", "/dl".into());
+    task.status = DownloadState::Failed;
+    task.error_reason = Some("HTTP 404".to_string());
+    service.task_repository.insert("t1".to_string(), task);
+
+    service.cancel_task("t1").await.unwrap();
+    // cancel 清除 error_reason 是既有行为(双写),保持不变
+    assert_eq!(service.get_task_detail("t1").unwrap().error_reason, None);
+
+    // 等待 cancel 快照落盘(persist_snapshot 为 spawn_blocking fire-and-forget,
+    // 且存储层有 revision CAS:若 undo 写入携带的 revision 落后于磁盘会被拒)。
+    // 真实场景中 undo 必发生在 cancel 落盘之后,此处模拟该时序。
+    let mut cancelled = false;
+    for _ in 0..50 {
+        if let Ok(Some(s)) = service.task_store.load_snapshot("t1")
+            && s.status == DownloadState::Cancelled
+        {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cancelled, "cancel 快照应在 1 秒内落盘");
+
+    let restored = service.undo_cancel_task("t1").await.unwrap();
+    assert_eq!(restored, DownloadState::Failed);
+    assert_eq!(
+        service
+            .get_task_detail("t1")
+            .unwrap()
+            .error_reason
+            .as_deref(),
+        Some("HTTP 404"),
+        "undo_cancel 应恢复 cancel 前的 error_reason"
+    );
+
+    // 持久化快照也应恢复 fail_reason(persist_snapshot 内部为 spawn_blocking
+    // fire-and-forget,轮询等待落盘,避免竞态)
+    let mut persisted = None;
+    for _ in 0..50 {
+        if let Ok(Some(s)) = service.task_store.load_snapshot("t1")
+            && s.status == DownloadState::Failed
+        {
+            persisted = Some(s.fail_reason.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    match persisted {
+        Some(reason) => assert_eq!(
+            reason.as_deref(),
+            Some("HTTP 404"),
+            "快照应恢复 fail_reason"
+        ),
+        None => panic!("快照应在 1 秒内恢复为 Failed 状态"),
+    }
+}
+
+#[tokio::test]
 async fn test_undo_cancel_from_paused_restores_paused() {
     let (service, _dir) = make_service();
     service
@@ -837,6 +901,7 @@ async fn test_undo_cancel_timeout_fails() {
         "t1".to_string(),
         super::UndoRecord::Cancel {
             previous_status: DownloadState::Downloading,
+            previous_error_reason: None,
             timestamp: Instant::now() - Duration::from_secs(31),
         },
     );

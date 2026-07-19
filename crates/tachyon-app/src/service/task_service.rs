@@ -73,6 +73,8 @@ enum UndoRecord {
     /// 取消任务前的状态快照
     Cancel {
         previous_status: DownloadState,
+        /// 取消前的失败原因(cancel 会双写清除 error_reason,undo 需恢复)
+        previous_error_reason: Option<String>,
         timestamp: Instant,
     },
     /// 删除任务前保留的完整任务记录与快照(仅 delete_local_file == false)
@@ -534,7 +536,7 @@ impl TaskService {
 
     /// 取消任务
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), AppError> {
-        let previous_status = {
+        let (previous_status, previous_error_reason) = {
             let mut task = self
                 .task_repository
                 .get_mut(task_id)
@@ -545,19 +547,22 @@ impl TaskService {
                 }
                 _ => {
                     let previous = task.status;
+                    // 捕获失败原因供 undo 恢复:下方 persist_snapshot 会双写清除它
+                    let prev_reason = task.error_reason.clone();
                     task.status = DownloadState::Cancelled;
                     task.speed = 0;
                     tracing::info!(task_id = %task_id, "取消任务");
-                    previous
+                    (previous, prev_reason)
                 }
             }
         };
 
-        // 记录撤销信息:取消前状态
+        // 记录撤销信息:取消前状态与失败原因
         self.undo_records.insert(
             task_id.to_string(),
             UndoRecord::Cancel {
                 previous_status,
+                previous_error_reason,
                 timestamp: Instant::now(),
             },
         );
@@ -669,6 +674,7 @@ impl TaskService {
             .ok_or_else(|| AppError::Config("该任务无可用撤销记录".to_string()))?;
         let UndoRecord::Cancel {
             previous_status,
+            previous_error_reason,
             timestamp,
         } = record
         else {
@@ -689,7 +695,9 @@ impl TaskService {
             }
         }
 
-        self.persist_snapshot(task_id, None).await;
+        // persist_snapshot 会同步内存 task.error_reason 与快照 fail_reason,
+        // 恢复 Failed 状态时一并恢复 cancel 前的失败原因
+        self.persist_snapshot(task_id, previous_error_reason).await;
         tracing::info!(
             task_id = %task_id,
             previous_status = %previous_status,
