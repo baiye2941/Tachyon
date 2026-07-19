@@ -91,7 +91,9 @@
 }
 
 .chunk-cell--downloading {
-  background: var(--color-status-downloading);
+  /* 底色降为低强度:不透明 token 实色会与充能条渐变(同名色)叠加,
+     填充区/非填充区颜色一致导致字节进度不可见 */
+  background: color-mix(in srgb, var(--color-status-downloading) 28%, transparent);
   box-shadow: 0 0 6px color-mix(in srgb, var(--color-accent-primary) 16%, transparent);
 }
 

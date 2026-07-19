@@ -482,26 +482,33 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
       }
 
       // 2) 块底色
+      // 下载中块底色降为低 alpha 同名色(≈0.28,与 DOM 端 28% color-mix 同档):
+      // 不透明实色会与全强度渐变 overlay 同色叠加,导致字节进度不可见。
+      // pulse 呼吸仍由 globalAlpha 承载(0.85~1.0 振荡),行为语义不变。
       ctx.globalAlpha =
         block.status === "downloading" && hasMotion
           ? 0.85 + 0.15 * pulse
           : 1;
-      ctx.fillStyle = fillColor;
+      ctx.fillStyle =
+        block.status === "downloading"
+          ? withAlpha(fillColor, 0.28)
+          : fillColor;
       ctx.beginPath();
       ctx.roundRect(x, y, BLOCK_SIZE, BLOCK_SIZE, radius);
       ctx.fill();
       ctx.globalAlpha = 1;
 
       // 下载中块渐变深度:宽度 = BLOCK_SIZE × 块平均字节进度,
-      // 颜色取 downloading token 解析色的两档低透明度,与 DOM 端充能条同语义;
+      // 颜色取 downloading token 解析色的全强度两档(0.9 → 1.0),
+      // 与低 alpha 底色拉开层次,填充区明显亮于未填充区;
       // 非动画效果,reduced-motion 下同样绘制。
       if (block.status === "downloading") {
         const depth = progressByBlock[i] ?? 0;
         if (depth > 0) {
           const fillW = BLOCK_SIZE * depth;
           const grad = ctx.createLinearGradient(x, y, x + fillW, y);
-          grad.addColorStop(0, withAlpha(fillColor, 0.25));
-          grad.addColorStop(1, withAlpha(fillColor, 0.55));
+          grad.addColorStop(0, withAlpha(fillColor, 0.9));
+          grad.addColorStop(1, withAlpha(fillColor, 1));
           ctx.fillStyle = grad;
           ctx.beginPath();
           ctx.roundRect(x, y, fillW, BLOCK_SIZE, radius);

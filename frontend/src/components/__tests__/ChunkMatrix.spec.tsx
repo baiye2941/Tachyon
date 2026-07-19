@@ -7,6 +7,8 @@ import {
   beforeAll,
   beforeEach,
 } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   render,
   screen,
@@ -815,19 +817,13 @@ describe("ChunkMatrix 分片矩阵", () => {
 
   describe("Canvas 聚合块字节进度渐变", () => {
     /**
-     * 用持有引用的 mock ctx 替换 getContext,便于断言绘制调用。
-     * 测试结束后恢复 beforeAll 安装的全局 mock,避免泄漏到其他用例。
+     * 安装持有引用的 mock ctx,返回句柄与恢复函数。
+     * 同步断言用 withMockContext;跨 await 的测试直接用本函数 + try/finally。
      */
-    function withMockContext<T>(
-      run: (ctx: {
-        createLinearGradient: ReturnType<typeof vi.fn>;
-        addColorStop: ReturnType<typeof vi.fn>;
-        fillRect: ReturnType<typeof vi.fn>;
-        roundRect: ReturnType<typeof vi.fn>;
-      }) => T,
-    ): T {
+    function installMockContext() {
       const addColorStop = vi.fn();
       const grad = { addColorStop } as unknown as CanvasGradient;
+      const fillStyles: string[] = [];
       const ctx = {
         setTransform: vi.fn(),
         clearRect: vi.fn(),
@@ -841,21 +837,55 @@ describe("ChunkMatrix 分片矩阵", () => {
         clip: vi.fn(),
         fillRect: vi.fn(),
       } as unknown as CanvasRenderingContext2D;
+      let currentFillStyle: unknown = "";
+      Object.defineProperty(ctx, "fillStyle", {
+        get: () => currentFillStyle,
+        set: (v: unknown) => {
+          currentFillStyle = v;
+          fillStyles.push(String(v));
+        },
+      });
       const prev = HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext = function () {
         return ctx;
       } as unknown as typeof HTMLCanvasElement.prototype.getContext;
-      try {
-        return run({
+      return {
+        handles: {
           createLinearGradient: ctx.createLinearGradient as ReturnType<
             typeof vi.fn
           >,
           addColorStop,
           fillRect: ctx.fillRect as unknown as ReturnType<typeof vi.fn>,
           roundRect: ctx.roundRect as unknown as ReturnType<typeof vi.fn>,
-        });
+          clearRect: ctx.clearRect as unknown as ReturnType<typeof vi.fn>,
+          fillStyles,
+        },
+        restore: () => {
+          HTMLCanvasElement.prototype.getContext = prev;
+        },
+      };
+    }
+
+    /**
+     * 用持有引用的 mock ctx 替换 getContext,便于断言绘制调用。
+     * 测试结束后恢复 beforeAll 安装的全局 mock,避免泄漏到其他用例。
+     */
+    function withMockContext<T>(
+      run: (ctx: {
+        createLinearGradient: ReturnType<typeof vi.fn>;
+        addColorStop: ReturnType<typeof vi.fn>;
+        fillRect: ReturnType<typeof vi.fn>;
+        roundRect: ReturnType<typeof vi.fn>;
+        clearRect: ReturnType<typeof vi.fn>;
+        /** fillStyle 赋值序列(字符串化),用于断言底色/渐变用色 */
+        fillStyles: string[];
+      }) => T,
+    ): T {
+      const { handles, restore } = installMockContext();
+      try {
+        return run(handles);
       } finally {
-        HTMLCanvasElement.prototype.getContext = prev;
+        restore();
       }
     }
 
@@ -914,19 +944,58 @@ describe("ChunkMatrix 分片矩阵", () => {
         const widths = roundRect.mock.calls.map((call) => call[2] as number);
         const expected = 14 * (5000 / (4000 * 3));
         expect(widths.some((w) => Math.abs(w - expected) < 1e-6)).toBe(true);
-        // 渐变为 downloading token 同色的两档低透明度(0.25 → 0.55)
+        // 渐变为 downloading token 全强度两档(0.9 → 1.0),
+        // 与低 alpha 底色拉开层次,保证填充区明显亮于未填充区
         const stops = addColorStop.mock.calls.map(
           (call) => [call[0] as number, call[1] as string] as const,
         );
         expect(
           stops.some(
-            ([offset, color]) => offset === 0 && color.includes("0.25"),
+            ([offset, color]) => offset === 0 && color.includes("0.9"),
           ),
         ).toBe(true);
         expect(
           stops.some(
-            ([offset, color]) => offset === 1 && color.includes("0.55"),
+            ([offset, color]) => offset === 1 && /, 1\)$/.test(color),
           ),
+        ).toBe(true);
+      });
+    });
+
+    it("downloading 块底色为低透明度,与全强度渐变 overlay 拉开层次", () => {
+      withMockContext(({ fillStyles, addColorStop }) => {
+        // reduced-motion:屏蔽扫描光带/pulse,隔离底色与字节进度渐变两条路径
+        mockMatchMedia(true);
+        setFragmentData("t-canvas", {
+          total: 250,
+          doneSet: new Set(),
+          downloadingSet: new Set([0, 1]),
+          bytesMap: new Map([
+            [0, 2000],
+            [1, 2000],
+          ]),
+          finalized: false,
+        });
+        render(() => (
+          <ChunkMatrix
+            taskId="t-canvas"
+            fragmentsTotal={250}
+            fragmentsDone={0}
+            progress={0}
+            fileSize={1_000_000}
+          />
+        ));
+        // 底色:同名 token 色的低 alpha(≈0.28),不再是不透明实色,
+        // 否则与渐变 overlay 同色叠加后字节进度不可见
+        const rgbaFills = fillStyles.filter((v) => v.startsWith("rgba("));
+        expect(rgbaFills.some((v) => v.includes("0.28"))).toBe(true);
+        // 渐变 overlay 保持全强度:底色 alpha 必须严格小于 overlay 端点 alpha
+        const stops = addColorStop.mock.calls.map(
+          (call) => [call[0] as number, call[1] as string] as const,
+        );
+        expect(stops.length).toBeGreaterThan(0);
+        expect(
+          stops.every(([, color]) => !color.includes("0.28")),
         ).toBe(true);
       });
     });
@@ -955,6 +1024,39 @@ describe("ChunkMatrix 分片矩阵", () => {
         ));
         expect(createLinearGradient).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe("chunk-matrix.css 充能条/底色层次(静态断言)", () => {
+    // jsdom 不加载样式表,computed 断言不可行;改为读取 CSS 源文件做规则级断言
+    // (vitest 进程 cwd 为 frontend 根目录;先剥离注释,避免选择器匹配被注释干扰)
+    const css = readFileSync(
+      resolve(process.cwd(), "src/styles/components/chunk-matrix.css"),
+      "utf-8",
+    ).replace(/\/\*[\s\S]*?\*\//g, "");
+    const ruleBody = (selector: string): string => {
+      const rule = css
+        .split("}")
+        .find((r) => r.split("{")[0]?.trim() === selector);
+      return rule?.split("{")[1] ?? "";
+    };
+
+    it(".chunk-cell--downloading 底色为低强度 color-mix,非不透明 token 实色", () => {
+      const body = ruleBody(".chunk-cell--downloading");
+      expect(body).not.toBe("");
+      // 底色必须降强度:不透明 token 实色会与充能条渐变同色叠加,
+      // 填充区/非填充区颜色一致导致字节进度不可见
+      expect(body).toContain("color-mix");
+      expect(body).toContain("28%");
+      expect(body).not.toMatch(
+        /background:\s*var\(--color-status-downloading\)\s*;/,
+      );
+    });
+
+    it("充能条渐变保持全强度 token 色收尾(填充区亮于未填充区)", () => {
+      const body = ruleBody(".chunk-cell--downloading .chunk-cell-fill");
+      expect(body).not.toBe("");
+      expect(body).toContain("var(--color-status-downloading) 100%");
     });
   });
 });
