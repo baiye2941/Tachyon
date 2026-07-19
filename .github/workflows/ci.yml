@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # 最小权限原则:CI 只需要 contents: read
 permissions:
@@ -19,35 +20,114 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Path filters: 纯 docs / 纯 frontend 跳过重 job，节省 billable
+  changes:
+    name: 变更检测
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      docs: ${{ steps.filter.outputs.docs }}
+      # 重 rust job 是否运行: rust 变更 / workflow_dispatch / 非纯 docs&frontend
+      run_rust: ${{ steps.flags.outputs.run_rust }}
+      run_frontend: ${{ steps.flags.outputs.run_frontend }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/ci/**'
+              - 'deny.toml'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+            frontend:
+              - 'frontend/**'
+            docs:
+              - 'docs/**'
+              - 'README.md'
+              - '**/*.md'
+              - '.claude/**'
+      - name: 计算门禁开关
+        id: flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust="${{ steps.filter.outputs.rust }}"
+          frontend="${{ steps.filter.outputs.frontend }}"
+          docs="${{ steps.filter.outputs.docs }}"
+          # workflow_dispatch 或 push 到 main 默认全量；paths-filter 在 PR 上最有价值
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            echo "run_frontend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 纯 frontend: 不跑 rust 重 job
+          # 纯 docs: 不跑 rust/frontend 重 job
+          # rust 或混合: 全量 rust；frontend 变更也跑 frontend
+          run_rust=false
+          run_frontend=false
+          if [[ "$rust" == "true" ]]; then
+            run_rust=true
+          fi
+          # 安全回退: 过滤器全 false（如仅改 .github/scripts 等未列出路径）时仍跑 rust
+          if [[ "$rust" != "true" && "$frontend" != "true" && "$docs" != "true" ]]; then
+            run_rust=true
+          fi
+          if [[ "$frontend" == "true" || "$rust" == "true" ]]; then
+            run_frontend=true
+          fi
+          # 纯 docs: 两边都不跑
+          if [[ "$docs" == "true" && "$rust" != "true" && "$frontend" != "true" ]]; then
+            run_rust=false
+            run_frontend=false
+          fi
+          echo "run_rust=$run_rust" >> "$GITHUB_OUTPUT"
+          echo "run_frontend=$run_frontend" >> "$GITHUB_OUTPUT"
+          echo "filters: rust=$rust frontend=$frontend docs=$docs → run_rust=$run_rust run_frontend=$run_frontend"
+
   fmt:
     name: 格式检查
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: stable
           components: rustfmt
+          # fmt 不编译，无需 shared target
+          cache-key-suffix: fmt
       - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: clippy
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: 测试 (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -55,13 +135,13 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          # Ubuntu stable 与 clippy/docs 共享 target；Win/mac 用各自 shared-key
+          shared-key: ${{ runner.os == 'Linux' && format('ubuntu-stable-{0}', hashFiles('**/Cargo.lock')) || format('{0}-stable-{1}', runner.os, hashFiles('**/Cargo.lock')) }}
+          cache-key-suffix: test
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force --locked cargo-nextest
@@ -70,16 +150,18 @@ jobs:
 
   docs:
     name: 文档构建
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: docs
       - name: 构建文档(零警告)
         run: cargo doc --no-deps --all-features --locked
         env:
@@ -89,29 +171,36 @@ jobs:
     # MSRV 门禁:工作区声明 rust-version = "1.85",但 CI 默认用浮动 stable,
     # 依赖升级可能在不知情下破坏声明的最低支持版本。本 job 用固定 1.85 验证编译。
     name: MSRV (1.85)
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: "1.85"
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+          # MSRV 必须独立 cache key，禁止与 stable 共享
+          shared-key: ubuntu-msrv-1.85-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: msrv
       - name: 验证 MSRV 编译(1.85)
         run: cargo build --all --locked --all-features
 
   audit:
     name: 安全审计 (cargo-deny)
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: audit
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-deny (预编译二进制)
         run: cargo binstall -y --force cargo-deny
@@ -124,12 +213,17 @@ jobs:
 
   cargo-audit:
     name: Cargo Audit
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: cargo-audit
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
@@ -140,7 +234,7 @@ jobs:
         env:
           AUDIT_WITH_DENY: "0"
 
-  # SRE-013: TOML 格式检查
+  # SRE-013: TOML 格式检查（廉价，始终运行）
   taplo:
     name: TOML 格式检查 (taplo)
     runs-on: ubuntu-latest
@@ -163,24 +257,26 @@ jobs:
 
   coverage:
     name: 覆盖率检查
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: nightly
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+          # nightly 独立 key，禁止与 stable 共享
+          shared-key: ubuntu-nightly-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: 运行覆盖率检查
         # SSOT: scripts/ci/coverage.sh
-        # 逐 crate + --fail-under-regions 90（禁止合计 fail-under-lines）
+        # 一次 instrument + 逐 crate regions >= 90（禁止合计 fail-under-lines）
         # ignore: test_harness + 平台 IO 后端(iocp/winio/iouring)
         run: bash scripts/ci/coverage.sh
       - name: 生成覆盖率报告
@@ -196,40 +292,43 @@ jobs:
 
   miri:
     name: Miri (unsafe 代码检测)
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: nightly
           components: miri
-      - uses: Swatinem/rust-cache@v2
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+          shared-key: ubuntu-nightly-miri-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: miri
       # SSOT: scripts/ci/miri.sh（含 dir_sync isolation skip，CI/Release 同源）
       - name: Miri 检测
         run: bash scripts/ci/miri.sh
 
+  # bench: 仅 main push 采样，不进 ci-pass 关键路径（噪声大，非正确性门禁）
   bench:
     name: 性能基准采样
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.run_rust == 'true'
     env:
       # ci 模式:Criterion 采样缩减(样本数/时间),产出绝对时间,禁止公网竞品排名
       TACHYON_BENCH_MODE: ci
     steps:
       - uses: actions/checkout@v7
-      - name: 安装系统依赖(Ubuntu)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: bench
       - name: 运行 Criterion 快速采样(核心 e2e 路径)
         run: |
           TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2
@@ -237,11 +336,13 @@ jobs:
 
   frontend:
     name: 前端检查
+    needs: [changes]
+    if: needs.changes.outputs.run_frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       - name: 安装前端依赖
         working-directory: frontend
         run: bun install --frozen-lockfile
@@ -266,8 +367,10 @@ jobs:
     name: CI 通过
     runs-on: ubuntu-latest
     if: always()
+    # bench 已移出关键路径（main 采样保留，失败不阻断 ci-pass）
     # 审计 C2:MSRV 必须纳入汇总,否则 1.85 编译失败仍可能显示 CI 全绿
-    needs: [fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, bench, frontend, msrv]
+    # skipped 视为通过：path filter 跳过的重 job 不阻断
+    needs: [changes, fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, frontend, msrv]
     steps:
       - name: 检查所有 CI 作业是否成功
         run: |
@@ -278,4 +381,4 @@ jobs:
               exit 1
             fi
           done
-          echo "所有 CI 作业通过"
+          echo "所有 CI 作业通过（skipped 允许）"

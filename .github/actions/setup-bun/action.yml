@@ -1,0 +1,16 @@
+name: Setup Bun
+description: 安装 Bun 运行时（oven-sh/setup-bun）
+
+inputs:
+  bun-version:
+    description: Bun 版本（默认 latest）
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: 安装 Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
