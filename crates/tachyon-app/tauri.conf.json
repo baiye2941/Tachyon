@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/main/crates/tauri-config-schema/schema.json",
   "productName": "Tachyon",
-  "version": "0.1.1-0",
+  "version": "0.1.2",
   "identifier": "com.tachyon.app",
   "build": {
     "frontendDist": "../../frontend/dist",
@@ -38,7 +38,8 @@
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
@@ -46,7 +47,7 @@
       "endpoints": [
         "https://github.com/baiye2941/ai-model-downloader/releases/latest/download/latest.json"
       ],
-      "pubkey": "PLACEHOLDER_GENERATE_WITH_TAURI_SIGNER",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUwMzQ2RUY1NzExMzc1MUMKUldRY2RSTng5VzQwNElaZ0dnL2N4dmhyUnkzSC83aVUyU2FnQzNSS25ENFFDUnYvS1YvSkdIcDgK",
       "dialog": true
     }
   }

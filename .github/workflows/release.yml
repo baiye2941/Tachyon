@@ -151,11 +151,9 @@ jobs:
           cargo binstall -y --force cargo-audit
       - name: 安全审计 (SSOT)
         run: bash scripts/ci/audit.sh
-      # PLACEHOLDER 公钥时脚本会 RED；真实密钥接入前仅作信息性检查，不阻断 fallback
-      - name: 签名配置检查（信息性，PLACEHOLDER 仍会打印 FAIL）
-        run: |
-          bash .github/scripts/verify-signature-config.sh \
-            || echo "::warning::签名配置未就绪（常见原因 pubkey=PLACEHOLDER）"
+      # 签名配置硬门禁：PLACEHOLDER / 缺 cosign 配置必须失败
+      - name: 签名配置检查（硬失败）
+        run: bash .github/scripts/verify-signature-config.sh
       - name: 安装 nightly 工具链(覆盖率)
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -504,6 +502,25 @@ jobs:
         working-directory: frontend
         run: bun install --frozen-lockfile
 
+      # 构建前硬校验签名 secret 与配置（禁止私钥缺失软跳过）
+      - name: 校验 Tauri 签名密钥与配置
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-signature-config.sh
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::缺少 secret TAURI_SIGNING_PRIVATE_KEY"
+            exit 1
+          fi
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
+            echo "::error::缺少 secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+            exit 1
+          fi
+          echo "Tauri 签名密钥 secret 已配置"
+
       # dry-run: 故意不设 tagName/releaseName — tauri-action 仅构建 + workflow artifacts，
       # 不创建 GitHub Release，避免污染 draft。
       # 参考: https://github.com/tauri-apps/tauri-action examples/test-build-only.yml
@@ -524,8 +541,7 @@ jobs:
         uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # SEC-013: Tauri updater ed25519 签名(本地密钥对,私钥入 GH secret)
-          # 缺失时 tauri-action 跳过 .sig 生成,不报错
+          # SEC-013: Tauri updater ed25519 签名(私钥在 GH secret；缺失必须在前序 step 失败)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -541,7 +557,11 @@ jobs:
             - **Linux**: `.deb` / `.AppImage`
 
             ### 变更
-            详见 Git 历史和 PR 描述。
+            详见 Git 历史、CHANGELOG 与 PR 描述。
+
+            ### 校验
+            - 安装包附带 `.sha256` 与 cosign keyless `.bundle`
+            - Tauri updater 附带 `.sig`（ed25519）
           releaseDraft: true
           prerelease: false
           projectPath: crates/tachyon-app
@@ -549,6 +569,19 @@ jobs:
           # 通过 actions/download-artifact 下载。默认 false 时产物只上传到 Release,
           # 后续 job 用 download-artifact pattern: tachyon-* 会下载到 0 个文件。
           uploadWorkflowArtifacts: true
+
+      # 私钥缺失时 tauri-action 可能静默跳过 .sig — 构建后硬断言
+      - name: 硬断言 Tauri updater .sig 已生成
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t SIGS < <(find . -type f -name '*.sig' 2>/dev/null | LC_ALL=C sort || true)
+          echo "找到 ${#SIGS[@]} 个 .sig 文件"
+          printf '  %s\n' "${SIGS[@]:-}"
+          if [[ ${#SIGS[@]} -lt 1 ]]; then
+            echo "::error::未生成任何 .sig（检查 TAURI_SIGNING_PRIVATE_KEY 与 createUpdaterArtifacts）"
+            exit 1
+          fi
 
   # 所有平台构建完成且门禁通过后,将 draft release 发布为 public
   publish-release:
@@ -560,6 +593,8 @@ jobs:
     runs-on: ubuntu-latest
     # 含 cosign + Release 资产对账下载/上传 sidecar，5min 偏紧
     timeout-minutes: 15
+    # 发布环境：可在仓库 Settings → Environments 配置审批人
+    environment: release-production
     permissions:
       contents: write
       # SEC-013: cosign keyless 需 OIDC token 签发权限
@@ -607,9 +642,13 @@ jobs:
           mapfile -t SIDECARS < <(
             find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
           )
+          mapfile -t SIGS < <(
+            find dist -type f -name '*.sig' | LC_ALL=C sort
+          )
           pkg_n=${#PKGS[@]}
           side_n=${#SIDECARS[@]}
-          echo "packages=$pkg_n sidecars=$side_n"
+          sig_n=${#SIGS[@]}
+          echo "packages=$pkg_n sidecars=$side_n sigs=$sig_n"
           [[ "$pkg_n" -ge 1 ]] || { echo "::error::无安装包"; exit 1; }
           # 每个包应有 .sha256 + .bundle → 2N
           expect=$((pkg_n * 2))
@@ -619,13 +658,66 @@ jobs:
             printf '  side: %s\n' "${SIDECARS[@]}"
             exit 1
           fi
-          for s in "${SIDECARS[@]}"; do
+          if [[ "$sig_n" -lt 1 ]]; then
+            echo "::error::dist 中无 .sig（updater 签名缺失）"
+            exit 1
+          fi
+          for s in "${SIDECARS[@]}" "${SIGS[@]}"; do
             # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
             # 使用 path#basename 降低嵌套路径上传时 basename 撞名风险
             base=$(basename "$s")
             gh release upload "$TAG" "${s}#${base}" --repo "${{ github.repository }}" --clobber
             echo "已上传: $s -> $base"
           done
+
+      - name: 生成并上传 SBOM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p sbom
+          # Cargo SBOM（cyclonedx JSON via cargo-cyclonedx 或简易 cargo tree）
+          if command -v cargo >/dev/null 2>&1; then
+            cargo install cargo-cyclonedx --locked -q 2>/dev/null || cargo binstall -y cargo-cyclonedx 2>/dev/null || true
+          fi
+          if command -v cargo-cyclonedx >/dev/null 2>&1 || cargo cyclonedx -h >/dev/null 2>&1; then
+            cargo cyclonedx -f json --all 2>/dev/null || cargo cyclonedx --format json 2>/dev/null || true
+            # collect possible outputs
+            find . -maxdepth 3 -name 'bom*.json' -o -name '*cyclonedx*.json' 2>/dev/null | head -5 | while read -r f; do
+              cp "$f" "sbom/$(basename "$f")" || true
+            done
+          fi
+          # 始终生成可复现的依赖清单兜底
+          cargo tree --workspace --locked --prefix none 2>/dev/null | sort -u > sbom/cargo-tree.txt || true
+          if [[ -f frontend/bun.lock ]]; then
+            cp frontend/bun.lock sbom/frontend-bun.lock
+          fi
+          {
+            echo "# Tachyon ${TAG} SBOM"
+            echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit=${GITHUB_SHA}"
+            ls -la sbom/
+          } > sbom/README.txt
+          # 至少有 cargo-tree 或 lock
+          [[ -s sbom/cargo-tree.txt || -s sbom/frontend-bun.lock ]] || {
+            echo "::error::SBOM 生成失败"
+            exit 1
+          }
+          # cosign 签名 SBOM 目录内文件
+          for f in sbom/*; do
+            [[ -f "$f" ]] || continue
+            sha256sum "$f" | tee "$f.sha256"
+            cosign sign-blob --yes --bundle "$f.bundle" "$f" || {
+              echo "::warning::cosign SBOM 签名失败: $f"
+            }
+          done
+          for f in sbom/*; do
+            [[ -f "$f" ]] || continue
+            base=$(basename "$f")
+            gh release upload "$TAG" "${f}#sbom-${base}" --repo "${{ github.repository }}" --clobber
+          done
+          echo "SBOM 已上传"
 
       - name: 将 draft release 发布为 public
         env:
