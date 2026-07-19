@@ -18,6 +18,7 @@ import {
 import ChunkMatrix, { buildBlocks, buildBlockProgress } from "../ChunkMatrix";
 import * as taskFragments from "../../stores/taskFragments";
 import type { TaskFragmentData } from "../../stores/taskFragments";
+import { expectOverlayVisible } from "../../test-utils/compositeContrast";
 
 /**
  * 可响应式更新的 store mock。
@@ -1069,6 +1070,11 @@ describe("ChunkMatrix 分片矩阵", () => {
         expect(
           stops.every(([, color]) => !color.includes("0.28")),
         ).toBe(true);
+        // 合成可见性:overlay 端点叠在底色上必须与底色本身可区分,
+        // 否则同色叠加,字节进度在视觉上不存在(字符串断言之外的数学兜底)
+        const baseFill = rgbaFills.find((v) => v.includes("0.28"))!;
+        const overlayEnd = stops.find(([offset]) => offset === 1)![1];
+        expectOverlayVisible(baseFill, overlayEnd);
       });
     });
 
