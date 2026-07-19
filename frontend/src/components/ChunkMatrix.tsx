@@ -326,6 +326,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
 
   onCleanup(() => {
     if (rafId !== null) cancelAnimationFrame(rafId);
+    if (redrawRafId !== null) cancelAnimationFrame(redrawRafId);
     if (resizeObs !== null) resizeObs.disconnect();
     if (hideHoverTimer !== null) clearTimeout(hideHoverTimer);
   });
@@ -656,11 +657,18 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     }
   });
 
+  // Canvas 重绘调度:rAF 合帧——pending 标志把同帧多次失效合并为一次绘制;
+  // pulse 循环激活(rafId !== null)时跳过,pulse 每帧已读最新 blocks 自行重绘。
+  let redrawRafId: number | null = null;
   createEffect(() => {
-    const blockList = blocks();
-    if (shouldAggregate()) {
-      drawCanvas(blockList, currentPulsePhase);
-    }
+    blocks(); // 依赖追踪:分片数据/布局变化时触发重绘调度
+    if (!shouldAggregate()) return;
+    if (rafId !== null || redrawRafId !== null) return;
+    redrawRafId = requestAnimationFrame(() => {
+      redrawRafId = null;
+      // 读最新 blocks:同帧内后到变化由本次合并绘制覆盖
+      drawCanvas(blocks(), currentPulsePhase);
+    });
   });
 
   createEffect(() => {
@@ -781,36 +789,43 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
             class="chunk-tooltip"
             classList={{ "chunk-tooltip--visible": tooltipVisible() }}
           >
-            <Show when={tooltipData()} keyed>
+            {/* 非 keyed:静态结构一次渲染,title/percent/status 走细粒度绑定;
+                keyed 会让 tooltipData 引用每次变化都整体重建 DOM,
+                并反复重启 tooltip-pop 动画 */}
+            <Show when={tooltipData()}>
               {(tip) => (
                 <>
                   <div
                     class="chunk-tooltip-dot"
-                    style={{ background: tip.color }}
+                    style={{ background: tip().color }}
                   />
                   <div class="chunk-tooltip-body">
                     <div class="chunk-tooltip-title">
-                      {tip.title}
-                      <Show when={tip.type === "chunk"}>
+                      {tip().title}
+                      <Show when={tip().type === "chunk"}>
                         <span class="chunk-tooltip-subtitle">
-                          / {(tip as { total: number }).total}
+                          / {(tip() as { total: number }).total}
                         </span>
                       </Show>
                     </div>
                     <div class="chunk-tooltip-meta">
                       <div class="chunk-tooltip-meta-left">
-                        <span class={tip.statusClass}>{tip.statusLabel}</span>
+                        <span class={tip().statusClass}>
+                          {tip().statusLabel}
+                        </span>
                         <span class="chunk-tooltip-sep">·</span>
                       </div>
-                      <span class="chunk-tooltip-value">{tip.percentText}</span>
+                      <span class="chunk-tooltip-value">
+                        {tip().percentText}
+                      </span>
                     </div>
-                    <Show when={tip.type === "block"}>
+                    <Show when={tip().type === "block"}>
                       <div class="chunk-tooltip-row">
                         <div class="chunk-tooltip-label">
-                          {(tip as { detailLabel: string }).detailLabel}
+                          {(tip() as { detailLabel: string }).detailLabel}
                         </div>
                         <div class="chunk-tooltip-value">
-                          {(tip as { detailValue: string }).detailValue}
+                          {(tip() as { detailValue: string }).detailValue}
                         </div>
                       </div>
                     </Show>

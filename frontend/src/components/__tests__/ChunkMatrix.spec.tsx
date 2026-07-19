@@ -813,6 +813,48 @@ describe("ChunkMatrix 分片矩阵", () => {
         "60%",
       );
     });
+
+    it("fragData 字节变化时 tooltip 内容节点引用不变(无 keyed 重建)", async () => {
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 30]]),
+        finalized: false,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={10}
+          fragmentsDone={0}
+          progress={0.03}
+          fileSize={1000}
+        />
+      ));
+      const cell = document.querySelector<HTMLElement>("[data-index='3']")!;
+      fireEvent.focus(cell);
+      const bodyBefore = document.querySelector(".chunk-tooltip-body");
+      const dotBefore = document.querySelector(".chunk-tooltip-dot");
+      expect(bodyBefore).not.toBeNull();
+      expect(dotBefore).not.toBeNull();
+
+      // 字节数变化只应细粒度更新文本,不得重建 tooltip 内容节点
+      // (keyed Show 会整体重建并反复重启 tooltip-pop 动画)
+      setFragmentData("test-task", {
+        total: 10,
+        doneSet: new Set(),
+        downloadingSet: new Set([3]),
+        bytesMap: new Map([[3, 60]]),
+        finalized: false,
+      });
+      await Promise.resolve();
+
+      expect(document.querySelector(".chunk-tooltip-body")).toBe(bodyBefore);
+      expect(document.querySelector(".chunk-tooltip-dot")).toBe(dotBefore);
+      expect(document.querySelector(".chunk-tooltip-value")?.textContent).toBe(
+        "60%",
+      );
+    });
   });
 
   describe("Canvas 聚合块字节进度渐变", () => {
@@ -1024,6 +1066,50 @@ describe("ChunkMatrix 分片矩阵", () => {
         ));
         expect(createLinearGradient).not.toHaveBeenCalled();
       });
+    });
+
+    it("同帧连续多次 fragData 变化经 rAF 合并,只触发一次重绘", async () => {
+      const { handles, restore } = installMockContext();
+      try {
+        // 非 reduced-motion 但无 downloading 块:pulse 循环不启动,
+        // 重绘只能来自 effect 调度,clearRect 次数即 drawCanvas 次数
+        mockMatchMedia(false);
+        setFragmentData("t-throttle", {
+          total: 250,
+          doneSet: new Set([0, 1, 2]),
+          downloadingSet: new Set(),
+          bytesMap: new Map(),
+          finalized: false,
+        });
+        render(() => (
+          <ChunkMatrix
+            taskId="t-throttle"
+            fragmentsTotal={250}
+            fragmentsDone={3}
+            progress={0.1}
+            fileSize={1_000_000}
+          />
+        ));
+        // 冲刷 mount 与首次 effect 触发的重绘,再清零计数
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        handles.clearRect.mockClear();
+
+        // 同帧内连续 3 次字节变化(模拟 250ms tick 密集到达)
+        for (const downloaded of [100, 200, 300]) {
+          setFragmentData("t-throttle", {
+            total: 250,
+            doneSet: new Set([0, 1, 2]),
+            downloadingSet: new Set(),
+            bytesMap: new Map([[5, downloaded]]),
+            finalized: false,
+          });
+        }
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        // pending 标志合并同帧多次失效:三次变化只画一次
+        expect(handles.clearRect.mock.calls.length).toBe(1);
+      } finally {
+        restore();
+      }
     });
   });
 
