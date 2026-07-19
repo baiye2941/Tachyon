@@ -677,40 +677,31 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           mkdir -p sbom
-          # Cargo SBOM（cyclonedx JSON via cargo-cyclonedx 或简易 cargo tree）
-          if command -v cargo >/dev/null 2>&1; then
-            cargo install cargo-cyclonedx --locked -q 2>/dev/null || cargo binstall -y cargo-cyclonedx 2>/dev/null || true
+          # 不在 publish job 安装完整 Rust；用已提交的 lockfile 作为可复现清单
+          if [[ -f Cargo.lock ]]; then
+            cp Cargo.lock sbom/Cargo.lock
           fi
-          if command -v cargo-cyclonedx >/dev/null 2>&1 || cargo cyclonedx -h >/dev/null 2>&1; then
-            cargo cyclonedx -f json --all 2>/dev/null || cargo cyclonedx --format json 2>/dev/null || true
-            # collect possible outputs
-            find . -maxdepth 3 -name 'bom*.json' -o -name '*cyclonedx*.json' 2>/dev/null | head -5 | while read -r f; do
-              cp "$f" "sbom/$(basename "$f")" || true
-            done
-          fi
-          # 始终生成可复现的依赖清单兜底
-          cargo tree --workspace --locked --prefix none 2>/dev/null | sort -u > sbom/cargo-tree.txt || true
           if [[ -f frontend/bun.lock ]]; then
             cp frontend/bun.lock sbom/frontend-bun.lock
           fi
+          if [[ -f deny.toml ]]; then
+            cp deny.toml sbom/deny.toml
+          fi
           {
-            echo "# Tachyon ${TAG} SBOM"
+            echo "# Tachyon ${TAG} SBOM (lockfile snapshot)"
             echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "commit=${GITHUB_SHA}"
+            echo "files:"
             ls -la sbom/
           } > sbom/README.txt
-          # 至少有 cargo-tree 或 lock
-          [[ -s sbom/cargo-tree.txt || -s sbom/frontend-bun.lock ]] || {
-            echo "::error::SBOM 生成失败"
+          [[ -s sbom/Cargo.lock || -s sbom/frontend-bun.lock ]] || {
+            echo "::error::SBOM 缺少 lockfile"
             exit 1
           }
-          # cosign 签名 SBOM 目录内文件
           for f in sbom/*; do
             [[ -f "$f" ]] || continue
             sha256sum "$f" | tee "$f.sha256"
-            cosign sign-blob --yes --bundle "$f.bundle" "$f" || {
-              echo "::warning::cosign SBOM 签名失败: $f"
-            }
+            cosign sign-blob --yes --bundle "$f.bundle" "$f"
           done
           for f in sbom/*; do
             [[ -f "$f" ]] || continue
