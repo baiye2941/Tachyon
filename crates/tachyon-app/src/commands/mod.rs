@@ -1176,7 +1176,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_max_concurrent_semaphore_gating() {
-        let state = AppState::new();
+        // 必须用 test_state()（独立临时 store），禁止 AppState::new()：
+        // 后者打开全局 ~/.tachyon/store，nextest 并行时会锁冲突
+        // （macOS: Resource temporarily unavailable / os error 35）。
+        let state = test_state();
         {
             let mut cfg = state.domain.config.lock().await;
             cfg.max_concurrent_tasks = 2;
@@ -1193,7 +1196,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await
@@ -1204,7 +1207,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await
@@ -1215,7 +1218,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
-            true,
+            false,
             None,
         )
         .await;

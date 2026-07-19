@@ -1,0 +1,37 @@
+name: Setup Rust
+description: 安装 Rust 工具链并配置 Swatinem/rust-cache（可选 shared-key）
+
+inputs:
+  toolchain:
+    description: Rust 工具链（stable / nightly / 1.85 等）
+    required: false
+    default: stable
+  components:
+    description: 逗号分隔的 rustup components（可空）
+    required: false
+    default: ""
+  cache-key-suffix:
+    description: 额外 cache key 后缀（区分 job 内差异）
+    required: false
+    default: ""
+  shared-key:
+    description: rust-cache shared-key；同 OS+toolchain 的 job 可共享 target
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: 安装 Rust 工具链
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        # 空字符串时不传 components 会触发 action 默认；这里显式透传（可空）
+        components: ${{ inputs.components }}
+
+    - name: Rust 依赖缓存
+      uses: Swatinem/rust-cache@v2
+      with:
+        # shared-key 为空时 rust-cache 回退到默认按 job 隔离
+        shared-key: ${{ inputs.shared-key }}
+        key: ${{ inputs.cache-key-suffix }}
