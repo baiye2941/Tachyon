@@ -167,22 +167,25 @@ else
 fi
 
 # ── 输出 ───────────────────────────────────────────────────
+# 注意: macOS/bash 在 set -u 下对空数组 "${arr[@]}" 会 unbound variable
 echo "--- 通过 ---"
-if [ ${#pass_list[@]} -eq 0 ]; then
+if [ "${#pass_list[@]}" -eq 0 ]; then
   echo "  (无)"
+else
+  for item in "${pass_list[@]}"; do
+    echo "  [OK] $item"
+  done
 fi
-for item in "${pass_list[@]}"; do
-  echo "  [OK] $item"
-done
 
 echo ""
 echo "--- 失败 ---"
-if [ ${#fail_list[@]} -eq 0 ]; then
+if [ "${#fail_list[@]}" -eq 0 ]; then
   echo "  (无)"
+else
+  for item in "${fail_list[@]}"; do
+    echo "  [FAIL] $item"
+  done
 fi
-for item in "${fail_list[@]}"; do
-  echo "  [FAIL] $item"
-done
 
 echo ""
 if [ "$errors" -eq 0 ]; then
