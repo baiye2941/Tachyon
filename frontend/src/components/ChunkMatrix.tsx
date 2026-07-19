@@ -949,7 +949,7 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
             label={tr("status.label.pending")}
           />
           <LegendItem
-            color="var(--color-status-downloading)"
+            color={`linear-gradient(90deg, var(--color-status-downloading) 55%, color-mix(in srgb, var(--color-status-downloading) 28%, transparent) 55%)`}
             label={tr("status.label.downloading")}
             pulse
           />

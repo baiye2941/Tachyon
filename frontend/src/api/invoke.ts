@@ -1,7 +1,7 @@
 import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, QuicCapability, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
-import { isBrowserDev, removeMockTask } from '../stores/mockData'
+import { isBrowserDev, removeMockTask, getMockTaskFragments } from '../stores/mockData'
 import type { RecoveryWarningPayload } from './events'
 
 async function getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
@@ -145,7 +145,12 @@ export const api = {
   /** 订阅进度更新(通过 Tauri 事件推送) */
   subscribeProgress: () => invoke<void>('subscribe_progress'),
   /** 获取任务分片状态(DetailPanel 打开时调用) */
-  getTaskFragments: (taskId: string) => invoke<TaskFragmentsView>('get_task_fragments', { taskId }),
+  getTaskFragments: (taskId: string) => {
+    if (isBrowserDev()) {
+      return Promise.resolve(getMockTaskFragments(taskId))
+    }
+    return invoke<TaskFragmentsView>('get_task_fragments', { taskId })
+  },
   /** 获取应用配置 */
   getConfig: () => invoke<AppConfig>('get_config'),
   /** FIX-16:获取 BT 各流量类别的代理覆盖状态(隐私可见性) */

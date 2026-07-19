@@ -11,7 +11,7 @@
  * 状态机 / 详情面板 / chunk 网格全部按真实路径激活。
  */
 import { onCleanup } from "solid-js";
-import type { TaskInfo, ProgressPayload } from "../types";
+import type { TaskInfo, ProgressPayload, TaskFragmentsView } from "../types";
 import { $tasks, updateProgress } from "../stores/downloads";
 
 /** 判断当前是否为浏览器 dev 环境(无 Tauri 后端,且非测试环境)。
@@ -26,10 +26,55 @@ export function isBrowserDev(): boolean {
 
 export function removeMockTask(taskId: string): boolean {
   if (!isBrowserDev()) return false;
+  fragSim.delete(taskId);
   const next = $tasks.get().filter((task) => task.id !== taskId);
   if (next.length === $tasks.get().length) return false;
   $tasks.set(next);
   return true;
+}
+
+/** mock 并发分片数(与真实默认并发同量级) */
+const MOCK_CONCURRENCY = 6;
+
+/** 每任务分片模拟状态:done 已完成数 / next 下一个待启动 index / active 下载中 index→字节 */
+interface FragSim {
+  done: number;
+  next: number;
+  active: Map<number, number>;
+}
+
+const fragSim = new Map<string, FragSim>();
+
+/** 惰性初始化分片模拟:从任务当前进度推导 done,预填活跃窗口让充能条立即可见 */
+function ensureFragSim(t: TaskInfo): FragSim {
+  let s = fragSim.get(t.id);
+  if (!s) {
+    const total = t.fragmentsTotal || 0;
+    const done = Math.min(t.fragmentsDone || 0, total);
+    const perFrag = total > 0 ? (t.fileSize || 0) / total : 0;
+    const active = new Map<number, number>();
+    let next = done;
+    while (active.size < MOCK_CONCURRENCY && next < total) {
+      active.set(next, Math.round(perFrag * Math.random() * 0.4));
+      next++;
+    }
+    s = { done, next, active };
+    fragSim.set(t.id, s);
+  }
+  return s;
+}
+
+/** 供 api.getTaskFragments 的浏览器 dev mock:返回当前分片视图(对齐真实后端形状) */
+export function getMockTaskFragments(taskId: string): TaskFragmentsView {
+  const t = $tasks.get().find((x) => x.id === taskId);
+  const total = t?.fragmentsTotal || 0;
+  if (!t || total === 0) return { total: 0, doneIndices: [], downloadingIndices: [] };
+  const s = ensureFragSim(t);
+  return {
+    total,
+    doneIndices: Array.from({ length: s.done }, (_, i) => i),
+    downloadingIndices: [...s.active.keys()],
+  };
 }
 
 const now = Date.now();
@@ -91,7 +136,9 @@ export function startMockData(): void {
   // 注入种子任务
   $tasks.set(seedTasks());
 
-  // 1s tick:downloading 任务推进进度 + 速度抖动
+  // 1s tick:downloading 任务推进进度 + 速度抖动 + 分片生命周期模拟。
+  // 分片模拟与真实后端同语义:completedDelta/startedDelta 增量 + fragmentBytes
+  // 活跃分片字节快照(覆盖式),驱动 ChunkMatrix 充能条/tooltip 走真实路径。
   const iv = setInterval(() => {
     const tasks = $tasks.get();
     const payload: Record<string, ProgressPayload> = {};
@@ -105,15 +152,61 @@ export function startMockData(): void {
       const completed = received >= size;
       // 速度抖动 ±6%
       const jitter = 1 + (Math.random() - 0.5) * 0.12;
+
+      // 分片生命周期模拟:活跃窗口内推进字节,满片完成,补满窗口
+      const total = t.fragmentsTotal || 0;
+      const sim = total > 0 ? ensureFragSim(t) : null;
+      const perFrag = total > 0 ? size / total : 0;
+      const completedDelta: number[] = [];
+      const startedDelta: number[] = [];
+      if (sim && perFrag > 0) {
+        if (completed) {
+          // 终态:剩余活跃分片全部完成
+          for (const idx of sim.active.keys()) completedDelta.push(idx);
+          sim.active.clear();
+          sim.done = total;
+        } else {
+          // 本 tick 字节增量均摊到活跃分片(片间 ±30% 抖动)
+          const share = inc / Math.max(1, sim.active.size);
+          for (const [idx, bytes] of [...sim.active]) {
+            const next = bytes + share * (0.7 + Math.random() * 0.6);
+            if (next >= perFrag) {
+              completedDelta.push(idx);
+              sim.active.delete(idx);
+              sim.done++;
+            } else {
+              sim.active.set(idx, next);
+            }
+          }
+          // 补满活跃窗口
+          while (sim.active.size < MOCK_CONCURRENCY && sim.next < total) {
+            sim.active.set(sim.next, 0);
+            startedDelta.push(sim.next);
+            sim.next++;
+          }
+        }
+      }
+
       payload[t.id] = {
         id: t.id,
         progress: pct,
         downloaded: received,
         speed: completed ? 0 : Math.max(0.5e6, t.speed * jitter),
         status: completed ? "completed" : "downloading",
-        fragmentsDone: Math.floor((t.fragmentsTotal || 0) * pct),
-        fragmentsTotal: 0,
-        activeConcurrency: 0,
+        fragmentsDone: sim ? sim.done : Math.floor(total * pct),
+        // 传真实值(mock 曾因每 tick 发 0 把任务的 fragmentsTotal 清零,矩阵整段消失)
+        fragmentsTotal: total,
+        activeConcurrency: sim ? sim.active.size : 0,
+        ...(completedDelta.length ? { completedDelta } : {}),
+        ...(startedDelta.length ? { startedDelta } : {}),
+        ...(sim && sim.active.size > 0
+          ? {
+              fragmentBytes: [...sim.active].map(([index, downloaded]) => ({
+                index,
+                downloaded: Math.round(downloaded),
+              })),
+            }
+          : {}),
       };
       changed = true;
     }
