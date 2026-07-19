@@ -153,7 +153,9 @@ jobs:
         run: bash scripts/ci/audit.sh
       # PLACEHOLDER 公钥时脚本会 RED；真实密钥接入前仅作信息性检查，不阻断 fallback
       - name: 签名配置检查（信息性，PLACEHOLDER 仍会打印 FAIL）
-        run: bash .github/scripts/verify-signature-config.sh || echo "::warning::签名配置未就绪（常见原因: pubkey=PLACEHOLDER）"
+        run: |
+          bash .github/scripts/verify-signature-config.sh \
+            || echo "::warning::签名配置未就绪（常见原因 pubkey=PLACEHOLDER）"
       - name: 安装 nightly 工具链(覆盖率)
         uses: dtolnay/rust-toolchain@nightly
         with:
