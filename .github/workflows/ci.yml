@@ -255,6 +255,16 @@ jobs:
       - name: TOML 格式检查
         run: taplo check
 
+  # 文档/工作流漂移检测（廉价，始终运行）
+  doc-drift:
+    name: 文档漂移检测
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: 检测文档与 workflow 漂移
+        run: bash scripts/ci/check-doc-drift.sh
+
   coverage:
     name: 覆盖率检查
     needs: [changes]
@@ -372,7 +382,7 @@ jobs:
     # skipped 视为通过：path filter 跳过的重 job 不阻断
     # 注意：needs.*.result 在 GHA 中不会展开为各 job 结果列表（会变成字面量 "Array"），
     # 必须逐个引用 needs.<job>.result，否则 failure 会被静默放过（假绿）。
-    needs: [changes, fmt, clippy, test, docs, audit, cargo-audit, taplo, coverage, miri, frontend, msrv]
+    needs: [changes, fmt, clippy, test, docs, audit, cargo-audit, taplo, doc-drift, coverage, miri, frontend, msrv]
     steps:
       - name: 检查所有 CI 作业是否成功
         env:
@@ -384,6 +394,7 @@ jobs:
           R_AUDIT: ${{ needs.audit.result }}
           R_CARGO_AUDIT: ${{ needs.cargo-audit.result }}
           R_TAPLO: ${{ needs.taplo.result }}
+          R_DOC_DRIFT: ${{ needs.doc-drift.result }}
           R_COVERAGE: ${{ needs.coverage.result }}
           R_MIRI: ${{ needs.miri.result }}
           R_FRONTEND: ${{ needs.frontend.result }}
@@ -407,6 +418,7 @@ jobs:
           check audit "$R_AUDIT"
           check cargo-audit "$R_CARGO_AUDIT"
           check taplo "$R_TAPLO"
+          check doc-drift "$R_DOC_DRIFT"
           check coverage "$R_COVERAGE"
           check miri "$R_MIRI"
           check frontend "$R_FRONTEND"

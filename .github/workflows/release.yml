@@ -372,48 +372,100 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: 发布门禁通过
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN_INPUT: ${{ inputs.dry-run || 'n/a' }}
         run: |
+          set -euo pipefail
           echo "所有门禁检查通过:"
           echo "  - 同 SHA CI 绿 / fallback 全量门禁"
           echo "  - 版本一致性检查"
           echo "  - 安装冒烟测试"
-          echo ""
-          echo "Release 将从 draft 变为 public"
+          echo "event=$EVENT_NAME dry-run=$DRY_RUN_INPUT"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN_INPUT" != "false" ]]; then
+            echo "干跑模式: 不 undraft / 不公开发布"
+          else
+            echo "正式路径: 后续 publish-release 会将 draft 变为 public"
+          fi
 
-  # 发布失败时自动回滚:将当前 release 标记为 pre-release
+  # 发布失败时自动回滚:
+  # - 若仍是 draft: 保持 draft 并标 prerelease（尽量不扩大分发面）
+  # - 若已 public: 尝试重新 draft；失败则 delete release（禁止仅 prerelease 当安全回滚）
   # dry-run 不创建 public/draft 副作用路径上的回滚；tag 推送与 dry-run=false 仍回滚
+  # 覆盖 publish-release，避免「已 public 后失败却无人回滚」
   rollback-on-failure:
     name: 发布回滚
-    if: failure() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
-    needs: [build-release, install-smoke]
+    # always() 防止 needs 中 skipped job 导致本 job 被静默跳过
+    if: >-
+      always()
+      && (needs.build-release.result == 'failure'
+          || needs.install-smoke.result == 'failure'
+          || needs.publish-release.result == 'failure')
+      && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
+    needs: [build-release, install-smoke, publish-release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: 标记当前 release 为 pre-release
+      - name: 回滚 Release（draft / re-draft / delete）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          echo "发布流程失败,将 release $TAG 标记为 pre-release"
-          # release 可能尚未创建(如门禁阶段失败),容错处理
-          gh release edit "$TAG" --prerelease --repo "${{ github.repository }}" || \
+          if [[ -z "$TAG" || "$TAG" == "$GITHUB_REF" && "$GITHUB_REF" != refs/tags/* ]]; then
+            # 非 tag 路径（异常）
+            TAG="${GITHUB_REF_NAME:-}"
+          fi
+          TAG="${TAG#refs/tags/}"
+          echo "发布流程失败,尝试回滚 release: $TAG"
+
+          if ! gh release view "$TAG" --repo "$REPO" >/tmp/release-meta.json 2>/dev/null; then
             echo "::warning::Release $TAG 不存在,无需回滚(可能门禁阶段失败前未创建 release)"
+            exit 0
+          fi
+
+          is_draft=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft')
+          is_prerelease=$(gh release view "$TAG" --repo "$REPO" --json isPrerelease --jq '.isPrerelease')
+          echo "当前状态: isDraft=$is_draft isPrerelease=$is_prerelease"
+
+          if [[ "$is_draft" == "true" ]]; then
+            # 仍是 draft: 标 prerelease 并保持 draft
+            gh release edit "$TAG" --draft --prerelease --repo "$REPO" || true
+            echo "已保持 draft 并标记 prerelease: $TAG"
+            exit 0
+          fi
+
+          # 已 public: 优先重新 draft；gh 若不支持 undraft→draft，则删除 release
+          if gh release edit "$TAG" --draft --prerelease --repo "$REPO" 2>/tmp/re-draft.err; then
+            echo "已将 public release 重新 draft 并标记 prerelease: $TAG"
+            exit 0
+          fi
+
+          echo "::warning::无法 re-draft，尝试删除 release 以停止分发"
+          cat /tmp/re-draft.err || true
+          if gh release delete "$TAG" --yes --repo "$REPO"; then
+            echo "已删除 release: $TAG（请发安全通告并重新打 tag）"
+          else
+            echo "::error::回滚失败: 既不能 re-draft 也不能 delete。请立即手动处理 $TAG"
+            exit 1
+          fi
 
       - name: 输出回滚说明
+        if: always()
         run: |
           echo "========================================"
           echo "发布回滚报告"
           echo "========================================"
           echo "Tag: ${GITHUB_REF#refs/tags/}"
-          echo "状态: 已标记为 pre-release"
+          echo "策略: draft 保持 draft+prerelease; 已 public 则 re-draft 或 delete"
           echo ""
           echo "后续步骤:"
           echo "1. 检查失败的 job 日志,定位问题"
           echo "2. 修复问题后推送新 tag 或重新运行 workflow"
-          echo "3. 验证通过后,手动取消 pre-release 标记:"
-          echo "   gh release edit <tag> --draft=false --prerelease=false"
+          echo "3. 若 release 被 delete,需重新打 tag 发布"
           echo "========================================"
 
   # 构建 release 产物
@@ -546,18 +598,33 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          # 递归上传 sidecar（嵌套 artifact 布局下顶层 glob 会漏）
+          # 与 sign 脚本同一套扩展
+          mapfile -t PKGS < <(
+            find dist -type f -size +0c \( \
+              -name '*.msi' -o -name '*.deb' -o -name '*.dmg' -o -name '*.AppImage' \
+            \) | LC_ALL=C sort
+          )
           mapfile -t SIDECARS < <(
             find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
           )
-          [[ ${#SIDECARS[@]} -ge 1 ]] || {
-            echo "::error::无 sidecar 可上传（sha256/bundle）"
+          pkg_n=${#PKGS[@]}
+          side_n=${#SIDECARS[@]}
+          echo "packages=$pkg_n sidecars=$side_n"
+          [[ "$pkg_n" -ge 1 ]] || { echo "::error::无安装包"; exit 1; }
+          # 每个包应有 .sha256 + .bundle → 2N
+          expect=$((pkg_n * 2))
+          if [[ "$side_n" -ne "$expect" ]]; then
+            echo "::error::sidecar 数量($side_n) != 2 * 产物数($expect)"
+            printf '  pkg: %s\n' "${PKGS[@]}"
+            printf '  side: %s\n' "${SIDECARS[@]}"
             exit 1
-          }
+          fi
           for s in "${SIDECARS[@]}"; do
             # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
-            gh release upload "$TAG" "$s" --repo "${{ github.repository }}" --clobber
-            echo "已上传: $s"
+            # 使用 path#basename 降低嵌套路径上传时 basename 撞名风险
+            base=$(basename "$s")
+            gh release upload "$TAG" "${s}#${base}" --repo "${{ github.repository }}" --clobber
+            echo "已上传: $s -> $base"
           done
 
       - name: 将 draft release 发布为 public
