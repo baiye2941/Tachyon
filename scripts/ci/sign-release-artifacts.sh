@@ -31,15 +31,25 @@ find "$DIST_DIR" -type f -ls 2>/dev/null || ls -laR "$DIST_DIR"
 # 清理旧 sidecar，避免计数污染（仅本脚本生成的扩展）
 find "$DIST_DIR" -type f \( -name '*.sha256' -o -name '*.bundle' \) -delete 2>/dev/null || true
 
-# 与 install-smoke 同一套递归找包
+# 与 install-smoke 同一套递归找包，且要求非零大小（-size +0c）
 mapfile -t FILES < <(
-  find "$DIST_DIR" -type f \( \
+  find "$DIST_DIR" -type f -size +0c \( \
     -name '*.msi' -o -name '*.deb' -o -name '*.dmg' -o -name '*.AppImage' \
   \) | LC_ALL=C sort
 )
 
 if [[ ${#FILES[@]} -lt 1 ]]; then
-  echo "::error::无产物可签名（在 $DIST_DIR 下未找到 msi/deb/dmg/AppImage）" >&2
+  # 区分：完全无包 vs 仅有零字节包
+  mapfile -t ZERO_OR_ANY < <(
+    find "$DIST_DIR" -type f \( \
+      -name '*.msi' -o -name '*.deb' -o -name '*.dmg' -o -name '*.AppImage' \
+    \) | LC_ALL=C sort
+  )
+  if [[ ${#ZERO_OR_ANY[@]} -ge 1 ]]; then
+    echo "::error::仅发现零字节安装包（${ZERO_OR_ANY[*]}），拒绝签名（与 install-smoke -size +0c 对齐）" >&2
+  else
+    echo "::error::无产物可签名（在 $DIST_DIR 下未找到 msi/deb/dmg/AppImage）" >&2
+  fi
   exit 1
 fi
 
@@ -101,6 +111,10 @@ if [[ -n "${RECONCILE_TAG:-}" ]]; then
     mapfile -t matches < <(find "$RECONCILE_DIR" -type f -name "$base" | LC_ALL=C sort)
     if [[ ${#matches[@]} -eq 0 ]]; then
       echo "::error::Release 资产缺失: $base（本地 artifact 有，Release 无）" >&2
+      exit 1
+    fi
+    if [[ ${#matches[@]} -gt 1 ]]; then
+      echo "::error::Release 资产 basename 多重匹配: $base → ${matches[*]}（拒绝静默取 matches[0]）" >&2
       exit 1
     fi
     local_hash=$(sha256sum "$f" | awk '{print $1}')
