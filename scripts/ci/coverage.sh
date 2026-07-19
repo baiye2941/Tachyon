@@ -8,7 +8,11 @@ CRATES=(tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tach
 
 # 仅生成 HTML（供 CI always 步骤，不重跑门禁）
 if [[ "${COVERAGE_HTML_ONLY:-0}" == "1" ]]; then
-  cargo llvm-cov -p "${CRATES[@]}" --locked \
+  pkg_args=()
+  for crate in "${CRATES[@]}"; do
+    pkg_args+=(-p "$crate")
+  done
+  cargo llvm-cov "${pkg_args[@]}" --locked \
     --ignore-filename-regex "$IGNORE" --html || true
   exit 0
 fi
@@ -22,6 +26,10 @@ for crate in "${CRATES[@]}"; do
 done
 
 if [[ "${COVERAGE_HTML:-0}" == "1" ]]; then
-  cargo llvm-cov -p "${CRATES[@]}" --locked \
+  pkg_args=()
+  for crate in "${CRATES[@]}"; do
+    pkg_args+=(-p "$crate")
+  done
+  cargo llvm-cov "${pkg_args[@]}" --locked \
     --ignore-filename-regex "$IGNORE" --html || true
 fi
