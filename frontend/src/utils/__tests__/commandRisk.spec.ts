@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { Mock } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { COMMAND_RISK, getRiskTier, confirmDestructive } from '../commandRisk'
 
 describe('commandRisk (P1-11a)', () => {
@@ -106,6 +108,50 @@ describe('commandRisk (P1-11a)', () => {
 
     it('未登记命令默认 destructive(白名单原则)', () => {
       expect(getRiskTier('unknown_evil_command')).toBe('destructive')
+    })
+
+    it('invoke.ts 暴露的全部命令均已登记风险等级(防未登记误弹确认)', () => {
+      // 回归:get_quic_capability 等 12 条命令曾未登记,默认 destructive
+      // 导致切到「连接」tab / 加标签 / 拖拽排序时误弹破坏性确认框
+      const invokeSrc = readFileSync(
+        resolve(process.cwd(), 'src/api/invoke.ts'),
+        'utf-8',
+      )
+      const cmds = new Set<string>()
+      // 匹配 invoke<T>('cmd_name' 及 fn<T>('cmd_name'(requestConfirmation 直调)
+      for (const m of invokeSrc.matchAll(
+        /(?:invoke|fn)<[^>(]*>\(\s*'([a-z_]+)'/g,
+      )) {
+        cmds.add(m[1]!)
+      }
+      expect(cmds.size).toBeGreaterThan(10)
+      for (const cmd of cmds) {
+        expect(
+          COMMAND_RISK[cmd],
+          `命令 ${cmd} 在 invoke.ts 中暴露但未登记风险等级`,
+        ).toBeDefined()
+      }
+    })
+
+    it('补登命令分级正确:查询类 safe,状态变更类 mutate', () => {
+      // 只读查询(切「连接」tab 即调用,误弹确认的元凶)
+      expect(getRiskTier('get_quic_capability')).toBe('safe')
+      expect(getRiskTier('get_bt_proxy_coverage')).toBe('safe')
+      expect(getRiskTier('get_sniffer_capture_config')).toBe('safe')
+      // 可恢复状态变更
+      for (const cmd of [
+        'add_sniffer_resource',
+        'clear_sniffer_resources',
+        'create_task_from_sniffer',
+        'set_sniffer_capture_config',
+        'add_task_tag',
+        'remove_task_tag',
+        'set_task_tags',
+        'move_task',
+        'reorder_tasks',
+      ]) {
+        expect(getRiskTier(cmd), `${cmd} 应为 mutate`).toBe('mutate')
+      }
     })
   })
 

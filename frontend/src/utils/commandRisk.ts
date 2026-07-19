@@ -49,6 +49,10 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   open_task_folder: 'safe',
   open_folder_under_download_root: 'safe',
   get_recovery_warning: 'safe',
+  // 只读查询补登:未登记会默认 destructive 误弹确认(连接 tab 曾因此闪确认框)
+  get_quic_capability: 'safe',
+  get_bt_proxy_coverage: 'safe',
+  get_sniffer_capture_config: 'safe',
   // 状态变更 / 网络触发
   pause_task: 'mutate',
   resume_task: 'mutate',
@@ -59,6 +63,16 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   add_model_favorite: 'mutate',
   remove_model_favorite: 'mutate',
   batch_create_hf_tasks: 'mutate',
+  // 状态变更补登:标签/排序/嗅探器操作(可恢复,非破坏性)
+  add_task_tag: 'mutate',
+  remove_task_tag: 'mutate',
+  set_task_tags: 'mutate',
+  move_task: 'mutate',
+  reorder_tasks: 'mutate',
+  add_sniffer_resource: 'mutate',
+  clear_sniffer_resources: 'mutate',
+  create_task_from_sniffer: 'mutate',
+  set_sniffer_capture_config: 'mutate',
   // 破坏性:数据删除 / 安全策略变更 / 备份导入导出 / 撤销类恢复
   delete_task: 'destructive',
   undo_cancel_task: 'destructive',
