@@ -429,7 +429,8 @@ jobs:
     # 注意: job 级 if 不能用 env 上下文,故内联等价表达式
     if: success() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 含 cosign + Release 资产对账下载/上传 sidecar，5min 偏紧
+    timeout-minutes: 15
     permissions:
       contents: write
       # SEC-013: cosign keyless 需 OIDC token 签发权限
@@ -445,62 +446,49 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # S-12: 生成 SHA256 校验文件并附加到 release
-      - name: 生成 SHA256 校验文件
-        shell: bash
-        run: |
-          cd dist
-          for file in *.msi *.deb *.dmg *.AppImage; do
-            if [ -f "$file" ]; then
-              sha256sum "$file" > "$file.sha256"
-              echo "SHA256 校验文件已生成: $file.sha256"
-            fi
-          done
-
       # SEC-013: sigstore cosign keyless 签名(零密钥管理,GH OIDC → Fulcio 短期证书)
       - name: 安装 cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: 对产物进行 sigstore keyless 签名(bundle)
+      # SSOT: scripts/ci/sign-release-artifacts.sh
+      # 递归 find(msi/deb/dmg/AppImage) + SHA256 + cosign + 硬断言数量一致
+      # RECONCILE_TAG: 与 draft Release 资产字节对账，避免 artifact 布局与用户下载物不一致
+      - name: 签名产物(递归 find + 硬断言 + Release 对账)
         shell: bash
         env:
           COSIGN_EXPERIMENTAL: 1
-        run: |
-          set -euo pipefail
-          cd dist
-          for f in *.msi *.deb *.dmg *.AppImage; do
-            [ -f "$f" ] || continue
-            cosign sign-blob --yes --bundle "$f.bundle" "$f"
-            echo "已签名: $f -> $f.bundle"
-          done
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DIST_DIR: dist
+          RECONCILE_TAG: ${{ github.ref_name }}
+        run: bash scripts/ci/sign-release-artifacts.sh
 
-      - name: 上传签名 bundle 到 release
+      - name: 上传签名与校验文件到 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          cd dist
-          for b in *.bundle; do
-            [ -f "$b" ] || continue
-            gh release upload "$TAG" "$b" --repo "${{ github.repository }}" --clobber
+          # 递归上传 sidecar（嵌套 artifact 布局下顶层 glob 会漏）
+          mapfile -t SIDECARS < <(
+            find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
+          )
+          [[ ${#SIDECARS[@]} -ge 1 ]] || {
+            echo "::error::无 sidecar 可上传（sha256/bundle）"
+            exit 1
+          }
+          for s in "${SIDECARS[@]}"; do
+            # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
+            gh release upload "$TAG" "$s" --repo "${{ github.repository }}" --clobber
+            echo "已上传: $s"
           done
 
       - name: 将 draft release 发布为 public
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           echo "所有平台构建完成,发布 release $TAG"
-
-          # 上传 SHA256 校验文件到 release
-          cd dist
-          for sha_file in *.sha256; do
-            if [ -f "$sha_file" ]; then
-              # 审计 SEC-013:校验文件上传失败必须阻断公开发布
-              gh release upload "$TAG" "$sha_file" --repo "${{ github.repository }}" --clobber
-            fi
-          done
-
           gh release edit "$TAG" --draft=false --repo "${{ github.repository }}"
           echo "Release $TAG 已公开发布"
