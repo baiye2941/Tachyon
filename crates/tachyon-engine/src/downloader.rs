@@ -10819,7 +10819,7 @@ mod tests {
         );
     }
 
-    // ===== Task 5: execute_full_download 整块路径进度上报 =====
+    // ------ execute_full_download 整块路径进度上报 ------
 
     /// 多块整块流协议:probe 成功(不支持 Range),download_full_stream 产出 N 块。
     /// 供整块路径进度上报相关测试复用。

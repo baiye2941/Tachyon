@@ -299,7 +299,10 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                         // completed_indices。引擎在对象身份不兼容等场景会丢弃
                         // 续传数据全量重下,此时 completed_indices 不含快照分片;
                         // 照收快照种子会让 total_downloaded 虚高(种子+重下双计),
-                        // 且 checkpoint 会把虚高值写回快照。校验失败退回 fallback。
+                        // 且 checkpoint 会把虚高值写回快照。校验失败种子归 0:
+                        // repository 的 downloaded 正是被拒快照恢复出的同一个
+                        // 陈旧值(重启经 snapshot_to_task_info 恢复、resume 不清
+                        // 字节),引擎已明确从头重下,只能从零累计真实重下字节。
                         let snapshot_matches_plan = snap
                             .completed_fragments
                             .iter()
@@ -312,12 +315,9 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                                 task_id = %task_id,
                                 snap_completed = snap.completed_fragments.len(),
                                 plan_completed = completed.len(),
-                                "快照与 PlanComplete 续传决策不一致,放弃快照种子"
+                                "快照与 PlanComplete 续传决策不一致,种子归 0 全量重下"
                             );
-                            total_downloaded = task_repository
-                                .get(&task_id)
-                                .map(|t| t.downloaded)
-                                .unwrap_or(0);
+                            total_downloaded = 0;
                         }
                     }
                     Ok(None) => {
@@ -1343,13 +1343,14 @@ mod tests {
         );
     }
 
-    /// 快照与引擎续传决策失配时不得采用快照种子。
+    /// 快照与引擎续传决策失配时不得采用快照种子,也不得取 repository 值。
     ///
     /// 场景:对象身份不兼容,引擎丢弃续传数据全量重下,PlanComplete 的
-    /// completed_indices 为空;磁盘快照仍是旧的(completed=[0,1],
-    /// downloaded=750)。若照收快照种子,total_downloaded 虚高
-    /// (750 + 重下字节),后续 checkpoint 还会把虚高值写回快照。
-    /// 期望:放弃快照种子,退回 repository 现有 downloaded(此处 0)。
+    /// completed_indices 为空。真实流程中 repository 的 downloaded 正是
+    /// 被拒快照恢复出的同一个陈旧值(重启经 snapshot_to_task_info 恢复、
+    /// resume 不清字节,此处 750);快照亦然(completed=[0,1], downloaded=750)。
+    /// 无论取哪个,total_downloaded 都虚高(750 + 重下字节),后续 checkpoint
+    /// 还会把虚高值写回快照。期望:种子直接归 0,从头累计真实重下字节。
     #[tokio::test]
     async fn plan_complete_rejects_snapshot_seed_when_plan_discards_resume() {
         let pool = ChunkReaderPool::new(1);
@@ -1358,15 +1359,13 @@ mod tests {
         let (task_store, _tmp) = test_task_store_kept();
         let task_id = "plan-complete-seed-mismatch".to_string();
 
-        // 全量重下:repository 中任务从 0 开始;旧快照仍为 750
-        let task = make_task_info(&task_id, 1000, 0, 4, 0);
+        // 真实流程:repository 与快照同为陈旧值 750(重启恢复 + resume 不清字节)
+        let task = make_task_info(&task_id, 1000, 750, 4, 2);
         task_repository.insert(task_id.clone(), task.clone());
 
-        let mut stale_task = task.clone();
-        stale_task.downloaded = 750;
         let mut partial = HashMap::new();
         partial.insert(2, 50_u64);
-        let snapshot = make_resume_snapshot(&stale_task, vec![0, 1], partial, 250);
+        let snapshot = make_resume_snapshot(&task, vec![0, 1], partial, 250);
         task_store.save_snapshot(&snapshot).unwrap();
 
         let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);

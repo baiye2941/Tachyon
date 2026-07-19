@@ -221,7 +221,9 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         ? (p.status as DownloadStatus)
         : oldStatus;
 
-      // downloading 态纵深防御:防止续传/乱序 tick 导致进度条回退
+      // downloading 态纵深防御:防止续传/乱序 tick 导致进度条回退。
+      // 取舍:失配重下等合法回退也会被 clamp,直至真实字节追上——
+      // 宁让进度条短暂停滞,不给乱序事件回退空间
       const stayDownloading = newStatus === "downloading";
       const incomingDownloaded = p.downloaded ?? task.downloaded;
       const incomingProgress = p.progress ?? task.progress;
