@@ -311,10 +311,19 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                             frag_bytes = snap.partial_fragments;
                             total_downloaded = snap.downloaded;
                         } else {
+                            // 缺失索引(快照有而 plan 未采纳的分片),截断防爆日志
+                            let missing: Vec<u32> = snap
+                                .completed_fragments
+                                .iter()
+                                .filter(|idx| !completed.contains(idx))
+                                .take(8)
+                                .copied()
+                                .collect();
                             tracing::warn!(
                                 task_id = %task_id,
                                 snap_completed = snap.completed_fragments.len(),
                                 plan_completed = completed.len(),
+                                missing_indices = ?missing,
                                 "快照与 PlanComplete 续传决策不一致,种子归 0 全量重下"
                             );
                             total_downloaded = 0;
@@ -1474,6 +1483,75 @@ mod tests {
         assert_eq!(
             task.downloaded, 350,
             "无快照应 fallback 到 repository downloaded=300, 再 +50 => 350; 实际 {}",
+            task.downloaded
+        );
+    }
+
+    /// 快照文件损坏(load_snapshot 返回 Err)时 fallback 到 repository downloaded。
+    ///
+    /// 场景:快照 JSON 损坏,无法解析;此时引擎续传决策未知,取 repository
+    /// 现值(与无快照分支同语义),不因损坏而 panic 或归零已有进度。
+    #[tokio::test]
+    async fn plan_complete_falls_back_to_repository_on_snapshot_load_error() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, tmp) = test_task_store_kept();
+        let task_id = "plan-complete-corrupt-snapshot".to_string();
+
+        // repository 已有 300 字节
+        let task = make_task_info(&task_id, 1000, 300, 4, 1);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        // 先写合法快照再损坏文件,使 load_snapshot 走 Err 分支
+        let snapshot = make_resume_snapshot(&task, vec![0], HashMap::new(), 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+        std::fs::write(
+            tmp.path().join(format!("task_{task_id}.json")),
+            "{ 这不是合法 JSON",
+        )
+        .unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![0],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 分片 1 上报 50 字节: Err fallback 取 repository 300, +50 = 350
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                fragment_downloaded: 50,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 350).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 350,
+            "快照损坏应 fallback 到 repository downloaded=300, 再 +50 => 350; 实际 {}",
             task.downloaded
         );
     }
