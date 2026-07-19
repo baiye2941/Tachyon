@@ -184,10 +184,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 # 格式检查
 cargo fmt --all -- --check
 
-# 覆盖率（核心 crate）
-cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
-  -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
-  --fail-under-lines 90 --summary-only
+# 覆盖率门禁（逐 crate + regions 90，与 CI 同源）
+bash scripts/ci/coverage.sh
 
 # 前端测试
 cd frontend && bun run test

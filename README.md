@@ -194,11 +194,8 @@ cargo nextest run --all
 # Clippy 零警告(CI 以 -D warnings 运行)
 cargo clippy --all-targets --all-features -- -D warnings
 
-# 覆盖率门禁(逐 crate 断言,regions 指标)
-for c in tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tachyon-scheduler; do
-  cargo llvm-cov -p "$c" --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
-    --fail-under-regions 90 --summary-only || break
-done
+# 覆盖率门禁(逐 crate + regions 90,与 CI 同源)
+bash scripts/ci/coverage.sh
 
 # 前端测试
 cd frontend && bun run test

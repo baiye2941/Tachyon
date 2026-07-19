@@ -126,7 +126,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
       # SRE-003: 前端安全审计门禁
       # 使用 bun audit(项目用 bun 管理依赖,无 package-lock.json,
       # npm audit 会因 ENOLOCK 失败)。与 ci.yml 的前端审计命令保持一致。
@@ -373,7 +373,7 @@ jobs:
 
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
 
       # dry-run: 故意不设 tagName/releaseName — tauri-action 仅构建 + workflow artifacts，
       # 不创建 GitHub Release，避免污染 draft。

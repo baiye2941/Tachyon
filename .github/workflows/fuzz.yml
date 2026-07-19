@@ -41,11 +41,14 @@ jobs:
       # H8: corpus 持久化 —— 跨 fuzz 运行复用 corpus,让覆盖率随时间积累。
       # cargo-fuzz 默认把 corpus 存到 fuzz/corpus/<target>/,artifact 只保存 crash。
       # 缓存 key 用日期,每天首次运行重建(避免无限增长);restore-key 跨天复用。
+      - name: 计算 corpus 缓存日期
+        id: date
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - name: 恢复 corpus 缓存
         uses: actions/cache@v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-${{ github.run_id }}
+          key: fuzz-corpus-${{ steps.date.outputs.day }}
           restore-keys: |
             fuzz-corpus-
       - name: 运行 fuzz target

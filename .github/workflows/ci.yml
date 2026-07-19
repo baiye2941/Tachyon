@@ -244,7 +244,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: 前端依赖安全审计
         working-directory: frontend
         run: bun audit --audit-level=high

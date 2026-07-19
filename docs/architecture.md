@@ -641,10 +641,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 # 格式检查
 cargo fmt --all -- --check
 
-# 覆盖率（核心逻辑 crate，目标 >= 90%）
-cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
-  -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
-  --fail-under-lines 90 --summary-only
+# 覆盖率门禁（逐 crate + --fail-under-regions 90，与 CI 同源）
+bash scripts/ci/coverage.sh
 
 # 前端测试
 cd frontend && bun run test
@@ -668,7 +666,7 @@ cargo fmt --all -- --check && \
 | audit | `cargo deny check` + `cargo machete` |
 | cargo-audit | `cargo audit` |
 | taplo | TOML 格式检查 |
-| coverage | `cargo llvm-cov` >= 90% |
+| coverage | 逐 crate `cargo llvm-cov --fail-under-regions 90`（`scripts/ci/coverage.sh`） |
 | miri | Miri unsafe 代码检测 |
 | bench | Criterion 基准 Smoke 测试 |
 | frontend | TS 类型检查 + lint + test + 构建 |
