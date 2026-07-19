@@ -142,8 +142,18 @@ export default function DetailPanel(props: DetailPanelProps) {
   // task 变化时按需加载分片数据(DetailPanel 打开/task 切换/PlanComplete)
   // 仅当 fragmentsTotal > 0 且 store 中尚无有效数据时拉取,
   // 避免探测阶段(total=0)缓存空数据导致 PlanComplete 后无法重拉。
+  //
+  // 切换清理:DetailPanel 常驻不销毁,onCleanup 只在组件销毁时触发;
+  // 必须在此处跟踪前一个 taskId,切换(含变为 null)时显式清理旧 entry,
+  // 否则残留 entry 会让 mergeFragmentDelta 为每个历史任务做 Set 克隆。
+  let prevTaskId: string | null = null;
   createEffect(() => {
     const task = props.task;
+    const taskId = task?.id ?? null;
+    if (prevTaskId !== null && prevTaskId !== taskId) {
+      clearTaskFragments(prevTaskId);
+    }
+    prevTaskId = taskId;
     if (!task) return;
     if (task.fragmentsTotal === 0) return;
     const fragData = getTaskFragmentData(task.id);
@@ -151,10 +161,9 @@ export default function DetailPanel(props: DetailPanelProps) {
     loadTaskFragments(task.id);
   });
 
-  // DetailPanel 关闭时清理分片数据
+  // DetailPanel 销毁时清理当前任务的分片数据
   onCleanup(() => {
-    const task = props.task;
-    if (task) clearTaskFragments(task.id);
+    if (prevTaskId !== null) clearTaskFragments(prevTaskId);
   });
 
   // 详情覆盖式:focus trap 仅在覆盖模式时激活;侧栏模式列表仍可交互,不 trap

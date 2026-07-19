@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createSignal } from "solid-js";
 import {
   render,
   cleanup,
@@ -607,5 +608,32 @@ describe("DetailPanel", () => {
     expect(badge).not.toBeNull();
     expect(badge?.getAttribute("role")).toBe("status");
     expect(badge?.getAttribute("aria-label")).toBeTruthy();
+  });
+
+  describe("分片数据生命周期", () => {
+    it("切换任务(A→B→null)时清理旧任务的 fragment entry", async () => {
+      const { clearTaskFragments } = await import(
+        "../../stores/taskFragments"
+      );
+      const [task, setTask] = createSignal<TaskInfo | null>(baseTask);
+      const { default: DetailPanel } = await import("../DetailPanel");
+      render(() => (
+        <I18nProvider i18n={i18n}>
+          <DetailPanel task={task()} onClose={() => {}} variant="overlay" />
+        </I18nProvider>
+      ));
+      await waitForRaf();
+
+      // A → B:DetailPanel 常驻不销毁,旧任务 A 的 entry 必须显式清理,
+      // 否则 mergeFragmentDelta 会为残留任务持续做 Set 克隆
+      setTask({ ...baseTask, id: "task-2", fileName: "b.bin" });
+      await waitForRaf();
+      expect(clearTaskFragments).toHaveBeenCalledWith("task-1");
+
+      // B → null(面板关闭):B 的 entry 同样清理
+      setTask(null);
+      await waitForRaf();
+      expect(clearTaskFragments).toHaveBeenCalledWith("task-2");
+    });
   });
 });
