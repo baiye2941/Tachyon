@@ -1,7 +1,10 @@
+<div align="center">
+
 # Tachyon
 
-> High-performance Rust + Tauri v2 desktop download manager.  
-> 基于 Rust + Tauri v2 构建的高性能桌面下载器。
+**基于 Rust + Tauri v2 的高性能桌面下载器**
+
+名字取自《赛马娘 Pretty Derby》中的爱丽速子（Agnes Tachyon）——以速度为信仰。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust)
@@ -10,6 +13,8 @@
 ![Clippy](https://img.shields.io/badge/clippy-0%20warnings-green?style=flat-square)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square)
+
+</div>
 
 ---
 
@@ -21,22 +26,25 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 
 - 大文件单线程下载带宽利用率低、断线后需从头重下。
 - 现有下载工具缺乏 HuggingFace 模型仓库的原生集成。
-- 桌面端缺少在 I/O 路径上针对 Linux/Windows 做零拷贝优化的下载工具。
+- BT 下载在国内网络环境下需要走代理才能连通 tracker 与 peer。
+- 桌面端缺少在 I/O 路径上针对 Linux / Windows 做系统级优化的下载工具。
 
 **核心能力一览**
 
 | 能力 | 说明 |
 |------|------|
 | 多线程分片下载 | `DownloadTask` 动态分片规划，`JoinSet` 并发执行 |
-| 多协议传输 | HTTP/HTTPS、QUIC、BitTorrent 磁力链接 |
-| 零拷贝存储引擎 | Linux io_uring、Windows IOCP / WinFile、TokioFile 自动回退 |
+| 分片字节级实时进度 | 详情页分片矩阵在下载过程中实时显示每片字节级充能进度（250ms 聚合推送，快照式自愈） |
+| 多协议传输 | HTTP/HTTPS、QUIC（编译期可选）、BitTorrent 磁力链接 |
+| BT 代理支持 | SOCKS5 代理覆盖 tracker 与 peer 流量，支持自动检测系统代理 |
+| 高性能存储引擎 | Linux io_uring、Windows IOCP / WinFile、TokioFile 自动回退 |
 | 智能调度 | `AdaptiveDownloadScheduler` + `HoltLinearPredictor` 双指数平滑 |
+| 多源并发下载 | MirrorProtocol 多镜像源 least-in-flight 调度 + 质量加权选源 |
+| 断点续传 | 任务快照持久化，分片级与字节级续传，快照一致性校验防进度虚高 |
 | 流式哈希校验 | BLAKE3 / SHA-256 CPU 校验，GPU 校验预留 |
-| 断点续传 | 任务快照持久化，支持分片级和字节级续传 |
+| 限速控制 | 无锁令牌桶，支持跨任务全局限速（进程内共享 RateLimiter） |
 | HuggingFace Hub 集成 | 模型浏览、LFS 解析、Token 管理、本地模型扫描 |
 | 浏览器资源嗅探 | 基于扩展名识别视频 / 音频 / 文档 / 压缩包等资源 |
-| 多源并发下载 | MirrorProtocol 多镜像源 least-in-flight 调度 + 质量加权选源 |
-| 限速控制 | 无锁令牌桶，支持跨任务全局限速（进程内共享 RateLimiter） |
 
 ---
 
@@ -63,7 +71,7 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | `tachyon-core` | 类型、trait、错误体系、配置、安全校验 |
 | `tachyon-engine` | 分片引擎、并发许可器、多源竞速、限速器 |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 |
-| `tachyon-io` | 跨平台异步 I/O（io_uring/IOCP）、BufferPool 池化、直接 async write |
+| `tachyon-io` | 跨平台异步 I/O（io_uring / IOCP）、BufferPool 池化 |
 | `tachyon-protocol` | HTTP/HTTPS、QUIC、BitTorrent 协议实现 |
 | `tachyon-crypto` | BLAKE3 / SHA-256 校验、GPU 加速预留 |
 | `tachyon-sniffer` | 浏览器资源类型识别与捕获过滤 |
@@ -91,14 +99,14 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 git clone https://github.com/baiye2941/Tachyon.git
 cd Tachyon
 
-# 调试构建（默认 HTTP + magnet；QUIC/HTTP3 需显式 --features tachyon-protocol/http3）
+# 调试构建（默认 HTTP + magnet）
 cargo build
 
 # 发布构建
 cargo build --release
 
-# 默认包含 HTTP + Magnet(根包未定义 feature 开关,如需仅 HTTP 请在 tachyon-protocol 层关闭)
-cargo build
+# QUIC/HTTP3(reqwest http3 为 unstable,需显式开启)
+RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
 ```
 
 ### 开发模式
@@ -118,9 +126,10 @@ cargo tauri dev
 ### GUI 快速开始
 
 1. 启动应用：`cargo tauri dev` 或运行构建产物。
-2. 在“新建任务”中粘贴下载链接，或从 HuggingFace Hub 浏览模型。
+2. 在「新建任务」中粘贴下载链接，或从 HuggingFace Hub 浏览模型。
 3. 选择保存路径，点击下载；任务列表实时显示速度、进度与分片状态。
-4. 支持暂停、恢复、取消、删除；重启后会自动恢复未完成任务。
+4. 打开任务详情页可查看分片矩阵：下载中分片显示字节级充能进度与实时百分比。
+5. 支持暂停、恢复、取消、删除；重启后会自动恢复未完成任务。
 
 ### HuggingFace 模型下载示例
 
@@ -129,6 +138,10 @@ cargo tauri dev
 ```bash
 export HF_TOKEN=your_token_here
 ```
+
+### BT / 磁力链接
+
+在设置页的「磁力链接」标签可配置 SOCKS5 代理（覆盖 tracker 与 peer 流量）。留空时自动检测 `ALL_PROXY` / `HTTP_PROXY` 环境变量并转为 `socks5://` 使用。
 
 ### 配置说明
 
@@ -170,19 +183,19 @@ graph TB
 
 ---
 
-## 测试
+## 测试与质量
+
+项目当前保有 Rust 测试 1800+、前端测试 800+，CI 全平台（Windows / Linux / macOS）门禁通过。
 
 ```bash
-# Rust 测试
+# Rust 测试(nextest,比 cargo test 快 2-3 倍)
 cargo nextest run --all
 
-# Clippy 零警告
+# Clippy 零警告(CI 以 -D warnings 运行)
 cargo clippy --all-targets --all-features -- -D warnings
 
-# 覆盖率（核心 crate）
-cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
-  -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
-  --fail-under-lines 90 --summary-only
+# 覆盖率门禁(逐 crate + regions 90,与 CI 同源)
+bash scripts/ci/coverage.sh
 
 # 前端测试
 cd frontend && bun run test
@@ -213,4 +226,4 @@ cd frontend && bun run test
 
 ## 开源协议
 
-本项目采用 MIT / Apache-2.0 双许可证。详见 [LICENSE](LICENSE)。
+本项目采用 MIT / Apache-2.0 双许可证。详见 [LICENSE](LICENSE) 与 [LICENSE-APACHE](LICENSE-APACHE)。

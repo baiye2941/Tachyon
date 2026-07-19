@@ -28,6 +28,11 @@ concurrency:
 permissions:
   contents: write
 
+# DRY_RUN: workflow_dispatch 且 dry-run != false 时为 true（默认 dry-run=true）
+# 注意: job 级 if 不能读 env 上下文,发布/回滚条件用 github.event_name + inputs 表达式
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run != 'false' }}
+
 jobs:
   # 完整 CI 门禁: release 必须在所有 CI 检查通过后才能构建
   ci-gate:
@@ -76,40 +81,20 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: 运行覆盖率检查(核心 crate 逐 crate >= 90%)
-        # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)
-        # 逐 crate 门禁:避免合计门禁让单 crate 低覆盖被拉平(与 ci.yml 一致)
-        # --ignore-filename-regex: test_harness(测试基础设施) + iocp/winio/iouring(平台 IO 后端,内核 FFI)
-        run: |
-          set -e
-          for crate in tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tachyon-scheduler; do
-            echo "::group::覆盖率: $crate"
-            cargo llvm-cov -p "$crate" \
-              --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
-              --fail-under-regions 90 --summary-only
-            echo "::endgroup::"
-          done
+        # SSOT: scripts/ci/coverage.sh（逐 crate + --fail-under-regions 90）
+        run: bash scripts/ci/coverage.sh
 
       # SRE-002: Miri 检查门禁
       # 注意:Miri 组件只在 nightly 可用,必须设置 RUSTUP_TOOLCHAIN=nightly
       # 否则 cargo miri setup 会用 stable 报错 "miri component not available"
-      # (与 ci.yml 的 miri job 配置一致)
+      # SSOT: scripts/ci/miri.sh（含 dir_sync，与 CI 同源）
       - name: 安装 nightly 工具链(Miri)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
 
-      - name: 初始化 Miri
-        run: cargo miri setup
-        env:
-          RUSTUP_TOOLCHAIN: nightly
-
-      - name: Miri 检测 tachyon-core
-        run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip test_validate_multi_save_paths --skip proptests
-        env:
-          RUSTUP_TOOLCHAIN: nightly
-
-      - name: Miri 检测 tachyon-io (非平台特定代码)
-        run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring --skip pipeline --skip tokio_file --skip winio --skip write_pipeline
+      - name: Miri 检测
+        run: bash scripts/ci/miri.sh
         env:
           RUSTUP_TOOLCHAIN: nightly
 
@@ -125,15 +110,11 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-deny
         run: cargo binstall -y --force cargo-deny
-      - name: cargo deny 检查
-        run: cargo deny check
       - name: 安装 cargo-audit
         run: cargo binstall -y --force cargo-audit
-      - name: cargo audit 检查
-        # 与 deny.toml [advisories].ignore 对齐,治理同一组已知的间接依赖漏洞
-        # (librqbit/Tauri 引入的 quick-xml、glib、bincode、backoff 等)。
-        # RUSTSEC-2026-0186(memmap2)已随 0.9.11 升级消除,deny.toml 已移除,此处不再忽略。
-        run: cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0012 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0060 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0190
+      # SSOT: scripts/ci/audit.sh — ignore 从 deny.toml 解析，再 cargo audit + cargo deny
+      - name: cargo audit + deny 检查
+        run: bash scripts/ci/audit.sh
 
   # 前端门禁
   frontend-gate:
@@ -145,7 +126,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
       # SRE-003: 前端安全审计门禁
       # 使用 bun audit(项目用 bun 管理依赖,无 package-lock.json,
       # npm audit 会因 ENOLOCK 失败)。与 ci.yml 的前端审计命令保持一致。
@@ -166,42 +147,18 @@ jobs:
         run: bun run build
 
   # 版本一致性检查
+  # tag 推送: 比 tag vs Cargo/tauri/frontend
+  # workflow_dispatch: 只比三文件互相同（不把 GITHUB_REF 当版本）
   version-check:
     name: 版本一致性检查
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - name: 检查 tag 与各配置文件版本一致
-        run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "Tag 版本: ${TAG_VERSION}"
-
-          # Cargo.toml workspace version
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "Cargo.toml 版本: ${CARGO_VERSION}"
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Cargo.toml 版本不一致: tag=v${TAG_VERSION}, Cargo.toml=${CARGO_VERSION}"
-            exit 1
-          fi
-
-          # tauri.conf.json version
-          TAURI_VERSION=$(grep '"version"' crates/tachyon-app/tauri.conf.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "tauri.conf.json 版本: ${TAURI_VERSION}"
-          if [ "$TAG_VERSION" != "$TAURI_VERSION" ]; then
-            echo "::error::tauri.conf.json 版本不一致: tag=v${TAG_VERSION}, tauri.conf.json=${TAURI_VERSION}"
-            exit 1
-          fi
-
-          # frontend/package.json version
-          FRONTEND_VERSION=$(grep '"version"' frontend/package.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "frontend/package.json 版本: ${FRONTEND_VERSION}"
-          if [ "$TAG_VERSION" != "$FRONTEND_VERSION" ]; then
-            echo "::error::frontend/package.json 版本不一致: tag=v${TAG_VERSION}, package.json=${FRONTEND_VERSION}"
-            exit 1
-          fi
-
-          echo "所有版本一致: ${TAG_VERSION}"
+      - name: 检查版本一致性
+        # SSOT: scripts/ci/version-check.sh
+        # tag push → tag 模式；dispatch/其他 → files 模式（auto 亦可，显式更清晰）
+        run: bash scripts/ci/version-check.sh ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 'tag' || 'files' }}
 
   # 安装冒烟测试:验证构建产物可安装且二进制可执行
   # 注意: Tauri GUI 应用需要 display server,CI 无头环境无法验证窗口启动,
@@ -349,9 +306,10 @@ jobs:
           echo "Release 将从 draft 变为 public"
 
   # 发布失败时自动回滚:将当前 release 标记为 pre-release
+  # dry-run 不创建 public/draft 副作用路径上的回滚；tag 推送与 dry-run=false 仍回滚
   rollback-on-failure:
     name: 发布回滚
-    if: failure()
+    if: failure() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     needs: [build-release, install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -415,9 +373,26 @@ jobs:
 
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
 
-      - uses: tauri-apps/tauri-action@v1.0.0
+      # dry-run: 故意不设 tagName/releaseName — tauri-action 仅构建 + workflow artifacts，
+      # 不创建 GitHub Release，避免污染 draft。
+      # 参考: https://github.com/tauri-apps/tauri-action examples/test-build-only.yml
+      - name: 构建 Tauri (dry-run, 不创建 Release)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != 'false'
+        uses: tauri-apps/tauri-action@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/tachyon-app
+          uploadWorkflowArtifacts: true
+
+      # tag 推送 或 workflow_dispatch dry-run=false: 创建 draft Release + workflow artifacts
+      - name: 构建 Tauri 并上传 draft Release
+        if: github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false'
+        uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # SEC-013: Tauri updater ed25519 签名(本地密钥对,私钥入 GH secret)
@@ -450,10 +425,12 @@ jobs:
   publish-release:
     name: 发布 Release
     needs: [release-gate]
-    # workflow_dispatch 干跑模式(dry-run=true)跳过发布,仅验证构建链路
-    if: success() && github.event_name != 'workflow_dispatch'
+    # dry-run=true(默认)跳过公开发布; tag 推送 或 显式 dry-run=false 才 undraft
+    # 注意: job 级 if 不能用 env 上下文,故内联等价表达式
+    if: success() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 含 cosign + Release 资产对账下载/上传 sidecar，5min 偏紧
+    timeout-minutes: 15
     permissions:
       contents: write
       # SEC-013: cosign keyless 需 OIDC token 签发权限
@@ -469,62 +446,49 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # S-12: 生成 SHA256 校验文件并附加到 release
-      - name: 生成 SHA256 校验文件
-        shell: bash
-        run: |
-          cd dist
-          for file in *.msi *.deb *.dmg *.AppImage; do
-            if [ -f "$file" ]; then
-              sha256sum "$file" > "$file.sha256"
-              echo "SHA256 校验文件已生成: $file.sha256"
-            fi
-          done
-
       # SEC-013: sigstore cosign keyless 签名(零密钥管理,GH OIDC → Fulcio 短期证书)
       - name: 安装 cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: 对产物进行 sigstore keyless 签名(bundle)
+      # SSOT: scripts/ci/sign-release-artifacts.sh
+      # 递归 find(msi/deb/dmg/AppImage) + SHA256 + cosign + 硬断言数量一致
+      # RECONCILE_TAG: 与 draft Release 资产字节对账，避免 artifact 布局与用户下载物不一致
+      - name: 签名产物(递归 find + 硬断言 + Release 对账)
         shell: bash
         env:
           COSIGN_EXPERIMENTAL: 1
-        run: |
-          set -euo pipefail
-          cd dist
-          for f in *.msi *.deb *.dmg *.AppImage; do
-            [ -f "$f" ] || continue
-            cosign sign-blob --yes --bundle "$f.bundle" "$f"
-            echo "已签名: $f -> $f.bundle"
-          done
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DIST_DIR: dist
+          RECONCILE_TAG: ${{ github.ref_name }}
+        run: bash scripts/ci/sign-release-artifacts.sh
 
-      - name: 上传签名 bundle 到 release
+      - name: 上传签名与校验文件到 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          cd dist
-          for b in *.bundle; do
-            [ -f "$b" ] || continue
-            gh release upload "$TAG" "$b" --repo "${{ github.repository }}" --clobber
+          # 递归上传 sidecar（嵌套 artifact 布局下顶层 glob 会漏）
+          mapfile -t SIDECARS < <(
+            find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
+          )
+          [[ ${#SIDECARS[@]} -ge 1 ]] || {
+            echo "::error::无 sidecar 可上传（sha256/bundle）"
+            exit 1
+          }
+          for s in "${SIDECARS[@]}"; do
+            # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
+            gh release upload "$TAG" "$s" --repo "${{ github.repository }}" --clobber
+            echo "已上传: $s"
           done
 
       - name: 将 draft release 发布为 public
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           echo "所有平台构建完成,发布 release $TAG"
-
-          # 上传 SHA256 校验文件到 release
-          cd dist
-          for sha_file in *.sha256; do
-            if [ -f "$sha_file" ]; then
-              # 审计 SEC-013:校验文件上传失败必须阻断公开发布
-              gh release upload "$TAG" "$sha_file" --repo "${{ github.repository }}" --clobber
-            fi
-          done
-
           gh release edit "$TAG" --draft=false --repo "${{ github.repository }}"
           echo "Release $TAG 已公开发布"

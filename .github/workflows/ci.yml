@@ -133,12 +133,12 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.20.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
-      # 与 deny.toml [advisories].ignore 对齐,治理同一组已知的间接依赖漏洞
-      # (librqbit/Tauri 引入的 quick-xml、glib、bincode、backoff 等)。
-      # 审计 A-10:quick-xml 0194/0195 同时覆盖 librqbit-upnp 与 Tauri/plist 链,
-      # 目标 quick-xml >=0.41 后移除 ignore;不得再标注为「仅 UPnP」。
-      # RUSTSEC-2026-0186(memmap2)已随 0.9.11 升级消除,不再忽略。
-      - run: cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2025-0012 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0060 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0190
+      # ignore 单源 = deny.toml [advisories].ignore（scripts/ci/audit.sh 解析）
+      # 本 job 仅跑 cargo-audit；cargo deny 由 audit job 负责
+      - name: cargo audit 检查
+        run: bash scripts/ci/audit.sh
+        env:
+          AUDIT_WITH_DENY: "0"
 
   # SRE-013: TOML 格式检查
   taplo:
@@ -179,42 +179,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: 运行覆盖率检查
-        # 覆盖率口径: 排除协议层(需外部网络)、tachyon-app(需 Tauri 运行时)
-        # 仅检查核心逻辑 crate 的覆盖率。
-        #
-        # 逐 crate 门禁(而非合计):合计门禁会让单 crate 低覆盖被高覆盖 crate 拉平,
-        # 门禁失效。逐 crate 断言确保每个核心 crate 单独达标。
-        #
-        # 指标用 regions 而非 lines:cargo-llvm-cov 的 lcov 行统计对 Rust 注释行
-        # (///)、属性行(#[serde(default)])、let chains(if let ... && let ...)
-        # 存在已知偏差——这些非可执行行被计入"未覆盖行"分母,导致 tachyon-core
-        # 在已有 100+ 个 validate 测试全通过的情况下,lines 口径仍假性低于 90%
-        # (实际逻辑已覆盖)。regions 是 LLVM 的基本覆盖单元,粒度更细(一行可含
-        # 多个 region),不受上述 lcov 行统计偏差影响,是更准确的覆盖率度量。
-        # 各 crate regions 覆盖率:core 90.9% / engine 90.2% / store 96.9% /
-        # io 95.2% / crypto 98.4% / scheduler 99.1%。
-        #
-        # --ignore-filename-regex:
-        #   - test_harness: #[cfg(test)] 门控的测试基础设施(MockProtocol/FailingStorage 等),非生产代码
-        #   - iocp|winio|iouring: 平台特定 IO 后端(Windows IOCP/WinFile、Linux io_uring),
-        #     属内核 FFI 接口,跨平台 CI 无法覆盖非目标平台分支,按 AGENTS.md "网络 IO
-        #     依赖外部硬件排除计算" 规则不计入门禁分母
-        run: |
-          set -e
-          for crate in tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tachyon-scheduler; do
-            echo "::group::覆盖率: $crate"
-            cargo llvm-cov -p "$crate" \
-              --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
-              --fail-under-regions 90 --summary-only
-            echo "::endgroup::"
-          done
+        # SSOT: scripts/ci/coverage.sh
+        # 逐 crate + --fail-under-regions 90（禁止合计 fail-under-lines）
+        # ignore: test_harness + 平台 IO 后端(iocp/winio/iouring)
+        run: bash scripts/ci/coverage.sh
       - name: 生成覆盖率报告
         if: always()
-        run: |
-          cargo llvm-cov -p tachyon-core -p tachyon-engine -p tachyon-store \
-            -p tachyon-io -p tachyon-crypto -p tachyon-scheduler \
-            --ignore-filename-regex "(test_harness|iocp|winio|iouring)" \
-            --html || true
+        run: bash scripts/ci/coverage.sh
+        env:
+          COVERAGE_HTML_ONLY: "1"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -237,12 +210,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - name: 初始化 Miri
-        run: cargo miri setup
-      - name: Miri 检测 tachyon-core
-        run: cargo miri test -p tachyon-core --lib -- --skip test_validate_save_path --skip test_validate_multi_save_paths --skip proptests
-      - name: Miri 检测 tachyon-io (非平台特定代码)
-        run: cargo miri test -p tachyon-io --lib -- --skip iocp --skip iouring --skip pipeline --skip tokio_file --skip winio --skip write_pipeline --skip dir_sync
+      # SSOT: scripts/ci/miri.sh（含 dir_sync isolation skip，CI/Release 同源）
+      - name: Miri 检测
+        run: bash scripts/ci/miri.sh
 
   bench:
     name: 性能基准采样
@@ -274,7 +244,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: 安装前端依赖
         working-directory: frontend
-        run: bun install
+        run: bun install --frozen-lockfile
       - name: 前端依赖安全审计
         working-directory: frontend
         run: bun audit --audit-level=high

@@ -127,11 +127,24 @@ check \
   "$release_yml" \
   "sigstore/cosign-installer"
 
-# 8) 调用 cosign sign-blob --yes --bundle <file>.bundle <file>
-check \
-  "C3 release.yml 含 cosign sign-blob --bundle 调用" \
-  "$release_yml" \
-  "cosign[[:space:]]+sign-blob.*--bundle"
+# 8) cosign sign-blob --bundle：允许内联在 release.yml，或经 SSOT 脚本间接调用
+#    Task 3 后 cosign 迁到 scripts/ci/sign-release-artifacts.sh，C3 不能再只扫 yml
+sign_script="scripts/ci/sign-release-artifacts.sh"
+c3_name="C3 cosign sign-blob --bundle（release.yml 内联或 SSOT 脚本）"
+c3_ok=0
+if [ -f "$release_yml" ] && grep -Eq -- "cosign[[:space:]]+sign-blob.*--bundle" "$release_yml"; then
+  c3_ok=1
+elif [ -f "$release_yml" ] && [ -f "$sign_script" ] \
+  && grep -Eq -- "scripts/ci/sign-release-artifacts\\.sh" "$release_yml" \
+  && grep -Eq -- "cosign[[:space:]]+sign-blob.*--bundle" "$sign_script"; then
+  c3_ok=1
+fi
+if [ "$c3_ok" -eq 1 ]; then
+  pass_list+=("$c3_name")
+else
+  fail_list+=("$c3_name: release.yml 未内联 cosign sign-blob --bundle，且未引用含该调用的 $sign_script")
+  errors=$((errors + 1))
+fi
 
 # ── 输出 ───────────────────────────────────────────────────
 echo "--- 通过 ---"
