@@ -69,6 +69,11 @@ const COMPLETED_STATUSES: DownloadStatus[] = ["completed"];
 const DOWNLOADING_SET = new Set<DownloadStatus>(DOWNLOADING_STATUSES);
 const INCOMPLETE_SET = new Set<DownloadStatus>(INCOMPLETE_STATUSES);
 const COMPLETED_SET = new Set<DownloadStatus>(COMPLETED_STATUSES);
+const TERMINAL_STATUSES = new Set<DownloadStatus>([
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 const [tasks, setTasksRaw] = createStore<TaskInfo[]>([]);
 const [selectedId, setSelectedId] = createSignal<string | null>(null);
@@ -202,12 +207,6 @@ export const $activeCount = {
 };
 
 export function updateProgress(payload: Record<string, ProgressPayload>) {
-  const TERMINAL_STATUSES = new Set<DownloadStatus>([
-    "completed",
-    "failed",
-    "cancelled",
-  ]);
-
   batch(() => {
     // hot 层增量更新:收集所有变化的 high-frequency 字段
     const hotUpdates = new Map<string, HotProgress>();

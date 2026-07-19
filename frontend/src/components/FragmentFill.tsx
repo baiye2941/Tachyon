@@ -6,15 +6,14 @@ interface FragmentFillProps {
   progress: number;
   /** 是否减少动画(reduced-motion 降级为静态 transform) */
   reducedMotion: boolean;
-  /** 自定义填充色(内联,会覆盖 CSS 液面渐变);缺省由 CSS token 渐变接管 */
-  color?: string;
 }
 
 /**
  * 分片半填充充能条:在 chunk-cell 内部从左到右填充,弹簧物理驱动。
  *
  * 性能:仅动 transform: scaleX(GPU 合成,零 reflow)。reduced-motion 降级为
- * 静态 transform(无 spring,无 rAF)。父级 chunk-cell 设 overflow: hidden +
+ * 静态 transform(无 spring,无 rAF),并带 chunk-cell-fill--static 修饰类
+ * 关掉 will-change(静态分支无合成需求)。父级 chunk-cell 设 overflow: hidden +
  * position: relative,本组件 absolute inset-0。
  *
  * Motion 用法对齐 DetailPanel/CommandPalette:animate 传独立变换值 scaleX
@@ -26,10 +25,6 @@ interface FragmentFillProps {
  */
 export default function FragmentFill(props: FragmentFillProps): JSX.Element {
   const pct = () => Math.max(0, Math.min(1, props.progress));
-  // 仅在显式传 color 时内联背景,否则交由 CSS(.chunk-cell--downloading
-  // .chunk-cell-fill 的液面渐变)生效——内联样式优先级高,会盖掉渐变。
-  const bgStyle = (): JSX.CSSProperties | undefined =>
-    props.color ? { background: props.color } : undefined;
 
   // Show 分支而非 early return:reducedMotion 是响应式 prop(OS 设置可热切换),
   // early return 会冻结在首次渲染的分支(eslint solid/components-return-once)。
@@ -47,17 +42,13 @@ export default function FragmentFill(props: FragmentFillProps): JSX.Element {
             damping: 30,
             mass: 0.8,
           }}
-          style={bgStyle()}
           aria-hidden="true"
         />
       }
     >
       <div
-        class="chunk-cell-fill"
-        style={{
-          transform: `scaleX(${pct()})`,
-          ...bgStyle(),
-        }}
+        class="chunk-cell-fill chunk-cell-fill--static"
+        style={{ transform: `scaleX(${pct()})` }}
         aria-hidden="true"
       />
     </Show>

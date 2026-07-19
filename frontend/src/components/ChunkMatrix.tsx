@@ -396,11 +396,18 @@ export default function ChunkMatrix(props: ChunkMatrixProps) {
     );
   });
 
-  // 整块下载兜底:任务完成但 doneSet 为空(单分片整块下载无 Chunk::completed 事件)
+  // 整块下载兜底:任务完成(progress>=1)但 doneSet 未收齐时,补 0..total 全部 done。
+  // 两种场景:单分片整块下载无 Chunk::completed 事件(doneSet 为空);
+  // Lagged 背压丢 completedDelta(只有部分格变绿)。任务完成即全片完成,
+  // 统一按 total 补全,避免「只有 0 号格绿」的假象。
   createEffect(() => {
     const data = fragData();
-    if (props.progress >= 1 && data && data.doneSet.size === 0) {
-      mergeFragmentDelta(props.taskId, [0], []);
+    if (props.progress >= 1 && data && data.doneSet.size < data.total) {
+      mergeFragmentDelta(
+        props.taskId,
+        Array.from({ length: data.total }, (_, i) => i),
+        [],
+      );
     }
   });
 

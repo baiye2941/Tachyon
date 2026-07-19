@@ -857,6 +857,36 @@ describe("ChunkMatrix 分片矩阵", () => {
     });
   });
 
+  describe("整块下载兜底", () => {
+    it("progress>=1 但 doneSet 未收齐时,兜底补全 0..total 全部 done", async () => {
+      // Lagged 背压丢 completedDelta:只有 2 号收到完成事件
+      setFragmentData("test-task", {
+        total: 4,
+        doneSet: new Set([2]),
+        downloadingSet: new Set(),
+        bytesMap: new Map(),
+        finalized: true,
+      });
+      render(() => (
+        <ChunkMatrix
+          taskId="test-task"
+          fragmentsTotal={4}
+          fragmentsDone={4}
+          progress={1}
+        />
+      ));
+      await Promise.resolve();
+      // 兜底语义:任务完成即全片完成,补 0..total 全部 done,而非只补 [0]
+      expect(mergeFragmentDelta).toHaveBeenCalledWith(
+        "test-task",
+        [0, 1, 2, 3],
+        [],
+      );
+      await Promise.resolve();
+      expect(document.querySelectorAll(".chunk-cell--done").length).toBe(4);
+    });
+  });
+
   describe("Canvas 聚合块字节进度渐变", () => {
     /**
      * 安装持有引用的 mock ctx,返回句柄与恢复函数。
@@ -1143,6 +1173,13 @@ describe("ChunkMatrix 分片矩阵", () => {
       const body = ruleBody(".chunk-cell--downloading .chunk-cell-fill");
       expect(body).not.toBe("");
       expect(body).toContain("var(--color-status-downloading) 100%");
+    });
+
+    it("reduced-motion 静态分支(.chunk-cell-fill--static)不保留 will-change", () => {
+      const body = ruleBody(".chunk-cell-fill--static");
+      expect(body).not.toBe("");
+      // 静态 transform 无合成需求,will-change: transform 会白占合成层内存
+      expect(body).toContain("will-change: auto");
     });
   });
 });

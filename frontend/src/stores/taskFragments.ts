@@ -20,13 +20,22 @@ const [fragmentMap, setFragmentMap] = createSignal<Map<string, TaskFragmentData>
 // 竞态防护 token:按 taskId 隔离,避免不同任务的并发 loadTaskFragments 互相干扰
 const loadTokens = new Map<string, number>();
 
+/** 纯字节快照合并的 per-task 最小间隔(ms)。
+ * 250ms 进度 tick 中纯字节合并占比最高,每次都重建 Map/条目代价不小;
+ * 节流丢弃的中间快照会被后到的快照覆盖(覆盖式合并,幂等),无正确性风险。
+ * 状态 delta(completed/started)永远即时通过,不经此闸门;
+ * clearTaskFragmentDownloading 与 loadTaskFragments 不节流。 */
+const BYTES_MERGE_MIN_INTERVAL_MS = 100;
+const lastBytesMergeAt = new Map<string, number>();
+
 /** DetailPanel 打开/task 切换时调用:首拉元数据 + 初始 doneSet/downloadingSet
  * 后端 total=0 表示 PlanComplete 尚未到达(探测中),此时不写入 store,
  * 保持 undefined 以便后续 fragmentsTotal 变非 0 时再次重拉。
  *
  * 快照合并:await 期间收到的 delta 不会被覆盖。doneSet 取快照与本地 delta 的并集
- * (快照是权威基线,delta 是增量补充);downloadingSet 以快照为准
- * (后端 authoritative,本地 delta 可能已过时)。 */
+ * (快照是权威基线,delta 是增量补充);downloadingSet 取
+ * `snapshot ∪ (本地 downloadingSet − mergedDone)`——await 窗口内的 started
+ * 不能被快照覆盖丢失,但已完成的分片必须剔除。 */
 export async function loadTaskFragments(taskId: string) {
   const token = (loadTokens.get(taskId) ?? 0) + 1;
   loadTokens.set(taskId, token);
@@ -43,12 +52,17 @@ export async function loadTaskFragments(taskId: string) {
       // (await 期间可能收到 completedDelta,这些不应被快照覆盖)
       const mergedDone = new Set(snapshotDone);
       for (const idx of data.doneSet) mergedDone.add(idx);
-      // downloadingSet 以快照为准(后端 authoritative)
+      // downloadingSet:快照 ∪ (本地 downloadingSet − mergedDone)
+      // (await 期间的 started delta 不能被快照覆盖;已完成的分片剔除)
       // bytesMap 保留已有本地快照:首拉快照不含字节进度,保留 delta 合并结果
+      const mergedDownloading = new Set(snapshotDownloading);
+      for (const idx of data.downloadingSet) {
+        if (!mergedDone.has(idx)) mergedDownloading.add(idx);
+      }
       next.set(taskId, {
         total: view.total,
         doneSet: mergedDone,
-        downloadingSet: snapshotDownloading,
+        downloadingSet: mergedDownloading,
         bytesMap: data.bytesMap,
         finalized: data.finalized,
       });
@@ -68,6 +82,7 @@ export async function loadTaskFragments(taskId: string) {
 /** DetailPanel 关闭时调用:清理 */
 export function clearTaskFragments(taskId: string) {
   loadTokens.delete(taskId);
+  lastBytesMergeAt.delete(taskId);
   setFragmentMap((prev) => {
     const next = new Map(prev);
     next.delete(taskId);
@@ -104,6 +119,29 @@ export function mergeFragmentDelta(
     // finalized 时只处理 completed,跳过所有 started
     const effectiveStarted = data.finalized ? [] : startedDelta;
     const next = new Map(prev);
+    if (completedDelta.length === 0 && effectiveStarted.length === 0) {
+      // 纯字节合并:per-task 节流闸门,丢弃过密的中间快照
+      const now = Date.now();
+      const last = lastBytesMergeAt.get(taskId);
+      if (last !== undefined && now - last < BYTES_MERGE_MIN_INTERVAL_MS) {
+        return prev;
+      }
+      lastBytesMergeAt.set(taskId, now);
+      // 集合无状态变化:复用 Set 引用,仅覆盖式重建 bytesMap 与条目,
+      // 避免 250ms tick 下每个任务克隆两个 Set
+      const newBytesMap = new Map<number, number>();
+      if (fragmentBytes) {
+        for (const entry of fragmentBytes) {
+          // 跳过已完成的(防御:后端已完成分片不应出现在快照,但前端兜底)
+          if (!data.doneSet.has(entry.index)) {
+            newBytesMap.set(entry.index, entry.downloaded);
+          }
+        }
+      }
+      next.set(taskId, { ...data, bytesMap: newBytesMap });
+      return next;
+    }
+    // 有状态 delta:永远即时通过(不节流),克隆集合并应用
     // 先处理 completed:加入 doneSet,从 downloadingSet 移除
     const newDone = new Set(data.doneSet);
     const newDownloading = new Set(data.downloadingSet);

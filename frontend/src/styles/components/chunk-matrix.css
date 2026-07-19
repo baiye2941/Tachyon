@@ -142,6 +142,11 @@
   );
 }
 
+/* reduced-motion 静态分支:无 spring 动画,will-change 只会白占合成层内存 */
+.chunk-cell-fill--static {
+  will-change: auto;
+}
+
 .chunk-cell--selected {
   transform: scale(1.06);
   box-shadow:

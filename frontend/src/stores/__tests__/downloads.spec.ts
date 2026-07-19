@@ -5,6 +5,7 @@ import type { TaskInfo } from '../../types'
 const mockGetTaskList = vi.fn()
 const mockReorderTasks = vi.fn()
 const mockMoveTask = vi.fn()
+const mockGetTaskFragments = vi.fn()
 const mockAddToast = vi.fn()
 const mockAddHistoryRecord = vi.fn()
 
@@ -13,6 +14,7 @@ vi.mock('../../api/invoke', () => ({
     getTaskList: (...args: unknown[]) => mockGetTaskList(...args),
     reorderTasks: (...args: unknown[]) => mockReorderTasks(...args),
     moveTask: (...args: unknown[]) => mockMoveTask(...args),
+    getTaskFragments: (...args: unknown[]) => mockGetTaskFragments(...args),
   },
 }))
 
@@ -48,6 +50,7 @@ describe('downloads store', () => {
     mockGetTaskList.mockReset()
     mockReorderTasks.mockReset()
     mockMoveTask.mockReset()
+    mockGetTaskFragments.mockReset()
     mockAddToast.mockReset()
     mockAddHistoryRecord.mockReset()
     downloadsModule = await import('../downloads')
@@ -380,6 +383,36 @@ describe('downloads store', () => {
     })
 
     expect(downloadsModule.$tasks.get()[0]?.errorReason).toBeUndefined()
+  })
+
+  it('updateProgress 仅含 fragmentBytes(无 delta)的 payload 触发 mergeFragmentDelta 更新 bytesMap', async () => {
+    // fragmentBytes 每 tick 推送,delta 为空也必须走合并,否则充能条冻结
+    mockGetTaskFragments.mockResolvedValue({
+      total: 4,
+      doneIndices: [],
+      downloadingIndices: [0],
+    })
+    const { loadTaskFragments, getTaskFragmentData, clearTaskFragments } =
+      await import('../taskFragments')
+    await loadTaskFragments('t1')
+    downloadsModule.setTasks([makeTask('t1')])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.5,
+        downloaded: 512,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 2,
+        fragmentsTotal: 4,
+        activeConcurrency: 4,
+        fragmentBytes: [{ index: 0, downloaded: 512 }],
+      },
+    })
+
+    expect(getTaskFragmentData('t1')?.bytesMap.get(0)).toBe(512)
+    clearTaskFragments('t1')
   })
 
   it('refreshTaskList 成功时更新任务列表', async () => {

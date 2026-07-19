@@ -47,4 +47,20 @@ describe("FragmentFill", () => {
     const fill = container.querySelector(".chunk-cell-fill");
     expect(fill?.getAttribute("aria-hidden")).toBe("true");
   });
+
+  it("reducedMotion 静态分支带 chunk-cell-fill--static 修饰类(will-change 降级)", () => {
+    const { container } = render(() => (
+      <FragmentFill progress={0.5} reducedMotion={true} />
+    ));
+    const fill = container.querySelector(".chunk-cell-fill");
+    expect(fill?.classList.contains("chunk-cell-fill--static")).toBe(true);
+  });
+
+  it("动画分支不带 chunk-cell-fill--static 修饰类", () => {
+    const { container } = render(() => (
+      <FragmentFill progress={0.5} reducedMotion={false} />
+    ));
+    const fill = container.querySelector(".chunk-cell-fill");
+    expect(fill?.classList.contains("chunk-cell-fill--static")).toBe(false);
+  });
 });
