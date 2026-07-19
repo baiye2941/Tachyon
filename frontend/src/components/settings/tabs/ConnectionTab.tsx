@@ -1,7 +1,7 @@
 import type { SetStoreFunction } from "solid-js/store";
-import { createResource, Show } from "solid-js";
+import { Show } from "solid-js";
 import { tr } from "../../../i18n";
-import { api } from "../../../api/invoke";
+import { getQuicCapabilityResource } from "../../../stores/quicCapabilityCache";
 import SliderItem from "../items/SliderItem";
 import ToggleItem from "../items/ToggleItem";
 import type { ConfigDraft } from "../SettingsPanel";
@@ -13,8 +13,9 @@ export interface ConnectionTabProps {
 
 export default function ConnectionTab(props: ConnectionTabProps) {
   const t = tr;
-  // 审计 HTTP-10:QUIC 能力可见性——读取编译期能力,提示用户降级
-  const [quicCap] = createResource(() => api.getQuicCapability().catch(() => null));
+  // 审计 HTTP-10:QUIC 能力可见性——读取编译期能力,提示用户降级。
+  // 模块级单例缓存,tab 重挂载不再重新 fetch(防内容晚到闪动)
+  const quicCap = getQuicCapabilityResource();
   return (
     <div class="flex flex-col gap-5">
       <SliderItem

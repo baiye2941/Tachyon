@@ -18,6 +18,8 @@ import ConfirmDialog from "../ConfirmDialog";
 import Button from "../../shared/ui/Button";
 import { tr, type MessageKey } from "../../i18n";
 import { $experimental } from "../../stores/experimental";
+import { getQuicCapabilityResource } from "../../stores/quicCapabilityCache";
+import { getBtProxyCoverageResource } from "../../stores/btProxyCoverageCache";
 import GeneralTab from "./tabs/GeneralTab";
 import DownloadTab from "./tabs/DownloadTab";
 import ConnectionTab from "./tabs/ConnectionTab";
@@ -269,6 +271,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
   };
 
   onMount(async () => {
+    // 预取异步能力报告(fire-and-forget):首次切到「连接」/「磁力链接」tab 时
+    // 数据已就绪,避免 pending → resolved 内容晚到产生一帧闪动
+    getQuicCapabilityResource();
+    getBtProxyCoverageResource();
     $configLoading.set(true);
     try {
       const cfg = await api.getConfig();
