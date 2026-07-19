@@ -64,7 +64,9 @@ fn synthesize_terminal_view(state: &AppState, task_id: &str) -> TaskFragmentsVie
 
     match status {
         DownloadState::Completed => {
-            // 内存 fragments_total 缺失(如重启后未恢复该字段)时从快照兜底
+            // 内存 fragments_total 缺失(如重启后未恢复该字段)时从快照兜底。
+            // 注:当前前端对 fragmentsTotal===0 的任务不发本命令(DetailPanel 早退),
+            // 该兜底是防御性路径,为将来的调用方/其他客户端保留
             let total = if memory_total > 0 {
                 memory_total
             } else {

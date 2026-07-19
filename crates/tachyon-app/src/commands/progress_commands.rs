@@ -32,6 +32,7 @@ pub async fn subscribe_progress(
 
     let mut rx = state.runtime.progress_broker.subscribe();
     let task_repository = state.domain.task_repository.clone();
+    let fragment_state_store = state.fragment_state_store.clone();
 
     tokio::spawn(async move {
         // 首次广播全量快照，保证前端初始状态正确
@@ -59,7 +60,17 @@ pub async fn subscribe_progress(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "进度 broadcast 订阅滞后,继续接收后续事件");
+                    tracing::warn!(
+                        skipped = n,
+                        "进度 broadcast 订阅滞后,合成权威 resync 后继续接收"
+                    );
+                    // Lagged 后中间 delta 已丢；用 task_repository + fragment_state_store
+                    // 合成权威全量 resync，保证前端分片集合最终一致。
+                    let snap = build_lagged_resync_event(&task_repository, &fragment_state_store);
+                    if !snap.is_empty() {
+                        let _ = app_handle.emit("progress-update", &snap);
+                        last_snapshot = snap;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -118,7 +129,10 @@ fn build_initial_progress_event(
                     file_size: t.file_size,
                     completed_delta: vec![],
                     started_delta: vec![],
-                    error_reason: None,
+                    // 与 broker 路径(build_progress_event)对齐带真实值:
+                    // 否则 G 修复(wire 三态)后初始快照会以 null 清掉前端已展示的错误文案,
+                    // 启动时 Failed 任务的错误提示会闪一下才被 delta 修正
+                    error_reason: t.error_reason.clone(),
                     fragment_bytes: vec![],
                 },
             )
@@ -142,19 +156,102 @@ fn compute_progress_delta(
         .collect()
 }
 
+/// Lagged 恢复：用 task_repository + fragment_state_store 合成权威全量 resync。
+///
+/// 语义：
+/// - 标量字段来自 TaskInfo（对齐 `build_initial_progress_event`）
+/// - 有 frag state 时：`completed_delta` = done_set 全量有序，
+///   `started_delta` = downloading_set 全量有序
+/// - 无 frag state 时：delta 为空，仅推送任务标量
+/// - `fragment_bytes` 本路径可空（权威字节快照仍由后续正常 tick 补齐）
+pub(crate) fn build_lagged_resync_event(
+    task_repository: &crate::repository::TaskRepository,
+    fragment_state_store: &crate::projection::FragmentStateStore,
+) -> ProgressEvent {
+    task_repository
+        .iter()
+        .map(|r| {
+            let id = r.key();
+            let t = r.value();
+            let (completed_delta, started_delta) = if let Some(frag) = fragment_state_store.get(id)
+            {
+                (
+                    frag.done_set.iter().copied().collect(),
+                    frag.downloading_set.iter().copied().collect(),
+                )
+            } else {
+                (vec![], vec![])
+            };
+            (
+                id.clone(),
+                TaskProgress {
+                    id: id.clone(),
+                    progress: t.progress,
+                    speed: t.speed,
+                    downloaded: t.downloaded,
+                    status: t.status,
+                    fragments_done: t.fragments_done,
+                    fragments_total: t.fragments_total,
+                    active_concurrency: t.active_concurrency,
+                    file_size: t.file_size,
+                    completed_delta,
+                    started_delta,
+                    error_reason: t.error_reason.clone(),
+                    fragment_bytes: vec![],
+                },
+            )
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::super::TaskInfo;
     use super::super::task_commands::create_task_inner;
     use super::super::tests::test_state;
     use super::*;
+    use crate::projection::{FragmentStateStore, TaskFragmentState};
+    use crate::repository::TaskRepository;
     use crate::service::try_claim_subscription;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tachyon_core::types::DownloadState;
+
+    fn make_downloading_task(
+        id: &str,
+        downloaded: u64,
+        fragments_done: u32,
+        fragments_total: u32,
+    ) -> TaskInfo {
+        TaskInfo {
+            id: id.to_string(),
+            url: format!("https://example.com/{id}.bin"),
+            file_name: format!("{id}.bin"),
+            file_size: Some(1000),
+            downloaded,
+            speed: 0,
+            status: DownloadState::Downloading,
+            progress: if fragments_total > 0 {
+                f64::from(fragments_done) / f64::from(fragments_total)
+            } else {
+                0.0
+            },
+            fragments_total,
+            fragments_done,
+            active_concurrency: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            save_path: "/tmp".to_string(),
+            error_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
 
     #[test]
     fn test_try_claim_subscription_first_call_returns_true() {
@@ -435,5 +532,97 @@ mod tests {
         let event = build_initial_progress_event(&state.domain.task_repository);
         let tp = event.values().next().expect("应至少一个任务");
         assert!(tp.fragment_bytes.is_empty());
+    }
+
+    /// 初始全量快照必须携带真实 error_reason:订阅前已 Failed 的任务,
+    /// 若快照硬编码 None,wire 三态(null=清除)会把前端已展示的错误文案清掉
+    #[tokio::test]
+    async fn test_build_initial_progress_event_carries_error_reason() {
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/failed.bin".to_string(),
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        // 模拟订阅前已失败:直接在仓库中标记 Failed + 失败原因
+        let mut task = state
+            .domain
+            .task_repository
+            .get_mut(&id)
+            .expect("任务应在仓库中");
+        task.status = DownloadState::Failed;
+        task.error_reason = Some("连接超时".to_string());
+        drop(task);
+
+        let event = build_initial_progress_event(&state.domain.task_repository);
+        let tp = event.get(&id).expect("任务应在初始快照中");
+        assert_eq!(tp.error_reason.as_deref(), Some("连接超时"));
+    }
+
+    /// Lagged 恢复必须把 fragment_state_store 的 done/downloading 全量灌入 delta。
+    ///
+    /// 场景: broadcast 订阅滞后丢弃了中间 Started/Chunk 事件后，
+    /// 前端仅凭后续增量无法还原已完成/进行中的分片集合；
+    /// resync 必须用权威全量 done_set / downloading_set 补齐。
+    #[test]
+    fn lagged_resync_includes_all_done_indices() {
+        let repo = TaskRepository::new();
+        repo.insert("t1".to_string(), make_downloading_task("t1", 500, 2, 4));
+
+        let store = FragmentStateStore::new();
+        store.init("t1", TaskFragmentState::from_plan(4, vec![0, 2]));
+        store.mark_downloading("t1", 1);
+
+        let event = build_lagged_resync_event(&repo, &store);
+        let tp = event.get("t1").expect("resync 应包含 task t1");
+
+        let mut completed = tp.completed_delta.clone();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            vec![0, 2],
+            "completed_delta 应为 done_set 全量有序"
+        );
+        assert!(
+            tp.started_delta.contains(&1),
+            "started_delta 应包含 downloading 分片 1, got {:?}",
+            tp.started_delta
+        );
+        assert_eq!(tp.downloaded, 500, "标量 downloaded 应来自 TaskInfo");
+        assert_eq!(tp.fragments_done, 2, "标量 fragments_done 应来自 TaskInfo");
+        assert_eq!(tp.fragments_total, 4);
+        assert_eq!(tp.status, DownloadState::Downloading);
+    }
+
+    /// 有任务但无 fragment state 时: delta 为空，标量仍来自 TaskInfo。
+    #[test]
+    fn lagged_resync_empty_delta_when_no_frag_state() {
+        let repo = TaskRepository::new();
+        repo.insert("t1".to_string(), make_downloading_task("t1", 100, 0, 4));
+        let store = FragmentStateStore::new();
+
+        let event = build_lagged_resync_event(&repo, &store);
+        let tp = event
+            .get("t1")
+            .expect("即使无 frag state, resync 也应包含 task 标量");
+
+        assert!(
+            tp.completed_delta.is_empty(),
+            "无 frag state 时 completed_delta 应为空"
+        );
+        assert!(
+            tp.started_delta.is_empty(),
+            "无 frag state 时 started_delta 应为空"
+        );
+        assert_eq!(tp.downloaded, 100);
+        assert_eq!(tp.fragments_done, 0);
+        assert_eq!(tp.fragments_total, 4);
+        assert_eq!(tp.status, DownloadState::Downloading);
     }
 }
