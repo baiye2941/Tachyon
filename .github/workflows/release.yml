@@ -28,6 +28,11 @@ concurrency:
 permissions:
   contents: write
 
+# DRY_RUN: workflow_dispatch 且 dry-run != false 时为 true（默认 dry-run=true）
+# 注意: job 级 if 不能读 env 上下文,发布/回滚条件用 github.event_name + inputs 表达式
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run != 'false' }}
+
 jobs:
   # 完整 CI 门禁: release 必须在所有 CI 检查通过后才能构建
   ci-gate:
@@ -142,42 +147,18 @@ jobs:
         run: bun run build
 
   # 版本一致性检查
+  # tag 推送: 比 tag vs Cargo/tauri/frontend
+  # workflow_dispatch: 只比三文件互相同（不把 GITHUB_REF 当版本）
   version-check:
     name: 版本一致性检查
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - name: 检查 tag 与各配置文件版本一致
-        run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "Tag 版本: ${TAG_VERSION}"
-
-          # Cargo.toml workspace version
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "Cargo.toml 版本: ${CARGO_VERSION}"
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Cargo.toml 版本不一致: tag=v${TAG_VERSION}, Cargo.toml=${CARGO_VERSION}"
-            exit 1
-          fi
-
-          # tauri.conf.json version
-          TAURI_VERSION=$(grep '"version"' crates/tachyon-app/tauri.conf.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "tauri.conf.json 版本: ${TAURI_VERSION}"
-          if [ "$TAG_VERSION" != "$TAURI_VERSION" ]; then
-            echo "::error::tauri.conf.json 版本不一致: tag=v${TAG_VERSION}, tauri.conf.json=${TAURI_VERSION}"
-            exit 1
-          fi
-
-          # frontend/package.json version
-          FRONTEND_VERSION=$(grep '"version"' frontend/package.json | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "frontend/package.json 版本: ${FRONTEND_VERSION}"
-          if [ "$TAG_VERSION" != "$FRONTEND_VERSION" ]; then
-            echo "::error::frontend/package.json 版本不一致: tag=v${TAG_VERSION}, package.json=${FRONTEND_VERSION}"
-            exit 1
-          fi
-
-          echo "所有版本一致: ${TAG_VERSION}"
+      - name: 检查版本一致性
+        # SSOT: scripts/ci/version-check.sh
+        # tag push → tag 模式；dispatch/其他 → files 模式（auto 亦可，显式更清晰）
+        run: bash scripts/ci/version-check.sh ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 'tag' || 'files' }}
 
   # 安装冒烟测试:验证构建产物可安装且二进制可执行
   # 注意: Tauri GUI 应用需要 display server,CI 无头环境无法验证窗口启动,
@@ -325,9 +306,10 @@ jobs:
           echo "Release 将从 draft 变为 public"
 
   # 发布失败时自动回滚:将当前 release 标记为 pre-release
+  # dry-run 不创建 public/draft 副作用路径上的回滚；tag 推送与 dry-run=false 仍回滚
   rollback-on-failure:
     name: 发布回滚
-    if: failure()
+    if: failure() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     needs: [build-release, install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -393,7 +375,24 @@ jobs:
         working-directory: frontend
         run: bun install
 
-      - uses: tauri-apps/tauri-action@v1.0.0
+      # dry-run: 故意不设 tagName/releaseName — tauri-action 仅构建 + workflow artifacts，
+      # 不创建 GitHub Release，避免污染 draft。
+      # 参考: https://github.com/tauri-apps/tauri-action examples/test-build-only.yml
+      - name: 构建 Tauri (dry-run, 不创建 Release)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != 'false'
+        uses: tauri-apps/tauri-action@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/tachyon-app
+          uploadWorkflowArtifacts: true
+
+      # tag 推送 或 workflow_dispatch dry-run=false: 创建 draft Release + workflow artifacts
+      - name: 构建 Tauri 并上传 draft Release
+        if: github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false'
+        uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # SEC-013: Tauri updater ed25519 签名(本地密钥对,私钥入 GH secret)
@@ -426,8 +425,9 @@ jobs:
   publish-release:
     name: 发布 Release
     needs: [release-gate]
-    # workflow_dispatch 干跑模式(dry-run=true)跳过发布,仅验证构建链路
-    if: success() && github.event_name != 'workflow_dispatch'
+    # dry-run=true(默认)跳过公开发布; tag 推送 或 显式 dry-run=false 才 undraft
+    # 注意: job 级 if 不能用 env 上下文,故内联等价表达式
+    if: success() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
