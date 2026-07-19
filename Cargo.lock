@@ -5222,7 +5222,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "bytes",
@@ -5247,7 +5247,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-app"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "dashmap",
@@ -5276,7 +5276,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-core"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "crossbeam-utils",
@@ -5296,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-crypto"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "serde",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-engine"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5337,7 +5337,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-hub"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5351,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-io"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "crossbeam-queue",
@@ -5367,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-protocol"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "aes",
  "bytes",
@@ -5387,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-scheduler"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "parking_lot",
  "proptest",
@@ -5398,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-sniffer"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5409,7 +5409,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-store"
-version = "0.1.1-0"
+version = "0.1.2"
 dependencies = [
  "fs2",
  "serde",
