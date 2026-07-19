@@ -217,6 +217,108 @@ describe('downloads store', () => {
     expect(task?.status).toBe('downloading')
   })
 
+  // ── downloading 态进度单调保护（续传回退纵深防御） ─────────
+
+  it('updateProgress downloading 态不回退 downloaded/progress', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        downloaded: 750,
+        progress: 0.75,
+        speed: 200,
+        fragmentsDone: 3,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.01,
+        downloaded: 10,
+        speed: 50,
+        status: 'downloading',
+        fragmentsDone: 0,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
+      },
+    })
+
+    const task = downloadsModule.$tasks.get()[0]
+    expect(task?.downloaded).toBe(750)
+    expect(task?.progress).toBe(0.75)
+    // speed 不强制单调
+    expect(task?.speed).toBe(50)
+    // hot 层同步保持单调
+    const hot = downloadsModule.getHotProgress('t1')
+    expect(hot?.downloaded).toBe(750)
+    expect(hot?.progress).toBe(0.75)
+  })
+
+  it('updateProgress 离开 downloading 时允许 downloaded/progress 回退', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        downloaded: 750,
+        progress: 0.75,
+        speed: 200,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.01,
+        downloaded: 10,
+        speed: 0,
+        status: 'paused',
+        fragmentsDone: 0,
+        fragmentsTotal: 0,
+        activeConcurrency: 0,
+      },
+    })
+
+    const task = downloadsModule.$tasks.get()[0]
+    expect(task?.status).toBe('paused')
+    expect(task?.downloaded).toBe(10)
+    expect(task?.progress).toBe(0.01)
+  })
+
+  it('updateProgress 转到 failed/cancelled 态允许 downloaded 重置(不单调保护)', () => {
+    // 终态(失败/取消)后任务可能被重试或清理,downloaded 必须允许归零,
+    // 单调保护只针对 downloading 态内的乱序 tick
+    for (const status of ['failed', 'cancelled'] as const) {
+      downloadsModule.setTasks([
+        makeTask('t1', {
+          status: 'downloading',
+          downloaded: 750,
+          progress: 0.75,
+          speed: 200,
+        }),
+      ])
+
+      downloadsModule.updateProgress({
+        t1: {
+          id: 't1',
+          progress: 0,
+          downloaded: 0,
+          speed: 0,
+          status,
+          fragmentsDone: 0,
+          fragmentsTotal: 0,
+          activeConcurrency: 0,
+        },
+      })
+
+      const task = downloadsModule.$tasks.get()[0]
+      expect(task?.status).toBe(status)
+      expect(task?.downloaded).toBe(0)
+      expect(task?.progress).toBe(0)
+      const hot = downloadsModule.getHotProgress('t1')
+      expect(hot?.downloaded).toBe(0)
+      expect(hot?.progress).toBe(0)
+    }
+  })
+
   it('updateProgress 状态转到 terminal 时写入历史记录', () => {
     downloadsModule.setTasks([
       makeTask('t1', { status: 'downloading', speed: 100, downloaded: 1024, progress: 0.9, fragmentsDone: 3 }),

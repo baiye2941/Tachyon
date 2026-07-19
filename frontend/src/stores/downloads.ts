@@ -221,9 +221,17 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         ? (p.status as DownloadStatus)
         : oldStatus;
 
-      const newDownloaded = p.downloaded ?? task.downloaded;
+      // downloading 态纵深防御:防止续传/乱序 tick 导致进度条回退
+      const stayDownloading = newStatus === "downloading";
+      const incomingDownloaded = p.downloaded ?? task.downloaded;
+      const incomingProgress = p.progress ?? task.progress;
+      const newDownloaded = stayDownloading
+        ? Math.max(task.downloaded, incomingDownloaded)
+        : incomingDownloaded;
       const newSpeed = p.speed ?? task.speed;
-      const newProgress = p.progress ?? task.progress;
+      const newProgress = stayDownloading
+        ? Math.max(task.progress, incomingProgress)
+        : incomingProgress;
       const newFragmentsDone = p.fragmentsDone ?? task.fragmentsDone;
       const newFragmentsTotal = p.fragmentsTotal ?? task.fragmentsTotal;
       const newConcurrency = p.activeConcurrency ?? 0;
