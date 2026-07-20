@@ -117,77 +117,118 @@ jobs:
           echo "ci_green=true" >> "$GITHUB_OUTPUT"
 
   # fallback: 同 SHA 无绿 CI 时重跑关键门禁（SSOT 脚本，禁止内嵌第二套 skip）
+  # always() 确保 ci-gate needs 链中无 skipped job（GitHub Actions 默认将
+  # skipped needs 传播给下游 matrix job，即使下游有显式 if 条件）。
+  # ci_green=true 时内部快速跳过（exit 0 = success），不做实际构建。
   ci-fallback:
     name: CI 门禁回退
     needs: [verify-ci-green]
-    if: needs.verify-ci-green.outputs.ci_green != 'true'
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: 检查是否需要重跑门禁
+        id: check
+        env:
+          CI_GREEN: ${{ needs.verify-ci-green.outputs.ci_green }}
+        run: |
+          if [[ "${CI_GREEN}" == "true" ]]; then
+            echo "同 SHA CI 已绿，跳过 fallback 门禁"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - name: 退出（CI 已绿）
+        if: steps.check.outputs.skip == 'true'
+        run: exit 0
       - uses: actions/checkout@v7
+        if: steps.check.outputs.skip != 'true'
       - uses: ./.github/actions/setup-ubuntu-deps
+        if: steps.check.outputs.skip != 'true'
       - uses: ./.github/actions/setup-rust
+        if: steps.check.outputs.skip != 'true'
         with:
           toolchain: stable
           components: rustfmt, clippy
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: release-fallback
       - uses: cargo-bins/cargo-binstall@v1.20.0
+        if: steps.check.outputs.skip != 'true'
       - name: 格式检查
+        if: steps.check.outputs.skip != 'true'
         run: cargo fmt --all -- --check
       - name: Clippy 零告警
+        if: steps.check.outputs.skip != 'true'
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: 安装 cargo-nextest
+        if: steps.check.outputs.skip != 'true'
         run: cargo binstall -y --force cargo-nextest
       - name: 运行测试(nextest, 失败重试 2 次)
+        if: steps.check.outputs.skip != 'true'
         run: cargo nextest run --all --locked --retries 2
       - name: 文档构建(零警告)
+        if: steps.check.outputs.skip != 'true'
         run: cargo doc --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
       - name: 安装 cargo-deny / cargo-audit
+        if: steps.check.outputs.skip != 'true'
         run: |
           cargo binstall -y --force cargo-deny
           cargo binstall -y --force cargo-audit
       - name: 安全审计 (SSOT)
+        if: steps.check.outputs.skip != 'true'
         run: bash scripts/ci/audit.sh
       # 签名配置硬门禁：PLACEHOLDER / 缺 cosign 配置必须失败
       - name: 签名配置检查（硬失败）
+        if: steps.check.outputs.skip != 'true'
         run: bash .github/scripts/verify-signature-config.sh
       - name: 安装 nightly 工具链(覆盖率)
+        if: steps.check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools
       - uses: taiki-e/install-action@cargo-llvm-cov
+        if: steps.check.outputs.skip != 'true'
       - name: 覆盖率检查 (SSOT)
+        if: steps.check.outputs.skip != 'true'
         run: bash scripts/ci/coverage.sh
         env:
           RUSTUP_TOOLCHAIN: nightly
       - name: 安装 nightly 工具链(Miri)
+        if: steps.check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - name: Miri 检测 (SSOT)
+        if: steps.check.outputs.skip != 'true'
         run: bash scripts/ci/miri.sh
         env:
           RUSTUP_TOOLCHAIN: nightly
       - uses: ./.github/actions/setup-bun
+        if: steps.check.outputs.skip != 'true'
       - name: 前端依赖
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun install --frozen-lockfile
       - name: 前端依赖安全审计
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun audit --audit-level=high
       - name: TypeScript 类型检查
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun run typecheck
       - name: ESLint 检查
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun run lint
       - name: 前端单元测试
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun run test
       - name: 前端构建
+        if: steps.check.outputs.skip != 'true'
         working-directory: frontend
         run: bun run build
 
