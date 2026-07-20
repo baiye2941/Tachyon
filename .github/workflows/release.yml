@@ -571,17 +571,19 @@ jobs:
           uploadWorkflowArtifacts: true
 
       # 私钥缺失时 tauri-action 可能静默跳过 .sig — 构建后硬断言
+      # 注意: macOS 默认 bash 3.2 无 mapfile，用 while/read 兼容
       - name: 硬断言 Tauri updater .sig 已生成
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t SIGS < <(find . -type f -name '*.sig' 2>/dev/null | LC_ALL=C sort || true)
-          echo "找到 ${#SIGS[@]} 个 .sig 文件"
-          printf '  %s\n' "${SIGS[@]:-}"
-          if [[ ${#SIGS[@]} -lt 1 ]]; then
+          sig_count=$(find . -type f -name '*.sig' 2>/dev/null | LC_ALL=C sort | wc -l | tr -d '[:space:]')
+          echo "找到 ${sig_count} 个 .sig 文件"
+          find . -type f -name '*.sig' 2>/dev/null | LC_ALL=C sort | sed 's/^/  /'
+          if [[ "${sig_count:-0}" -lt 1 ]]; then
             echo "::error::未生成任何 .sig（检查 TAURI_SIGNING_PRIVATE_KEY 与 createUpdaterArtifacts）"
             exit 1
           fi
+          echo "Tauri updater .sig 已生成"
 
   # 所有平台构建完成且门禁通过后,将 draft release 发布为 public
   publish-release:
@@ -633,36 +635,35 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          # 与 sign 脚本同一套扩展
-          mapfile -t PKGS < <(
+          # publish 跑在 ubuntu，mapfile 可用；但为跨平台兼容改用 while/read
+          PKGS=$(
             find dist -type f -size +0c \( \
               -name '*.msi' -o -name '*.deb' -o -name '*.dmg' -o -name '*.AppImage' \
             \) | LC_ALL=C sort
           )
-          mapfile -t SIDECARS < <(
+          SIDECARS=$(
             find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
           )
-          mapfile -t SIGS < <(
-            find dist -type f -name '*.sig' | LC_ALL=C sort
-          )
-          pkg_n=${#PKGS[@]}
-          side_n=${#SIDECARS[@]}
-          sig_n=${#SIGS[@]}
+          SIGS=$(find dist -type f -name '*.sig' | LC_ALL=C sort)
+          pkg_n=$(printf '%s\n' "$PKGS" | grep -c . || true)
+          side_n=$(printf '%s\n' "$SIDECARS" | grep -c . || true)
+          sig_n=$(printf '%s\n' "$SIGS" | grep -c . || true)
           echo "packages=$pkg_n sidecars=$side_n sigs=$sig_n"
           [[ "$pkg_n" -ge 1 ]] || { echo "::error::无安装包"; exit 1; }
-          # 每个包应有 .sha256 + .bundle → 2N
           expect=$((pkg_n * 2))
           if [[ "$side_n" -ne "$expect" ]]; then
             echo "::error::sidecar 数量($side_n) != 2 * 产物数($expect)"
-            printf '  pkg: %s\n' "${PKGS[@]}"
-            printf '  side: %s\n' "${SIDECARS[@]}"
+            printf '  pkg: %s\n' "$PKGS"
+            printf '  side: %s\n' "$SIDECARS"
             exit 1
           fi
           if [[ "$sig_n" -lt 1 ]]; then
             echo "::error::dist 中无 .sig（updater 签名缺失）"
             exit 1
           fi
-          for s in "${SIDECARS[@]}" "${SIGS[@]}"; do
+          # shellcheck disable=SC2086
+          for s in $SIDECARS $SIGS; do
+            [ -n "$s" ] || continue
             # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
             # 使用 path#basename 降低嵌套路径上传时 basename 撞名风险
             base=$(basename "$s")
