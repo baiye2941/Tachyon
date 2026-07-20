@@ -634,44 +634,27 @@ pub async fn get_recovery_warning(
 
 /// 请求破坏性操作的确认令牌(P1-11b)
 ///
-/// 前端在用户通过 window.confirm 确认后调用此命令获取一次性 token,
-/// 再将 token 传入破坏性命令(delete_task/update_config)完成操作。
+/// 前端在各操作自带的显式用户手势(应用内 ConfirmDialog/原生文件选择框/
+/// 保存按钮/撤销按钮)之后调用此命令获取一次性 token,再将 token 传入破坏性
+/// 命令(delete_task/update_config 等)完成操作。
 ///
 /// 安全属性:
 /// - token 一次性使用,验证后立即销毁,重放攻击无效
 /// - 60 秒过期,限制攻击窗口
+/// - token 绑定 action,无法跨操作复用
 /// - 此命令本身是 safe 的,不执行任何破坏性操作
 /// - 容量满时返回明确错误,而非静默返回空字符串(S-04)
+///
+/// UX 审计(2026-07-20):签发 token 前曾弹 OS 原生确认框(SEC-003),
+/// 但它对所有 destructive 操作都是叠加在已有用户手势之上的第二次确认,
+/// 用户反馈强烈。已移除;已知取舍:XSS/注入脚本可与前端同权请求 token
+/// (SEC-003 在 SEC-002 spec 中本即为 non-goal),token 的一次性/时效/
+/// action 绑定属性不变。
 #[tauri::command]
 pub fn request_confirmation(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     action: String,
 ) -> Result<String, AppError> {
-    // 审计 SEC-003:签发 token 前必须弹出 OS 原生确认框。
-    // 恶意 WebView 脚本无法在无用户点击时静默获取破坏性 action token。
-    // 测试环境(无 GUI / 未 manage Dialog)跳过 OS 对话框,仅保留 token 密码学属性。
-    #[cfg(not(test))]
-    {
-        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-        let title = "确认操作";
-        let message = format!(
-            "应用请求执行破坏性操作: {action}
-
-请确认这是你本人发起的操作。"
-        );
-        let confirmed = app
-            .dialog()
-            .message(message)
-            .title(title)
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancel)
-            .blocking_show();
-        if !confirmed {
-            return Err(AppError::Config("用户取消了确认操作".into()));
-        }
-    }
-    let _ = &app;
     state.service.confirmation_service.request(&action)
 }
 
@@ -1726,7 +1709,8 @@ pub(crate) mod tests {
     /// 两个 AppState 应看到相同的信号量状态。
     #[tokio::test]
     async fn test_buffer_pool_shared_across_clone_for_task() {
-        let state = AppState::new();
+        // 测试隔离:test_state 注入 temp 数据目录,避免与应用实例争抢真实 store 锁
+        let state = test_state();
         let pool = state.infra.buffer_pool.read().await.clone();
         let capacity = pool.capacity();
 
