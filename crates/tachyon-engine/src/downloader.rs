@@ -1089,6 +1089,78 @@ impl DownloadTask {
         Ok(())
     }
 
+    // ----- BT/magnet 冷启动解耦 -----
+
+    /// BT/magnet 分片目标数量:HTTP 默认 `default_target_fragments`(16)的两倍。
+    /// 调度器带宽样本只在分片完成时产生;BT 慢 swarm 下 16 片级的大分片迟迟不完,
+    /// 0 样本 → confidence 恒 0 → ramp 锁死冷启动并发,反馈环路断裂。
+    /// 翻倍目标数让完成事件更早到来。
+    const BT_TARGET_FRAGMENTS: u64 = 32;
+
+    /// BT 分片大小下限:对齐常见 torrent piece 大小(1-4MiB)上限,
+    /// 避免过细分片放大 FileStream 数量与 FragmentRecord 状态开销。
+    const BT_MIN_FRAGMENT_SIZE: u64 = 4 * 1024 * 1024;
+
+    /// BT 分片大小上限:单片过大则完成事件过稀、stall 重试需整片重读。
+    /// 10GiB 文件约 671 片,远低于 `plan_fragments` 的 1,000,000 片硬上限;
+    /// 1TB 极端场景约 65,536 片,FragmentRecord(每片百余字节)内存仍在 10MB 量级。
+    const BT_MAX_FRAGMENT_SIZE: u64 = 16 * 1024 * 1024;
+
+    /// BT 冷启动置信度阈值:低于此值认为调度器无有效带宽样本,
+    /// 并发度与分片策略不走 HTTP 保守探路。与 re-recommend 循环的
+    /// 高置信判定(`confidence > 0.5`)保持同一水位。
+    const BT_COLD_START_CONFIDENCE: f64 = 0.5;
+
+    /// 判定当前任务是否为 BT/magnet 下载。
+    ///
+    /// 判据:URL 为 magnet scheme(与构造期协议选择 `new` 同一判据),
+    /// 或 probe 元数据标记 `protocol_managed_storage`(librqbit 经自定义
+    /// StorageFactory 直写 Tachyon 存储,由 MagnetProtocol::probe 设置)。
+    /// BT 的 piece 调度由 librqbit 自管,无 HTTP 的 429/限流语义,
+    /// 故冷启动并发与分片粒度与 HTTP 解耦。
+    fn is_bt_task(&self) -> bool {
+        tachyon_core::looks_like_magnet_url(&self.url)
+            || self
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.protocol_managed_storage)
+    }
+
+    /// BT/magnet 任务的分片大小:`file_size / 32` clamp 到 [4MiB, 16MiB]。
+    ///
+    /// 293.8MiB → 约 9.2MiB/片 × 32 片;10GiB → 16MiB/片 × 约 671 片。
+    /// 与 HTTP 分片策略(`default_target_fragments` + 带宽因子)解耦:
+    /// BT piece 通常 1-4MiB,小分片让分片完成事件(调度器带宽样本唯一来源)
+    /// 在慢 swarm 下也能及时产生,并把 stall 重试粒度从 18MiB 级整片收细。
+    fn bt_fragment_size(file_size: u64) -> u64 {
+        (file_size / Self::BT_TARGET_FRAGMENTS)
+            .clamp(Self::BT_MIN_FRAGMENT_SIZE, Self::BT_MAX_FRAGMENT_SIZE)
+    }
+
+    /// BT 冷启动并发解耦:BT/magnet 任务在调度器低置信度(无样本或 < 0.5)
+    /// 时返回配置并发 `max_concurrent_fragments`,替代 cold-start 推荐值。
+    ///
+    /// 背景:HTTP 保守探路(`cold_start_initial_concurrency` 起步 + ramp 爬坡)
+    /// 是为防 429/限流;BT 的 piece 调度由 librqbit 自管,16 个 FileStream
+    /// 对 librqbit 只是 DashMap 里的 16 条 StreamState,无 429 语义。
+    /// 慢 swarm 下按 cold-start 4 并发跑大分片,完成事件过稀 → 调度器
+    /// 0 样本 → confidence 恒 0 → ramp 锁死,反馈环路断裂。
+    ///
+    /// 返回 None 表示不参与覆盖(HTTP 任务,或 BT 已有有效样本),
+    /// 调用方按调度器推荐值照常执行。re-recommend 循环的
+    /// 「低置信度只升不降」门禁保证解耦后的并发不被低置信推荐值压回,
+    /// 样本到位(confidence >= 0.5)后照常参与调度。
+    fn bt_cold_start_concurrency_override(
+        &self,
+        recommendation: &tachyon_core::traits::ScheduleRecommendation,
+    ) -> Option<u32> {
+        if self.is_bt_task() && recommendation.confidence < Self::BT_COLD_START_CONFIDENCE {
+            Some(self.config.max_concurrent_fragments.max(1))
+        } else {
+            None
+        }
+    }
+
     // ----- 步骤 2: 规划分片 -----
 
     /// 根据已探测的文件元数据规划分片
@@ -1117,9 +1189,15 @@ impl DownloadTask {
             "调度器建议"
         );
 
-        // 调度器有高置信度带宽预测时使用其建议,否则回退到 scheduler_config 计算,
-        // 避免冷启动时盲目采用默认 min_fragment_size 导致小文件过度分片。
-        let suggested_frag_size = if recommendation.confidence > 0.0 {
+        // BT/magnet 任务与 HTTP 分片策略解耦:固定走小分片公式,
+        // 让分片完成事件(调度器带宽样本唯一来源)在慢 swarm 下及时产生,
+        // 并收细 stall 重试粒度;不采用调度器按 HTTP 语义给出的 fragment_size。
+        // HTTP 路径保持原样:调度器有高置信度带宽预测时使用其建议,否则回退到
+        // scheduler_config 计算,避免冷启动时盲目采用默认 min_fragment_size
+        // 导致小文件过度分片。
+        let suggested_frag_size = if self.is_bt_task() {
+            Some(Self::bt_fragment_size(file_size))
+        } else if recommendation.confidence > 0.0 {
             Some(recommendation.fragment_size)
         } else {
             None
@@ -1202,10 +1280,15 @@ impl DownloadTask {
                 .filter(|f| f.state == crate::fragment::FragmentState::Done)
                 .map(|f| f.info.index)
                 .collect();
+            // BT 冷启动解耦时上报解耦后的初始并发,与 execute_fragmented_download
+            // 实际生效值一致(active_concurrency 展示不错位);HTTP 原样上报推荐值。
+            let initial_concurrency = self
+                .bt_cold_start_concurrency_override(&recommendation)
+                .unwrap_or(recommendation.concurrency);
             if let Err(e) = tx.try_send(FragmentProgress::PlanComplete {
                 total,
                 completed_indices,
-                initial_concurrency: recommendation.concurrency,
+                initial_concurrency,
             }) {
                 warn!(error = %e, "PlanComplete 事件发送失败(通道满或关闭)");
             }
@@ -1746,17 +1829,27 @@ impl DownloadTask {
             .scheduler
             .recommend(file_size, self.config.max_concurrent_fragments);
 
-        // 使用调度器建议的并发度,但不超过配置的最大值
-        let effective_concurrency = recommendation
-            .concurrency
-            .min(self.config.max_concurrent_fragments)
-            .max(1) as usize;
+        // 使用调度器建议的并发度,但不超过配置的最大值。
+        // BT/magnet 冷启动(低置信度)解耦:直接用配置并发,HTTP 路径不变
+        // (cold-start 起步 + ramp 爬坡 + 429 保护全部保留)。
+        let (effective_concurrency, concurrency_reason) =
+            match self.bt_cold_start_concurrency_override(&recommendation) {
+                Some(configured) => (configured as usize, "bt_cold_start"),
+                None => (
+                    recommendation
+                        .concurrency
+                        .min(self.config.max_concurrent_fragments)
+                        .max(1) as usize,
+                    "scheduler",
+                ),
+            };
 
         info!(
             configured_concurrency = self.config.max_concurrent_fragments,
             recommended_concurrency = recommendation.concurrency,
             effective_concurrency = effective_concurrency,
             confidence = recommendation.confidence,
+            reason = concurrency_reason,
             "使用调度器并发建议"
         );
 
@@ -4400,9 +4493,12 @@ mod tests {
             ..Default::default()
         };
 
-        // 不预置 storage:让 init_storage 据 file_layout 构造 StorageSet::Multi
+        // 不预置 storage:让 init_storage 据 file_layout 构造 StorageSet::Multi。
+        // url 用 http:本测试语义是「跨文件边界分片 → StorageSet::Multi 分发」,
+        // 与 BT 无关;magnet url 会命中 BT 小分片策略(file_size/32 clamp
+        // [4MiB,16MiB]),1024 字节文件只剩 1 片,覆盖不到跨边界分片路径。
         let mut task = DownloadTask::new_for_test_no_storage(
-            "magnet:?xt=urn:btih:fakehash".into(),
+            "http://example.com/multi_torrent".into(),
             config,
             protocol,
         );
@@ -11743,6 +11839,142 @@ mod tests {
         assert!(
             task.fragments.iter().all(|f| f.is_done()),
             "所有分片应 Done"
+        );
+    }
+
+    // ------ BT 冷启动并发解耦与小分片规划 ------
+
+    /// BT 测试元数据构造(protocol_managed_storage 可开关)
+    fn bt_test_meta(file_size: u64, managed: bool) -> FileMetadata {
+        FileMetadata {
+            file_name: "bt.bin".into(),
+            file_size: Some(file_size),
+            content_type: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: managed,
+            resolved_host: None,
+        }
+    }
+
+    /// bt_fragment_size 公式:file_size/32 clamp [4MiB, 16MiB]
+    #[test]
+    fn test_bt_fragment_size_clamped() {
+        const MIB: u64 = 1024 * 1024;
+        // 下限: 64MiB/32 = 2MiB < 4MiB → 4MiB
+        assert_eq!(DownloadTask::bt_fragment_size(64 * MIB), 4 * MIB);
+        // 边界: 128MiB/32 = 4MiB 恰为下限
+        assert_eq!(DownloadTask::bt_fragment_size(128 * MIB), 4 * MIB);
+        // 中间: 用户实际文件 293.8MiB(308157657 字节)/32 ≈ 9.6MiB
+        assert_eq!(DownloadTask::bt_fragment_size(308157657), 308157657 / 32);
+        // 上限: 10GiB/32 = 320MiB > 16MiB → 16MiB
+        assert_eq!(DownloadTask::bt_fragment_size(10 * 1024 * MIB), 16 * MIB);
+        // 零文件 → 下限
+        assert_eq!(DownloadTask::bt_fragment_size(0), 4 * MIB);
+    }
+
+    #[tokio::test]
+    async fn test_is_bt_task_by_magnet_url() {
+        let protocol = Arc::new(MockProto::new(bt_test_meta(4096, false)));
+        let task = DownloadTask::new_for_test(
+            "magnet:?xt=urn:btih:ABC123".into(),
+            test_config(),
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory(),
+        );
+        assert!(task.is_bt_task(), "magnet URL 应判为 BT 任务");
+    }
+
+    #[tokio::test]
+    async fn test_is_bt_task_by_protocol_managed_storage() {
+        let protocol = Arc::new(MockProto::new(bt_test_meta(4096, true)));
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/bt.bin".into(),
+            test_config(),
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory(),
+        );
+        assert!(!task.is_bt_task(), "HTTP URL 且无元数据标记 → 非 BT");
+        task.metadata = Some(bt_test_meta(4096, true));
+        assert!(
+            task.is_bt_task(),
+            "protocol_managed_storage 元数据标记 → BT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bt_cold_start_override_returns_configured_when_low_confidence() {
+        let protocol = Arc::new(MockProto::new(bt_test_meta(4096, false)));
+        let task = DownloadTask::new_for_test(
+            "magnet:?xt=urn:btih:ABC123".into(),
+            DownloadConfig {
+                max_concurrent_fragments: 16,
+                ..test_config()
+            },
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory(),
+        );
+        // 无样本 confidence=0.0 → 覆盖为 configured(16)
+        let rec = tachyon_core::traits::ScheduleRecommendation {
+            concurrency: 4,
+            fragment_size: 1024,
+            confidence: 0.0,
+        };
+        assert_eq!(task.bt_cold_start_concurrency_override(&rec), Some(16));
+        // 有样本 confidence >= 0.5 → 不覆盖,照常参与调度
+        let rec2 = tachyon_core::traits::ScheduleRecommendation {
+            confidence: 0.6,
+            ..rec
+        };
+        assert_eq!(task.bt_cold_start_concurrency_override(&rec2), None);
+    }
+
+    #[tokio::test]
+    async fn test_bt_cold_start_override_ignores_http_tasks() {
+        let protocol = Arc::new(MockProto::new(bt_test_meta(4096, false)));
+        let task = DownloadTask::new_for_test(
+            "http://example.com/f.bin".into(),
+            test_config(),
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory(),
+        );
+        let rec = tachyon_core::traits::ScheduleRecommendation {
+            concurrency: 4,
+            fragment_size: 1024,
+            confidence: 0.0,
+        };
+        assert_eq!(
+            task.bt_cold_start_concurrency_override(&rec),
+            None,
+            "HTTP 任务冷启动不覆盖(ramp/429 保护保留)"
+        );
+    }
+
+    /// BT 任务 plan 采用小分片公式(与 HTTP 分片策略解耦)
+    #[tokio::test]
+    async fn test_plan_bt_uses_small_fragment_formula() {
+        let file_size = 308157657u64; // 用户实际文件 293.8MiB
+        let protocol = Arc::new(MockProto::new(bt_test_meta(file_size, false)));
+        let mut task = DownloadTask::new_for_test(
+            "magnet:?xt=urn:btih:ABC123".into(),
+            test_config(),
+            protocol as Arc<dyn Protocol>,
+            StorageKind::memory(),
+        );
+        task.metadata = Some(bt_test_meta(file_size, false));
+        let frags = task.plan().expect("plan 应成功");
+        let expected_size = DownloadTask::bt_fragment_size(file_size);
+        assert_eq!(
+            frags.len() as u64,
+            file_size.div_ceil(expected_size),
+            "BT 分片数应由 bt_fragment_size 公式决定(约 32 片)"
+        );
+        assert!(
+            (30..=33).contains(&frags.len()),
+            "293.8MiB 应约 32 片,实际 {}",
+            frags.len()
         );
     }
 }
