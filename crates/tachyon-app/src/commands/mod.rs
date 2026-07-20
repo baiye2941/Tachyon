@@ -148,8 +148,8 @@ pub struct TaskInfo {
     pub error_reason: Option<String>,
     /// 任务级重试计数。
     ///
-    /// 审计 A-13 诚实：当前恒为 0，未接入引擎分片/整流 attempt 聚合；
-    /// 仅在快照与 IPC 间原样复制，前端诊断「已重试 N 次」在 N=0 时不展示。
+    /// 累计引擎分片/整块路径的可重试失败次数(每次 `FragmentProgress::Retry` +1)。
+    /// 经快照持久化与 IPC 下发；前端诊断「已重试 N 次」在 N>0 时展示。
     #[serde(default)]
     pub retry_count: u32,
     /// 用户自定义任务标签,用于前端分组/过滤。

@@ -276,6 +276,65 @@ mod tests {
         assert_eq!(loaded[0].id, "task-1");
     }
 
+    /// 非零 retry_count 经 snapshot ↔ TaskInfo 往返保持(A-13 聚合后真实语义)。
+    #[test]
+    fn test_snapshot_round_trip_preserves_nonzero_retry_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(temp.path()).unwrap();
+        let snapshot = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "retry-task".to_string(),
+            url: "https://example.com/retry.bin".to_string(),
+            save_path: "/downloads/retry.bin".to_string(),
+            file_name: "retry.bin".to_string(),
+            file_size: Some(2048),
+            downloaded: 512,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 512,
+            status: DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(2048),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 7,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+
+        store.save_snapshot(&snapshot).unwrap();
+        let loaded = store
+            .load_snapshot("retry-task")
+            .unwrap()
+            .expect("快照应存在");
+        assert_eq!(loaded.retry_count, 7, "快照往返应保留非零 retry_count");
+
+        let task = snapshot_to_task_info(&loaded);
+        assert_eq!(task.retry_count, 7, "snapshot→TaskInfo 应保留非零 retry_count");
+
+        let back = task_info_to_snapshot(
+            &task,
+            task.save_path.clone(),
+            loaded.fragment_size,
+            loaded.completed_fragments.clone(),
+            loaded.partial_fragments.clone(),
+            loaded.etag.clone(),
+            loaded.last_modified.clone(),
+            loaded.supports_range,
+        );
+        assert_eq!(
+            back.retry_count, 7,
+            "TaskInfo→snapshot 应保留非零 retry_count"
+        );
+    }
+
     #[test]
     fn test_load_recoverable_with_warnings_exposes_corrupt_keys() {
         // P1-06续: 损坏快照的 key 必须暴露给调用方(UI 告警),不能被静默吞掉

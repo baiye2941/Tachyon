@@ -406,6 +406,64 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     );
                 }
             }
+            FragmentProgress::Retry {
+                fragment_index,
+                attempt,
+            } => {
+                // 任务级累计:每次分片可重试失败 +1(不按 attempt 设 max,便于诊断「已重试 N 次」)
+                let new_retry_count = if let Some(mut task) = task_repository.get_mut(&task_id) {
+                    task.retry_count = task.retry_count.saturating_add(1);
+                    Some(task.retry_count)
+                } else {
+                    None
+                };
+                if let Some(count) = new_retry_count {
+                    tracing::info!(
+                        task_id = %task_id,
+                        fragment_index,
+                        attempt,
+                        retry_count = count,
+                        "分片重试,任务级 retry_count 已累加"
+                    );
+                    // 持久化到快照,续传/恢复后诊断仍可见累计重试次数
+                    let ts = task_store.clone();
+                    let tid = task_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ts.update_snapshot(&tid, |snap| {
+                            snap.retry_count = count;
+                        })
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "retry_count checkpoint 落盘失败"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "retry_count checkpoint spawn_blocking 失败"
+                            );
+                        }
+                    }
+                }
+                // 进度字段未变,仍 mark_dirty 使前端可在下次 resync/列表读到新 retry_count
+                if let Some(ref callback) = on_progress {
+                    let bytes_snapshot: Vec<FragmentByteEntry> = frag_bytes
+                        .iter()
+                        .map(|(&k, &v)| FragmentByteEntry {
+                            index: k,
+                            downloaded: v,
+                        })
+                        .collect();
+                    callback(&task_id, None, &bytes_snapshot);
+                }
+            }
             FragmentProgress::Chunk {
                 fragment_index,
                 completed: chunk_completed,
@@ -1682,6 +1740,76 @@ mod tests {
         assert_eq!(
             task.fragments_done, 2,
             "completed_indices=[0,1] 仍应反映 fragments_done=2"
+        );
+    }
+
+    /// 收到 FragmentProgress::Retry 后 TaskInfo.retry_count 按次累加,并写入快照。
+    #[tokio::test]
+    async fn test_chunk_reader_retry_increments_task_retry_count() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "test-retry-count".to_string();
+
+        let task = make_task_info(&task_id, 1024, 0, 2, 0);
+        task_repository.insert(task_id.clone(), task.clone());
+        // 预写快照,便于验证 retry_count 落盘
+        task_store
+            .save_snapshot(&make_resume_snapshot(&task, vec![], HashMap::new(), 512))
+            .unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store: task_store.clone(),
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::Retry {
+                fragment_index: 0,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        progress_tx
+            .send(FragmentProgress::Retry {
+                fragment_index: 1,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        progress_tx
+            .send(FragmentProgress::Retry {
+                fragment_index: 0,
+                attempt: 2,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.retry_count, 3,
+            "三次 Retry 事件应使任务级 retry_count=3"
+        );
+
+        let snap = task_store
+            .load_snapshot(&task_id)
+            .unwrap()
+            .expect("快照应存在");
+        assert_eq!(
+            snap.retry_count, 3,
+            "retry_count 应 checkpoint 到快照"
         );
     }
 }

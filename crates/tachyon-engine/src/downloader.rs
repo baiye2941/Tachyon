@@ -1383,6 +1383,7 @@ impl DownloadTask {
                         && !Self::is_pause_timeout_error(&e)
                         && attempt < max_retries
                     {
+                        let next_attempt = attempt + 1;
                         let backoff = match &e {
                             DownloadError::Throttled {
                                 retry_after_secs: Some(secs),
@@ -1393,12 +1394,19 @@ impl DownloadTask {
                             }
                         };
                         warn!(
-                            attempt = attempt + 1,
+                            attempt = next_attempt,
                             max_retries,
                             ?backoff,
                             error = %e,
                             "整块下载可重试失败,退避后重试"
                         );
+                        // 整块路径 fragment_index=0,与任务级 retry_count 聚合对齐
+                        if let Some(tx) = &self.progress_tx {
+                            let _ = tx.try_send(FragmentProgress::Retry {
+                                fragment_index: 0,
+                                attempt: next_attempt,
+                            });
+                        }
                         // 重置存储,防止半写残留污染下次 attempt
                         if let Some(storage) = self.storage.as_ref() {
                             let size = self
@@ -1685,12 +1693,19 @@ impl DownloadTask {
                             DownloadError::Network(format!("源 {frag_url} 已被熔断,跳过重试")),
                         ));
                     }
+                    let next_attempt = attempt + 1;
                     warn!(
                         index = frag_index,
-                        attempt = attempt + 1,
+                        attempt = next_attempt,
                         source = %frag_url,
                         "源处于熔断状态,跳过本次尝试"
                     );
+                    if let Some(tx) = &frag_progress_tx {
+                        let _ = tx.try_send(FragmentProgress::Retry {
+                            fragment_index: frag_index,
+                            attempt: next_attempt,
+                        });
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     attempt += 1;
                     continue;
@@ -1764,14 +1779,22 @@ impl DownloadTask {
                                 }
                             }
                         };
+                        let next_attempt = attempt + 1;
                         warn!(
                             index = frag_index,
-                            attempt = attempt + 1,
+                            attempt = next_attempt,
                             max_retries,
                             backoff_secs = backoff.as_secs(),
                             error = %e,
                             "分片下载失败,退避后重试"
                         );
+                        // 任务级 retry_count 聚合:可重试失败时发出 Retry 事件
+                        if let Some(tx) = &frag_progress_tx {
+                            let _ = tx.try_send(FragmentProgress::Retry {
+                                fragment_index: frag_index,
+                                attempt: next_attempt,
+                            });
+                        }
                         if !frag_has_mirrors {
                             frag_circuit_breakers.record_failure(&frag_url);
                         }
