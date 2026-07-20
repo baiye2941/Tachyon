@@ -135,13 +135,22 @@ cancel-safe:`StreamExt::next` 仅持有 `&mut stream`,被 select! 取消时
 
 ```rust
 pub trait PeerHealthSource: Send + Sync {
-    /// 是否有活跃 peer(已连接或正在连接)
+    /// 是否有活跃 peer(live > 0)
     fn healthy(&self) -> bool;
+    /// peer 三元组统计(live/connecting/queued),默认 None(无统计能力)
+    fn peer_counts(&self) -> Option<PeerCounts> {
+        None
+    }
 }
 ```
 
 生产实现 `ManagedTorrentPeerHealth` 包装
-`handle.live()?.stats_snapshot().peer_stats.{live + connecting} > 0`。
+`handle.live()?.stats_snapshot().peer_stats`,healthy 判定为 `live > 0`
+(收紧自 `live + connecting > 0`:queued 只是 tracker/DHT 发现的地址、
+connecting 尚未完成握手,两者都不能产出数据;计入它们会让
+"stall 超时"文案误导,且 peer_wait 智能等待分支永不进入)。
+stall 错误消息带 `live=/connecting=/queued=` 三元组明细。
+
 测试实现 `MockPeerHealth` 用原子 bool 模拟。
 
 #### 3.3.2 make_chunk_stream 超时分层
@@ -154,13 +163,16 @@ pub trait PeerHealthSource: Send + Sync {
 │  │                                                     │ │
 │  │  tokio::time::timeout(stall, reader.read())         │ │
 │  │      │                                             │ │
-│  │      ├─ Ok(Ok(n)) → yield Ok(Bytes), 重置 no_peer  │ │
+│  │      ├─ Ok(Ok(n)) → yield Ok(Bytes), 重置看门狗    │ │
 │  │      ├─ Ok(Ok(0)) → None (EOF)                     │ │
 │  │      ├─ Ok(Err)  → yield Err(Io)                   │ │
 │  │      └─ Err(超时) → 检查 peer_health:             │ │
-│  │          ├─ None/healthy → yield Err(Timeout,       │ │
-│  │          │   "stall 超时,有 peer 但无数据")        │ │
-│  │          └─ 不健康 → 累计 no_peer += 5s:           │ │
+│  │          ├─ healthy(live > 0) → stall 看门狗:      │ │
+│  │          │   采样全局已校验字节:                  │ │
+│  │          │   ├─ 仍在增长 → 慢但活,续命继续等      │ │
+│  │          │   │   (≤ 10 次,超限判分片饿死)         │ │
+│  │          │   └─ 无增长 → yield Err(Timeout)       │ │
+│  │          └─ 无 peer(live=0) → 墙钟对比 peer_wait: │ │
 │  │              ├─ < peer_wait → sleep(5s), loop 重试  │ │
 │  │              └─ ≥ peer_wait → yield Err(Timeout,    │ │
 │  │                  "无可用 peer,等待 N秒后超时")     │ │
@@ -170,9 +182,14 @@ pub trait PeerHealthSource: Send + Sync {
 
 关键设计:
 - **None = 未启用 peer 监控**:回退纯 stall_timeout 行为(向后兼容)
-- **有 peer + read 超时**:产出 stall Timeout,让引擎重试
-- **无 peer + 累计 < peer_wait**:sleep 轮询间隔后 loop 重试(不产出空项)
-- **无 peer + 累计 ≥ peer_wait**:产出"无可用 peer"Timeout
+- **有 peer(live > 0)+ read 超时**:进入 stall 看门狗——采样
+  `ProgressSampler.downloaded_and_checked_bytes`(torrent 全局已校验字节),
+  全局仍在增长说明 swarm 慢但活(本分片只是暂时饿死),重置等待继续读;
+  续命上限 `MAX_STALL_WATCHDOG_RENEWALS = 10`(10 × 60s ≈ 10 分钟,
+  远超慢 swarm 读一个 piece 的 60-140s),超限判分片饿死,
+  防单分片永久挂起占住 worker;未注入采样器回退原 stall Timeout
+- **无 peer + 墙钟 < peer_wait**:sleep 轮询间隔后 loop 重试(不产出空项)
+- **无 peer + 墙钟 ≥ peer_wait**:产出"无可用 peer"Timeout
 
 `peer_wait` 给死 swarm 恢复窗口:tracker 重试 60s,DHT 重建 1-2min,
 默认 5 分钟平衡恢复概率与用户体验。
