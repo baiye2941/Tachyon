@@ -163,7 +163,12 @@ pub struct TaskInfo {
     pub display_order: i64,
     /// 创建任务时配置的镜像 URL 列表。
     /// 旧任务/旧快照无此字段时默认 None;restart_download 据此恢复多源。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 内存/快照保留原始 URL;序列化到前端时与主 url 对齐脱敏(SEC-008)。
+    #[serde(
+        default,
+        skip_serializing_if = "mirror_urls_is_empty",
+        serialize_with = "serialize_mirror_urls_for_display"
+    )]
     pub mirror_urls: Option<Vec<String>>,
 }
 
@@ -173,6 +178,30 @@ pub struct TaskInfo {
 /// 无法解析时原文返回,不伪造占位符污染剪贴板。
 fn serialize_url_for_display<S: serde::Serializer>(url: &str, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&tachyon_core::url_for_display(url))
+}
+
+/// `mirror_urls` 为空或 None 时不写入前端 JSON。
+fn mirror_urls_is_empty(urls: &Option<Vec<String>>) -> bool {
+    urls.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// 序列化镜像 URL 列表时逐项 `url_for_display`(SEC-008):
+/// 内存与快照仍为原始 URL,仅 IPC/展示边界脱敏。
+fn serialize_mirror_urls_for_display<S: serde::Serializer>(
+    urls: &Option<Vec<String>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match urls {
+        None => s.serialize_none(),
+        Some(list) => {
+            use serde::ser::SerializeSeq;
+            let mut seq = s.serialize_seq(Some(list.len()))?;
+            for url in list {
+                seq.serialize_element(&tachyon_core::url_for_display(url))?;
+            }
+            seq.end()
+        }
+    }
 }
 
 /// 序列化保存路径时剥除 Windows verbatim 前缀,前端复制/显示得到常规路径
@@ -1161,6 +1190,56 @@ pub(crate) mod tests {
         assert_eq!(value["url"], "https://example.com/f.bin");
         assert!(!json.contains("secret"));
         assert!(!json.contains("token=abc"));
+    }
+
+    #[test]
+    fn test_task_info_mirror_urls_serialized_stripped() {
+        // SEC-008: mirror_urls 与主 url 对齐,序列化到前端时剥 query/凭据;
+        // 内存与快照仍保留原始值供 restart_download 续传。
+        let mut task = make_task_info_for_display(
+            "https://cdn.example.com/path/f.bin?token=main-secret",
+            r"D:\dl\f.bin",
+        );
+        task.mirror_urls = Some(vec![
+            "https://mirror1.example.com/path/f.bin?token=mirror-secret-1".to_string(),
+            "https://user:pass@mirror2.example.com/path/f.bin?sig=xyz#frag".to_string(),
+        ]);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("mirror-secret-1"),
+            "mirror query token 不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("main-secret"),
+            "主 url query 不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("user:pass") && !json.contains(":pass@"),
+            "mirror 凭据不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("sig=xyz"),
+            "mirror query 不得泄漏到前端: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mirrors = value["mirrorUrls"]
+            .as_array()
+            .expect("mirrorUrls 应出现在 JSON 中");
+        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors[0], "https://mirror1.example.com/f.bin");
+        assert_eq!(mirrors[1], "https://mirror2.example.com/f.bin");
+    }
+
+    #[test]
+    fn test_task_info_empty_mirror_urls_skipped() {
+        // 空镜像列表不应出现在前端 JSON(与 skip_serializing_if 一致)
+        let mut task = make_task_info_for_display("https://example.com/f.bin", r"D:\dl\f.bin");
+        task.mirror_urls = Some(vec![]);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("mirrorUrls"),
+            "空 mirror_urls 应 skip 序列化: {json}"
+        );
     }
 
     /// 构造测试用 TaskProgress,减少字面量样板

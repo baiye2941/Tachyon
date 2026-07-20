@@ -66,6 +66,23 @@ fn normalize_single_tag(tag: &str) -> String {
     trimmed.chars().take(MAX_TAG_LENGTH).collect::<String>()
 }
 
+/// 归一化镜像 URL 列表:空输入/仅空白项 → None;否则过滤空白并 to_vec。
+///
+/// 避免 create_task 把 `Some([])` 写入 TaskInfo/快照,前端与磁盘均不存空数组。
+fn normalize_mirror_urls(mirror_urls: Option<&[String]>) -> Option<Vec<String>> {
+    let mirrors = mirror_urls?;
+    let cleaned: Vec<String> = mirrors
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 /// 任务操作撤销记录
 ///
 /// 保存在内存中,无需持久化。超过 [`UNDO_WINDOW`] 后撤销请求返回错误。
@@ -399,8 +416,9 @@ impl TaskService {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
-            // 持久化镜像列表,供 restart_download / 快照恢复多源续传
-            mirror_urls: mirror_urls.map(|v| v.to_vec()),
+            // 持久化镜像列表,供 restart_download / 快照恢复多源续传。
+            // 空切片/全空字符串归一为 None,避免快照写空数组。
+            mirror_urls: normalize_mirror_urls(mirror_urls),
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性
@@ -477,7 +495,7 @@ impl TaskService {
             url: url.to_string(),
             download_dir: download_dir_str.to_string(),
             download_config,
-            mirror_urls: mirror_urls.map(|v| v.to_vec()),
+            mirror_urls: normalize_mirror_urls(mirror_urls),
             preferred_file_name,
             auto_start,
         })
