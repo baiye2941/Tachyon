@@ -29,6 +29,10 @@ use crate::task_store::TaskStore;
 pub struct DomainState {
     pub task_repository: TaskRepository,
     pub config: Arc<Mutex<AppConfig>>,
+    /// 配置文件持久化路径(测试隔离注入点):
+    /// 生产为 `dirs()/.tachyon/config.json`,测试指向临时目录下的独立文件,
+    /// 避免 update_config / authorize_download_directory 等 persist 路径写穿真实用户配置。
+    pub config_path: std::path::PathBuf,
 }
 
 /// 基础设施状态：连接、存储、I/O 池

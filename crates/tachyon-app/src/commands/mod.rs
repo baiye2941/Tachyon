@@ -138,6 +138,9 @@ pub struct TaskInfo {
     #[serde(default)]
     pub active_concurrency: u32,
     pub created_at: String,
+    /// 任务保存路径。
+    /// 存储 canonical 原值;序列化到前端时剥除 Windows `\\?\` verbatim 前缀(显示用)。
+    #[serde(serialize_with = "serialize_path_for_display")]
     pub save_path: String,
     /// 失败原因原文（仅 status=Failed 时有值）。
     /// 前端诊断面板据此展示真实错误，无需启发式推断。
@@ -160,9 +163,34 @@ pub struct TaskInfo {
     pub display_order: i64,
 }
 
-/// 序列化 URL 时脱敏，前端只看到不含敏感参数的 URL
+/// 序列化 URL 时转换为显示形式(tachyon_core::url_for_display):
+/// magnet/ed2k 等无 host 的内容寻址 scheme 原文放行(前端可复制真实链接、
+/// 命令面板可正常判断 startsWith('magnet:'));http(s) 剥 query/凭据(SEC-008);
+/// 无法解析时原文返回,不伪造占位符污染剪贴板。
 fn serialize_url_for_display<S: serde::Serializer>(url: &str, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&tachyon_core::safety::redact_url_for_log(url))
+    s.serialize_str(&tachyon_core::url_for_display(url))
+}
+
+/// 序列化保存路径时剥除 Windows verbatim 前缀,前端复制/显示得到常规路径
+fn serialize_path_for_display<S: serde::Serializer>(path: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(strip_verbatim_prefix(path).as_ref())
+}
+
+/// 剥除 Windows canonicalize 产出的 `\\?\` verbatim 前缀:
+/// - `\\?\D:\foo` → `D:\foo`
+/// - `\\?\UNC\server\share` → `\\server\share`
+/// - 非 Windows / 无前缀路径原样返回
+///
+/// 仅用于展示边界(UI 显示/复制、explorer 等外部进程参数);
+/// 安全校验层(authorize/validate/open 边界检查)仍使用 canonical 原值做 starts_with 比较。
+pub(crate) fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
 }
 
 /// HF 任务元数据（可选，仅 HF 来源的下载任务有值）
@@ -392,7 +420,10 @@ impl Default for AppState {
 
 impl AppState {
     pub fn try_new() -> Result<Self, AppError> {
-        let config = match crate::commands::config_commands::load_persisted_config() {
+        // 配置文件路径:生产为 dirs()/.tachyon/config.json;
+        // 测试经 test_state() 注入临时路径,避免 persist 写穿真实用户配置
+        let config_path = crate::commands::config_commands::config_file_path();
+        let config = match crate::commands::config_commands::load_persisted_config(&config_path) {
             Ok(cfg) => {
                 // 校验持久化配置,失败则回退默认配置并记录警告
                 if let Err(e) = crate::commands::config_commands::validate_config(&cfg) {
@@ -464,6 +495,7 @@ impl AppState {
             domain: DomainState {
                 task_repository,
                 config: config_arc,
+                config_path,
             },
             infra: InfraState {
                 connection_pool,
@@ -873,6 +905,18 @@ pub(crate) mod tests {
             .to_string();
         let _ = std::fs::create_dir_all(&test_dir);
         let task_repository = TaskRepository::new();
+        // 测试配置文件路径注入:指向系统临时目录下的独立文件,避免
+        // update_config_inner / authorize_download_directory_inner 的 persist
+        // 写穿真实用户配置(%USERPROFILE%\.tachyon\config.json)。
+        // 同一进程内多次构造用原子计数器区分文件名;nextest 每测试独立进程,pid 天然隔离。
+        static TEST_CONFIG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let test_config_dir = std::env::temp_dir().join("tachyon-test-config");
+        let _ = std::fs::create_dir_all(&test_config_dir);
+        let config_path = test_config_dir.join(format!(
+            "config-{}-{}.json",
+            std::process::id(),
+            TEST_CONFIG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let config_arc = Arc::new(tokio::sync::Mutex::new(AppConfig {
             max_concurrent_tasks: 5,
             download: DownloadConfig {
@@ -924,6 +968,7 @@ pub(crate) mod tests {
             domain: DomainState {
                 task_repository,
                 config: config_arc,
+                config_path,
             },
             infra: InfraState {
                 connection_pool,
@@ -1040,6 +1085,93 @@ pub(crate) mod tests {
         assert_eq!(deserialized.id, "test-id");
         assert_eq!(deserialized.file_size, Some(1024));
         assert!((deserialized.progress - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ------ 展示边界:strip_verbatim_prefix / serialize_*_for_display ------
+
+    #[test]
+    fn test_strip_verbatim_prefix_drive_path() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\D:\downloads\f.bin"),
+            r"D:\downloads\f.bin"
+        );
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix_unc_path() {
+        // \\?\UNC\server\share 必须转换为 \\server\share,而非简单去前缀
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\dir"),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix_passthrough() {
+        assert_eq!(strip_verbatim_prefix(r"D:\downloads"), r"D:\downloads");
+        assert_eq!(strip_verbatim_prefix("/home/user/dl"), "/home/user/dl");
+        assert_eq!(strip_verbatim_prefix(""), "");
+    }
+
+    /// 构造带自定义 url/save_path 的 TaskInfo,聚焦序列化边界
+    fn make_task_info_for_display(url: &str, save_path: &str) -> TaskInfo {
+        TaskInfo {
+            id: "t-display".to_string(),
+            url: url.to_string(),
+            file_name: "f.bin".to_string(),
+            file_size: None,
+            downloaded: 0,
+            speed: 0,
+            status: DownloadState::Pending,
+            progress: 0.0,
+            fragments_total: 0,
+            fragments_done: 0,
+            active_concurrency: 0,
+            created_at: "2025-01-01T00:00:00+08:00".to_string(),
+            save_path: save_path.to_string(),
+            error_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+        }
+    }
+
+    #[test]
+    fn test_task_info_save_path_serialized_without_verbatim_prefix() {
+        let task =
+            make_task_info_for_display("https://example.com/f.bin", r"\\?\D:\downloads\f.bin");
+        let json = serde_json::to_string(&task).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["savePath"], r"D:\downloads\f.bin");
+        assert!(
+            !json.contains(r"\\?\\"),
+            "verbatim 前缀不得泄漏到前端: {json}"
+        );
+    }
+
+    #[test]
+    fn test_task_info_magnet_url_serialized_verbatim() {
+        // magnet 原文放行:前端复制链接/startsWith('magnet:') 判断依赖完整值
+        let magnet = "magnet:?xt=urn:btih:ABC123&dn=name&tr=udp://t/announce";
+        let task = make_task_info_for_display(magnet, r"D:\dl\f.bin");
+        let json = serde_json::to_string(&task).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["url"], magnet);
+    }
+
+    #[test]
+    fn test_task_info_http_url_serialized_stripped() {
+        // http(s) 仍剥 query/凭据(SEC-008)
+        let task = make_task_info_for_display(
+            "https://user:secret@example.com/path/f.bin?token=abc#frag",
+            r"D:\dl\f.bin",
+        );
+        let json = serde_json::to_string(&task).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["url"], "https://example.com/f.bin");
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("token=abc"));
     }
 
     /// 构造测试用 TaskProgress,减少字面量样板
@@ -1176,9 +1308,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_max_concurrent_semaphore_gating() {
-        // 必须用 test_state()（独立临时 store），禁止 AppState::new()：
-        // 后者打开全局 ~/.tachyon/store，nextest 并行时会锁冲突
-        // （macOS: Resource temporarily unavailable / os error 35）。
+        // 必须用 test_state()(独立临时 store/config)，禁止 AppState::new()：
+        // 后者打开全局 ~/.tachyon/store；nextest 并行会锁冲突，且可能写穿真实用户目录。
         let state = test_state();
         {
             let mut cfg = state.domain.config.lock().await;

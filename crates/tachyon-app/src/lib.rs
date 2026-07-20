@@ -233,9 +233,9 @@ pub fn run() {
 #[cfg(test)]
 #[tokio::test]
 async fn any_fragment() {
-    use std::sync::Arc;
-
-    let state = Arc::new(AppState::new());
+    // 测试隔离:用 test_state()(临时目录 store/config),不用 AppState::new()——
+    // 后者锁定 ~/.tachyon/store,与运行中的应用实例冲突(os error 33)且写穿真实用户目录
+    let state = commands::tests::test_state();
     let task_id = uuid::Uuid::new_v4().to_string();
     let task = commands::TaskInfo {
         id: task_id.clone(),
@@ -278,7 +278,8 @@ async fn any_fragment() {
 async fn max_concurrent() {
     use commands::TaskInfo;
 
-    let state = AppState::new();
+    // 测试隔离:同上,用 test_state() 避免锁定真实用户数据目录
+    let state = commands::tests::test_state();
     {
         let mut cfg = state.domain.config.lock().await;
         cfg.max_concurrent_tasks = 2;

@@ -80,12 +80,15 @@ pub(crate) async fn authorize_download_directory_inner(
         cfg.download.authorized_dirs.push(validated.clone());
     }
     let to_save = cfg.clone();
+    let config_path = state.domain.config_path.clone();
     drop(cfg);
-    tokio::task::spawn_blocking(move || persist_config(&to_save))
+    tokio::task::spawn_blocking(move || persist_config(&to_save, &config_path))
         .await
         .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
     tracing::info!(dir = %validated, "已授权下载目录");
-    Ok(validated)
+    // 返回值剥除 Windows verbatim 前缀供前端直接显示;
+    // 落盘/入白名单的 validated 保持 canonical 原值(starts_with 安全比较依赖)
+    Ok(super::strip_verbatim_prefix(&validated).into_owned())
 }
 
 /// 路径是否落在任一 authorized_dirs 之下(SEC-006 备份路径门禁)
@@ -206,8 +209,9 @@ async fn update_config_inner(state: &AppState, patch: ConfigPatch) -> Result<(),
         .task_service
         .update_cached_download_dir(new_download_dir)
         .await;
+    let config_path = state.domain.config_path.clone();
     tokio::task::spawn_blocking(move || {
-        crate::commands::config_commands::persist_config(&config_to_save)
+        crate::commands::config_commands::persist_config(&config_to_save, &config_path)
     })
     .await
     .map_err(|e| AppError::Config(format!("持久化配置任务失败: {e}")))??;
@@ -386,17 +390,18 @@ const CONFIG_FILE_NAME: &str = "config.json";
 /// 获取持久化配置文件路径
 ///
 /// 配置文件位于 `tachyon_core::config::dirs()/.tachyon/config.json`。
-fn config_file_path() -> std::path::PathBuf {
+/// 仅生产路径(AppState::try_new)使用;测试经 `AppState.domain.config_path` 注入临时路径。
+pub(crate) fn config_file_path() -> std::path::PathBuf {
     let data_root = tachyon_core::config::dirs().unwrap_or_else(|| std::path::PathBuf::from("."));
     data_root.join(".tachyon").join(CONFIG_FILE_NAME)
 }
 
-/// 将当前配置持久化到磁盘
+/// 将当前配置持久化到磁盘指定路径
 ///
 /// 使用临时文件+重命名实现原子写入,避免写一半导致配置文件损坏。
 /// 调用方应在非阻塞上下文中使用(如在 `spawn_blocking` 中调用)。
-pub(crate) fn persist_config(config: &AppConfig) -> Result<(), AppError> {
-    let path = config_file_path();
+/// 目标路径由调用方提供(取自 `AppState.domain.config_path`,测试隔离注入点)。
+pub(crate) fn persist_config(config: &AppConfig, path: &std::path::Path) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::Config(format!("创建配置目录失败: {e}")))?;
@@ -424,20 +429,20 @@ pub(crate) fn persist_config(config: &AppConfig) -> Result<(), AppError> {
         .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
     std::fs::write(&tmp, json)
         .map_err(|e| AppError::Config(format!("写入配置临时文件失败: {e}")))?;
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, path)
         .map_err(|e| AppError::Config(format!("重命名配置文件失败: {e}")))?;
     Ok(())
 }
 
-/// 从磁盘加载持久化配置
+/// 从指定路径加载持久化配置
 ///
 /// 若配置文件不存在则返回默认配置;若解析失败则返回错误,由调用方决定是否回退。
-pub(crate) fn load_persisted_config() -> Result<AppConfig, AppError> {
-    let path = config_file_path();
+/// 路径由调用方提供(生产: [`config_file_path`];测试: 注入的临时路径)。
+pub(crate) fn load_persisted_config(path: &std::path::Path) -> Result<AppConfig, AppError> {
     let mut config = if !path.exists() {
         AppConfig::default()
     } else {
-        let json = std::fs::read_to_string(&path)
+        let json = std::fs::read_to_string(path)
             .map_err(|e| AppError::Config(format!("读取配置文件失败: {e}")))?;
         serde_json::from_str::<AppConfig>(&json)
             .map_err(|e| AppError::Config(format!("解析配置文件失败: {e}")))?
@@ -694,6 +699,32 @@ fn canonical_authorized_roots(config: &AppConfig) -> Result<Vec<std::path::PathB
             Ok(canonical)
         })
         .collect()
+}
+
+/// 「可打开目录」根集合:download_dir 与 authorized_dirs 的 canonical 形式(去重)。
+///
+/// 与 SEC-006 门禁 [`canonical_authorized_roots`] 的严格语义不同,此处宽松处理:
+/// 单个条目无法解析(不存在/无权限)时跳过而非整体失败——
+/// 打开文件夹只需证明目标位于任一已知根之下,不应因一个失效条目阻断其它合法根。
+pub(crate) fn canonical_download_roots(config: &AppConfig) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    let mut push_canonical = |dir: &str| {
+        let path = std::path::Path::new(dir);
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(canonical) = path.canonicalize()
+            && canonical.is_dir()
+            && !roots.contains(&canonical)
+        {
+            roots.push(canonical);
+        }
+    };
+    push_canonical(&config.download.download_dir);
+    for dir in &config.download.authorized_dirs {
+        push_canonical(dir);
+    }
+    roots
 }
 
 fn is_forbidden_authorized_root(canonical: &std::path::Path) -> bool {
@@ -1788,5 +1819,107 @@ mod tests {
         assert!(!is_forbidden_authorized_root(std::path::Path::new(
             "/home/user/downloads"
         )));
+    }
+
+    // ------ canonical_download_roots / authorize_download_directory_inner ------
+
+    /// roots = canonicalize(download_dir) ∪ canonicalize(authorized_dirs),单条目失效跳过
+    #[test]
+    fn test_canonical_download_roots_includes_authorized_and_skips_broken() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let broken = root_a.path().join("gone");
+
+        let mut config = AppConfig::default();
+        config.download.download_dir = root_a.path().to_string_lossy().to_string();
+        config.download.authorized_dirs = vec![
+            root_b.path().to_string_lossy().to_string(),
+            broken.to_string_lossy().to_string(),
+        ];
+
+        let roots = canonical_download_roots(&config);
+        assert!(
+            roots.contains(&root_a.path().canonicalize().unwrap()),
+            "应包含 canonical download_dir: {roots:?}"
+        );
+        assert!(
+            roots.contains(&root_b.path().canonicalize().unwrap()),
+            "应包含 canonical authorized_dirs 条目: {roots:?}"
+        );
+        assert_eq!(roots.len(), 2, "失效条目跳过而非整体报错: {roots:?}");
+    }
+
+    /// authorize 返回值剥 verbatim 前缀(前端直接显示),白名单/落盘保持 canonical
+    #[tokio::test]
+    async fn test_authorize_inner_returns_display_path_but_stores_canonical() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let requested = dir.path().to_string_lossy().to_string();
+
+        let returned = authorize_download_directory_inner(&state, requested)
+            .await
+            .unwrap();
+
+        // 返回值:剥除 Windows verbatim 前缀,供前端直接显示/回填
+        assert!(
+            !returned.starts_with(r"\\?\"),
+            "返回值不得带 verbatim 前缀: {returned}"
+        );
+        // 白名单:保持 canonical 原值(starts_with 安全比较依赖)
+        let canonical = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let cfg = state.domain.config.lock().await;
+        assert!(
+            cfg.download.authorized_dirs.iter().any(|d| d == &canonical),
+            "白名单应存 canonical 原值: {:?}",
+            cfg.download.authorized_dirs
+        );
+        drop(cfg);
+        // 展示值与 canonical 仅差前缀
+        assert_eq!(
+            std::path::Path::new(&returned),
+            std::path::Path::new(crate::commands::strip_verbatim_prefix(&canonical).as_ref())
+        );
+    }
+
+    /// 测试隔离:持久化落盘到 test_state 注入的临时 config_path,而非真实用户配置
+    #[tokio::test]
+    async fn test_authorize_inner_persists_to_injected_config_path() {
+        let state = test_state();
+        let config_path = state.domain.config_path.clone();
+        assert!(
+            config_path.starts_with(std::env::temp_dir()),
+            "test_state 注入的配置路径应位于 temp(隔离真实用户配置): {config_path:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        authorize_download_directory_inner(&state, dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            config_path.is_file(),
+            "配置应落盘到注入路径: {config_path:?}"
+        );
+        let saved = load_persisted_config(&config_path).unwrap();
+        assert!(
+            saved
+                .download
+                .authorized_dirs
+                .iter()
+                .any(|d| d == &canonical),
+            "落盘配置应含新授权目录(canonical): {:?}",
+            saved.download.authorized_dirs
+        );
     }
 }

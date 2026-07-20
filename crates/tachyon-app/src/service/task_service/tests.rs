@@ -1113,3 +1113,57 @@ fn empty_snapshot() -> TaskSnapshot {
         display_order: 0,
     }
 }
+
+// ── create_task 去重:url_identity_key(magnet 按 info hash)─────────────────
+
+/// 不同 info hash 的 magnet 是不同资源,不得误判重复
+/// (回归:旧实现把任意 magnet 统一脱敏为 <invalid-url>,第二个 magnet 任务必被误拒)
+#[tokio::test]
+async fn test_create_task_allows_two_different_magnets() {
+    let (service, _dir) = make_service();
+    let m1 = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=one&tr=udp://t1";
+    let m2 = "magnet:?xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&dn=two&tr=udp://t2";
+    service
+        .create_task(m1, None, None, None, false)
+        .await
+        .expect("第一个 magnet 应创建成功");
+    service
+        .create_task(m2, None, None, None, false)
+        .await
+        .expect("不同 info hash 的 magnet 不得误判重复");
+}
+
+/// 同一资源(info hash 相同,大小写/tracker/dn 不同)判重
+#[tokio::test]
+async fn test_create_task_rejects_same_info_hash_magnet() {
+    let (service, _dir) = make_service();
+    let m1 = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=one&tr=udp://t1";
+    // 同 hash 大写形式 + 不同 dn/tr 参数 → 同一资源
+    let m2 = "magnet:?dn=other&tr=https://t2/announce&xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567";
+    service
+        .create_task(m1, None, None, None, false)
+        .await
+        .unwrap();
+    let result = service.create_task(m2, None, None, None, false).await;
+    assert!(
+        matches!(result, Err(AppError::TaskAlreadyExists(_))),
+        "同 info hash 应判重: {result:?}"
+    );
+}
+
+/// http(s) 去重口径不变:同路径不同签名 query 判同
+#[tokio::test]
+async fn test_create_task_dedup_http_ignores_query() {
+    let (service, _dir) = make_service();
+    service
+        .create_task("https://example.com/f.bin?sig=1", None, None, None, false)
+        .await
+        .unwrap();
+    let result = service
+        .create_task("https://example.com/f.bin?sig=2", None, None, None, false)
+        .await;
+    assert!(
+        matches!(result, Err(AppError::TaskAlreadyExists(_))),
+        "同路径不同 query 应判重: {result:?}"
+    );
+}

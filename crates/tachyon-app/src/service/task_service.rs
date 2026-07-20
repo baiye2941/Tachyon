@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tachyon_core::config::{AppConfig, DownloadConfig};
-use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log, sanitize_filename};
+use tachyon_core::safety::{extract_filename_from_url, sanitize_filename, url_identity_key};
 use tachyon_core::types::DownloadState;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -373,10 +373,12 @@ impl TaskService {
             .clone()
             .unwrap_or_else(|| extract_filename_from_url(url));
         let created_at = now_iso8601();
-        // 去重键:用脱敏 URL 比较,使不同 token 的同源 URL 视为同一任务。
-        // 存储层(TaskInfo.url)保留原始 URL,供断点续传 restart_download 复用;
-        // 序列化到前端时由 serialize_url_for_display 脱敏(见 commands/mod.rs)。
-        let redacted_url = redact_url_for_log(url);
+        // 去重键:url_identity_key —— magnet 按 info hash(同一资源的不同 tracker/dn
+        // 判同;缺失 xt 的 magnet 保留原文,不再统一塌缩为占位符而误判重复);
+        // http(s) 按 scheme://host/basename(忽略签名 query 差异,与原 redact 比较行为一致);
+        // 无法解析按原文。存储层(TaskInfo.url)保留原始 URL,供断点续传 restart_download 复用;
+        // 序列化到前端时由 serialize_url_for_display 转换(见 commands/mod.rs)。
+        let identity_key = url_identity_key(url);
 
         let task = TaskInfo {
             id: task_id.clone(),
@@ -409,7 +411,7 @@ impl TaskService {
             for r in self.task_repository.iter() {
                 let t = r.value();
                 if !url_exists
-                    && redact_url_for_log(&t.url) == redacted_url
+                    && url_identity_key(&t.url) == identity_key
                     && t.status != DownloadState::Cancelled
                     && t.status != DownloadState::Completed
                     && t.status != DownloadState::Failed

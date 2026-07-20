@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tachyon_core::config::{AppConfig, DownloadConfig};
-use tachyon_core::safety::{extract_filename_from_url, redact_url_for_log};
+use tachyon_core::safety::{extract_filename_from_url, url_identity_key};
 use tachyon_core::traits::{Protocol, TaskRunner};
 use tachyon_core::types::{DownloadState, FileMetadata};
 use tachyon_engine::BufferPool;
@@ -432,11 +432,25 @@ pub(crate) async fn probe_and_save_metadata(
             );
 
             {
-                // 预计算总分段数(基于最小分片1MB),供进度显示使用
-                let total_frags = meta
-                    .file_size
-                    .map(|s| s.max(1).div_ceil(1024 * 1024))
-                    .unwrap_or(0) as u32;
+                // 预计算总分段数供进度显示:直接调用 engine 的 plan_fragments
+                // (无调度器建议时的默认分支),与真实规划同一公式,
+                // 取代原先固定 1MiB 分片导致的显示口径偏差。
+                // PlanComplete 到达后会被真实分片数覆盖(chunk_reader_pool)。
+                let scheduler_config = {
+                    let cfg = state.domain.config.lock().await;
+                    cfg.scheduler.clone()
+                };
+                let total_frags = match meta.file_size {
+                    Some(size) => tachyon_engine::fragment::plan_fragments(
+                        size,
+                        meta.supports_range,
+                        None,
+                        &scheduler_config,
+                    )
+                    .map(|fragments| fragments.len() as u32)
+                    .unwrap_or(0),
+                    None => 0,
+                };
                 if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
                     task.file_size = meta.file_size;
                     task.fragments_total = total_frags;
@@ -710,10 +724,10 @@ pub async fn get_task_detail(
 ///
 /// 替代前端 `shell.open`,移除前端 `shell:allow-open` 权限后由后端统一控制:
 /// - 按 task_id 查找任务,取其 save_path 的父目录
-/// - canonicalize 后校验该目录位于配置的 download_dir 之内,拒绝路径逃逸
+/// - canonicalize 后校验该目录位于 download_dir 或任一 authorized_dirs 之下,拒绝路径逃逸
 /// - 通过 OS 原生命令打开(Windows: explorer / macOS: open / Linux: xdg-open)
 ///
-/// 安全边界:仅能打开下载根目录内的路径,防止 save_path 被污染后打开任意目录。
+/// 安全边界:仅能打开下载根目录/已授权目录内的路径,防止 save_path 被污染后打开任意目录。
 #[tauri::command]
 pub async fn open_task_folder(
     state: tauri::State<'_, AppState>,
@@ -731,7 +745,7 @@ pub async fn open_task_folder(
 /// 在系统文件管理器中打开指定目录(P1-21)
 ///
 /// 用于历史记录/本地模型等不在任务仓库中的场景:调用方传入完整路径,
-/// 后端校验该路径位于配置的 download_dir 之内后打开,拒绝路径逃逸。
+/// 后端校验该路径位于 download_dir 或任一 authorized_dirs 之下后打开,拒绝路径逃逸。
 #[tauri::command]
 pub async fn open_folder_under_download_root(
     state: tauri::State<'_, AppState>,
@@ -741,42 +755,26 @@ pub async fn open_folder_under_download_root(
     open_dir_under_download_root(&state, target).await
 }
 
-/// 校验 target 目录位于配置的 download_dir 之内,并通过 OS 文件管理器打开
+/// 校验 target 目录位于 download_dir 或任一 authorized_dirs 之下,并通过 OS 文件管理器打开
 async fn open_dir_under_download_root(
     state: &AppState,
     target: std::path::PathBuf,
 ) -> Result<(), AppError> {
-    // 读取配置的 download_dir 作为安全边界
-    let download_dir_str = {
+    let config = {
         let cfg = state.domain.config.lock().await;
-        cfg.download.download_dir.clone()
+        cfg.clone()
     };
-    let download_root = std::path::PathBuf::from(&download_dir_str);
 
-    // canonicalize 双方后做前缀校验,拒绝路径逃逸
-    // (canonicalize 要求路径存在;目标目录在任务完成后均应存在,
-    //  不存在则视为非法,直接拒绝)
-    let canon_target = tokio::task::spawn_blocking(move || target.canonicalize())
-        .await
-        .map_err(|e| AppError::Config(format!("路径规范化失败: {e}")))?
-        .map_err(|e| AppError::Config(format!("目标目录不可访问: {e}")))?;
+    // canonicalize 是阻塞 IO,放 spawn_blocking;校验本身是纯函数便于单测
+    let canon_target =
+        tokio::task::spawn_blocking(move || ensure_dir_under_download_roots(&config, &target))
+            .await
+            .map_err(|e| AppError::Config(format!("路径规范化失败: {e}")))??;
 
-    let canon_root = tokio::task::spawn_blocking(move || download_root.canonicalize())
-        .await
-        .map_err(|e| AppError::Config(format!("路径规范化失败: {e}")))?
-        .map_err(|e| AppError::Config(format!("下载根目录不可访问: {e}")))?;
-
-    if !canon_target.starts_with(&canon_root) {
-        tracing::warn!(
-            target = %canon_target.display(),
-            root = %canon_root.display(),
-            "拒绝打开下载根目录之外的路径"
-        );
-        return Err(AppError::Config("路径不在下载目录范围内".to_string()));
-    }
-
-    // 通过 OS 原生命令打开文件管理器(独立后台进程,不阻塞)
-    let target_str = canon_target.to_string_lossy().to_string();
+    // 通过 OS 原生命令打开文件管理器(独立后台进程,不阻塞);
+    // 剥除 Windows verbatim 前缀:explorer 对 \\?\ 形式路径的支持不可靠
+    let canon_str = canon_target.to_string_lossy();
+    let target_str = super::strip_verbatim_prefix(canon_str.as_ref()).into_owned();
     tokio::task::spawn_blocking(move || {
         let result = open_in_file_manager(&target_str);
         if let Err(e) = result {
@@ -786,6 +784,39 @@ async fn open_dir_under_download_root(
     .await
     .map_err(|e| AppError::Config(format!("打开文件管理器任务失败: {e}")))?;
     Ok(())
+}
+
+/// 校验 target 位于 download_dir 或任一 authorized_dirs 之下(纯函数,可单测)
+///
+/// 安全边界 = canonicalize(download_dir) ∪ canonicalize(authorized_dirs),
+/// 与 create_task 的授权口径一致(修复"已授权目录能创建任务、却不能打开文件夹")。
+/// canonicalize 要求路径存在;目标目录在任务完成后均应存在,不存在则视为非法。
+/// 成功时返回 canonical 后的目标路径,供调用方打开文件管理器。
+fn ensure_dir_under_download_roots(
+    config: &tachyon_core::config::AppConfig,
+    target: &std::path::Path,
+) -> Result<std::path::PathBuf, AppError> {
+    let canon_target = target
+        .canonicalize()
+        .map_err(|e| AppError::Config(format!("目标目录不可访问: {e}")))?;
+    let roots = crate::commands::config_commands::canonical_download_roots(config);
+
+    if roots.is_empty() {
+        return Err(AppError::Config(
+            "下载根目录与授权目录均不可访问".to_string(),
+        ));
+    }
+
+    if !roots.iter().any(|root| canon_target.starts_with(root)) {
+        tracing::warn!(
+            target = %canon_target.display(),
+            roots = ?roots,
+            "拒绝打开下载根目录之外的路径"
+        );
+        return Err(AppError::Config("路径不在下载目录范围内".to_string()));
+    }
+
+    Ok(canon_target)
 }
 
 /// 跨平台调用系统文件管理器打开指定目录
@@ -917,7 +948,8 @@ pub async fn move_task(
 /// 探测文件真实名称(HEAD 请求 / DHT 查询种子元数据)
 ///
 /// - HTTP/HTTPS: 发送 HEAD 请求获取 Content-Disposition 等元数据
-/// - 磁力链接: 通过 DHT/Tracker 查询种子 info.name(与迅雷行为一致)
+/// - 磁力链接: 通过 DHT/Tracker 查询种子 info.name(与迅雷行为一致),
+///   元数据超时收紧到 15s(UI 即时反馈,不沿用下载级 120s 默认)
 ///
 /// 探测失败时回退到 URL 本地提取(extract_filename_from_url / magnet-{infoHash})。
 #[tauri::command]
@@ -940,13 +972,27 @@ pub(crate) async fn probe_filename_inner(
     // P0-8: UI 探测是一次性元数据读取,与 DownloadTask 的 factory 绑定不同
     // (probe 无 storage_factory,下载有 factory → 不同 cache key)。
     // 若不 pause+delete,会留下无所有者的 session torrent 持续联网。
+    /// UI 文件名探测的元数据超时上限(秒)
+    ///
+    /// MagnetConfig.metadata_timeout_secs(默认 120s)面向真实下载,允许等待
+    /// 半死 swarm;UI 探测是模态框内的即时反馈,失败可回退 dn=/magnet-{hash},
+    /// 15s 足以完成健康 swarm 的 tracker announce + ut_metadata 交换(经代理)。
+    const MAGNET_PROBE_TIMEOUT_CAP_SECS: u64 = 15;
+
     #[cfg(feature = "magnet")]
     if tachyon_core::looks_like_magnet_url(&url) {
         let bt_session = state.infra.bt_session.lock().await.clone();
         if let Some(session) = bt_session {
+            // UI 探测用收紧的元数据超时:120s 的下载级超时会让模态框长时间无反馈
+            let probe_config = {
+                let mut c = session.config().clone();
+                c.metadata_timeout_secs =
+                    c.metadata_timeout_secs.min(MAGNET_PROBE_TIMEOUT_CAP_SECS);
+                c
+            };
             let protocol = tachyon_engine::MagnetProtocol::new(
                 session.session(),
-                session.config().clone(),
+                probe_config,
                 session.download_dir().clone(),
                 session.handle_cache(),
             )
@@ -1506,8 +1552,9 @@ pub(crate) async fn import_backup_inner(
             .update_cached_download_dir(backup.config.download.download_dir.clone())
             .await;
         let config_to_persist = backup.config.clone();
+        let config_path = state.domain.config_path.clone();
         tokio::task::spawn_blocking(move || {
-            crate::commands::config_commands::persist_config(&config_to_persist)
+            crate::commands::config_commands::persist_config(&config_to_persist, &config_path)
         })
         .await
         .map_err(|e| AppError::Config(format!("持久化导入配置任务失败: {e}")))??;
@@ -1527,17 +1574,19 @@ pub(crate) async fn import_backup_inner(
         }
     }
 
+    // 去重键口径与 TaskService::create_task 一致(url_identity_key):
+    // magnet 按 info hash,http(s) 按 scheme://host/basename,其余按原文
     let existing_urls: HashSet<String> = state
         .domain
         .task_repository
         .iter()
-        .map(|r| redact_url_for_log(&r.value().url))
+        .map(|r| url_identity_key(&r.value().url))
         .collect();
 
     let mut imported = 0usize;
     for mut snapshot in backup.tasks {
-        let redacted = redact_url_for_log(&snapshot.url);
-        if !overwrite && existing_urls.contains(&redacted) {
+        let identity = url_identity_key(&snapshot.url);
+        if !overwrite && existing_urls.contains(&identity) {
             continue;
         }
 
@@ -2533,8 +2582,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_concurrent_tasks_rejects() {
-        // 必须用 test_state()（独立临时 store），禁止 AppState::new()：
-        // 全局 ~/.tachyon/store 在 nextest 并行下会锁冲突。
+        // 必须用 test_state()(独立临时 store/config)，禁止 AppState::new()：
+        // 后者打开全局 ~/.tachyon/store；nextest 并行会锁冲突，且可能写穿真实用户目录。
         let state = test_state();
         {
             let mut cfg = state.domain.config.lock().await;
@@ -3677,6 +3726,96 @@ mod tests {
         let state = test_state();
         let result = probe_filename_inner(&state, "not-a-url".to_string()).await;
         assert!(result.is_err(), "无效 URL 应返回错误");
+    }
+
+    // ------ ensure_dir_under_download_roots(打开文件夹授权口径) ------
+
+    /// 构造 download_dir=root_a、authorized_dirs=[root_a, root_b] 的配置
+    fn make_open_dir_config(root_a: &std::path::Path, root_b: &std::path::Path) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.download.download_dir = root_a.to_string_lossy().to_string();
+        config.download.authorized_dirs = vec![
+            root_a.to_string_lossy().to_string(),
+            root_b.to_string_lossy().to_string(),
+        ];
+        config
+    }
+
+    /// 修复"已授权目录能创建任务、却不能打开文件夹":
+    /// 位于 authorized_dirs(但不在 download_dir)之下的目录应放行
+    #[test]
+    fn test_open_dir_allows_authorized_dir_outside_download_dir() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let target = root_b.path().join("sub");
+        std::fs::create_dir_all(&target).unwrap();
+        let config = make_open_dir_config(root_a.path(), root_b.path());
+
+        let result = ensure_dir_under_download_roots(&config, &target);
+        assert!(
+            result.is_ok(),
+            "authorized_dirs 之下的目录应放行: {:?}",
+            result.unwrap_err()
+        );
+        assert_eq!(result.unwrap(), target.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_open_dir_allows_download_dir_subdir() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let target = root_a.path().join("sub");
+        std::fs::create_dir_all(&target).unwrap();
+        let config = make_open_dir_config(root_a.path(), root_b.path());
+
+        assert!(ensure_dir_under_download_roots(&config, &target).is_ok());
+    }
+
+    /// download_dir 与 authorized_dirs 之外的目录必须拒绝(安全边界不回归)
+    #[test]
+    fn test_open_dir_rejects_path_outside_roots() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = make_open_dir_config(root_a.path(), root_b.path());
+
+        let err = ensure_dir_under_download_roots(&config, outside.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("路径不在下载目录范围内"),
+            "目录之外的路径应拒绝: {err}"
+        );
+    }
+
+    #[test]
+    fn test_open_dir_rejects_nonexistent_target() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let config = make_open_dir_config(root_a.path(), root_b.path());
+        let missing = root_a.path().join("no-such-dir");
+
+        let err = ensure_dir_under_download_roots(&config, &missing).unwrap_err();
+        assert!(
+            err.to_string().contains("目标目录不可访问"),
+            "不存在的目标应拒绝: {err}"
+        );
+    }
+
+    #[test]
+    fn test_open_dir_rejects_when_all_roots_broken() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        // 配置里的根全部不存在 → canonicalize 全失败 → roots 为空
+        let mut config = AppConfig::default();
+        config.download.download_dir = root_a.path().join("gone-a").to_string_lossy().to_string();
+        config.download.authorized_dirs =
+            vec![root_b.path().join("gone-b").to_string_lossy().to_string()];
+
+        let err = ensure_dir_under_download_roots(&config, target.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("均不可访问"),
+            "roots 全失效应明确报错: {err}"
+        );
     }
 
     /// 不支持的协议(如 ftp)应返回错误
