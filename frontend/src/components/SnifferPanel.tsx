@@ -10,7 +10,6 @@ import { formatSize } from '../utils/format'
 import Button from '../shared/ui/Button'
 import { tr } from '../i18n'
 import { addToast } from '../stores/toast'
-import { requestConfirm } from '../stores/confirm'
 import { useFocusTrap } from '../hooks/useFocusTrap'
 
 const typeColors: Record<string, string> = {
@@ -127,15 +126,8 @@ export default function SnifferPanel(props: SnifferPanelProps) {
 
   const handleClear = async () => {
     if (props.resources.length === 0) return
-    const result = await requestConfirm({
-      title: tr('sniffer.clearConfirmTitle'),
-      message: tr('sniffer.clearConfirm'),
-      confirmLabel: tr('sniffer.clearConfirmLabel'),
-      tone: 'danger',
-    })
-    if (result.ok) {
-      props.onClearResources()
-    }
+    // 清空嗅探列表低风险(资源可重新嗅探/添加),直接执行不弹二次确认框
+    props.onClearResources()
   }
 
   // —— 捕获配置操作(即时保存) ——

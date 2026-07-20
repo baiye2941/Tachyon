@@ -143,23 +143,7 @@ describe('SettingsPanel', () => {
     expect((screen.getByLabelText('每个主机最大连接数') as HTMLInputElement).value).toBe('4')
   })
 
-  it('点击保存时弹出确认对话框(P1-11)', async () => {
-    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
-    renderSettingsPanel()
-
-    await waitFor(() => {
-      expect(screen.queryByText('加载配置中...')).toBeNull()
-    })
-
-    fireEvent.click(screen.getByText('保存配置'))
-
-    // 确认对话框应出现
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-  })
-
-  it('确认保存时调用 api.updateConfig 且参数为 ConfigPatch(不含安全字段)', async () => {
+  it('点击保存直接生效,不弹二次确认框(UX 审计:可逆操作免确认)', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockResolvedValue(undefined)
     renderSettingsPanel()
@@ -170,11 +154,23 @@ describe('SettingsPanel', () => {
 
     fireEvent.click(screen.getByText('保存配置'))
 
-    // 等待确认对话框出现后点击确认
+    // 直接调用 updateConfig,且界面上不存在确认按钮
     await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
     })
-    fireEvent.click(screen.getByText('确认保存'))
+    expect(screen.queryByText('确认保存')).toBeNull()
+  })
+
+  it('保存时调用 api.updateConfig 且参数为 ConfigPatch(不含安全字段)', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('保存配置'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -222,10 +218,6 @@ describe('SettingsPanel', () => {
 
     // 保存
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -254,10 +246,6 @@ describe('SettingsPanel', () => {
     fireEvent.input(input, { target: { value: 'socks5://127.0.0.1:7897' } })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -268,7 +256,7 @@ describe('SettingsPanel', () => {
     expect(calledWith.magnet!.socksProxyUrl).toBe('socks5://127.0.0.1:7897')
   })
 
-  it('确认保存成功时显示 toast 配置已保存', async () => {
+  it('保存成功时显示 toast 配置已保存', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockResolvedValue(undefined)
     renderSettingsPanel()
@@ -278,17 +266,13 @@ describe('SettingsPanel', () => {
     })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(addToast).toHaveBeenCalledWith('配置已保存', 'success')
     })
   })
 
-  it('确认保存失败时显示 toast 错误信息', async () => {
+  it('保存失败时显示 toast 错误信息', async () => {
     vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
     vi.mocked(api.updateConfig).mockRejectedValue(new Error('network error'))
     renderSettingsPanel()
@@ -298,10 +282,6 @@ describe('SettingsPanel', () => {
     })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(addToast).toHaveBeenCalledWith(expect.stringContaining('保存配置失败'), 'error')
@@ -318,10 +298,6 @@ describe('SettingsPanel', () => {
     })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -376,10 +352,6 @@ describe('SettingsPanel', () => {
     fireEvent.input(input, { target: { value: '15' } })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -411,10 +383,6 @@ describe('SettingsPanel', () => {
     fireEvent.click(toggleBtn)
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -435,10 +403,6 @@ describe('SettingsPanel', () => {
     })
 
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)
@@ -493,10 +457,6 @@ describe('SettingsPanel', () => {
 
     // 保存后 patch 应携带翻转后的通知设置
     fireEvent.click(screen.getByText('保存配置'))
-    await waitFor(() => {
-      expect(screen.getByText('确认保存')).toBeDefined()
-    })
-    fireEvent.click(screen.getByText('确认保存'))
 
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalledTimes(1)

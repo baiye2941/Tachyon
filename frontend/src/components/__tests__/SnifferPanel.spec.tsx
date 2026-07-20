@@ -75,36 +75,24 @@ describe("SnifferPanel", () => {
     );
   });
 
-  it("清空按钮调用 requestConfirm 替代 window.confirm", async () => {
-    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false });
+  it("清空按钮直接清空资源(低风险操作,不弹确认框)", async () => {
     const onClearResources = vi.fn();
     renderPanel({ onClearResources });
 
     fireEvent.click(screen.getByTitle("清空"));
-    await vi.waitFor(() => {
-      expect(mockRequestConfirm).toHaveBeenCalledTimes(1);
-    });
-    expect(mockRequestConfirm).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: "清空嗅探资源",
-        confirmLabel: "清空",
-        tone: "danger",
-      }),
-    );
+    // UX 审计:嗅探列表可重新嗅探/添加,清空不再弹二次确认
+    expect(mockRequestConfirm).not.toHaveBeenCalled();
     await vi.waitFor(() => {
       expect(onClearResources).toHaveBeenCalledTimes(1);
     });
   });
 
-  it("取消清空时不调用 onClearResources", async () => {
-    mockRequestConfirm.mockResolvedValue({ ok: false, deleteLocalFile: false });
+  it("无资源时清空按钮不调用 onClearResources", async () => {
     const onClearResources = vi.fn();
-    renderPanel({ onClearResources });
+    renderPanel({ onClearResources, resources: [] });
 
     fireEvent.click(screen.getByTitle("清空"));
-    await vi.waitFor(() => {
-      expect(mockRequestConfirm).toHaveBeenCalledTimes(1);
-    });
     expect(onClearResources).not.toHaveBeenCalled();
+    expect(mockRequestConfirm).not.toHaveBeenCalled();
   });
 });

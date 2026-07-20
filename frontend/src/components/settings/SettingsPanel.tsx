@@ -208,7 +208,6 @@ export default function SettingsPanel(props: SettingsPanelProps) {
   });
 
   const [saving, setSaving] = createSignal(false);
-  const [confirmOpen, setConfirmOpen] = createSignal(false);
   // 数据导入/导出
   const [importConfirmOpen, setImportConfirmOpen] = createSignal(false);
   const [importPath, setImportPath] = createSignal<string | null>(null);
@@ -349,13 +348,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
     };
   };
 
-  const handleSave = () => {
-    // 弹出确认对话框(P1-11)，替代 window.confirm
-    setConfirmOpen(true);
-  };
-
-  const handleConfirmSave = async () => {
-    setConfirmOpen(false);
+  const handleSave = async () => {
+    // 保存配置是可逆操作,点击保存直接生效(成功/失败均有 toast),
+    // 不再弹二次确认框(UX 审计:P1-11 确认门对低频可逆操作属于过度确认)
     setSaving(true);
     try {
       await api.updateConfig(buildPatch());
@@ -658,18 +653,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         </div>
       </div>
 
-      {/* 配置保存确认对话框(P1-11) */}
-      <ConfirmDialog
-        open={confirmOpen()}
-        title={t("confirm.updateConfig.title")}
-        message={t("confirm.updateConfig.message")}
-        confirmLabel={t("confirm.updateConfig.confirmLabel")}
-        loading={saving()}
-        onConfirm={handleConfirmSave}
-        onCancel={() => setConfirmOpen(false)}
-      />
-
-      {/* 数据导入确认对话框:覆盖 / 合并 */}
+      {/* 数据导入确认对话框:覆盖 / 合并(模式选择,非二次确认) */}
       <ConfirmDialog
         open={importConfirmOpen()}
         title={t("settings.backup.importConfirmTitle")}

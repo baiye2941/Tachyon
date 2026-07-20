@@ -64,20 +64,13 @@ export async function resumeSelected(): Promise<void> {
 /**
  * 批量取消选中任务
  *
- * cancel = 立即停止下载但保留任务记录(区别于 delete)。cancel_task 是 mutate
- * 级(非 destructive),后端无需 confirmation token;但批量操作为防误触,前端
- * 走一次应用内 ConfirmDialog(中性 tone,提示"停止但保留记录")。
+ * cancel = 立即停止下载但保留任务记录(区别于 delete),且取消后 toast
+ * 自带"撤销"按钮(30s 后悔药),属于可逆操作——不再弹二次确认框,
+ * 直接执行(UX 审计:可逆操作的确认门属于过度确认)。
  */
 export async function cancelSelected(): Promise<void> {
   const ids = Array.from($selectedIds.get());
   if (ids.length === 0) return;
-
-  const result = await requestConfirm({
-    title: tr("confirm.cancelBatch.title"),
-    message: tr("confirm.cancelBatch.message", { count: ids.length }),
-    confirmLabel: tr("confirm.cancelBatch.confirmLabel"),
-  });
-  if (!result.ok) return;
 
   const results = await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
   const successfulIds: string[] = [];
@@ -302,7 +295,7 @@ export async function resumeAll(): Promise<void> {
 /**
  * 取消所有运行中/暂停中的任务
  *
- * cancelAll 走单次应用内确认(中性 tone),避免误触批量取消。
+ * 与 cancelSelected 一致:可逆操作(有撤销入口),直接执行不弹确认框。
  */
 export async function cancelAll(): Promise<void> {
   const ids = $tasks
@@ -320,13 +313,6 @@ export async function cancelAll(): Promise<void> {
     addToast(tr("toast.noTasksToCancel"), "info");
     return;
   }
-
-  const result = await requestConfirm({
-    title: tr("confirm.cancelBatch.title"),
-    message: tr("confirm.cancelBatch.message", { count: ids.length }),
-    confirmLabel: tr("confirm.cancelBatch.confirmLabel"),
-  });
-  if (!result.ok) return;
 
   await Promise.allSettled(ids.map((id) => api.cancelTask(id)));
   await refreshTaskList();

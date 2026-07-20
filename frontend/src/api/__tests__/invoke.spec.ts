@@ -34,6 +34,69 @@ describe('isLocalPath (路径合法性校验)', () => {
   })
 })
 
+describe('api.authorizeDownloadDirectory (SEC-002)', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'request_confirmation' ? 'token-123' : 'D:\\downloads'),
+    )
+  })
+
+  it('跳过 window.confirm(原生选目录手势即确认),自动附加后端确认令牌', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    const result = await api.authorizeDownloadDirectory('D:\\downloads')
+    expect(result).toBe('D:\\downloads')
+    // 回归断言:WebView2 在原生文件对话框后弹 window.confirm 会卡死,此路径禁止再弹
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(invokeMock).toHaveBeenCalledTimes(2)
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'request_confirmation', {
+      action: 'authorize_download_directory',
+    })
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'authorize_download_directory', {
+      path: 'D:\\downloads',
+      confirmationToken: 'token-123',
+    })
+    confirmSpy.mockRestore()
+  })
+})
+
+describe('api.undoCancelTask / undoDeleteTask (撤销即确认)', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'request_confirmation' ? 'token-123' : undefined),
+    )
+  })
+
+  it('undoCancelTask 跳过 window.confirm,自动附加后端确认令牌', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    await api.undoCancelTask('task-1')
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'request_confirmation', {
+      action: 'undo_cancel_task',
+    })
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'undo_cancel_task', {
+      taskId: 'task-1',
+      confirmationToken: 'token-123',
+    })
+    confirmSpy.mockRestore()
+  })
+
+  it('undoDeleteTask 跳过 window.confirm,自动附加后端确认令牌', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    await api.undoDeleteTask('task-2')
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'request_confirmation', {
+      action: 'undo_delete_task',
+    })
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'undo_delete_task', {
+      taskId: 'task-2',
+      confirmationToken: 'token-123',
+    })
+    confirmSpy.mockRestore()
+  })
+})
+
 describe('api.openFolder (P1-21 后端校验)', () => {
   beforeEach(() => {
     invokeMock.mockReset()

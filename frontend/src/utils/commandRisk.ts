@@ -4,11 +4,15 @@
  * 背景：Tauri v2 的 capability/permission 体系不覆盖用户自定义的
  * `#[tauri::command]`,所有自定义命令默认对前端全量放行。XSS 或供应链
  * 注入后可静默调用全部命令。本模块提供**前端纵深防御层**(P1-11a):
- * 对破坏性命令强制弹出用户确认,用户取消则拒绝发送 invoke。
+ * 风险分层表 + window.confirm 确认门。当前全部已登记 destructive 命令
+ * 均在调用方自带应用内确认(ConfirmDialog/原生文件对话框/撤销按钮手势)
+ * 并以 skipConfirm 跳过弹门;window.confirm 仅作为**未登记新命令**
+ * (默认 destructive,白名单原则)的兜底,防止漏登记时静默放行。
  *
  * 后端 confirmation token 机制(P1-11b)提供真正的安全边界:
- * 破坏性命令(delete_task/update_config)执行前需先通过
+ * 破坏性命令(delete_task/update_config 等)执行前需先通过
  * request_confirmation 获取一次性 token,再将 token 传入命令。
+ * invoke 包装器对 destructive 级命令自动附加 token,与 skipConfirm 无关。
  * Token 一次性使用+60秒过期,防止 XSS/供应链注入后静默调用。
  */
 

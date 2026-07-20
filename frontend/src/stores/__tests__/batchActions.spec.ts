@@ -317,19 +317,16 @@ describe('batchActions store', () => {
     expect(mockAddToast).toHaveBeenCalledWith('没有可恢复的任务', 'info')
   })
 
-  it('cancelSelected 确认后取消选中任务(中性 tone,保留记录)', async () => {
+  it('cancelSelected 直接取消选中任务(可逆操作,不弹确认框)', async () => {
     downloadsModule.setTasks([makeTask('t1'), makeTask('t2')])
     selectionModule.selectAll(['t1'])
-    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
     mockCancelTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
     await batchActionsModule.cancelSelected()
 
-    expect(mockRequestConfirm).toHaveBeenCalledTimes(1)
-    expect(mockRequestConfirm).toHaveBeenCalledWith(
-      expect.objectContaining({ title: '取消选中任务' }),
-    )
+    // UX 审计:可逆操作(撤销 toast 兜底)不再弹二次确认
+    expect(mockRequestConfirm).not.toHaveBeenCalled()
     expect(mockCancelTask).toHaveBeenCalledWith('t1')
     expect(selectionModule.$selectedIds.get().size).toBe(0)
     expect(mockAddToastWithActions).toHaveBeenCalledWith(
@@ -342,15 +339,13 @@ describe('batchActions store', () => {
     )
   })
 
-  it('cancelSelected 用户取消时不执行', async () => {
+  it('cancelSelected 无选中任务时不执行', async () => {
     downloadsModule.setTasks([makeTask('t1')])
-    selectionModule.selectAll(['t1'])
-    mockRequestConfirm.mockResolvedValue({ ok: false, deleteLocalFile: false })
 
     await batchActionsModule.cancelSelected()
 
     expect(mockCancelTask).not.toHaveBeenCalled()
-    expect(selectionModule.$selectedIds.get().size).toBe(1)
+    expect(mockRequestConfirm).not.toHaveBeenCalled()
   })
 
   it('cancelSelected 成功后点击撤销调用 undoCancelTask', async () => {
@@ -397,19 +392,19 @@ describe('batchActions store', () => {
     expect(mockGetTaskList).toHaveBeenCalled()
   })
 
-  it('cancelAll 取消所有活跃与暂停任务', async () => {
+  it('cancelAll 取消所有活跃与暂停任务(不弹确认框)', async () => {
     downloadsModule.setTasks([
       makeTask('t1', { status: 'downloading' }),
       makeTask('t2', { status: 'paused' }),
       makeTask('t3', { status: 'resuming' }),
       makeTask('t4', { status: 'completed' }),
     ])
-    mockRequestConfirm.mockResolvedValue({ ok: true, deleteLocalFile: false })
     mockCancelTask.mockResolvedValue(undefined)
     mockGetTaskList.mockResolvedValue([])
 
     await batchActionsModule.cancelAll()
 
+    expect(mockRequestConfirm).not.toHaveBeenCalled()
     expect(mockCancelTask).toHaveBeenCalledWith('t1')
     expect(mockCancelTask).toHaveBeenCalledWith('t2')
     expect(mockCancelTask).toHaveBeenCalledWith('t3')

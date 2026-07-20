@@ -88,14 +88,17 @@ export const api = {
   /** 创建下载任务 */
   createTask: (url: string, downloadDir?: string, mirrorUrls?: string[], fileName?: string, autoStart?: boolean) =>
     invoke<string>('create_task', { url, downloadDir, mirrorUrls, fileName, autoStart }),
-  /** 显式授权下载目录(SEC-002:需确认令牌,禁止 create_task 静默扩权) */
-  authorizeDownloadDirectory: async (path: string) => {
-    const token = await requestConfirmation('authorize_download_directory')
-    return invoke<string>('authorize_download_directory', {
-      path,
-      confirmationToken: token,
-    })
-  },
+  /**
+   * 显式授权下载目录(SEC-002:需确认令牌,禁止 create_task 静默扩权)
+   *
+   * skipConfirm=true:原生文件夹选择框的"选择目录"手势即显式用户确认,
+   * 不再叠加 window.confirm —— WebView2 在原生文件对话框刚关闭时弹 JS
+   * 确认框会卡死或出现在主窗口后方,整个 webview 被同步阻塞,表现为
+   * "点击确认后没反应"。P1-11b 安全边界不变:invoke 包装器对 destructive
+   * 命令仍自动附加后端一次性确认令牌。
+   */
+  authorizeDownloadDirectory: (path: string) =>
+    invoke<string>('authorize_download_directory', { path }, /* skipConfirm */ true),
   /** 探测真实文件名(HEAD 请求获取 Content-Disposition / DHT 查询种子元数据) */
   probeFilename: (url: string) => invoke<string>('probe_filename', { url }),
   /** 获取任务列表 */
@@ -128,10 +131,20 @@ export const api = {
     }
     return invoke<void>('delete_task', { taskId, deleteLocalFile: opts?.deleteLocalFile }, opts?.skipConfirm)
   },
-  /** 撤销取消任务(破坏性操作,需确认令牌) */
-  undoCancelTask: (taskId: string) => invoke<void>('undo_cancel_task', { taskId }),
-  /** 撤销删除任务(破坏性操作,需确认令牌) */
-  undoDeleteTask: (taskId: string) => invoke<void>('undo_delete_task', { taskId }),
+  /**
+   * 撤销取消任务(破坏性操作,需确认令牌)
+   *
+   * skipConfirm=true:撤销入口是"已取消 [撤销]"提示条上的撤销按钮,
+   * 点击撤销本身即显式用户确认,再弹 window.confirm 属于反向 UX。
+   * 后端 confirmation token 仍由 invoke 包装器自动附加,安全边界不变。
+   */
+  undoCancelTask: (taskId: string) => invoke<void>('undo_cancel_task', { taskId }, /* skipConfirm */ true),
+  /**
+   * 撤销删除任务(破坏性操作,需确认令牌)
+   *
+   * 同 undoCancelTask:撤销按钮点击即确认,跳过 invoke 内 window.confirm。
+   */
+  undoDeleteTask: (taskId: string) => invoke<void>('undo_delete_task', { taskId }, /* skipConfirm */ true),
   /** 重排任务顺序 */
   reorderTasks: (orderedIds: string[]) => invoke<void>('reorder_tasks', { orderedIds }),
   /** 将任务移动到指定任务之前,beforeId 为空时移到末尾 */
