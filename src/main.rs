@@ -1,7 +1,7 @@
 //! Tachyon 磁力链接下载测试工具
 //!
 //! 用于验证真实 BT 网络下的磁力链接下载路径。
-//! 用法: cargo run --bin tachyon-cli -- <magnet_url> <output_dir> [--socks-proxy <url>]
+//! 用法: cargo run --bin tachyon-cli -- `<magnet_url>` `<output_dir>` `[--socks-proxy <proxy_url>]`
 
 mod cli_proxy;
 
