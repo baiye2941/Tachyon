@@ -37,7 +37,7 @@ jobs:
         with:
           workspaces: "fuzz"
           shared-key: fuzz-workspace-${{ hashFiles('fuzz/Cargo.lock') }}
-      - uses: cargo-bins/cargo-binstall@v1.20.0
+      - uses: cargo-bins/cargo-binstall@v1.21.0
       - name: 安装 cargo-fuzz
         run: cargo binstall -y --force cargo-fuzz || cargo install cargo-fuzz
       # H8: corpus 持久化 —— 跨 fuzz 运行复用 corpus,让覆盖率随时间积累。
