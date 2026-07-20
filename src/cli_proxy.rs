@@ -1,9 +1,11 @@
 //! CLI SOCKS 代理解析：参数 > 环境变量 > None，禁止硬编码默认代理。
 
-use std::collections::HashMap;
-
-/// 优先级：显式 CLI 参数 > 环境变量（ALL_PROXY → HTTPS_PROXY → HTTP_PROXY）> None。
+/// 优先级：显式 CLI 参数 > 环境变量（与 `tachyon_core::config::detect_socks_proxy` 键序对齐）> None。
+/// 键序：`ALL_PROXY > all_proxy > HTTPS_PROXY > https_proxy > HTTP_PROXY > http_proxy`。
 /// 空字符串视为未设置。绝不发明 7897 等默认端口。
+///
+/// 注意：本函数只做“取第一个非空 URL”，不做 scheme 规范化（http→socks5）。
+/// CLI 调试工具直接把结果交给 `MagnetConfig.socks_proxy_url`，scheme 由配置校验负责。
 pub fn resolve_socks_proxy(
     cli: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
@@ -14,7 +16,15 @@ pub fn resolve_socks_proxy(
             return Some(trimmed.to_string());
         }
     }
-    for key in ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+    // 与 detect_socks_proxy 键序对齐：大写优先于小写（POSIX 大小写敏感）
+    for key in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
         if let Some(val) = env(key) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
@@ -23,14 +33,6 @@ pub fn resolve_socks_proxy(
         }
     }
     None
-}
-
-/// 从环境变量 HashMap 查找（测试注入用）。
-pub fn resolve_socks_proxy_from_map(
-    cli: Option<&str>,
-    env_map: &HashMap<String, String>,
-) -> Option<String> {
-    resolve_socks_proxy(cli, &|k| env_map.get(k).cloned())
 }
 
 /// 从 argv 解析可选 `--socks-proxy <url>`，不破坏 `<magnet> <out_dir>` 位置参数。
@@ -67,6 +69,14 @@ mod tests {
 
     fn empty_env(_k: &str) -> Option<String> {
         None
+    }
+
+    /// 测试注入：从 HashMap 读环境变量（仅测试用，避免生产 dead_code）。
+    fn resolve_socks_proxy_from_map(
+        cli: Option<&str>,
+        env_map: &HashMap<String, String>,
+    ) -> Option<String> {
+        resolve_socks_proxy(cli, &|k| env_map.get(k).cloned())
     }
 
     #[test]
@@ -151,6 +161,32 @@ mod tests {
         assert_eq!(
             resolve_socks_proxy_from_map(None, &map),
             Some("socks5://http:1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cli_proxy_env_lowercase_keys() {
+        // 与 detect_socks_proxy 对齐：小写键在对应大写键缺失时生效
+        let mut map = HashMap::new();
+        map.insert("all_proxy".to_string(), "socks5://lower-all:1".to_string());
+        assert_eq!(
+            resolve_socks_proxy_from_map(None, &map),
+            Some("socks5://lower-all:1".to_string())
+        );
+
+        // 大写优先于小写
+        map.insert("ALL_PROXY".to_string(), "socks5://upper-all:2".to_string());
+        assert_eq!(
+            resolve_socks_proxy_from_map(None, &map),
+            Some("socks5://upper-all:2".to_string())
+        );
+
+        map.clear();
+        map.insert("https_proxy".to_string(), "socks5://lower-https:3".to_string());
+        map.insert("http_proxy".to_string(), "socks5://lower-http:4".to_string());
+        assert_eq!(
+            resolve_socks_proxy_from_map(None, &map),
+            Some("socks5://lower-https:3".to_string())
         );
     }
 
