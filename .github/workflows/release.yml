@@ -241,7 +241,8 @@ jobs:
   install-smoke:
     name: 安装冒烟测试 (${{ matrix.platform }})
     needs: build-release
-    if: success()
+    # 显式检查 build-release result,避免 needs 链中 skipped 传播
+    if: needs.build-release.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -365,7 +366,8 @@ jobs:
   release-gate:
     name: 发布门禁
     needs: [install-smoke]
-    if: success()
+    # 显式检查 install-smoke result,避免 needs 链中 skipped 传播
+    if: needs.install-smoke.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -470,6 +472,10 @@ jobs:
   build-release:
     name: 构建发布 (${{ matrix.platform }})
     needs: [ci-gate, version-check]
+    # 显式检查直接 needs 的 result,不受 ci-gate 的 if: always() 依赖链中
+    # ci-fallback skipped 的传播影响(同 SHA CI 已绿时 ci-fallback 被 skipped,
+    # GitHub Actions 默认会将 skipped 传播给下游 matrix job 导致构建被跳过)
+    if: needs.ci-gate.result == 'success' && needs.version-check.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -590,8 +596,9 @@ jobs:
     name: 发布 Release
     needs: [release-gate]
     # dry-run=true(默认)跳过公开发布; tag 推送 或 显式 dry-run=false 才 undraft
+    # 显式检查 release-gate result,避免 needs 链中 skipped 传播
     # 注意: job 级 if 不能用 env 上下文,故内联等价表达式
-    if: success() && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
+    if: needs.release-gate.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.dry-run == 'false')
     runs-on: ubuntu-latest
     # 含 cosign + Release 资产对账下载/上传 sidecar，5min 偏紧
     timeout-minutes: 15
