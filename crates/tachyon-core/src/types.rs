@@ -562,10 +562,7 @@ pub enum FragmentProgress {
     /// 在 spawn 重试循环判定 `will retry` 后 `try_send`(可丢)。
     /// `attempt` 为该分片本次将进行的 attempt 序号(从 1 起,对应失败后递增的计数)。
     /// app 层每收到一次累加 `TaskInfo.retry_count`(任务级累计重试次数)。
-    Retry {
-        fragment_index: u32,
-        attempt: u32,
-    },
+    Retry { fragment_index: u32, attempt: u32 },
 }
 
 #[cfg(test)]

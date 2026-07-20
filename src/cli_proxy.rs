@@ -114,10 +114,7 @@ mod tests {
         let result = resolve_socks_proxy(None, &empty_env);
         assert_eq!(result, None, "无 CLI/env 时必须为 None，不得硬编码 7897");
         if let Some(ref s) = result {
-            assert!(
-                !s.contains("7897"),
-                "不得硬编码 7897 代理，实际: {s}"
-            );
+            assert!(!s.contains("7897"), "不得硬编码 7897 代理，实际: {s}");
         }
     }
 
@@ -182,8 +179,14 @@ mod tests {
         );
 
         map.clear();
-        map.insert("https_proxy".to_string(), "socks5://lower-https:3".to_string());
-        map.insert("http_proxy".to_string(), "socks5://lower-http:4".to_string());
+        map.insert(
+            "https_proxy".to_string(),
+            "socks5://lower-https:3".to_string(),
+        );
+        map.insert(
+            "http_proxy".to_string(),
+            "socks5://lower-http:4".to_string(),
+        );
         assert_eq!(
             resolve_socks_proxy_from_map(None, &map),
             Some("socks5://lower-https:3".to_string())

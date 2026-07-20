@@ -1807,9 +1807,6 @@ mod tests {
             .load_snapshot(&task_id)
             .unwrap()
             .expect("快照应存在");
-        assert_eq!(
-            snap.retry_count, 3,
-            "retry_count 应 checkpoint 到快照"
-        );
+        assert_eq!(snap.retry_count, 3, "retry_count 应 checkpoint 到快照");
     }
 }
