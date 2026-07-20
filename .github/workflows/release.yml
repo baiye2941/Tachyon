@@ -644,11 +644,9 @@ jobs:
           SIDECARS=$(
             find dist -type f \( -name '*.sha256' -o -name '*.bundle' \) | LC_ALL=C sort
           )
-          SIGS=$(find dist -type f -name '*.sig' | LC_ALL=C sort)
           pkg_n=$(printf '%s\n' "$PKGS" | grep -c . || true)
           side_n=$(printf '%s\n' "$SIDECARS" | grep -c . || true)
-          sig_n=$(printf '%s\n' "$SIGS" | grep -c . || true)
-          echo "packages=$pkg_n sidecars=$side_n sigs=$sig_n"
+          echo "packages=$pkg_n sidecars=$side_n"
           [[ "$pkg_n" -ge 1 ]] || { echo "::error::无安装包"; exit 1; }
           expect=$((pkg_n * 2))
           if [[ "$side_n" -ne "$expect" ]]; then
@@ -657,12 +655,18 @@ jobs:
             printf '  side: %s\n' "$SIDECARS"
             exit 1
           fi
+          # .sig 由 tauri-action 在各 build job 直接上传到 Release（不在 workflow artifact）
+          # 此处从 Release 列表验证 .sig 存在，不要求 dist 中有
+          sig_n=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+            --jq '[.assets[].name | select(endswith(".sig"))] | length')
+          echo "release .sig assets: $sig_n"
           if [[ "$sig_n" -lt 1 ]]; then
-            echo "::error::dist 中无 .sig（updater 签名缺失）"
+            echo "::error::Release 上无任何 .sig（updater 签名缺失）"
             exit 1
           fi
+          # 上传 sidecar（.sha256 / .bundle）
           # shellcheck disable=SC2086
-          for s in $SIDECARS $SIGS; do
+          for s in $SIDECARS; do
             [ -n "$s" ] || continue
             # 审计 SEC-013: 校验/签名上传失败必须阻断公开发布
             # 使用 path#basename 降低嵌套路径上传时 basename 撞名风险
