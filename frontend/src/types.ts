@@ -26,7 +26,7 @@ export interface TaskInfo {
   activeConcurrency?: number
   /** 失败原因原文(仅 status='failed' 时有值),后端 TaskInfo.error_reason */
   errorReason?: string
-  /** 任务级重试计数(保留字段,当前恒为 0) */
+  /** 任务级重试计数:分片/整块可重试失败累计,经快照与 progress 事件同步 */
   retryCount?: number
   /** 用户自定义任务标签,用于分组/过滤 */
   tags?: string[]
@@ -281,6 +281,8 @@ export interface ProgressPayload {
   fragmentBytes?: FragmentByteProgress[]
   /** 任务失败原因。Failed 终态时由后端写入,UI 无需等待 get_task_list 全量刷新即可展示错误详情(P1-22-4) */
   errorReason?: string | null
+  /** 任务级重试计数。进度事件同步;缺失时前端保持原值 */
+  retryCount?: number
 }
 
 export type ProgressEvent = Record<string, ProgressPayload>

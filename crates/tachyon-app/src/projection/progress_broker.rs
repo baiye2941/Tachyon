@@ -338,6 +338,7 @@ fn build_progress_event(
                     started_delta,
                     error_reason: t.error_reason.clone(),
                     fragment_bytes,
+                    retry_count: t.retry_count,
                 },
             )
         })

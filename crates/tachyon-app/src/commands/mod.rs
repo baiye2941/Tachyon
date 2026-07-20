@@ -355,6 +355,10 @@ pub struct TaskProgress {
     /// 快照式:前端无状态、幂等、丢包自愈。空时 skip 以省带宽。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fragment_bytes: Vec<FragmentByteProgress>,
+    /// 任务级重试计数(与 TaskInfo.retry_count 同源)。
+    /// 进度事件路径同步,避免前端仅靠 get_task_list 才能看到「已重试 N 次」。
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -827,14 +831,8 @@ pub(crate) async fn persist_task_snapshot(
             true,
         );
         if let Some(existing) = existing {
-            snapshot.fragment_size = existing.fragment_size;
-            snapshot.completed_fragments = existing.completed_fragments;
-            snapshot.partial_fragments = existing.partial_fragments;
-            snapshot.etag = existing.etag;
-            snapshot.last_modified = existing.last_modified;
-            snapshot.supports_range = existing.supports_range;
-            snapshot.retry_count = existing.retry_count;
-            snapshot.revision = existing.revision;
+            // 内存 TaskInfo.retry_count 权威；不合并磁盘 retry_count
+            crate::task_store::merge_disk_progress_into_snapshot(&mut snapshot, &existing);
         }
         snapshot.fail_reason = fail_reason;
         // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
@@ -1258,7 +1256,25 @@ pub(crate) mod tests {
             started_delta: vec![],
             error_reason: error_reason.map(String::from),
             fragment_bytes: vec![],
+            retry_count: 0,
         }
+    }
+
+    #[test]
+    fn test_task_progress_retry_count_serializes_and_defaults() {
+        let mut tp = make_progress(None);
+        tp.retry_count = 5;
+        let json = serde_json::to_string(&tp).unwrap();
+        assert!(
+            json.contains(r#""retryCount":5"#),
+            "retry_count 应以 camelCase 序列化,实际: {json}"
+        );
+        let decoded: TaskProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.retry_count, 5);
+        // 旧版 JSON 无字段 → default 0
+        let legacy = r#"{"id":"t1","progress":0.0,"speed":0,"downloaded":0,"status":"cancelled","fragmentsDone":0}"#;
+        let decoded: TaskProgress = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.retry_count, 0);
     }
 
     #[test]
@@ -1922,6 +1938,7 @@ mod fragment_bytes_tests {
             started_delta: vec![],
             error_reason: None,
             fragment_bytes: vec![],
+            retry_count: 0,
         };
         let json = serde_json::to_string(&tp).unwrap();
         // skip_serializing_if = Vec::is_empty,空时不应出现在 JSON
@@ -1950,6 +1967,7 @@ mod fragment_bytes_tests {
                 index: 1,
                 downloaded: 256,
             }],
+            retry_count: 0,
         };
         let json = serde_json::to_string(&tp).unwrap();
         assert!(

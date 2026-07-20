@@ -198,6 +198,26 @@ pub fn task_info_to_snapshot(
     }
 }
 
+/// 将磁盘快照中的续传/校验字段合并进内存 TaskInfo 构建的 snapshot。
+///
+/// **不覆盖** `retry_count`：内存 `TaskInfo.retry_count` 是权威源
+///（由 chunk_reader 消费 `FragmentProgress::Retry` 累加，并可能已 checkpoint）；
+/// 若用磁盘旧值覆盖，会在 `persist_task_snapshot` / `persist_task_state` 时
+/// 把运行期累加的重试次数抹回落盘前的值。
+///
+/// 合并字段：fragment_size、completed/partial_fragments、etag、last_modified、
+/// supports_range、revision。`fail_reason` 由调用方单独处理（两条路径语义不同）。
+pub fn merge_disk_progress_into_snapshot(snapshot: &mut TaskSnapshot, existing: &TaskSnapshot) {
+    snapshot.fragment_size = existing.fragment_size;
+    snapshot.completed_fragments = existing.completed_fragments.clone();
+    snapshot.partial_fragments = existing.partial_fragments.clone();
+    snapshot.etag = existing.etag.clone();
+    snapshot.last_modified = existing.last_modified.clone();
+    snapshot.supports_range = existing.supports_range;
+    // 审计 H-05: full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序
+    snapshot.revision = existing.revision;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +296,84 @@ mod tests {
         assert_eq!(loaded[0].id, "task-1");
     }
 
+    /// 内存 TaskInfo.retry_count 在与磁盘快照合并时保持权威，不被 existing 覆盖。
+    #[test]
+    fn test_merge_disk_progress_preserves_memory_retry_count() {
+        let mut from_memory = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "merge-retry".to_string(),
+            url: "https://example.com/m.bin".to_string(),
+            save_path: "/downloads/m.bin".to_string(),
+            file_name: "m.bin".to_string(),
+            file_size: Some(1024),
+            downloaded: 512,
+            completed_fragments: vec![],
+            partial_fragments: HashMap::new(),
+            total_fragments: 2,
+            fragment_size: 0,
+            status: DownloadState::Downloading,
+            etag: None,
+            last_modified: None,
+            content_length: Some(1024),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 3, // 内存权威：运行期已累加
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+        let existing = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 5,
+            id: "merge-retry".to_string(),
+            url: "https://example.com/m.bin".to_string(),
+            save_path: "/downloads/m.bin".to_string(),
+            file_name: "m.bin".to_string(),
+            file_size: Some(1024),
+            downloaded: 256,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::from([(1, 128)]),
+            total_fragments: 2,
+            fragment_size: 512,
+            status: DownloadState::Paused,
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Wed, 01 Jan 2020 00:00:00 GMT".to_string()),
+            content_length: Some(1024),
+            supports_range: false,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:00Z".to_string(),
+            fail_reason: Some("old".to_string()),
+            retry_count: 1, // 磁盘旧值，不得覆盖内存 3
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+
+        merge_disk_progress_into_snapshot(&mut from_memory, &existing);
+
+        assert_eq!(
+            from_memory.retry_count, 3,
+            "合并后 retry_count 必须保留内存权威值 3，不能被磁盘 1 覆盖"
+        );
+        assert_eq!(from_memory.fragment_size, 512);
+        assert_eq!(from_memory.completed_fragments, vec![0]);
+        assert_eq!(from_memory.partial_fragments.get(&1), Some(&128));
+        assert_eq!(from_memory.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(
+            from_memory.last_modified.as_deref(),
+            Some("Wed, 01 Jan 2020 00:00:00 GMT")
+        );
+        assert!(!from_memory.supports_range);
+        assert_eq!(from_memory.revision, 5);
+        // fail_reason 不由 merge helper 处理
+        assert_eq!(from_memory.fail_reason, None);
+    }
+
     /// 非零 retry_count 经 snapshot ↔ TaskInfo 往返保持(A-13 聚合后真实语义)。
     #[test]
     fn test_snapshot_round_trip_preserves_nonzero_retry_count() {
@@ -317,7 +415,10 @@ mod tests {
         assert_eq!(loaded.retry_count, 7, "快照往返应保留非零 retry_count");
 
         let task = snapshot_to_task_info(&loaded);
-        assert_eq!(task.retry_count, 7, "snapshot→TaskInfo 应保留非零 retry_count");
+        assert_eq!(
+            task.retry_count, 7,
+            "snapshot→TaskInfo 应保留非零 retry_count"
+        );
 
         let back = task_info_to_snapshot(
             &task,

@@ -1002,16 +1002,10 @@ impl TaskService {
                 true,
             );
             if let Some(existing) = existing {
-                snapshot.fragment_size = existing.fragment_size;
-                snapshot.completed_fragments = existing.completed_fragments;
-                snapshot.partial_fragments = existing.partial_fragments;
-                snapshot.etag = existing.etag;
-                snapshot.last_modified = existing.last_modified;
-                snapshot.supports_range = existing.supports_range;
-                snapshot.retry_count = existing.retry_count;
+                // 内存 TaskInfo.retry_count 权威；不合并磁盘 retry_count
+                crate::task_store::merge_disk_progress_into_snapshot(&mut snapshot, &existing);
+                // service 路径默认保留磁盘 fail_reason；patch 可再覆盖
                 snapshot.fail_reason = existing.fail_reason;
-                // 审计 H-05:full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序
-                snapshot.revision = existing.revision;
             }
             patch(&mut snapshot);
             // task_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。

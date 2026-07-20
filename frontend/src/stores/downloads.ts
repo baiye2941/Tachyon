@@ -246,6 +246,9 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         p.errorReason !== undefined
           ? (p.errorReason ?? undefined)
           : task.errorReason;
+      // retryCount:字段缺失保持原值;有值(含 0)时覆盖
+      const newRetryCount =
+        p.retryCount !== undefined ? p.retryCount : task.retryCount;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -268,13 +271,14 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         pushTaskSpeed(id, newSpeed);
       }
 
-      // 审计 FT-04:cold 字段(fragmentsTotal/concurrency/errorReason)不能被
+      // 审计 FT-04:cold 字段(fragmentsTotal/concurrency/errorReason/retryCount)不能被
       // hot/status/size 三类条件代理,否则详情线程列与错误文案会卡在旧值
       const oldConcurrency = task.activeConcurrency ?? 0;
       const coldChanged =
         newFragmentsTotal !== task.fragmentsTotal ||
         newConcurrency !== oldConcurrency ||
-        newErrorReason !== task.errorReason;
+        newErrorReason !== task.errorReason ||
+        newRetryCount !== task.retryCount;
       const sizeChanged = newSize !== task.fileSize;
       const hasChanged =
         hotChanged || newStatus !== oldStatus || coldChanged || sizeChanged;
@@ -291,6 +295,7 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           fileSize: newSize,
           activeConcurrency: newConcurrency,
           errorReason: newErrorReason,
+          retryCount: newRetryCount,
         });
       }
 

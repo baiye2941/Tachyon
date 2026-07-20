@@ -134,6 +134,7 @@ fn build_initial_progress_event(
                     // 启动时 Failed 任务的错误提示会闪一下才被 delta 修正
                     error_reason: t.error_reason.clone(),
                     fragment_bytes: vec![],
+                    retry_count: t.retry_count,
                 },
             )
         })
@@ -198,6 +199,7 @@ pub(crate) fn build_lagged_resync_event(
                     started_delta,
                     error_reason: t.error_reason.clone(),
                     fragment_bytes: vec![],
+                    retry_count: t.retry_count,
                 },
             )
         })
@@ -387,6 +389,7 @@ mod tests {
             started_delta: vec![],
             error_reason: None,
             fragment_bytes: vec![],
+            retry_count: 0,
         };
         let mut last = HashMap::new();
         last.insert("t1".to_string(), tp.clone());
@@ -415,6 +418,7 @@ mod tests {
                 started_delta: vec![],
                 error_reason: None,
                 fragment_bytes: vec![],
+                retry_count: 0,
             },
         );
         last.insert(
@@ -433,6 +437,7 @@ mod tests {
                 started_delta: vec![],
                 error_reason: None,
                 fragment_bytes: vec![],
+                retry_count: 0,
             },
         );
 
@@ -471,6 +476,7 @@ mod tests {
                 started_delta: vec![],
                 error_reason: None,
                 fragment_bytes: vec![],
+                retry_count: 0,
             },
         );
 
@@ -503,6 +509,7 @@ mod tests {
                 started_delta: vec![],
                 error_reason: None,
                 fragment_bytes: vec![],
+                retry_count: 0,
             },
         );
 
