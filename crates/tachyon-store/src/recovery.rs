@@ -14,7 +14,7 @@ use crate::kv::KvStore;
 /// 每次 TaskSnapshot 结构发生新增/删除/重命名字段时递增。
 /// 新增字段必须标注 `#[serde(default)]`，确保旧版本 JSON 可正常反序列化。
 /// 删除字段应先改为 `Option<T>` + `#[serde(default)]`，至少保留一个版本周期的兼容。
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 7;
 
 fn default_supports_range_true() -> bool {
     true
@@ -83,6 +83,10 @@ pub struct TaskSnapshot {
     /// 旧版快照无此字段时默认 0,保持与创建时间降序的兼容排序。
     #[serde(default)]
     pub display_order: i64,
+    /// 创建任务时配置的镜像 URL 列表。
+    /// 旧版快照无此字段时默认 None;重启/续传时从快照恢复多源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_urls: Option<Vec<String>>,
 }
 
 /// 下载任务持久化记录（旧接口，保持向后兼容）
@@ -152,6 +156,7 @@ impl From<TaskRecord> for TaskSnapshot {
             tags: Vec::new(),
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 }
@@ -463,6 +468,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 
@@ -663,6 +669,7 @@ mod tests {
             tags: vec!["model".to_string(), "important".to_string()],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -738,6 +745,79 @@ mod tests {
         let snapshot: TaskSnapshot = serde_json::from_str(new_json).unwrap();
         assert_eq!(snapshot.schema_version, 1);
         assert_eq!(snapshot.id, "new-task");
+    }
+
+    // ── mirror_urls 快照持久化(schema v7) ──
+
+    #[test]
+    fn test_task_snapshot_mirror_urls_json_roundtrip() {
+        let mut snapshot = make_snapshot("mirror-task", tachyon_core::DownloadState::Paused);
+        snapshot.mirror_urls = Some(vec![
+            "https://mirror1.example.com/file.bin".to_string(),
+            "https://mirror2.example.com/file.bin".to_string(),
+        ]);
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            json.contains("mirrorUrls"),
+            "序列化应使用 camelCase mirrorUrls: {json}"
+        );
+        let loaded: TaskSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.mirror_urls.as_ref().map(|v| v.as_slice()),
+            Some(
+                [
+                    "https://mirror1.example.com/file.bin".to_string(),
+                    "https://mirror2.example.com/file.bin".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(loaded.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(SNAPSHOT_SCHEMA_VERSION, 7);
+    }
+
+    #[test]
+    fn test_task_snapshot_old_json_without_mirror_urls_deserializes_to_none() {
+        // 旧版快照无 mirrorUrls 字段时必须默认为 None,不能反序列化失败
+        let old_json = r#"{
+            "schemaVersion":6,
+            "id":"legacy-mirror",
+            "url":"https://example.com/legacy.bin",
+            "savePath":"/downloads/legacy.bin",
+            "fileName":"legacy.bin",
+            "fileSize":2048,
+            "downloaded":512,
+            "completedFragments":[0],
+            "totalFragments":4,
+            "fragmentSize":512,
+            "status":"paused",
+            "createdAt":"2026-01-01T00:00:00Z",
+            "updatedAt":"2026-01-01T00:00:01Z",
+            "retryCount":0
+        }"#;
+        let snapshot: TaskSnapshot = serde_json::from_str(old_json).unwrap();
+        assert!(
+            snapshot.mirror_urls.is_none(),
+            "旧 JSON 无 mirrorUrls 时应为 None"
+        );
+    }
+
+    #[test]
+    fn test_task_snapshot_kv_roundtrip_preserves_mirror_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+
+        let mut snapshot = make_snapshot("kv-mirrors", tachyon_core::DownloadState::Downloading);
+        snapshot.mirror_urls = Some(vec!["https://cdn.example.com/a.bin".to_string()]);
+        mgr.save_task_snapshot(&snapshot).unwrap();
+
+        let loaded = mgr.load_task_snapshot("kv-mirrors").unwrap().unwrap();
+        assert_eq!(
+            loaded.mirror_urls,
+            Some(vec!["https://cdn.example.com/a.bin".to_string()])
+        );
     }
 
     // ── 坏 JSON 隔离测试 ──

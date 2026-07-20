@@ -161,6 +161,10 @@ pub struct TaskInfo {
     /// 任务在列表中的显示顺序，越小越靠前。
     #[serde(default)]
     pub display_order: i64,
+    /// 创建任务时配置的镜像 URL 列表。
+    /// 旧任务/旧快照无此字段时默认 None;restart_download 据此恢复多源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_urls: Option<Vec<String>>,
 }
 
 /// 序列化 URL 时转换为显示形式(tachyon_core::url_for_display):
@@ -1062,6 +1066,7 @@ pub(crate) mod tests {
             tags: vec!["model".to_string()],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();
@@ -1117,6 +1122,7 @@ pub(crate) mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 

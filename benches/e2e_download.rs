@@ -45,6 +45,7 @@ fn make_snapshot(id: &str, status: DownloadState, downloaded: u64, fragments: u3
         tags: vec![],
         hf_meta: None,
         display_order: 0,
+        mirror_urls: None,
     }
 }
 

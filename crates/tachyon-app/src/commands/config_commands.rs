@@ -1290,6 +1290,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
         state
             .domain

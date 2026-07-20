@@ -141,6 +141,7 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         display_order: snapshot.display_order,
+        mirror_urls: snapshot.mirror_urls.clone(),
     }
 }
 
@@ -193,6 +194,7 @@ pub fn task_info_to_snapshot(
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .filter(|v| !v.is_null()),
         display_order: task.display_order,
+        mirror_urls: task.mirror_urls.clone(),
     }
 }
 
@@ -227,6 +229,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let task = snapshot_to_task_info(&snapshot);
@@ -264,6 +267,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         store.save_snapshot(&snapshot).unwrap();
@@ -304,6 +308,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
         store.save_snapshot(&good).unwrap();
 
@@ -376,6 +381,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let snapshot = task_info_to_snapshot(
@@ -415,6 +421,7 @@ mod tests {
             tags: vec!["model".to_string(), "important".to_string()],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let snapshot = task_info_to_snapshot(
@@ -434,5 +441,66 @@ mod tests {
 
         let recovered = snapshot_to_task_info(&snapshot);
         assert_eq!(recovered.tags, task.tags);
+    }
+
+    #[test]
+    fn test_snapshot_to_task_info_preserves_mirror_urls() {
+        let mut snapshot = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "task-mirrors".to_string(),
+            url: "https://example.com/file.bin".to_string(),
+            save_path: "/downloads/file.bin".to_string(),
+            file_name: "file.bin".to_string(),
+            file_size: Some(1000),
+            downloaded: 250,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 250,
+            status: DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(1000),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ]),
+        };
+
+        let task = snapshot_to_task_info(&snapshot);
+        assert_eq!(
+            task.mirror_urls,
+            Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ])
+        );
+
+        // 往返:TaskInfo -> Snapshot 同样保留
+        let back = task_info_to_snapshot(
+            &task,
+            snapshot.save_path.clone(),
+            snapshot.fragment_size,
+            snapshot.completed_fragments.clone(),
+            snapshot.partial_fragments.clone(),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(back.mirror_urls, task.mirror_urls);
+
+        // 缺字段默认 None
+        snapshot.mirror_urls = None;
+        let task_none = snapshot_to_task_info(&snapshot);
+        assert!(task_none.mirror_urls.is_none());
     }
 }

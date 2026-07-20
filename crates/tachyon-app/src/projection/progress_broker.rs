@@ -446,6 +446,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
         repository.insert(
@@ -469,6 +470,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -518,6 +520,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -576,6 +579,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -616,6 +620,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -682,6 +687,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -738,6 +744,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 
@@ -761,6 +768,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 
@@ -893,6 +901,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -949,6 +958,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
         let broker = ProgressBroker::new_no_aggregator(repository.clone());
@@ -1040,6 +1050,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
         let broker = ProgressBroker::new_no_aggregator(repository.clone());
@@ -1102,6 +1113,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
         let broker = ProgressBroker::new_no_aggregator(repository.clone());

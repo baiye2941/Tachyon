@@ -399,6 +399,8 @@ impl TaskService {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            // 持久化镜像列表,供 restart_download / 快照恢复多源续传
+            mirror_urls: mirror_urls.map(|v| v.to_vec()),
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性

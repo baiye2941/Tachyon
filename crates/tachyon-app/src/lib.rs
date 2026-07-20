@@ -256,6 +256,7 @@ async fn any_fragment() {
         tags: vec![],
         hf_meta: None,
         display_order: 0,
+        mirror_urls: None,
     };
     state.domain.task_repository.insert(task_id.clone(), task);
 
@@ -309,6 +310,7 @@ async fn max_concurrent() {
                     tags: vec![],
                     hf_meta: None,
                     display_order: 0,
+                    mirror_urls: None,
                 },
             );
         }

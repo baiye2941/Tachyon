@@ -1200,10 +1200,10 @@ pub(crate) async fn resume_task_inner(state: &AppState, task_id: String) -> Resu
 ///
 /// 用于 resume 无运行 task_fn 的任务(应用启动恢复的任务、task_fn 已退出的任务)。
 ///
-/// 参数重建策略(TaskInfo/Snapshot 均不存 download_dir/mirror_urls/download_config):
+/// 参数重建策略:
 /// - `download_dir`: 从 `save_path` 的父目录推导。
 /// - `download_config`: 用当前 `AppConfig` 经 `build_download_config` 重建。
-/// - `mirror_urls`: 快照未存储,无法恢复,故传 `None`(单源续传;原镜像配置丢失是已知限制)。
+/// - `mirror_urls`: 从 TaskInfo(快照持久化)读取,保留创建时配置的多源。
 /// - `preferred_file_name`: 传 `None`,probe 会复用磁盘上既有文件名。
 async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppError> {
     let task = state
@@ -1226,6 +1226,7 @@ async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppErro
         build_download_config(&cfg, &download_dir)
     };
 
+    let mirrors = mirrors_for_restart(&task);
     let state_arc = Arc::new(state.clone_for_task());
     state
         .runtime
@@ -1236,12 +1237,19 @@ async fn restart_download(state: &AppState, task_id: &str) -> Result<(), AppErro
             task.url,
             download_dir,
             download_config,
-            None, // mirror_urls 无法从快照恢复,单源续传
+            mirrors,
             None, // preferred_file_name 无需覆盖,probe 复用既有文件名
         )
         .await;
     tracing::info!(task_id = %task_id, "重启 task_fn 激活断点续传");
     Ok(())
+}
+
+/// 从 TaskInfo 提取 restart 应使用的镜像列表。
+///
+/// 纯函数,便于单测验证 restart 不再硬编码 `None`。
+pub(crate) fn mirrors_for_restart(task: &TaskInfo) -> Option<Vec<String>> {
+    task.mirror_urls.clone()
 }
 
 pub(crate) async fn cancel_task_inner(state: &AppState, task_id: String) -> Result<(), AppError> {
@@ -1678,6 +1686,7 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
 
@@ -3388,9 +3397,48 @@ mod tests {
                 tags: vec![],
                 hf_meta: None,
                 display_order: 0,
+                mirror_urls: None,
             },
         );
         task_id
+    }
+
+    #[test]
+    fn test_mirrors_for_restart_uses_task_mirror_urls() {
+        // restart_download 必须传 task.mirror_urls,不再硬编码 None
+        let mut task = TaskInfo {
+            id: "t-mirror".to_string(),
+            url: "https://primary.example.com/file.bin".to_string(),
+            file_name: "file.bin".to_string(),
+            file_size: Some(100),
+            downloaded: 0,
+            speed: 0,
+            status: DownloadState::Paused,
+            progress: 0.0,
+            fragments_total: 1,
+            fragments_done: 0,
+            active_concurrency: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            save_path: "/downloads/file.bin".to_string(),
+            error_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ]),
+        };
+        assert_eq!(
+            mirrors_for_restart(&task),
+            Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ])
+        );
+        task.mirror_urls = None;
+        assert!(mirrors_for_restart(&task).is_none());
     }
 
     #[tokio::test]
@@ -3914,6 +3962,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 
