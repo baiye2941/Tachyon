@@ -5,7 +5,10 @@
 //! - `validate_resolved_ip` — DNS 解析后 IP 校验(防 DNS Rebinding)
 //! - `validate_redirect` — 重定向目标逐跳校验
 //! - `reject_forbidden_ip` — IP 地址黑名单校验
-//! - `redact_url_for_log` — URL 日志脱敏
+//! - `redact_url_for_log` — URL 日志脱敏(magnet 保留 info hash)
+//! - `url_for_display` — UI 展示用 URL(magnet 等无 host scheme 原文放行)
+//! - `url_identity_key` — URL 身份键(任务去重,magnet 按 info hash)
+//! - `magnet_info_hash` — magnet URI info hash 提取
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -234,7 +237,50 @@ fn reject_forbidden_ipv6(ip: Ipv6Addr) -> DownloadResult<()> {
     Ok(())
 }
 
+/// 从 magnet URI 提取 info hash(xt=urn:btih:<hash>),统一小写。
+///
+/// info hash 是公开内容标识(与 dn=/tr= 等可能含敏感信息的参数不同),
+/// 可用于日志标识与任务去重。非 magnet 链接或缺失 xt 参数时返回 None。
+pub fn magnet_info_hash(url: &str) -> Option<String> {
+    const MAGNET_PREFIX: &str = "magnet:?";
+    const URN_BTIH_PREFIX: &str = "urn:btih:";
+    let query = url
+        .get(..MAGNET_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(MAGNET_PREFIX))
+        .and_then(|_| url.get(MAGNET_PREFIX.len()..))?;
+    for param in query.split('&') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("xt") {
+            continue;
+        }
+        if let Some(hash) = value
+            .get(..URN_BTIH_PREFIX.len())
+            .filter(|urn| urn.eq_ignore_ascii_case(URN_BTIH_PREFIX))
+            .and_then(|_| value.get(URN_BTIH_PREFIX.len()..))
+        {
+            let hash = hash.trim();
+            if !hash.is_empty() {
+                return Some(hash.to_lowercase());
+            }
+        }
+    }
+    None
+}
+
 pub fn redact_url_for_log(url: &str) -> String {
+    // magnet 是 cannot-be-a-base scheme,host_str() 恒为 None,
+    // 不能走通用 host 分支;info hash 是公开标识,保留供日志排查
+    if let Some(hash) = magnet_info_hash(url) {
+        return format!("magnet:xt=urn:btih:{hash}");
+    }
+    if url
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+    {
+        return "magnet:<no-info-hash>".to_string();
+    }
     let Ok(parsed) = Url::parse(url) else {
         return "<invalid-url>".to_string();
     };
@@ -252,6 +298,37 @@ pub fn redact_url_for_log(url: &str) -> String {
     } else {
         format!("{}://{}/{}", parsed.scheme(), host, basename)
     }
+}
+
+/// UI 展示用 URL:magnet/ed2k 等无 host 的内容寻址 scheme 原文放行
+/// (无凭据概念,且前端需要可复制的真实链接);http(s) 仍剥 query/凭据(SEC-008)。
+pub fn url_for_display(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else {
+        // 无法解析时原样返回,不伪造占位符污染用户剪贴板
+        return url.to_string();
+    };
+    if parsed.host_str().is_none() {
+        return url.to_string();
+    }
+    redact_url_for_log(url)
+}
+
+/// URL 身份键(任务去重比较用):
+/// - magnet 按 info hash —— 同一资源的不同 tracker/dn 参数判同,
+///   不同资源不再因统一脱敏成占位符而误判重复;
+/// - http(s) 按 scheme://host/basename —— 忽略签名 query 差异;
+/// - 其余按原文。
+pub fn url_identity_key(url: &str) -> String {
+    if let Some(hash) = magnet_info_hash(url) {
+        return format!("magnet:xt=urn:btih:{hash}");
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return url.to_string();
+    };
+    if parsed.host_str().is_none() {
+        return url.to_string();
+    }
+    redact_url_for_log(url)
 }
 
 #[cfg(test)]
@@ -526,5 +603,186 @@ mod tests {
         let result = validate_public_http_url(&private);
         assert!(result.is_err(), "私有 IP 字面量应被拒绝");
         assert!(result.unwrap_err().to_string().contains("受限"));
+    }
+
+    // -----------------------------------------------------------------------
+    // magnet_info_hash: info hash 提取
+    // -----------------------------------------------------------------------
+
+    /// base32 大写 info hash(用户实际链接)应被提取并统一小写。
+    #[test]
+    fn magnet_info_hash_extracts_base32_hash_lowercased() {
+        let url = "magnet:?xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&dn=example";
+        assert_eq!(
+            magnet_info_hash(url),
+            Some("6gjxeq5sgff7bwmql74vtoaxzc36xsjg".to_string())
+        );
+    }
+
+    /// 40 位 hex 大写 info hash 应被提取并统一小写。
+    #[test]
+    fn magnet_info_hash_extracts_hex_hash_lowercased() {
+        let url = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567";
+        assert_eq!(
+            magnet_info_hash(url),
+            Some("0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    /// scheme、参数名、URN 前缀的大小写均不敏感。
+    #[test]
+    fn magnet_info_hash_ignores_scheme_and_param_name_case() {
+        let url = "MAGNET:?Xt=URN:BTIH:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG";
+        assert_eq!(
+            magnet_info_hash(url),
+            Some("6gjxeq5sgff7bwmql74vtoaxzc36xsjg".to_string())
+        );
+    }
+
+    /// xt 不在首位、与 dn=/tr= 及无值参数混杂时仍能正确定位。
+    #[test]
+    fn magnet_info_hash_finds_xt_among_other_params() {
+        let url = "magnet:?dn=Some%20File&flag&tr=udp://tracker.example:1337/announce&xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&tr=udp://tracker2.example:6969";
+        assert_eq!(
+            magnet_info_hash(url),
+            Some("6gjxeq5sgff7bwmql74vtoaxzc36xsjg".to_string())
+        );
+    }
+
+    #[test]
+    fn magnet_info_hash_returns_none_without_xt() {
+        assert!(
+            magnet_info_hash("magnet:?dn=only-name").is_none(),
+            "缺 xt 参数应返回 None"
+        );
+    }
+
+    /// xt 指向非 btih 的 URN(如 sha1)不是 info hash。
+    #[test]
+    fn magnet_info_hash_returns_none_for_non_btih_xt() {
+        assert!(
+            magnet_info_hash("magnet:?xt=urn:sha1:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG").is_none(),
+            "非 btih 的 xt 应返回 None"
+        );
+    }
+
+    #[test]
+    fn magnet_info_hash_returns_none_for_non_magnet_url() {
+        assert!(
+            magnet_info_hash("https://example.com/file.bin").is_none(),
+            "非 magnet 链接应返回 None"
+        );
+    }
+
+    /// 空 hash(含纯空白)不应被接受。
+    #[test]
+    fn magnet_info_hash_returns_none_for_empty_hash() {
+        assert!(
+            magnet_info_hash("magnet:?xt=urn:btih:").is_none(),
+            "空 hash 应返回 None"
+        );
+        assert!(
+            magnet_info_hash("magnet:?xt=urn:btih:   ").is_none(),
+            "纯空白 hash 应返回 None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // redact_url_for_log: magnet 分支
+    // -----------------------------------------------------------------------
+
+    /// 完整 magnet 脱敏后仅保留小写 info hash,dn=/tr= 内容不得进入日志。
+    #[test]
+    fn redacts_magnet_to_info_hash_only() {
+        let redacted = redact_url_for_log(
+            "magnet:?xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&dn=Secret%20Name&tr=udp://tracker.example:1337/announce",
+        );
+        assert_eq!(
+            redacted,
+            "magnet:xt=urn:btih:6gjxeq5sgff7bwmql74vtoaxzc36xsjg"
+        );
+        assert!(!redacted.contains("Secret"), "dn 内容不得出现在日志中");
+        assert!(
+            !redacted.contains("tracker.example"),
+            "tr 内容不得出现在日志中"
+        );
+    }
+
+    /// 无 xt 的 magnet 无法提取 info hash,统一脱敏为占位符。
+    #[test]
+    fn redacts_magnet_without_xt_to_placeholder() {
+        assert_eq!(redact_url_for_log("magnet:?dn=x"), "magnet:<no-info-hash>");
+    }
+
+    // -----------------------------------------------------------------------
+    // url_for_display: UI 展示
+    // -----------------------------------------------------------------------
+
+    /// magnet 无 host 与凭据概念,前端需要可复制的完整链接,原文放行。
+    #[test]
+    fn url_for_display_passes_magnet_through_verbatim() {
+        let magnet = "magnet:?xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&dn=Some%20File&tr=udp://tracker.example:1337/announce";
+        assert_eq!(url_for_display(magnet), magnet);
+    }
+
+    /// http(s) 仍剥 query/fragment/凭据(SEC-008)。
+    #[test]
+    fn url_for_display_strips_http_query_and_credentials() {
+        let display = url_for_display(
+            "https://user:secret@example.com/path/model.bin?token=abc&signature=def#frag",
+        );
+        assert_eq!(display, "https://example.com/model.bin");
+        assert!(!display.contains("abc"));
+        assert!(!display.contains("secret"));
+    }
+
+    /// 无法解析的字符串原样返回,不伪造占位符污染用户剪贴板。
+    #[test]
+    fn url_for_display_returns_unparseable_input_verbatim() {
+        assert_eq!(url_for_display("not a url"), "not a url");
+    }
+
+    // -----------------------------------------------------------------------
+    // url_identity_key: 任务去重身份键
+    // -----------------------------------------------------------------------
+
+    /// 同一资源(info hash 相同)的 magnet,tr=/dn= 不同、hash 大小写不同仍判同。
+    #[test]
+    fn url_identity_key_groups_magnets_by_info_hash() {
+        let a = "magnet:?xt=urn:btih:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG&dn=File%20A&tr=udp://tracker1.example:1337/announce";
+        let b = "magnet:?dn=File%20B&tr=udp://tracker2.example:6969/announce&xt=urn:btih:6gjxeq5sgff7bwmql74vtoaxzc36xsjg";
+        assert_eq!(url_identity_key(a), url_identity_key(b));
+
+        let c = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=File%20A";
+        assert_ne!(url_identity_key(a), url_identity_key(c));
+    }
+
+    /// http(s) 按 scheme://host/basename 判同,忽略签名 query 差异。
+    #[test]
+    fn url_identity_key_ignores_http_query_differences() {
+        let a = "https://example.com/path/model.bin?token=abc";
+        let b = "https://example.com/path/model.bin?token=xyz&signature=123";
+        assert_eq!(url_identity_key(a), url_identity_key(b));
+
+        let c = "https://example.com/path/other.bin?token=abc";
+        assert_ne!(url_identity_key(a), url_identity_key(c));
+    }
+
+    /// 无法解析的字符串按原文作为身份键。
+    #[test]
+    fn url_identity_key_returns_unparseable_input_verbatim() {
+        assert_eq!(url_identity_key("not a url"), "not a url");
+        // 不同的不可解析字符串不再塌缩为同一占位符而误判重复
+        assert_ne!(
+            url_identity_key("not a url"),
+            url_identity_key("also not a url")
+        );
+    }
+
+    /// 无 xt 的 magnet 无 info hash 可提取,host_str() 为 None,按原文返回。
+    #[test]
+    fn url_identity_key_returns_magnet_without_xt_verbatim() {
+        let url = "magnet:?dn=only-name";
+        assert_eq!(url_identity_key(url), url);
     }
 }
