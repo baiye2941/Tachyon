@@ -231,7 +231,7 @@ cd frontend && bun run build
 | 路径授权非 openat2 | `validate_save_path` 拒绝中间 symlink/reparse 并在 open 前复查；**不**声称 `openat2(RESOLVE_BENEATH)` 句柄级路径封印，validate→open 仍存在 TOCTOU 残余 |
 | ConnectionPool 非 TCP 池 | 历史名 `ConnectionPool` 实为并发许可器；TCP/TLS/H2 复用由 reqwest Client / `HttpClientRegistry` |
 | quick-xml 间接漏洞 | CI 暂 ignore RUSTSEC-2026-0194/0195（librqbit-upnp + Tauri/plist 双链）；目标 quick-xml ≥0.41 后移除 |
-| 配置热更新字段语义不统一 | `rate_limit`/`ConnectionPool`/`BufferPool`/`BtSession(magnet|download_dir)` 即时或新任务生效；剪贴板 `enable_watch` **即时**（轮询循环启动后按配置门禁）；`poll_interval_ms` 间隔热改仍为非目标；任务级 `retry_count` 当前恒 0（未聚合引擎 attempt） |
+| 配置热更新字段语义不统一 | `rate_limit`/`ConnectionPool`/`BufferPool`/`BtSession(magnet|download_dir)` 即时或新任务生效；剪贴板 `enable_watch` **即时**（轮询循环启动后按配置门禁）；`poll_interval_ms` 间隔热改仍为非目标；任务级 `retry_count` 为引擎分片/整块可重试失败累计次数 |
 
 ---
 

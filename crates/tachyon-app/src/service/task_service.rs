@@ -66,6 +66,23 @@ fn normalize_single_tag(tag: &str) -> String {
     trimmed.chars().take(MAX_TAG_LENGTH).collect::<String>()
 }
 
+/// 归一化镜像 URL 列表:空输入/仅空白项 → None;否则过滤空白并 to_vec。
+///
+/// 避免 create_task 把 `Some([])` 写入 TaskInfo/快照,前端与磁盘均不存空数组。
+fn normalize_mirror_urls(mirror_urls: Option<&[String]>) -> Option<Vec<String>> {
+    let mirrors = mirror_urls?;
+    let cleaned: Vec<String> = mirrors
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 /// 任务操作撤销记录
 ///
 /// 保存在内存中,无需持久化。超过 [`UNDO_WINDOW`] 后撤销请求返回错误。
@@ -399,6 +416,9 @@ impl TaskService {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            // 持久化镜像列表,供 restart_download / 快照恢复多源续传。
+            // 空切片/全空字符串归一为 None,避免快照写空数组。
+            mirror_urls: normalize_mirror_urls(mirror_urls),
         };
 
         // 使用互斥锁保证 check-and-insert 的原子性
@@ -475,7 +495,7 @@ impl TaskService {
             url: url.to_string(),
             download_dir: download_dir_str.to_string(),
             download_config,
-            mirror_urls: mirror_urls.map(|v| v.to_vec()),
+            mirror_urls: normalize_mirror_urls(mirror_urls),
             preferred_file_name,
             auto_start,
         })
@@ -982,16 +1002,10 @@ impl TaskService {
                 true,
             );
             if let Some(existing) = existing {
-                snapshot.fragment_size = existing.fragment_size;
-                snapshot.completed_fragments = existing.completed_fragments;
-                snapshot.partial_fragments = existing.partial_fragments;
-                snapshot.etag = existing.etag;
-                snapshot.last_modified = existing.last_modified;
-                snapshot.supports_range = existing.supports_range;
-                snapshot.retry_count = existing.retry_count;
+                // 内存 TaskInfo.retry_count 权威；不合并磁盘 retry_count
+                crate::task_store::merge_disk_progress_into_snapshot(&mut snapshot, &existing);
+                // service 路径默认保留磁盘 fail_reason；patch 可再覆盖
                 snapshot.fail_reason = existing.fail_reason;
-                // 审计 H-05:full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序
-                snapshot.revision = existing.revision;
             }
             patch(&mut snapshot);
             // task_store 底层为 FileStore 同步 I/O(含 fsync),包裹 spawn_blocking 避免阻塞 tokio。

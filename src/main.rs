@@ -1,13 +1,17 @@
 //! Tachyon 磁力链接下载测试工具
 //!
 //! 用于验证真实 BT 网络下的磁力链接下载路径。
-//! 用法: cargo run --bin tachyon -- <magnet_url> <output_dir>
+//! 用法: cargo run --bin tachyon-cli -- `<magnet_url>` `<output_dir>` `[--socks-proxy <proxy_url>]`
+
+mod cli_proxy;
 
 use std::sync::Arc;
 use tachyon_core::config::DownloadConfig;
 use tachyon_engine::bt_session::BtSession;
 use tachyon_engine::downloader::DownloadTask;
 use tachyon_scheduler::AdaptiveDownloadScheduler;
+
+use cli_proxy::{parse_cli_args, resolve_socks_proxy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,19 +23,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("用法: {} <magnet_url> <output_dir>", args[0]);
-        std::process::exit(1);
-    }
-    let magnet_url = &args[1];
-    let output_dir = std::path::PathBuf::from(&args[2]);
+    let (magnet_url, out_dir, cli_proxy) = match parse_cli_args(&args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+    let output_dir = std::path::PathBuf::from(&out_dir);
+    let socks_proxy = resolve_socks_proxy(cli_proxy.as_deref(), &|k| std::env::var(k).ok());
 
     println!("磁力链接: {magnet_url}");
     println!("输出目录: {}", output_dir.display());
+    match &socks_proxy {
+        Some(p) => println!("SOCKS 代理: {p}"),
+        None => println!("SOCKS 代理: (无)"),
+    }
 
-    // 创建 BT Session(配置 SOCKS5 代理,BT tracker+peer 走代理)
+    // 创建 BT Session：代理仅来自 CLI/环境变量，默认无代理
     let bt_config = tachyon_core::config::MagnetConfig {
-        socks_proxy_url: Some("socks5://127.0.0.1:7897".to_string()),
+        socks_proxy_url: socks_proxy,
         metadata_timeout_secs: 180,
         enable_dht: true,
         disable_dht_when_socks: false,

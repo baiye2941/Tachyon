@@ -141,6 +141,7 @@ pub fn snapshot_to_task_info(snapshot: &TaskSnapshot) -> TaskInfo {
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         display_order: snapshot.display_order,
+        mirror_urls: snapshot.mirror_urls.clone(),
     }
 }
 
@@ -193,7 +194,28 @@ pub fn task_info_to_snapshot(
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .filter(|v| !v.is_null()),
         display_order: task.display_order,
+        mirror_urls: task.mirror_urls.clone(),
     }
+}
+
+/// 将磁盘快照中的续传/校验字段合并进内存 TaskInfo 构建的 snapshot。
+///
+/// **不覆盖** `retry_count`：内存 `TaskInfo.retry_count` 是权威源
+///（由 chunk_reader 消费 `FragmentProgress::Retry` 累加，并可能已 checkpoint）；
+/// 若用磁盘旧值覆盖，会在 `persist_task_snapshot` / `persist_task_state` 时
+/// 把运行期累加的重试次数抹回落盘前的值。
+///
+/// 合并字段：fragment_size、completed/partial_fragments、etag、last_modified、
+/// supports_range、revision。`fail_reason` 由调用方单独处理（两条路径语义不同）。
+pub fn merge_disk_progress_into_snapshot(snapshot: &mut TaskSnapshot, existing: &TaskSnapshot) {
+    snapshot.fragment_size = existing.fragment_size;
+    snapshot.completed_fragments = existing.completed_fragments.clone();
+    snapshot.partial_fragments = existing.partial_fragments.clone();
+    snapshot.etag = existing.etag.clone();
+    snapshot.last_modified = existing.last_modified.clone();
+    snapshot.supports_range = existing.supports_range;
+    // 审计 H-05: full-save 必须携带磁盘 revision,否则 CAS 会把 0 当旧写拒绝/错序
+    snapshot.revision = existing.revision;
 }
 
 #[cfg(test)]
@@ -227,6 +249,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let task = snapshot_to_task_info(&snapshot);
@@ -264,12 +287,153 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         store.save_snapshot(&snapshot).unwrap();
         let loaded = store.load_recoverable().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "task-1");
+    }
+
+    /// 内存 TaskInfo.retry_count 在与磁盘快照合并时保持权威，不被 existing 覆盖。
+    #[test]
+    fn test_merge_disk_progress_preserves_memory_retry_count() {
+        let mut from_memory = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "merge-retry".to_string(),
+            url: "https://example.com/m.bin".to_string(),
+            save_path: "/downloads/m.bin".to_string(),
+            file_name: "m.bin".to_string(),
+            file_size: Some(1024),
+            downloaded: 512,
+            completed_fragments: vec![],
+            partial_fragments: HashMap::new(),
+            total_fragments: 2,
+            fragment_size: 0,
+            status: DownloadState::Downloading,
+            etag: None,
+            last_modified: None,
+            content_length: Some(1024),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 3, // 内存权威：运行期已累加
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+        let existing = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 5,
+            id: "merge-retry".to_string(),
+            url: "https://example.com/m.bin".to_string(),
+            save_path: "/downloads/m.bin".to_string(),
+            file_name: "m.bin".to_string(),
+            file_size: Some(1024),
+            downloaded: 256,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::from([(1, 128)]),
+            total_fragments: 2,
+            fragment_size: 512,
+            status: DownloadState::Paused,
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Wed, 01 Jan 2020 00:00:00 GMT".to_string()),
+            content_length: Some(1024),
+            supports_range: false,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:00Z".to_string(),
+            fail_reason: Some("old".to_string()),
+            retry_count: 1, // 磁盘旧值，不得覆盖内存 3
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+
+        merge_disk_progress_into_snapshot(&mut from_memory, &existing);
+
+        assert_eq!(
+            from_memory.retry_count, 3,
+            "合并后 retry_count 必须保留内存权威值 3，不能被磁盘 1 覆盖"
+        );
+        assert_eq!(from_memory.fragment_size, 512);
+        assert_eq!(from_memory.completed_fragments, vec![0]);
+        assert_eq!(from_memory.partial_fragments.get(&1), Some(&128));
+        assert_eq!(from_memory.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(
+            from_memory.last_modified.as_deref(),
+            Some("Wed, 01 Jan 2020 00:00:00 GMT")
+        );
+        assert!(!from_memory.supports_range);
+        assert_eq!(from_memory.revision, 5);
+        // fail_reason 不由 merge helper 处理
+        assert_eq!(from_memory.fail_reason, None);
+    }
+
+    /// 非零 retry_count 经 snapshot ↔ TaskInfo 往返保持(A-13 聚合后真实语义)。
+    #[test]
+    fn test_snapshot_round_trip_preserves_nonzero_retry_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(temp.path()).unwrap();
+        let snapshot = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "retry-task".to_string(),
+            url: "https://example.com/retry.bin".to_string(),
+            save_path: "/downloads/retry.bin".to_string(),
+            file_name: "retry.bin".to_string(),
+            file_size: Some(2048),
+            downloaded: 512,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 512,
+            status: DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(2048),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 7,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+
+        store.save_snapshot(&snapshot).unwrap();
+        let loaded = store
+            .load_snapshot("retry-task")
+            .unwrap()
+            .expect("快照应存在");
+        assert_eq!(loaded.retry_count, 7, "快照往返应保留非零 retry_count");
+
+        let task = snapshot_to_task_info(&loaded);
+        assert_eq!(
+            task.retry_count, 7,
+            "snapshot→TaskInfo 应保留非零 retry_count"
+        );
+
+        let back = task_info_to_snapshot(
+            &task,
+            task.save_path.clone(),
+            loaded.fragment_size,
+            loaded.completed_fragments.clone(),
+            loaded.partial_fragments.clone(),
+            loaded.etag.clone(),
+            loaded.last_modified.clone(),
+            loaded.supports_range,
+        );
+        assert_eq!(
+            back.retry_count, 7,
+            "TaskInfo→snapshot 应保留非零 retry_count"
+        );
     }
 
     #[test]
@@ -304,6 +468,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
         store.save_snapshot(&good).unwrap();
 
@@ -376,6 +541,7 @@ mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let snapshot = task_info_to_snapshot(
@@ -415,6 +581,7 @@ mod tests {
             tags: vec!["model".to_string(), "important".to_string()],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
 
         let snapshot = task_info_to_snapshot(
@@ -434,5 +601,66 @@ mod tests {
 
         let recovered = snapshot_to_task_info(&snapshot);
         assert_eq!(recovered.tags, task.tags);
+    }
+
+    #[test]
+    fn test_snapshot_to_task_info_preserves_mirror_urls() {
+        let mut snapshot = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "task-mirrors".to_string(),
+            url: "https://example.com/file.bin".to_string(),
+            save_path: "/downloads/file.bin".to_string(),
+            file_name: "file.bin".to_string(),
+            file_size: Some(1000),
+            downloaded: 250,
+            completed_fragments: vec![0],
+            partial_fragments: HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 250,
+            status: DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(1000),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:01Z".to_string(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ]),
+        };
+
+        let task = snapshot_to_task_info(&snapshot);
+        assert_eq!(
+            task.mirror_urls,
+            Some(vec![
+                "https://m1.example.com/file.bin".to_string(),
+                "https://m2.example.com/file.bin".to_string(),
+            ])
+        );
+
+        // 往返:TaskInfo -> Snapshot 同样保留
+        let back = task_info_to_snapshot(
+            &task,
+            snapshot.save_path.clone(),
+            snapshot.fragment_size,
+            snapshot.completed_fragments.clone(),
+            snapshot.partial_fragments.clone(),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(back.mirror_urls, task.mirror_urls);
+
+        // 缺字段默认 None
+        snapshot.mirror_urls = None;
+        let task_none = snapshot_to_task_info(&snapshot);
+        assert!(task_none.mirror_urls.is_none());
     }
 }

@@ -148,8 +148,8 @@ pub struct TaskInfo {
     pub error_reason: Option<String>,
     /// 任务级重试计数。
     ///
-    /// 审计 A-13 诚实：当前恒为 0，未接入引擎分片/整流 attempt 聚合；
-    /// 仅在快照与 IPC 间原样复制，前端诊断「已重试 N 次」在 N=0 时不展示。
+    /// 累计引擎分片/整块路径的可重试失败次数(每次 `FragmentProgress::Retry` +1)。
+    /// 经快照持久化与 IPC 下发；前端诊断「已重试 N 次」在 N>0 时展示。
     #[serde(default)]
     pub retry_count: u32,
     /// 用户自定义任务标签,用于前端分组/过滤。
@@ -161,6 +161,15 @@ pub struct TaskInfo {
     /// 任务在列表中的显示顺序，越小越靠前。
     #[serde(default)]
     pub display_order: i64,
+    /// 创建任务时配置的镜像 URL 列表。
+    /// 旧任务/旧快照无此字段时默认 None;restart_download 据此恢复多源。
+    /// 内存/快照保留原始 URL;序列化到前端时与主 url 对齐脱敏(SEC-008)。
+    #[serde(
+        default,
+        skip_serializing_if = "mirror_urls_is_empty",
+        serialize_with = "serialize_mirror_urls_for_display"
+    )]
+    pub mirror_urls: Option<Vec<String>>,
 }
 
 /// 序列化 URL 时转换为显示形式(tachyon_core::url_for_display):
@@ -169,6 +178,30 @@ pub struct TaskInfo {
 /// 无法解析时原文返回,不伪造占位符污染剪贴板。
 fn serialize_url_for_display<S: serde::Serializer>(url: &str, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&tachyon_core::url_for_display(url))
+}
+
+/// `mirror_urls` 为空或 None 时不写入前端 JSON。
+fn mirror_urls_is_empty(urls: &Option<Vec<String>>) -> bool {
+    urls.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// 序列化镜像 URL 列表时逐项 `url_for_display`(SEC-008):
+/// 内存与快照仍为原始 URL,仅 IPC/展示边界脱敏。
+fn serialize_mirror_urls_for_display<S: serde::Serializer>(
+    urls: &Option<Vec<String>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match urls {
+        None => s.serialize_none(),
+        Some(list) => {
+            use serde::ser::SerializeSeq;
+            let mut seq = s.serialize_seq(Some(list.len()))?;
+            for url in list {
+                seq.serialize_element(&tachyon_core::url_for_display(url))?;
+            }
+            seq.end()
+        }
+    }
 }
 
 /// 序列化保存路径时剥除 Windows verbatim 前缀,前端复制/显示得到常规路径
@@ -322,6 +355,10 @@ pub struct TaskProgress {
     /// 快照式:前端无状态、幂等、丢包自愈。空时 skip 以省带宽。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fragment_bytes: Vec<FragmentByteProgress>,
+    /// 任务级重试计数(与 TaskInfo.retry_count 同源)。
+    /// 进度事件路径同步,避免前端仅靠 get_task_list 才能看到「已重试 N 次」。
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 pub(crate) type ProgressEvent = HashMap<String, TaskProgress>;
@@ -794,14 +831,8 @@ pub(crate) async fn persist_task_snapshot(
             true,
         );
         if let Some(existing) = existing {
-            snapshot.fragment_size = existing.fragment_size;
-            snapshot.completed_fragments = existing.completed_fragments;
-            snapshot.partial_fragments = existing.partial_fragments;
-            snapshot.etag = existing.etag;
-            snapshot.last_modified = existing.last_modified;
-            snapshot.supports_range = existing.supports_range;
-            snapshot.retry_count = existing.retry_count;
-            snapshot.revision = existing.revision;
+            // 内存 TaskInfo.retry_count 权威；不合并磁盘 retry_count
+            crate::task_store::merge_disk_progress_into_snapshot(&mut snapshot, &existing);
         }
         snapshot.fail_reason = fail_reason;
         // task_store 底层为 FileStore 同步 I/O(含 fsync),用 fire-and-forget
@@ -1062,6 +1093,7 @@ pub(crate) mod tests {
             tags: vec!["model".to_string()],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();
@@ -1117,6 +1149,7 @@ pub(crate) mod tests {
             tags: vec![],
             hf_meta: None,
             display_order: 0,
+            mirror_urls: None,
         }
     }
 
@@ -1157,6 +1190,56 @@ pub(crate) mod tests {
         assert!(!json.contains("token=abc"));
     }
 
+    #[test]
+    fn test_task_info_mirror_urls_serialized_stripped() {
+        // SEC-008: mirror_urls 与主 url 对齐,序列化到前端时剥 query/凭据;
+        // 内存与快照仍保留原始值供 restart_download 续传。
+        let mut task = make_task_info_for_display(
+            "https://cdn.example.com/path/f.bin?token=main-secret",
+            r"D:\dl\f.bin",
+        );
+        task.mirror_urls = Some(vec![
+            "https://mirror1.example.com/path/f.bin?token=mirror-secret-1".to_string(),
+            "https://user:pass@mirror2.example.com/path/f.bin?sig=xyz#frag".to_string(),
+        ]);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("mirror-secret-1"),
+            "mirror query token 不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("main-secret"),
+            "主 url query 不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("user:pass") && !json.contains(":pass@"),
+            "mirror 凭据不得泄漏到前端: {json}"
+        );
+        assert!(
+            !json.contains("sig=xyz"),
+            "mirror query 不得泄漏到前端: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mirrors = value["mirrorUrls"]
+            .as_array()
+            .expect("mirrorUrls 应出现在 JSON 中");
+        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors[0], "https://mirror1.example.com/f.bin");
+        assert_eq!(mirrors[1], "https://mirror2.example.com/f.bin");
+    }
+
+    #[test]
+    fn test_task_info_empty_mirror_urls_skipped() {
+        // 空镜像列表不应出现在前端 JSON(与 skip_serializing_if 一致)
+        let mut task = make_task_info_for_display("https://example.com/f.bin", r"D:\dl\f.bin");
+        task.mirror_urls = Some(vec![]);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("mirrorUrls"),
+            "空 mirror_urls 应 skip 序列化: {json}"
+        );
+    }
+
     /// 构造测试用 TaskProgress,减少字面量样板
     fn make_progress(error_reason: Option<&str>) -> TaskProgress {
         TaskProgress {
@@ -1173,7 +1256,25 @@ pub(crate) mod tests {
             started_delta: vec![],
             error_reason: error_reason.map(String::from),
             fragment_bytes: vec![],
+            retry_count: 0,
         }
+    }
+
+    #[test]
+    fn test_task_progress_retry_count_serializes_and_defaults() {
+        let mut tp = make_progress(None);
+        tp.retry_count = 5;
+        let json = serde_json::to_string(&tp).unwrap();
+        assert!(
+            json.contains(r#""retryCount":5"#),
+            "retry_count 应以 camelCase 序列化,实际: {json}"
+        );
+        let decoded: TaskProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.retry_count, 5);
+        // 旧版 JSON 无字段 → default 0
+        let legacy = r#"{"id":"t1","progress":0.0,"speed":0,"downloaded":0,"status":"cancelled","fragmentsDone":0}"#;
+        let decoded: TaskProgress = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.retry_count, 0);
     }
 
     #[test]
@@ -1837,6 +1938,7 @@ mod fragment_bytes_tests {
             started_delta: vec![],
             error_reason: None,
             fragment_bytes: vec![],
+            retry_count: 0,
         };
         let json = serde_json::to_string(&tp).unwrap();
         // skip_serializing_if = Vec::is_empty,空时不应出现在 JSON
@@ -1865,6 +1967,7 @@ mod fragment_bytes_tests {
                 index: 1,
                 downloaded: 256,
             }],
+            retry_count: 0,
         };
         let json = serde_json::to_string(&tp).unwrap();
         assert!(

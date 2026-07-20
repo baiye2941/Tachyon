@@ -527,8 +527,8 @@ pub struct DownloadStateChange {
 /// 分片进度事件
 ///
 /// 通过 `progress_tx` 通道发送给上层(tachyon-app)。
-/// 三变体:控制帧(PlanComplete,一次性可靠)、开始帧(Started,低频可丢)、
-/// 数据帧(Chunk,高频可丢)。
+/// 四变体:控制帧(PlanComplete,一次性可靠)、开始帧(Started,低频可丢)、
+/// 数据帧(Chunk,高频可丢)、重试帧(Retry,低频可丢)。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FragmentProgress {
@@ -557,6 +557,12 @@ pub enum FragmentProgress {
     /// 用 `try_send`(可丢):丢失仅导致该分片短暂不在 downloading_set,
     /// 不影响正确性。重试时重复发送,app 层 `mark_downloading` 幂等吸收。
     Started { fragment_index: u32 },
+    /// 分片可重试失败:即将退避后再次 attempt
+    ///
+    /// 在 spawn 重试循环判定 `will retry` 后 `try_send`(可丢)。
+    /// `attempt` 为该分片本次将进行的 attempt 序号(从 1 起,对应失败后递增的计数)。
+    /// app 层每收到一次累加 `TaskInfo.retry_count`(任务级累计重试次数)。
+    Retry { fragment_index: u32, attempt: u32 },
 }
 
 #[cfg(test)]
@@ -1143,7 +1149,9 @@ mod tests {
                 assert_eq!(completed_indices, vec![0, 1, 2]);
                 assert_eq!(initial_concurrency, 4);
             }
-            FragmentProgress::Chunk { .. } | FragmentProgress::Started { .. } => {
+            FragmentProgress::Chunk { .. }
+            | FragmentProgress::Started { .. }
+            | FragmentProgress::Retry { .. } => {
                 panic!("应为 PlanComplete")
             }
         }
@@ -1168,7 +1176,9 @@ mod tests {
                 assert!(completed);
                 assert_eq!(fragment_downloaded, 1024);
             }
-            FragmentProgress::PlanComplete { .. } | FragmentProgress::Started { .. } => {
+            FragmentProgress::PlanComplete { .. }
+            | FragmentProgress::Started { .. }
+            | FragmentProgress::Retry { .. } => {
                 panic!("应为 Chunk")
             }
         }
@@ -1187,8 +1197,52 @@ mod tests {
             FragmentProgress::Started { fragment_index } => {
                 assert_eq!(fragment_index, 7);
             }
-            FragmentProgress::PlanComplete { .. } | FragmentProgress::Chunk { .. } => {
+            FragmentProgress::PlanComplete { .. }
+            | FragmentProgress::Chunk { .. }
+            | FragmentProgress::Retry { .. } => {
                 panic!("应为 Started")
+            }
+        }
+    }
+
+    /// 任务级 retry_count 聚合:Retry 变体可构造、匹配、serde 往返
+    #[test]
+    fn test_fragment_progress_retry_construct_and_serialization() {
+        let progress = FragmentProgress::Retry {
+            fragment_index: 3,
+            attempt: 2,
+        };
+        match &progress {
+            FragmentProgress::Retry {
+                fragment_index,
+                attempt,
+            } => {
+                assert_eq!(*fragment_index, 3);
+                assert_eq!(*attempt, 2);
+            }
+            FragmentProgress::PlanComplete { .. }
+            | FragmentProgress::Chunk { .. }
+            | FragmentProgress::Started { .. } => {
+                panic!("应为 Retry")
+            }
+        }
+        let json = serde_json::to_string(&progress).unwrap();
+        assert!(json.contains("\"retry\""));
+        assert!(json.contains("\"fragment_index\":3"));
+        assert!(json.contains("\"attempt\":2"));
+        let de: FragmentProgress = serde_json::from_str(&json).unwrap();
+        match de {
+            FragmentProgress::Retry {
+                fragment_index,
+                attempt,
+            } => {
+                assert_eq!(fragment_index, 3);
+                assert_eq!(attempt, 2);
+            }
+            FragmentProgress::PlanComplete { .. }
+            | FragmentProgress::Chunk { .. }
+            | FragmentProgress::Started { .. } => {
+                panic!("反序列化应为 Retry")
             }
         }
     }

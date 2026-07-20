@@ -439,6 +439,32 @@ async fn test_create_task_success() {
 }
 
 #[tokio::test]
+async fn test_create_task_stores_mirror_urls_on_task_and_snapshot() {
+    // create 带 mirrors 时 TaskInfo 与落盘快照都必须保留,供 restart 多源续传
+    let (service, _dir) = make_service();
+    let url = "https://primary.example.com/file.bin";
+    let mirrors = vec![
+        "https://m1.example.com/file.bin".to_string(),
+        "https://m2.example.com/file.bin".to_string(),
+    ];
+    let creation = service
+        .create_task(url, None, Some(&mirrors), None, false)
+        .await
+        .expect("create_task 应成功");
+    assert_eq!(creation.mirror_urls.as_ref(), Some(&mirrors));
+
+    let task = service.get_task_detail(&creation.task_id).unwrap();
+    assert_eq!(task.mirror_urls.as_ref(), Some(&mirrors));
+
+    let snapshot = service
+        .task_store
+        .load_snapshot(&creation.task_id)
+        .unwrap()
+        .expect("初始快照应已落盘");
+    assert_eq!(snapshot.mirror_urls.as_ref(), Some(&mirrors));
+}
+
+#[tokio::test]
 async fn test_create_task_dedup_same_url() {
     let (service, _dir) = make_service();
     let url = "https://example.com/file.bin";
@@ -1082,6 +1108,7 @@ fn make_task_with_order(
         tags: vec![],
         hf_meta: None,
         display_order,
+        mirror_urls: None,
     }
 }
 
@@ -1111,6 +1138,7 @@ fn empty_snapshot() -> TaskSnapshot {
         tags: vec![],
         hf_meta: None,
         display_order: 0,
+        mirror_urls: None,
     }
 }
 

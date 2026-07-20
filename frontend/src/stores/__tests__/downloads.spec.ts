@@ -217,6 +217,50 @@ describe('downloads store', () => {
     expect(task?.status).toBe('downloading')
   })
 
+  it('updateProgress 应用 retryCount 且字段缺失时保持原值', () => {
+    downloadsModule.setTasks([
+      makeTask('t1', {
+        status: 'downloading',
+        speed: 100,
+        downloaded: 100,
+        progress: 0.1,
+        fragmentsDone: 1,
+        retryCount: 2,
+      }),
+    ])
+
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.1,
+        downloaded: 100,
+        speed: 100,
+        status: 'downloading',
+        fragmentsDone: 1,
+        fragmentsTotal: 4,
+        activeConcurrency: 1,
+        retryCount: 5,
+      },
+    })
+
+    expect(downloadsModule.$tasks.get()[0]?.retryCount).toBe(5)
+
+    // 缺省 retryCount 字段:保持 5
+    downloadsModule.updateProgress({
+      t1: {
+        id: 't1',
+        progress: 0.2,
+        downloaded: 200,
+        speed: 120,
+        status: 'downloading',
+        fragmentsDone: 1,
+        fragmentsTotal: 4,
+        activeConcurrency: 1,
+      },
+    })
+    expect(downloadsModule.$tasks.get()[0]?.retryCount).toBe(5)
+  })
+
   // ── downloading 态进度单调保护（续传回退纵深防御） ─────────
 
   it('updateProgress downloading 态不回退 downloaded/progress', () => {
