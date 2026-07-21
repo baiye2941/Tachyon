@@ -295,7 +295,7 @@ async fn decrypt_aes128(
     data: &[u8],
     seq: u128,
 ) -> DownloadResult<Bytes> {
-    use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+    use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
     type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
     // 下载密钥(16 字节)
@@ -349,7 +349,7 @@ async fn decrypt_aes128(
         )));
     }
     let plaintext = Aes128CbcDec::new(&key_arr.into(), &iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|e| DownloadError::Protocol(format!("AES-128-CBC 解密失败: {e:?}")))?;
     Ok(Bytes::from(plaintext.to_vec()))
 }
@@ -1050,7 +1050,7 @@ plain.ts
 
     #[tokio::test]
     async fn test_hls_aes128_decryption() {
-        use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
         let server = wiremock::MockServer::start().await;
@@ -1067,7 +1067,7 @@ plain.ts
         let mut buf1 = vec![0u8; 16];
         buf1[..plaintext1.len()].copy_from_slice(plaintext1);
         let cipher1 = Aes128CbcEnc::new(&key.into(), &iv.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buf1, plaintext1.len())
+            .encrypt_padded::<Pkcs7>(&mut buf1, plaintext1.len())
             .unwrap()
             .to_vec();
 
@@ -1077,7 +1077,7 @@ plain.ts
         let mut buf2 = vec![0u8; 16];
         buf2[..plaintext2.len()].copy_from_slice(plaintext2);
         let cipher2 = Aes128CbcEnc::new(&key.into(), &iv2.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buf2, plaintext2.len())
+            .encrypt_padded::<Pkcs7>(&mut buf2, plaintext2.len())
             .unwrap()
             .to_vec();
 
@@ -1124,7 +1124,7 @@ plain.ts
 
     #[tokio::test]
     async fn test_hls_aes128_decryption_with_explicit_iv() {
-        use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
         let server = wiremock::MockServer::start().await;
@@ -1138,7 +1138,7 @@ plain.ts
         let mut buf = vec![0u8; 16];
         buf[..plaintext.len()].copy_from_slice(plaintext);
         let cipher = Aes128CbcEnc::new(&key.into(), &iv.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+            .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
             .unwrap()
             .to_vec();
 
@@ -1180,7 +1180,7 @@ plain.ts
     /// 旧实现 download_full 直接拼接密文(不调用 decrypt_aes128),导致两个 API 结果不同。
     #[tokio::test]
     async fn test_hls_download_full_decrypts_aes128_like_stream() {
-        use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
         let server = wiremock::MockServer::start().await;
@@ -1194,7 +1194,7 @@ plain.ts
         let mut buf = vec![0u8; 16];
         buf[..plaintext.len()].copy_from_slice(plaintext);
         let cipher = Aes128CbcEnc::new(&key.into(), &iv.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+            .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
             .unwrap()
             .to_vec();
 
