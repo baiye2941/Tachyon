@@ -36,8 +36,8 @@ tracing.workspace = true
 futures.workspace = true
 dashmap.workspace = true
 librqbit = { workspace = true, optional = true }
-aes = "0.8"
-cbc = "0.1"
+aes = "0.9"
+cbc = "0.2"
 hex = "0.4"
 
 [dev-dependencies]
