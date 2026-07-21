@@ -138,7 +138,7 @@ impl ProgressBroker {
         let notification_emitter = self.notification_emitter.clone();
         let notified_states = self.notified_states.clone();
 
-        tokio::spawn(async move {
+        crate::runtime::panic_isolation::spawn_isolated("progress_aggregator", async move {
             let mut interval = tokio::time::interval(Duration::from_millis(AGGREGATOR_INTERVAL_MS));
             // Force first tick to fire immediately
             interval.tick().await;

@@ -490,7 +490,18 @@ impl StorageSet {
                 if data.is_empty() {
                     return Ok(0);
                 }
-                let end = offset + data.len() as u64 - 1;
+                // 防溢出:offset + len 在 release(overflow-checks=false)下静默回绕,
+                // 传入接近 u64::MAX 的 offset 会导致 split_range 得到错误分段。
+                // 用 checked_add + checked_sub 显式校验,溢出返回 Config 错误。
+                let end = offset
+                    .checked_add(data.len() as u64)
+                    .and_then(|e| e.checked_sub(1))
+                    .ok_or_else(|| {
+                        DownloadError::Config(format!(
+                            "write_at offset({offset}) + len({}) 溢出",
+                            data.len()
+                        ))
+                    })?;
                 let segments = layout.split_range(offset, end);
                 let mut total_written = 0usize;
                 let mut byte_cursor = 0usize;
@@ -501,14 +512,17 @@ impl StorageSet {
                     byte_cursor += seg_len;
                     let mut local_pos = local_start;
                     while !remaining.is_empty() {
-                        debug_assert!(
-                            file_id < storages.len(),
-                            "file_id {file_id} 越界 storages.len()={}",
-                            storages.len()
-                        );
-                        let written = storages[file_id]
-                            .write_at(local_pos, remaining.clone())
-                            .await?;
+                        // 方案 A:用 get 替代裸索引,越界返回 Err 而非 panic
+                        // (release 下 debug_assert 消失,裸索引 storages[file_id]
+                        // 在 metadata 损坏/竞态时会 UB)。storages 与 layout 错配
+                        // 属配置级故障,返回 Config 错误由调用方处理。
+                        let storage = storages.get(file_id).ok_or_else(|| {
+                            DownloadError::Config(format!(
+                                "多文件存储 file_id {file_id} 越界 storages.len()={}",
+                                storages.len()
+                            ))
+                        })?;
+                        let written = storage.write_at(local_pos, remaining.clone()).await?;
                         if written == 0 {
                             return Err(DownloadError::Fragment(format!(
                                 "多文件存储短写未前进(file_id={file_id}, offset={local_pos})"
@@ -542,7 +556,17 @@ impl StorageSet {
                 if data.is_empty() {
                     return Ok(0);
                 }
-                let end = offset + data.len() as u64 - 1;
+                // 防溢出:offset + len 在 release(overflow-checks=false)下静默回绕,
+                // 用 checked_add + checked_sub 显式校验,溢出返回 Config 错误。
+                let end = offset
+                    .checked_add(data.len() as u64)
+                    .and_then(|e| e.checked_sub(1))
+                    .ok_or_else(|| {
+                        DownloadError::Config(format!(
+                            "write_at_mut offset({offset}) + len({}) 溢出",
+                            data.len()
+                        ))
+                    })?;
                 let segments = layout.split_range(offset, end);
                 let mut total_written = 0usize;
                 for (file_id, local_start, local_end) in segments {
@@ -555,14 +579,14 @@ impl StorageSet {
                     let mut local_pos = local_start;
                     // 段内短写重试:slice 引用计数,不复制
                     while !remaining_chunk.is_empty() {
-                        debug_assert!(
-                            file_id < storages.len(),
-                            "file_id {file_id} 越界 storages.len()={}",
-                            storages.len()
-                        );
-                        let written = storages[file_id]
-                            .write_at(local_pos, remaining_chunk.clone())
-                            .await?;
+                        // 方案 A:用 get 替代裸索引,越界返回 Err 而非 panic
+                        let storage = storages.get(file_id).ok_or_else(|| {
+                            DownloadError::Config(format!(
+                                "多文件存储 file_id {file_id} 越界 storages.len()={}",
+                                storages.len()
+                            ))
+                        })?;
+                        let written = storage.write_at(local_pos, remaining_chunk.clone()).await?;
                         if written == 0 {
                             return Err(DownloadError::Fragment(format!(
                                 "多文件存储短写未前进: file_id={file_id}, offset={local_pos}, remaining={}",
@@ -599,12 +623,14 @@ impl StorageSet {
             Self::Multi { storages, layout } => {
                 // size 是全局总长;各文件长度由 layout 决定,按 (file_id, len) 分配
                 for (file_id, len) in layout_split_iter(layout) {
-                    debug_assert!(
-                        file_id < storages.len(),
-                        "file_id {file_id} 越界 storages.len()={}",
-                        storages.len()
-                    );
-                    storages[file_id].allocate(len).await?;
+                    // 方案 A:用 get 替代裸索引,越界返回 Err 而非 panic
+                    let storage = storages.get(file_id).ok_or_else(|| {
+                        DownloadError::Config(format!(
+                            "多文件存储 file_id {file_id} 越界 storages.len()={}",
+                            storages.len()
+                        ))
+                    })?;
+                    storage.allocate(len).await?;
                 }
                 let _ = size; // 总长仅作校验用,实际按各文件长度分配
                 Ok(())
@@ -665,17 +691,29 @@ async fn read_multi(
     if buf.is_empty() {
         return Ok(0);
     }
-    let end = offset + buf.len() as u64 - 1;
+    // 防溢出:offset + len 在 release(overflow-checks=false)下静默回绕,
+    // 用 checked_add + checked_sub 显式校验,溢出返回 Config 错误。
+    let end = offset
+        .checked_add(buf.len() as u64)
+        .and_then(|e| e.checked_sub(1))
+        .ok_or_else(|| {
+            DownloadError::Config(format!(
+                "read_multi offset({offset}) + len({}) 溢出",
+                buf.len()
+            ))
+        })?;
     let segments = layout.split_range(offset, end);
     let mut total_read = 0usize;
     for (file_id, local_start, local_end) in segments {
         let seg_len = (local_end - local_start + 1) as usize;
-        debug_assert!(
-            file_id < storages.len(),
-            "file_id {file_id} 越界 storages.len()={}",
-            storages.len()
-        );
-        let read = storages[file_id]
+        // 方案 A:用 get 替代裸索引,越界返回 Err 而非 panic
+        let storage = storages.get(file_id).ok_or_else(|| {
+            DownloadError::Config(format!(
+                "多文件存储 file_id {file_id} 越界 storages.len()={}",
+                storages.len()
+            ))
+        })?;
+        let read = storage
             .read_at(local_start, &mut buf[total_read..total_read + seg_len])
             .await?;
         total_read += read;
@@ -1466,21 +1504,18 @@ mod tests {
     // 在 metadata 损坏时 panic。期望:
     //   1. 构造时用 try_from_spans 校验 layout,file_id 与 storage 数量错配
     //      返回 DownloadError 而非 panic(见 rejects_invalid_layout_at_construction)
-    //   2. 热路径保留 debug_assert!(file_id < storages.len()) 兜底
-    //      (见 debug_asserts_file_id_bounds)
+    //   2. 热路径用 storages.get(file_id).ok_or_else(...)? 替代裸索引,
+    //      越界返回 DownloadError::Config 而非 panic(release/debug 一致)
+    //      (见 *_returns_err_on_out_of_bounds_file_id)
 
-    /// 合法 Multi 在 write_at 正常 file_id 下不 panic;越界 file_id 在 debug
-    /// 构建下应触发 debug_assert(用 catch_unwind 捕获)。
+    /// 合法 Multi 在 write_at 正常 file_id 下成功;越界 file_id 应返回 Err
+    /// 而非 panic(release/debug 一致,方案 A)。
     ///
-    /// 构造合法 layout(file0 [0,1), file1 [1,2)),各 1 字节 storage;
-    /// 再用畸形 layout(file_id=5,storage 只有 2 个)通过 from_spans 绕过校验
-    /// 后调 write_at,期望 debug_assert 触发 panic。release 构建无 debug_assert,
-    /// 测试自动忽略(避免误绿)。
-    #[test]
-    #[cfg(debug_assertions)]
-    fn test_storage_set_multi_debug_asserts_file_id_bounds() {
-        use std::panic;
-
+    /// 构造合法 layout(file0 [0,1), file1 [1,2)),各 1 字节 storage,验证
+    /// 正常写入成功;再用畸形 layout(file_id=5,storage 只有 2 个)通过
+    /// from_spans 绕过构造期校验后调 write_at,期望返回 DownloadError::Config。
+    #[tokio::test]
+    async fn test_storage_set_multi_bounds_check_on_out_of_range_file_id() {
         // 合法 layout:file0 [0,1), file1 [1,2)
         let good_spans = vec![
             tachyon_core::FileSpan {
@@ -1504,18 +1539,15 @@ mod tests {
             good_spans,
         )
         .expect("合法双文件布局应构造成功");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            storage.allocate(2).await.unwrap();
-            let _ = storage
-                .write_at(0, Bytes::from_static(b"ab"))
-                .await
-                .unwrap();
-        });
+        storage.allocate(2).await.unwrap();
+        storage
+            .write_at(0, Bytes::from_static(b"ab"))
+            .await
+            .unwrap();
 
         // 畸形 layout:file_id=5 越界(>storages.len()=2)。
-        // from_spans 仅排序不校验,绕过构造期校验;write_at 跨边界触发
-        // storages[5] 裸索引,debug_assert 实装后应在索引前触发更清晰的 panic。
+        // from_spans 仅排序不校验,绕过构造期校验;write_at 跨边界到第二段
+        // (file_id=5),期望返回 Err 而非裸索引 panic。
         let bad_spans = vec![
             tachyon_core::FileSpan {
                 file_id: 0,
@@ -1530,8 +1562,6 @@ mod tests {
                 name: "x".into(),
             },
         ];
-        // 通过 from_spans + 直接构造 StorageSet::Multi 绕过 multi 校验,
-        // 模拟 metadata 损坏已渗入热路径的场景。
         let bad_layout = tachyon_core::FileLayout::from_spans(bad_spans);
         let bad_storage = StorageSet::Multi {
             storages: vec![
@@ -1540,15 +1570,13 @@ mod tests {
             ],
             layout: bad_layout,
         };
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async {
-                let _ = bad_storage.write_at(0, Bytes::from_static(b"ab")).await;
-            });
-        }));
+        let err = bad_storage
+            .write_at(0, Bytes::from_static(b"ab"))
+            .await
+            .expect_err("越界 file_id 应返回 Err 而非 panic");
         assert!(
-            result.is_err(),
-            "越界 file_id 在 debug 构建下应触发 debug_assert panic"
+            matches!(err, tachyon_core::DownloadError::Config(_)),
+            "越界 file_id 应返回 Config 错误,实际: {err:?}"
         );
     }
 
@@ -1592,6 +1620,98 @@ mod tests {
         assert!(
             result.is_err(),
             "畸形 layout 构造 StorageSet 必须返回 Err 而非 panic"
+        );
+    }
+
+    // ===== F-09 续:热路径越界 file_id 应返回 Err 而非 panic(RED) =====
+    //
+    // 构造期 try_from_spans 已拦截畸形 layout,但 metadata 损坏/竞态仍可能使
+    // layout 与 storages 错配渗入热路径。原实现用 debug_assert!(file_id <
+    // storages.len()) 保护裸索引 storages[file_id]:debug 下 panic,release 下
+    // debug_assert 消失 → 裸索引越界 UB(原 panic=abort 杀进程)。期望:4 条
+    // 热路径(write_at/write_at_mut/read_at/allocate)在 file_id 越界时返回
+    // DownloadError::Config 而非 panic,release 与 debug 行为一致。
+
+    /// 构造 layout 与 storages 错配的 StorageSet::Multi:layout 的第二段
+    /// file_id=5,但 storages 只有 2 个。通过 from_spans 绕过构造期校验,
+    /// 模拟 metadata 损坏已渗入热路径。offset=1 命中第二段 → split_range
+    /// 返回 file_id=5,越界 storages.len()=2。
+    fn make_out_of_bounds_storage_set() -> StorageSet {
+        let bad_spans = vec![
+            tachyon_core::FileSpan {
+                file_id: 0,
+                global_offset: 0,
+                len: 1,
+                name: "a".into(),
+            },
+            tachyon_core::FileSpan {
+                file_id: 5,
+                global_offset: 1,
+                len: 1,
+                name: "x".into(),
+            },
+        ];
+        let bad_layout = tachyon_core::FileLayout::from_spans(bad_spans);
+        StorageSet::Multi {
+            storages: vec![
+                DynStorage::memory_with_capacity(1),
+                DynStorage::memory_with_capacity(1),
+            ],
+            layout: bad_layout,
+        }
+    }
+
+    /// write_at 在 file_id 越界时应返回 Err 而非 panic(release/debug 一致)。
+    #[tokio::test]
+    async fn storage_set_multi_write_at_returns_err_on_out_of_bounds_file_id() {
+        let bad_storage = make_out_of_bounds_storage_set();
+        // offset=1 命中第二段(file_id=5),越界 storages.len()=2
+        let result = bad_storage.write_at(1, Bytes::from_static(b"x")).await;
+        let err = result.expect_err("越界 file_id 应返回 Err 而非 panic");
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Config(_)),
+            "越界 file_id 应返回 Config 错误,实际: {err:?}"
+        );
+    }
+
+    /// write_at_mut 在 file_id 越界时应返回 Err 而非 panic(release/debug 一致)。
+    #[tokio::test]
+    async fn storage_set_multi_write_at_mut_returns_err_on_out_of_bounds_file_id() {
+        let bad_storage = make_out_of_bounds_storage_set();
+        let mut data = BytesMut::from(&b"x"[..]);
+        let result = bad_storage.write_at_mut(1, &mut data).await;
+        let err = result.expect_err("越界 file_id 应返回 Err 而非 panic");
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Config(_)),
+            "越界 file_id 应返回 Config 错误,实际: {err:?}"
+        );
+    }
+
+    /// read_at 在 file_id 越界时应返回 Err 而非 panic(release/debug 一致)。
+    #[tokio::test]
+    async fn storage_set_multi_read_at_returns_err_on_out_of_bounds_file_id() {
+        let bad_storage = make_out_of_bounds_storage_set();
+        let mut buf = [0u8; 1];
+        let result = bad_storage.read_at(1, &mut buf).await;
+        let err = result.expect_err("越界 file_id 应返回 Err 而非 panic");
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Config(_)),
+            "越界 file_id 应返回 Config 错误,实际: {err:?}"
+        );
+    }
+
+    /// allocate 在 file_id 越界时应返回 Err 而非 panic(release/debug 一致)。
+    ///
+    /// allocate 走 layout_split_iter → split_range(0, total-1),第二段
+    /// file_id=5 越界。
+    #[tokio::test]
+    async fn storage_set_multi_allocate_returns_err_on_out_of_bounds_file_id() {
+        let bad_storage = make_out_of_bounds_storage_set();
+        let result = bad_storage.allocate(2).await;
+        let err = result.expect_err("越界 file_id 应返回 Err 而非 panic");
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Config(_)),
+            "越界 file_id 应返回 Config 错误,实际: {err:?}"
         );
     }
 }

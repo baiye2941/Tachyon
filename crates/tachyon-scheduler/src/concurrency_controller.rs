@@ -36,14 +36,23 @@ impl ConcurrencyController {
     /// 创建控制器
     ///
     /// # 参数
-    /// - `initial`: 初始目标并发度
+    /// - `initial`: 初始目标并发度(将 clamp 到 [1, hard_limit],与 `set_target` 语义一致)
     /// - `hard_limit`: 硬上限(不可超过,通常 = max_concurrent_fragments)
+    ///
+    /// # 不变式
+    /// - `hard_limit` 必须 >= 1(release 下也用 `assert!` 检查,hard_limit=0 会导致
+    ///   Semaphore::new(0) 无 permit、`set_target` 的 clamp(1, 0) panic 或 target=0 卡死,
+    ///   把静默卡死转为启动期可定位的 panic)
+    /// - `initial` clamp 到 [1, hard_limit]:保证 target 永不为 0(否则 `should_spawn`
+    ///   永远 false → 不 spawn 任何分片 → 下载永久卡死且无错误信号)
     pub fn new(initial: u32, hard_limit: u32) -> Self {
-        debug_assert!(initial > 0, "初始并发度必须 > 0");
-        debug_assert!(hard_limit >= initial, "硬上限必须 >= 初始并发度");
+        // release 下也检查:hard_limit=0 无法工作(Semaphore 无 permit、clamp panic、target=0 卡死)
+        assert!(hard_limit >= 1, "硬上限 hard_limit 必须 >= 1");
+        // 与 set_target 的 clamp 语义对齐,保证 target ∈ [1, hard_limit],永不为 0
+        let clamped_initial = initial.clamp(1, hard_limit);
         Self {
             active: AtomicU32::new(0),
-            target: AtomicU32::new(initial),
+            target: AtomicU32::new(clamped_initial),
             hard_limit,
         }
     }
@@ -277,5 +286,53 @@ mod tests {
         assert!(!ctrl.should_spawn(), "active=4 >= target=4 应阻止 spawn");
         // 未触达硬上限 4(若信号量以 hard_limit 构造,4 个 permit 恰好满足)
         assert_eq!(ctrl.hard_limit(), 4);
+    }
+
+    /// RED-TDD:`new` 必须把 initial=0 clamp 到 1,保证 target 永不为 0。
+    ///
+    /// 背景:release 模式下旧 `debug_assert!(initial > 0)` 被移除,若调用方传入
+    /// initial=0(如 bt_cold_start 配置覆盖路径未做 .max(1)),target 直接存 0,
+    /// `should_spawn()` 永远返回 false → 不 spawn 任何分片 → 下载永久卡死且无错误
+    /// 信号。修复:与 `set_target` 一致在 `new` 内 clamp 到 [1, hard_limit]。
+    #[test]
+    fn test_new_clamps_initial_zero_to_one() {
+        // initial=0 不应产生 target=0 的卡死状态
+        let ctrl = ConcurrencyController::new(0, 10);
+        assert_eq!(
+            ctrl.target(),
+            1,
+            "initial=0 必须 clamp 到 1,target=0 会导致 should_spawn 永远 false → 卡死"
+        );
+        assert_eq!(ctrl.hard_limit(), 10);
+        assert!(
+            ctrl.should_spawn(),
+            "active=0 < target=1 应可 spawn(target=0 会让此条件永远 false)"
+        );
+    }
+
+    /// RED-TDD:`new` 当 initial > hard_limit 时应 clamp 到 hard_limit(与 set_target 对齐)。
+    ///
+    /// 旧实现 release 下不 clamp,target 直接存入越界值(initial > hard_limit),
+    /// 与 `set_target` 的 [1, hard_limit] clamp 语义不一致,且 hard_limit 失去上限意义。
+    #[test]
+    fn test_new_clamps_initial_above_hard_limit() {
+        let ctrl = ConcurrencyController::new(20, 10);
+        assert_eq!(
+            ctrl.target(),
+            10,
+            "initial=20 > hard_limit=10 应 clamp 到 10,target 不应超过硬上限"
+        );
+        assert_eq!(ctrl.hard_limit(), 10);
+    }
+
+    /// RED-TDD:`new` 拒绝 hard_limit=0(并发度硬上限为 0 无意义)。
+    ///
+    /// hard_limit=0 时:Semaphore::new(0) 无 permit、`set_target` 的 clamp(1, 0) 因
+    /// min > max 而 panic、或 target=0 卡死。三种路径均无法正常工作,故在构造时
+    /// 用 `assert!`(release 也检查)显式 panic,把静默卡死转化为可定位的启动期错误。
+    #[test]
+    #[should_panic(expected = "硬上限 hard_limit 必须 >= 1")]
+    fn test_new_rejects_zero_hard_limit() {
+        let _ = ConcurrencyController::new(1, 0);
     }
 }

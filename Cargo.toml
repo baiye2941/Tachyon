@@ -36,6 +36,7 @@ tokio-stream = "0.1"
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # HTTP
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2", "socks"] }
@@ -179,5 +180,9 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# panic 策略:此前为 "abort",但桌面下载器中单个后台任务(下载 task_fn/进度聚合/
+# chunk reader worker)的 panic 会直接杀整个进程,用户只见前端无响应/闪退,且日志走
+# stderr 在 windows_subsystem=windows 下丢失,无法诊断。改回默认 unwind,配合每个
+# spawn 任务外包 catch_unwind 隔离 panic,使单个下载崩溃不影响其他任务与 UI。
+# 详见 docs 与 AGENTS.md "NEVER 让后台任务 panic 杀全应用" 教训。
 overflow-checks = false

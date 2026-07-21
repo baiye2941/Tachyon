@@ -2282,9 +2282,13 @@ impl DownloadTask {
             let size = frag.info.size.max(1);
             let rt = frag.realtime_downloaded.load(Ordering::Acquire);
             let eff_end = frag.effective_end.load(Ordering::Acquire);
+            // 防溢出:frag.info.start + rt 是裸加法,release(overflow-checks=false)下
+            // 若 rt 异常增长会静默回绕。用 saturating_add 与下方 2284 行实际拆分逻辑
+            // (start.saturating_add(realtime))保持一致,消除不一致性。
+            // 即便此处选片偏差,2284 行的 remaining 检查会拒绝拆分,不致数据损坏。
             let remaining = eff_end
                 .saturating_add(1)
-                .saturating_sub(frag.info.start + rt);
+                .saturating_sub(frag.info.start.saturating_add(rt));
             if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
                 continue;
             }

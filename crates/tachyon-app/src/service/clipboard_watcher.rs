@@ -109,7 +109,7 @@ impl ClipboardWatcher {
         let sniffer = self.sniffer_service.clone();
         let last_text = self.last_text.clone();
 
-        tokio::spawn(async move {
+        crate::runtime::panic_isolation::spawn_isolated("clipboard_watcher", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
             // 首次 tick 不读(避免启动时把已有内容当新检测)
             interval.tick().await;

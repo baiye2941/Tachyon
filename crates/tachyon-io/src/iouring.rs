@@ -944,8 +944,20 @@ fn aligned_alloc(size: usize, align: usize) -> AlignedBuffer {
         align - misalignment
     };
 
-    debug_assert!(offset < align);
-    debug_assert!(offset + size <= storage_len);
+    // SAFETY 前置条件:`ptr()` 中的 unsafe `as_mut_ptr().add(self.offset)` 依赖
+    //   offset < align(否则 .add 超出对齐块边界)与 offset + size <= storage_len
+    //   (否则 .add(size) 越界写入)成立。此处用 `assert!`(release 也检查)兜底,
+    //   把潜在的越界 UB 转为可隔离的 panic。debug_assert 在 release 下被移除会丢失
+    //   这层保护。调用方(aligned_alloc 自身计算 offset)已保证不变式,assert 仅作
+    //   soundness 兜底:若未来重构破坏了 offset 计算,此处会立刻 panic 而非静默 UB。
+    assert!(
+        offset < align,
+        "对齐偏移 offset 必须 < align(SAFETY:ptr().add(offset) 前置条件)"
+    );
+    assert!(
+        offset + size <= storage_len,
+        "SAFETY:offset + size 必须 <= storage_len,否则 ptr().add(size) 越界写入"
+    );
 
     AlignedBuffer {
         storage: UnsafeCell::new(storage),
@@ -2150,6 +2162,48 @@ mod tests {
             (buf.as_ptr() as usize).is_multiple_of(4096),
             "buffer 地址应按 4096 对齐"
         );
+    }
+
+    /// SAFETY 回归:`aligned_alloc` 的 offset 不变式必须对所有 (size, align) 组合成立。
+    ///
+    /// 背景:`ptr()` 的 unsafe `as_mut_ptr().add(self.offset)` 依赖两个前置条件:
+    ///   - offset < align(否则 .add 越出对齐块)
+    ///   - offset + size <= storage_len(否则 .add(size) 越界写入 → UB)
+    /// 旧实现用 `debug_assert` 保护,release 下被移除会丢失这层 soundness 检查,导致
+    /// 若未来 offset 计算被破坏则静默 UB。升级为 `assert!` 后,本测试验证断言在各组合下
+    /// 不触发(即不变式成立),同时通过 `as_ptr()`(内部调用 `ptr()`)走一遍 unsafe 路径。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_aligned_alloc_offset_invariants_hold() {
+        // (size, align) 多样组合覆盖:对齐边界、非对齐、最小/大尺寸、不同对齐值
+        let cases: [(usize, usize); 6] = [
+            (1, 512),
+            (100, 512),
+            (512, 512),
+            (513, 512),
+            (1024, 4096),
+            (256 * 1024, 4096),
+        ];
+        for (size, align) in cases {
+            let storage_len = size + (align - 1);
+            let buf = aligned_alloc(size, align);
+            // 白盒读取 offset(同模块测试可访问私有字段),验证 SAFETY 前置条件
+            assert!(
+                buf.offset < align,
+                "size={size} align={align}: offset={} 必须 < align(SAFETY:ptr().add(offset) 前置条件)",
+                buf.offset
+            );
+            assert!(
+                buf.offset + size <= storage_len,
+                "size={size} align={align}: offset+size={} 必须 <= storage_len={storage_len}(SAFETY:ptr().add(size) 越界保护)",
+                buf.offset + size
+            );
+            assert_eq!(buf.len(), size, "逻辑长度应保持调用方请求的大小");
+            // 走一遍 unsafe 路径(as_ptr 内部调用 ptr()->as_mut_ptr().add(offset)),
+            // 验证地址对齐且非空(assert! 已保证不越界,此处验证语义正确性)
+            let addr = buf.as_ptr() as usize;
+            assert!(addr.is_multiple_of(align), "暴露的指针应按 align 对齐");
+        }
     }
 
     /// 回归测试: buffer_count=16 时,首次分配必须返回 idx=0 而非 16。

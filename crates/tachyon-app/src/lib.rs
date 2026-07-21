@@ -1,6 +1,7 @@
 //! Tachyon Tauri 应用库
 
 pub mod commands;
+pub mod logging;
 pub mod projection;
 pub mod repository;
 pub mod runtime;
@@ -19,24 +20,15 @@ use commands::*;
 pub fn run() {
     use tauri::Manager;
 
-    // 设置全局 panic hook，确保 panic 信息被 tracing 捕获
-    std::panic::set_hook(Box::new(|panic_info| {
-        tracing::error!(
-            target = "panic",
-            panic.file = panic_info.location().map(|l| l.file()),
-            panic.line = panic_info.location().map(|l| l.line()),
-            panic.column = panic_info.location().map(|l| l.column()),
-            "应用 panic: {panic_info}",
-        );
-    }));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .init();
+    // 日志与 panic 兜底地基(release 可诊断性):
+    // - tracing-appender 滚动文件日志(~/.tachyon/logs/app.YYYY-MM-DD.log)
+    // - panic hook 直写 panic.log(绕过非阻塞缓冲,保证 panic 落盘)
+    // - LogGuard 必须保活至应用退出:其 Drop flush 非阻塞文件缓冲
+    //   panic=unwind 下,正常退出或 panic unwind 均触发 flush
+    //
+    // 此前 panic 仅走 tracing->stderr,release windows_subsystem 下 stderr 被丢弃,
+    // 用户只见闪退;现在 panic.log 保证留下诊断证据。
+    let _log_guard = logging::init_logging();
 
     // === tokio runtime 显式调优 ===
     // Tauri v2 默认通过 `tokio::runtime::Runtime::new()` 创建 runtime:

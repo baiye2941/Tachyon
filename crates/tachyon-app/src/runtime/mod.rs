@@ -10,6 +10,7 @@
 pub mod chunk_reader_pool;
 pub mod download_session;
 pub mod download_supervisor;
+pub mod panic_isolation;
 
 pub use chunk_reader_pool::{ChunkReaderJob, ChunkReaderPool};
 pub use download_session::DownloadSession;

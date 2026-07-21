@@ -190,6 +190,10 @@ impl AlignedBuf {
         }
 
         let align = self.alloc.layout.align();
+        // COW 分配失败(OOM)是不可恢复场景:无独立分配就无法安全写入(共享分配写入
+        // 会破坏其他视图)。此 expect 触发条件为系统内存耗尽,属"不可恢复"错误;
+        // panic=unwind 下该 panic 可被 catch_unwind 隔离,比 UB 可控。保留 expect,
+        // 不为消除它而做大重构破坏 &mut self 无错误返回的 API 契约。
         let new_alloc =
             AlignedAlloc::new(self.cap, align).expect("AlignedBuf copy-on-write allocation failed");
         if self.pos != 0 {
@@ -206,7 +210,11 @@ impl AlignedBuf {
 
     /// 返回当前窗口的原始起始指针，不创建引用。
     fn data_ptr(&self) -> *mut u8 {
-        debug_assert!(
+        // soundness 不变量: offset + cap <= alloc_size。release 下也必须检查——
+        // 旧实现用 debug_assert!(release 下编译消失),后续 unsafe { ptr.add(offset) }
+        // 越界 → 堆越界 UB → 静默内存损坏或崩溃。panic=unwind 下 panic 可被
+        // catch_unwind 隔离,UB 不可恢复,故宁 panic 不 UB。
+        assert!(
             self.offset
                 .checked_add(self.cap)
                 .is_some_and(|end| end <= self.alloc.layout.size()),
@@ -250,7 +258,17 @@ impl AlignedBuf {
 
     /// 已写入数据的切片引用
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: [0, pos) 是唯一被 AlignedBuf 追踪为已初始化的范围，且 pos <= cap。
+        // soundness 不变量: [0, pos) 是唯一被 AlignedBuf 追踪为已初始化的范围,
+        // 且 pos <= cap(由 as_mut_slice/extend_from_slice 的守卫与 split 的 cap=pos
+        // 构造保证)。release 下也必须检查——旧实现完全无守卫,pos > cap 时
+        // from_raw_parts 越界读 UB。panic=unwind 下可被 catch_unwind 隔离,UB 不可恢复。
+        assert!(
+            self.pos <= self.cap,
+            "AlignedBuf 不变量违反: pos({}) > cap({})",
+            self.pos,
+            self.cap
+        );
+        // SAFETY: 上述 assert 保证 pos <= cap;[0, pos) 是唯一已初始化范围。
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.pos) }
     }
 
@@ -260,7 +278,15 @@ impl AlignedBuf {
     /// 纳入逻辑长度，也不会由 `freeze()` 产出。
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.ensure_unique_for_write();
-        debug_assert!(self.pos <= self.cap, "AlignedBuf 不变量违反: pos > cap");
+        // soundness 不变量: pos <= cap。release 下也必须检查——旧实现用
+        // debug_assert!(release 下编译消失),随后 `spare = cap - pos` 在 pos > cap
+        // 时下溢为 usize::MAX,write_bytes 写入巨量字节 → 堆越界写 UB。
+        assert!(
+            self.pos <= self.cap,
+            "AlignedBuf 不变量违反: pos({}) > cap({})",
+            self.pos,
+            self.cap
+        );
         let ptr = self.data_ptr();
         let spare = self.cap - self.pos;
 
@@ -704,6 +730,51 @@ mod tests {
         let split = buf.split();
         let bytes = split.freeze();
         assert!(satisfies_no_buffering_alignment(0, &bytes));
+    }
+
+    /// 回归: `data_ptr` 的 `offset + cap <= alloc_size` 不变量在 release 下也必须被检查。
+    ///
+    /// 旧实现用 `debug_assert!`,release 下编译消失(语言保证),任何边界 bug 会让
+    /// `unsafe { ptr.add(offset) }` 越界 → 堆越界 UB → 静默内存损坏。升级为 `assert!`
+    /// 后,release 下也 panic(panic=unwind 可被 catch_unwind 隔离,UB 不可恢复)。
+    ///
+    /// `data_ptr` 只计算指针不解引用,故旧实现(red)在 release 下不 panic、不触发 UB,
+    /// `should_panic` 以"未 panic"失败;升级后(green)在 release 下也 panic。
+    ///
+    /// tests 作为子模块可访问父模块私有字段,此处手动破坏不变量以验证守卫触发。
+    #[test]
+    #[should_panic(expected = "AlignedBuf 不变量违反")]
+    fn test_data_ptr_panics_on_offset_cap_overflow() {
+        let mut buf = AlignedBuf::new(SECTOR_ALIGN).unwrap();
+        // cap 设为超过分配大小,使 offset(0) + cap > alloc_size
+        buf.cap = buf.alloc.layout.size() + 1;
+        let _ = buf.data_ptr();
+    }
+
+    /// 回归: `as_slice` 的 `from_raw_parts(ptr, pos)` 依赖 `pos <= cap` 不变量。
+    ///
+    /// 旧实现**完全没有**该 assert(debug_assert 也没有),release 与 debug 下均无守卫,
+    /// `pos > cap` 时 `from_raw_parts` 越界读 UB。新增 `assert!` 后,release 下也 panic。
+    /// 这是本修复中新补的守卫(不只是 debug_assert→assert 升级)。
+    #[test]
+    #[should_panic(expected = "AlignedBuf 不变量违反")]
+    fn test_as_slice_panics_on_pos_gt_cap() {
+        let mut buf = AlignedBuf::new(SECTOR_ALIGN).unwrap();
+        buf.pos = buf.cap + 1;
+        let _ = buf.as_slice();
+    }
+
+    /// 回归: `as_mut_slice` 的 `pos <= cap` 不变量在 release 下也必须被检查。
+    ///
+    /// 旧实现用 `debug_assert!`,release 下编译消失,`spare = cap - pos` 减法下溢为
+    /// `usize::MAX`,随后 `write_bytes(ptr.add(pos), 0, spare)` 写入巨量字节 → 堆越界
+    /// 写 UB。升级为 `assert!` 后,在 `spare` 计算之前 panic,阻止 UB。
+    #[test]
+    #[should_panic(expected = "AlignedBuf 不变量违反")]
+    fn test_as_mut_slice_panics_on_pos_gt_cap() {
+        let mut buf = AlignedBuf::new(SECTOR_ALIGN).unwrap();
+        buf.pos = buf.cap + 1;
+        let _ = buf.as_mut_slice();
     }
 
     use tachyon_core::config::WRITE_BATCH_BYTES;

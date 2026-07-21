@@ -104,26 +104,56 @@ impl DownloadSupervisor {
         let tid = task_id.to_string();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
-        let handle = tokio::spawn(async move {
-            let _ = start_rx.await;
-            // 读锁内 clone 出当前 Arc<ConnectionPool>:
-            // 取的是任务启动时刻的 pool 快照,后续热重建不影响本任务。
-            let pool_clone = pool_handle.read().await.clone();
-            let buffer_pool_clone = buffer_pool_handle.read().await.clone();
-            task_fn(
-                state,
-                tid,
-                url,
-                download_dir,
-                download_config,
-                pool_clone,
-                buffer_pool_clone,
-                control_rx,
-                mirror_urls,
-                preferred_file_name,
-            )
-            .await;
-        });
+        // 隔离 task_fn panic:单个下载崩溃不应杀全应用(release windows_subsystem
+        // 下用户只见闪退)。panic 经 tracing 落盘 panic.log。
+        // 依赖 panic=unwind(根 Cargo.toml release profile 已改回)。
+        //
+        // panic 后收尾:catch_unwind 捕获 panic 后,主动调 mark_task_failed_and_cleanup
+        // 把任务转 Failed 态并清理 runtime(handles/command_channels/command_locks),
+        // 否则 task_fn 栈展开会跳过 DownloadSession::run 的第 9-11 步终态清理,
+        // 导致任务永久卡 Downloading + handle/channel 泄漏。
+        // start_rx 门控与 pool clone 都在隔离 future 内,保证 spawn 后 JoinHandle
+        // 语义与原实现一致(任务在 start_tx.send 后才真正运行,wait_for_handle 能 join)。
+        let state_for_panic = state.clone();
+        let tid_for_panic = tid.clone();
+        let handle = crate::runtime::panic_isolation::spawn_isolated_with_panic_hook(
+            "task_fn",
+            async move {
+                let _ = start_rx.await;
+                // 读锁内 clone 出当前 Arc<ConnectionPool>:
+                // 取的是任务启动时刻的 pool 快照,后续热重建不影响本任务。
+                let pool_clone = pool_handle.read().await.clone();
+                let buffer_pool_clone = buffer_pool_handle.read().await.clone();
+                task_fn(
+                    state,
+                    tid,
+                    url,
+                    download_dir,
+                    download_config,
+                    pool_clone,
+                    buffer_pool_clone,
+                    control_rx,
+                    mirror_urls,
+                    preferred_file_name,
+                )
+                .await;
+            },
+            move |panic_msg: String| {
+                // 在 panic 捕获后同步执行终态清理:标记 Failed + 清理 runtime
+                // (task_fn 栈已展开,DownloadSession::run 的 cleanup 被跳过)
+                let state = state_for_panic.clone();
+                let task_id = tid_for_panic.clone();
+                tokio::spawn(async move {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        panic.msg = %panic_msg,
+                        "task_fn panic 已捕获,执行终态清理(标记 Failed + 清理 runtime)"
+                    );
+                    crate::commands::task_commands::mark_task_failed_and_cleanup(&state, &task_id)
+                        .await;
+                });
+            },
+        );
 
         self.handles.insert(task_id.to_string(), handle);
         // start_tx.send 只在 start_rx 被 drop 时失败（即 spawned task 已被 abort），

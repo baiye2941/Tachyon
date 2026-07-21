@@ -133,7 +133,7 @@ impl ChunkReaderPool {
         // worker 正在处理长 job 且队列已满,dispatcher 会 HOL 饿死其他空闲 worker。
         // 策略:从 round-robin 起点 try_reserve;全满则 clone Sender 并发 reserve,
         // 第一个拿到 permit 的 worker 收下 job(job 本身不需 Clone)。
-        tokio::spawn(async move {
+        crate::runtime::panic_isolation::spawn_isolated("chunk_reader_dispatcher", async move {
             let mut next_worker = 0usize;
             let n = worker_txs.len();
             while let Some(job) = job_rx.recv().await {
@@ -202,7 +202,7 @@ impl ChunkReaderPool {
             let mut rx = worker_rxs
                 .pop()
                 .expect("worker_rxs 数量应匹配 worker_count");
-            tokio::spawn(async move {
+            crate::runtime::panic_isolation::spawn_isolated("chunk_reader_worker", async move {
                 while let Some(job) = rx.recv().await {
                     run_chunk_reader(job).await;
                 }

@@ -34,7 +34,7 @@ pub async fn subscribe_progress(
     let task_repository = state.domain.task_repository.clone();
     let fragment_state_store = state.fragment_state_store.clone();
 
-    tokio::spawn(async move {
+    crate::runtime::panic_isolation::spawn_isolated("progress_broadcaster", async move {
         // 首次广播全量快照，保证前端初始状态正确
         let mut last_snapshot: ProgressEvent = build_initial_progress_event(&task_repository);
         let _ = app_handle.emit("progress-update", &last_snapshot);

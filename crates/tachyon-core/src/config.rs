@@ -4415,6 +4415,9 @@ mod tests {
         }
         let cfg = DownloadConfig::default();
         // 恢复环境变量(无论断言结果如何,确保不污染后续测试)
+        // SAFETY: 同上 set 块合约:(1) ENV_TEST_LOCK 串行化锁仍持有(_guard 未 drop);
+        // (2) saved_* 来自 std::env::var_os,为合法 OsString 非裸指针,无 UB;
+        // (3) set_var 仅传编译期字符串字面量作 key。与 @4407-4409 合约一致。
         unsafe {
             if let Some(v) = saved_userprofile {
                 std::env::set_var("USERPROFILE", v);
