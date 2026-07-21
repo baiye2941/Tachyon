@@ -47,7 +47,7 @@ jobs:
         id: date
         run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - name: 恢复 corpus 缓存
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ steps.date.outputs.day }}
