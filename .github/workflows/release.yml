@@ -152,7 +152,7 @@ jobs:
           components: rustfmt, clippy
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: release-fallback
-      - uses: cargo-bins/cargo-binstall@v1.20.0
+      - uses: cargo-bins/cargo-binstall@v1.21.0
         if: steps.check.outputs.skip != 'true'
       - name: 格式检查
         if: steps.check.outputs.skip != 'true'

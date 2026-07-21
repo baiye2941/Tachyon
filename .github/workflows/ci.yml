@@ -142,7 +142,7 @@ jobs:
           # Ubuntu stable 与 clippy/docs 共享 target；Win/mac 用各自 shared-key
           shared-key: ${{ runner.os == 'Linux' && format('ubuntu-stable-{0}', hashFiles('**/Cargo.lock')) || format('{0}-stable-{1}', runner.os, hashFiles('**/Cargo.lock')) }}
           cache-key-suffix: test
-      - uses: cargo-bins/cargo-binstall@v1.20.0
+      - uses: cargo-bins/cargo-binstall@v1.21.0
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force --locked cargo-nextest
       - name: 运行测试(nextest, 失败重试 2 次)
@@ -201,7 +201,7 @@ jobs:
           toolchain: stable
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: audit
-      - uses: cargo-bins/cargo-binstall@v1.20.0
+      - uses: cargo-bins/cargo-binstall@v1.21.0
       - name: 安装 cargo-deny (预编译二进制)
         run: cargo binstall -y --force cargo-deny
       - run: cargo deny check
@@ -224,7 +224,7 @@ jobs:
           toolchain: stable
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: cargo-audit
-      - uses: cargo-bins/cargo-binstall@v1.20.0
+      - uses: cargo-bins/cargo-binstall@v1.21.0
       - name: 安装 cargo-audit (预编译二进制)
         run: cargo binstall -y --force cargo-audit
       # ignore 单源 = deny.toml [advisories].ignore（scripts/ci/audit.sh 解析）
