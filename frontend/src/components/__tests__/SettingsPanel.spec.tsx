@@ -89,6 +89,7 @@ const mockConfig = {
     forceTrackerIntervalSecs: 120,
     deferWritesUpToMb: 16,
     disableDhtWhenSocks: true,
+    allowPrivatePeers: false,
     peerAddrs: [],
   },
   hub: {
@@ -415,6 +416,49 @@ describe('SettingsPanel', () => {
     expect(calledWith.magnet!.forceTrackerIntervalSecs).toBe(mockConfig.magnet.forceTrackerIntervalSecs)
     expect(calledWith.magnet!.deferWritesUpToMb).toBe(mockConfig.magnet.deferWritesUpToMb)
     expect(calledWith.magnet!.disableDhtWhenSocks).toBe(mockConfig.magnet.disableDhtWhenSocks)
+  })
+
+  it('后端旧 DTO 缺 allowPrivatePeers 时受限 Peer 开关默认关闭', async () => {
+    const legacyMagnet = { ...mockConfig.magnet }
+    Reflect.deleteProperty(legacyMagnet, 'allowPrivatePeers')
+    vi.mocked(api.getConfig).mockResolvedValue({
+      ...mockConfig,
+      magnet: legacyMagnet,
+    })
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+    const toggle = screen.getByRole('button', { name: '允许私有 Peer' })
+    expect(toggle.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('允许私有 Peer 开关可访问地翻转并保存补丁', async () => {
+    vi.mocked(api.getConfig).mockResolvedValue(mockConfig)
+    vi.mocked(api.updateConfig).mockResolvedValue(undefined)
+    renderSettingsPanel()
+
+    await waitFor(() => {
+      expect(screen.queryByText('加载配置中...')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('磁力链接'))
+    const toggle = screen.getByRole('button', { name: '允许私有 Peer' })
+    expect(toggle.getAttribute('aria-pressed')).toBe('false')
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(screen.getByText('保存配置'))
+    await waitFor(() => {
+      expect(api.updateConfig).toHaveBeenCalledTimes(1)
+    })
+
+    const calledWith = vi.mocked(api.updateConfig).mock.calls[0]?.[0] as ConfigPatch
+    expect(calledWith.magnet?.allowPrivatePeers).toBe(true)
   })
 
   it('About 标签展示支持协议 + 只读 User-Agent', async () => {

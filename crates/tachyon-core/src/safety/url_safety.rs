@@ -132,52 +132,45 @@ pub fn validate_redirect(
     Ok(safe_ips)
 }
 
-pub fn reject_forbidden_ip(ip: IpAddr) -> DownloadResult<()> {
+/// 判断 IP 是否属于受限 BT peer 地址范围。
+///
+/// 此分类不包含 `test-harness` 例外，供 BT 等不能访问本地网络的调用方复用。
+pub fn is_restricted_peer_ip(ip: IpAddr) -> bool {
+    classify_restricted_ip(ip).is_some()
+}
+
+#[derive(Clone, Copy)]
+enum RestrictedIpKind {
+    General,
+    Documentation,
+    Benchmark,
+    IetfProtocolAssignments,
+}
+
+/// 受限地址规则的唯一来源；HTTP 和 BT 策略均复用此纯分类。
+fn classify_restricted_ip(ip: IpAddr) -> Option<RestrictedIpKind> {
     match ip {
-        IpAddr::V4(v4) => reject_forbidden_ipv4(v4),
-        IpAddr::V6(v6) => reject_forbidden_ipv6(v6),
+        IpAddr::V4(ip) => classify_restricted_ipv4(ip),
+        IpAddr::V6(ip) => classify_restricted_ipv6(ip),
     }
 }
 
-fn reject_forbidden_ipv4(ip: Ipv4Addr) -> DownloadResult<()> {
+fn classify_restricted_ipv4(ip: Ipv4Addr) -> Option<RestrictedIpKind> {
     let octets = ip.octets();
 
-    // test-harness feature 下放行 loopback:供 wiremock 端到端测试使用。
-    // 仅 dev-dependencies 开启,生产 binary 的 SSRF 防护完整。
-    #[cfg(not(feature = "test-harness"))]
     if ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip == Ipv4Addr::new(169, 254, 169, 254)
+        // 组播(224.0.0.0/4)和保留地址(240.0.0.0/4,含广播 255.255.255.255)
+        || octets[0] >= 224
+        // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+        || (octets[0] == 100 && (octets[1] & 0xC0) == 0x40)
     {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip}"
-        )));
+        return Some(RestrictedIpKind::General);
     }
-    #[cfg(feature = "test-harness")]
-    if ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip == Ipv4Addr::new(169, 254, 169, 254)
-    {
-        // loopback 放行,其余受限地址仍拒绝
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip}"
-        )));
-    }
-    // 组播(224.0.0.0/4)和保留地址(240.0.0.0/4,含广播 255.255.255.255)
-    if octets[0] >= 224 {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip}"
-        )));
-    }
-    // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
-    if octets[0] == 100 && (octets[1] & 0xC0) == 0x40 {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip}"
-        )));
-    }
+
     // RFC 5737 文档地址: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
     // S-16: 匹配整个 /24 网段(前 3 个字节),而非仅 .0 网络地址
     let doc_ranges: [(u8, u8, u8); 3] = [(192, 0, 2), (198, 51, 100), (203, 0, 113)];
@@ -185,56 +178,93 @@ fn reject_forbidden_ipv4(ip: Ipv4Addr) -> DownloadResult<()> {
         .iter()
         .any(|&(a, b, c)| octets[0] == a && octets[1] == b && octets[2] == c)
     {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip} (RFC 5737 文档地址)"
-        )));
+        return Some(RestrictedIpKind::Documentation);
     }
     // RFC 2544 基准测试地址 (198.18.0.0/15)
     if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip} (RFC 2544 基准测试地址)"
-        )));
+        return Some(RestrictedIpKind::Benchmark);
     }
     // IETF Protocol Assignments (192.0.0.0/24)
     if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv4 地址: {ip} (IETF Protocol Assignments)"
-        )));
+        return Some(RestrictedIpKind::IetfProtocolAssignments);
     }
-    Ok(())
+    None
 }
 
-fn reject_forbidden_ipv6(ip: Ipv6Addr) -> DownloadResult<()> {
+fn classify_restricted_ipv6(ip: Ipv6Addr) -> Option<RestrictedIpKind> {
     if let Some(mapped) = ip.to_ipv4_mapped() {
-        return reject_forbidden_ipv4(mapped);
+        return classify_restricted_ipv4(mapped);
     }
 
     let segments = ip.segments();
     let first_segment = segments[0];
     let unique_local = (first_segment & 0xfe00) == 0xfc00;
     let link_local = (first_segment & 0xffc0) == 0xfe80;
-    // test-harness feature 下放行 loopback(::1):供 wiremock 端到端测试使用。
-    // 仅 dev-dependencies 开启,生产 binary 的 SSRF 防护完整。
-    #[cfg(not(feature = "test-harness"))]
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || unique_local || link_local {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv6 地址: {ip}"
-        )));
-    }
-    #[cfg(feature = "test-harness")]
-    if ip.is_unspecified() || ip.is_multicast() || unique_local || link_local {
-        // loopback(::1)放行,其余受限地址仍拒绝
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv6 地址: {ip}"
-        )));
-    }
     // 站点本地地址 fec0::/10 (RFC 3879 已弃用但仍可能被解析)
-    if (segments[0] & 0xFFC0) == 0xFEC0 {
-        return Err(DownloadError::Config(format!(
-            "不允许访问受限 IPv6 地址: {ip}"
-        )));
+    let site_local = (first_segment & 0xFFC0) == 0xFEC0;
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || unique_local
+        || link_local
+        || site_local
+    {
+        Some(RestrictedIpKind::General)
+    } else {
+        None
     }
-    Ok(())
+}
+
+pub fn reject_forbidden_ip(ip: IpAddr) -> DownloadResult<()> {
+    let Some(kind) = classify_restricted_ip(ip) else {
+        return Ok(());
+    };
+
+    // 仅 HTTP 测试夹具允许 loopback 访问 wiremock；基础分类和 BT 策略不放宽。
+    #[cfg(feature = "test-harness")]
+    if is_loopback_ip(ip) {
+        return Ok(());
+    }
+
+    Err(forbidden_ip_error(ip, kind))
+}
+
+#[cfg(feature = "test-harness")]
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    }
+}
+
+#[cfg(test)]
+fn reject_forbidden_ipv4(ip: Ipv4Addr) -> DownloadResult<()> {
+    reject_forbidden_ip(IpAddr::V4(ip))
+}
+
+fn forbidden_ip_error(ip: IpAddr, kind: RestrictedIpKind) -> DownloadError {
+    match ip {
+        IpAddr::V4(ip) => forbidden_ipv4_error(ip, kind),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| forbidden_ipv4_error(mapped, kind))
+            .unwrap_or_else(|| DownloadError::Config(format!("不允许访问受限 IPv6 地址: {ip}"))),
+    }
+}
+
+fn forbidden_ipv4_error(ip: Ipv4Addr, kind: RestrictedIpKind) -> DownloadError {
+    let suffix = match kind {
+        RestrictedIpKind::General => "",
+        RestrictedIpKind::Documentation => " (RFC 5737 文档地址)",
+        RestrictedIpKind::Benchmark => " (RFC 2544 基准测试地址)",
+        RestrictedIpKind::IetfProtocolAssignments => " (IETF Protocol Assignments)",
+    };
+    DownloadError::Config(format!("不允许访问受限 IPv4 地址: {ip}{suffix}"))
 }
 
 /// 从 magnet URI 提取 info hash(xt=urn:btih:<hash>),统一小写。
@@ -382,9 +412,10 @@ mod tests {
         ] {
             assert!(reject_forbidden_ip(ip).is_err(), "{ip} should be rejected");
         }
-        // loopback 应被放行
+        // loopback 应被放行。
         assert!(reject_forbidden_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_ok());
         assert!(reject_forbidden_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_ok());
+        assert!(reject_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()).is_ok());
     }
 
     #[test]
@@ -494,6 +525,47 @@ mod tests {
     fn accepts_public_https_url() {
         let url = Url::parse("https://example.com/releases/app.zip").unwrap();
         assert!(validate_public_http_url(&url).is_ok());
+    }
+
+    #[test]
+    fn restricted_peer_ip_rejects_all_restricted_ranges_under_test_harness() {
+        // BT peer 策略不得继承 HTTP test-harness 对 loopback 的放行例外。
+        let restricted_ips = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6("fd00::1".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6("ff02::1".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)),
+        ];
+
+        for ip in restricted_ips {
+            assert!(
+                is_restricted_peer_ip(ip),
+                "受限 BT peer 地址必须被拒绝: {ip}"
+            );
+        }
+
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V6("2001:4860:4860::8888".parse().unwrap()),
+        ] {
+            assert!(
+                !is_restricted_peer_ip(ip),
+                "公网 BT peer 地址不得被拒绝: {ip}"
+            );
+        }
     }
 
     #[test]

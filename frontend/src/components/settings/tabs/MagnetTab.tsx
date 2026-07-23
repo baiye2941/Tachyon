@@ -19,6 +19,7 @@ export interface MagnetTabProps {
 
 export default function MagnetTab(props: MagnetTabProps) {
   const t = tr;
+
   return (
     <div class="flex flex-col gap-5">
       <ToggleItem
@@ -36,6 +37,21 @@ export default function MagnetTab(props: MagnetTabProps) {
         value={props.draft.magnet.disableDhtPersistence}
         onChange={(v) => props.setDraft("magnet", "disableDhtPersistence", v)}
       />
+      <ToggleItem
+        label={t("settings.magnet.allowPrivatePeers")}
+        value={props.draft.magnet.allowPrivatePeers}
+        onChange={(v) => props.setDraft("magnet", "allowPrivatePeers", v)}
+      />
+      <div
+        style={{
+          "font-size": "11px",
+          color: "var(--color-text-tertiary)",
+          "margin-top": "-12px",
+          "line-height": "1.5",
+        }}
+      >
+        {t("settings.magnet.allowPrivatePeersHint")}
+      </div>
       <div>
         <span
           style={{

@@ -14,6 +14,7 @@ pub use filename::{
     validate_save_path,
 };
 pub use url_safety::{
-    magnet_info_hash, redact_url_for_log, reject_forbidden_ip, url_for_display, url_identity_key,
-    validate_public_http_url, validate_redirect, validate_resolved_ip,
+    is_restricted_peer_ip, magnet_info_hash, redact_url_for_log, reject_forbidden_ip,
+    url_for_display, url_identity_key, validate_public_http_url, validate_redirect,
+    validate_resolved_ip,
 };

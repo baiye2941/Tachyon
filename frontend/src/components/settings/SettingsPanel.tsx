@@ -85,6 +85,7 @@ export interface ConfigDraft {
     forceTrackerIntervalSecs: number;
     deferWritesUpToMb: number;
     disableDhtWhenSocks: boolean;
+    allowPrivatePeers: boolean;
   };
   hub: {
     sourceMode: HfSourceMode;
@@ -194,6 +195,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       forceTrackerIntervalSecs: 120,
       deferWritesUpToMb: 16,
       disableDhtWhenSocks: true,
+      allowPrivatePeers: false,
     },
     hub: {
       sourceMode: "mirror",
@@ -255,6 +257,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         forceTrackerIntervalSecs: cfg.magnet.forceTrackerIntervalSecs ?? 120,
         deferWritesUpToMb: cfg.magnet.deferWritesUpToMb ?? 16,
         disableDhtWhenSocks: cfg.magnet.disableDhtWhenSocks ?? true,
+        allowPrivatePeers: cfg.magnet.allowPrivatePeers ?? false,
       },
       hub: {
         sourceMode: cfg.hub?.sourceMode ?? "mirror",
@@ -329,6 +332,7 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         forceTrackerIntervalSecs: draft.magnet.forceTrackerIntervalSecs,
         deferWritesUpToMb: draft.magnet.deferWritesUpToMb,
         disableDhtWhenSocks: draft.magnet.disableDhtWhenSocks,
+        allowPrivatePeers: draft.magnet.allowPrivatePeers,
       },
       scheduler: {
         minFragmentSize: draft.scheduler.minFragmentSize,

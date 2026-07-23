@@ -38,6 +38,22 @@ pub type ProgressCallback =
 use crate::repository::TaskRepository;
 use crate::task_store::TaskStore;
 
+/// 在 blocking 线程中读取 PlanComplete 所需的任务快照。
+async fn load_plan_snapshot(
+    task_store: Arc<TaskStore>,
+    task_id: String,
+) -> Result<Result<Option<tachyon_store::TaskSnapshot>, crate::AppError>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(hook) = tests::test_hook::take_for(&task_id) {
+            return hook(task_store, task_id);
+        }
+
+        task_store.load_snapshot(&task_id)
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // ChunkReaderJob: 提交到池的进度处理任务
 // ---------------------------------------------------------------------------
@@ -293,8 +309,8 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 // 从快照种子 total_downloaded / frag_bytes,避免续传后进度回退与双重计数。
                 // 有 snapshot 时用 snap.downloaded + partial_fragments;
                 // 无 snapshot 时 fallback 到 task_repository 中现有 downloaded。
-                match task_store.load_snapshot(&task_id) {
-                    Ok(Some(snap)) => {
+                match load_plan_snapshot(Arc::clone(&task_store), task_id.clone()).await {
+                    Ok(Ok(Some(snap))) => {
                         // 一致性校验:快照已完成分片必须 ⊆ PlanComplete 宣告的
                         // completed_indices。引擎在对象身份不兼容等场景会丢弃
                         // 续传数据全量重下,此时 completed_indices 不含快照分片;
@@ -329,7 +345,18 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                             total_downloaded = 0;
                         }
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
+                        total_downloaded = task_repository
+                            .get(&task_id)
+                            .map(|t| t.downloaded)
+                            .unwrap_or(0);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "PlanComplete 加载快照失败,fallback 到 repository downloaded"
+                        );
                         total_downloaded = task_repository
                             .get(&task_id)
                             .map(|t| t.downloaded)
@@ -339,7 +366,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                         tracing::warn!(
                             task_id = %task_id,
                             error = %e,
-                            "PlanComplete 加载快照失败,fallback 到 repository downloaded"
+                            "PlanComplete 快照 blocking 任务失败,fallback 到 repository downloaded"
                         );
                         total_downloaded = task_repository
                             .get(&task_id)
@@ -660,6 +687,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::AppError;
     use crate::commands::TaskInfo;
     use crate::repository::TaskRepository;
     use tachyon_core::types::DownloadState;
@@ -745,6 +773,445 @@ mod tests {
             display_order: 0,
             mirror_urls: None,
         }
+    }
+
+    /// `PlanComplete` 快照读取的测试专用接缝。
+    ///
+    /// 生产 helper 后续仅能在其 `spawn_blocking` closure 内取走并调用该 hook；
+    /// hook 不安装时必须保持真实 `TaskStore::load_snapshot` 路径。
+    pub(in super::super) mod test_hook {
+        use super::*;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        type PlanSnapshotHook = Box<
+            dyn FnOnce(Arc<TaskStore>, String) -> Result<Option<TaskSnapshot>, AppError>
+                + Send
+                + 'static,
+        >;
+
+        struct InstalledPlanSnapshotHook {
+            expected_task_id: String,
+            hook: PlanSnapshotHook,
+        }
+
+        static PLAN_SNAPSHOT_HOOK: OnceLock<Mutex<Option<InstalledPlanSnapshotHook>>> =
+            OnceLock::new();
+        static PLAN_SNAPSHOT_HOOK_TEST_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> =
+            OnceLock::new();
+
+        fn hook_slot() -> &'static Mutex<Option<InstalledPlanSnapshotHook>> {
+            PLAN_SNAPSHOT_HOOK.get_or_init(|| Mutex::new(None))
+        }
+
+        fn test_lock() -> &'static Arc<tokio::sync::Mutex<()>> {
+            PLAN_SNAPSHOT_HOOK_TEST_LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        }
+
+        /// 安装一次性 hook，并以 RAII 在测试退出时恢复全局状态。
+        pub(super) async fn install(
+            expected_task_id: String,
+            hook: PlanSnapshotHook,
+        ) -> PlanSnapshotHookGuard {
+            let serial_guard = Arc::clone(test_lock()).lock_owned().await;
+            let mut slot = hook_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(slot.is_none(), "PlanComplete 测试 hook 不应被重复安装");
+            *slot = Some(InstalledPlanSnapshotHook {
+                expected_task_id,
+                hook,
+            });
+            drop(slot);
+
+            PlanSnapshotHookGuard {
+                _serial_guard: serial_guard,
+            }
+        }
+
+        /// 仅当 PlanComplete 对应预期任务时，供 production helper 取走一次性 hook。
+        /// 非匹配任务必须保留 slot，继续走真实 `TaskStore` 路径。
+        pub(in super::super) fn take_for(task_id: &str) -> Option<PlanSnapshotHook> {
+            let mut slot = hook_slot().lock().unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|installed| installed.expected_task_id == task_id)
+            {
+                slot.take().map(|installed| installed.hook)
+            } else {
+                None
+            }
+        }
+
+        pub(super) struct PlanSnapshotHookGuard {
+            _serial_guard: tokio::sync::OwnedMutexGuard<()>,
+        }
+
+        impl Drop for PlanSnapshotHookGuard {
+            fn drop(&mut self) {
+                let _ = hook_slot().lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
+        }
+    }
+
+    enum SnapshotHookRelease {
+        Return(Result<Option<TaskSnapshot>, AppError>),
+        Panic,
+    }
+
+    /// 安装会在 blocking closure 内报告开始并等待 release 的快照 hook。
+    fn install_blocking_snapshot_hook(
+        expected_task_id: String,
+        started_tx: oneshot::Sender<()>,
+        release_rx: oneshot::Receiver<SnapshotHookRelease>,
+    ) -> impl std::future::Future<Output = test_hook::PlanSnapshotHookGuard> {
+        test_hook::install(
+            expected_task_id,
+            Box::new(move |_task_store, _task_id| {
+                let _ = started_tx.send(());
+                match release_rx
+                    .blocking_recv()
+                    .expect("测试必须在 hook 等待时发送 release")
+                {
+                    SnapshotHookRelease::Return(result) => result,
+                    SnapshotHookRelease::Panic => panic!("受控 PlanComplete 快照 hook panic"),
+                }
+            }),
+        )
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CallbackEvent {
+        delta: Option<ProgressDelta>,
+        downloaded: u64,
+    }
+
+    fn callback_observer(
+        task_repository: TaskRepository,
+        events_tx: mpsc::UnboundedSender<CallbackEvent>,
+    ) -> ProgressCallback {
+        Arc::new(move |task_id, delta, _fragment_bytes| {
+            let downloaded = task_repository
+                .get(task_id)
+                .expect("callback 对应任务必须仍存在")
+                .downloaded;
+            events_tx
+                .send(CallbackEvent { delta, downloaded })
+                .expect("测试必须持续接收 progress callback");
+        })
+    }
+
+    /// 无关任务的 PlanComplete 不得取走目标任务的全局快照 hook。
+    ///
+    /// 先让 other 任务走真实的无快照 fallback 并完成，再启动 target；target 才能
+    /// 触发其阻塞 hook 并沿既有 release/finish 路径退出。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn plan_complete_hook_ignores_non_matching_task_without_consuming_target_hook() {
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let other_task_id = "plan-complete-hook-other".to_string();
+        let target_task_id = "plan-complete-hook-target".to_string();
+
+        task_repository.insert(
+            other_task_id.clone(),
+            make_task_info(&other_task_id, 1_000, 300, 2, 0),
+        );
+        let target_task = make_task_info(&target_task_id, 1_000, 0, 2, 0);
+        task_repository.insert(target_task_id.clone(), target_task.clone());
+        let mut target_snapshot = make_resume_snapshot(&target_task, vec![0], HashMap::new(), 500);
+        target_snapshot.downloaded = 500;
+        task_store.save_snapshot(&target_snapshot).unwrap();
+
+        let (started_tx, mut started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let _hook =
+            install_blocking_snapshot_hook(target_task_id.clone(), started_tx, release_rx).await;
+
+        let (other_progress_tx, other_progress_rx) = mpsc::channel(1);
+        let (other_done_tx, mut other_done_rx) = oneshot::channel();
+        other_progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 2,
+                completed_indices: vec![],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+        drop(other_progress_tx);
+        let other_job = ChunkReaderJob {
+            task_id: other_task_id.clone(),
+            progress_rx: other_progress_rx,
+            task_repository: task_repository.clone(),
+            task_store: task_store.clone(),
+            done_tx: other_done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        let other_reader = tokio::spawn(run_chunk_reader(other_job));
+
+        tokio::select! {
+            started = &mut started_rx => {
+                started.expect("target hook 的 started 通知不得被关闭");
+                panic!("无关 other 任务错误地消费了 target 的 PlanComplete hook");
+            }
+            completed = &mut other_done_rx => {
+                completed.expect("other 任务必须通过真实 fallback 路径完成");
+            }
+        }
+        other_reader
+            .await
+            .expect("other 任务 fallback 后不得 panic");
+        assert_eq!(
+            task_repository.get(&other_task_id).unwrap().downloaded,
+            300,
+            "无快照 other 任务必须保留 repository downloaded 作为 fallback 种子"
+        );
+
+        let (target_progress_tx, target_progress_rx) = mpsc::channel(1);
+        let (target_done_tx, target_done_rx) = oneshot::channel();
+        target_progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 2,
+                completed_indices: vec![0],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+        drop(target_progress_tx);
+        let target_job = ChunkReaderJob {
+            task_id: target_task_id.clone(),
+            progress_rx: target_progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx: target_done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        let target_reader = tokio::spawn(run_chunk_reader(target_job));
+
+        started_rx
+            .await
+            .expect("target 任务必须启动其 PlanComplete hook");
+        assert!(
+            release_tx
+                .send(SnapshotHookRelease::Return(Ok(Some(target_snapshot))))
+                .is_ok(),
+            "target hook 必须仍在等待 release"
+        );
+        target_done_rx
+            .await
+            .expect("release 后 target 任务必须完成");
+        target_reader
+            .await
+            .expect("release 后 target 任务不得 panic");
+        assert_eq!(
+            task_repository.get(&target_task_id).unwrap().downloaded,
+            500,
+            "target 任务必须使用其 hook 返回的快照种子"
+        );
+    }
+
+    /// PlanComplete 的同步快照读取必须离开唯一 Tokio worker，且在快照种子、
+    /// PlanComplete callback 和其后 Chunk 之间形成顺序屏障。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn plan_complete_waits_for_blocking_snapshot_before_callbacks_and_chunks() {
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-blocking-order".to_string();
+        let task = make_task_info(&task_id, 1_000, 17, 3, 0);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let snapshot = make_resume_snapshot(&task, vec![0, 1], HashMap::new(), 350);
+        let mut snapshot = snapshot;
+        snapshot.downloaded = 700;
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (started_tx, mut started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let _hook = install_blocking_snapshot_hook(task_id.clone(), started_tx, release_rx).await;
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = oneshot::channel();
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 3,
+                completed_indices: vec![0, 1],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: Some(callback_observer(task_repository.clone(), events_tx)),
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        let mut reader = tokio::spawn(run_chunk_reader(job));
+
+        tokio::select! {
+            started = &mut started_rx => {
+                started.expect("blocking snapshot hook 的 started 通知不得被关闭");
+            }
+            event = events_rx.recv() => {
+                panic!("PlanComplete 在 blocking snapshot hook 开始前触发 callback: {event:?}");
+            }
+            joined = &mut reader => {
+                panic!("chunk reader 在 blocking snapshot hook 开始前退出: {joined:?}");
+            }
+        }
+
+        // 在 loader 已阻塞后才排队后续 Chunk，证明同一 progress channel 不会越过屏障。
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 2,
+                fragment_downloaded: 300,
+                completed: true,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        let (sibling_tx, sibling_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            sibling_tx
+                .send(())
+                .expect("同一 reactor 的 sibling 接收端必须存在");
+        });
+        sibling_rx
+            .await
+            .expect("同步 snapshot read 不得堵塞唯一 Tokio worker");
+
+        assert_eq!(
+            task_repository.get(&task_id).unwrap().downloaded,
+            17,
+            "release 前不得应用依赖 snapshot 的 downloaded 种子"
+        );
+        assert!(
+            matches!(events_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "release 前不得触发 PlanComplete 或后续 Chunk callback"
+        );
+
+        assert!(
+            release_tx
+                .send(SnapshotHookRelease::Return(Ok(Some(snapshot))))
+                .is_ok(),
+            "blocking snapshot hook 必须仍在等待 release"
+        );
+
+        done_rx
+            .await
+            .expect("release 后 chunk reader 必须发送 completion signal");
+        reader.await.expect("release 后 chunk reader 不得 panic");
+
+        assert_eq!(
+            events_rx.recv().await,
+            Some(CallbackEvent {
+                delta: None,
+                downloaded: 700,
+            }),
+            "PlanComplete callback 必须先观察到 snapshot seed"
+        );
+        assert_eq!(
+            events_rx.recv().await,
+            Some(CallbackEvent {
+                delta: Some(ProgressDelta::Completed(2)),
+                downloaded: 1_000,
+            }),
+            "随后排队的 Chunk 必须在 PlanComplete callback 后才消费"
+        );
+        assert!(
+            matches!(
+                events_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "仅发送 PlanComplete 和一个 Chunk 时不应产生额外 callback"
+        );
+    }
+
+    /// blocking closure panic 形成 JoinError 时必须 fallback 到 repository downloaded，
+    /// 并且 worker 仍要发送 completion signal，不能展开 async chunk reader。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn plan_complete_falls_back_to_repository_when_snapshot_blocking_task_panics() {
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "plan-complete-join-error-fallback".to_string();
+        let task = make_task_info(&task_id, 1_000, 321, 2, 0);
+        task_repository.insert(task_id.clone(), task);
+
+        let (started_tx, mut started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let _hook = install_blocking_snapshot_hook(task_id.clone(), started_tx, release_rx).await;
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = mpsc::channel(2);
+        let (done_tx, done_rx) = oneshot::channel();
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 2,
+                completed_indices: vec![],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: Some(callback_observer(task_repository.clone(), events_tx)),
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        let mut reader = tokio::spawn(run_chunk_reader(job));
+
+        tokio::select! {
+            started = &mut started_rx => {
+                started.expect("blocking snapshot hook 的 started 通知不得被关闭");
+            }
+            event = events_rx.recv() => {
+                panic!("JoinError hook 开始前 PlanComplete 已触发 callback: {event:?}");
+            }
+            joined = &mut reader => {
+                panic!("JoinError hook 开始前 chunk reader 已退出: {joined:?}");
+            }
+        }
+
+        assert!(
+            release_tx.send(SnapshotHookRelease::Panic).is_ok(),
+            "panic hook 必须仍在等待 release"
+        );
+        drop(progress_tx);
+
+        done_rx
+            .await
+            .expect("JoinError fallback 后 chunk reader 仍须发送 completion signal");
+        reader
+            .await
+            .expect("JoinError fallback 不得令 async chunk reader panic");
+
+        assert_eq!(
+            task_repository.get(&task_id).unwrap().downloaded,
+            321,
+            "JoinError 必须 fallback 到 repository downloaded"
+        );
+        assert_eq!(
+            events_rx.recv().await,
+            Some(CallbackEvent {
+                delta: None,
+                downloaded: 321,
+            }),
+            "JoinError fallback 后仍须发出 PlanComplete callback"
+        );
+        assert!(
+            matches!(
+                events_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "仅发送 PlanComplete 时不应产生额外 callback"
+        );
     }
 
     #[tokio::test]
