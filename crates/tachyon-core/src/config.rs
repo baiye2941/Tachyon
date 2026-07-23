@@ -636,6 +636,37 @@ pub fn detect_socks_proxy() -> Option<String> {
     None
 }
 
+/// 解析用于 HTTP(S) 客户端的代理 URL
+///
+/// 优先级:
+/// 1. `explicit` 非空 → 原样返回
+/// 2. 环境变量(大写优先小写): `ALL_PROXY` > `HTTPS_PROXY` > `HTTP_PROXY`
+///
+/// 与 `detect_socks_proxy` 不同:返回原始 URL(不把 http 转 socks5),供
+/// `reqwest::Proxy::all` 使用。**仅有 HTTP_PROXY 时也返回**,配合 Proxy::all
+/// 覆盖 HTTPS CONNECT,修复 reqwest 默认「HTTPS 不读 HTTP_PROXY」导致的直连 403。
+pub fn resolve_http_proxy(explicit: Option<&str>) -> Option<String> {
+    if let Some(p) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(p.to_string());
+    }
+    for var in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(url) = std::env::var(var) {
+            let url = url.trim();
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// 布尔默认值 true 的辅助函数（serde default 不支持直接写 true）
 fn default_true() -> bool {
     true
@@ -4320,6 +4351,123 @@ mod tests {
             redact_proxy_url("http://user:pass@proxy.example.com:8080"),
             "http://proxy.example.com:8080"
         );
+    }
+
+    #[test]
+    fn test_resolve_http_proxy_explicit_wins_over_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // Windows env 大小写不敏感:先清小写再 set 大写
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::set_var("HTTP_PROXY", "http://env:1");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("ALL_PROXY");
+        }
+        assert_eq!(
+            resolve_http_proxy(Some("http://explicit:9")).as_deref(),
+            Some("http://explicit:9")
+        );
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    /// 关键:仅 HTTP_PROXY 时也必须返回,否则 HTTPS 下载直连被墙/403
+    #[test]
+    fn test_resolve_http_proxy_http_proxy_only_covers_https() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:7897");
+        }
+        assert_eq!(
+            resolve_http_proxy(None).as_deref(),
+            Some("http://127.0.0.1:7897"),
+            "仅 HTTP_PROXY 时 resolve 必须返回,供 Proxy::all 覆盖 HTTPS"
+        );
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_resolve_http_proxy_https_over_http() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("ALL_PROXY");
+            std::env::set_var("HTTPS_PROXY", "http://https-proxy:443");
+            std::env::set_var("HTTP_PROXY", "http://http-proxy:80");
+        }
+        assert_eq!(
+            resolve_http_proxy(None).as_deref(),
+            Some("http://https-proxy:443")
+        );
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_resolve_http_proxy_all_proxy_highest() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:1080");
+            std::env::set_var("HTTPS_PROXY", "http://https-proxy:443");
+            std::env::set_var("HTTP_PROXY", "http://http-proxy:80");
+        }
+        assert_eq!(
+            resolve_http_proxy(None).as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_resolve_http_proxy_empty_explicit_falls_to_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("all_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+        }
+        assert_eq!(
+            resolve_http_proxy(Some("  ")).as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn test_resolve_http_proxy_none_when_unset() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+        }
+        assert!(resolve_http_proxy(None).is_none());
     }
 
     #[test]
