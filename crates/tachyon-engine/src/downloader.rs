@@ -95,13 +95,6 @@ const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
 /// 构造全局 BufferPool 时能引用同一值,保证池化 buffer 尺寸与写入阈值一致。
 const WRITE_BATCH_BYTES: usize = tachyon_core::config::WRITE_BATCH_BYTES;
 
-/// 控制通道(暂停/取消)检查频率 — 每 N 个 chunk 检查一次。
-///
-/// watch::Receiver::borrow_and_update 是原子读,单次开销极低,但高速下载
-/// (小 chunk)下每 chunk 检查会累积。降频到每 8 chunk 检查一次,暂停/取消
-/// 响应延迟仍在 MB 级(8 chunk),用户无感。
-const CONTROL_CHECK_CHUNK_INTERVAL: u64 = 8;
-
 /// P6:verify 读盘哈希循环的取消检查点间隔 — 每累计 N 字节已读数据检查一次中断信号。
 ///
 /// verify 阶段读盘哈希在大文件(数十 GB)上可能持续数分钟,无检查点时取消
@@ -414,7 +407,6 @@ impl DownloadTask {
                             session.handle_cache(),
                         )
                         .with_ops_gate(session.ops_gate())
-                        .with_session_coordinator(session.session_coordinator())
                         .with_storage_factory(factory.clone().boxed()),
                     );
                     let protocol: Arc<dyn Protocol> = magnet_arc.clone();
@@ -670,7 +662,6 @@ impl DownloadTask {
                 bt_session.handle_cache(),
             )
             .with_ops_gate(bt_session.ops_gate())
-            .with_session_coordinator(bt_session.session_coordinator())
             .with_storage_factory(bt_factory),
         );
 
@@ -872,6 +863,30 @@ impl DownloadTask {
         }
     }
 
+    /// 控制通道当前是否为 Pause(主循环禁止 spawn/rebalance 用)
+    fn control_is_paused(control_rx: &Option<watch::Receiver<TaskCommand>>) -> bool {
+        control_rx
+            .as_ref()
+            .is_some_and(|rx| matches!(*rx.borrow(), TaskCommand::Pause))
+    }
+
+    /// 协作式热路径检查:若控制通道为 Pause/Cancel/Failed 立即返回对应错误。
+    /// 与 `wait_control_rx` 不同:**Pause 时不挂起等 Resume**,立刻 Err 让调用方停 IO;
+    /// Resume 等待由 spawn 重试循环/外层负责。
+    fn check_control_interrupt(
+        control_rx: &mut Option<watch::Receiver<TaskCommand>>,
+    ) -> DownloadResult<()> {
+        let Some(rx) = control_rx.as_mut() else {
+            return Ok(());
+        };
+        match rx.borrow_and_update().to_download_state() {
+            DownloadState::Cancelled => Err(DownloadError::Cancelled),
+            DownloadState::Failed => Err(DownloadError::Other("任务已失败".into())),
+            DownloadState::Paused => Err(DownloadError::Paused),
+            _ => Ok(()),
+        }
+    }
+
     async fn wait_control(
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
@@ -884,30 +899,24 @@ impl DownloadTask {
 
     /// 在下载进行期间监视中断信号(取消/暂停),供 `tokio::select!` 分支使用。
     ///
-    /// 与 `wait_control_rx` 的关键区别:正常运行状态(Downloading 等)下**不会立即返回**,
-    /// 而是挂起等待状态变化,因此不会在 `select!` 中抢占正在进行的下载分支。
-    /// 只有在出现 Cancelled/Failed 时返回 `Err`,出现 Paused 时按暂停语义阻塞/超时。
+    /// 与 `wait_control_rx` 的关键区别:
+    /// - 正常运行(Downloading 等)下**挂起**等状态变化,不抢占下载分支
+    /// - **Paused 立即返回 `Err(Paused)`**,使 select 抢占 stream/write,停止 in-flight IO
+    ///   (wait_control_rx 仍负责在分片间隙/入队前挂起等 Resume)
+    /// - Cancelled/Failed 返回对应 Err
+    ///
     /// 控制通道关闭时返回错误,避免任务永久挂起。
     async fn watch_for_interrupt(
         rx: &mut watch::Receiver<TaskCommand>,
-        pause_timeout: Duration,
+        _pause_timeout: Duration,
     ) -> DownloadResult<()> {
         loop {
             let state = rx.borrow_and_update().to_download_state();
             match state {
                 DownloadState::Cancelled => return Err(DownloadError::Cancelled),
                 DownloadState::Failed => return Err(DownloadError::Other("任务已失败".into())),
-                DownloadState::Paused => {
-                    tokio::time::timeout(pause_timeout, rx.changed())
-                        .await
-                        .map_err(|_| {
-                            DownloadError::Timeout(format!(
-                                "暂停超过 {} 秒",
-                                pause_timeout.as_secs()
-                            ))
-                        })?
-                        .map_err(|_| DownloadError::Other("控制通道已关闭".into()))?;
-                }
+                // 立即抢占 select:禁止在 Paused 时继续读网/写盘
+                DownloadState::Paused => return Err(DownloadError::Paused),
                 _ => {
                     if rx.changed().await.is_err() {
                         return Err(DownloadError::Other("控制通道意外关闭".into()));
@@ -1194,11 +1203,19 @@ impl DownloadTask {
         // BT/magnet 任务与 HTTP 分片策略解耦:固定走小分片公式,
         // 让分片完成事件(调度器带宽样本唯一来源)在慢 swarm 下及时产生,
         // 并收细 stall 重试粒度;不采用调度器按 HTTP 语义给出的 fragment_size。
-        // HTTP 路径保持原样:调度器有高置信度带宽预测时使用其建议,否则回退到
-        // scheduler_config 计算,避免冷启动时盲目采用默认 min_fragment_size
-        // 导致小文件过度分片。
+        //
+        // 断点续传:若已有 completed/partial 快照(按 **index** 存储),
+        // 必须使用与冷启动相同的确定性划分(plan_fragments 的 None 分支),
+        // **禁止**再用 recommendation.fragment_size——否则 resume 后分片边界
+        // 漂移,completed index 会错跳过/重下错误区间。
+        //
+        // 首下 HTTP:调度器 confidence>0 时用其建议,否则回退 scheduler_config。
+        let has_resume_snapshot =
+            !self.completed_fragments.is_empty() || !self.partial_fragments.is_empty();
         let suggested_frag_size = if self.is_bt_task() {
             Some(Self::bt_fragment_size(file_size))
+        } else if has_resume_snapshot {
+            None
         } else if recommendation.confidence > 0.0 {
             Some(recommendation.fragment_size)
         } else {
@@ -1379,6 +1396,11 @@ impl DownloadTask {
             match self.execute_full_download_once(pause_timeout).await {
                 Ok(()) => break,
                 Err(e) => {
+                    // 用户暂停:等 Resume 后重试本 attempt,不计入 max_retries
+                    if matches!(e, DownloadError::Paused) {
+                        Self::wait_control(&mut self.control_rx, pause_timeout).await?;
+                        continue;
+                    }
                     // 暂停超时是控制语义,不是瞬态网络故障;禁止纳入 max_retries 退避
                     // (否则 1s 暂停超时 × 默认 3 次重试会远超调用方等待窗口)。
                     if e.is_retryable()
@@ -1512,14 +1534,15 @@ impl DownloadTask {
         loop {
             let chunk_result = if let Some(rx) = self.control_rx.as_mut() {
                 tokio::select! {
-                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
-                        Some(r) => r,
-                        None => break, // EOF:正常退出循环
-                    },
+                    biased;
                     interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
                         interrupt?;
                         return Err(DownloadError::Other("控制信号异常结束".into()));
                     }
+                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
+                        Some(r) => r,
+                        None => break, // EOF:正常退出循环
+                    },
                 }
             } else {
                 match tokio_stream::StreamExt::next(&mut stream).await {
@@ -1527,10 +1550,8 @@ impl DownloadTask {
                     None => break,
                 }
             };
-            // chunk 间隙快速响应暂停/取消
-            if let Some(rx) = self.control_rx.as_mut() {
-                Self::wait_control_rx(rx, pause_timeout).await?;
-            }
+            // chunk 间隙:Pause 立即停,不挂起等 Resume
+            Self::check_control_interrupt(&mut self.control_rx)?;
             let chunk = chunk_result?;
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|_| DownloadError::Config("整块下载 chunk 长度溢出".into()))?;
@@ -1666,7 +1687,7 @@ impl DownloadTask {
         let frag_url = ctx.url.to_string();
         let frag_host = ctx.host.to_string();
         let frag_limiter = ctx.limiter.clone();
-        let frag_control_rx = ctx.control_rx.clone();
+        let mut frag_control_rx = ctx.control_rx.clone();
         let frag_progress_tx = ctx.progress_tx.clone();
         let frag_verifier = ctx.verifier.clone();
         let frag_metrics = ctx.metrics.clone();
@@ -1749,6 +1770,16 @@ impl DownloadTask {
                         break Ok((frag_index, downloaded, duration, computed_hash));
                     }
                     Err(e) => {
+                        // 用户暂停:不计入 attempt,等 Resume 后从同一 attempt 重下本片
+                        if matches!(e, DownloadError::Paused) {
+                            if let Some(rx) = frag_control_rx.as_mut()
+                                && let Err(wait_err) =
+                                    Self::wait_control_rx(rx, pause_timeout).await
+                            {
+                                break Err((frag_index, wait_err));
+                            }
+                            continue;
+                        }
                         if !e.is_retryable()
                             || Self::is_pause_timeout_error(&e)
                             || attempt >= max_retries
@@ -1910,7 +1941,7 @@ impl DownloadTask {
         self.refresh_resolved_host_from_protocol();
         let host = self.request_host()?;
         let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
-        let control_rx = self.control_rx.clone();
+        let mut control_rx = self.control_rx.clone();
         let progress_tx = self.progress_tx.clone();
         let max_retries = self.config.max_retries;
         // 优先使用外部共享限速器(跨任务全局限速),否则从配置创建 per-task 限速器
@@ -1992,7 +2023,7 @@ impl DownloadTask {
         // 初始入队用 clone 的 sender;主循环保留 Option<Sender> 供 rebalance 重入队。
         // 全部初始分片入队后不 drop 主 sender,避免 rebalance 无法再 enqueue。
         let frag_tx_enqueue = frag_tx.as_ref().expect("frag_tx 刚创建").clone();
-        let enqueue_handle = tokio::spawn(async move {
+        let mut enqueue_handle = tokio::spawn(async move {
             for spec in pending_specs {
                 if frag_tx_enqueue.send(spec).await.is_err() {
                     break; // 主循环退出,frag_rx 已 drop
@@ -2036,11 +2067,101 @@ impl DownloadTask {
         let mut reschedule_timer = interval(reschedule_interval);
 
         loop {
+            // 用户 Pause:强制 abort 在途分片并停车,避免 select 饿死/阻塞 await 导致“无法暂停”
+            if Self::control_is_paused(&control_rx) {
+                tracing::info!("检测到 Pause,中止在途分片并等待 Resume");
+                // 停掉入队任务,丢弃尚未 spawn 的 spec(Pause 期间不应再开新片)
+                enqueue_handle.abort();
+                if let Some(tx) = frag_tx.take() {
+                    drop(tx);
+                }
+                while frag_rx.try_recv().is_ok() {}
+                // 强制终止在途 IO(含卡在 pool.acquire / stream 中的 task)
+                Self::abort_remaining_fragment_tasks(&mut handles).await;
+                // abort 路径可能跳过 record_complete,必须清零 active
+                concurrency_ctrl.reset_active();
+                // drain 成功结果(若 abort 前刚好完成)
+                while let Ok(result) = completed_rx.try_recv() {
+                    if let Ok((index, downloaded, duration, computed_hash)) = result
+                        && (index != 0 || downloaded != 0)
+                    {
+                        let _ = self.record_completed_fragment(
+                            index,
+                            downloaded,
+                            duration,
+                            computed_hash,
+                        );
+                    }
+                }
+                // Downloading → Pending + 固化 resume_offset(字节级续传)
+                for frag in &mut self.fragments {
+                    frag.park_for_pause();
+                }
+                // 等 Resume / Cancel / 超时
+                if let Some(rx) = control_rx.as_mut() {
+                    Self::wait_control_rx(rx, pause_timeout).await?;
+                }
+                // Resume:把仍为 Pending 的分片重新入队
+                let pending: Vec<FragmentSpec> = self
+                    .fragments
+                    .iter()
+                    .filter(|f| f.state == crate::fragment::FragmentState::Pending)
+                    .map(|frag| {
+                        (
+                            frag.info.index,
+                            frag.info.start,
+                            frag.info.end,
+                            frag.resume_offset,
+                            frag.info.hash.is_some(),
+                            FragmentShared {
+                                effective_end: Arc::clone(&frag.effective_end),
+                                realtime_downloaded: Arc::clone(&frag.realtime_downloaded),
+                            },
+                        )
+                    })
+                    .collect();
+                if pending.is_empty() {
+                    // 全部已完成
+                    frag_tx.take();
+                    completed_tx.take();
+                    break;
+                }
+                let (new_tx, new_rx) =
+                    mpsc::channel::<FragmentSpec>((effective_concurrency * 2).max(8));
+                frag_rx = new_rx;
+                frag_tx = Some(new_tx);
+                let mut requeue = Vec::with_capacity(pending.len());
+                for spec in pending {
+                    let idx = spec.0 as usize;
+                    if idx < self.fragments.len() {
+                        // park 后是 Pending,可再 start_download
+                        if self.fragments[idx].state == crate::fragment::FragmentState::Pending {
+                            self.fragments[idx].start_download()?;
+                        }
+                    }
+                    requeue.push(spec);
+                }
+                let frag_tx_enqueue = frag_tx.as_ref().expect("frag_tx recreated").clone();
+                enqueue_handle = tokio::spawn(async move {
+                    for spec in requeue {
+                        if frag_tx_enqueue.send(spec).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tracing::info!("Resume 后已重新入队未完成分片");
+                continue;
+            }
+
             tokio::select! {
                 // 动态并发度:周期性 re-recommend,带宽变化时提升并发度
                 // guard !handles.is_empty():只在有在途 task 时才 poll,
                 // 所有 task 完成后此分支 disable,使 else => break 能正确触发
                 _ = reschedule_timer.tick(), if !handles.is_empty() => {
+                    // 用户暂停期间禁止 re-recommend / rebalance(避免 Pause 后仍开新片)
+                    if Self::control_is_paused(&control_rx) {
+                        continue;
+                    }
                     let rec = self.scheduler.recommend(file_size, max_concurrent_fragments);
                     let new_target = rec.concurrency.min(max_concurrent_fragments).max(1);
                     let old = concurrency_ctrl.target();
@@ -2056,16 +2177,17 @@ impl DownloadTask {
                             "闭环并发度调整"
                         );
                     }
-                    // 安全 rebalance:拆最慢未完成分片的剩余区间,await 入队
-                    // (不用 try_send,避免旧 work-stealing 丢尾片)
+                    // 安全 rebalance:try_send 入队,Full 时 revert(不堵主循环)
                     if let Some(tx) = frag_tx.as_ref() {
                         let _ = self.try_rebalance_slowest_fragment(tx).await;
                     }
                 }
                 // dispatcher:从中央队列拉取分片,acquire permit 后 spawn task
                 // 闭环并发控制:仅当 active < target 时才拉取新分片(可降并发)
+                // Pause 时禁止 spawn:否则 UI 已暂停仍会开新分片,表现为“无法暂停”
                 // should_spawn()=false 时,等待 task 完成(record_complete)使 active 下降
-                spec = frag_rx.recv(), if concurrency_ctrl.should_spawn() => {
+                spec = frag_rx.recv(), if concurrency_ctrl.should_spawn()
+                    && !Self::control_is_paused(&control_rx) => {
                     match spec {
                         Some(spec) => {
                             let spawn_ctx = FragmentSpawnCtx {
@@ -2261,11 +2383,14 @@ impl DownloadTask {
         Ok(())
     }
 
-    /// 安全慢片 rebalance:拆分下载中最慢分片的未完成尾部,await 入队。
+    /// 安全慢片 rebalance:拆分下载中最慢分片的未完成尾部,try_send 入队。
     ///
     /// 相对已删除的 work-stealing:
-    /// - 使用 `send().await` 而非 `try_send`(不丢尾片)
-    /// - 入队失败则 `revert_split` 回滚
+    /// - **故意用 `try_send` 而非 `send().await`**:主循环在完成事件路径
+    ///   同步 await 本函数;channel 满时阻塞 send 会永久卡住 dispatcher
+    ///   (实测:冷启动 concurrency=4、容量 8 时 4/17 分片后进度冻结)。
+    ///   丢一次 rebalance 可通过 `revert_split` 安全回滚,下次定时/完成再试。
+    /// - 入队失败(Full/Closed)则 `revert_split` 回滚
     /// - 不依赖 steal_rx / 额外 completed_tx 生命周期
     ///
     /// 最慢片剩余 >= 2*MIN_SPLIT_SIZE 即可拆(含最后一片 straggler)。
@@ -2347,7 +2472,8 @@ impl DownloadTask {
             },
         );
 
-        match frag_tx.send(spec).await {
+        // try_send:Full 时立即返回,避免堵死 execute_fragmented_download 主循环
+        match frag_tx.try_send(spec) {
             Ok(()) => {
                 info!(
                     slow_index = idx,
@@ -2357,6 +2483,7 @@ impl DownloadTask {
                 Ok(true)
             }
             Err(_) => {
+                // Full 或 Closed:回滚 split,下次 rebalance 再试
                 self.fragments[idx].revert_split_after_failed_dispatch(&stolen);
                 Ok(false)
             }
@@ -2588,11 +2715,12 @@ impl DownloadTask {
             let write = storage.write_at(pos, remaining.clone());
             let written = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
-                    result = write => result?,
+                    biased;
                     control = Self::watch_for_interrupt(rx, pause_timeout) => {
                         control?;
                         return Err(DownloadError::Other("控制信号异常结束".into()));
                     }
+                    result = write => result?,
                 }
             } else {
                 write.await?
@@ -2732,8 +2860,12 @@ impl DownloadTask {
                 Ok(()) => {
                     tracing::trace!(idx = frag_index, bytes = total_written, "进度事件已发送");
                 }
-                Err(e) => {
-                    tracing::warn!(idx = frag_index, error = %e, "增量进度事件丢弃(通道满或关闭)");
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // 通道满是设计内背压(try_send 可丢增量),高频 warn 会淹没日志
+                    tracing::trace!(idx = frag_index, "增量进度事件丢弃(通道满)");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(idx = frag_index, "进度通道已关闭,丢弃增量事件");
                 }
             }
         }
@@ -2806,11 +2938,12 @@ impl DownloadTask {
             .min(frag_end);
         let stream = if let Some(rx) = control_rx.as_mut() {
             tokio::select! {
-                result = protocol.download_range_stream(url, actual_start, current_effective_end, object_identity.clone()) => result?,
+                biased;
                 control = Self::watch_for_interrupt(rx, pause_timeout) => {
                     control?;
                     return Err(DownloadError::Other("控制信号异常结束".into()));
                 }
+                result = protocol.download_range_stream(url, actual_start, current_effective_end, object_identity.clone()) => result?,
             }
         } else {
             protocol
@@ -2837,7 +2970,6 @@ impl DownloadTask {
             .realtime_downloaded
             .store(resume_offset, std::sync::atomic::Ordering::Release);
         // 控制通道/进度上报降频计数器，用递减替代 is_multiple_of 模运算
-        let mut control_check_countdown = 0u64; // 0 保证第一个 chunk 先检查一次
         let mut progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
         // write_buf 由调用方传入(跨分片复用),此处不再新建
         // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件。
@@ -2852,14 +2984,15 @@ impl DownloadTask {
             // cancel-safe:StreamExt::next 仅持有 &mut stream,被 select! 取消时无部分状态。
             let chunk_result = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
-                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
-                        Some(r) => r,
-                        None => break, // EOF:正常退出循环
-                    },
+                    biased;
                     interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
                         interrupt?;
                         return Err(DownloadError::Other("控制信号异常结束".into()));
                     }
+                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
+                        Some(r) => r,
+                        None => break, // EOF:正常退出循环
+                    },
                 }
             } else {
                 match tokio_stream::StreamExt::next(&mut stream).await {
@@ -2867,16 +3000,10 @@ impl DownloadTask {
                     None => break,
                 }
             };
-            // 控制通道降频检查:每 N chunk 检查一次暂停/取消,减少原子读开销。
-            // 注意:上方 select! 已覆盖"无 chunk 到达"的死 swarm 场景;此降频检查
-            // 主要处理 Paused 等非取消状态在 chunk 间隙的快速响应(与原语义一致)。
-            if let Some(rx) = control_rx.as_mut() {
-                if control_check_countdown == 0 {
-                    Self::wait_control_rx(rx, pause_timeout).await?;
-                    control_check_countdown = CONTROL_CHECK_CHUNK_INTERVAL;
-                }
-                control_check_countdown -= 1;
-            }
+            // 每 chunk 立即检查 Pause/Cancel(不挂起等 Resume)。
+            // wait_control_rx 在 Pause 时会阻塞等 Resume,不适合热路径;
+            // select! biased+interrupt 优先是主路径,此处兜底防 select 饿死。
+            Self::check_control_interrupt(&mut control_rx)?;
             let chunk = chunk_result?;
             // BUG-1 修复:检查 effective_end 是否被 try_split 缩小
             // 若 pos 已超过 effective_end,worker 的区域已被 steal,立即停止
@@ -3337,6 +3464,17 @@ impl DownloadTask {
     }
 
     fn apply_terminal_error(&mut self, error: &DownloadError) {
+        // 用户协作暂停:保持 Paused,不升 Failed
+        if matches!(error, DownloadError::Paused) {
+            if self.state != DownloadState::Paused {
+                if let Ok(s) = self.state.try_transition(DownloadState::Paused) {
+                    self.state = s;
+                } else {
+                    self.state = DownloadState::Paused;
+                }
+            }
+            return;
+        }
         // P1 / 审计 M-05:暂停超时应保持 Paused。
         // wait_control_rx 观察 Pause 时历史上不把 DownloadTask.state 设为 Paused
         // (仍为 Downloading),导致仅凭 state==Paused 的分支不可达。
@@ -8334,6 +8472,89 @@ mod tests {
         assert_eq!(failed, vec![2], "应精确标记真正失败的分片 index=2");
     }
 
+    /// 续传时 plan 必须忽略带宽 recommendation,保持与冷启动确定性分片一致,
+    /// 否则 snapshot 的 completed index 会与新边界错位。
+    #[tokio::test]
+    async fn test_plan_resume_ignores_recommendation_fragment_size() {
+        use std::sync::Arc;
+        use tachyon_core::traits::{DownloadScheduler, ScheduleRecommendation};
+
+        struct BiasedScheduler;
+        impl DownloadScheduler for BiasedScheduler {
+            fn recommend(&self, _file_size: u64, max_concurrency: u32) -> ScheduleRecommendation {
+                ScheduleRecommendation {
+                    concurrency: max_concurrency.max(1),
+                    // 故意给与默认(32MB/16=2MB)完全不同的分片大小
+                    fragment_size: 4 * 1024 * 1024,
+                    confidence: 0.99,
+                }
+            }
+            fn observe_bandwidth(&self, _: u64) {}
+            fn predicted_bandwidth(&self) -> u64 {
+                100 * 1024 * 1024
+            }
+        }
+
+        let file_size = 32 * 1024 * 1024u64; // 32MB
+        let meta = test_metadata("resume-plan.bin", file_size);
+        let protocol = Arc::new(MockProto::new(meta));
+        let storage = StorageKind::memory_with_capacity(file_size as usize);
+
+        // 冷启动无 resume:会吃 recommendation → 2MB 分片 → 16 片
+        let mut fresh = DownloadTask::new_for_test(
+            "http://example.com/resume-plan.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 16,
+                ..test_config()
+            },
+            protocol.clone(),
+            storage.clone(),
+        );
+        fresh.scheduler = Arc::new(BiasedScheduler);
+        fresh.metadata = Some(test_metadata("resume-plan.bin", file_size));
+        let fresh_plan = fresh.plan().expect("plan");
+        assert_eq!(
+            fresh_plan[0].size,
+            4 * 1024 * 1024,
+            "无 resume 时应采用 recommendation 4MB"
+        );
+
+        // 有 resume snapshot:必须忽略 recommendation,用确定性划分
+        let mut resume = DownloadTask::new_for_test(
+            "http://example.com/resume-plan.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 16,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        resume.scheduler = Arc::new(BiasedScheduler);
+        resume.metadata = Some(test_metadata("resume-plan.bin", file_size));
+        resume.set_completed_fragments(vec![0]);
+        let resume_plan = resume.plan().expect("plan");
+
+        let stable =
+            crate::fragment::plan_fragments(file_size, true, None, &resume.scheduler_config)
+                .expect("stable plan");
+        assert_eq!(
+            resume_plan.len(),
+            stable.len(),
+            "续传 plan 分片数必须等于确定性 None 建议"
+        );
+        assert_eq!(
+            resume_plan[0].size, stable[0].size,
+            "续传首片 size 必须稳定,不得采用 recommendation 4MB"
+        );
+        assert_ne!(
+            resume_plan[0].size,
+            4 * 1024 * 1024,
+            "续传不得使用 biased recommendation 分片大小"
+        );
+    }
+
     /// P0-3:注入已完成分片后,plan() 应跳过它们的下载,且 progress 反映已完成部分。
     #[tokio::test]
     async fn test_resume_skips_completed_fragments() {
@@ -9019,6 +9240,40 @@ mod tests {
             "prepare_storage 阶段取消应返回 Cancelled, 实际: {result:?}"
         );
         assert_eq!(task.state(), DownloadState::Cancelled);
+    }
+
+    #[test]
+    fn test_control_is_paused_detects_pause_command() {
+        let (_tx, rx) = watch::channel(TaskCommand::Start);
+        let opt = Some(rx);
+        assert!(!DownloadTask::control_is_paused(&opt));
+        let (tx, rx) = watch::channel(TaskCommand::Pause);
+        let opt = Some(rx);
+        assert!(DownloadTask::control_is_paused(&opt));
+        let _ = tx; // keep sender alive
+        assert!(!DownloadTask::control_is_paused(&None));
+    }
+
+    /// RED-TDD: watch_for_interrupt 在 Pause 时必须立即返回 Err(Paused),
+    /// 以便 select! 抢占 in-flight stream/write(而非挂起等 Resume 导致继续读网)。
+    #[tokio::test]
+    async fn test_watch_for_interrupt_returns_immediately_on_pause() {
+        let (tx, mut rx) = watch::channel(TaskCommand::Start);
+        // 并发:一边 watch,一边稍后发 Pause(不 spawn 借用 rx,避免 'static 约束)
+        let watch = DownloadTask::watch_for_interrupt(&mut rx, Duration::from_secs(30));
+        let send = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(TaskCommand::Pause).unwrap();
+        };
+        let (result, _) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(200), watch),
+            send
+        );
+        let result = result.expect("Pause 后 watch_for_interrupt 必须在 200ms 内返回");
+        assert!(
+            matches!(result, Err(DownloadError::Paused)),
+            "期望 Err(Paused), got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -11692,6 +11947,77 @@ mod tests {
         let spec = rx.try_recv().expect("应入队新分片 spec");
         assert_eq!(spec.0, 1, "新分片 index=1");
         assert!(spec.1 > 0, "新分片 start > 0");
+    }
+
+    /// RED-TDD: channel 满时 rebalance 不得 send().await 挂死主循环;
+    /// 应快速返回 Ok(false) 并 revert_split,保留原分片边界。
+    #[tokio::test]
+    async fn test_rebalance_full_channel_does_not_hang_and_reverts() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let original_end = size - 1;
+        let frag0 = {
+            let info = FragmentInfo::new(0, 0, original_end, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded.store(size / 10, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("full-ch.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/full-ch.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag0];
+        task.metadata = Some(test_metadata("full-ch.bin", size));
+
+        // 容量 1:塞满后 rebalance 的 send 无法前进
+        let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(1);
+        let dummy: FragmentSpec = (
+            99,
+            0,
+            0,
+            0,
+            false,
+            FragmentShared {
+                effective_end: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                realtime_downloaded: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+        tx.try_send(dummy).expect("先填满 channel");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            task.try_rebalance_slowest_fragment(&tx),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "rebalance 在 channel 满时必须在 200ms 内返回,不得 send().await 挂死主循环"
+        );
+        let did = result.unwrap().expect("rebalance 不应 Err");
+        assert!(!did, "channel 满时应返回 Ok(false) 表示未入队");
+        assert_eq!(task.fragments.len(), 1, "未入队成功则不得 push 新分片");
+        assert_eq!(
+            task.fragments[0].info.end, original_end,
+            "入队失败必须 revert_split 恢复原 end"
+        );
+        assert_eq!(
+            task.fragments[0].effective_end.load(Ordering::Acquire),
+            original_end,
+            "入队失败必须 revert effective_end"
+        );
     }
 
     /// rebalance:剩余不足时不拆分
