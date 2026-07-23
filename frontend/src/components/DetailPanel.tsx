@@ -37,6 +37,7 @@ import {
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
+import { redownloadTask } from "../stores/taskActions";
 import { addToast } from "../stores/toast";
 import { requestConfirm } from "../stores/confirm";
 import { clearTaskHistory } from "../stores/taskSpeedHistory";
@@ -399,7 +400,9 @@ export default function DetailPanel(props: DetailPanelProps) {
     if (retrying() || mirrorRetrying()) return;
     setRetrying(true);
     try {
-      await api.createTask(t2.url);
+      // 活跃任务需先取消再重建(后端 URL 去重拒绝同 URL 非终态任务),
+      // 语义封装在 redownloadTask,与右键菜单/命令面板一致
+      await redownloadTask(t2);
       await refreshTaskList();
       addToast(tr("toast.redownloadSuccess"), "success");
     } catch (e) {

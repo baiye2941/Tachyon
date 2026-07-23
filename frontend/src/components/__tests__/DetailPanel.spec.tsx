@@ -232,7 +232,8 @@ describe("DetailPanel", () => {
     ).toBeNull();
   });
 
-  it("点击重新下载应创建新任务", async () => {
+  it("点击重新下载应先取消活跃任务再创建新任务(后端 URL 去重)", async () => {
+    mockApi.cancelTask.mockResolvedValue(undefined);
     mockApi.createTask.mockResolvedValue("task-2");
     await renderWithI18n(baseTask);
     await waitForRaf();
@@ -240,6 +241,27 @@ describe("DetailPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新下载" }));
     await new Promise((r) => setTimeout(r, 0));
 
+    // baseTask 为 downloading:后端 create_task 拒绝同 URL 非终态任务,
+    // 需先取消旧任务再创建
+    expect(mockApi.cancelTask).toHaveBeenCalledWith("task-1");
+    expect(mockApi.createTask).toHaveBeenCalledWith(
+      "https://example.com/model.gguf",
+    );
+    // 取消必须先于创建
+    const cancelOrder = mockApi.cancelTask.mock.invocationCallOrder[0]!;
+    const createOrder = mockApi.createTask.mock.invocationCallOrder[0]!;
+    expect(cancelOrder).toBeLessThan(createOrder);
+  });
+
+  it("终态任务重新下载应直接创建新任务(无需先取消)", async () => {
+    mockApi.createTask.mockResolvedValue("task-2");
+    await renderWithI18n({ ...baseTask, status: "completed", speed: 0 });
+    await waitForRaf();
+
+    fireEvent.click(screen.getByRole("button", { name: "重新下载" }));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(mockApi.cancelTask).not.toHaveBeenCalled();
     expect(mockApi.createTask).toHaveBeenCalledWith(
       "https://example.com/model.gguf",
     );
