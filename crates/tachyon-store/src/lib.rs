@@ -21,8 +21,8 @@ pub mod store;
 
 pub use kv::KvStore;
 pub use recovery::{
-    ProtectedSnapshot, RecoveryError, RecoveryManager, RecoveryResult,
-    SNAPSHOT_SCHEMA_VERSION, TaskNamespaceReservation, TaskRecord, TaskSnapshot,
+    ProtectedSnapshot, RecoveryError, RecoveryManager, RecoveryResult, SNAPSHOT_SCHEMA_VERSION,
+    TaskNamespaceReservation, TaskRecord, TaskSnapshot,
 };
 pub use store::{Durability, FileStore, MemoryStore, Store};
 

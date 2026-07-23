@@ -1829,7 +1829,9 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
         let p = Arc::clone(&protocol);
         let url = magnet_url.clone();
         futures.push(async move {
-            let stream = p.download_range_stream(&url, i * 16, i * 16 + 15, None).await;
+            let stream = p
+                .download_range_stream(&url, i * 16, i * 16 + 15, None)
+                .await;
             stream.is_ok()
         });
     }

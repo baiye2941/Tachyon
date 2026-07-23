@@ -3,7 +3,11 @@
 //! 负责在应用启动时从持久化存储中恢复未完成的下载任务。
 //! 提供 `TaskRecord` / `TaskSnapshot` 类型和 `RecoveryManager` 管理器。
 
-use std::{collections::HashMap, fmt, io, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::HashMap,
+    fmt, io,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -516,7 +520,10 @@ impl RecoveryManager {
     }
 
     /// S-02b §3.1:验证 reservation 的 manager identity + nonce + active。
-    fn validate_reservation(&self, reservation: &TaskNamespaceReservation<'_>) -> Result<(), RecoveryError> {
+    fn validate_reservation(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+    ) -> Result<(), RecoveryError> {
         // manager identity:通过指针比较验证 reservation 属于本 manager
         if !std::ptr::eq(reservation.manager, self) {
             return Err(RecoveryError::ReservationActive);
@@ -1989,8 +1996,7 @@ mod tests {
         mgr.save_task_snapshot(&incoming).unwrap();
         let after = mgr.load_task_snapshot("rwfail").unwrap().unwrap();
         assert_eq!(
-            after.revision,
-            disk.revision,
+            after.revision, disk.revision,
             "tombstone 仍生效,旧 revision save 不得写入"
         );
         assert_eq!(
@@ -2025,10 +2031,12 @@ mod tests {
 
             // 不创建 reservation:普通 batch API 不得返回 ReservationActive。
             let result = mgr.load_all_task_snapshots().unwrap();
-            assert!(result
-                .unsupported_schema
-                .iter()
-                .any(|p| p.key == "task_future"));
+            assert!(
+                result
+                    .unsupported_schema
+                    .iter()
+                    .any(|p| p.key == "task_future")
+            );
         }
         // (b) invalid schema → InvalidData,无 reservation
         {
@@ -2042,10 +2050,7 @@ mod tests {
             assert_invalid_data(err, "task_bad");
 
             // 不创建 reservation:普通单 key load 不得返回 ReservationActive。
-            assert_invalid_data(
-                mgr.load_task_snapshot("bad").unwrap_err(),
-                "task_bad",
-            );
+            assert_invalid_data(mgr.load_task_snapshot("bad").unwrap_err(), "task_bad");
         }
     }
 

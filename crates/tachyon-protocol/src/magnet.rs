@@ -630,10 +630,7 @@ impl MagnetProtocol {
                 downloaded_bytes: snap.downloaded_and_checked_bytes,
                 uploaded_bytes: snap.uploaded_bytes,
             };
-            *self
-                .last_peer_stats
-                .lock()
-                .expect("last_peer_stats lock") = Some(stats.clone());
+            *self.last_peer_stats.lock().expect("last_peer_stats lock") = Some(stats.clone());
             Some(stats)
         } else {
             // live 不可取(尚未 live 或已 cleanup):返回最后捕获值。
@@ -2152,8 +2149,7 @@ impl Protocol for MagnetProtocol {
                         Err(e) => {
                             // layout 失败必须请求 tracked cleanup,与 probe 路径对称,
                             // 不能只 drop(cleanup) 后返回错误留下 orphan registration。
-                            let cleanup_deadline =
-                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            let cleanup_deadline = TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
                             if let Some(action) = coordinator.cleanup_action_for(
                                 Magnet::parse(&url)
                                     .ok()
@@ -2321,8 +2317,7 @@ impl Protocol for MagnetProtocol {
                     }) {
                         Ok(layout) => layout,
                         Err(e) => {
-                            let cleanup_deadline =
-                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            let cleanup_deadline = TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
                             if let Some(action) = coordinator.cleanup_action_for(
                                 Magnet::parse(&url)
                                     .ok()
@@ -2475,8 +2470,7 @@ impl Protocol for MagnetProtocol {
                     }) {
                         Ok(layout) => layout,
                         Err(e) => {
-                            let cleanup_deadline =
-                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            let cleanup_deadline = TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
                             if let Some(action) = coordinator.cleanup_action_for(
                                 Magnet::parse(&url)
                                     .ok()
