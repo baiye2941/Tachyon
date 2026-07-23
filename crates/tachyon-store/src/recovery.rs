@@ -967,10 +967,10 @@ impl Drop for TaskNamespaceReservation<'_> {
             .progress_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Ok(mut active) = self.manager.active_reservation.lock() {
-            if active.as_ref() == Some(&self.nonce) {
-                *active = None;
-            }
+        if let Ok(mut active) = self.manager.active_reservation.lock()
+            && active.as_ref() == Some(&self.nonce)
+        {
+            *active = None;
         }
     }
 }
