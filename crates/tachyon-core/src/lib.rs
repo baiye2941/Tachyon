@@ -29,10 +29,11 @@ pub use download_source::{
 };
 pub use error::{DownloadError, DownloadResult};
 pub use safety::{
-    extract_filename, extract_filename_from_url, magnet_info_hash, parse_content_disposition,
-    redact_url_for_log, reject_forbidden_ip, reject_symlink_or_reparse_components,
-    sanitize_filename, url_for_display, url_identity_key, validate_multi_save_paths,
-    validate_public_http_url, validate_redirect, validate_resolved_ip, validate_save_path,
+    extract_filename, extract_filename_from_url, is_restricted_peer_ip, magnet_info_hash,
+    parse_content_disposition, redact_url_for_log, reject_forbidden_ip,
+    reject_symlink_or_reparse_components, sanitize_filename, url_for_display, url_identity_key,
+    validate_multi_save_paths, validate_public_http_url, validate_redirect, validate_resolved_ip,
+    validate_save_path,
 };
 pub use traits::{AsyncStorage, ByteStream, Protocol, TaskRunner, Verifier};
 pub use types::{

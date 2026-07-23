@@ -503,6 +503,9 @@ const zhCN = {
   "settings.magnet.enableDht": "启用 DHT 协议",
   "settings.magnet.enableUpnp": "启用 UPnP 端口转发",
   "settings.magnet.disableDhtPersistence": "禁用 DHT 持久化(仅内存)",
+  "settings.magnet.allowPrivatePeers": "允许私有 Peer",
+  "settings.magnet.allowPrivatePeersHint":
+    "仅用于已确认的 LAN/自托管 swarm；默认关闭，不会提升公网下载速度。保存后只影响后续 BT 连接。",
   "settings.magnet.socksProxyUrl": "SOCKS5 代理(BT tracker + peer)",
   "settings.magnet.socksProxyUrlPlaceholder": "socks5://127.0.0.1:7897",
   "settings.magnet.socksProxyUrlHint":

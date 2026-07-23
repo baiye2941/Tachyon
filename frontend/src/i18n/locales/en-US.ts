@@ -524,6 +524,9 @@ const enUS = {
   "settings.magnet.enableUpnp": "Enable UPnP port forwarding",
   "settings.magnet.disableDhtPersistence":
     "Disable DHT persistence (in-memory only)",
+  "settings.magnet.allowPrivatePeers": "Allow private peers",
+  "settings.magnet.allowPrivatePeersHint":
+    "Only for confirmed LAN/self-hosted swarms. Off by default; it does not improve public-download speed. Saving affects only subsequent BT connections.",
   "settings.magnet.socksProxyUrl": "SOCKS5 proxy (BT tracker + peer)",
   "settings.magnet.socksProxyUrlPlaceholder": "socks5://127.0.0.1:7897",
   "settings.magnet.socksProxyUrlHint":

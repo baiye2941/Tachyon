@@ -14,6 +14,7 @@
 //! - `download_full_stream()` 保留作 fallback（多文件 torrent 或 metadata 未就绪），
 //!   走 `wait_until_completed` + 磁盘读两段式
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -628,6 +629,150 @@ pub fn parse_pe_from_magnet(uri: &str) -> Vec<SocketAddr> {
         .collect()
 }
 
+/// 传入 librqbit 的预置 peer 总量上限。
+const MAX_INITIAL_PEERS: usize = 64;
+/// URI 与配置来源在首轮分配的公平配额。
+const MAX_INITIAL_PEERS_PER_SOURCE: usize = 32;
+
+#[derive(Default)]
+struct InitialPeerSourceStats {
+    invalid: usize,
+    restricted: usize,
+    duplicate: usize,
+    over_limit: usize,
+}
+
+impl InitialPeerSourceStats {
+    fn has_rejected(&self) -> bool {
+        self.invalid != 0 || self.restricted != 0 || self.duplicate != 0 || self.over_limit != 0
+    }
+}
+
+/// 规范化单一来源的 peer：先过滤不可用地址，再按首次出现顺序去重。
+fn normalize_initial_peer_source(
+    peers: impl IntoIterator<Item = SocketAddr>,
+    invalid: usize,
+    allow_private_peers: bool,
+    stats: &mut InitialPeerSourceStats,
+) -> Vec<SocketAddr> {
+    stats.invalid = invalid;
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for peer in peers {
+        if peer.port() == 0 {
+            stats.invalid += 1;
+        } else if !allow_private_peers && tachyon_core::is_restricted_peer_ip(peer.ip()) {
+            stats.restricted += 1;
+        } else if !seen.insert(peer) {
+            stats.duplicate += 1;
+        } else {
+            normalized.push(peer);
+        }
+    }
+
+    normalized
+}
+
+/// 收集唯一、受限且稳定有界的 librqbit 初始 peer。
+///
+/// URI 与配置分别保留首次出现顺序；URI 在跨来源重复时优先。首轮各占最多
+/// 32 项，随后按 URI、配置的固定优先级回填，最终不超过 64 项。
+fn collect_initial_peers(url: &str, config: &MagnetConfig) -> Vec<SocketAddr> {
+    let raw_uri_peer_count = url
+        .get(8..)
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|param| {
+                    param
+                        .get(..3)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pe="))
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let parsed_uri_peers = if url.get(8..).is_some() {
+        parse_pe_from_magnet(url)
+    } else {
+        Vec::new()
+    };
+    let mut uri_stats = InitialPeerSourceStats::default();
+    let uri_peers = normalize_initial_peer_source(
+        parsed_uri_peers.iter().copied(),
+        raw_uri_peer_count.saturating_sub(parsed_uri_peers.len()),
+        config.allow_private_peers,
+        &mut uri_stats,
+    );
+
+    let mut config_parse_invalid = 0;
+    let parsed_config_peers: Vec<SocketAddr> = config
+        .peer_addrs
+        .iter()
+        .filter_map(|value| match value.parse::<SocketAddr>() {
+            Ok(peer) => Some(peer),
+            Err(_) => {
+                config_parse_invalid += 1;
+                None
+            }
+        })
+        .collect();
+    let mut config_stats = InitialPeerSourceStats::default();
+    let mut config_peers = normalize_initial_peer_source(
+        parsed_config_peers,
+        config_parse_invalid,
+        config.allow_private_peers,
+        &mut config_stats,
+    );
+
+    let uri_seen: HashSet<SocketAddr> = uri_peers.iter().copied().collect();
+    config_peers.retain(|peer| {
+        if uri_seen.contains(peer) {
+            config_stats.duplicate += 1;
+            false
+        } else {
+            true
+        }
+    });
+
+    let uri_first = uri_peers.len().min(MAX_INITIAL_PEERS_PER_SOURCE);
+    let config_first = config_peers.len().min(MAX_INITIAL_PEERS_PER_SOURCE);
+    let mut initial_peers = Vec::with_capacity(MAX_INITIAL_PEERS);
+    initial_peers.extend_from_slice(&uri_peers[..uri_first]);
+    initial_peers.extend_from_slice(&config_peers[..config_first]);
+
+    for peer in &uri_peers[uri_first..] {
+        if initial_peers.len() == MAX_INITIAL_PEERS {
+            uri_stats.over_limit += 1;
+        } else {
+            initial_peers.push(*peer);
+        }
+    }
+    for peer in &config_peers[config_first..] {
+        if initial_peers.len() == MAX_INITIAL_PEERS {
+            config_stats.over_limit += 1;
+        } else {
+            initial_peers.push(*peer);
+        }
+    }
+
+    if uri_stats.has_rejected() || config_stats.has_rejected() {
+        tracing::debug!(
+            source = "uri+config",
+            uri_invalid = uri_stats.invalid,
+            uri_restricted = uri_stats.restricted,
+            uri_duplicate = uri_stats.duplicate,
+            uri_over_limit = uri_stats.over_limit,
+            config_invalid = config_stats.invalid,
+            config_restricted = config_stats.restricted,
+            config_duplicate = config_stats.duplicate,
+            config_over_limit = config_stats.over_limit,
+        );
+    }
+
+    initial_peers
+}
+
 /// 从磁力链接解析 `&so=` 参数为 0-based file_id 列表(BEP 9 选择文件)
 ///
 /// magnet URI 可含一个 `so=` 参数,值为逗号分隔的 0-based file_id。
@@ -1050,8 +1195,8 @@ fn resolve_first_file_path(
 ///
 /// `force_tracker_interval` 透传 librqbit `AddTorrentOptions.force_tracker_interval`,
 /// 强制定期回连 tracker 刷新 peer 列表(None 禁用,由 librqbit 默认策略决定)。
-/// `initial_peers` 透传 `AddTorrentOptions.initial_peers`,预置已知 peer 直连
-/// (BEP 9 magnet `&pe=` 参数解析出的地址 + 配置 `peer_addrs`)。
+/// 初始 peer 在本函数内按 URI 与配置统一规范化后写入
+/// `AddTorrentOptions.initial_peers`，避免调用方绕过安全边界。
 ///
 /// `timeout` 包裹 `session.add_torrent().await` 整体(含 librqbit 内部的
 /// `resolve_magnet` —— DHT get_peers + tracker announce + TCP peer ut_metadata 交换)。
@@ -1064,13 +1209,14 @@ async fn add_magnet_to_session(
     url: &str,
     download_dir: &std::path::Path,
     force_tracker_interval: Option<Duration>,
-    initial_peers: Vec<SocketAddr>,
+    config: &MagnetConfig,
     timeout: Duration,
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
     ops_gate: &SessionOpsGate,
     socks_active: bool,
     only_files: Option<Vec<usize>>,
 ) -> DownloadResult<Arc<ManagedTorrent>> {
+    let initial_peers = collect_initial_peers(url, config);
     // SOCKS 下剥离 magnet 内嵌 UDP tracker(审计 privacy)
     let url_owned = strip_udp_trackers_from_magnet(url, socks_active);
     if socks_active && url_owned != url {
@@ -1338,17 +1484,6 @@ impl Protocol for MagnetProtocol {
             } else {
                 Some(Duration::from_secs(config.force_tracker_interval_secs))
             };
-            // initial_peers: magnet &pe= 参数解析(BEP 9) + 配置 peer_addrs,合并去重前合并
-            let initial_peers = {
-                let mut addrs = parse_pe_from_magnet(&url);
-                addrs.extend(
-                    config
-                        .peer_addrs
-                        .iter()
-                        .filter_map(|s| s.parse::<SocketAddr>().ok()),
-                );
-                addrs
-            };
             // metadata_timeout 覆盖 add_torrent(含 resolve_magnet)+ wait_until_initialized 全流程
             let socks_active = config.socks_proxy_url.is_some()
                 || tachyon_core::config::detect_socks_proxy().is_some();
@@ -1360,7 +1495,7 @@ impl Protocol for MagnetProtocol {
                 &url,
                 &download_dir,
                 force_tracker_interval,
-                initial_peers,
+                &config,
                 metadata_timeout,
                 storage_factory.as_ref().map(|f| f.clone_box()),
                 &ops_gate,
@@ -1493,6 +1628,7 @@ impl Protocol for MagnetProtocol {
         // add_torrent 超时(复用 metadata_timeout,覆盖 resolve_magnet 死 swarm 兜底)
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         let socks_active = self.socks_active();
+        let config = self.config.clone();
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
@@ -1511,7 +1647,7 @@ impl Protocol for MagnetProtocol {
                     &url,
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
-                    Vec::new(),
+                    &config,
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
@@ -1628,6 +1764,7 @@ impl Protocol for MagnetProtocol {
         let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         let socks_active = self.socks_active();
+        let config = self.config.clone();
         // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
         // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
         // 下载常需 30 分钟以上,5 分钟超时必然在下载中途误杀,产出误导错误信息
@@ -1653,7 +1790,7 @@ impl Protocol for MagnetProtocol {
                     &url,
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
-                    Vec::new(),
+                    &config,
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
@@ -1728,6 +1865,7 @@ impl Protocol for MagnetProtocol {
         let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
         let socks_active = self.socks_active();
+        let config = self.config.clone();
         // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
         let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
@@ -1747,7 +1885,7 @@ impl Protocol for MagnetProtocol {
                     &url,
                     &download_dir,
                     None, // 回退路径不强制 tracker interval
-                    Vec::new(),
+                    &config,
                     metadata_timeout,
                     storage_factory.as_ref().map(|f| f.clone_box()),
                     &ops_gate,
@@ -1812,6 +1950,204 @@ impl Protocol for MagnetProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_initial_peers_handles_malformed_uri_boundaries_without_panicking() {
+        let config = MagnetConfig::default();
+        let malformed_uris = ["short", "magnet:é", "https://example.test/not-a-magnet"];
+
+        for uri in malformed_uris {
+            let result = std::panic::catch_unwind(|| collect_initial_peers(uri, &config));
+            assert!(result.is_ok(), "collector 对畸形 URI 不得 panic: {uri:?}");
+            assert_eq!(
+                result.expect("已断言 collector 不 panic"),
+                Vec::<SocketAddr>::new(),
+                "畸形 URI 不得产出初始 peer: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_initial_peers_defaults_to_rejecting_restricted_invalid_and_port_zero() {
+        let url = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+            &pe=8.8.8.8:6881&pe=127.0.0.1:6882&pe=10.0.0.1:6883\
+            &pe=1.1.1.1:0&pe=not-an-address";
+        let config = MagnetConfig {
+            peer_addrs: vec![
+                "9.9.9.9:6884".to_string(),
+                "192.168.1.10:6885".to_string(),
+                "172.16.0.1:6886".to_string(),
+                "4.4.4.4:0".to_string(),
+                "not-an-address".to_string(),
+            ],
+            ..MagnetConfig::default()
+        };
+
+        let expected: Vec<SocketAddr> = ["8.8.8.8:6881", "9.9.9.9:6884"]
+            .into_iter()
+            .map(|value| value.parse().expect("测试地址必须有效"))
+            .collect();
+        assert_eq!(
+            collect_initial_peers(url, &config),
+            expected,
+            "默认 collector 只能保留公开、可解析且端口非零的 peer"
+        );
+    }
+
+    #[test]
+    fn collect_initial_peers_allows_restricted_ip_literals_only_when_opted_in() {
+        let url = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+            &pe=127.0.0.1:6881&pe=[fd00::1]:6882&pe=8.8.8.8:6883\
+            &pe=localhost:6884&pe=1.1.1.1:0";
+        let denied_config = MagnetConfig {
+            peer_addrs: vec![
+                "10.0.0.1:6885".to_string(),
+                "[fe80::1]:6886".to_string(),
+                "9.9.9.9:6887".to_string(),
+                "localhost:6888".to_string(),
+                "4.4.4.4:0".to_string(),
+            ],
+            ..MagnetConfig::default()
+        };
+        let mut allowed_config = denied_config.clone();
+        allowed_config.allow_private_peers = true;
+
+        let denied_expected: Vec<SocketAddr> = ["8.8.8.8:6883", "9.9.9.9:6887"]
+            .into_iter()
+            .map(|value| value.parse().expect("测试地址必须有效"))
+            .collect();
+        assert_eq!(
+            collect_initial_peers(url, &denied_config),
+            denied_expected,
+            "未 opt-in 时不得输出受限 IP literal"
+        );
+
+        let allowed_expected: Vec<SocketAddr> = [
+            "127.0.0.1:6881",
+            "[fd00::1]:6882",
+            "8.8.8.8:6883",
+            "10.0.0.1:6885",
+            "[fe80::1]:6886",
+            "9.9.9.9:6887",
+        ]
+        .into_iter()
+        .map(|value| value.parse().expect("测试地址必须有效"))
+        .collect();
+        assert_eq!(
+            collect_initial_peers(url, &allowed_config),
+            allowed_expected,
+            "仅 opt-in 后可恢复受限 IP literal；hostname、无效项和端口零仍须拒绝"
+        );
+    }
+
+    #[test]
+    fn collect_initial_peers_applies_stable_source_quotas_dedup_and_total_cap() {
+        let uri_peers: Vec<String> = (1u16..=34)
+            .map(|index| format!("1.1.1.{index}:{}", 6000 + index))
+            .collect();
+        let mut url = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string();
+        for peer in &uri_peers {
+            url.push_str("&pe=");
+            url.push_str(peer);
+        }
+        url.push_str("&pe=1.1.1.1:6001");
+
+        let mut peer_addrs = vec![uri_peers[0].clone(), uri_peers[1].clone()];
+        peer_addrs.extend((1u16..=32).map(|index| format!("8.8.8.{index}:{}", 7000 + index)));
+        peer_addrs.push("8.8.8.1:7001".to_string());
+        let config = MagnetConfig {
+            peer_addrs,
+            ..MagnetConfig::default()
+        };
+
+        let mut expected: Vec<SocketAddr> = uri_peers
+            .iter()
+            .take(32)
+            .map(|value| value.parse().expect("测试地址必须有效"))
+            .collect();
+        expected.extend(
+            config
+                .peer_addrs
+                .iter()
+                .skip(2)
+                .take(32)
+                .map(|value| value.parse::<SocketAddr>().expect("测试地址必须有效")),
+        );
+        assert_eq!(expected.len(), 64, "测试夹具必须覆盖总量上限");
+        assert_eq!(
+            collect_initial_peers(&url, &config),
+            expected,
+            "URI/config 应各保留稳定去重后的 32 项，URI 跨源重复优先且总量封顶 64"
+        );
+    }
+
+    #[test]
+    fn collect_initial_peers_backfills_unused_source_quota_in_stable_order() {
+        let short_uri = ["1.1.1.1:6001".to_string(), "1.1.1.2:6002".to_string()];
+        let short_uri_url = format!(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&pe={}",
+            short_uri.join("&pe=")
+        );
+        let config_heavy: Vec<String> = (1u16..=64)
+            .map(|index| format!("8.8.8.{index}:{}", 7000 + index))
+            .collect();
+        let config_heavy_config = MagnetConfig {
+            peer_addrs: config_heavy.clone(),
+            ..MagnetConfig::default()
+        };
+        let mut uri_short_expected: Vec<SocketAddr> = short_uri
+            .iter()
+            .map(|value| value.parse().expect("测试地址必须有效"))
+            .collect();
+        uri_short_expected.extend(
+            config_heavy
+                .iter()
+                .take(62)
+                .map(|value| value.parse::<SocketAddr>().expect("测试地址必须有效")),
+        );
+        assert_eq!(
+            collect_initial_peers(&short_uri_url, &config_heavy_config),
+            uri_short_expected,
+            "URI 未用满 32 项配额时，config 应以自身稳定顺序补至 64"
+        );
+
+        let uri_heavy: Vec<String> = (1u16..=64)
+            .map(|index| format!("9.9.9.{index}:{}", 8000 + index))
+            .collect();
+        let mut uri_heavy_url =
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string();
+        for peer in &uri_heavy {
+            uri_heavy_url.push_str("&pe=");
+            uri_heavy_url.push_str(peer);
+        }
+        let config_short = ["4.4.4.1:9001".to_string(), "4.4.4.2:9002".to_string()];
+        let config_short_config = MagnetConfig {
+            peer_addrs: config_short.to_vec(),
+            ..MagnetConfig::default()
+        };
+        let mut config_short_expected: Vec<SocketAddr> = uri_heavy
+            .iter()
+            .take(32)
+            .map(|value| value.parse().expect("测试地址必须有效"))
+            .collect();
+        config_short_expected.extend(
+            config_short
+                .iter()
+                .map(|value| value.parse::<SocketAddr>().expect("测试地址必须有效")),
+        );
+        config_short_expected.extend(
+            uri_heavy
+                .iter()
+                .skip(32)
+                .take(30)
+                .map(|value| value.parse::<SocketAddr>().expect("测试地址必须有效")),
+        );
+        assert_eq!(
+            collect_initial_peers(&uri_heavy_url, &config_short_config),
+            config_short_expected,
+            "config 未用满 32 项配额时，URI 应按固定来源优先级稳定回填"
+        );
+    }
 
     #[test]
     fn test_validate_magnet_uri_valid_sha1() {

@@ -99,7 +99,9 @@ export interface MagnetConfig {
   deferWritesUpToMb: number
   /** SOCKS5 启用时是否禁用 DHT(UDP 不可经 SOCKS5),后端默认 true */
   disableDhtWhenSocks: boolean
-  /** 预置 peer 地址列表(host:port),从磁力链接 &pe= 解析 + 用户配置合并 */
+  /** 是否允许受限 IP literal peer；旧 DTO 缺省时按 false 处理 */
+  allowPrivatePeers?: boolean
+  /** 预置 peer 地址列表(IP:port 或 [IPv6]:port)，从磁力链接 &pe= 解析 + 用户配置合并 */
   peerAddrs: string[]
 }
 
@@ -211,6 +213,7 @@ export interface MagnetPatch {
   forceTrackerIntervalSecs?: number
   deferWritesUpToMb?: number
   disableDhtWhenSocks?: boolean
+  allowPrivatePeers?: boolean
   peerAddrs?: string[]
 }
 

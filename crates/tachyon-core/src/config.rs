@@ -471,6 +471,11 @@ pub struct MagnetConfig {
     /// 格式:`host:port`。从磁力链接 `&pe=` 参数解析 + 用户手动配置合并。
     #[serde(default)]
     pub peer_addrs: Vec<String>,
+    /// 是否允许受限地址作为预置 peer（默认关闭）
+    ///
+    /// 仅用于已确认的 LAN 或自托管 swarm；开启不会提升公网下载速度。
+    #[serde(default)]
+    pub allow_private_peers: bool,
     /// 高隐私模式(审计 BT-11 最小缓解)
     ///
     /// 启用后 Session 强制禁用 DHT、禁用 UPnP、不注入全局/公共 tracker。
@@ -672,6 +677,7 @@ impl Default for MagnetConfig {
             defer_writes_up_to_mb: default_defer_writes_up_to_mb(),
             disable_dht_when_socks: true,
             peer_addrs: Vec::new(),
+            allow_private_peers: false,
             high_privacy: false,
             listen_port_start: None,
             listen_port_end: None,
@@ -1320,6 +1326,7 @@ pub struct MagnetPatch {
     pub defer_writes_up_to_mb: Option<u64>,
     pub disable_dht_when_socks: Option<bool>,
     pub peer_addrs: Option<Vec<String>>,
+    pub allow_private_peers: Option<bool>,
     pub high_privacy: Option<bool>,
     pub listen_port_start: Option<Option<u16>>,
     pub listen_port_end: Option<Option<u16>>,
@@ -1392,6 +1399,9 @@ impl MagnetPatch {
         }
         if let Some(v) = &self.peer_addrs {
             base.peer_addrs = v.clone();
+        }
+        if let Some(v) = self.allow_private_peers {
+            base.allow_private_peers = v;
         }
         if let Some(v) = self.high_privacy {
             base.high_privacy = v;
@@ -2772,6 +2782,57 @@ mod tests {
     }
 
     #[test]
+    fn magnet_config_legacy_private_peer_addrs_validate_but_default_to_opt_out() {
+        // 历史配置保留原始 peer 字符串，但缺少显式授权时必须默认关闭。
+        let mut legacy_json = serde_json::to_value(MagnetConfig::default()).unwrap();
+        let legacy_object = legacy_json.as_object_mut().unwrap();
+        legacy_object.remove("allowPrivatePeers");
+        legacy_object.insert(
+            "peerAddrs".into(),
+            serde_json::json!([
+                "10.0.0.7:6881",
+                "[fd00::7]:6881",
+                "not-an-ip-literal",
+                "203.0.113.7:0"
+            ]),
+        );
+
+        let config: MagnetConfig = serde_json::from_value(legacy_json).unwrap();
+
+        assert!(!config.allow_private_peers);
+        assert_eq!(
+            config.peer_addrs,
+            vec![
+                "10.0.0.7:6881",
+                "[fd00::7]:6881",
+                "not-an-ip-literal",
+                "203.0.113.7:0"
+            ]
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn magnet_patch_allow_private_peers_applies() {
+        let mut config = MagnetConfig::default();
+        assert!(!config.allow_private_peers);
+
+        MagnetPatch {
+            allow_private_peers: Some(true),
+            ..Default::default()
+        }
+        .apply_to(&mut config);
+        assert!(config.allow_private_peers);
+
+        MagnetPatch {
+            allow_private_peers: None,
+            ..Default::default()
+        }
+        .apply_to(&mut config);
+        assert!(config.allow_private_peers);
+    }
+
+    #[test]
     fn test_magnet_patch_apply_to_overwrites_some_fields() {
         let mut base = MagnetConfig::default();
         base.enable_dht = true;
@@ -3277,6 +3338,7 @@ mod tests {
             defer_writes_up_to_mb: Some(32),
             disable_dht_when_socks: Some(false),
             peer_addrs: Some(vec!["1.2.3.4:6881".into()]),
+            allow_private_peers: None,
             high_privacy: None,
             listen_port_start: Some(Some(6881)),
             listen_port_end: Some(Some(6889)),

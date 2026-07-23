@@ -34,7 +34,10 @@ export default function ToggleItem(props: ToggleItemProps) {
         </Show>
       </div>
       <button
+        type="button"
         class="relative"
+        aria-label={props.label}
+        aria-pressed={props.value}
         style={{
           width: "40px",
           height: "22px",
