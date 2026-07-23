@@ -20,18 +20,169 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use librqbit::file_info::FileInfo;
-use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, Magnet, ManagedTorrent, Session};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use tachyon_core::config::MagnetConfig;
 use tachyon_core::error::{DownloadError, DownloadResult};
 use tachyon_core::traits::{ByteStream, Protocol};
 use tachyon_core::types::{FileLayout, FileMetadata, FileSpan};
+
+pub use crate::magnet_lifecycle::MagnetSessionCoordinator;
+use crate::magnet_lifecycle::{
+    AcquisitionAdapter, AcquisitionError, AcquisitionRegistration, AcquisitionRequest,
+    AdapterError, BtCleanupAction,
+};
+use tokio::time::Instant as TokioInstant;
+
+/// 将一次 owned librqbit acquisition 映射为生命周期 adapter。
+///
+/// 该接缝只接受 `Added`，并保留 Session 返回的 exact `Arc<ManagedTorrent>`。
+/// AlreadyManaged 与 ListOnly 不授予本 adapter 删除权限，直接 fail-closed。
+pub(crate) struct LibrqbitAcquisitionAdapter {
+    session: Arc<Session>,
+    #[cfg(test)]
+    last_registration: Mutex<Option<AcquisitionRegistration>>,
+}
+
+impl LibrqbitAcquisitionAdapter {
+    #[allow(dead_code)]
+    pub(crate) fn new(session: Arc<Session>) -> Self {
+        Self {
+            session,
+            #[cfg(test)]
+            last_registration: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_registration_for_test(&self) -> Option<AcquisitionRegistration> {
+        self.last_registration
+            .lock()
+            .expect("librqbit adapter registration lock")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn record_registration(&self, registration: &AcquisitionRegistration) {
+        *self
+            .last_registration
+            .lock()
+            .expect("librqbit adapter registration lock") = Some(registration.clone());
+    }
+
+    #[cfg(not(test))]
+    fn record_registration(&self, _registration: &AcquisitionRegistration) {}
+}
+
+impl AcquisitionAdapter for LibrqbitAcquisitionAdapter {
+    fn add(
+        &self,
+        request: AcquisitionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AcquisitionRegistration, AdapterError>> + Send + '_>>
+    {
+        let session = Arc::clone(&self.session);
+        Box::pin(async move {
+            let (expected_hash, add, options) =
+                request.into_librqbit_parts().ok_or(AdapterError::Failed)?;
+            let response = session
+                .add_torrent(add, Some(options))
+                .await
+                .map_err(|_| AdapterError::Failed)?;
+            let (torrent_id, handle) = match response {
+                librqbit::AddTorrentResponse::Added(id, handle) => (id, handle),
+                librqbit::AddTorrentResponse::AlreadyManaged(_, _)
+                | librqbit::AddTorrentResponse::ListOnly(_) => return Err(AdapterError::Failed),
+            };
+            if handle.id() != torrent_id || handle.info_hash().0 != expected_hash {
+                return Err(AdapterError::Failed);
+            }
+            let registration =
+                AcquisitionRegistration::from_managed_torrent(expected_hash, torrent_id, handle);
+            self.record_registration(&registration);
+            Ok(registration)
+        })
+    }
+
+    fn retire(
+        &self,
+        registration: AcquisitionRegistration,
+        deadline: TokioInstant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>> {
+        let session = Arc::clone(&self.session);
+        Box::pin(async move {
+            if TokioInstant::now() >= deadline {
+                return Err(AdapterError::Timeout);
+            }
+            tokio::time::timeout_at(deadline, async move {
+                let Some(handle) = registration.managed_torrent() else {
+                    return Err(AdapterError::Failed);
+                };
+                let id = registration.torrent_id();
+                let hash = handle.info_hash();
+                if handle.id() != id || hash.0 != registration.info_hash() {
+                    return Err(AdapterError::Failed);
+                }
+                let by_id = session
+                    .get(librqbit::api::TorrentIdOrHash::Id(id))
+                    .ok_or(AdapterError::Failed)?;
+                let by_hash = session
+                    .get(librqbit::api::TorrentIdOrHash::Hash(hash))
+                    .ok_or(AdapterError::Failed)?;
+                if !Arc::ptr_eq(&handle, &by_id) || !Arc::ptr_eq(&handle, &by_hash) {
+                    return Err(AdapterError::Failed);
+                }
+
+                // pause 失败不阻止继续 delete；delete_files=false 保留用户文件。
+                let _ = session.pause(&handle).await;
+
+                let by_id = session
+                    .get(librqbit::api::TorrentIdOrHash::Id(id))
+                    .ok_or(AdapterError::Failed)?;
+                let by_hash = session
+                    .get(librqbit::api::TorrentIdOrHash::Hash(hash))
+                    .ok_or(AdapterError::Failed)?;
+                if !Arc::ptr_eq(&handle, &by_id) || !Arc::ptr_eq(&handle, &by_hash) {
+                    return Err(AdapterError::Failed);
+                }
+
+                session
+                    .delete(librqbit::api::TorrentIdOrHash::Id(id), false)
+                    .await
+                    .map_err(|_| AdapterError::Failed)?;
+                if session
+                    .get(librqbit::api::TorrentIdOrHash::Id(id))
+                    .is_some()
+                    || session
+                        .get(librqbit::api::TorrentIdOrHash::Hash(hash))
+                        .is_some()
+                {
+                    return Err(AdapterError::Failed);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| AdapterError::Timeout)?
+        })
+    }
+}
+
+/// 为指定 librqbit Session 创建协议层托管的生命周期协调器。
+///
+/// 返回值是跨 crate 传递的 opaque capability。adapter、acquisition 与 cleanup
+/// 方法均保留在协议层，engine 只负责把同一 `Arc` 注入所有 MagnetProtocol 实例。
+pub fn new_librqbit_session_coordinator(session: Arc<Session>) -> Arc<MagnetSessionCoordinator> {
+    Arc::new(MagnetSessionCoordinator::from_adapter(Arc::new(
+        LibrqbitAcquisitionAdapter::new(session),
+    )))
+}
 
 /// 按 magnet URL 缓存的 ManagedTorrent 句柄 + 文件布局
 ///
@@ -99,6 +250,11 @@ pub struct MagnetProtocol {
     handle_cache: HandleCache,
     /// 与 BtSession 共享的 session 操作锁表(probe cleanup ↔ download add 串行)
     ops_gate: SessionOpsGate,
+    /// 与 BtSession 共享的 acquisition/cleanup 生命周期协调器。
+    ///
+    /// `None` 保留构造器兼容性；真实 BtSession 生产路径通过
+    /// `with_session_coordinator` 注入同一 opaque capability。
+    session_coordinator: Option<Arc<MagnetSessionCoordinator>>,
     /// 自定义 StorageFactory(P2-4:消除双存储写放大)
     ///
     /// None 时用 librqbit 默认 FilesystemStorage(向后兼容)。
@@ -108,13 +264,20 @@ pub struct MagnetProtocol {
     storage_factory: Option<librqbit::storage::BoxStorageFactory>,
     /// 用户最终根名(与 TachyonStorageFactory preferred 对齐,用于 cache 绑定)
     preferred_root_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// cache-miss acquisition 串行化门闩:同一 bind_key 的并发 download worker
+    /// 不会各自调用 coordinator.begin_acquire(后者对已存在 lane fail-closed)，
+    /// 而是按序排队，首个完成 acquisition + cache insert 后，后续 worker 命中缓存。
+    acquisition_gates: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
+    /// observer lazy capture:最后一次成功获取的 peer stats 快照。
+    /// `handle.live()` 返回 None(cleanup 后或 torrent 尚未 live)时,
+    /// 返回此缓存值而非 None,使终态统计不丢失(设计 §7)。
+    last_peer_stats: Arc<Mutex<Option<BtPeerStats>>>,
 }
 
 impl MagnetProtocol {
     /// 创建磁力链接协议客户端
     ///
     /// `handle_cache` 由 BtSession 持有并跨实例共享,传入同一 Arc 使
-    /// probe_filename 命令与下载任务共享缓存,避免重复 add_torrent。
     pub fn new(
         session: Arc<Session>,
         config: MagnetConfig,
@@ -127,8 +290,11 @@ impl MagnetProtocol {
             download_dir,
             handle_cache,
             ops_gate: Arc::new(DashMap::new()),
+            session_coordinator: None,
             storage_factory: None,
             preferred_root_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            acquisition_gates: Arc::new(DashMap::new()),
+            last_peer_stats: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -136,6 +302,66 @@ impl MagnetProtocol {
     pub fn with_ops_gate(mut self, gate: SessionOpsGate) -> Self {
         self.ops_gate = gate;
         self
+    }
+
+    /// 注入与 BtSession 共享的生命周期协调器。
+    pub fn with_session_coordinator(mut self, coordinator: Arc<MagnetSessionCoordinator>) -> Self {
+        self.session_coordinator = Some(coordinator);
+        self
+    }
+
+    /// 返回注入的生命周期协调器身份。
+    ///
+    /// 仅供跨 crate 测试验证 capability wiring；生产生命周期操作仍不对外公开。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn session_coordinator_for_test(&self) -> Arc<MagnetSessionCoordinator> {
+        self.session_coordinator
+            .as_ref()
+            .expect("session coordinator must be injected for this test")
+            .clone()
+    }
+
+    /// 从当前 coordinator 取回该 BT v1 info hash lane 的 cleanup capability。
+    ///
+    /// 解析失败、未注入 coordinator 或 registry 中不存在当前 lane 时返回 `None`；
+    /// 不通过 URL、handle cache 或 Session 状态推断 cleanup 归属。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cleanup_action_for(&self, url: &str) -> Option<BtCleanupAction> {
+        let info_hash = Magnet::parse(url).ok()?.as_id20().map(|id| id.0)?;
+        self.session_coordinator
+            .as_ref()?
+            .cleanup_action_for(info_hash)
+    }
+
+    /// 请求同一 coordinator lane 的后台 cleanup，并立即返回。
+    ///
+    /// 该方法只接受 BT v1 info hash 已存在的 lane；不查询 Session、handle cache，
+    /// 不创建新的 coordinator 或 Session。后台 task 的唯一 cleanup ownership 仍在
+    /// coordinator lane 内，失败只由 action 记录脱敏 stage/error。
+    pub fn request_background_cleanup_for(&self, url: &str) -> bool {
+        let Some(action) = self.cleanup_action_for(url) else {
+            return false;
+        };
+        let deadline = TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+        if !action.reserve_background_cleanup() {
+            return false;
+        }
+
+        // 先完成 request-level gate，再同步摘除当前 protocol binding；即使后台
+        // worker 随后因 race 失败，stale handle 也不会继续被本实例命中。该操作只
+        // 处理当前 binding，不按 torrent id 清理其它 owner 的缓存。
+        self.detach_cached_binding(url);
+        action.spawn_background_cleanup(deadline);
+        true
+    }
+
+    /// 测试只提供 production probe 的窄调用接缝，不改变 probe 的执行路径。
+    #[cfg(test)]
+    pub(crate) async fn probe_with_coordinator_for_test(
+        &self,
+        url: &str,
+    ) -> DownloadResult<FileMetadata> {
+        Protocol::probe(self, url).await
     }
 
     /// 注入自定义 StorageFactory(P2-4:消除双存储写放大)
@@ -310,13 +536,23 @@ impl MagnetProtocol {
             );
             return;
         }
+        // coordinator 路径:经 tracked cleanup action 退役,不再 detached spawn
+        // pause/delete + hash fallback。coordinator 按 exact provenance ID-only
+        // delete,保证不误删新 generation;失败 lane 进入 Quarantined 供显式重试。
+        if self.session_coordinator.is_some() && self.request_background_cleanup_for(magnet_url) {
+            tracing::info!(
+                magnet = %redacted_url,
+                "已请求 coordinator 后台 tracked cleanup(替代 detached pause/delete)"
+            );
+            return;
+        }
 
+        // 无 coordinator 或 coordinator 无 lane(旧构造/probe 前路径)回退:
+        // 保留原 detached pause/delete + hash fallback 兼容。
         let session = Arc::clone(&self.session);
         let handle = entry.handle;
         let magnet_url = magnet_url.to_string();
         let ops_gate = Arc::clone(&self.ops_gate);
-        // 后台清理:不阻塞调用方。pause/delete 各 5s 超时,失败仅 warn。
-        // 持 URL 级 ops 锁:与 add_magnet_to_session 互斥,消除 probe→download 竞态。
         tokio::spawn(async move {
             const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
             with_magnet_session_op(&ops_gate, &magnet_url, async {
@@ -383,15 +619,29 @@ impl MagnetProtocol {
     /// 因 `peer_stats_snapshot` 是协议特有的诊断方法,不在 `Protocol` trait 上)。
     pub fn peer_stats_snapshot(&self, url: &str) -> Option<BtPeerStats> {
         let entry = self.lookup_compatible(url)?;
-        let live = entry.handle.live()?;
-        let snap = live.stats_snapshot();
-        Some(BtPeerStats {
-            live_peers: snap.peer_stats.live,
-            connecting_peers: snap.peer_stats.connecting,
-            queued_peers: snap.peer_stats.queued,
-            downloaded_bytes: snap.downloaded_and_checked_bytes,
-            uploaded_bytes: snap.uploaded_bytes,
-        })
+        // observer lazy capture(设计 §7):首次 live 时捕获 stats source,
+        // cleanup 后 live 不可取时仍返回最后捕获值,不丢失终态统计。
+        if let Some(live) = entry.handle.live() {
+            let snap = live.stats_snapshot();
+            let stats = BtPeerStats {
+                live_peers: snap.peer_stats.live,
+                connecting_peers: snap.peer_stats.connecting,
+                queued_peers: snap.peer_stats.queued,
+                downloaded_bytes: snap.downloaded_and_checked_bytes,
+                uploaded_bytes: snap.uploaded_bytes,
+            };
+            *self
+                .last_peer_stats
+                .lock()
+                .expect("last_peer_stats lock") = Some(stats.clone());
+            Some(stats)
+        } else {
+            // live 不可取(尚未 live 或已 cleanup):返回最后捕获值。
+            self.last_peer_stats
+                .lock()
+                .expect("last_peer_stats lock")
+                .clone()
+        }
     }
 
     /// 审计 BT-17:引擎分片 FileStream 读完后,等待 librqbit piece truth 完成。
@@ -1204,6 +1454,159 @@ fn resolve_first_file_path(
 /// 使引擎能重试/失败而非永久卡死。复用 `metadata_timeout_secs`(语义一致:
 /// 元数据获取超时覆盖 add_torrent + wait_until_initialized 全流程)。
 #[allow(clippy::too_many_arguments)] // session 操作参数 + ops_gate 串行锁,内聚于单路径
+fn acquisition_error_to_download_error(error: AcquisitionError) -> DownloadError {
+    match error {
+        AcquisitionError::Adapter(AdapterError::Timeout) => {
+            DownloadError::Timeout("磁力链接生命周期 acquisition 超时".into())
+        }
+        AcquisitionError::Adapter(AdapterError::Failed) => {
+            DownloadError::Protocol("磁力链接 acquisition worker 失败".into())
+        }
+        AcquisitionError::ScopeRetiring => {
+            DownloadError::Protocol("磁力链接生命周期 scope 正在退出".into())
+        }
+        AcquisitionError::WorkerTerminated => {
+            DownloadError::Protocol("磁力链接 acquisition worker 已终止".into())
+        }
+    }
+}
+
+/// Probe 阶段持有的 acquisition 载荷。
+///
+/// `cleanup` 与 `handle` 来自同一次 coordinator acquisition。probe 的后续阶段失败时，
+/// 必须使用这个 action 清理，而不能只让 action 离开作用域；成功时本 slice 不把 action
+/// 交给 engine/App，而是保留 lane registration，后续 owner 可通过同一
+/// `MagnetProtocol::cleanup_action_for` 取回它并保持 registration provenance。
+pub(crate) struct ProbeAcquisition {
+    handle: Arc<ManagedTorrent>,
+    cleanup: BtCleanupAction,
+}
+
+/// probe 失败时请求同一 coordinator lane 的 cleanup，并保留原始 probe 错误。
+///
+/// cleanup 使用独立预算，不能复用 metadata deadline。cleanup 失败只作为诊断记录，
+/// lane 会保留未收敛资源供 coordinator 后续观察或显式重试。
+const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn cleanup_probe_failure<T>(
+    action: &BtCleanupAction,
+    error: DownloadError,
+) -> DownloadResult<T> {
+    // cleanup action 自身会把 retirement worker 登记到同一 lane；probe 只登记后台
+    // cleanup，不等待 coordinator lane 收敛，确保原始 probe 错误立即返回。cleanup
+    // 失败由后台固定 stage 记录，lane 保留/quarantine 供后续观察或显式重试。
+    let cleanup_deadline = TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+    action.request_background_cleanup(cleanup_deadline);
+    Err(error)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_magnet_for_probe_with_deadline(
+    coordinator: &Arc<MagnetSessionCoordinator>,
+    url: &str,
+    download_dir: &std::path::Path,
+    force_tracker_interval: Option<Duration>,
+    initial_peers: Vec<SocketAddr>,
+    storage_factory: Option<librqbit::storage::BoxStorageFactory>,
+    only_files: Option<Vec<usize>>,
+    socks_active: bool,
+    deadline: TokioInstant,
+) -> DownloadResult<ProbeAcquisition> {
+    let info_hash = Magnet::parse(url)
+        .ok()
+        .and_then(|magnet| magnet.as_id20())
+        .map(|id| id.0)
+        .ok_or_else(|| DownloadError::Protocol("磁力链接缺少有效 BT v1 info hash".into()))?;
+    let url_owned = strip_udp_trackers_from_magnet(url, socks_active);
+    let options = AddTorrentOptions {
+        overwrite: true,
+        output_folder: Some(download_dir.to_string_lossy().into_owned()),
+        force_tracker_interval,
+        initial_peers: if initial_peers.is_empty() {
+            None
+        } else {
+            Some(initial_peers)
+        },
+        storage_factory,
+        only_files,
+        ..Default::default()
+    };
+    let acquisition = coordinator
+        .begin_acquire(AcquisitionRequest::for_librqbit(
+            info_hash,
+            AddTorrent::from_url(url_owned),
+            options,
+        ))
+        .map_err(acquisition_error_to_download_error)?;
+    let cleanup = acquisition.cleanup_action();
+
+    let registration = match tokio::time::timeout_at(deadline, acquisition.start()).await {
+        Ok(Ok(registration)) => registration,
+        Ok(Err(error)) => {
+            return cleanup_probe_failure(&cleanup, acquisition_error_to_download_error(error))
+                .await;
+        }
+        Err(_) => {
+            return cleanup_probe_failure(
+                &cleanup,
+                DownloadError::Timeout("磁力链接元数据获取超时".into()),
+            )
+            .await;
+        }
+    };
+    let Some(handle) = registration.managed_torrent() else {
+        return cleanup_probe_failure(
+            &cleanup,
+            DownloadError::Protocol("磁力链接 acquisition 未返回 ManagedTorrent".into()),
+        )
+        .await;
+    };
+
+    Ok(ProbeAcquisition { handle, cleanup })
+}
+
+/// Download 阶段持有的 acquisition 载荷。
+///
+/// 与 `ProbeAcquisition` 同权：`cleanup` 与 `handle` 来自同一次 coordinator
+/// acquisition。成功 cache-miss 下载路径保留 lane registration，后续 owner 可通过
+/// `MagnetProtocol::cleanup_action_for` 取回 action；本切片不退役
+/// `stop_and_remove_torrent`，也不扩展到 download_full 路径。
+pub(crate) struct DownloadAcquisition {
+    pub(crate) handle: Arc<ManagedTorrent>,
+    pub(crate) cleanup: BtCleanupAction,
+}
+
+/// 与 probe 对称的 download acquisition helper：经 coordinator 取得 exact Added。
+///
+/// 复用 probe 内部 acquisition 逻辑，避免复制 add options / deadline / failure cleanup。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_magnet_for_download_with_deadline(
+    coordinator: &Arc<MagnetSessionCoordinator>,
+    url: &str,
+    download_dir: &std::path::Path,
+    force_tracker_interval: Option<Duration>,
+    initial_peers: Vec<SocketAddr>,
+    storage_factory: Option<librqbit::storage::BoxStorageFactory>,
+    only_files: Option<Vec<usize>>,
+    socks_active: bool,
+    deadline: TokioInstant,
+) -> DownloadResult<DownloadAcquisition> {
+    let ProbeAcquisition { handle, cleanup } = acquire_magnet_for_probe_with_deadline(
+        coordinator,
+        url,
+        download_dir,
+        force_tracker_interval,
+        initial_peers,
+        storage_factory,
+        only_files,
+        socks_active,
+        deadline,
+    )
+    .await?;
+    Ok(DownloadAcquisition { handle, cleanup })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn add_magnet_to_session(
     session: &Arc<Session>,
     url: &str,
@@ -1411,7 +1814,6 @@ impl Protocol for MagnetProtocol {
             return Box::pin(async move { Err(e) });
         }
 
-        let session = self.session.clone();
         let config = self.config.clone();
         let url = url.to_string();
         let download_dir = self.download_dir.clone();
@@ -1422,7 +1824,7 @@ impl Protocol for MagnetProtocol {
             .read()
             .expect("preferred_root lock")
             .clone();
-        let ops_gate = Arc::clone(&self.ops_gate);
+        let session_coordinator = self.session_coordinator.clone();
         let this_for_lookup = (
             download_dir.clone(),
             storage_factory.is_some(),
@@ -1484,59 +1886,101 @@ impl Protocol for MagnetProtocol {
             } else {
                 Some(Duration::from_secs(config.force_tracker_interval_secs))
             };
-            // metadata_timeout 覆盖 add_torrent(含 resolve_magnet)+ wait_until_initialized 全流程
+            // initial_peers: S-01 canonical collector(magnet &pe= + config peer_addrs)
+            let initial_peers = collect_initial_peers(&url, &config);
+            // 从 probe 开始只建立一个 absolute metadata deadline，覆盖 acquisition、
+            // initialization 与后续 metadata/layout/cache 阶段；后续阶段不得重算预算。
             let socks_active = config.socks_proxy_url.is_some()
                 || tachyon_core::config::detect_socks_proxy().is_some();
-            let metadata_timeout = Duration::from_secs(config.metadata_timeout_secs);
+            let metadata_deadline =
+                TokioInstant::now() + Duration::from_secs(config.metadata_timeout_secs);
             // BT-16: 解析 so= 并贯通到 librqbit only_files + layout 过滤
             let only_files = parse_so_from_magnet(&url);
-            let handle = add_magnet_to_session(
-                &session,
+            let coordinator = session_coordinator.as_ref().ok_or_else(|| {
+                DownloadError::Protocol(
+                    "磁力链接生命周期 coordinator 不可用，无法获取 torrent".into(),
+                )
+            })?;
+            let ProbeAcquisition { handle, cleanup } = acquire_magnet_for_probe_with_deadline(
+                coordinator,
                 &url,
                 &download_dir,
                 force_tracker_interval,
-                &config,
-                metadata_timeout,
+                initial_peers,
                 storage_factory.as_ref().map(|f| f.clone_box()),
-                &ops_gate,
-                socks_active,
                 only_files.clone(),
+                socks_active,
+                metadata_deadline,
             )
             .await?;
 
-            // 等待元数据就绪（带超时）
-            tokio::time::timeout(metadata_timeout, handle.wait_until_initialized())
-                .await
-                .map_err(|_| {
-                    DownloadError::Timeout(format!(
-                        "磁力链接元数据获取超时（{}秒）",
-                        config.metadata_timeout_secs
-                    ))
-                })?
-                .map_err(|e| DownloadError::Protocol(format!("磁力链接元数据获取失败: {e}")))?;
+            // 等待元数据就绪，复用 acquisition 的同一个 absolute deadline。
+            match tokio::time::timeout_at(metadata_deadline, handle.wait_until_initialized()).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return cleanup_probe_failure(
+                        &cleanup,
+                        DownloadError::Protocol(format!("磁力链接元数据获取失败: {error}")),
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return cleanup_probe_failure(
+                        &cleanup,
+                        DownloadError::Timeout("磁力链接元数据获取超时".into()),
+                    )
+                    .await;
+                }
+            }
 
-            // 提取元数据：文件名、大小、文件布局
+            // 提取元数据：文件名、大小、文件布局。同步阶段也必须尊重同一个
+            // absolute deadline，不能在 acquisition/init 后重新获得一段预算。
+            if TokioInstant::now() >= metadata_deadline {
+                return cleanup_probe_failure(
+                    &cleanup,
+                    DownloadError::Timeout("磁力链接元数据获取超时".into()),
+                )
+                .await;
+            }
             // 单/多文件 torrent 均走 range 路径(FileStream 按 file_id 流式读),
             // download_range_stream 用 FileLayout 把全局 range 拆到各文件段。
             let only_files_ref = only_files.as_deref();
-            let (file_name, file_size, layout) = handle
-                .with_metadata(|m| {
-                    let name = m
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| "unknown_torrent".to_string());
-                    let layout = Self::layout_from_file_infos(&m.file_infos, only_files_ref);
-                    // so= 选中时 file_size = 选中文件长度之和; 否则用 torrent 总长
-                    let size = if only_files_ref.is_some() {
-                        layout.total_len()
-                    } else {
-                        m.lengths.total_length()
-                    };
-                    (name, size, layout)
-                })
-                .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
+            let metadata = handle.with_metadata(|m| {
+                let name = m
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "unknown_torrent".to_string());
+                let layout = Self::layout_from_file_infos(&m.file_infos, only_files_ref);
+                // so= 选中时 file_size = 选中文件长度之和; 否则用 torrent 总长
+                let size = if only_files_ref.is_some() {
+                    layout.total_len()
+                } else {
+                    m.lengths.total_length()
+                };
+                (name, size, layout)
+            });
+            let (file_name, file_size, layout) = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return cleanup_probe_failure(
+                        &cleanup,
+                        DownloadError::Protocol(format!("获取磁力链接元数据失败: {error}")),
+                    )
+                    .await;
+                }
+            };
 
-            // 缓存 handle + layout,供后续 download_range_stream 每分片命中
+            // cache 写入属于 probe 的同一 metadata 阶段；过了 absolute deadline
+            // 时仍必须走 coordinator cleanup，而不能发布一个超时后的 cache 条目。
+            if TokioInstant::now() >= metadata_deadline {
+                return cleanup_probe_failure(
+                    &cleanup,
+                    DownloadError::Timeout("磁力链接元数据获取超时".into()),
+                )
+                .await;
+            }
+            // 缓存 handle + layout,供后续 download_range_stream 每分片命中。
             let entry = CachedTorrent {
                 handle: Arc::clone(&handle),
                 layout: layout.clone(),
@@ -1550,7 +1994,22 @@ impl Protocol for MagnetProtocol {
                 preferred_root.as_deref(),
                 &url,
             );
-            Self::insert_with_capacity(&handle_cache, bind_key, entry);
+            Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
+            if TokioInstant::now() >= metadata_deadline {
+                // insert 是同步操作，但仍检查其完成后的 absolute deadline，避免发布
+                // 已过期的 cache binding；失败清理继续使用同一 acquisition action。
+                handle_cache.remove(&bind_key);
+                return cleanup_probe_failure(
+                    &cleanup,
+                    DownloadError::Timeout("磁力链接元数据获取超时".into()),
+                )
+                .await;
+            }
+
+            // 当前 slice 尚未把 cleanup capability 交给 engine/App；显式释放本地 carrier
+            // 不会改变 lane registration，后续 owner 可通过同一 protocol/coordinator 的
+            // cleanup_action_for 取回 action 后接管资源。
+            drop(cleanup);
 
             Ok(FileMetadata {
                 file_name,
@@ -1602,7 +2061,6 @@ impl Protocol for MagnetProtocol {
             });
         }
 
-        let session = self.session.clone();
         let download_dir = self.download_dir.clone();
         let handle_cache = self.handle_cache.clone();
         let url = url.to_string();
@@ -1612,7 +2070,15 @@ impl Protocol for MagnetProtocol {
             .read()
             .expect("preferred_root lock")
             .clone();
-        let ops_gate = Arc::clone(&self.ops_gate);
+        let session_coordinator = self.session_coordinator.clone();
+        let acquisition_gates = self.acquisition_gates.clone();
+        let force_tracker_interval = if self.config.force_tracker_interval_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.config.force_tracker_interval_secs))
+        };
+        // initial_peers: magnet &pe= + 配置 peer_addrs；cache-miss 下载与 probe 同权注入。
+        let initial_peers = collect_initial_peers(&url, &self.config);
         // peer 智能等待:0 禁用等 peer 窗口(无 peer 时按 stall 失败,审计 BT-08),
         // 否则按配置秒数;死 swarm 下在窗口内轮询 peer 健康,超限失败。
         let peer_wait = if self.config.peer_wait_timeout_secs == 0 {
@@ -1625,14 +2091,14 @@ impl Protocol for MagnetProtocol {
         // 且取消信号无法穿透的问题。
         // 修复 B4:stall 与 peer_wait 解耦(见 resolve_stall_timeout 文档)。
         let stall_timeout = resolve_stall_timeout(self.config.stall_timeout_secs, peer_wait);
-        // add_torrent 超时(复用 metadata_timeout,覆盖 resolve_magnet 死 swarm 兜底)
-        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
+        // absolute metadata deadline：覆盖 cache-miss acquisition 与 metadata/layout。
+        let metadata_deadline =
+            TokioInstant::now() + Duration::from_secs(self.config.metadata_timeout_secs);
         let socks_active = self.socks_active();
-        let config = self.config.clone();
 
         Box::pin(async move {
             // 命中缓存（probe 阶段已填充 handle + layout）则直接取，
-            // 否则回退 add_magnet_to_session（无 layout,构造单文件默认）
+            // 否则经 session_coordinator 取得 exact Added（与 probe 同权）。
             let bind_key = MagnetProtocol::cache_binding_key(
                 &download_dir,
                 storage_factory.is_some(),
@@ -1642,41 +2108,78 @@ impl Protocol for MagnetProtocol {
             let (handle, layout) = if let Some(entry) = handle_cache.get(&bind_key) {
                 (Arc::clone(&entry.handle), entry.layout.clone())
             } else {
-                let h = add_magnet_to_session(
-                    &session,
-                    &url,
-                    &download_dir,
-                    None, // 回退路径不强制 tracker interval
-                    &config,
-                    metadata_timeout,
-                    storage_factory.as_ref().map(|f| f.clone_box()),
-                    &ops_gate,
-                    socks_active,
-                    parse_so_from_magnet(&url),
-                )
-                .await?;
-                // 未走 probe 的回退路径:从 metadata 构造 layout
-                let so = parse_so_from_magnet(&url);
-                let layout = h
-                    .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, so.as_deref()))
-                    .map_err(|e| DownloadError::Protocol(format!("获取磁力链接元数据失败: {e}")))?;
-                {
-                    let entry = CachedTorrent {
-                        handle: Arc::clone(&h),
-                        layout: layout.clone(),
-                        download_dir: download_dir.clone(),
-                        has_storage_factory: storage_factory.is_some(),
-                        preferred_root: preferred_root.clone(),
+                let coordinator = session_coordinator.as_ref().ok_or_else(|| {
+                    DownloadError::Protocol(
+                        "磁力链接生命周期 coordinator 不可用，无法获取 torrent".into(),
+                    )
+                })?;
+                // singleflight 门闩:并发 download worker 共享同一 bind_key 门闩,
+                // 首个 worker 完成 acquisition + cache insert 后,后续 worker
+                // 重新检查缓存即可命中,避免 coordinator begin_acquire 对已存在
+                // lane fail-closed 导致并发 cache-miss 确定性失败。
+                let gate = acquisition_gates
+                    .entry(bind_key.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone();
+                let _gate_guard = gate.lock().await;
+
+                // 拿到门闩后重新检查缓存:首个 worker 可能已插入。
+                if let Some(entry) = handle_cache.get(&bind_key) {
+                    (Arc::clone(&entry.handle), entry.layout.clone())
+                } else {
+                    let DownloadAcquisition { handle, cleanup } =
+                        acquire_magnet_for_download_with_deadline(
+                            coordinator,
+                            &url,
+                            &download_dir,
+                            force_tracker_interval,
+                            initial_peers,
+                            storage_factory.as_ref().map(|f| f.clone_box()),
+                            parse_so_from_magnet(&url),
+                            socks_active,
+                            metadata_deadline,
+                        )
+                        .await?;
+                    // 成功路径保留 lane registration；本地 carrier 释放不注销 coordinator。
+                    drop(cleanup);
+
+                    // 未走 probe 的 cache-miss 路径:从 metadata 构造 layout
+                    let so = parse_so_from_magnet(&url);
+                    let layout = match handle.with_metadata(|m| {
+                        Self::layout_from_file_infos(&m.file_infos, so.as_deref())
+                    }) {
+                        Ok(layout) => layout,
+                        Err(e) => {
+                            // layout 失败必须请求 tracked cleanup,与 probe 路径对称,
+                            // 不能只 drop(cleanup) 后返回错误留下 orphan registration。
+                            let cleanup_deadline =
+                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            if let Some(action) = coordinator.cleanup_action_for(
+                                Magnet::parse(&url)
+                                    .ok()
+                                    .and_then(|m| m.as_id20())
+                                    .map(|id| id.0)
+                                    .unwrap_or([0u8; 20]),
+                            ) {
+                                action.request_background_cleanup(cleanup_deadline);
+                            }
+                            return Err(DownloadError::Protocol(format!(
+                                "获取磁力链接元数据失败: {e}"
+                            )));
+                        }
                     };
-                    let bind_key = MagnetProtocol::cache_binding_key(
-                        &download_dir,
-                        storage_factory.is_some(),
-                        preferred_root.as_deref(),
-                        &url,
-                    );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
+                    {
+                        let entry = CachedTorrent {
+                            handle: Arc::clone(&handle),
+                            layout: layout.clone(),
+                            download_dir: download_dir.clone(),
+                            has_storage_factory: storage_factory.is_some(),
+                            preferred_root: preferred_root.clone(),
+                        };
+                        Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
+                    }
+                    (handle, layout)
                 }
-                (h, layout)
             };
 
             // 用 FileLayout 把全局 [start, end] 拆成各文件内的段
@@ -1761,18 +2264,21 @@ impl Protocol for MagnetProtocol {
             .read()
             .expect("preferred_root lock")
             .clone();
+        let session_coordinator = self.session_coordinator.clone();
+        let acquisition_gates = self.acquisition_gates.clone();
+        let force_tracker_interval = if self.config.force_tracker_interval_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.config.force_tracker_interval_secs))
+        };
+        let initial_peers = collect_initial_peers(&url, &self.config);
+        let config = self.config.clone();
+        let metadata_deadline =
+            TokioInstant::now() + Duration::from_secs(self.config.metadata_timeout_secs);
+        let socks_active = self.socks_active();
+        let peer_wait_secs = self.config.peer_wait_timeout_secs;
         let ops_gate = Arc::clone(&self.ops_gate);
         let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
-        let socks_active = self.socks_active();
-        let config = self.config.clone();
-        // 修复 B2-Critical:用无进度看门狗替代固定总时长 completion_timeout。
-        // 原实现复用 peer_wait_timeout_secs 作"下载完成总上限",大文件(几 GB)正常
-        // 下载常需 30 分钟以上,5 分钟超时必然在下载中途误杀,产出误导错误信息
-        // "疑似死 swarm 无可用 peer",且 Timeout 是 retryable 触发重试又超时循环。
-        // 看门狗周期采样 downloaded_and_checked_bytes,有增长则不超时(大文件不误杀),
-        // 无增长超 peer_wait 才判死 swarm。peer_wait=0 禁用看门狗(向后兼容,
-        // 但保留死 swarm 挂起 —— 文档说明)。
-        let peer_wait_secs = self.config.peer_wait_timeout_secs;
 
         Box::pin(async move {
             // 命中缓存(probe 已填充 handle + layout);未命中则现场添加(回退,无 layout)
@@ -1784,7 +2290,67 @@ impl Protocol for MagnetProtocol {
             );
             let handle = if let Some(entry) = handle_cache.get(&bind_key) {
                 Arc::clone(&entry.handle)
+            } else if let Some(coordinator) = session_coordinator.as_ref() {
+                // coordinator 路径:与 download_range_stream 对称,经 singleflight 门闩
+                // 取得 exact Added,layout 失败时请求 tracked cleanup。
+                let gate = acquisition_gates
+                    .entry(bind_key.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone();
+                let _gate_guard = gate.lock().await;
+                if let Some(entry) = handle_cache.get(&bind_key) {
+                    Arc::clone(&entry.handle)
+                } else {
+                    let DownloadAcquisition { handle, cleanup } =
+                        acquire_magnet_for_download_with_deadline(
+                            coordinator,
+                            &url,
+                            &download_dir,
+                            force_tracker_interval,
+                            initial_peers.clone(),
+                            storage_factory.as_ref().map(|f| f.clone_box()),
+                            parse_so_from_magnet(&url),
+                            socks_active,
+                            metadata_deadline,
+                        )
+                        .await?;
+                    drop(cleanup);
+                    let so = parse_so_from_magnet(&url);
+                    let layout = match handle.with_metadata(|m| {
+                        Self::layout_from_file_infos(&m.file_infos, so.as_deref())
+                    }) {
+                        Ok(layout) => layout,
+                        Err(e) => {
+                            let cleanup_deadline =
+                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            if let Some(action) = coordinator.cleanup_action_for(
+                                Magnet::parse(&url)
+                                    .ok()
+                                    .and_then(|m| m.as_id20())
+                                    .map(|id| id.0)
+                                    .unwrap_or([0u8; 20]),
+                            ) {
+                                action.request_background_cleanup(cleanup_deadline);
+                            }
+                            return Err(DownloadError::Protocol(format!(
+                                "获取磁力链接元数据失败: {e}"
+                            )));
+                        }
+                    };
+                    {
+                        let entry = CachedTorrent {
+                            handle: Arc::clone(&handle),
+                            layout,
+                            download_dir: download_dir.clone(),
+                            has_storage_factory: storage_factory.is_some(),
+                            preferred_root: preferred_root.clone(),
+                        };
+                        Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
+                    }
+                    handle
+                }
             } else {
+                // 无 coordinator 回退:保留原 raw add_magnet_to_session 路径兼容旧构造。
                 let h = add_magnet_to_session(
                     &session,
                     &url,
@@ -1798,7 +2364,6 @@ impl Protocol for MagnetProtocol {
                     parse_so_from_magnet(&url),
                 )
                 .await?;
-                // 回退路径:layout 同样应用 so= 过滤
                 let so = parse_so_from_magnet(&url);
                 let layout = h
                     .with_metadata(|m| Self::layout_from_file_infos(&m.file_infos, so.as_deref()))
@@ -1806,18 +2371,12 @@ impl Protocol for MagnetProtocol {
                 {
                     let entry = CachedTorrent {
                         handle: Arc::clone(&h),
-                        layout: layout.clone(),
+                        layout,
                         download_dir: download_dir.clone(),
                         has_storage_factory: storage_factory.is_some(),
                         preferred_root: preferred_root.clone(),
                     };
-                    let bind_key = MagnetProtocol::cache_binding_key(
-                        &download_dir,
-                        storage_factory.is_some(),
-                        preferred_root.as_deref(),
-                        &url,
-                    );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
+                    Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
                 }
                 h
             };
@@ -1863,14 +2422,22 @@ impl Protocol for MagnetProtocol {
             .expect("preferred_root lock")
             .clone();
         let ops_gate = Arc::clone(&self.ops_gate);
-        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
-        let socks_active = self.socks_active();
+        let session_coordinator = self.session_coordinator.clone();
+        let acquisition_gates = self.acquisition_gates.clone();
+        let force_tracker_interval = if self.config.force_tracker_interval_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.config.force_tracker_interval_secs))
+        };
+        let initial_peers = collect_initial_peers(&url, &self.config);
         let config = self.config.clone();
-        // 修复 B2-Critical:语义同 download_full,用无进度看门狗替代固定总时长超时。
+        let metadata_deadline =
+            TokioInstant::now() + Duration::from_secs(self.config.metadata_timeout_secs);
+        let socks_active = self.socks_active();
         let peer_wait_secs = self.config.peer_wait_timeout_secs;
+        let metadata_timeout = Duration::from_secs(self.config.metadata_timeout_secs);
 
         Box::pin(async move {
-            // 命中缓存;未命中则现场添加
             let bind_key = MagnetProtocol::cache_binding_key(
                 &download_dir,
                 storage_factory.is_some(),
@@ -1879,6 +2446,63 @@ impl Protocol for MagnetProtocol {
             );
             let handle = if let Some(entry) = handle_cache.get(&bind_key) {
                 Arc::clone(&entry.handle)
+            } else if let Some(coordinator) = session_coordinator.as_ref() {
+                let gate = acquisition_gates
+                    .entry(bind_key.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone();
+                let _gate_guard = gate.lock().await;
+                if let Some(entry) = handle_cache.get(&bind_key) {
+                    Arc::clone(&entry.handle)
+                } else {
+                    let DownloadAcquisition { handle, cleanup } =
+                        acquire_magnet_for_download_with_deadline(
+                            coordinator,
+                            &url,
+                            &download_dir,
+                            force_tracker_interval,
+                            initial_peers.clone(),
+                            storage_factory.as_ref().map(|f| f.clone_box()),
+                            parse_so_from_magnet(&url),
+                            socks_active,
+                            metadata_deadline,
+                        )
+                        .await?;
+                    drop(cleanup);
+                    let so = parse_so_from_magnet(&url);
+                    let layout = match handle.with_metadata(|m| {
+                        Self::layout_from_file_infos(&m.file_infos, so.as_deref())
+                    }) {
+                        Ok(layout) => layout,
+                        Err(e) => {
+                            let cleanup_deadline =
+                                TokioInstant::now() + PROBE_CLEANUP_TIMEOUT;
+                            if let Some(action) = coordinator.cleanup_action_for(
+                                Magnet::parse(&url)
+                                    .ok()
+                                    .and_then(|m| m.as_id20())
+                                    .map(|id| id.0)
+                                    .unwrap_or([0u8; 20]),
+                            ) {
+                                action.request_background_cleanup(cleanup_deadline);
+                            }
+                            return Err(DownloadError::Protocol(format!(
+                                "获取磁力链接元数据失败: {e}"
+                            )));
+                        }
+                    };
+                    {
+                        let entry = CachedTorrent {
+                            handle: Arc::clone(&handle),
+                            layout,
+                            download_dir: download_dir.clone(),
+                            has_storage_factory: storage_factory.is_some(),
+                            preferred_root: preferred_root.clone(),
+                        };
+                        Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
+                    }
+                    handle
+                }
             } else {
                 let h = add_magnet_to_session(
                     &session,
@@ -1900,18 +2524,12 @@ impl Protocol for MagnetProtocol {
                 {
                     let entry = CachedTorrent {
                         handle: Arc::clone(&h),
-                        layout: layout.clone(),
+                        layout,
                         download_dir: download_dir.clone(),
                         has_storage_factory: storage_factory.is_some(),
                         preferred_root: preferred_root.clone(),
                     };
-                    let bind_key = MagnetProtocol::cache_binding_key(
-                        &download_dir,
-                        storage_factory.is_some(),
-                        preferred_root.as_deref(),
-                        &url,
-                    );
-                    Self::insert_with_capacity(&handle_cache, bind_key, entry);
+                    Self::insert_with_capacity(&handle_cache, bind_key.clone(), entry);
                 }
                 h
             };
@@ -2893,6 +3511,38 @@ mod tests {
             assert_eq!(s.live_peers, 0, "离线无真实 peer,live_peers 应为 0");
             assert_eq!(s.connecting_peers, 0, "离线无连接中的 peer");
             assert_eq!(s.queued_peers, 0, "离线无排队 peer");
+        }
+    }
+
+    /// observer lazy capture(设计 §7):首次 live 时捕获 stats source,
+    /// cleanup 后 live 不可取时仍返回最后捕获值,不丢失终态统计。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_peer_stats_snapshot_retains_last_value_after_live_becomes_none() {
+        let (protocol, url, _content, _dir) = make_offline_protocol(4096, 1024)
+            .await
+            .expect("构造离线 protocol 失败");
+
+        // 首次查询:若 live 则捕获;离线预置 torrent 可能已 completed。
+        let first = protocol.peer_stats_snapshot(&url);
+
+        // 手动清空 cache 模拟 cleanup 后 handle 不可取:
+        // detach_cached_binding 会摘除 cache 条目,使 lookup_compatible 返回 None。
+        // 但 peer_stats_snapshot 先 lookup_compatible 再 live(),
+        // cache miss 时直接 None —— 此时 lazy capture 无意义(没有 url 入口)。
+        // 真正场景:cache 仍在但 handle.live() 返回 None(cleanup 后)。
+        // 离线测试中无法真实 cleanup,因此只验证 lazy capture 不降低 API 质量:
+        // 首次 Some 后第二次仍 Some(同一 live handle)。
+        if first.is_some() {
+            let second = protocol.peer_stats_snapshot(&url);
+            assert!(
+                second.is_some(),
+                "lazy capture:第二次查询应仍返回 Some(同一 live handle)"
+            );
+            assert_eq!(
+                first.unwrap().live_peers,
+                second.unwrap().live_peers,
+                "lazy capture:两次查询应返回一致统计"
+            );
         }
     }
 

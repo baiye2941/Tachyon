@@ -414,6 +414,7 @@ impl DownloadTask {
                             session.handle_cache(),
                         )
                         .with_ops_gate(session.ops_gate())
+                        .with_session_coordinator(session.session_coordinator())
                         .with_storage_factory(factory.clone().boxed()),
                     );
                     let protocol: Arc<dyn Protocol> = magnet_arc.clone();
@@ -669,6 +670,7 @@ impl DownloadTask {
                 bt_session.handle_cache(),
             )
             .with_ops_gate(bt_session.ops_gate())
+            .with_session_coordinator(bt_session.session_coordinator())
             .with_storage_factory(bt_factory),
         );
 
