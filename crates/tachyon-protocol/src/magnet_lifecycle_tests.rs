@@ -1487,6 +1487,8 @@ async fn production_probe_registers_cache_miss_added_with_session_coordinator()
         enable_upnp: false,
         trackers: Vec::new(),
         peer_addrs: vec![format!("127.0.0.1:{seeder_port}")],
+        // S-01 默认拒绝 loopback; loopback seeder fixture 必须显式 opt-in。
+        allow_private_peers: true,
         ..MagnetConfig::default()
     };
 
@@ -1640,6 +1642,8 @@ async fn production_download_range_stream_registers_cache_miss_added_with_sessio
         enable_upnp: false,
         trackers: Vec::new(),
         peer_addrs: vec![format!("127.0.0.1:{seeder_port}")],
+        // S-01 默认拒绝 loopback; loopback seeder fixture 必须显式 opt-in。
+        allow_private_peers: true,
         ..MagnetConfig::default()
     };
 
@@ -1803,6 +1807,8 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
         enable_upnp: false,
         trackers: Vec::new(),
         peer_addrs: vec![format!("127.0.0.1:{seeder_port}")],
+        // S-01 默认拒绝 loopback; loopback seeder fixture 必须显式 opt-in。
+        allow_private_peers: true,
         ..MagnetConfig::default()
     };
     let coordinator = crate::magnet::new_librqbit_session_coordinator(Arc::clone(&client_session));

@@ -143,6 +143,10 @@ fn map_recovery_error(error: RecoveryError) -> AppError {
         },
         RecoveryError::InvalidData { key } => AppError::InvalidSnapshot { key },
         RecoveryError::Io(error) => AppError::Io(error),
+        // S-02b reservation 是 store 内进程保护,app 层映射为可操作 Io/Config 类错误。
+        RecoveryError::ReservationActive => AppError::Config(
+            "任务命名空间当前被独占操作占用,请稍后重试".into(),
+        ),
     }
 }
 
