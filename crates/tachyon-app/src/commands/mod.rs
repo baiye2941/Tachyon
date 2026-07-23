@@ -65,6 +65,18 @@ pub enum AppError {
     UnsupportedProtocol(String),
     #[error("核心错误: {0}")]
     Core(#[from] tachyon_core::DownloadError),
+    /// 快照 schema 由更高版本程序写入，需升级客户端后才能恢复。
+    #[error("需要升级应用以恢复快照: found={found_version}, supported={supported_version}")]
+    UpgradeRequired {
+        found_version: u32,
+        supported_version: u32,
+    },
+    /// 单个快照内容无效（损坏 JSON 等），携带可定位 key。
+    #[error("无效快照: {key}")]
+    InvalidSnapshot { key: String },
+    /// 存储层 I/O 失败。
+    #[error("IO 错误: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl serde::Serialize for AppError {
@@ -100,6 +112,29 @@ impl serde::Serialize for AppError {
                 map.serialize_entry("type", "Core")?;
                 map.serialize_entry("message", &err.to_string())?;
                 map.serialize_entry("inner", err)?;
+            }
+            AppError::UpgradeRequired {
+                found_version,
+                supported_version,
+            } => {
+                map.serialize_entry("type", "UpgradeRequired")?;
+                map.serialize_entry(
+                    "message",
+                    &format!(
+                        "需要升级应用以恢复快照: found={found_version}, supported={supported_version}"
+                    ),
+                )?;
+                map.serialize_entry("foundVersion", found_version)?;
+                map.serialize_entry("supportedVersion", supported_version)?;
+            }
+            AppError::InvalidSnapshot { key } => {
+                map.serialize_entry("type", "InvalidSnapshot")?;
+                map.serialize_entry("message", &format!("无效快照: {key}"))?;
+                map.serialize_entry("key", key)?;
+            }
+            AppError::Io(err) => {
+                map.serialize_entry("type", "Io")?;
+                map.serialize_entry("message", &err.to_string())?;
             }
         }
         map.end()
@@ -564,14 +599,22 @@ impl AppState {
         Self::try_new().expect("AppState 初始化失败")
     }
 
-    /// 加载恢复的任务,返回损坏快照的 key 列表(供 UI 告警)
-    pub async fn load_recovered_tasks(&self) -> Result<Vec<String>, AppError> {
-        let (snapshots, corrupt_keys) = self.infra.task_store.load_recoverable_with_warnings()?;
+    /// 加载恢复的任务，返回结构化 outcome（corrupt + unsupported_schema）。
+    ///
+    /// - 仅插入可恢复的合法任务
+    /// - future schema 进入 `unsupported_schema`，不得混入 corrupt 或静默丢弃
+    /// - 损坏 JSON 仍进入 `corrupt_keys`
+    pub async fn load_recovered_tasks(&self) -> Result<StartupRecovery, AppError> {
+        let (snapshots, corrupt_keys, unsupported_schema) =
+            self.infra.task_store.load_recoverable_with_warnings()?;
         for snapshot in snapshots {
             let task = crate::task_store::snapshot_to_task_info(&snapshot);
             self.domain.task_repository.insert(task.id.clone(), task);
         }
-        Ok(corrupt_keys)
+        Ok(StartupRecovery {
+            corrupt_keys,
+            unsupported_schema,
+        })
     }
 
     /// 创建用于 task_fn 的轻量 AppState 克隆
@@ -610,6 +653,14 @@ pub struct RecoveryWarning {
     pub corrupt_keys: Vec<String>,
     /// 损坏数量(冗余字段,便于前端无需 .length)
     pub count: usize,
+}
+/// 启动恢复结果：合法任务已插入 repository 后的告警摘要。
+#[derive(Debug, Clone)]
+pub struct StartupRecovery {
+    /// 无法解析的损坏 key 列表
+    pub corrupt_keys: Vec<String>,
+    /// 需要升级客户端才能处理的 future schema 快照
+    pub unsupported_schema: Vec<tachyon_store::ProtectedSnapshot>,
 }
 
 #[tauri::command]
@@ -1899,6 +1950,134 @@ pub(crate) mod tests {
         assert!(
             deps.contains("tachyon-engine"),
             "A-01:app 应经 tachyon-engine 门面"
+        );
+    }
+
+    /// S-02a2: startup consumer 恢复合法任务；future 为 upgrade notice，不得混入 corrupt 或静默丢弃。
+    #[tokio::test]
+    async fn load_recovered_tasks_surfaces_future_as_upgrade_notice_not_corrupt() {
+        let state = test_state();
+        let found_version = tachyon_store::SNAPSHOT_SCHEMA_VERSION + 1;
+
+        let good = tachyon_store::TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "good".to_string(),
+            url: "https://example.com/good.bin".to_string(),
+            save_path: "/downloads/good.bin".to_string(),
+            file_name: "good.bin".to_string(),
+            file_size: Some(100),
+            downloaded: 0,
+            completed_fragments: vec![],
+            partial_fragments: std::collections::HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 25,
+            status: tachyon_core::types::DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(100),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:00Z".to_string(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+
+        // 经 TaskStore facade 打开已知临时目录，再写入 future/corrupt raw。
+        let tmp = tempfile::tempdir().unwrap();
+        let bound_store = crate::task_store::TaskStore::open(tmp.path()).unwrap();
+        bound_store.save_snapshot(&good).unwrap();
+        let future_raw = format!(
+            r#"{{"schemaVersion":{found_version},"id":"future","url":"https://example.com/f.bin","fileName":"f.bin","downloaded":0,"status":"downloading","createdAt":"2026-05-29T00:00:00Z","updatedAt":"2026-05-29T00:00:00Z"}}"#
+        );
+        std::fs::write(tmp.path().join("task_future.json"), future_raw.as_bytes()).unwrap();
+        std::fs::write(
+            tmp.path().join("task_corrupt.json"),
+            "{ this is not valid json !!!",
+        )
+        .unwrap();
+
+        let task_repository = TaskRepository::new();
+        let config = state.domain.config.clone();
+        let config_path = state.domain.config_path.clone();
+        let task_store = Arc::new(bound_store);
+        let task_service = Arc::new(TaskService::new(
+            task_repository.clone(),
+            config.clone(),
+            task_store.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let specialized = AppState {
+            domain: DomainState {
+                task_repository: task_repository.clone(),
+                config,
+                config_path,
+            },
+            infra: InfraState {
+                connection_pool: state.infra.connection_pool.clone(),
+                task_store,
+                favorites_store: state.infra.favorites_store.clone(),
+                chunk_reader_pool: state.infra.chunk_reader_pool.clone(),
+                buffer_pool: state.infra.buffer_pool.clone(),
+                global_rate_limiter: state.infra.global_rate_limiter.clone(),
+                #[cfg(feature = "magnet")]
+                bt_session: state.infra.bt_session.clone(),
+            },
+            service: ServiceState {
+                task_service,
+                sniffer_service: state.service.sniffer_service.clone(),
+                confirmation_service: state.service.confirmation_service.clone(),
+            },
+            runtime: RuntimeState {
+                supervisor: state.runtime.supervisor.clone(),
+                progress_broker: Arc::new(ProgressBroker::new_no_aggregator(
+                    task_repository.clone(),
+                )),
+                progress_subscribed: Arc::new(AtomicBool::new(false)),
+                recovery_warning: Arc::new(tokio::sync::Mutex::new(None)),
+            },
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+
+        // 期望 startup 返回结构化 outcome（corrupt + unsupported_schema），而非仅 Vec<String>。
+        let recovery = specialized
+            .load_recovered_tasks()
+            .await
+            .expect("startup recovery 不得因 future/corrupt 整批失败");
+
+        assert!(
+            specialized.domain.task_repository.contains_key("good"),
+            "合法任务必须进入 repository"
+        );
+        assert!(
+            !specialized.domain.task_repository.contains_key("future"),
+            "future 不得当作可恢复任务插入"
+        );
+
+        assert!(
+            !recovery.corrupt_keys.iter().any(|k| k.contains("future")),
+            "future 不得混入 corrupt_keys: {:?}",
+            recovery.corrupt_keys
+        );
+        assert!(
+            recovery.corrupt_keys.iter().any(|k| k.contains("corrupt")),
+            "损坏 key 仍须暴露: {:?}",
+            recovery.corrupt_keys
+        );
+        assert_eq!(
+            recovery.unsupported_schema.len(),
+            1,
+            "future 必须作为显式 upgrade notice 上报"
+        );
+        assert_eq!(recovery.unsupported_schema[0].key, "task_future");
+        assert_eq!(recovery.unsupported_schema[0].found_version, found_version);
+        assert_eq!(
+            recovery.unsupported_schema[0].supported_version,
+            tachyon_store::SNAPSHOT_SCHEMA_VERSION
         );
     }
 }

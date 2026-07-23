@@ -21,7 +21,8 @@ pub mod store;
 
 pub use kv::KvStore;
 pub use recovery::{
-    RecoveryManager, RecoveryResult, SNAPSHOT_SCHEMA_VERSION, TaskRecord, TaskSnapshot,
+    ProtectedSnapshot, RecoveryError, RecoveryManager, RecoveryResult,
+    SNAPSHOT_SCHEMA_VERSION, TaskNamespaceReservation, TaskRecord, TaskSnapshot,
 };
 pub use store::{Durability, FileStore, MemoryStore, Store};
 
@@ -78,10 +79,16 @@ fn recovery() {
     {
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);
-        let pending = mgr.recover_pending_tasks().unwrap();
-        assert_eq!(pending.len(), 2, "应恢复 2 个未完成任务");
+        let result = mgr.recover_pending_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 2, "应恢复 2 个未完成任务");
+        assert!(result.corrupt_keys.is_empty());
+        assert!(result.unsupported_schema.is_empty());
 
-        let ids: Vec<&str> = pending.iter().map(|r| r.task_id.as_str()).collect();
+        let ids: Vec<&str> = result
+            .tasks
+            .iter()
+            .map(|snapshot| snapshot.id.as_str())
+            .collect();
         assert!(ids.contains(&"t1"), "downloading 状态应恢复");
         assert!(ids.contains(&"t3"), "paused 状态应恢复");
 

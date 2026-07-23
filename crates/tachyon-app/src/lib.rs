@@ -118,18 +118,18 @@ pub fn run() {
                 }
 
                 match state.load_recovered_tasks().await {
-                    Ok(corrupt_keys) => {
+                    Ok(recovery) => {
                         // 损坏快照非空时向 UI 广播一次性恢复告警
-                        if !corrupt_keys.is_empty() {
+                        if !recovery.corrupt_keys.is_empty() {
                             use tauri::Emitter;
-                            let count = corrupt_keys.len();
+                            let count = recovery.corrupt_keys.len();
                             tracing::warn!(
                                 count,
-                                keys = ?corrupt_keys,
+                                keys = ?recovery.corrupt_keys,
                                 "启动恢复检测到损坏快照,已跳过"
                             );
                             let warning = RecoveryWarning {
-                                corrupt_keys,
+                                corrupt_keys: recovery.corrupt_keys,
                                 count,
                             };
                             // P1-22-3: setup 阶段前端事件监听器尚未注册,直接 emit 会被漏接。
@@ -138,6 +138,13 @@ pub fn run() {
                             *state.runtime.recovery_warning.lock().await =
                                 Some(warning.clone());
                             let _ = handle.emit("recovery-warning", &warning);
+                        }
+                        if !recovery.unsupported_schema.is_empty() {
+                            tracing::warn!(
+                                count = recovery.unsupported_schema.len(),
+                                items = ?recovery.unsupported_schema,
+                                "启动恢复检测到 future schema 快照,需升级客户端"
+                            );
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "恢复未完成任务失败"),

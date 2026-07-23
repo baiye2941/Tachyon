@@ -1460,7 +1460,7 @@ pub(crate) async fn export_backup_inner(state: &AppState, path: String) -> Resul
     let config = { state.domain.config.lock().await.clone() };
     // 审计 SEC-006:备份路径必须在 authorized_dirs 下
     crate::commands::config_commands::path_under_authorized_dirs(&config, &path)?;
-    let (tasks, corrupt_keys) = state
+    let (tasks, corrupt_keys, unsupported_schema) = state
         .infra
         .task_store
         .load_all()
@@ -1471,6 +1471,17 @@ pub(crate) async fn export_backup_inner(state: &AppState, path: String) -> Resul
             keys = ?corrupt_keys,
             "导出备份时发现损坏快照"
         );
+    }
+    if !unsupported_schema.is_empty() {
+        tracing::warn!(
+            count = unsupported_schema.len(),
+            items = ?unsupported_schema,
+            "导出备份时发现 future schema 快照,拒绝导出不完整备份"
+        );
+        return Err(AppError::UpgradeRequired {
+            found_version: unsupported_schema[0].found_version,
+            supported_version: unsupported_schema[0].supported_version,
+        });
     }
 
     let backup = Backup {
