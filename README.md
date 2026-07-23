@@ -4,8 +4,6 @@
 
 **基于 Rust + Tauri v2 的高性能桌面下载器**
 
-名字取自《赛马娘 Pretty Derby》中的爱丽速子（Agnes Tachyon）——以速度为信仰。
-
 [![CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust)
 ![Edition](https://img.shields.io/badge/edition-2024-blue?style=flat-square)
