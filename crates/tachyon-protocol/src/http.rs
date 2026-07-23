@@ -323,17 +323,18 @@ impl HttpClient {
             .dns_resolver(PublicDnsResolver::new())
             .redirect(safe_redirect_policy());
 
-        // 代理策略:显式 proxy > 系统环境变量(默认)。
-        // 不再调用 `.no_proxy()` —— 原实现强制屏蔽系统代理,导致国内被墙 CDN 直连失败,
-        // 且与 BT 侧 `detect_socks_proxy` 自动嗅探系统代理的语义割裂。
-        // None 时 reqwest 默认读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量。
+        // 代理策略:显式 proxy > env(ALL/HTTPS/HTTP_PROXY) > 无代理。
+        // 用 resolve_http_proxy + Proxy::all 显式注入,而非依赖 reqwest 默认读 env:
+        // reqwest 默认对 HTTPS 不读 HTTP_PROXY(只读 HTTPS_PROXY/ALL_PROXY),
+        // 国内常见仅设 HTTP_PROXY 的混合端口代理会导致 HTTPS 直连 403。
+        // resolve_http_proxy 在仅有 HTTP_PROXY 时也返回它,配合 Proxy::all 覆盖 HTTPS CONNECT。
         // 审计 SEC-007:走代理时 PublicDnsResolver 只解析代理主机,目标域名由代理解析;
         // 本地 reject_forbidden_ip 不覆盖代理后端——代理即 SSRF 信任边界。
-        if let Some(proxy_url) = proxy {
+        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:把 socks5:// 转 socks5h:// 让 reqwest 远程解析目标域名,
             // 防止走代理的 HTTP(S) tracker 请求在本地 DNS 泄漏目标域名。
             // (BT peer 路径仍用 socks5://,librqbit 不识别 socks5h://)
-            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy_url = http_proxy_remote_dns(&proxy_url);
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 // 安全:proxy URL 可能含 user:pass@,错误信息须脱敏避免凭据泄露到前端。
                 // 用 redact_proxy_url 保留 scheme/host/port(代理诊断需要端口),
@@ -480,9 +481,9 @@ impl HttpClient {
             .http2_keep_alive_while_idle(true)
             .http2_prior_knowledge();
 
-        if let Some(proxy_url) = proxy {
+        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
-            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy_url = http_proxy_remote_dns(&proxy_url);
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 DownloadError::Config(format!(
                     "无效的代理 URL '{}': {}",
@@ -531,9 +532,9 @@ impl HttpClient {
             .tcp_nodelay(true)
             .http1_only();
 
-        if let Some(proxy_url) = proxy {
+        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
-            let proxy_url = http_proxy_remote_dns(proxy_url);
+            let proxy_url = http_proxy_remote_dns(&proxy_url);
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
                 DownloadError::Config(format!(
                     "无效的代理 URL '{}': {}",
