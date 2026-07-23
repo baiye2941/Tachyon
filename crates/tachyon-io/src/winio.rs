@@ -506,6 +506,8 @@ mod tests {
     fn file_allocation_size(path: &std::path::Path) -> u64 {
         use std::os::windows::io::AsRawHandle;
         let file = std::fs::File::open(path).unwrap();
+        // SAFETY: FILE_STANDARD_INFO 是 POD Win32 结构体,全零位模式是有效初始值,
+        // 用作 GetFileInformationByHandleEx 输出缓冲区。
         let mut info: windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO =
             unsafe { std::mem::zeroed() };
         // Safety:

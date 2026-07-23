@@ -72,6 +72,7 @@ struct AlignedAlloc {
 // 都先以 Arc::get_mut 检查唯一性，必要时 COW 到独立分配后才写入。Arc 引用计数本身
 // 绝不等同于可变访问的独占性；绕过该不变量的原始指针写入由调用方承担 unsafe 契约。
 unsafe impl Send for AlignedAlloc {}
+// SAFETY: 同 Send 的理由:AlignedAlloc 的并发安全访问由 AlignedBuf 的 Arc+COW 不变量保证。
 unsafe impl Sync for AlignedAlloc {}
 
 impl AlignedAlloc {
@@ -159,7 +160,6 @@ impl AlignedBuf {
     /// 分配指定容量和对齐的缓冲区
     ///
     /// `align` 必须是 2 的幂。`cap` 必须为正数。
-    #[allow(dead_code)] // 预留 API,未来可能支持非 512 对齐场景
     pub fn with_align(cap: usize, align: usize) -> io::Result<Self> {
         if cap == 0 {
             return Err(io::Error::new(
@@ -386,17 +386,6 @@ impl AlignedBuf {
 impl AsRef<[u8]> for AlignedBuf {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
-    }
-}
-
-#[allow(dead_code)] // 预留 trait impl,未来可能被外部代码使用
-impl AsMut<[u8]> for AlignedBuf {
-    /// 返回覆盖完整容量的可变切片。
-    ///
-    /// 没有提交逻辑长度的 API，故对 `len()` 之后字节的写入不会改变逻辑长度，也不会由
-    /// `freeze()` 产出。
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
     }
 }
 

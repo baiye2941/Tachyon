@@ -331,7 +331,6 @@ enum DriverCmd {
         done: tokio::sync::oneshot::Sender<DownloadResult<()>>,
     },
     /// 关闭 driver task
-    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -812,22 +811,6 @@ impl IoUringBufferGuard {
     /// 已预留容量,`permit.send` 为同步非 await,取消窗口不再覆盖"等容量"。
     fn mark_submitted(&mut self) {
         self.submitted = true;
-    }
-
-    /// send 失败(driver 已关闭,消息未入队)时显式回收。
-    ///
-    /// 调用后 `submitted=false`,后续 Drop 不再 double-free。
-    ///
-    /// 注意:tokio 1.52 的 `Permit::send` 返回 `()` 而非 `Result`,
-    /// reserve 成功即保证 channel 未关闭,故当前 lib 代码中不再调用本方法
-    /// (send 不会失败)。保留是为兼容 H-07 取消语义分析与测试覆盖,以及
-    /// 未来若改用 `try_send` 等返回 Result 的 API 时复用。
-    #[allow(dead_code)]
-    fn reclaim_unsent(&mut self) {
-        if self.submitted {
-            self.pool.free(self.buf_idx);
-            self.submitted = false;
-        }
     }
 }
 
@@ -2474,23 +2457,6 @@ mod tests {
         pool.free(a);
         // 回收后应能再次分配到 A
         assert_eq!(pool.alloc(), Some(0), "driver push 失败回收后索引应可复用");
-    }
-
-    /// 审计 H-07:reserve 成功后若 send 失败,reclaim_unsent 必须归还槽位。
-    #[test]
-    fn test_guard_reclaim_unsent_after_failed_enqueue() {
-        let pool = std::sync::Arc::new(BufferIndexPool::new(2));
-        let a = pool.alloc().expect("分配 A");
-        let mut guard = IoUringBufferGuard::new(pool.clone(), a);
-        // 模拟:reserve 已成功并 mark,但 permit.send 失败(driver 关闭)
-        guard.mark_submitted();
-        guard.reclaim_unsent();
-        drop(guard);
-        assert_eq!(
-            pool.alloc(),
-            Some(0),
-            "send 失败后 reclaim_unsent 应归还 fixed buffer 槽位"
-        );
     }
 
     /// 审计 H-07:reserve 等待期间取消(未 mark)必须回收——与 mark 前 Drop 同构。

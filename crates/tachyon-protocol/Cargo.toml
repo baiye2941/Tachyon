@@ -49,9 +49,12 @@ tokio = { workspace = true, features = ["test-util"] }
 # loopback),使 wiremock 端到端 HTTP 测试可运行。仅 dev-dependencies,不影响生产。
 tachyon-protocol = { path = ".", features = ["test-harness"] }
 
-# 声明 `reqwest_unstable` 为合法的 cfg(由 RUSTFLAGS='--cfg reqwest_unstable' 注入),
-# 避免 `unexpected_cfgs` 警告。该 cfg 仅在启用 `http3` feature 时有意义,但 lint
-# 配置本身无条件声明是安全的。
+# 审计 E-03: lint 配置。
+# reqwest_unstable cfg 声明由 RUSTFLAGS='--cfg reqwest_unstable' 注入,
+# 仅在启用 http3 feature 时有意义,但 lint 配置无条件声明是安全的。
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(reqwest_unstable)"]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

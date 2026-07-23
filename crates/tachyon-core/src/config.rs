@@ -4357,6 +4357,8 @@ mod tests {
     fn test_resolve_http_proxy_explicit_wins_over_env() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         // Windows env 大小写不敏感:先清小写再 set 大写
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("all_proxy");
             std::env::remove_var("https_proxy");
@@ -4369,6 +4371,8 @@ mod tests {
             resolve_http_proxy(Some("http://explicit:9")).as_deref(),
             Some("http://explicit:9")
         );
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("HTTP_PROXY");
         }
@@ -4378,6 +4382,8 @@ mod tests {
     #[test]
     fn test_resolve_http_proxy_http_proxy_only_covers_https() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("all_proxy");
             std::env::remove_var("https_proxy");
@@ -4391,6 +4397,8 @@ mod tests {
             Some("http://127.0.0.1:7897"),
             "仅 HTTP_PROXY 时 resolve 必须返回,供 Proxy::all 覆盖 HTTPS"
         );
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("HTTP_PROXY");
         }
@@ -4399,6 +4407,8 @@ mod tests {
     #[test]
     fn test_resolve_http_proxy_https_over_http() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("all_proxy");
             std::env::remove_var("https_proxy");
@@ -4411,6 +4421,8 @@ mod tests {
             resolve_http_proxy(None).as_deref(),
             Some("http://https-proxy:443")
         );
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("HTTPS_PROXY");
             std::env::remove_var("HTTP_PROXY");
@@ -4420,6 +4432,8 @@ mod tests {
     #[test]
     fn test_resolve_http_proxy_all_proxy_highest() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("all_proxy");
             std::env::remove_var("https_proxy");
@@ -4432,6 +4446,8 @@ mod tests {
             resolve_http_proxy(None).as_deref(),
             Some("socks5://127.0.0.1:1080")
         );
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("ALL_PROXY");
             std::env::remove_var("HTTPS_PROXY");
@@ -4442,6 +4458,8 @@ mod tests {
     #[test]
     fn test_resolve_http_proxy_empty_explicit_falls_to_env() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("all_proxy");
             std::env::remove_var("https_proxy");
@@ -4454,6 +4472,8 @@ mod tests {
             resolve_http_proxy(Some("  ")).as_deref(),
             Some("http://127.0.0.1:1")
         );
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("HTTP_PROXY");
         }
@@ -4462,6 +4482,8 @@ mod tests {
     #[test]
     fn test_resolve_http_proxy_none_when_unset() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: ENV_TEST_LOCK 串行化锁保护下修改进程级环境变量,测试结束前清理全部
+        // 大小写变体,避免污染后续测试。Windows env 大小写不敏感,先清小写再 set 大写。
         unsafe {
             std::env::remove_var("ALL_PROXY");
             std::env::remove_var("HTTPS_PROXY");

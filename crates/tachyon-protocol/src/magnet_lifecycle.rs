@@ -25,7 +25,6 @@ use tokio::time::Instant;
 /// adapter 实现不得保留 coordinator、lane 或 cleanup action。lane 持有 adapter，
 /// 而 worker 仅以 `Weak<Lane>` 回写完成结果，避免 `Lane -> JoinHandle -> task -> Lane`
 /// 强引用环。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait AcquisitionAdapter: Send + Sync {
     fn add(
         &self,
@@ -43,7 +42,6 @@ pub(crate) trait AcquisitionAdapter: Send + Sync {
 ///
 /// 请求是一次性 owned 值：真实 librqbit lane 携带 owned torrent descriptor，
 /// 不把 Session 或任何外部 owner 放进 request。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AcquisitionRequest {
     info_hash: [u8; 20],
     librqbit_add: Option<(AddTorrent<'static>, AddTorrentOptions)>,
@@ -94,7 +92,6 @@ impl AcquisitionRequest {
 /// `managed_torrent` 是真实 Session 返回的 exact Arc；cleanup 只能凭这个
 /// provenance 退役，不能退化为仅凭可碰撞身份的删除。
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AcquisitionRegistration {
     info_hash: [u8; 20],
     torrent_id: usize,
@@ -111,7 +108,6 @@ impl std::fmt::Debug for AcquisitionRegistration {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AcquisitionRegistration {
     #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
@@ -216,16 +212,13 @@ impl Drop for WorkerExitGuard {
 
 /// 外部 adapter 边界的失败分类。
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AdapterError {
-    #[allow(dead_code)]
     Failed,
     Timeout,
 }
 
 /// acquisition 返回的最小错误分类。
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AcquisitionError {
     Adapter(AdapterError),
     ScopeRetiring,
@@ -234,7 +227,6 @@ pub(crate) enum AcquisitionError {
 
 /// cleanup 已收敛的结果。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum BtCleanupOutcome {
     Converged,
     NoLease,
@@ -263,7 +255,6 @@ impl std::error::Error for BtCleanupError {}
 
 /// 可观察的 scope 状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ScopeState {
     Acquiring,
     Retiring,
@@ -273,8 +264,9 @@ pub(crate) enum ScopeState {
 ///
 /// `result` 由 task 在退出前同步提交；finished handle 只在提交结果后由 lane reaper
 /// 移除。这样 caller waiter 的 abort 不会影响外部 adapter future。
-#[cfg_attr(not(test), allow(dead_code))]
 struct AcquisitionWorker {
+    // abort_handle 仅用于 Drop 取消 worker,无显式读取(RAII 模式)
+    #[allow(dead_code)]
     abort_handle: AbortHandle,
     result: Option<Result<AcquisitionRegistration, AcquisitionError>>,
     joined: bool,
@@ -284,20 +276,19 @@ struct AcquisitionWorker {
 ///
 /// `registration` 仍保存在 `LaneState`，worker 仅取得副本。因此外部 retire 失败时，
 /// lane 仍持有资源并缓存失败结果，而不是把资源遗失给被取消的 waiter。
-#[cfg_attr(not(test), allow(dead_code))]
 struct RetirementWorker {
+    // abort_handle 仅用于 Drop 取消 worker,无显式读取(RAII 模式)
+    #[allow(dead_code)]
     abort_handle: AbortHandle,
     result: Option<Result<BtCleanupOutcome, BtCleanupError>>,
     joined: bool,
 }
 
 /// 每个 info hash 的唯一 coordinator lane。
-#[cfg_attr(not(test), allow(dead_code))]
 struct LaneRegistry {
     lanes: Mutex<HashMap<[u8; 20], Arc<Lane>>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Lane {
     adapter: Arc<dyn AcquisitionAdapter>,
     registry: Weak<LaneRegistry>,
@@ -328,7 +319,6 @@ impl Drop for WaiterGuard {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct LaneState {
     scope_state: ScopeState,
     active_waiters: usize,
@@ -345,7 +335,6 @@ struct LaneState {
     retirement: Option<RetirementWorker>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Lane {
     fn new(
         adapter: Arc<dyn AcquisitionAdapter>,
@@ -957,7 +946,6 @@ impl Lane {
 ///
 /// 这是跨 crate 传递的 opaque capability；acquisition adapter 与生命周期操作
 /// 仍保持在协议 crate 内部，engine 只能持有并共享其 `Arc`。
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct MagnetSessionCoordinator {
     adapter: Arc<dyn AcquisitionAdapter>,
     registry: Arc<LaneRegistry>,
@@ -980,7 +968,6 @@ impl From<TestWorkerKind> for WorkerExitKind {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MagnetSessionCoordinator {
     /// 从协议层内部 adapter 创建 coordinator。
     pub(crate) fn from_adapter(adapter: Arc<dyn AcquisitionAdapter>) -> Self {
@@ -1052,6 +1039,7 @@ impl MagnetSessionCoordinator {
     }
 
     /// 等待指定 info hash scope 进入目标状态；用于 deterministic 测试同步。
+    #[cfg(test)]
     pub(crate) async fn wait_for_state(&self, info_hash: [u8; 20], target: ScopeState) {
         let lane = {
             let lanes = self
@@ -1185,13 +1173,11 @@ impl MagnetSessionCoordinator {
 }
 
 /// 已同步注册、尚未开始或正在进行 acquisition 的 scope。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MagnetAcquisition {
     lane: Arc<Lane>,
     request: AcquisitionRequest,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MagnetAcquisition {
     /// 提供与该 scope 绑定的可 clone cleanup capability。
     pub(crate) fn cleanup_action(&self) -> BtCleanupAction {
@@ -1216,6 +1202,7 @@ impl MagnetAcquisition {
     }
 
     /// 兼容便利 API；实际 adapter worker 仍由 lane 持有而非 caller future。
+    #[allow(dead_code)]
     pub(crate) async fn acquire(self) -> Result<AcquisitionRegistration, AcquisitionError> {
         self.start().await
     }
@@ -1247,12 +1234,10 @@ impl MagnetAcquisition {
 
 /// 绑定 scope 的 opaque cleanup capability。
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BtCleanupAction {
     lane: Arc<Lane>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl BtCleanupAction {
     /// 在 lane mutex 下登记 request-level cleanup，尚不启动后台 waiter。
     ///
@@ -1324,6 +1309,7 @@ impl BtCleanupAction {
     }
 
     /// 显式重试已经超时的 cleanup，复用原有 retirement worker，不创建新的退役尝试。
+    #[allow(dead_code)]
     pub(crate) async fn retry_cleanup_until(
         &self,
         deadline: Instant,
@@ -1442,7 +1428,6 @@ impl BtCleanupAction {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 enum CleanupStep {
     StartRetirement,
     Return(Result<BtCleanupOutcome, BtCleanupError>),

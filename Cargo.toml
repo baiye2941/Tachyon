@@ -100,6 +100,10 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"
 http-body = "1"
+[workspace.lints.clippy]
+# 审计 E-03: 强制所有 unsafe 块携带 Safety 注释。
+# restriction lint(warn 级),缺注释的 unsafe 块会产生警告,CI -D warnings 升级为报错。
+undocumented_unsafe_blocks = "warn"
 
 [package]
 name = "tachyon"
@@ -108,6 +112,8 @@ edition.workspace = true
 license.workspace = true
 description = "Tachyon 超高性能下载器 基准测试与集成测试入口"
 autobenches = true
+[lints]
+workspace = true
 
 [[bin]]
 name = "tachyon-cli"

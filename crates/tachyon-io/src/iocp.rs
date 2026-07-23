@@ -100,6 +100,8 @@ impl CompletionSlot {
 // 因此不存在两个线程同时对同一 UnsafeCell 执行写操作的情况。
 #[cfg(target_os = "windows")]
 unsafe impl Send for CompletionSlot {}
+// SAFETY: 同 Send 的理由:CompletionSlot 的并发访问由 IOCP 完成端口串行化,
+// state 转换单向且由 poller 单线程执行,配合 Release/Acquire 内存序保证可见性。
 #[cfg(target_os = "windows")]
 unsafe impl Sync for CompletionSlot {}
 
@@ -440,6 +442,8 @@ pub struct IoCpStorage {
 // - 其余字段均为 Arc/AtomicBool 等已知线程安全类型
 #[cfg(target_os = "windows")]
 unsafe impl Send for IoCpStorage {}
+// SAFETY: 同 Send 的理由:IoCpStorage 的并发访问由 IOCP 调度保护,
+// file 句柄通过 raw handle 访问受 IOCP 调度串行化,其余字段均为已知线程安全类型。
 #[cfg(target_os = "windows")]
 unsafe impl Sync for IoCpStorage {}
 
@@ -1292,6 +1296,8 @@ mod tests {
     fn file_allocation_size(path: &std::path::Path) -> u64 {
         use std::os::windows::io::AsRawHandle;
         let file = std::fs::File::open(path).unwrap();
+        // SAFETY: FILE_STANDARD_INFO 是 POD Win32 结构体,全零位模式是有效初始值,
+        // 用作 GetFileInformationByHandleEx 输出缓冲区。
         let mut info: windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO =
             unsafe { std::mem::zeroed() };
         // Safety:
