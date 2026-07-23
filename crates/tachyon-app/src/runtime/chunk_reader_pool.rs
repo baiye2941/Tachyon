@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use tachyon_core::FragmentProgress;
+use tachyon_core::types::DownloadState;
 
 /// 进度变化增量类型(传给 ProgressBroker,用于区分 started/completed delta)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -555,7 +556,15 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                         task.downloaded = total_downloaded;
                         task.fragments_done = frags_done;
                         task.fragments_total = total_frags;
-                        task.speed = speed;
+                        // 非下载态速度强制归 0:Pause 后引擎停车,但本 reader 仍消化
+                        // 队列中已落盘字节的进度事件(字节入账正确,不可丢弃);
+                        // 若照写滑动窗口速度,pause_task 清零的 speed 会被重写为非零
+                        // 并永久残留,前端列表表现为"暂停后仍在下载"。
+                        task.speed = if task.status == DownloadState::Downloading {
+                            speed
+                        } else {
+                            0
+                        };
                         // 主进度使用字节比例而非分片比例
                         // clamp 到 [0.0, 1.0] 防止进度事件乱序导致进度条溢出
                         if let Some(file_size) = task.file_size.filter(|&s| s > 0) {
@@ -1381,6 +1390,86 @@ mod tests {
             "分片完成事件导致字节双重计数: got {} expected {}",
             task.downloaded, frag_size
         );
+    }
+
+    /// 回归:暂停后 chunk reader 消化队列中已落盘字节的进度事件时,
+    /// 字节必须继续入账(快照 checkpoint 依赖),但速度必须归 0——
+    /// 不得覆盖 pause_task 清零值,否则前端列表显示"暂停后仍在下载"。
+    #[tokio::test]
+    async fn test_chunk_reader_zeroes_speed_when_paused() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "test-paused-speed".to_string();
+
+        // 模拟 pause_task 后的仓库状态:Paused + speed 已清零
+        task_repository.insert(
+            task_id.clone(),
+            TaskInfo {
+                id: task_id.clone(),
+                url: "https://example.com/file.bin".to_string(),
+                file_name: "file.bin".to_string(),
+                file_size: Some(2048),
+                downloaded: 0,
+                speed: 0,
+                status: DownloadState::Paused,
+                progress: 0.0,
+                fragments_total: 2,
+                fragments_done: 0,
+                active_concurrency: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                save_path: "/tmp/file.bin".to_string(),
+                error_reason: None,
+                retry_count: 0,
+                tags: vec![],
+                hf_meta: None,
+                display_order: 0,
+                mirror_urls: None,
+            },
+        );
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: true,
+                fragment_downloaded: 1024,
+            })
+            .await
+            .unwrap();
+        // 越过 500ms 速度采样窗口,使第二个事件算出非零滑动窗口速度,
+        // 确保断言命中"钳制归 0"而非"本就算出 0"
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                completed: true,
+                fragment_downloaded: 1024,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(task.downloaded, 2048, "已落盘字节应继续入账");
+        assert_eq!(task.fragments_done, 2);
+        assert_eq!(task.speed, 0, "Paused 状态速度必须归 0");
     }
 
     #[tokio::test]
