@@ -3,9 +3,12 @@
 //! 负责在应用启动时从持久化存储中恢复未完成的下载任务。
 //! 提供 `TaskRecord` / `TaskSnapshot` 类型和 `RecoveryManager` 管理器。
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, io, sync::atomic::{AtomicU64, Ordering}};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, IgnoredAny, MapAccess, Visitor},
+};
 
 use crate::kv::KvStore;
 
@@ -168,15 +171,278 @@ fn parse_legacy_status(status: &str) -> tachyon_core::DownloadState {
     tachyon_core::DownloadState::from_str(status).unwrap_or(tachyon_core::DownloadState::Failed)
 }
 
-/// 恢复结果:包含成功恢复的任务和无法解析的损坏 key
+/// 被保护的 future schema 快照。
 ///
-/// 单个损坏 JSON 不会阻断其他任务的恢复(隔离策略)。
+/// 该快照对当前版本有效，但需要更高版本的程序处理，不能被当作损坏数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedSnapshot {
+    /// 存储中的原始 key。
+    pub key: String,
+    /// 快照声明的 schema 版本。
+    pub found_version: u32,
+    /// 当前程序支持的最高 schema 版本。
+    pub supported_version: u32,
+}
+
+/// 快照恢复的 fail-closed 错误。
+pub enum RecoveryError {
+    /// 快照由更高版本程序写入，必须保持原始内容不变。
+    Unsupported(ProtectedSnapshot),
+    /// 快照内容无效，包含其存储 key 以便调用方定位。
+    InvalidData { key: String },
+    /// 存储层 I/O 操作失败。
+    Io(io::Error),
+    /// S-02b:任务命名空间已被活跃 reservation 占用,普通 API 不得执行。
+    ReservationActive,
+}
+
+impl fmt::Debug for RecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(snapshot) => formatter
+                .debug_tuple("RecoveryError::Unsupported")
+                .field(snapshot)
+                .finish(),
+            Self::InvalidData { key } => formatter
+                .debug_struct("RecoveryError::InvalidData")
+                .field("key", key)
+                .finish(),
+            Self::Io(_) => formatter.write_str("RecoveryError::Io(..)"),
+            Self::ReservationActive => formatter.write_str("RecoveryError::ReservationActive"),
+        }
+    }
+}
+
+impl fmt::Display for RecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(_) => formatter.write_str("不支持的快照 schema 版本"),
+            Self::InvalidData { .. } => formatter.write_str("快照数据无效"),
+            Self::Io(_) => formatter.write_str("快照存储 I/O 操作失败"),
+            Self::ReservationActive => formatter.write_str("任务命名空间已被占用"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Unsupported(_) | Self::InvalidData { .. } | Self::ReservationActive => None,
+        }
+    }
+}
+
+/// 恢复结果:包含成功恢复的任务、损坏 key 和受保护的 future schema 快照。
+///
+/// 单个损坏 JSON 或 future schema 不会阻断其他任务的恢复(隔离策略)。
 #[derive(Debug)]
 pub struct RecoveryResult {
     /// 成功恢复的任务快照
     pub tasks: Vec<TaskSnapshot>,
     /// 无法解析的 key 列表(记录日志供排查,不中断恢复流程)
     pub corrupt_keys: Vec<String>,
+    /// 需要更新程序才能处理的快照，原始数据保持不变。
+    pub unsupported_schema: Vec<ProtectedSnapshot>,
+}
+
+/// 顶层 JSON 的 schema header 分类。
+#[derive(Debug, Clone, Copy)]
+enum SnapshotSchemaHeader {
+    /// 缺少 header，保留旧格式 fallback。
+    Legacy,
+    /// 已声明的 schema 版本。
+    Version(u32),
+}
+
+/// 仅接受无符号 32 位整数的 schemaVersion 值。
+struct SchemaVersion(u32);
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SchemaVersionVisitor)
+    }
+}
+
+struct SchemaVersionVisitor;
+
+impl<'de> Visitor<'de> for SchemaVersionVisitor {
+    type Value = SchemaVersion;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("0 到 u32::MAX 的整数 schemaVersion")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        u32::try_from(value)
+            .map(SchemaVersion)
+            .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(value), &self))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_value(de::Unexpected::Signed(value), &self))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_value(de::Unexpected::Float(value), &self))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_value(de::Unexpected::Bool(value), &self))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_value(de::Unexpected::Str(value), &self))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_type(de::Unexpected::Unit, &self))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::invalid_type(de::Unexpected::Option, &self))
+    }
+}
+
+struct SnapshotSchemaHeaderVisitor;
+
+impl<'de> Visitor<'de> for SnapshotSchemaHeaderVisitor {
+    type Value = SnapshotSchemaHeader;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("包含可选 schemaVersion 的 JSON 对象")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut schema_version = None;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "schemaVersion" {
+                if schema_version.is_some() {
+                    return Err(de::Error::duplicate_field("schemaVersion"));
+                }
+                schema_version = Some(map.next_value::<SchemaVersion>()?.0);
+            } else {
+                // 流式跳过非 header 字段，避免 Value/Map 折叠重复字段。
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+
+        Ok(schema_version.map_or(SnapshotSchemaHeader::Legacy, SnapshotSchemaHeader::Version))
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotSchemaHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SnapshotSchemaHeaderVisitor)
+    }
+}
+
+/// 使用流式 visitor 分类顶层 schema header，并拒绝尾随 JSON。
+fn classify_snapshot_schema(json: &str) -> io::Result<SnapshotSchemaHeader> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let header = SnapshotSchemaHeader::deserialize(&mut deserializer)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    deserializer
+        .end()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(header)
+}
+
+/// 单 key 加载的内部分类结果，供 batch 路径保留 future/corrupt/I/O 语义。
+#[derive(Debug)]
+enum LoadTaskSnapshotError {
+    Io(io::Error),
+    Unsupported { found_version: u32 },
+    Corrupt,
+}
+
+impl From<io::Error> for LoadTaskSnapshotError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl LoadTaskSnapshotError {
+    fn into_recovery_error(self, key: &str) -> RecoveryError {
+        match self {
+            Self::Io(error) => RecoveryError::Io(error),
+            Self::Unsupported { found_version } => {
+                RecoveryError::Unsupported(protected_snapshot(key, found_version))
+            }
+            Self::Corrupt => RecoveryError::InvalidData {
+                key: key.to_string(),
+            },
+        }
+    }
+}
+
+fn protected_snapshot(key: &str, found_version: u32) -> ProtectedSnapshot {
+    ProtectedSnapshot {
+        key: key.to_string(),
+        found_version,
+        supported_version: SNAPSHOT_SCHEMA_VERSION,
+    }
+}
+
+fn ensure_supported_snapshot(snapshot: &TaskSnapshot) -> Result<(), RecoveryError> {
+    if snapshot.schema_version > SNAPSHOT_SCHEMA_VERSION {
+        return Err(RecoveryError::Unsupported(protected_snapshot(
+            &format!("task_{}", snapshot.id),
+            snapshot.schema_version,
+        )));
+    }
+    Ok(())
+}
+
+/// S-02b:任务命名空间 reservation capability。
+///
+/// 由 [`RecoveryManager::reserve_task_namespace`] 创建,持有期间所有普通
+/// load/save/update/remove/restore/batch API 返回
+/// [`RecoveryError::ReservationActive`],仅 reserved 变体可用。
+/// `Drop` 释放匹配的活跃 reservation;构造仅限 `RecoveryManager` 内部。
+pub struct TaskNamespaceReservation<'a> {
+    /// 创建该 reservation 的 manager 引用,Drop 时用于释放活跃 reservation。
+    manager: &'a RecoveryManager,
+    /// 该 reservation 的唯一 nonce,用于区分同一 manager 的多次 reservation。
+    nonce: u64,
+}
+
+impl fmt::Debug for TaskNamespaceReservation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskNamespaceReservation")
+            .field("nonce", &self.nonce)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 恢复管理器
@@ -190,7 +456,12 @@ pub struct RecoveryManager {
     /// 审计 H-05:删除 tombstone。key=task_id, value=删除时磁盘 revision。
     /// 之后任何 `revision <= tombstone` 的 save 拒绝,防止旧 full-save 复活已删任务。
     delete_tombstones: std::sync::Mutex<HashMap<String, u64>>,
+    /// S-02b:活跃 reservation 的 nonce;None 表示无活跃 reservation。
+    active_reservation: std::sync::Mutex<Option<u64>>,
 }
+
+/// S-02b:全局递增的 reservation nonce,保证每次 reservation 唯一。
+static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 impl RecoveryManager {
     /// 创建恢复管理器
@@ -199,7 +470,179 @@ impl RecoveryManager {
             store,
             progress_lock: std::sync::Mutex::new(()),
             delete_tombstones: std::sync::Mutex::new(HashMap::new()),
+            active_reservation: std::sync::Mutex::new(None),
         }
+    }
+
+    /// S-02b:检查是否存在活跃 reservation;存在则返回 `ReservationActive`。
+    ///
+    /// 必须在持有 `progress_lock` 后调用,确保与 `reserve`/`Drop` 互斥。
+    fn check_no_active_reservation(&self) -> Result<(), RecoveryError> {
+        if self
+            .active_reservation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(RecoveryError::ReservationActive);
+        }
+        Ok(())
+    }
+
+    /// S-02b §3.1:扫描全部 `task_*` key 并用 header classifier 分类。
+    ///
+    /// 遇 future/invalid 即返回 typed error,不得创建 reservation。
+    /// 全部合法时创建活跃 reservation 并返回。
+    pub fn reserve_task_namespace(&self) -> Result<TaskNamespaceReservation<'_>, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 先扫描全部 task_ key,遇第一个 bad key 即 fail-closed
+        for key in self.store.keys().map_err(RecoveryError::Io)? {
+            if key.starts_with("task_") {
+                // 复用 load_task_snapshot_by_key 的分类逻辑(future/invalid/corrupt)
+                self.load_task_snapshot_by_key(&key)
+                    .map_err(|error| error.into_recovery_error(&key))?;
+            }
+        }
+        // 全部合法,创建活跃 reservation
+        let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+        *self
+            .active_reservation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(nonce);
+        Ok(TaskNamespaceReservation {
+            manager: self,
+            nonce,
+        })
+    }
+
+    /// S-02b §3.1:验证 reservation 的 manager identity + nonce + active。
+    fn validate_reservation(&self, reservation: &TaskNamespaceReservation<'_>) -> Result<(), RecoveryError> {
+        // manager identity:通过指针比较验证 reservation 属于本 manager
+        if !std::ptr::eq(reservation.manager, self) {
+            return Err(RecoveryError::ReservationActive);
+        }
+        match self
+            .active_reservation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(active) if *active == reservation.nonce => Ok(()),
+            _ => Err(RecoveryError::ReservationActive),
+        }
+    }
+
+    /// S-02b:reserved load — 验证 reservation 后委托内部 locked 操作。
+    pub fn load_reserved(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+        task_id: &str,
+    ) -> Result<Option<TaskSnapshot>, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_reservation(reservation)?;
+        let key = format!("task_{task_id}");
+        self.load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))
+    }
+
+    /// S-02b:reserved save — 验证 reservation 后强制写入(bump revision,跳过 CAS)。
+    ///
+    /// reservation 已提供独占性,无需 CAS revision check;tombstone 仍生效。
+    pub fn save_reserved(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+        snapshot: &TaskSnapshot,
+    ) -> Result<(), RecoveryError> {
+        ensure_supported_snapshot(snapshot)?;
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_reservation(reservation)?;
+        let key = format!("task_{}", snapshot.id);
+        let existing = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?;
+        // tombstone:拒绝基于删除前状态的旧写
+        if let Ok(tombs) = self.delete_tombstones.lock()
+            && let Some(&tomb_rev) = tombs.get(&snapshot.id)
+            && snapshot.revision <= tomb_rev
+        {
+            tracing::warn!(
+                task_id = %snapshot.id,
+                incoming_revision = snapshot.revision,
+                tombstone_revision = tomb_rev,
+                "拒绝写入已删除任务快照(H-05 tombstone)"
+            );
+            return Ok(());
+        }
+        let base_rev = existing.as_ref().map(|s| s.revision).unwrap_or(0);
+        let mut to_write = snapshot.clone();
+        to_write.revision = base_rev.saturating_add(1);
+        if to_write.schema_version < SNAPSHOT_SCHEMA_VERSION {
+            to_write.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        }
+        self.store
+            .put_durable(&key, &to_write)
+            .map_err(RecoveryError::Io)
+    }
+
+    /// S-02b:reserved update — 验证 reservation 后执行 locked load-modify-save。
+    pub fn update_reserved(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+        task_id: &str,
+        patch: impl FnOnce(&mut TaskSnapshot),
+    ) -> Result<Option<TaskSnapshot>, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_reservation(reservation)?;
+        let key = format!("task_{task_id}");
+        let mut snapshot = match self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        patch(&mut snapshot);
+        if snapshot.schema_version < SNAPSHOT_SCHEMA_VERSION {
+            snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        }
+        self.save_task_snapshot_locked(&snapshot)?;
+        let final_snap = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?;
+        Ok(final_snap)
+    }
+
+    /// S-02b:reserved remove — 验证 reservation 后执行 locked remove。
+    pub fn remove_reserved(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+        task_id: &str,
+    ) -> Result<bool, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_reservation(reservation)?;
+        let key = format!("task_{task_id}");
+        let existing_rev = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?
+            .map(|s| s.revision)
+            .unwrap_or(0);
+        let deleted = self.store.delete(&key).map_err(RecoveryError::Io)?;
+        if let Ok(mut tombs) = self.delete_tombstones.lock() {
+            tombs.insert(task_id.to_string(), existing_rev);
+        }
+        Ok(deleted)
+    }
+
+    /// S-02b:reserved restore — 验证 reservation 后执行 locked restore。
+    pub fn restore_reserved(
+        &self,
+        reservation: &TaskNamespaceReservation<'_>,
+        snapshot: &TaskSnapshot,
+    ) -> Result<(), RecoveryError> {
+        ensure_supported_snapshot(snapshot)?;
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_reservation(reservation)?;
+        self.restore_task_snapshot_locked(snapshot)
     }
 
     /// 保存任务快照(强制持久化)
@@ -220,22 +663,72 @@ impl RecoveryManager {
     /// 该方法已通过 `CHECKPOINT_BATCH_SIZE` 与 `PARTIAL_CHECKPOINT_INTERVAL`
     /// 限频(批量 + 时间间隔双维度节流),Durable 的 fsync 开销被摊薄到可控频率,
     /// 不会成为每分片的热点。
-    pub fn save_task_snapshot(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
+    pub fn save_task_snapshot(&self, snapshot: &TaskSnapshot) -> Result<(), RecoveryError> {
+        ensure_supported_snapshot(snapshot)?;
         let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
         self.save_task_snapshot_locked(snapshot)
     }
 
-    /// 撤销删除等显式恢复路径:清除 tombstone 后强制写入。
-    pub fn restore_task_snapshot(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
+    /// 撤销删除等显式恢复路径:使用 max(tombstone,disk)+1 写入,
+    /// 仅在 strict durable 写成功后才清除 tombstone。
+    pub fn restore_task_snapshot(&self, snapshot: &TaskSnapshot) -> Result<(), RecoveryError> {
+        ensure_supported_snapshot(snapshot)?;
         let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
+        self.restore_task_snapshot_locked(snapshot)
+    }
+
+    /// S-02b §3.3:restore 的 locked 实现。
+    ///
+    /// 关键不变式:
+    /// 1. 使用 `max(tombstone_revision, disk_revision)+1` 作为写入 revision,
+    ///    不得信任传入 snapshot.revision。
+    /// 2. 仅在 strict durable write(`put_durable`)成功后才清除 tombstone;
+    ///    写失败时 tombstone 保留,旧 revision save 仍被拒绝。
+    fn restore_task_snapshot_locked(&self, snapshot: &TaskSnapshot) -> Result<(), RecoveryError> {
+        let key = format!("task_{}", snapshot.id);
+        // 先读取并分类磁盘原始快照,future/corrupt/I/O 均不得继续。
+        let existing = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?;
+        let disk_rev = existing.as_ref().map(|s| s.revision).unwrap_or(0);
+
+        // tombstone revision:restore 路径需要取 max(tombstone, disk)+1
+        let tomb_rev = self
+            .delete_tombstones
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&snapshot.id)
+            .copied()
+            .unwrap_or(0);
+        let write_rev = tomb_rev.max(disk_rev).saturating_add(1);
+
+        let mut to_write = snapshot.clone();
+        to_write.revision = write_rev;
+        if to_write.schema_version < SNAPSHOT_SCHEMA_VERSION {
+            to_write.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        }
+
+        // strict durable write:成功后才清 tombstone
+        self.store
+            .put_durable(&key, &to_write)
+            .map_err(RecoveryError::Io)?;
+
+        // durable 写成功,清除 tombstone
         if let Ok(mut tombs) = self.delete_tombstones.lock() {
             tombs.remove(&snapshot.id);
         }
-        self.save_task_snapshot_locked(snapshot)
+        Ok(())
     }
 
-    fn save_task_snapshot_locked(&self, snapshot: &TaskSnapshot) -> std::io::Result<()> {
+    fn save_task_snapshot_locked(&self, snapshot: &TaskSnapshot) -> Result<(), RecoveryError> {
+        ensure_supported_snapshot(snapshot)?;
         let key = format!("task_{}", snapshot.id);
+        // 先分类现有 raw，不能让 tombstone 提前掩盖 future/corrupt 快照。
+        let existing = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?;
 
         // tombstone:拒绝基于删除前状态的旧写
         if let Ok(tombs) = self.delete_tombstones.lock()
@@ -251,7 +744,6 @@ impl RecoveryManager {
             return Ok(());
         }
 
-        let existing = self.load_task_snapshot_by_key(&key)?;
         let base_rev = existing.as_ref().map(|s| s.revision).unwrap_or(0);
         if snapshot.revision < base_rev {
             tracing::warn!(
@@ -268,68 +760,99 @@ impl RecoveryManager {
         if to_write.schema_version < SNAPSHOT_SCHEMA_VERSION {
             to_write.schema_version = SNAPSHOT_SCHEMA_VERSION;
         }
-        self.store.put_durable(&key, &to_write)
+        self.store
+            .put_durable(&key, &to_write)
+            .map_err(RecoveryError::Io)
     }
 
     /// 加载任务快照
-    pub fn load_task_snapshot(&self, task_id: &str) -> std::io::Result<Option<TaskSnapshot>> {
-        self.load_task_snapshot_by_key(&format!("task_{task_id}"))
+    ///
+    /// S-02b:活跃 reservation 期间返回 `ReservationActive`。
+    pub fn load_task_snapshot(&self, task_id: &str) -> Result<Option<TaskSnapshot>, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
+        let key = format!("task_{task_id}");
+        self.load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))
     }
 
-    fn load_task_snapshot_by_key(&self, key: &str) -> std::io::Result<Option<TaskSnapshot>> {
+    fn load_task_snapshot_by_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<TaskSnapshot>, LoadTaskSnapshotError> {
         let Some(json) = self.store.get_raw(key)? else {
             return Ok(None);
         };
-        serde_json::from_str::<TaskSnapshot>(&json)
-            .or_else(|_| serde_json::from_str::<TaskRecord>(&json).map(TaskSnapshot::from))
-            .map(Some)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+
+        match classify_snapshot_schema(&json).map_err(|_| LoadTaskSnapshotError::Corrupt)? {
+            SnapshotSchemaHeader::Version(found_version)
+                if found_version > SNAPSHOT_SCHEMA_VERSION =>
+            {
+                Err(LoadTaskSnapshotError::Unsupported { found_version })
+            }
+            SnapshotSchemaHeader::Legacy | SnapshotSchemaHeader::Version(_) => {
+                serde_json::from_str::<TaskSnapshot>(&json)
+                    .or_else(|_| serde_json::from_str::<TaskRecord>(&json).map(TaskSnapshot::from))
+                    .map(Some)
+                    .map_err(|_| LoadTaskSnapshotError::Corrupt)
+            }
+        }
     }
 
     /// 加载所有任务快照,隔离损坏记录
     ///
     /// 单个 key 解析失败不会中断其他任务的恢复,而是记录到 `corrupt_keys` 中。
-    pub fn load_all_task_snapshots(&self) -> std::io::Result<RecoveryResult> {
+    pub fn load_all_task_snapshots(&self) -> Result<RecoveryResult, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
         let mut tasks = Vec::new();
         let mut corrupt_keys = Vec::new();
-        for key in self.store.keys()? {
+        let mut unsupported_schema = Vec::new();
+        for key in self.store.keys().map_err(RecoveryError::Io)? {
             if key.starts_with("task_") {
                 match self.load_task_snapshot_by_key(&key) {
                     Ok(Some(snapshot)) => tasks.push(snapshot),
                     Ok(None) => {} // key 存在但无数据,忽略
-                    Err(_) => {
+                    Err(LoadTaskSnapshotError::Unsupported { found_version }) => {
+                        tracing::warn!(key = %key, found_version, "future schema 快照已隔离");
+                        unsupported_schema.push(protected_snapshot(&key, found_version));
+                    }
+                    Err(LoadTaskSnapshotError::Corrupt) => {
                         tracing::warn!(key = %key, "快照 JSON 损坏,跳过恢复");
                         corrupt_keys.push(key);
                     }
+                    Err(LoadTaskSnapshotError::Io(error)) => return Err(RecoveryError::Io(error)),
                 }
             }
         }
         Ok(RecoveryResult {
             tasks,
             corrupt_keys,
+            unsupported_schema,
         })
     }
 
     /// 保存任务记录（旧接口）
-    pub fn save_task(&self, record: &TaskRecord) -> std::io::Result<()> {
+    pub fn save_task(&self, record: &TaskRecord) -> Result<(), RecoveryError> {
         let snapshot: TaskSnapshot = TaskSnapshot::from(record.clone());
         self.save_task_snapshot(&snapshot)
     }
 
     /// 加载任务记录（旧接口）
-    pub fn load_task(&self, task_id: &str) -> std::io::Result<Option<TaskRecord>> {
+    pub fn load_task(&self, task_id: &str) -> Result<Option<TaskRecord>, RecoveryError> {
         Ok(self.load_task_snapshot(task_id)?.map(TaskRecord::from))
     }
-
     /// 删除任务记录(审计 H-05:持锁 + tombstone 防旧 save 复活)
-    pub fn remove_task(&self, task_id: &str) -> std::io::Result<bool> {
+    pub fn remove_task(&self, task_id: &str) -> Result<bool, RecoveryError> {
         let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
         let key = format!("task_{task_id}");
         let existing_rev = self
-            .load_task_snapshot_by_key(&key)?
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?
             .map(|s| s.revision)
             .unwrap_or(0);
-        let deleted = self.store.delete(&key)?;
+        let deleted = self.store.delete(&key).map_err(RecoveryError::Io)?;
         if let Ok(mut tombs) = self.delete_tombstones.lock() {
             // 即便 key 本就不存在,也记 tombstone,挡住 in-flight 的旧 full-save
             tombs.insert(task_id.to_string(), existing_rev);
@@ -337,28 +860,16 @@ impl RecoveryManager {
         Ok(deleted)
     }
 
-    /// 恢复所有未完成的任务
-    pub fn recover_pending_tasks(&self) -> std::io::Result<Vec<TaskRecord>> {
-        let mut pending = Vec::new();
-        for key in self.store.keys()? {
-            if let Some(task_id) = key.strip_prefix("task_")
-                && let Some(record) = self.load_task(task_id)?
-                && (record.status == "downloading" || record.status == "paused")
-            {
-                tracing::info!(task_id = %record.task_id, "恢复下载任务");
-                pending.push(record);
-            }
-        }
-        Ok(pending)
-    }
-
     /// 恢复所有未完成的任务（新接口）,隔离损坏记录
     ///
     /// 单个 key 解析失败不会中断恢复,而是记录到 `corrupt_keys` 中。
-    pub fn recover_pending_snapshots(&self) -> std::io::Result<RecoveryResult> {
+    pub fn recover_pending_snapshots(&self) -> Result<RecoveryResult, RecoveryError> {
+        let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
         let mut tasks = Vec::new();
         let mut corrupt_keys = Vec::new();
-        for key in self.store.keys()? {
+        let mut unsupported_schema = Vec::new();
+        for key in self.store.keys().map_err(RecoveryError::Io)? {
             if key.starts_with("task_") {
                 match self.load_task_snapshot_by_key(&key) {
                     Ok(Some(snapshot))
@@ -372,16 +883,22 @@ impl RecoveryManager {
                         tasks.push(snapshot);
                     }
                     Ok(_) => {} // 完成或空,跳过
-                    Err(_) => {
+                    Err(LoadTaskSnapshotError::Unsupported { found_version }) => {
+                        tracing::warn!(key = %key, found_version, "future schema 快照已隔离");
+                        unsupported_schema.push(protected_snapshot(&key, found_version));
+                    }
+                    Err(LoadTaskSnapshotError::Corrupt) => {
                         tracing::warn!(key = %key, "快照 JSON 损坏,跳过恢复");
                         corrupt_keys.push(key);
                     }
+                    Err(LoadTaskSnapshotError::Io(error)) => return Err(RecoveryError::Io(error)),
                 }
             }
         }
         Ok(RecoveryResult {
             tasks,
             corrupt_keys,
+            unsupported_schema,
         })
     }
 
@@ -402,10 +919,14 @@ impl RecoveryManager {
         &self,
         task_id: &str,
         patch: impl FnOnce(&mut TaskSnapshot),
-    ) -> std::io::Result<Option<TaskSnapshot>> {
+    ) -> Result<Option<TaskSnapshot>, RecoveryError> {
         let _lock = self.progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_no_active_reservation()?;
         let key = format!("task_{task_id}");
-        let mut snapshot = match self.load_task_snapshot_by_key(&key)? {
+        let mut snapshot = match self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?
+        {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -420,8 +941,30 @@ impl RecoveryManager {
         // 已持 progress_lock,走 locked save(revision CAS + bump)
         self.save_task_snapshot_locked(&snapshot)?;
         // 返回磁盘最终 revision
-        let final_snap = self.load_task_snapshot_by_key(&key)?;
+        let final_snap = self
+            .load_task_snapshot_by_key(&key)
+            .map_err(|error| error.into_recovery_error(&key))?;
         Ok(final_snap)
+    }
+}
+
+/// S-02b:Drop 时释放匹配的活跃 reservation。
+///
+/// 仅当当前 active reservation 的 nonce 与本 reservation 匹配时才清除;
+/// 若已被其他 reservation 替换(理论上不应发生,因 progress_lock 串行化),
+/// 则不修改。
+impl Drop for TaskNamespaceReservation<'_> {
+    fn drop(&mut self) {
+        let _lock = self
+            .manager
+            .progress_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut active) = self.manager.active_reservation.lock() {
+            if active.as_ref() == Some(&self.nonce) {
+                *active = None;
+            }
+        }
     }
 }
 
@@ -487,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_pending_tasks() {
+    fn test_recover_pending_snapshots() {
         let tmp = tempfile::tempdir().unwrap();
         let store = KvStore::open(tmp.path()).unwrap();
         let mgr = RecoveryManager::new(store);
@@ -495,9 +1038,16 @@ mod tests {
         mgr.save_task(&make_record("t2", "completed")).unwrap();
         mgr.save_task(&make_record("t3", "paused")).unwrap();
         mgr.save_task(&make_record("t4", "failed")).unwrap();
-        let pending = mgr.recover_pending_tasks().unwrap();
-        assert_eq!(pending.len(), 2);
-        let ids: Vec<&str> = pending.iter().map(|r| r.task_id.as_str()).collect();
+
+        let result = mgr.recover_pending_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 2);
+        assert!(result.corrupt_keys.is_empty());
+        assert!(result.unsupported_schema.is_empty());
+        let ids: Vec<&str> = result
+            .tasks
+            .iter()
+            .map(|snapshot| snapshot.id.as_str())
+            .collect();
         assert!(ids.contains(&"t1"));
         assert!(ids.contains(&"t3"));
     }
@@ -764,7 +1314,7 @@ mod tests {
         );
         let loaded: TaskSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            loaded.mirror_urls.as_ref().map(|v| v.as_slice()),
+            loaded.mirror_urls.as_deref(),
             Some(
                 [
                     "https://mirror1.example.com/file.bin".to_string(),
@@ -821,6 +1371,296 @@ mod tests {
     }
 
     // ── 坏 JSON 隔离测试 ──
+
+    fn task_key_path(dir: &std::path::Path, task_id: &str) -> std::path::PathBuf {
+        dir.join(format!("task_{task_id}.json"))
+    }
+
+    fn write_raw_task(dir: &std::path::Path, task_id: &str, raw: &str) -> std::path::PathBuf {
+        let path = task_key_path(dir, task_id);
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    fn future_legacy_record_raw(task_id: &str, found_version: u32) -> String {
+        let legacy_record_json =
+            serde_json::to_string(&make_record(task_id, "downloading")).unwrap();
+        format!(
+            r#"{{"schemaVersion":{found_version},{}"#,
+            legacy_record_json.trim_start_matches('{')
+        )
+    }
+
+    fn assert_unsupported(error: RecoveryError, key: &str, found_version: u32) {
+        match error {
+            RecoveryError::Unsupported(protected) => {
+                assert_eq!(protected.key, key);
+                assert_eq!(protected.found_version, found_version);
+                assert_eq!(protected.supported_version, SNAPSHOT_SCHEMA_VERSION);
+            }
+            other => panic!("expected typed Unsupported for {key}, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_data(error: RecoveryError, key: &str) {
+        match error {
+            RecoveryError::InvalidData { key: actual_key } => assert_eq!(actual_key, key),
+            other => panic!("expected typed InvalidData for {key}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn future_schema_single_load_returns_typed_protected_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let found_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        let raw = future_legacy_record_raw("future", found_version);
+        assert!(serde_json::from_str::<TaskRecord>(&raw).is_ok());
+        let path = write_raw_task(tmp.path(), "future", &raw);
+        let raw_before = std::fs::read(&path).unwrap();
+
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        assert_unsupported(
+            mgr.load_task_snapshot("future").unwrap_err(),
+            "task_future",
+            found_version,
+        );
+        assert_eq!(std::fs::read(path).unwrap(), raw_before);
+    }
+
+    #[test]
+    fn invalid_schema_headers_return_typed_invalid_data_without_legacy_fallback() {
+        let cases = [
+            (
+                "duplicate",
+                r#"{"schemaVersion":7,"schemaVersion":8,"task_id":"duplicate","url":"https://example.com/duplicate.zip","save_path":"/downloads/duplicate.zip","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#,
+            ),
+            (
+                "null",
+                r#"{"schemaVersion":null,"task_id":"null","url":"https://example.com/null.zip","save_path":"/downloads/null.zip","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#,
+            ),
+            (
+                "string",
+                r#"{"schemaVersion":"8","task_id":"string","url":"https://example.com/string.zip","save_path":"/downloads/string.zip","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#,
+            ),
+            (
+                "negative",
+                r#"{"schemaVersion":-1,"task_id":"negative","url":"https://example.com/negative.zip","save_path":"/downloads/negative.zip","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#,
+            ),
+            (
+                "overflow",
+                r#"{"schemaVersion":4294967296,"task_id":"overflow","url":"https://example.com/overflow.zip","save_path":"/downloads/overflow.zip","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#,
+            ),
+            ("non_object", r#"["not", "a", "snapshot"]"#),
+            ("trailing", r#"{"schemaVersion":7} {"task_id":"trailing"}"#),
+        ];
+
+        for (task_id, raw) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                matches!(task_id, "non_object" | "trailing")
+                    || serde_json::from_str::<TaskRecord>(raw).is_ok(),
+                "fixture {task_id} must be a viable legacy fallback decoy when it is an object"
+            );
+            let path = write_raw_task(tmp.path(), task_id, raw);
+            let raw_before = std::fs::read(&path).unwrap();
+            let store = KvStore::open(tmp.path()).unwrap();
+            let mgr = RecoveryManager::new(store);
+
+            assert_invalid_data(
+                mgr.load_task_snapshot(task_id).unwrap_err(),
+                &format!("task_{task_id}"),
+            );
+            assert_eq!(std::fs::read(path).unwrap(), raw_before, "{task_id}");
+        }
+    }
+
+    #[test]
+    fn future_incoming_save_restore_and_remove_preserve_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let found_version = SNAPSHOT_SCHEMA_VERSION + 1;
+
+        // future incoming snapshot 必须在碰触磁盘或 tombstone 前被拒绝。
+        let mut incoming = make_snapshot("incoming", tachyon_core::DownloadState::Paused);
+        incoming.schema_version = found_version;
+        mgr.delete_tombstones
+            .lock()
+            .unwrap()
+            .insert("incoming".to_string(), 41);
+        assert_unsupported(
+            mgr.save_task_snapshot(&incoming).unwrap_err(),
+            "task_incoming",
+            found_version,
+        );
+        assert_unsupported(
+            mgr.restore_task_snapshot(&incoming).unwrap_err(),
+            "task_incoming",
+            found_version,
+        );
+        assert!(!task_key_path(tmp.path(), "incoming").exists());
+        assert_eq!(
+            mgr.delete_tombstones.lock().unwrap().get("incoming"),
+            Some(&41)
+        );
+
+        // current incoming 也不能覆盖、restore 或删除磁盘上已有的 future raw。
+        let protected_raw = future_legacy_record_raw("protected", found_version);
+        let protected_path = write_raw_task(tmp.path(), "protected", &protected_raw);
+        let protected_before = std::fs::read(&protected_path).unwrap();
+        mgr.delete_tombstones
+            .lock()
+            .unwrap()
+            .insert("protected".to_string(), 73);
+        let current = make_snapshot("protected", tachyon_core::DownloadState::Paused);
+
+        assert_unsupported(
+            mgr.save_task_snapshot(&current).unwrap_err(),
+            "task_protected",
+            found_version,
+        );
+        assert_unsupported(
+            mgr.restore_task_snapshot(&current).unwrap_err(),
+            "task_protected",
+            found_version,
+        );
+        assert_unsupported(
+            mgr.remove_task("protected").unwrap_err(),
+            "task_protected",
+            found_version,
+        );
+        assert_eq!(std::fs::read(protected_path).unwrap(), protected_before);
+        assert_eq!(
+            mgr.delete_tombstones.lock().unwrap().get("protected"),
+            Some(&73)
+        );
+    }
+
+    #[test]
+    fn update_snapshot_rejects_patch_that_creates_future_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let current = make_snapshot("current", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&current).unwrap();
+        let current_path = task_key_path(tmp.path(), "current");
+        let current_before = std::fs::read(&current_path).unwrap();
+        let current_revision = mgr.load_task_snapshot("current").unwrap().unwrap().revision;
+        let current_patch_called = std::cell::Cell::new(false);
+
+        assert_unsupported(
+            mgr.update_snapshot("current", |snapshot| {
+                current_patch_called.set(true);
+                snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION + 1;
+            })
+            .unwrap_err(),
+            "task_current",
+            SNAPSHOT_SCHEMA_VERSION + 1,
+        );
+        assert!(
+            current_patch_called.get(),
+            "current raw must invoke the patch before rejecting its future schema"
+        );
+        assert_eq!(std::fs::read(&current_path).unwrap(), current_before);
+        assert_eq!(
+            mgr.load_task_snapshot("current").unwrap().unwrap().revision,
+            current_revision
+        );
+
+        let future_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        let future_raw = future_legacy_record_raw("direct_future", future_version);
+        let future_path = write_raw_task(tmp.path(), "direct_future", &future_raw);
+        let future_before = std::fs::read(&future_path).unwrap();
+        let patch_called = std::cell::Cell::new(false);
+        assert_unsupported(
+            mgr.update_snapshot("direct_future", |_| patch_called.set(true))
+                .unwrap_err(),
+            "task_direct_future",
+            future_version,
+        );
+        assert!(
+            !patch_called.get(),
+            "future raw must not invoke the patch closure"
+        );
+        assert_eq!(std::fs::read(future_path).unwrap(), future_before);
+    }
+
+    #[test]
+    fn recover_pending_snapshots_keeps_legal_tasks_and_classifies_future_and_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        mgr.save_task_snapshot(&make_snapshot(
+            "pending",
+            tachyon_core::DownloadState::Downloading,
+        ))
+        .unwrap();
+        mgr.save_task_snapshot(&make_snapshot(
+            "completed",
+            tachyon_core::DownloadState::Completed,
+        ))
+        .unwrap();
+
+        let future_raw = future_legacy_record_raw("future", SNAPSHOT_SCHEMA_VERSION + 1);
+        let future_path = write_raw_task(tmp.path(), "future", &future_raw);
+        let future_before = std::fs::read(&future_path).unwrap();
+        let corrupt_path = write_raw_task(tmp.path(), "corrupt", r#"{"schemaVersion":null}"#);
+        let corrupt_before = std::fs::read(&corrupt_path).unwrap();
+
+        let result = mgr.recover_pending_snapshots().unwrap();
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].id, "pending");
+        assert_eq!(result.corrupt_keys, vec!["task_corrupt"]);
+        assert_eq!(
+            result.unsupported_schema,
+            vec![ProtectedSnapshot {
+                key: "task_future".to_string(),
+                found_version: SNAPSHOT_SCHEMA_VERSION + 1,
+                supported_version: SNAPSHOT_SCHEMA_VERSION,
+            }]
+        );
+        assert_eq!(std::fs::read(future_path).unwrap(), future_before);
+        assert_eq!(std::fs::read(corrupt_path).unwrap(), corrupt_before);
+    }
+
+    #[test]
+    fn future_schema_is_reported_as_unsupported_not_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current_path = tmp.path().join("task_current.json");
+        let future_path = tmp.path().join("task_future.json");
+        let found_version = SNAPSHOT_SCHEMA_VERSION + 1;
+
+        let current = make_snapshot("current", tachyon_core::DownloadState::Downloading);
+        std::fs::write(&current_path, serde_json::to_vec(&current).unwrap()).unwrap();
+
+        // future JSON 的其余字段刻意保持为合法 TaskRecord：若 schema 检查晚于
+        // TaskRecord fallback，这条记录会被错误地当作旧记录恢复。
+        let legacy_record_json =
+            serde_json::to_string(&make_record("future", "downloading")).unwrap();
+        let future_raw = format!(
+            r#"{{"schemaVersion":{found_version},{}"#,
+            legacy_record_json.trim_start_matches('{')
+        );
+        assert!(future_raw.contains(&format!(r#""schemaVersion":{found_version}"#)));
+        assert!(serde_json::from_str::<TaskRecord>(&future_raw).is_ok());
+        std::fs::write(&future_path, future_raw.as_bytes()).unwrap();
+        let future_raw_before = std::fs::read(&future_path).unwrap();
+
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let result = mgr.load_all_task_snapshots().unwrap();
+
+        assert!(result.tasks.iter().any(|snapshot| snapshot.id == "current"));
+        assert!(result.tasks.iter().all(|snapshot| snapshot.id != "future"));
+        assert!(!result.corrupt_keys.iter().any(|key| key == "task_future"));
+        assert_eq!(result.unsupported_schema.len(), 1);
+        let protected = &result.unsupported_schema[0];
+        assert_eq!(protected.key, "task_future");
+        assert_eq!(protected.found_version, found_version);
+        assert_eq!(protected.supported_version, SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(std::fs::read(&future_path).unwrap(), future_raw_before);
+    }
 
     #[test]
     fn corrupt_json_is_isolated_during_recovery() {
@@ -1044,5 +1884,258 @@ mod tests {
         let restored = mgr.load_task_snapshot("undo").unwrap().unwrap();
         assert_eq!(restored.status, tachyon_core::DownloadState::Paused);
         assert!(restored.revision >= 1);
+    }
+    // ── S-02b: restore strict durable 顺序(§3.3)──
+
+    /// §3.3 step 3:restore 必须使用 `max(tombstone, disk)+1` 作为写入 revision,
+    /// 不得信任传入 revision;且仅在 strict durable 写成功后才清除 tombstone。
+    ///
+    /// 当前实现先清 tombstone 再以 `disk+1` 写入,既信任错误顺序又用错 revision,
+    /// 故此测试为 RED:期望 revision == 6,实际为 2。
+    #[test]
+    fn s02b_restore_uses_max_of_tombstone_and_disk_revision_then_clears_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let snap = make_snapshot("maxrev", tachyon_core::DownloadState::Paused);
+        mgr.save_task_snapshot(&snap).unwrap();
+        let disk = mgr.load_task_snapshot("maxrev").unwrap().unwrap();
+        assert_eq!(disk.revision, 1);
+
+        // tombstone revision(5)高于 disk revision(1)
+        mgr.delete_tombstones
+            .lock()
+            .unwrap()
+            .insert("maxrev".to_string(), 5);
+
+        // incoming revision 与 disk 持平,确保走到 durable write 而非 CAS 拒绝;
+        // spec 明确"不得信任传入 revision",故期望写入 max(5,1)+1 == 6。
+        let mut incoming = snap.clone();
+        incoming.revision = disk.revision;
+        mgr.restore_task_snapshot(&incoming).unwrap();
+
+        let restored = mgr.load_task_snapshot("maxrev").unwrap().unwrap();
+        assert_eq!(
+            restored.revision, 6,
+            "restore 必须使用 max(tombstone,disk)+1,不得信任传入 revision"
+        );
+        assert!(
+            mgr.delete_tombstones
+                .lock()
+                .unwrap()
+                .get("maxrev")
+                .is_none(),
+            "tombstone 必须在 strict durable 写成功后才清除"
+        );
+    }
+
+    /// §3.3 step 4-5:durable write 失败时 tombstone 必须保留,
+    /// 且旧 revision save 仍被 tombstone 拒绝。
+    ///
+    /// 当前实现先清 tombstone 再写,故 write 失败后 tombstone 已丢失 → RED。
+    /// 注入手段:将目标文件设为只读,使 `rename` 失败(读不受影响),
+    /// 经探针确认 `load` 成功而 `put_durable` 返回 `RecoveryError::Io`。
+    #[test]
+    fn s02b_restore_keeps_tombstone_when_durable_write_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let snap = make_snapshot("rwfail", tachyon_core::DownloadState::Paused);
+        mgr.save_task_snapshot(&snap).unwrap();
+        let disk = mgr.load_task_snapshot("rwfail").unwrap().unwrap();
+        assert_eq!(disk.revision, 1);
+
+        // tombstone(5)高于 disk(1):若 restore 在写前清 tombstone,失败后即丢失。
+        mgr.delete_tombstones
+            .lock()
+            .unwrap()
+            .insert("rwfail".to_string(), 5);
+
+        // 将目标文件设为只读,迫使 durable write 的 rename 失败。
+        let path = task_key_path(tmp.path(), "rwfail");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // incoming revision 与 disk 持平,确保走到 durable write 而非 CAS 拒绝。
+        let mut incoming = snap.clone();
+        incoming.revision = disk.revision;
+
+        let err = mgr.restore_task_snapshot(&incoming).unwrap_err();
+        match err {
+            RecoveryError::Io(_) => {}
+            other => {
+                let mut p = std::fs::metadata(&path).unwrap().permissions();
+                p.set_readonly(false);
+                let _ = std::fs::set_permissions(&path, p);
+                panic!("expected Io from failed durable write, got {other:?}");
+            }
+        }
+
+        // 还原可写,便于后续断言与清理。
+        let mut p = std::fs::metadata(&path).unwrap().permissions();
+        p.set_readonly(false);
+        let _ = std::fs::set_permissions(&path, p);
+
+        // tombstone 必须保留:strict durable 写失败后不得清除。
+        assert_eq!(
+            mgr.delete_tombstones.lock().unwrap().get("rwfail"),
+            Some(&5),
+            "durable write 失败后 tombstone 必须保留(不得在写前清除)"
+        );
+
+        // 旧 revision save 仍被 tombstone 拒绝:tombstone(5)仍生效,
+        // incoming.revision(1) <= 5 → CAS 拒绝,不得写入。
+        mgr.save_task_snapshot(&incoming).unwrap();
+        let after = mgr.load_task_snapshot("rwfail").unwrap().unwrap();
+        assert_eq!(
+            after.revision,
+            disk.revision,
+            "tombstone 仍生效,旧 revision save 不得写入"
+        );
+        assert_eq!(
+            mgr.delete_tombstones.lock().unwrap().get("rwfail"),
+            Some(&5),
+            "tombstone 在旧 save 拒绝后仍须存在"
+        );
+    }
+    // ── S-02b: store reservation capability(§3.1/§3.2)──
+    //
+    // 以下测试引用尚未实现的 reservation 公开 API,故为 compile RED:
+    //   RecoveryManager::reserve_task_namespace() -> Result<TaskNamespaceReservation, RecoveryError>
+    //   RecoveryError::ReservationActive
+    //   RecoveryManager::{load,save,update,remove,restore}_reserved(&reservation, ...)
+    // Coder 实现这些 API 后转为 GREEN。
+
+    /// §3.1:reserve_task_namespace 扫描全部 task_ key 并用同一 header classifier 分类;
+    /// 遇 future/invalid 即返回 typed error,不得创建 reservation。
+    #[test]
+    fn s02b_reserve_fails_on_future_or_invalid_without_creating_reservation() {
+        // (a) future schema → Unsupported,无 reservation
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = KvStore::open(tmp.path()).unwrap();
+            let mgr = RecoveryManager::new(store);
+            let found_version = SNAPSHOT_SCHEMA_VERSION + 1;
+            let raw = future_legacy_record_raw("future", found_version);
+            write_raw_task(tmp.path(), "future", &raw);
+
+            let err = mgr.reserve_task_namespace().unwrap_err();
+            assert_unsupported(err, "task_future", found_version);
+
+            // 不创建 reservation:普通 batch API 不得返回 ReservationActive。
+            let result = mgr.load_all_task_snapshots().unwrap();
+            assert!(result
+                .unsupported_schema
+                .iter()
+                .any(|p| p.key == "task_future"));
+        }
+        // (b) invalid schema → InvalidData,无 reservation
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = KvStore::open(tmp.path()).unwrap();
+            let mgr = RecoveryManager::new(store);
+            let raw = r#"{"schemaVersion":"8","task_id":"bad","url":"u","save_path":"p","file_size":1,"downloaded":0,"completed_fragments":[],"total_fragments":1,"status":"paused"}"#;
+            write_raw_task(tmp.path(), "bad", raw);
+
+            let err = mgr.reserve_task_namespace().unwrap_err();
+            assert_invalid_data(err, "task_bad");
+
+            // 不创建 reservation:普通单 key load 不得返回 ReservationActive。
+            assert_invalid_data(
+                mgr.load_task_snapshot("bad").unwrap_err(),
+                "task_bad",
+            );
+        }
+    }
+
+    /// §3.2:活跃 reservation 期间,普通 load/save/update/remove/restore/batch API
+    /// 一律返回 `ReservationActive`,不得先 scan 后照常执行或绕过。
+    #[test]
+    fn s02b_active_reservation_blocks_normal_apis_with_reservation_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let snap = make_snapshot("active", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&snap).unwrap();
+
+        let reservation = mgr.reserve_task_namespace().unwrap();
+
+        fn expect_reservation_active(err: RecoveryError) {
+            match err {
+                RecoveryError::ReservationActive => {}
+                other => panic!("expected ReservationActive, got {other:?}"),
+            }
+        }
+
+        expect_reservation_active(mgr.load_task_snapshot("active").unwrap_err());
+        expect_reservation_active(mgr.save_task_snapshot(&snap).unwrap_err());
+        expect_reservation_active(mgr.update_snapshot("active", |_| {}).unwrap_err());
+        expect_reservation_active(mgr.remove_task("active").unwrap_err());
+        expect_reservation_active(mgr.restore_task_snapshot(&snap).unwrap_err());
+        // batch read API 同样被 reservation 拦截
+        expect_reservation_active(mgr.load_all_task_snapshots().unwrap_err());
+        expect_reservation_active(mgr.recover_pending_snapshots().unwrap_err());
+    }
+
+    /// §3.1:reserved 变体在活跃 reservation 下可正常执行,验证 manager identity + nonce。
+    #[test]
+    fn s02b_reserved_variants_succeed_under_active_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let snap = make_snapshot("res", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&snap).unwrap();
+
+        let reservation = mgr.reserve_task_namespace().unwrap();
+
+        // reserved load
+        let loaded = mgr.load_reserved(&reservation, "res").unwrap().unwrap();
+        assert_eq!(loaded.id, "res");
+
+        // reserved save(bump revision)
+        let mut next = snap.clone();
+        next.downloaded = 999;
+        mgr.save_reserved(&reservation, &next).unwrap();
+        let after = mgr.load_reserved(&reservation, "res").unwrap().unwrap();
+        assert_eq!(after.downloaded, 999);
+        assert!(after.revision > loaded.revision);
+
+        // reserved update
+        mgr.update_reserved(&reservation, "res", |s| s.downloaded = 1234)
+            .unwrap();
+        let after2 = mgr.load_reserved(&reservation, "res").unwrap().unwrap();
+        assert_eq!(after2.downloaded, 1234);
+
+        // reserved remove + restore(tombstone 经 reserved 路径流转)
+        assert!(mgr.remove_reserved(&reservation, "res").unwrap());
+        mgr.restore_reserved(&reservation, &snap).unwrap();
+        let restored = mgr.load_reserved(&reservation, "res").unwrap().unwrap();
+        assert_eq!(restored.id, "res");
+    }
+
+    /// §3.1 Drop:reservation drop 仅释放匹配的 active capability;
+    /// 释放后普通 API 恢复可用,且下次 reserve 成功。
+    #[test]
+    fn s02b_dropping_reservation_releases_it_and_next_reserve_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = KvStore::open(tmp.path()).unwrap();
+        let mgr = RecoveryManager::new(store);
+        let snap = make_snapshot("drop", tachyon_core::DownloadState::Downloading);
+        mgr.save_task_snapshot(&snap).unwrap();
+
+        {
+            let _reservation = mgr.reserve_task_namespace().unwrap();
+            // active:普通 API 被拒
+            match mgr.load_task_snapshot("drop").unwrap_err() {
+                RecoveryError::ReservationActive => {}
+                other => panic!("expected ReservationActive, got {other:?}"),
+            }
+        }
+        // dropped:普通 API 恢复可用
+        let loaded = mgr.load_task_snapshot("drop").unwrap().unwrap();
+        assert_eq!(loaded.id, "drop");
+        // 下次 reserve 成功
+        let _r2 = mgr.reserve_task_namespace().unwrap();
     }
 }

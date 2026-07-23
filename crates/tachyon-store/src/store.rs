@@ -384,13 +384,15 @@ impl FileStore {
         // 重命名成功:临时文件已移动至目标路径,无需清理
         temp_guard.disarm();
 
-        // 持久模式:重命名后同步目录以保证目录项更新落盘
+        // 持久模式:重命名后同步目录以保证目录项更新落盘。
+        // S-02b:目录 sync_all 失败必须传播(durable 承诺),不得仅 warn。
+        // 注意:Windows 上 File::open(dir) 返回 AccessDenied(目录不能当文件打开),
+        // 此时无法做目录 fsync,跳过即可(与原行为一致);仅在能获取句柄时,
+        // sync_all 的失败必须传播。
         if effective == Durability::Durable
             && let Ok(dir_file) = std::fs::File::open(&self.dir)
-            && let Err(e) = dir_file.sync_all()
         {
-            // 目录 sync 失败不阻断写入,仅记录警告
-            tracing::warn!(key, error = %e, "KV 目录 fsync 失败(数据文件已落盘)");
+            dir_file.sync_all()?;
         }
 
         Ok(())

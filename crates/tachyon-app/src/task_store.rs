@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use tachyon_core::types::DownloadState;
-use tachyon_store::{KvStore, RecoveryManager, TaskSnapshot};
+use tachyon_store::{
+    KvStore, ProtectedSnapshot, RecoveryError, RecoveryManager, TaskSnapshot,
+};
 
 use crate::{AppError, TaskInfo};
 
@@ -22,39 +24,39 @@ impl TaskStore {
     pub fn save_snapshot(&self, snapshot: &TaskSnapshot) -> Result<(), AppError> {
         self.manager
             .save_task_snapshot(snapshot)
-            .map_err(|e| AppError::Config(format!("保存任务快照失败: {e}")))
+            .map_err(map_recovery_error)
     }
 
     /// 撤销删除等显式恢复:清 tombstone 后写入
     pub fn restore_snapshot(&self, snapshot: &TaskSnapshot) -> Result<(), AppError> {
         self.manager
             .restore_task_snapshot(snapshot)
-            .map_err(|e| AppError::Config(format!("恢复任务快照失败: {e}")))
+            .map_err(map_recovery_error)
     }
 
     pub fn load_snapshot(&self, task_id: &str) -> Result<Option<TaskSnapshot>, AppError> {
         self.manager
             .load_task_snapshot(task_id)
-            .map_err(|e| AppError::Config(format!("加载任务快照失败: {e}")))
+            .map_err(map_recovery_error)
     }
 
     pub fn load_recoverable(&self) -> Result<Vec<TaskSnapshot>, AppError> {
-        let (tasks, _corrupt) = self.load_recoverable_with_warnings()?;
+        let (tasks, _corrupt, _unsupported) = self.load_recoverable_with_warnings()?;
         Ok(tasks)
     }
 
-    /// 加载可恢复任务,同时返回无法解析的损坏 key 列表
+    /// 加载可恢复任务,同时返回损坏 key 与 future schema 保护项。
     ///
-    /// 与 `load_recoverable` 的区别在于暴露 corrupt_keys,
+    /// 与 `load_recoverable` 的区别在于暴露 corrupt_keys / unsupported_schema,
     /// 供调用方(如 Tauri setup 钩子)向 UI 广播恢复告警。
-    /// 单个损坏 JSON 不会阻断其他任务的恢复。
+    /// 单个损坏 JSON 或 future schema 不会阻断其他任务的恢复。
     pub fn load_recoverable_with_warnings(
         &self,
-    ) -> Result<(Vec<TaskSnapshot>, Vec<String>), AppError> {
+    ) -> Result<(Vec<TaskSnapshot>, Vec<String>, Vec<ProtectedSnapshot>), AppError> {
         let result = self
             .manager
             .recover_pending_snapshots()
-            .map_err(|e| AppError::Config(format!("加载恢复任务失败: {e}")))?;
+            .map_err(map_recovery_error)?;
         if !result.corrupt_keys.is_empty() {
             tracing::warn!(
                 count = result.corrupt_keys.len(),
@@ -62,17 +64,31 @@ impl TaskStore {
                 "部分任务快照损坏,已跳过"
             );
         }
-        Ok((result.tasks, result.corrupt_keys))
+        if !result.unsupported_schema.is_empty() {
+            tracing::warn!(
+                count = result.unsupported_schema.len(),
+                items = ?result.unsupported_schema,
+                "检测到需要升级客户端的 future schema 快照"
+            );
+        }
+        Ok((
+            result.tasks,
+            result.corrupt_keys,
+            result.unsupported_schema,
+        ))
     }
 
     /// 加载所有任务快照(含终态任务),用于备份导出
     ///
-    /// 返回任务快照列表和损坏 key 列表;损坏记录不阻断正常记录的导出。
-    pub fn load_all(&self) -> Result<(Vec<TaskSnapshot>, Vec<String>), AppError> {
+    /// 返回任务快照列表、损坏 key 列表与 future schema 保护项;
+    /// 损坏/future 记录不阻断正常记录的导出。
+    pub fn load_all(
+        &self,
+    ) -> Result<(Vec<TaskSnapshot>, Vec<String>, Vec<ProtectedSnapshot>), AppError> {
         let result = self
             .manager
             .load_all_task_snapshots()
-            .map_err(|e| AppError::Config(format!("加载所有任务快照失败: {e}")))?;
+            .map_err(map_recovery_error)?;
         if !result.corrupt_keys.is_empty() {
             tracing::warn!(
                 count = result.corrupt_keys.len(),
@@ -80,7 +96,18 @@ impl TaskStore {
                 "备份导出时发现损坏快照"
             );
         }
-        Ok((result.tasks, result.corrupt_keys))
+        if !result.unsupported_schema.is_empty() {
+            tracing::warn!(
+                count = result.unsupported_schema.len(),
+                items = ?result.unsupported_schema,
+                "备份导出时发现 future schema 快照"
+            );
+        }
+        Ok((
+            result.tasks,
+            result.corrupt_keys,
+            result.unsupported_schema,
+        ))
     }
 
     /// 删除任务快照(用于完成/取消/失败后的清理)
@@ -89,7 +116,7 @@ impl TaskStore {
     pub fn remove_snapshot(&self, task_id: &str) -> Result<bool, AppError> {
         self.manager
             .remove_task(task_id)
-            .map_err(|e| AppError::Config(format!("删除任务快照失败: {e}")))
+            .map_err(map_recovery_error)
     }
 
     /// 原子性地读取-修改-写入任务快照
@@ -103,7 +130,19 @@ impl TaskStore {
     ) -> Result<Option<TaskSnapshot>, AppError> {
         self.manager
             .update_snapshot(task_id, patch)
-            .map_err(|e| AppError::Config(format!("更新任务快照失败: {e}")))
+            .map_err(map_recovery_error)
+    }
+}
+
+/// 将 store 层 fail-closed 错误映射为可模式匹配的 AppError 变体。
+fn map_recovery_error(error: RecoveryError) -> AppError {
+    match error {
+        RecoveryError::Unsupported(protected) => AppError::UpgradeRequired {
+            found_version: protected.found_version,
+            supported_version: protected.supported_version,
+        },
+        RecoveryError::InvalidData { key } => AppError::InvalidSnapshot { key },
+        RecoveryError::Io(error) => AppError::Io(error),
     }
 }
 
@@ -476,7 +515,7 @@ mod tests {
         let corrupt_path = temp.path().join("task_corrupt.json");
         std::fs::write(&corrupt_path, "{ this is not valid json !!!").unwrap();
 
-        let (tasks, corrupt_keys) = store.load_recoverable_with_warnings().unwrap();
+        let (tasks, corrupt_keys, _unsupported) = store.load_recoverable_with_warnings().unwrap();
         assert_eq!(tasks.len(), 1, "正常任务应被恢复");
         assert_eq!(tasks[0].id, "good");
         assert_eq!(
@@ -662,5 +701,158 @@ mod tests {
         snapshot.mirror_urls = None;
         let task_none = snapshot_to_task_info(&snapshot);
         assert!(task_none.mirror_urls.is_none());
+    }
+
+    /// S-02a2: store `Unsupported` 必须映射为可模式匹配的 `AppError::UpgradeRequired`。
+    #[test]
+    fn unsupported_store_error_maps_to_upgrade_required() {
+        let temp = tempfile::tempdir().unwrap();
+        let found_version = tachyon_store::SNAPSHOT_SCHEMA_VERSION + 1;
+        let future_path = temp.path().join("task_future.json");
+        let future_raw = format!(
+            r#"{{"schemaVersion":{found_version},"id":"future","url":"https://example.com/f.bin","fileName":"f.bin","downloaded":0,"status":"downloading","createdAt":"2026-05-29T00:00:00Z","updatedAt":"2026-05-29T00:00:00Z"}}"#
+        );
+        std::fs::write(&future_path, future_raw.as_bytes()).unwrap();
+
+        let store = TaskStore::open(temp.path()).unwrap();
+        let err = store
+            .load_snapshot("future")
+            .expect_err("future schema 必须 fail-closed 为 UpgradeRequired");
+
+        match err {
+            AppError::UpgradeRequired {
+                found_version: found,
+                supported_version: supported,
+            } => {
+                assert_eq!(found, found_version);
+                assert_eq!(supported, tachyon_store::SNAPSHOT_SCHEMA_VERSION);
+            }
+            other => panic!("expected AppError::UpgradeRequired, got {other:?}"),
+        }
+    }
+
+    /// S-02a2: `InvalidData` 必须映射为可区分的 `InvalidSnapshot`，不得伪装成 UpgradeRequired 或 Io。
+    #[test]
+    fn invalid_data_maps_to_invalid_snapshot_not_upgrade_or_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let bad_path = temp.path().join("task_bad.json");
+        std::fs::write(&bad_path, "{ this is not valid json !!!").unwrap();
+
+        let store = TaskStore::open(temp.path()).unwrap();
+        let err = store
+            .load_snapshot("bad")
+            .expect_err("invalid JSON 必须 fail-closed 为 InvalidSnapshot");
+
+        match &err {
+            AppError::InvalidSnapshot { key } => {
+                assert!(
+                    key.contains("bad"),
+                    "InvalidSnapshot 应携带可定位 key, got {key}"
+                );
+            }
+            AppError::UpgradeRequired { .. } => {
+                panic!("invalid data 不得映射为 UpgradeRequired")
+            }
+            AppError::Io(_) => panic!("invalid data 不得映射为 Io"),
+            other => panic!("expected AppError::InvalidSnapshot, got {other:?}"),
+        }
+
+        // 与 UpgradeRequired 保持可区分（同路径不同输入产生不同变体）
+        let found_version = tachyon_store::SNAPSHOT_SCHEMA_VERSION + 1;
+        let future_path = temp.path().join("task_future.json");
+        let future_raw = format!(
+            r#"{{"schemaVersion":{found_version},"id":"future","url":"https://example.com/f.bin","fileName":"f.bin","downloaded":0,"status":"downloading","createdAt":"2026-05-29T00:00:00Z","updatedAt":"2026-05-29T00:00:00Z"}}"#
+        );
+        std::fs::write(&future_path, future_raw.as_bytes()).unwrap();
+        let upgrade_err = store.load_snapshot("future").expect_err("future → UpgradeRequired");
+        assert!(
+            matches!(upgrade_err, AppError::UpgradeRequired { .. }),
+            "future schema 必须仍为 UpgradeRequired: {upgrade_err:?}"
+        );
+        assert!(
+            !matches!(err, AppError::UpgradeRequired { .. }),
+            "InvalidSnapshot 与 UpgradeRequired 必须可区分"
+        );
+    }
+
+    /// S-02a2: startup facade 恢复合法任务，future 进入 upgrade notice，不得混入 corrupt 或静默丢弃。
+    #[test]
+    fn startup_recovery_surfaces_future_as_upgrade_notice_not_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(temp.path()).unwrap();
+
+        let good = TaskSnapshot {
+            schema_version: tachyon_store::SNAPSHOT_SCHEMA_VERSION,
+            revision: 0,
+            id: "good".to_string(),
+            url: "https://example.com/good.bin".to_string(),
+            save_path: "/downloads/good.bin".to_string(),
+            file_name: "good.bin".to_string(),
+            file_size: Some(100),
+            downloaded: 0,
+            completed_fragments: vec![],
+            partial_fragments: HashMap::new(),
+            total_fragments: 4,
+            fragment_size: 25,
+            status: DownloadState::Paused,
+            etag: None,
+            last_modified: None,
+            content_length: Some(100),
+            supports_range: true,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:00Z".to_string(),
+            fail_reason: None,
+            retry_count: 0,
+            tags: vec![],
+            hf_meta: None,
+            display_order: 0,
+            mirror_urls: None,
+        };
+        store.save_snapshot(&good).unwrap();
+
+        let found_version = tachyon_store::SNAPSHOT_SCHEMA_VERSION + 1;
+        let future_path = temp.path().join("task_future.json");
+        let future_raw = format!(
+            r#"{{"schemaVersion":{found_version},"id":"future","url":"https://example.com/f.bin","fileName":"f.bin","downloaded":0,"status":"downloading","createdAt":"2026-05-29T00:00:00Z","updatedAt":"2026-05-29T00:00:00Z"}}"#
+        );
+        std::fs::write(&future_path, future_raw.as_bytes()).unwrap();
+        let future_raw_before = std::fs::read(&future_path).unwrap();
+
+        let corrupt_path = temp.path().join("task_corrupt.json");
+        std::fs::write(&corrupt_path, "{ this is not valid json !!!").unwrap();
+
+        let (tasks, corrupt_keys, unsupported_schema) = store
+            .load_recoverable_with_warnings()
+            .expect("batch recovery 不得因 future/corrupt 整批失败");
+
+        assert_eq!(tasks.len(), 1, "合法任务必须继续恢复");
+        assert_eq!(tasks[0].id, "good");
+
+        assert_eq!(corrupt_keys.len(), 1, "损坏 key 仍单独暴露");
+        assert!(
+            corrupt_keys.iter().any(|k| k.contains("corrupt")),
+            "corrupt_keys 应包含损坏标识: {corrupt_keys:?}"
+        );
+        assert!(
+            !corrupt_keys.iter().any(|k| k.contains("future")),
+            "future 不得混入 corrupt_keys: {corrupt_keys:?}"
+        );
+
+        assert_eq!(
+            unsupported_schema.len(),
+            1,
+            "future 必须作为显式 upgrade notice 上报"
+        );
+        assert_eq!(unsupported_schema[0].key, "task_future");
+        assert_eq!(unsupported_schema[0].found_version, found_version);
+        assert_eq!(
+            unsupported_schema[0].supported_version,
+            tachyon_store::SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            std::fs::read(&future_path).unwrap(),
+            future_raw_before,
+            "future raw bytes 必须保持不变"
+        );
     }
 }
