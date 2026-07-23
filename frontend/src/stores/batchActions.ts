@@ -1,6 +1,5 @@
 import { api } from "../api/invoke";
 import { errorMessage } from "../utils/appError";
-import { getParentDirectory } from "../utils/path";
 import { $tasks, refreshTaskList } from "./downloads";
 import { $selectedIds, deselectAll } from "./selection";
 import { addToast } from "./toast";
@@ -397,7 +396,9 @@ export async function openSelectedFolders(): Promise<void> {
         return;
       }
       try {
-        await api.openFolder(getParentDirectory(task.savePath));
+        // open_task_folder 按任务 id 解析目录(后端兼容 save_path 目录/文件
+        // 两种形态);此前误传父目录路径会被当作 taskId 查询而必然失败
+        await api.openFolder(id);
         opened++;
       } catch (e) {
         failures.push(errorMessage(e));

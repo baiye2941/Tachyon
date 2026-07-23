@@ -434,9 +434,10 @@ describe('batchActions store', () => {
 
     await batchActionsModule.openSelectedFolders()
 
-    expect(mockOpenFolder).toHaveBeenCalledWith('/downloads/a')
-    expect(mockOpenFolder).toHaveBeenCalledWith('/downloads/b')
-    expect(mockOpenFolder).not.toHaveBeenCalledWith('')
+    // 按任务 id 调用 open_task_folder(后端兼容 save_path 目录/文件两种形态)
+    expect(mockOpenFolder).toHaveBeenCalledWith('t1')
+    expect(mockOpenFolder).toHaveBeenCalledWith('t2')
+    expect(mockOpenFolder).toHaveBeenCalledTimes(2)
     expect(mockAddToast).toHaveBeenCalledWith('已打开 2 个文件夹', 'success')
     expect(mockAddToast).toHaveBeenCalledWith('1 个任务暂无保存路径', 'info')
   })

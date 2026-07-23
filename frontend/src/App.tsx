@@ -11,6 +11,7 @@ import {
   refreshTaskList,
 } from "./stores/downloads";
 import { addToast } from "./stores/toast";
+import { redownloadTask } from "./stores/taskActions";
 import {
   $selectedIds,
   deselectAll,
@@ -246,8 +247,8 @@ function AppContent() {
   });
 
   const handleRedownload = (task: TaskInfo) => {
-    api
-      .createTask(task.url)
+    // 活跃任务先取消再重建(后端 URL 去重拒绝同 URL 非终态任务)
+    redownloadTask(task)
       .then(() => refreshTaskList())
       .catch((e) =>
         addToast(tr("toast.redownloadFailed", { error: errorMessage(e) }), "error"),
