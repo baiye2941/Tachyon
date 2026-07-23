@@ -224,12 +224,13 @@ cd frontend && bun run build
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
 | QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
-| HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。**SEC-007**:代理模式下最终目标域名解析/可达 IP 由代理决定;本地 `PublicDnsResolver`/`reject_forbidden_ip` 不覆盖代理后端——代理即 SSRF 信任边界,仅使用可信代理。 |
+| HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。**SEC-007 / 审计 S-06**:直连路径由 `PublicDnsResolver`/`reject_forbidden_ip` 过滤私网/链路本地/云元数据 IP;启用 HTTP/SOCKS 代理后,目标域名解析与可达 IP 由代理决定,本地过滤器**不覆盖**代理后端——**代理即 SSRF 信任边界**。仅配置你完全信任的代理;不要在不可信网络上把系统代理当作安全控制。代理凭据在日志中脱敏。 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
 | 前端仅支持中/英双语 | `solid-i18n` 当前仅配置 zh-CN 和 en-US |
 | BitTorrent Magnet 已支持分片并发 | 单文件 magnet 走 `download_range_stream`（基于 librqbit `FileStream`）进入引擎多 worker 分片路径；多文件 magnet 仍回退整文件流式 |
-| 路径授权非 openat2 | `validate_save_path` 拒绝中间 symlink/reparse 并在 open 前复查；**不**声称 `openat2(RESOLVE_BENEATH)` 句柄级路径封印，validate→open 仍存在 TOCTOU 残余 |
-| ConnectionPool 非 TCP 池 | 历史名 `ConnectionPool` 实为并发许可器；TCP/TLS/H2 复用由 reqwest Client / `HttpClientRegistry` |
+| 路径授权:中间目录 no-follow 打开 | `validate_save_path` 拒绝中间 symlink/reparse;打开时 Unix 走 openat 链(`O_NOFOLLOW`/`O_DIRECTORY`),Windows 分组件拒绝 reparse + 最终组件 `FILE_FLAG_OPEN_REPARSE_POINT`。**不**声称 Linux `openat2(RESOLVE_BENEATH)` 内核级路径封印,但中间目录 TOCTOU 已在应用层关闭 |
+| ConnectionPool 非 TCP 池 | 历史名 `ConnectionPool` 实为并发许可器；TCP/TLS/H2 复用由 reqwest Client / `HttpClientRegistry`。**审计 E-06**:死连接由 reqwest idle timeout + TCP keepalive + H2 PING 发现,不在许可器上做主动健康探测 |
+| 分片大小非 plan 时自适应 | **审计 P-03**:每任务冷启动调度器,plan 时刻 confidence≈0,`recommendation.fragment_size` 生产不可达;首下 HTTP 用 `default_target_fragments` 配置式分片以保证续传边界确定性。execute 期仍可 re-recommend **并发度** |
 | quick-xml 间接漏洞 | CI 暂 ignore RUSTSEC-2026-0194/0195（librqbit-upnp + Tauri/plist 双链）；目标 quick-xml ≥0.41 后移除 |
 | 配置热更新字段语义不统一 | `rate_limit`/`ConnectionPool`/`BufferPool`/`BtSession(magnet|download_dir)` 即时或新任务生效；剪贴板 `enable_watch` **即时**（轮询循环启动后按配置门禁）；`poll_interval_ms` 间隔热改仍为非目标；任务级 `retry_count` 为引擎分片/整块可重试失败累计次数 |
 

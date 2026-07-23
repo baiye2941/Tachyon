@@ -385,18 +385,43 @@ impl FileStore {
         temp_guard.disarm();
 
         // 持久模式:重命名后同步目录以保证目录项更新落盘。
-        // S-02b:目录 sync_all 失败必须传播(durable 承诺),不得仅 warn。
-        // 注意:Windows 上 File::open(dir) 返回 AccessDenied(目录不能当文件打开),
-        // 此时无法做目录 fsync,跳过即可(与原行为一致);仅在能获取句柄时,
-        // sync_all 的失败必须传播。
-        if effective == Durability::Durable
-            && let Ok(dir_file) = std::fs::File::open(&self.dir)
-        {
-            dir_file.sync_all()?;
+        // 审计 P-05:与 tachyon-io::dir_sync 对齐 —
+        // Unix: open(dir)+sync_all 落盘目录项;
+        // Windows: FILE_FLAG_BACKUP_SEMANTICS 打开验证可访问,NTFS 日志保证
+        // rename 原子+目录项持久,无需(也不可靠)对目录 sync_all。
+        // S-02b:失败必须传播(durable 承诺),不得仅 warn。
+        if effective == Durability::Durable {
+            sync_directory(&self.dir)?;
         }
 
         Ok(())
     }
+}
+
+/// 审计 P-05:目录项持久化,与 `tachyon-io::dir_sync::sync_parent_dir` 同构。
+///
+/// - Unix:打开目录并 `sync_all`
+/// - Windows:以 `FILE_FLAG_BACKUP_SEMANTICS` 打开验证可访问后返回(不 fsync)
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS(0x0200_0000):允许打开目录句柄
+        // share_mode READ|WRITE|DELETE(0x07):避免 sharing violation
+        opts.custom_flags(0x0200_0000).share_mode(0x07);
+    }
+    let dir_file = opts.open(dir)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        dir_file.sync_all()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = dir_file;
+    }
+    Ok(())
 }
 
 impl Store for FileStore {
@@ -1023,6 +1048,26 @@ mod tests {
         // 不应残留 .tmp 文件
         let tmp_path = store.path_for("overwrite_key").with_extension("tmp");
         assert!(!tmp_path.exists(), "覆盖后不应残留临时文件");
+    }
+
+    /// 审计 P-05:sync_directory 对存在的目录应成功(Windows 不 fsync,仅验证可打开)。
+    #[test]
+    fn file_sync_directory_succeeds_for_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_directory(dir.path()).expect("存在的目录 sync 应成功");
+    }
+
+    /// 审计 P-05:不存在的目录应返回 Err。
+    #[test]
+    fn file_sync_directory_err_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-subdir");
+        let err = sync_directory(&missing).expect_err("缺失目录应 Err");
+        assert!(
+            err.kind() == std::io::ErrorKind::NotFound
+                || err.kind() == std::io::ErrorKind::PermissionDenied,
+            "期望 NotFound/PermissionDenied, got {err:?}"
+        );
     }
 
     // ── durability / set_durable 测试 ──

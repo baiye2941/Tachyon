@@ -207,10 +207,10 @@ rate_limiter, metrics, circuit_breakers
 
 **`run()` 五阶段**：
 
-1. `probe()` — 探测文件元数据。
-2. `plan_fragments()` — 按调度器推荐的 `fragment_size` 规划分片。
+1. `probe()` — 探测文件元数据；仅 `observe_rtt(probe_elapsed)`，**不**在 probe 阶段采样带宽。
+2. `plan_fragments()` — 规划分片。**审计 P-03**:每任务新建冷启动 `AdaptiveDownloadScheduler`，plan 时刻 `confidence≈0`，故 `recommendation.fragment_size` 生产路径不可达；HTTP 首下回退 `default_target_fragments` 配置式分片。这是**有意设计**：固定分片边界保证续传 `completed_fragments ⊆ completed_indices`。execute 期 re-recommend 只调并发度，不改已落盘分片边界。
 3. `init_storage()` — 配合 `validate_save_path()` 创建存储文件。
-4. `execute()` — `JoinSet` 并发下载全部分片，每分片内流式写入 + 增量校验。
+4. `execute()` — `JoinSet` 并发下载全部分片，每分片内流式写入 + 增量校验；完成后 `observe_bandwidth` 供后续 re-recommend。
 5. `verify()` — 完整性校验。
 
 **其他模块**：
@@ -553,6 +553,7 @@ stateDiagram-v2
 - 指标：`active_requests()` / `host_active_requests()`（历史别名 `active_connections` 仍可用，但表示许可占用而非 socket 数）。
 - 使用 `DashMap` 维护 host 级信号量索引，降低高并发下的锁竞争。
 - 关闭时返回错误而非 panic。
+- **审计 E-06**:本类型**无**主动健康探测 API——它不是 socket 池。死连接由 reqwest `pool_idle_timeout` + TCP keepalive + H2 PING（`http2_keep_alive_*`）在首次 I/O 或空闲超时发现并淘汰；在 `ConnectionPool` 上加 probe 是类别错配。
 
 ### 7.2 RateLimiter
 
