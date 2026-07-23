@@ -275,6 +275,11 @@ fn resolve_uri(uri: &str, base_url: Option<&str>) -> DownloadResult<String> {
 /// HLS segment/key 可重试次数(额外 attempt,总次数 = 1 + N)
 const HLS_SEGMENT_MAX_RETRIES: u32 = 3;
 
+/// 审计 P-01:HLS 分片并发下载上限。
+/// AES-128 按分片独立可并行;有序产出由 `buffered` 保证。
+/// 8 在高 RTT 多分片场景下饱和连接,带宽受限时不致过度放大。
+const HLS_MAX_CONCURRENT_SEGMENTS: usize = 8;
+
 /// AES-128-CBC 解密 HLS 加密分片
 ///
 /// # 参数
@@ -431,6 +436,38 @@ impl HlsProtocol {
     }
 }
 
+/// 下载单个 HLS 分片并按需 AES-128 解密(审计 P-01 并发路径共享)。
+async fn download_and_decrypt_segment(
+    http: &Arc<HttpClient>,
+    uri: &str,
+    encryption: Option<&EncryptionKey>,
+    media_sequence: u64,
+    index: usize,
+) -> DownloadResult<Bytes> {
+    let data = http
+        .get_bytes_with_retry(uri, HLS_SEGMENT_MAX_RETRIES)
+        .await?;
+    match encryption {
+        Some(key) => match key.method {
+            EncryptionMethod::Aes128 => {
+                decrypt_aes128(
+                    http,
+                    key,
+                    &data,
+                    // FIX-18.1:IV 序号 = media_sequence + 分片索引(RFC 8216 §4.3.2.4)
+                    media_sequence as u128 + index as u128,
+                )
+                .await
+            }
+            EncryptionMethod::None => Ok(data),
+            EncryptionMethod::SampleAes => {
+                Err(DownloadError::Protocol("SAMPLE-AES 加密暂不支持".into()))
+            }
+        },
+        None => Ok(data),
+    }
+}
+
 impl Protocol for HlsProtocol {
     fn probe(
         &self,
@@ -518,35 +555,29 @@ impl Protocol for HlsProtocol {
                     media_sequence,
                     ..
                 } => {
+                    // 审计 P-01:分片并发下载,buffered 保序,上限 HLS_MAX_CONCURRENT_SEGMENTS。
+                    // FIX-18.3:与 download_full_stream 共享 download_and_decrypt_segment。
+                    use futures::stream::{self, StreamExt, TryStreamExt};
+                    let http = Arc::clone(&hls.http);
+                    let results: Vec<Bytes> = stream::iter(segments.into_iter().enumerate())
+                        .map(|(i, seg)| {
+                            let http = Arc::clone(&http);
+                            async move {
+                                download_and_decrypt_segment(
+                                    &http,
+                                    &seg.uri,
+                                    seg.encryption.as_ref(),
+                                    media_sequence,
+                                    i,
+                                )
+                                .await
+                            }
+                        })
+                        .buffered(HLS_MAX_CONCURRENT_SEGMENTS)
+                        .try_collect()
+                        .await?;
                     let mut buf = Vec::new();
-                    for (i, seg) in segments.iter().enumerate() {
-                        let data = hls
-                            .http
-                            .get_bytes_with_retry(&seg.uri, HLS_SEGMENT_MAX_RETRIES)
-                            .await?;
-                        // FIX-18.3:download_full 必须与 download_full_stream 一致地对
-                        // AES-128 分片解密(旧实现直接拼接密文,两个 API 结果不同)。
-                        let data = match &seg.encryption {
-                            Some(key) => match key.method {
-                                EncryptionMethod::Aes128 => {
-                                    decrypt_aes128(
-                                        &hls.http,
-                                        key,
-                                        &data,
-                                        // FIX-18.1:IV 序号 = media_sequence + 分片索引
-                                        media_sequence as u128 + i as u128,
-                                    )
-                                    .await?
-                                }
-                                EncryptionMethod::None => data,
-                                EncryptionMethod::SampleAes => {
-                                    return Err(DownloadError::Protocol(
-                                        "SAMPLE-AES 加密不支持".into(),
-                                    ));
-                                }
-                            },
-                            None => data,
-                        };
+                    for data in results {
                         buf.extend_from_slice(&data);
                     }
                     Ok(Bytes::from(buf))
@@ -572,77 +603,26 @@ impl Protocol for HlsProtocol {
                     media_sequence,
                     ..
                 } => {
+                    // 审计 P-01:分片并发下载 + 有序产出。
+                    // `buffered(N)` 同时 in-flight 最多 N 个分片,按 playlist 顺序 yield。
+                    // 旧实现 unfold 串行 await,高 RTT 多分片场景吞吐受限。
+                    use futures::stream::{self, StreamExt};
                     let http = Arc::clone(&hls.http);
-                    let total = segments.len();
-                    // 收集每个分片的 (uri, encryption) 信息,传入 unfold state
-                    let seg_info: Vec<(String, Option<EncryptionKey>)> = segments
-                        .iter()
-                        .map(|s| (s.uri.clone(), s.encryption.clone()))
-                        .collect();
-                    let idx = 0usize;
-                    // 使用 unfold 逐分片下载,避免 async_stream 依赖
-                    // state 持 http + (uri, encryption) 列表 + idx + media_sequence,避免借用 segments
-                    let stream = futures::stream::unfold(
-                        (http, seg_info, idx, total, media_sequence),
-                        |(http, segs, i, total, media_sequence)| async move {
-                            if i >= total {
-                                None
-                            } else {
-                                let (uri, encryption) = &segs[i];
-                                match http
-                                    .get_bytes_with_retry(uri, HLS_SEGMENT_MAX_RETRIES)
-                                    .await
-                                {
-                                    Ok(data) => {
-                                        // AES-128-CBC 解密(若分片已加密)
-                                        let data = match encryption {
-                                            Some(key) => match key.method {
-                                                EncryptionMethod::Aes128 => {
-                                                    match decrypt_aes128(
-                                                        &http,
-                                                        key,
-                                                        &data,
-                                                        // FIX-18.1:IV 序号 = media_sequence + 分片索引(RFC 8216 §4.3.2.4)
-                                                        media_sequence as u128 + i as u128,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(d) => d,
-                                                        Err(e) => {
-                                                            return Some((
-                                                                Err(e),
-                                                                (
-                                                                    http,
-                                                                    segs,
-                                                                    total,
-                                                                    total,
-                                                                    media_sequence,
-                                                                ),
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                                EncryptionMethod::None => data,
-                                                EncryptionMethod::SampleAes => {
-                                                    return Some((
-                                                        Err(DownloadError::Protocol(
-                                                            "SAMPLE-AES 加密暂不支持".into(),
-                                                        )),
-                                                        (http, segs, total, total, media_sequence),
-                                                    ));
-                                                }
-                                            },
-                                            None => data,
-                                        };
-                                        Some((Ok(data), (http, segs, i + 1, total, media_sequence)))
-                                    }
-                                    Err(e) => {
-                                        Some((Err(e), (http, segs, total, total, media_sequence)))
-                                    }
-                                }
+                    let stream = stream::iter(segments.into_iter().enumerate())
+                        .map(move |(i, seg)| {
+                            let http = Arc::clone(&http);
+                            async move {
+                                download_and_decrypt_segment(
+                                    &http,
+                                    &seg.uri,
+                                    seg.encryption.as_ref(),
+                                    media_sequence,
+                                    i,
+                                )
+                                .await
                             }
-                        },
-                    );
+                        })
+                        .buffered(HLS_MAX_CONCURRENT_SEGMENTS);
                     Ok(Box::pin(stream) as ByteStream)
                 }
                 _ => Err(DownloadError::Protocol("不是 media playlist".into())),
@@ -990,6 +970,64 @@ plain.ts
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(&collected, b"SEGMENT0_DATASEGMENT1_DATA");
+    }
+
+    /// 审计 P-01:分片必须并发下载。4 个 150ms 延迟分片若串行 ≥600ms,并发应 ≈150ms。
+    /// 阈值取 400ms 留余量,仍远低于串行下界。
+    #[tokio::test]
+    async fn test_hls_download_full_stream_downloads_segments_concurrently() {
+        use std::time::{Duration, Instant};
+        use wiremock::ResponseTemplate;
+
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri();
+        let m3u8 = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:1.000,
+seg0.ts
+#EXTINF:1.000,
+seg1.ts
+#EXTINF:1.000,
+seg2.ts
+#EXTINF:1.000,
+seg3.ts
+#EXT-X-ENDLIST
+";
+        Mock::given(method("GET"))
+            .and(path("/playlist.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(m3u8))
+            .mount(&server)
+            .await;
+        for name in ["seg0.ts", "seg1.ts", "seg2.ts", "seg3.ts"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(name.as_bytes().to_vec())
+                        .set_delay(Duration::from_millis(150)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        let url = format!("{base}/playlist.m3u8");
+        let start = Instant::now();
+        let stream = hls.download_full_stream(&url).await.expect("流应建立成功");
+        let mut collected = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            let chunk = chunk.expect("分片不应出错");
+            collected.extend_from_slice(&chunk);
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(&collected, b"seg0.tsseg1.tsseg2.tsseg3.ts", "应按序拼接");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "4×150ms 分片并发应远快于串行 600ms,实际 {elapsed:?}"
+        );
     }
 
     #[tokio::test]
