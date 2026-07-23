@@ -9,6 +9,11 @@ pub mod hls;
 pub mod http;
 #[cfg(feature = "magnet")]
 pub mod magnet;
+#[cfg(feature = "magnet")]
+mod magnet_lifecycle;
+
+#[cfg(all(test, feature = "magnet"))]
+mod magnet_lifecycle_tests;
 
 pub use http::{HttpClient, effective_quic_enabled, http3_compiled};
 #[cfg(feature = "magnet")]

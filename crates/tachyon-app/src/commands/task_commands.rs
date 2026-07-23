@@ -996,10 +996,15 @@ pub(crate) async fn probe_filename_inner(
                 session.download_dir().clone(),
                 session.handle_cache(),
             )
-            .with_ops_gate(session.ops_gate());
+            .with_ops_gate(session.ops_gate())
+            .with_session_coordinator(session.session_coordinator());
             let probe_result = protocol.probe(&url).await;
-            // 无论成功/失败都清理:失败也可能已 add 到 session 或半写 cache
-            protocol.stop_and_remove_torrent(&url).await;
+            // 无论成功/失败都请求同一 coordinator lane 的后台 cleanup；请求本身不等待
+            // 退役结果，probe 只负责立即返回 metadata 或本地 fallback。
+            let cleanup_requested = session.request_background_cleanup_for(&url);
+            if !cleanup_requested {
+                tracing::debug!("磁力链接 probe 未找到可用的后台 cleanup lane");
+            }
             match probe_result {
                 Ok(meta) => return Ok(meta.file_name),
                 Err(e) => {

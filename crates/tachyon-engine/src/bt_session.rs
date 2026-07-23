@@ -10,7 +10,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use librqbit::{PeerConnectionOptions, Session, SessionOptions};
 use tachyon_core::config::MagnetConfig;
-use tachyon_protocol::magnet::{HandleCache, SessionOpsGate};
+use tachyon_protocol::magnet::{
+    HandleCache, MagnetSessionCoordinator, SessionOpsGate, new_librqbit_session_coordinator,
+};
 
 /// 脱敏 SOCKS 代理 URL 的凭据,保留 scheme/host/port 供日志排查
 ///
@@ -58,6 +60,8 @@ pub struct BtSession {
     handle_cache: HandleCache,
     /// 与所有 MagnetProtocol 共享:probe cleanup 与 download add 串行
     ops_gate: SessionOpsGate,
+    /// 与所有 MagnetProtocol 共享的 acquisition/cleanup 生命周期协调器。
+    coordinator: Arc<MagnetSessionCoordinator>,
 }
 
 impl BtSession {
@@ -82,6 +86,8 @@ impl BtSession {
                 tachyon_core::DownloadError::Config(format!("创建 BitTorrent Session 失败: {e}"))
             })?;
 
+        let coordinator = new_librqbit_session_coordinator(Arc::clone(&session));
+
         Ok(Self {
             inner: session,
             config,
@@ -90,6 +96,7 @@ impl BtSession {
             socks_source,
             handle_cache: Arc::new(DashMap::new()),
             ops_gate: Arc::new(DashMap::new()),
+            coordinator,
         })
     }
 
@@ -272,6 +279,27 @@ impl BtSession {
     /// 跨实例共享的 session 操作锁表
     pub fn ops_gate(&self) -> SessionOpsGate {
         Arc::clone(&self.ops_gate)
+    }
+
+    /// 获取与当前 librqbit Session 绑定的生命周期协调器。
+    pub fn session_coordinator(&self) -> Arc<MagnetSessionCoordinator> {
+        Arc::clone(&self.coordinator)
+    }
+
+    /// 请求当前 Session 中指定 magnet 的后台 cleanup，并立即返回。
+    ///
+    /// 临时协议 facade 只复用当前 Session 的所有共享 owner；不会创建新的 Session
+    /// 或 coordinator。协议层仍持有 opaque cleanup capability 与 lane-owned worker。
+    pub fn request_background_cleanup_for(&self, url: &str) -> bool {
+        tachyon_protocol::MagnetProtocol::new(
+            Arc::clone(&self.inner),
+            self.config.clone(),
+            self.download_dir.clone(),
+            Arc::clone(&self.handle_cache),
+        )
+        .with_ops_gate(Arc::clone(&self.ops_gate))
+        .with_session_coordinator(Arc::clone(&self.coordinator))
+        .request_background_cleanup_for(url)
     }
 }
 
@@ -644,6 +672,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bt_session_background_cleanup_facade_fails_closed_for_invalid_or_unknown_magnet()
+    {
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let session = BtSession::new(dir.path().to_path_buf(), test_config())
+            .await
+            .expect("BtSession 应创建成功");
+
+        assert!(
+            !session.request_background_cleanup_for("not-a-magnet"),
+            "invalid magnet cleanup request must fail closed"
+        );
+        let unknown_magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            !session.request_background_cleanup_for(unknown_magnet),
+            "unknown magnet cleanup request must fail closed without a registered lane"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bt_session_new_constructs_without_panic() {
         // 端到端:build_session_options 产出的 opts 能被 Session 接受
         let dir = tempfile::TempDir::new().unwrap();
@@ -869,5 +916,49 @@ mod tests {
             !opts.enable_upnp_port_forwarding,
             "high_privacy=true 同时禁用 UPnP forwarding"
         );
+    }
+
+    /// 验证同一 BtSession 创建的 MagnetProtocol 实例绑定同一协调器身份。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bt_session_protocol_instances_share_session_coordinator()
+    -> tachyon_core::DownloadResult<()> {
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let session = BtSession::new(dir.path().to_path_buf(), test_config()).await?;
+        let coordinator = session.session_coordinator();
+        let cache = session.handle_cache();
+        let gate = session.ops_gate();
+
+        let protocol_a = tachyon_protocol::MagnetProtocol::new(
+            session.session(),
+            session.config().clone(),
+            session.download_dir().clone(),
+            Arc::clone(&cache),
+        )
+        .with_ops_gate(Arc::clone(&gate))
+        .with_session_coordinator(Arc::clone(&coordinator));
+        let protocol_b = tachyon_protocol::MagnetProtocol::new(
+            session.session(),
+            session.config().clone(),
+            session.download_dir().clone(),
+            Arc::clone(&cache),
+        )
+        .with_ops_gate(Arc::clone(&gate))
+        .with_session_coordinator(Arc::clone(&coordinator));
+
+        let protocol_a_coordinator = protocol_a.session_coordinator_for_test();
+        let protocol_b_coordinator = protocol_b.session_coordinator_for_test();
+        assert!(
+            Arc::ptr_eq(&coordinator, &protocol_a_coordinator),
+            "第一个 MagnetProtocol 必须绑定 BtSession 的 coordinator"
+        );
+        assert!(
+            Arc::ptr_eq(&coordinator, &protocol_b_coordinator),
+            "第二个 MagnetProtocol 必须绑定 BtSession 的 coordinator"
+        );
+        assert!(
+            Arc::ptr_eq(&protocol_a_coordinator, &protocol_b_coordinator),
+            "不同 MagnetProtocol 实例必须共享同一 coordinator Arc"
+        );
+        Ok(())
     }
 }
