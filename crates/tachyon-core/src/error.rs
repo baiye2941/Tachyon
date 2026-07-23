@@ -29,6 +29,11 @@ pub enum DownloadError {
     #[error("任务已取消")]
     Cancelled,
 
+    /// 用户暂停:协作中断 in-flight IO(供 watch_for_interrupt 抢占 select)。
+    /// 不可重试;调用方应 wait_control_rx 等 Resume,不得把任务标 Failed。
+    #[error("任务已暂停")]
+    Paused,
+
     #[error("任务不存在: {0}")]
     TaskNotFound(String),
 
@@ -106,6 +111,7 @@ impl DownloadError {
             DownloadError::NoExpectedChecksum => "NoExpectedChecksum",
             DownloadError::Config(_) => "Config",
             DownloadError::Cancelled => "Cancelled",
+            DownloadError::Paused => "Paused",
             DownloadError::TaskNotFound(_) => "TaskNotFound",
             DownloadError::ConnectionPoolExhausted => "ConnectionPoolExhausted",
             DownloadError::Timeout(_) => "Timeout",
@@ -179,6 +185,7 @@ impl DownloadError {
         match self {
             // 绝对不可重试
             DownloadError::Cancelled
+            | DownloadError::Paused
             | DownloadError::Forbidden { .. }
             | DownloadError::ChecksumMismatch { .. }
             | DownloadError::NoExpectedChecksum
@@ -591,6 +598,7 @@ mod tests {
             DownloadError::NoExpectedChecksum,
             DownloadError::Config("e".into()),
             DownloadError::Cancelled,
+            DownloadError::Paused,
             DownloadError::TaskNotFound("e".into()),
             DownloadError::ConnectionPoolExhausted,
             DownloadError::Timeout("e".into()),
@@ -631,6 +639,7 @@ mod tests {
     #[test]
     fn test_is_retryable_returns_false_for_non_retryable() {
         assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::Paused.is_retryable());
         assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
         assert!(
             !DownloadError::ChecksumMismatch {

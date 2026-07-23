@@ -102,6 +102,23 @@ impl FragmentRecord {
         Ok(())
     }
 
+    /// 用户暂停:Downloading → Pending,并把 realtime 写入 resume_offset 以便续传。
+    ///
+    /// 不增加 retry_count(暂停不是失败)。已完成/未开始的分片不动。
+    pub fn park_for_pause(&mut self) {
+        if self.state != FragmentState::Downloading {
+            return;
+        }
+        let rt = self.realtime_downloaded.load(Ordering::Acquire);
+        if rt > 0 {
+            let parked = rt.min(self.info.size);
+            self.resume_offset = parked;
+            self.info.downloaded = parked;
+        }
+        self.state = FragmentState::Pending;
+        self.start_time = None;
+    }
+
     /// 下载完成,转换到校验状态(仅允许从 Downloading 进入)
     pub fn complete_download(&mut self, downloaded: u64, duration: Duration) -> DownloadResult<()> {
         if self.state != FragmentState::Downloading {
@@ -477,6 +494,22 @@ mod tests {
             size,
         )
         .expect("测试分片应构造成功")
+    }
+
+    #[test]
+    fn test_park_for_pause_moves_downloading_to_pending_with_resume() {
+        use std::sync::atomic::Ordering;
+        let info = FragmentInfo::new(0, 0, 1023, 1024).unwrap();
+        let mut r = FragmentRecord::new(info, 3);
+        r.start_download().unwrap();
+        r.realtime_downloaded.store(400, Ordering::Release);
+        r.park_for_pause();
+        assert_eq!(r.state, FragmentState::Pending);
+        assert_eq!(r.resume_offset, 400);
+        assert_eq!(r.info.downloaded, 400);
+        assert!(r.start_time.is_none());
+        r.start_download().unwrap();
+        assert_eq!(r.state, FragmentState::Downloading);
     }
 
     #[test]

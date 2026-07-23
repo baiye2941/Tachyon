@@ -723,7 +723,8 @@ pub async fn get_task_detail(
 /// 在系统文件管理器中打开任务文件所在目录(P1-21)
 ///
 /// 替代前端 `shell.open`,移除前端 `shell:allow-open` 权限后由后端统一控制:
-/// - 按 task_id 查找任务,取其 save_path 的父目录
+/// - 按 task_id 查找任务,解析其 save_path 的目标目录(save_path 有两种形态:
+///   新建/活跃任务为下载目录本身,快照恢复任务为完整文件路径,见 resolve_open_target_dir)
 /// - canonicalize 后校验该目录位于 download_dir 或任一 authorized_dirs 之下,拒绝路径逃逸
 /// - 通过 OS 原生命令打开(Windows: explorer / macOS: open / Linux: xdg-open)
 ///
@@ -733,13 +734,33 @@ pub async fn open_task_folder(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), AppError> {
-    // 查找任务并取 save_path 的父目录
+    // 查找任务并解析要打开的目录
     let task = state.service.task_service.get_task_detail(&task_id)?;
-    let save_path = std::path::Path::new(&task.save_path);
-    let target_dir = save_path
-        .parent()
-        .ok_or_else(|| AppError::Config("任务保存路径无父目录".to_string()))?;
-    open_dir_under_download_root(&state, target_dir.to_path_buf()).await
+    // is_dir 是文件系统元数据调用,放 spawn_blocking 避免阻塞 tokio worker
+    let save_path = std::path::PathBuf::from(&task.save_path);
+    let target_dir = tokio::task::spawn_blocking(move || resolve_open_target_dir(save_path))
+        .await
+        .map_err(|e| AppError::Config(format!("解析保存路径任务失败: {e}")))??;
+    open_dir_under_download_root(&state, target_dir).await
+}
+
+/// 解析「打开文件夹」的目标目录:save_path 为目录形态时直接使用,文件形态取父目录
+///
+/// TaskInfo.save_path 存在两种形态(见 create_task / snapshot_to_task_info):
+/// - 新建/活跃任务:下载目录本身(create_task 时赋值 download_dir);
+/// - 快照恢复任务:完整文件路径(snapshot_to_task_info 保留快照 save_path)。
+///
+/// 一律取 parent 会在"保存路径即授权根"时逃逸出授权根,被下载根目录校验误拒,
+/// 表现为打开文件夹永远失败。
+fn resolve_open_target_dir(save_path: std::path::PathBuf) -> Result<std::path::PathBuf, AppError> {
+    if save_path.is_dir() {
+        Ok(save_path)
+    } else {
+        save_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| AppError::Config("任务保存路径无父目录".to_string()))
+    }
 }
 
 /// 在系统文件管理器中打开指定目录(P1-21)
@@ -1164,10 +1185,18 @@ pub(crate) async fn pause_task_inner(state: &AppState, task_id: String) -> Resul
     let _guard = lock.lock().await;
     state.service.task_service.pause_task(&task_id).await?;
     // 有运行中 task 时发送 Pause;无 channel 时仅改仓库状态(恢复任务未启动)
-    let _ = state
+    if !state
         .runtime
         .supervisor
-        .send_command(&task_id, TaskCommand::Pause);
+        .send_command(&task_id, TaskCommand::Pause)
+    {
+        tracing::warn!(
+            task_id = %task_id,
+            "Pause 控制通道不存在或已关闭(仓库已标 Paused;无运行中 task_fn 时属预期)"
+        );
+    } else {
+        tracing::info!(task_id = %task_id, "已发送 Pause 控制信号");
+    }
     Ok(())
 }
 
@@ -3879,6 +3908,47 @@ mod tests {
         assert!(
             err.to_string().contains("均不可访问"),
             "roots 全失效应明确报错: {err}"
+        );
+    }
+
+    // ------ resolve_open_target_dir(save_path 目录/文件两种形态) ------
+
+    /// 新建/活跃任务的 save_path 是下载目录本身:直接打开该目录,
+    /// 取 parent 会逃逸出授权根导致打开文件夹被误拒
+    #[test]
+    fn test_resolve_open_target_dir_dir_form_used_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("Test");
+        std::fs::create_dir_all(&save_path).unwrap();
+
+        let resolved = resolve_open_target_dir(save_path.clone()).unwrap();
+        assert_eq!(resolved, save_path, "目录形态应原样作为目标目录");
+    }
+
+    /// 快照恢复任务的 save_path 是完整文件路径:取父目录;
+    /// 文件已被删除时同样按父目录处理(目录仍可打开)
+    #[test]
+    fn test_resolve_open_target_dir_file_form_takes_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("02.mp4");
+        std::fs::write(&file_path, b"partial").unwrap();
+
+        let resolved = resolve_open_target_dir(file_path.clone()).unwrap();
+        assert_eq!(resolved, dir.path().to_path_buf(), "文件形态应取父目录");
+
+        // 文件已删除(非目录)仍回退父目录
+        std::fs::remove_file(&file_path).unwrap();
+        let resolved = resolve_open_target_dir(file_path).unwrap();
+        assert_eq!(resolved, dir.path().to_path_buf());
+    }
+
+    /// 无父目录的路径(空字符串)应明确报错而非 panic
+    #[test]
+    fn test_resolve_open_target_dir_no_parent_errors() {
+        let err = resolve_open_target_dir(std::path::PathBuf::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("无父目录"),
+            "空路径应报无父目录: {err}"
         );
     }
 

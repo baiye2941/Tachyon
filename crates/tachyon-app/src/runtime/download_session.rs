@@ -288,7 +288,9 @@ impl DownloadSession {
 
         // 7. 设置进度通道并提交到共享 ChunkReaderPool
         let (chunk_progress_tx, chunk_progress_rx) =
-            tokio::sync::mpsc::channel::<tachyon_core::FragmentProgress>(256);
+            tokio::sync::mpsc::channel::<tachyon_core::FragmentProgress>(4096);
+        // 容量 4096:多分片 + 每 5 chunk 上报时 256 极易 Full,
+        // 增量 try_send 可丢但会刷屏 WARN;完成事件用 send().await 仍可靠
         download_task.set_progress_sender(chunk_progress_tx);
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();

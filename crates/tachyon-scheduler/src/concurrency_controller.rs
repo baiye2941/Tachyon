@@ -103,6 +103,14 @@ impl ConcurrencyController {
             })
             .ok();
     }
+
+    /// 强制把 active 置 0。
+    ///
+    /// 用于用户暂停后 `JoinSet::abort_all`:被 abort 的 task 可能来不及
+    /// `record_complete`,导致 active 卡死、`should_spawn` 永远 false。
+    pub fn reset_active(&self) {
+        self.active.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +142,17 @@ mod tests {
         ctrl.record_spawn();
         assert_eq!(ctrl.active(), 2);
         assert!(!ctrl.should_spawn(), "active=2 >= target=2 应阻止 spawn");
+    }
+
+    #[test]
+    fn test_reset_active_clears_inflight_count() {
+        let ctrl = ConcurrencyController::new(2, 16);
+        ctrl.record_spawn();
+        ctrl.record_spawn();
+        assert!(!ctrl.should_spawn());
+        ctrl.reset_active();
+        assert_eq!(ctrl.active(), 0);
+        assert!(ctrl.should_spawn(), "reset_active 后应可重新 spawn");
     }
 
     #[test]
