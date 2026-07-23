@@ -172,11 +172,16 @@ cargo tauri dev
 ### 5.4 测试命令
 
 ```bash
-# Rust 测试（推荐 nextest）
+# Rust 测试（推荐 nextest；全局 retries=0，见审计 E-04）
 cargo nextest run --all
 
 # 单 crate
 cargo nextest run -p tachyon-core
+
+# 集成/混沌层(走 DownloadTask::run 真实路径,非平行宇宙 mock 循环)
+cargo nextest run -p tachyon-engine --test chaos_test
+# app 层 panic.log 端到端
+cargo nextest run -p tachyon-app --test panic_log_e2e
 
 # clippy 零警告
 cargo clippy --all-targets --all-features -- -D warnings
@@ -193,6 +198,21 @@ cd frontend && bun run test
 # 前端 E2E
 cd frontend && bun run test:e2e
 ```
+
+**审计 E-05 测试金字塔**:单元测试占绝大多数;跨 crate 集成以 `chaos_test`(引擎真实 `DownloadTask::run` + 故障注入)、`panic_log_e2e`、以及 `e2e_download`/`e2e_http_real` bench 为支柱。Tauri 命令层尚无原生 GUI 端到端门禁——前端 `test:e2e` 覆盖 UI,不替代 IPC 契约测试。扩展集成层时优先补「协议→引擎→存储」垂直切片,而非再堆单元数。
+
+### 5.5 PGO(可选,审计 P-02)
+
+Release 已启用 LTO/`codegen-units=1`。若需 Profile-Guided Optimization 再榨 5–15%(行业经验,非本仓保证):
+
+```bash
+# 需要 llvm-profdata(Linux/macOS;Windows 需另配 MSVC PGO,本脚本不覆盖)
+bash scripts/ci/pgo.sh generate   # 插桩 + e2e_download 采样 → target/pgo/merged.profdata
+bash scripts/ci/pgo.sh use        # profile-use 优化构建 tachyon-engine release
+bash scripts/ci/pgo.sh clean
+```
+
+PGO **不进** CI 关键路径(与 mutants/bench 同:本地或 main 采样),避免每次 PR 编译两遍。
 
 ---
 
@@ -223,6 +243,7 @@ cd frontend && bun run build
 | 限制 | 说明 |
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
+| DHT bootstrap 仅 2 节点且不可自定义 | **审计 P-04**:librqbit 8.x 硬编码 2 个 DHT bootstrap,`SessionOptions` 不暴露 `bootstrap_addrs`(见 `docs/sdd/magnet-speedup-limitations.md` T7)。冷启动 metadata 国内常 20–40s;已有缓解:DHT 路由表持久化、tracker 列表扩展、SOCKS5 代理。自定义 bootstrap 需 fork librqbit 或绕过 Session 封装,本仓不维护 fork |
 | QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
 | HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。**SEC-007 / 审计 S-06**:直连路径由 `PublicDnsResolver`/`reject_forbidden_ip` 过滤私网/链路本地/云元数据 IP;启用 HTTP/SOCKS 代理后,目标域名解析与可达 IP 由代理决定,本地过滤器**不覆盖**代理后端——**代理即 SSRF 信任边界**。仅配置你完全信任的代理;不要在不可信网络上把系统代理当作安全控制。代理凭据在日志中脱敏。 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |
