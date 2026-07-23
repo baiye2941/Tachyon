@@ -31,6 +31,7 @@ import {
 } from "../stores/commandHistory";
 import { getCommandShortcutKeys, getShortcutKeys } from "../stores/shortcuts";
 import { platformKeys } from "../commands/shortcuts";
+import { isMacPlatform } from "../stores/shortcuts";
 
 const GROUP_LABEL_KEYS_EXTENDED = {
   ...GROUP_LABEL_KEYS,
@@ -137,9 +138,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
     container: () => trapContainerRef,
     // Escape 仍由当前组件的 onKeyDown 处理；focus trap 只负责 Tab 循环与焦点恢复。
   });
-  const isMac =
-    typeof navigator !== "undefined" &&
-    /Mac|iPhone|iPad/.test(navigator.platform);
+  const isMac = isMacPlatform();
   const [inputQuery, setInputQuery] = createSignal("");
   const [query, setQuery] = createSignal("");
   const [activeIndex, setActiveIndex] = createSignal(0);

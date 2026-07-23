@@ -19,8 +19,17 @@ export const DEFAULT_BINDINGS: Record<MessageKey, string[]> = Object.fromEntries
 
 const [overrides, setOverrides] = createSignal<Partial<Record<MessageKey, string[]>>>({})
 
-function isMacPlatform(): boolean {
-  return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+/**
+ * 平台检测:优先 NavigatorUAData.platform,回退 userAgent。
+ * 不再使用已弃用的 navigator.platform(E-08)。
+ */
+export function isMacPlatform(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData
+  if (uaData?.platform) {
+    return /mac|iphone|ipad|ipod/i.test(uaData.platform)
+  }
+  return /Mac|iPhone|iPad|iPod/.test(navigator.userAgent)
 }
 
 function arraysEqual<T>(a: T[], b: T[]): boolean {

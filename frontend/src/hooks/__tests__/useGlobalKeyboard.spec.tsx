@@ -57,7 +57,10 @@ describe("useGlobalKeyboard", () => {
   });
 
   it("Cmd+N 在 macOS 下打开新建下载", () => {
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.stubGlobal("navigator", {
+      userAgentData: { platform: "macOS" },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)",
+    });
     render(() => <TestHarness />);
 
     fireEvent.keyDown(window, { key: "N", metaKey: true });

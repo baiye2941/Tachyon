@@ -120,9 +120,14 @@ describe('快捷键配置 store', () => {
   })
 
   it('matchKeyboardEvent macOS Cmd 命中 Ctrl 标记', () => {
-    const originalPlatform = Object.getOwnPropertyDescriptor(window.navigator, 'platform')
-    Object.defineProperty(window.navigator, 'platform', {
-      value: 'MacIntel',
+    const originalUAData = Object.getOwnPropertyDescriptor(window.navigator, 'userAgentData')
+    const originalUA = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent')
+    Object.defineProperty(window.navigator, 'userAgentData', {
+      value: { platform: 'macOS' },
+      configurable: true,
+    })
+    Object.defineProperty(window.navigator, 'userAgent', {
+      value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
       configurable: true,
     })
 
@@ -130,8 +135,14 @@ describe('快捷键配置 store', () => {
       const event = new KeyboardEvent('keydown', { key: 'K', metaKey: true })
       expect(matchKeyboardEvent(event, 'shortcut.openCommandPalette')).toBe(true)
     } finally {
-      if (originalPlatform) {
-        Object.defineProperty(window.navigator, 'platform', originalPlatform)
+      if (originalUAData) {
+        Object.defineProperty(window.navigator, 'userAgentData', originalUAData)
+      } else {
+        // @ts-expect-error cleanup
+        delete (window.navigator as any).userAgentData
+      }
+      if (originalUA) {
+        Object.defineProperty(window.navigator, 'userAgent', originalUA)
       }
     }
   })

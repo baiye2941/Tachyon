@@ -49,7 +49,10 @@ describe("ShortcutHelp", () => {
   });
 
   it("macOS 下 Ctrl 显示为 Cmd", () => {
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.stubGlobal("navigator", {
+      userAgentData: { platform: "macOS" },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)",
+    });
 
     const { container } = renderWithI18n(() => (
       <ShortcutHelp visible={true} onClose={() => undefined} />

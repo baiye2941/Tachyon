@@ -20,6 +20,7 @@ import {
   resetShortcut,
   resetAllShortcuts,
   findConflict,
+  isMacPlatform,
 } from "../../../stores/shortcuts";
 import { tr, type MessageKey } from "../../../i18n";
 import Button from "../../../shared/ui/Button";
@@ -69,8 +70,7 @@ export default function ShortcutsTab() {
     // 忽略单独的修饰键按下
     if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return;
 
-    const isMac =
-      typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+    const isMac = isMacPlatform();
     const modifiers: string[] = [];
     if (e.ctrlKey || (isMac && e.metaKey)) modifiers.push("Ctrl");
     if (e.altKey) modifiers.push("Alt");
@@ -152,8 +152,7 @@ interface ShortcutRowProps {
 
 function ShortcutRow(props: ShortcutRowProps) {
   const t = tr;
-  const isMac =
-    typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const isMac = isMacPlatform();
 
   const isRecording = () => props.recordingLabelKey() === props.shortcut.labelKey;
   const currentKeys = () => getShortcutKeys(props.shortcut.labelKey);

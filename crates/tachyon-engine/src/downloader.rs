@@ -73,6 +73,85 @@ pub fn create_adaptive_scheduler(
     Arc::new(AdaptiveDownloadScheduler::new(config))
 }
 
+/// 已知长度分片下载的终态结构不变式(审计 S-03)。
+///
+/// 在标 `DownloadState::Completed` 前调用:要求
+/// 1. 每个分片状态均为 Done
+/// 2. 分片区间连续、不重叠、覆盖 [0, file_size)
+/// 3. Σ size == file_size
+///
+/// 未知长度(`file_size == 0`/`None`)不在此函数职责内,调用方应跳过。
+pub(crate) fn assert_known_length_fragment_completion(
+    fragments: &[crate::fragment::FragmentRecord],
+    file_size: u64,
+) -> DownloadResult<()> {
+    use crate::fragment::FragmentState;
+
+    if file_size == 0 {
+        return Ok(());
+    }
+    if fragments.is_empty() {
+        return Err(DownloadError::Other(
+            "已知长度分片完成校验失败: 分片列表为空".into(),
+        ));
+    }
+
+    let mut ordered: Vec<_> = fragments.iter().collect();
+    ordered.sort_by_key(|f| f.info.start);
+
+    let mut cursor = 0u64;
+    let mut sum = 0u64;
+    for frag in &ordered {
+        if frag.state != FragmentState::Done {
+            return Err(DownloadError::Other(
+                format!(
+                    "已知长度分片完成校验失败: 分片 {} 状态为 {:?}, 期望 Done",
+                    frag.info.index, frag.state
+                )
+                .into(),
+            ));
+        }
+        if frag.info.start != cursor {
+            return Err(DownloadError::Other(
+                format!(
+                    "已知长度分片完成校验失败: 分片 {} 起点 {} 与期望连续起点 {} 不一致",
+                    frag.info.index, frag.info.start, cursor
+                )
+                .into(),
+            ));
+        }
+        let end_excl = frag.info.end.saturating_add(1);
+        if end_excl <= frag.info.start {
+            return Err(DownloadError::Other(
+                format!(
+                    "已知长度分片完成校验失败: 分片 {} 区间非法 [{}, {}]",
+                    frag.info.index, frag.info.start, frag.info.end
+                )
+                .into(),
+            ));
+        }
+        let size = end_excl - frag.info.start;
+        if frag.info.size != size {
+            return Err(DownloadError::Other(
+                format!(
+                    "已知长度分片完成校验失败: 分片 {} size {} 与区间长度 {} 不一致",
+                    frag.info.index, frag.info.size, size
+                )
+                .into(),
+            ));
+        }
+        sum = sum.saturating_add(size);
+        cursor = end_excl;
+    }
+
+    if cursor != file_size || sum != file_size {
+        return Err(DownloadError::Other(format!(
+            "已知长度分片完成校验失败: 覆盖终点 {cursor}/累计 {sum} 与 file_size {file_size} 不一致"
+        ).into()));
+    }
+    Ok(())
+}
+
 pub type StorageKind = DynStorage;
 
 /// L-9: verify() 分块读取文件的 chunk 大小 (8 MiB)。
@@ -2378,6 +2457,12 @@ impl DownloadTask {
         #[cfg(feature = "magnet")]
         self.wait_bt_piece_truth_if_protocol_managed().await?;
 
+        // 审计 S-03:已知长度分片路径在标 Completed 前做结构/字节不变式检查。
+        Self::validate_known_length_fragment_completion(
+            &self.fragments,
+            self.metadata.as_ref().and_then(|m| m.file_size),
+        )?;
+
         self.state = DownloadState::Completed;
         info!("全部分片下载完成");
         Ok(())
@@ -2611,6 +2696,33 @@ impl DownloadTask {
         self.goodput_window_start = Some(now);
         self.goodput_window_bytes = 0;
         (bps > 0).then_some(bps)
+    }
+
+    /// 审计 S-03:已知长度分片下载的终态结构/字节不变式入口。
+    ///
+    /// `file_size = None/0` 时跳过(未知长度不在本不变式范围)。
+    pub(crate) fn validate_known_length_fragment_completion(
+        fragments: &[crate::fragment::FragmentRecord],
+        file_size: Option<u64>,
+    ) -> DownloadResult<()> {
+        let Some(n) = file_size.filter(|&s| s > 0) else {
+            return Ok(());
+        };
+        // 额外要求每片 downloaded == size(字节终态)
+        for frag in fragments {
+            if frag.state == crate::fragment::FragmentState::Done
+                && frag.info.downloaded != frag.info.size
+            {
+                return Err(DownloadError::Other(
+                    format!(
+                        "已知长度分片完成校验失败: 分片 {} downloaded {} != size {}",
+                        frag.info.index, frag.info.downloaded, frag.info.size
+                    )
+                    .into(),
+                ));
+            }
+        }
+        assert_known_length_fragment_completion(fragments, n)
     }
 
     fn record_completed_fragment(
@@ -8114,6 +8226,126 @@ mod tests {
 
     // ------ 补充: FragmentRecord 状态转换(更完整的覆盖) ------
 
+    /// 审计 S-03:已知长度 + 全 Done + 连续覆盖 → Ok
+    #[test]
+    fn test_known_length_fragment_completion_accepts_continuous_done_cover() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 499,
+                size: 500,
+                downloaded: 500,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Done;
+        let mut b = FragmentRecord::new(
+            FragmentInfo {
+                index: 1,
+                start: 500,
+                end: 999,
+                size: 500,
+                downloaded: 500,
+                hash: None,
+            },
+            3,
+        );
+        b.state = FragmentState::Done;
+        assert!(assert_known_length_fragment_completion(&[a, b], 1000).is_ok());
+    }
+
+    /// 审计 S-03:存在非 Done 分片 → Err,不得标 Completed
+    #[test]
+    fn test_known_length_fragment_completion_rejects_non_done_fragment() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 999,
+                size: 1000,
+                downloaded: 0,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Downloading;
+        let err = assert_known_length_fragment_completion(&[a], 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("期望 Done") || err.to_string().contains("Done"),
+            "应报告非 Done: {err}"
+        );
+    }
+
+    /// 审计 S-03:区间空洞/不连续 → Err
+    #[test]
+    fn test_known_length_fragment_completion_rejects_gap() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 399,
+                size: 400,
+                downloaded: 400,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Done;
+        let mut b = FragmentRecord::new(
+            FragmentInfo {
+                index: 1,
+                start: 500, // 空洞 [400,499]
+                end: 999,
+                size: 500,
+                downloaded: 500,
+                hash: None,
+            },
+            3,
+        );
+        b.state = FragmentState::Done;
+        let err = assert_known_length_fragment_completion(&[a, b], 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("连续") || err.to_string().contains("不一致"),
+            "应报告空洞: {err}"
+        );
+    }
+
+    /// 审计 S-03:Σsize != file_size → Err
+    #[test]
+    fn test_known_length_fragment_completion_rejects_size_mismatch() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 499,
+                size: 500,
+                downloaded: 500,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Done;
+        let err = assert_known_length_fragment_completion(&[a], 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("file_size") || err.to_string().contains("不一致"),
+            "应报告总长不匹配: {err}"
+        );
+    }
+
     /// 验证 Pending -> Downloading -> Done 完整路径
     #[test]
     fn test_fragment_record_pending_to_done() {
@@ -8616,6 +8848,123 @@ mod tests {
         assert!((task.progress() - 1.0).abs() < f64::EPSILON);
     }
 
+    /// 审计 S-03 helper:构造固定三片矩阵(0..99,100..199,200..299),file_size=300。
+    fn s03_three_fragments(
+        states: [FragmentState; 3],
+        last_range: (u64, u64, u64),
+    ) -> Vec<FragmentRecord> {
+        let ranges = [(0u64, 99u64, 100u64), (100, 199, 100), last_range];
+        ranges
+            .into_iter()
+            .enumerate()
+            .map(|(i, (start, end, size))| {
+                let info = FragmentInfo {
+                    index: i as u32,
+                    start,
+                    end,
+                    size,
+                    downloaded: if states[i] == FragmentState::Done {
+                        size
+                    } else {
+                        0
+                    },
+                    hash: None,
+                };
+                let mut rec = FragmentRecord::new(info, 0);
+                match states[i] {
+                    FragmentState::Done => {
+                        rec.start_download().unwrap();
+                        rec.complete_download_fast(size, Duration::ZERO).unwrap();
+                    }
+                    FragmentState::Failed => {
+                        rec.force_fail();
+                    }
+                    FragmentState::Pending => {}
+                    other => panic!("s03 helper 不支持 state={other:?}"),
+                }
+                // last_range 可能被调用方改写 size/start;覆盖 helper 后的 info
+                if i == 2 {
+                    rec.info.start = last_range.0;
+                    rec.info.end = last_range.1;
+                    rec.info.size = last_range.2;
+                    if rec.state == FragmentState::Done {
+                        rec.info.downloaded = last_range.2;
+                    }
+                }
+                rec
+            })
+            .collect()
+    }
+
+    /// 审计 S-03:已知长度分片下载 Completed 前必须通过终态字节/结构不变式。
+    ///
+    /// 不变式(known-length fragmented, file_size = Some(n)):
+    /// 1. 每个 fragment state == Done
+    /// 2. ranges 连续无重叠:按 start 排序后首片 start==0, 相邻 end+1==next.start,
+    ///    末片 end+1 == n
+    /// 3. sum(size) == n, 且每片 downloaded == size
+    ///
+    /// 当前 `execute_fragmented_download` 在 handles/frag_rx 空后直接标 Completed,
+    /// 缺少对本不变式的调用。本测试锁定应存在的校验入口(compile/assert RED)。
+    #[test]
+    fn test_known_length_fragmented_completion_requires_all_fragments_done() {
+        let frags = s03_three_fragments(
+            [
+                FragmentState::Done,
+                FragmentState::Done,
+                FragmentState::Failed,
+            ],
+            (200, 299, 100),
+        );
+        let err = DownloadTask::validate_known_length_fragment_completion(&frags, Some(300))
+            .expect_err("存在非 Done 分片时终态校验必须失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Done") || msg.contains("终态") || msg.contains("分片"),
+            "错误信息应指向分片终态不变式, got={msg}"
+        );
+    }
+
+    /// 审计 S-03:ranges 必须连续覆盖 [0, file_size), sum(size)==file_size。
+    #[test]
+    fn test_known_length_fragmented_completion_requires_contiguous_ranges_and_size_sum() {
+        // 末片右移 1 字节 → gap at 200, end+1=301 != file_size
+        let frags = s03_three_fragments(
+            [
+                FragmentState::Done,
+                FragmentState::Done,
+                FragmentState::Done,
+            ],
+            (201, 300, 100),
+        );
+        let err = DownloadTask::validate_known_length_fragment_completion(&frags, Some(300))
+            .expect_err("ranges 不连续/未覆盖 file_size 时终态校验必须失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("连续")
+                || msg.contains("覆盖")
+                || msg.contains("range")
+                || msg.contains("file_size")
+                || msg.contains("间隙")
+                || msg.contains("重叠"),
+            "错误信息应指向 range/size 不变式, got={msg}"
+        );
+    }
+
+    /// 审计 S-03:合法全 Done + 连续覆盖应通过(锁定 API 语义,避免恒 false 实现)。
+    #[test]
+    fn test_known_length_fragmented_completion_accepts_valid_matrix() {
+        let frags = s03_three_fragments(
+            [
+                FragmentState::Done,
+                FragmentState::Done,
+                FragmentState::Done,
+            ],
+            (200, 299, 100),
+        );
+        DownloadTask::validate_known_length_fragment_completion(&frags, Some(300))
+            .expect("合法矩阵应通过终态不变式");
+    }
     /// 字节级断点续传:plan() 应为未完整分片注入 resume_offset 并调整进度。
     #[tokio::test]
     async fn test_resume_partial_fragment_sets_resume_offset() {

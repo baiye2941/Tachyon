@@ -660,7 +660,7 @@ cargo fmt --all -- --check && \
 | Job | 说明 |
 |-----|------|
 | fmt | `cargo fmt --check` |
-| clippy | `cargo clippy -D warnings` |
+| clippy | `cargo clippy -D warnings`（当前 Ubuntu） |
 | test | Ubuntu / Windows / macOS 三平台矩阵 |
 | docs | `cargo doc --no-deps` 零警告 |
 | audit | `cargo deny check` + `cargo machete` |
@@ -668,6 +668,8 @@ cargo fmt --all -- --check && \
 | taplo | TOML 格式检查 |
 | coverage | 逐 crate `cargo llvm-cov --fail-under-regions 90`（`scripts/ci/coverage.sh`） |
 | miri | Miri unsafe 代码检测 |
+| msrv | MSRV 工具链兼容性检查 |
+| doc-drift | 文档/计数漂移门禁 |
 | bench | Criterion 基准 Smoke 测试 |
 | frontend | TS 类型检查 + lint + test + 构建 |
 

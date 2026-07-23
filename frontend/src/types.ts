@@ -34,6 +34,8 @@ export interface TaskInfo {
   hfMeta?: HfTaskMeta
   /** 任务在列表中的显示顺序,越小越靠前。手动拖拽排序后由后端写入 */
   displayOrder?: number
+  /** 创建任务时配置的镜像 URL 列表(后端 mirror_urls,展示已脱敏) */
+  mirrorUrls?: string[]
 }
 
 export interface DownloadConfig {

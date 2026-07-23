@@ -7,7 +7,7 @@ import {
   platformKeys,
   type ShortcutGroup,
 } from "../commands/shortcuts";
-import { getShortcutKeys } from "../stores/shortcuts";
+import { getShortcutKeys, isMacPlatform } from "../stores/shortcuts";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { tr, type MessageKey } from "../i18n";
 
@@ -27,9 +27,7 @@ export default function ShortcutHelp(props: ShortcutHelpProps) {
   const t = (key: MessageKey) => tr(key);
 
   // macOS 检测(显示 Cmd 替代 Ctrl)
-  const isMac =
-    typeof navigator !== "undefined" &&
-    /Mac|iPhone|iPad/.test(navigator.platform);
+  const isMac = isMacPlatform();
   const groups = createMemo(() => groupedShortcuts());
   const groupOrder: ShortcutGroup[] = ["global", "navigation", "task", "list"];
 
