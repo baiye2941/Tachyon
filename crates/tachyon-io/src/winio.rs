@@ -56,6 +56,13 @@ impl WinFile {
         use std::os::windows::fs::OpenOptionsExt;
         use win_flags::*;
         let path = path.as_ref().to_path_buf();
+        // 审计 S-05:打开前拒绝中间目录 reparse,并 no-follow 创建父目录
+        if let Some(parent) = path.parent() {
+            crate::tokio_file::reject_existing_reparse_components(parent)
+                .map_err(DownloadError::Io)?;
+            crate::tokio_file::create_dir_all_nofollow(parent).map_err(DownloadError::Io)?;
+        }
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -81,6 +88,13 @@ impl WinFile {
         use std::os::windows::fs::OpenOptionsExt;
         use win_flags::*;
         let path = path.as_ref().to_path_buf();
+        // 审计 S-05:打开前拒绝中间目录 reparse,并 no-follow 创建父目录
+        if let Some(parent) = path.parent() {
+            crate::tokio_file::reject_existing_reparse_components(parent)
+                .map_err(DownloadError::Io)?;
+            crate::tokio_file::create_dir_all_nofollow(parent).map_err(DownloadError::Io)?;
+        }
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -102,6 +116,13 @@ impl WinFile {
     #[cfg(not(target_os = "windows"))]
     pub async fn open_standard<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
         let path = path.as_ref().to_path_buf();
+        // 审计 S-05:打开前拒绝中间目录 reparse,并 no-follow 创建父目录
+        if let Some(parent) = path.parent() {
+            crate::tokio_file::reject_existing_reparse_components(parent)
+                .map_err(DownloadError::Io)?;
+            crate::tokio_file::create_dir_all_nofollow(parent).map_err(DownloadError::Io)?;
+        }
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -136,6 +157,11 @@ impl WinFile {
         // 在 spawn_blocking 内调用)。直接用 OpenOptions。
         use std::os::windows::fs::OpenOptionsExt;
         use win_flags::*;
+        // 审计 S-05:fallback 打开同样拒绝中间 reparse
+        if let Some(parent) = self.path.parent() {
+            crate::tokio_file::reject_existing_reparse_components(parent)
+                .map_err(DownloadError::Io)?;
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

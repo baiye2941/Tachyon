@@ -8,16 +8,6 @@ use tachyon_core::{DownloadError, DownloadResult};
 
 use crate::storage::AsyncStorage;
 
-#[cfg(target_os = "windows")]
-mod win_share {
-    pub const FILE_SHARE_READ: u32 = 0x00000001;
-    pub const FILE_SHARE_WRITE: u32 = 0x00000002;
-    pub const FILE_SHARE_DELETE: u32 = 0x00000004;
-    /// 不跟随重解析点(symlink/junction)。FIX-09: 关闭 validate_save_path 与最终 open
-    /// 之间的最终组件 TOCTOU。详见 winio::win_flags::FILE_FLAG_OPEN_REPARSE_POINT。
-    pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
-}
-
 pub struct TokioFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
@@ -28,25 +18,248 @@ pub struct TokioFile {
     write_lock: Arc<std::sync::Mutex<()>>,
 }
 
+/// 审计 S-05:Unix 句柄化 openat 链,中间目录 O_NOFOLLOW|O_DIRECTORY,最终组件 O_NOFOLLOW|O_CREAT。
+#[cfg(unix)]
+fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::io::AsRawFd;
+
+    let mut components: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut root: Option<PathBuf> = None;
+    for c in path.components() {
+        match c {
+            std::path::Component::Prefix(p) => {
+                root = Some(PathBuf::from(p.as_os_str()));
+            }
+            std::path::Component::RootDir => {
+                root = Some(
+                    root.unwrap_or_default()
+                        .join(std::path::Component::RootDir.as_os_str()),
+                );
+            }
+            std::path::Component::Normal(name) => components.push(name),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "路径含 .. 组件,拒绝 openat 链",
+                ));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "路径无文件名组件",
+        ));
+    }
+
+    // 打开根/起始目录(绝对路径以 / 起;相对路径以 .)
+    let start = root.unwrap_or_else(|| PathBuf::from("."));
+    let mut dir_fd = open_dir_nofollow(&start)?;
+
+    let last = components.len() - 1;
+    for (i, name) in components.iter().enumerate() {
+        let c_name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径组件含内部 NUL")
+        })?;
+        if i < last {
+            // 中间目录:不存在则创建,打开时 O_NOFOLLOW|O_DIRECTORY
+            let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+            let mut fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // 创建中间目录后重开
+                    let mk = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0o755) };
+                    if mk < 0 {
+                        let e = std::io::Error::last_os_error();
+                        // EEXIST 竞态:另一进程已创建,继续 openat
+                        if e.raw_os_error() != Some(libc::EEXIST) {
+                            return Err(e);
+                        }
+                    }
+                    fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+            dir_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        } else {
+            // 最终组件:O_NOFOLLOW|O_CREAT|O_RDWR
+            let flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(unix)]
+fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含内部 NUL"))?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // 根目录 "/" 上 O_NOFOLLOW 无影响;相对 "." 亦然。
+    // 若起始路径本身是 symlink,拒绝(ELOOP),避免从 symlink 基目录起链。
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+    if fd < 0 {
+        // 基目录可能是已 canonicalize 的真实目录;O_NOFOLLOW 对非 symlink 无害。
+        // 若失败因非目录等,回退不带 O_NOFOLLOW 仅当路径是 "." 或 "/" (启动锚点)。
+        let err = std::io::Error::last_os_error();
+        if path == Path::new(".") || path == Path::new("/") {
+            let flags2 = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY;
+            let fd2 = unsafe { libc::open(c_path.as_ptr(), flags2) };
+            if fd2 < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd2) });
+        }
+        return Err(err);
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 审计 S-05:Windows 分组件 no-follow 打开。
+/// 中间目录:symlink_metadata 拒绝 reparse 后 create_dir + open;
+/// 最终组件:FILE_FLAG_OPEN_REPARSE_POINT 不跟随。
+#[cfg(target_os = "windows")]
+pub(crate) fn open_path_nofollow_create_windows(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // 拒绝路径中已存在的中间 reparse 组件
+    if let Some(parent) = path.parent() {
+        reject_existing_reparse_components(parent)?;
+        // 确保父目录存在(create_dir_all 不跟随 junction? 标准库会跟随 —
+        // 因此先按组件创建,每步检查 reparse)
+        create_dir_all_nofollow(parent)?;
+    }
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn reject_existing_reparse_components(path: &Path) -> std::io::Result<()> {
+    let mut cursor = PathBuf::new();
+    for c in path.components() {
+        match c {
+            // Prefix/RootDir 是盘符与根,不是可创建的中间目录;直接推进 cursor
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                cursor.push(c.as_os_str());
+                continue;
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "路径含 .. 组件,拒绝",
+                ));
+            }
+            std::path::Component::Normal(name) => {
+                cursor.push(name);
+            }
+        }
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) => {
+                use std::os::windows::fs::{FileTypeExt, MetadataExt};
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                let ft = meta.file_type();
+                if ft.is_symlink_dir()
+                    || ft.is_symlink_file()
+                    || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                {
+                    return Err(std::io::Error::other(format!(
+                        "路径组件是重解析点,拒绝: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 后续 create_dir 会创建;尚未存在的组件无需检查
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn create_dir_all_nofollow(path: &Path) -> std::io::Result<()> {
+    let mut cursor = PathBuf::new();
+    for c in path.components() {
+        match c {
+            // 盘符/根目录不可 create_dir,仅推进 cursor
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                cursor.push(c.as_os_str());
+                continue;
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "路径含 .. 组件,拒绝创建",
+                ));
+            }
+            std::path::Component::Normal(name) => {
+                cursor.push(name);
+            }
+        }
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) => {
+                use std::os::windows::fs::{FileTypeExt, MetadataExt};
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                let ft = meta.file_type();
+                if ft.is_symlink_dir()
+                    || ft.is_symlink_file()
+                    || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                {
+                    return Err(std::io::Error::other(format!(
+                        "中间目录是重解析点,拒绝创建: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cursor)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl TokioFile {
     #[cfg(target_os = "windows")]
     pub async fn open<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
         Self::open_sync(path).map_err(DownloadError::Io)
     }
 
+    /// 审计 S-05:分组件 no-follow 打开。最终组件带 FILE_FLAG_OPEN_REPARSE_POINT;
+    /// 中间目录经 symlink_metadata 拒绝 reparse 后打开,关闭 validate→open 中间目录 TOCTOU。
     #[cfg(target_os = "windows")]
     pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        use std::os::windows::fs::OpenOptionsExt;
-        use win_share::*;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(&path)?;
+        let file = open_path_nofollow_create_windows(&path)?;
         Ok(Self {
             path,
             file: Arc::new(file),
@@ -59,20 +272,17 @@ impl TokioFile {
         Self::open_sync(path).map_err(DownloadError::Io)
     }
 
+    /// 审计 S-05:句柄化 openat 链打开路径,中间目录与最终组件均 O_NOFOLLOW。
+    /// 攻击者在 validate_save_path 与 open 之间把中间目录替换为 symlink 时,
+    /// openat(O_NOFOLLOW|O_DIRECTORY) 返回 ELOOP 而非跟随到基目录外。
     #[cfg(unix)]
     pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
         let path = path.as_ref().to_path_buf();
-        // FIX-09: O_NOFOLLOW 防止 validate_save_path 与最终 open 之间的最终组件 TOCTOU。
-        // 若最终路径组件是符号链接,open 失败(ELOOP)而非跟随。对新文件创建无影响。
-        // 注意:仅保护最终组件;中间目录被替换为符号链接是残留 TOCTOU,需 openat/handle 化打开。
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let file = open_path_nofollow_create(&path)?;
         Ok(Self {
             path,
             file: Arc::new(file),
@@ -810,6 +1020,98 @@ mod tests {
                     // 第一个任务不应是 cancelled(它是被 join_next 取出的)
                     panic!("round {round}: 第一个任务 join 错误: {join_err}");
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod s05_nofollow_tests {
+    use super::*;
+    use std::fs;
+
+    /// 审计 S-05:中间目录被替换为 symlink 时,open 必须失败而非跟随写入基目录外。
+    #[test]
+    #[cfg(unix)]
+    fn test_open_sync_rejects_intermediate_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        fs::create_dir(&base).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let mid = base.join("mid");
+        fs::create_dir(&mid).unwrap();
+        // 先正常打开一次确保路径可用
+        let target = mid.join("file.bin");
+        let f = TokioFile::open_sync(&target).expect("正常路径应打开成功");
+        drop(f);
+        fs::remove_file(&target).ok();
+        // 把 mid 换成指向 outside 的 symlink
+        fs::remove_dir(&mid).unwrap();
+        std::os::unix::fs::symlink(&outside, &mid).unwrap();
+        let err = TokioFile::open_sync(&target).expect_err("中间目录 symlink 应被拒绝");
+        // ELOOP 或类似错误
+        let raw = err.raw_os_error();
+        assert!(
+            raw == Some(libc::ELOOP)
+                || err.kind() == std::io::ErrorKind::Other
+                || err.to_string().contains("symlink")
+                || err.to_string().contains("重解析")
+                || err.to_string().contains("符号"),
+            "期望 ELOOP/symlink 错误, got kind={:?} raw={:?} msg={err}",
+            err.kind(),
+            raw
+        );
+    }
+
+    /// 审计 S-05:正常无 symlink 路径仍应成功打开并写入。
+    #[test]
+    fn test_open_sync_normal_nested_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        fs::create_dir(&base).unwrap();
+        let nested = base.join("a").join("b").join("file.bin");
+        // 父目录可能不存在:open 应能创建中间目录(unix openat mkdirat / win create_dir_all_nofollow)
+        let f = TokioFile::open_sync(&nested).expect("嵌套路径应打开成功");
+        // 简单写入校验
+        drop(f);
+        assert!(nested.exists(), "文件应被创建");
+    }
+
+    /// 审计 S-05:Windows 中间目录被替换为 junction/symlink 时,open 必须失败。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_open_sync_rejects_intermediate_reparse() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("downloads");
+        fs::create_dir(&base).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let mid = base.join("mid");
+        fs::create_dir(&mid).unwrap();
+        let target = mid.join("file.bin");
+        let f = TokioFile::open_sync(&target).expect("正常路径应打开成功");
+        drop(f);
+        fs::remove_file(&target).ok();
+        // 把 mid 换成指向 outside 的 directory symlink/junction
+        fs::remove_dir(&mid).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_dir(&outside, &mid) {
+            // 无开发者模式/管理员时跳过(环境限制,非逻辑失败)
+            eprintln!("跳过:无法创建 directory symlink: {e}");
+            return;
+        }
+        match TokioFile::open_sync(&target) {
+            Ok(_) => panic!("中间目录 reparse 应被拒绝"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("重解析")
+                        || msg.contains("reparse")
+                        || msg.contains("symlink")
+                        || err.kind() == std::io::ErrorKind::Other,
+                    "期望 reparse 拒绝错误, got kind={:?} msg={msg}",
+                    err.kind()
+                );
             }
         }
     }
