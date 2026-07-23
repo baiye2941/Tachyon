@@ -538,17 +538,18 @@ impl AppState {
         );
         let task_repository = TaskRepository::new();
         let max_concurrent_tasks = config.max_concurrent_tasks;
-        let max_concurrent_fragments = config.download.max_concurrent_fragments;
         // 审计 A-03:全局共享限速器;None 配置 → 0(不限速)
         let initial_rate = config.download.rate_limit_bytes_per_sec.unwrap_or(0);
         let global_rate_limiter = Arc::new(tachyon_engine::RateLimiter::new(initial_rate));
+        // 审计 E-04:容量经纯函数 buffer_pool_capacity_for_config 派生(config 在下行 move)
+        let buffer_pool_capacity = Self::buffer_pool_capacity_for_config(&config);
         let config_arc = Arc::new(tokio::sync::Mutex::new(config));
         let create_task_lock = Arc::new(tokio::sync::Mutex::new(()));
         // 全局 buffer 池:容量 = 任务并发 × 分片并发,buffer_size = WRITE_BATCH_BYTES。
         // 惰性分配(用 new 而非 with_prefill),首次 alloc 才创建 buffer,降低启动内存开销。
         let buffer_pool = Arc::new(tokio::sync::RwLock::new(Arc::new(BufferPool::new(
             tachyon_core::config::WRITE_BATCH_BYTES,
-            (max_concurrent_tasks as usize) * (max_concurrent_fragments as usize),
+            buffer_pool_capacity,
         ))));
 
         let task_service = Arc::new(TaskService::new(
@@ -597,6 +598,12 @@ impl AppState {
     pub fn new() -> Self {
         // CLI/测试路径仍用 expect;GUI run() 必须走 try_new 以免白屏 panic
         Self::try_new().expect("AppState 初始化失败")
+    }
+    /// 审计 E-04: 从 AppConfig 派生 buffer_pool 容量(纯函数,无 AppState/IO)。
+    /// capacity = max_concurrent_tasks × max_concurrent_fragments。
+    /// 提取自 try_new 的 buffer_pool 构造,使测试无需 AppState::new()/dirs()/env 改动。
+    pub fn buffer_pool_capacity_for_config(config: &AppConfig) -> usize {
+        (config.max_concurrent_tasks as usize) * (config.download.max_concurrent_fragments as usize)
     }
 
     /// 加载恢复的任务，返回结构化 outcome（corrupt + unsupported_schema）。
@@ -1762,92 +1769,51 @@ pub(crate) mod tests {
         );
     }
 
-    // ── BufferPool 全局接入(切片1) RED 测试 ──────────────────────────
+    // ── BufferPool 全局接入(切片1) ─────────────────────────────────
     //
-    // 验证 AppState::new() 构造的 infra.buffer_pool 存在且规格正确。
-    // 规格:
-    //   buffer_size = tachyon_core::config::WRITE_BATCH_BYTES (256 KiB)
-    //   capacity    = max_concurrent_tasks × max_concurrent_fragments (默认 5×16=80)
-    //   available   = capacity (初始全可用)
-    //
-    // RED 原因:InfraState 尚未新增 buffer_pool 字段,且 AppState::try_new
-    // 尚未构造池。Coder 实现 InfraState.buffer_pool 字段 + try_new 构造逻辑后,
-    // 本测试应转为 GREEN。
+    // 审计 E-04:原测试调 AppState::new() 并 unsafe 改 USERPROFILE/HOME 来隔离
+    // dirs()/.tachyon 配置加载,是全局 nextest retries=2 的根因。改为直接测试
+    // 纯函数 buffer_pool_capacity_for_config + BufferPool 构造,零 IO/零 env 改动。
 
     #[test]
-    fn test_app_state_buffer_pool_spec() {
-        // 测试环境隔离:AppState::new() -> try_new -> load_persisted_config 会从
-        // dirs()/.tachyon/config.json 加载持久化配置(dirs() 在 Windows 用 USERPROFILE,
-        // Linux/macOS 用 HOME)。本机或其他环境若存在 ~/.tachyon/config.json 且含
-        // max_concurrent_tasks/max_concurrent_fragments 的非默认值,会导致 buffer_pool
-        // capacity 偏离默认 80,使绝对值断言失败。
-        //
-        // 修复:将 USERPROFILE/HOME 指向临时目录,使 config.json 不存在 -> 回退
-        // AppConfig::default() -> capacity = 5×16 = 80。测试结束恢复原值。
-        let temp_home = tempfile::tempdir().unwrap();
-        let original_userprofile = std::env::var_os("USERPROFILE");
-        let original_home = std::env::var_os("HOME");
+    fn test_buffer_pool_capacity_for_default_config() {
+        let cfg = AppConfig::default();
+        let capacity = AppState::buffer_pool_capacity_for_config(&cfg);
+        assert_eq!(
+            capacity, 80,
+            "默认配置容量应为 max_concurrent_tasks(5) × max_concurrent_fragments(16) = 80"
+        );
+    }
 
-        // Safety:测试代码,仅修改当前进程环境变量。本测试为同步 #[test],
-        // 不与其他读写 USERPROFILE/HOME 的测试并发运行,无跨线程竞争风险。
-        unsafe {
-            std::env::set_var("USERPROFILE", temp_home.path());
-            std::env::set_var("HOME", temp_home.path());
-        }
+    #[test]
+    fn test_buffer_pool_capacity_for_custom_config() {
+        let mut cfg = AppConfig::default();
+        cfg.max_concurrent_tasks = 3;
+        cfg.download.max_concurrent_fragments = 8;
+        assert_eq!(
+            AppState::buffer_pool_capacity_for_config(&cfg),
+            24,
+            "自定义配置容量应为 3 × 8 = 24"
+        );
+    }
 
-        // RAII guard:确保测试体(含 panic 路径)结束后恢复环境变量。
-        // guard 先于 temp_home 声明 -> drop 顺序为 guard(恢复环境) -> temp_home(删临时目录),
-        // 避免恢复后的 USERPROFILE 指向已被删除的临时目录。
-        struct EnvRestore {
-            userprofile: Option<std::ffi::OsString>,
-            home: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                // Safety:同上,测试结束阶段单线程恢复环境变量。
-                unsafe {
-                    match &self.userprofile {
-                        Some(v) => std::env::set_var("USERPROFILE", v),
-                        None => std::env::remove_var("USERPROFILE"),
-                    }
-                    match &self.home {
-                        Some(v) => std::env::set_var("HOME", v),
-                        None => std::env::remove_var("HOME"),
-                    }
-                }
-            }
-        }
-        let _restore = EnvRestore {
-            userprofile: original_userprofile,
-            home: original_home,
-        };
-
-        let state = AppState::new();
-        let pool = state.infra.buffer_pool.blocking_read().clone();
-
-        // buffer_size 应等于 WRITE_BATCH_BYTES(256 KiB)
+    #[test]
+    fn test_buffer_pool_spec_from_default_config() {
+        let cfg = AppConfig::default();
+        let pool = BufferPool::new(
+            tachyon_core::config::WRITE_BATCH_BYTES,
+            AppState::buffer_pool_capacity_for_config(&cfg),
+        );
         assert_eq!(
             pool.buffer_size(),
             tachyon_core::config::WRITE_BATCH_BYTES,
             "buffer_pool.buffer_size 应等于 WRITE_BATCH_BYTES"
         );
-
-        // capacity 应等于默认配置 max_concurrent_tasks(5) × max_concurrent_fragments(16) = 80
-        let expected_capacity = {
-            let cfg = AppConfig::default();
-            (cfg.max_concurrent_tasks as usize) * (cfg.download.max_concurrent_fragments as usize)
-        };
-        assert_eq!(
-            expected_capacity, 80,
-            "默认配置容量应为 5 × 16 = 80(前置断言)"
-        );
         assert_eq!(
             pool.capacity(),
-            expected_capacity,
+            80,
             "buffer_pool.capacity 应等于 max_concurrent_tasks × max_concurrent_fragments"
         );
-
-        // 初始状态下所有许可可用(池未被消费)
         assert_eq!(
             pool.available(),
             pool.capacity(),

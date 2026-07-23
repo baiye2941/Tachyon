@@ -2,6 +2,7 @@
 # 文档: https://nexte.st/docs/configuration/
 
 [profile.default]
-# 并行测试时部分 AppState::new() 测试因全局 .tachyon 目录竞态偶发失败
-# (预先存在的 flaky,非逻辑错误)。配置重试消除 CI 噪音。
-retries = 2
+# 审计 E-04: 原 retries=2 用于消音 AppState::new() 测试的全局 .tachyon 竞态。
+# 该测试已重构为纯函数测试(buffer_pool_capacity_for_config),零 IO/零 env 改动,
+# 无需重试。全局重试会掩盖真实回归,故设为 0。
+retries = 0

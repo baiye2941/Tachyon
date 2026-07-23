@@ -108,11 +108,17 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Clippy (${{ matrix.os }})
     needs: [changes]
     if: needs.changes.outputs.run_rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 审计 E-02: clippy 仅 ubuntu 编译时跳过 cfg(windows) 的 winio/iocp/tokio_file,
+        # Windows 优先应用的 IO 后端含大量 unsafe FFI,必须在此平台编译检查
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ubuntu-deps
@@ -120,7 +126,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: ${{ runner.os }}-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: clippy
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
@@ -131,6 +137,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
@@ -145,8 +152,9 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.21.0
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force --locked cargo-nextest
-      - name: 运行测试(nextest, 失败重试 2 次)
-        run: cargo nextest run --all --locked --retries 2
+      # 审计 E-04: 去掉全局 --retries 2,避免掩盖真实回归
+      - name: 运行测试(nextest)
+        run: cargo nextest run --all --locked
 
   docs:
     name: 文档构建
@@ -170,11 +178,16 @@ jobs:
   msrv:
     # MSRV 门禁:工作区声明 rust-version = "1.85",但 CI 默认用浮动 stable,
     # 依赖升级可能在不知情下破坏声明的最低支持版本。本 job 用固定 1.85 验证编译。
-    name: MSRV (1.85)
+    # 审计 E-02: 同 clippy,需在 Windows 验证 cfg(windows) IO 后端的 MSRV 兼容
+    name: MSRV (1.85, ${{ matrix.os }})
     needs: [changes]
     if: needs.changes.outputs.run_rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ubuntu-deps
@@ -183,7 +196,7 @@ jobs:
           toolchain: "1.85"
           components: rustfmt
           # MSRV 必须独立 cache key，禁止与 stable 共享
-          shared-key: ubuntu-msrv-1.85-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: ${{ runner.os }}-msrv-1.85-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: msrv
       - name: 验证 MSRV 编译(1.85)
         run: cargo build --all --locked --all-features
@@ -343,6 +356,27 @@ jobs:
         run: |
           TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2
           TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+
+  # 审计 E-01: 变异测试验证测试断言强度。极慢,仅 main push 运行,不阻断 ci-pass。
+  mutants:
+    name: 变异测试 (cargo-mutants)
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.run_rust == 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: mutants
+      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - name: 安装 cargo-mutants
+        run: cargo binstall -y --force cargo-mutants
+      - name: 变异测试 (tachyon-core)
+        run: bash scripts/ci/mutants.sh
 
   frontend:
     name: 前端检查
