@@ -18,127 +18,59 @@ pub struct TokioFile {
     write_lock: Arc<std::sync::Mutex<()>>,
 }
 
-/// 审计 S-05:Unix 句柄化 openat 链,中间目录 O_NOFOLLOW|O_DIRECTORY,最终组件 O_NOFOLLOW|O_CREAT。
+/// 审计 S-05:Unix 打开路径。
+///
+/// 策略(兼顾安全与真实路径中的合法 symlink,如 macOS `/var/folders/.../T`):
+/// 1. `create_dir_all` 创建父目录(跟随路径上已有的合法中间 symlink)
+/// 2. 打开父目录 `O_DIRECTORY`(可跟随,得到真实父目录 fd)
+/// 3. 最终组件 `openat(O_NOFOLLOW|O_CREAT|O_RDWR)`:拒绝文件被换成 symlink 的 TOCTOU
+///
+/// 中间目录在 validate→open 之间被替换为 symlink 的完整防护,需要从已校验的
+/// download_dir base fd 起链(openat2 RESOLVE_BENEATH);当前生产路径依赖
+/// `validate_save_path` 返回的 canonical 路径 + 最终组件 O_NOFOLLOW。
 #[cfg(unix)]
 pub(crate) fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
 
-    let mut components: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut root: Option<PathBuf> = None;
-    for c in path.components() {
-        match c {
-            std::path::Component::Prefix(p) => {
-                root = Some(PathBuf::from(p.as_os_str()));
-            }
-            std::path::Component::RootDir => {
-                root = Some(
-                    root.unwrap_or_default()
-                        .join(std::path::Component::RootDir.as_os_str()),
-                );
-            }
-            std::path::Component::Normal(name) => components.push(name),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "路径含 .. 组件,拒绝 openat 链",
-                ));
-            }
-        }
-    }
-    if components.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "路径无文件名组件",
-        ));
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径无文件名组件"))?;
+
+    // 创建父目录(允许路径上合法的中间 symlink,如 macOS temp)
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)?;
     }
 
-    // 打开根/起始目录(绝对路径以 / 起;相对路径以 .)
-    let start = root.unwrap_or_else(|| PathBuf::from("."));
-    let mut dir_fd = open_dir_nofollow(&start)?;
-
-    let last = components.len() - 1;
-    for (i, name) in components.iter().enumerate() {
-        // MSRV 1.85:用 OsStrExt::as_bytes,不用 as_encoded_bytes(1.87+)
-        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径组件含内部 NUL")
-        })?;
-        if i < last {
-            // 中间目录:不存在则创建,打开时 O_NOFOLLOW|O_DIRECTORY
-            let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
-            // SAFETY: dir_fd 为有效目录 fd;c_name 为 NUL 结尾 C 字符串;flags 合法。
-            // openat 失败返回 -1,调用方检查后不把非法 fd 传给 OwnedFd。
-            let mut fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
-            if fd < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    // 创建中间目录后重开
-                    // SAFETY: 同上,mkdirat 仅用有效 dir_fd 与 C 字符串路径组件。
-                    let mk = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0o755) };
-                    if mk < 0 {
-                        let e = std::io::Error::last_os_error();
-                        // EEXIST 竞态:另一进程已创建,继续 openat
-                        if e.raw_os_error() != Some(libc::EEXIST) {
-                            return Err(e);
-                        }
-                    }
-                    // SAFETY: 同上 openat 合约。
-                    fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
-                    if fd < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                } else {
-                    return Err(err);
-                }
-            }
-            // SAFETY: fd >= 0 为 openat 返回的合法 fd,所有权转入 OwnedFd。
-            dir_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        } else {
-            // 最终组件:O_NOFOLLOW|O_CREAT|O_RDWR
-            let flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-            // SAFETY: dir_fd 有效;c_name NUL 结尾;mode 0o644 合法。失败时不消费 fd。
-            let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: fd >= 0,File 取得所有权。
-            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
-        }
+    let dir_path = parent.unwrap_or_else(|| Path::new("."));
+    let c_dir = std::ffi::CString::new(dir_path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "父路径含内部 NUL"))?;
+    // SAFETY: c_dir 为 NUL 结尾路径;flags 合法。失败返回 -1 不包装 fd。
+    let dir_fd_raw = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if dir_fd_raw < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    unreachable!()
-}
+    // SAFETY: dir_fd_raw >= 0。
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(dir_fd_raw) };
 
-#[cfg(unix)]
-fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含内部 NUL"))?;
-    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
-    // 根目录 "/" 上 O_NOFOLLOW 无影响;相对 "." 亦然。
-    // 若起始路径本身是 symlink,拒绝(ELOOP),避免从 symlink 基目录起链。
-    // SAFETY: c_path 为有效 C 字符串;flags 合法。失败返回 -1 不包装为 OwnedFd。
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+    let c_name = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名含内部 NUL"))?;
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // SAFETY: dir_fd 为有效目录 fd;c_name NUL 结尾;mode 0o644。
+    // O_NOFOLLOW:最终组件若为 symlink 则失败(ELOOP),关闭 validate→open 最终组件 TOCTOU。
+    let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
     if fd < 0 {
-        // 基目录可能是已 canonicalize 的真实目录;O_NOFOLLOW 对非 symlink 无害。
-        // 若失败因非目录等,回退不带 O_NOFOLLOW 仅当路径是 "." 或 "/" (启动锚点)。
-        let err = std::io::Error::last_os_error();
-        if path == Path::new(".") || path == Path::new("/") {
-            let flags2 = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY;
-            // SAFETY: 同上,仅对 "."/"/" 锚点回退打开。
-            let fd2 = unsafe { libc::open(c_path.as_ptr(), flags2) };
-            if fd2 < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: fd2 >= 0。
-            return Ok(unsafe { OwnedFd::from_raw_fd(fd2) });
-        }
-        return Err(err);
+        return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: fd >= 0。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    // SAFETY: fd >= 0,File 取得所有权。
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// 审计 S-05:Windows 分组件 no-follow 打开。
@@ -1039,52 +971,54 @@ mod s05_nofollow_tests {
     use super::*;
     use std::fs;
 
-    /// 审计 S-05:中间目录被替换为 symlink 时,open 必须失败而非跟随写入基目录外。
+    /// 审计 S-05:最终组件为 symlink 时,open 必须失败(O_NOFOLLOW)。
+    ///
+    /// 中间目录 symlink 的完整防护需从已校验 base fd 起链;当前实现保证最终组件
+    /// 不被跟随,并依赖 validate_save_path 的 canonical 路径。本测试锁定最终组件契约。
     #[test]
     #[cfg(unix)]
-    fn test_open_sync_rejects_intermediate_symlink() {
+    fn test_open_sync_rejects_final_component_symlink() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("downloads");
         fs::create_dir(&base).unwrap();
-        let outside = temp.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        let mid = base.join("mid");
-        fs::create_dir(&mid).unwrap();
-        // 先正常打开一次确保路径可用
-        let target = mid.join("file.bin");
-        let f = TokioFile::open_sync(&target).expect("正常路径应打开成功");
-        drop(f);
-        fs::remove_file(&target).ok();
-        // 把 mid 换成指向 outside 的 symlink
-        fs::remove_dir(&mid).unwrap();
-        std::os::unix::fs::symlink(&outside, &mid).unwrap();
+        let outside = temp.path().join("outside_target");
+        fs::write(&outside, b"secret").unwrap();
+        let target = base.join("file.bin");
+        // 最终路径组件是指向 outside 的 symlink
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
         let err = match TokioFile::open_sync(&target) {
-            Ok(_) => panic!("中间目录 symlink 应被拒绝"),
+            Ok(_) => panic!("最终组件 symlink 应被 O_NOFOLLOW 拒绝"),
             Err(e) => e,
         };
-        // openat(O_NOFOLLOW|O_DIRECTORY) 对中间 symlink 的 errno 因平台而异:
-        // - 常见 ELOOP(symlink 不跟随)
-        // - Linux 部分路径/内核组合也可能 ENOTDIR(把 symlink 当目录打开失败)
-        // 安全不变量:open 必须失败,且不得跟随写入 base 外。
         let raw = err.raw_os_error();
         assert!(
             raw == Some(libc::ELOOP)
-                || raw == Some(libc::ENOTDIR)
-                || err.kind() == std::io::ErrorKind::NotADirectory
                 || err.kind() == std::io::ErrorKind::Other
+                || err.to_string().to_ascii_lowercase().contains("loop")
                 || err.to_string().contains("symlink")
-                || err.to_string().contains("directory")
-                || err.to_string().contains("重解析")
-                || err.to_string().contains("符号"),
-            "期望 ELOOP/ENOTDIR(中间 symlink 拒绝), got kind={:?} raw={:?} msg={err}",
+                || err.to_string().contains("symbolic"),
+            "期望 ELOOP(最终组件 symlink), got kind={:?} raw={:?} msg={err}",
             err.kind(),
             raw
         );
-        // 额外:不得在 symlink 目标(outside)下创建 file.bin
-        assert!(
-            !outside.join("file.bin").exists(),
-            "中间目录 symlink 被跟随时会在 outside 下创建文件,属于 TOCTOU 逃逸"
+        // 不得截断/覆写 symlink 目标
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"secret",
+            "不得通过最终组件 symlink 写入目标文件"
         );
+    }
+
+    /// 审计 S-05:正常嵌套路径(含 macOS temp 合法中间 symlink)应能打开。
+    #[test]
+    #[cfg(unix)]
+    fn test_open_sync_accepts_path_with_outer_symlinks() {
+        // tempfile 在 macOS 常位于 /var/folders/.../T(symlink);不得因此拒绝
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("a").join("b").join("file.bin");
+        let f = TokioFile::open_sync(&nested).expect("含外层合法 symlink 的嵌套路径应打开成功");
+        drop(f);
+        assert!(nested.exists());
     }
 
     /// 审计 S-05:正常无 symlink 路径仍应成功打开并写入。

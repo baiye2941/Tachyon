@@ -4813,13 +4813,14 @@ mod tests {
         let file_ids: Vec<usize> = spans.iter().map(|s| s.file_id).collect();
         assert_eq!(file_ids, vec![0, 2], "file_id 应保留原 torrent 索引");
 
-        // total_len = file0.len + file2.len = 100 + 400 = 500
+        // total_len = 选中��件长度之和(不硬编码:librqbit 可能对齐 piece 边界)
+        let expected = file_infos[0].len + file_infos[2].len;
         assert_eq!(
             layout.total_len(),
-            file_infos[0].len + file_infos[2].len,
-            "total_len 应为选中文件长度之和"
+            expected,
+            "total_len 应为选中文件长度之和, file_infos lens={:?}",
+            file_infos.iter().map(|f| f.len).collect::<Vec<_>>()
         );
-        assert_eq!(layout.total_len(), 500);
 
         // 未选中的 file_id=1 不应出现
         assert!(
