@@ -53,8 +53,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc", 
 rand = "0.10"
 
 # BitTorrent
-librqbit = "8"
-librqbit-core = "5"
+librqbit = "9.0.0-rc.0"
+librqbit-core = "9.0.0-rc.0"
 
 # Tauri
 tauri = { version = "2", features = ["tray-icon"] }

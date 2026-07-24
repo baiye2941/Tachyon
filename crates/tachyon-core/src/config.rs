@@ -493,6 +493,17 @@ pub struct MagnetConfig {
     /// BT TCP listen 端口结束(半开区间上界,与 librqbit Range.end 一致)
     #[serde(default)]
     pub listen_port_end: Option<u16>,
+
+    /// 审计 P-04 / librqbit 9+:自定义 DHT bootstrap 节点(`host:port`)。
+    /// 空列表 = 使用 librqbit 内置默认(当前 2 节点)。非空时覆盖默认列表。
+    /// 仅在 `enable_dht=true` 且未因 high_privacy/SOCKS 策略禁用 DHT 时生效。
+    #[serde(default)]
+    pub dht_bootstrap_addrs: Vec<String>,
+
+    /// 单 torrent 最大 live peer 连接数(librqbit 9+ `SessionOptions.peer_limit`)。
+    /// `None` = 上游默认;Some(n) 覆盖硬编码 128 限制(审计 T4 部分缓解)。
+    #[serde(default)]
+    pub peer_limit: Option<usize>,
 }
 
 fn default_metadata_timeout_secs() -> u64 {
@@ -712,6 +723,8 @@ impl Default for MagnetConfig {
             high_privacy: false,
             listen_port_start: None,
             listen_port_end: None,
+            dht_bootstrap_addrs: Vec::new(),
+            peer_limit: None,
         }
     }
 }
@@ -1361,6 +1374,8 @@ pub struct MagnetPatch {
     pub high_privacy: Option<bool>,
     pub listen_port_start: Option<Option<u16>>,
     pub listen_port_end: Option<Option<u16>>,
+    pub dht_bootstrap_addrs: Option<Vec<String>>,
+    pub peer_limit: Option<Option<usize>>,
 }
 
 /// 调度器配置白名单补丁
@@ -1442,6 +1457,12 @@ impl MagnetPatch {
         }
         if let Some(ref v) = self.listen_port_end {
             base.listen_port_end = *v;
+        }
+        if let Some(v) = &self.dht_bootstrap_addrs {
+            base.dht_bootstrap_addrs = v.clone();
+        }
+        if let Some(v) = self.peer_limit {
+            base.peer_limit = v;
         }
     }
 }
@@ -3373,6 +3394,8 @@ mod tests {
             high_privacy: None,
             listen_port_start: Some(Some(6881)),
             listen_port_end: Some(Some(6889)),
+            dht_bootstrap_addrs: Some(vec!["router.bittorrent.com:6881".into()]),
+            peer_limit: Some(Some(64)),
         };
         patch.apply_to(&mut cfg);
         assert_eq!(cfg.metadata_timeout_secs, 200);
@@ -3395,6 +3418,8 @@ mod tests {
         assert_eq!(cfg.peer_addrs, vec!["1.2.3.4:6881"]);
         assert_eq!(cfg.listen_port_start, Some(6881));
         assert_eq!(cfg.listen_port_end, Some(6889));
+        assert_eq!(cfg.dht_bootstrap_addrs, vec!["router.bittorrent.com:6881"]);
+        assert_eq!(cfg.peer_limit, Some(64));
     }
 
     #[test]
@@ -4636,11 +4661,11 @@ mod tests {
     #[test]
     fn test_download_config_default_falls_back_to_temp_dir_when_no_home() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let saved_userprofile = std::env::var_os("USERPROFILE");
+        let saved_home = std::env::var_os("HOME");
         // SAFETY: ENV_TEST_LOCK 串行化锁保护下临时修改进程级环境变量,
         // 测试结束前恢复原值。仅传编译期字符串字面量给 remove_var/set_var,
         // 无裸指针解引用,无数据竞争/UB 风险。
-        let saved_userprofile = std::env::var_os("USERPROFILE");
-        let saved_home = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("USERPROFILE");
             std::env::remove_var("HOME");

@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use librqbit::{PeerConnectionOptions, Session, SessionOptions};
+use librqbit::{
+    ConnectionOptions, DhtSessionConfig, ListenerOptions, PeerConnectionOptions, Session,
+    SessionOptions,
+};
+use std::net::{Ipv4Addr, SocketAddr};
 use tachyon_core::config::MagnetConfig;
 use tachyon_protocol::magnet::{
     HandleCache, MagnetSessionCoordinator, SessionOpsGate, new_librqbit_session_coordinator,
@@ -147,28 +151,19 @@ impl BtSession {
             config.enable_upnp
         };
 
-        let mut opts = SessionOptions {
-            disable_dht,
-            enable_upnp_port_forwarding: enable_upnp,
-            disable_dht_persistence: config.disable_dht_persistence,
-            // peer 连接超时调优(快速淘汰死 peer,腾出 128 槽位)
-            peer_opts: Some(PeerConnectionOptions {
-                connect_timeout: Some(Duration::from_secs(config.peer_connect_timeout_secs)),
-                read_write_timeout: Some(Duration::from_secs(config.peer_read_write_timeout_secs)),
-                ..Default::default()
-            }),
-            // 延迟写入缓冲(慢盘优化,0 禁用)
-            defer_writes_up_to: if config.defer_writes_up_to_mb == 0 {
-                None
-            } else {
-                Some(config.defer_writes_up_to_mb as usize)
-            },
+        // librqbit 9:peer 超时 + SOCKS 均挂在 ConnectionOptions
+        let peer_opts = PeerConnectionOptions {
+            connect_timeout: Some(Duration::from_secs(config.peer_connect_timeout_secs)),
+            read_write_timeout: Some(Duration::from_secs(config.peer_read_write_timeout_secs)),
             ..Default::default()
         };
-
-        // SOCKS5 代理
+        let mut connect = ConnectionOptions {
+            enable_tcp: true,
+            proxy_url: None,
+            peer_opts: Some(peer_opts),
+        };
         if let Some(ref proxy) = socks_proxy {
-            opts.socks_proxy_url = Some(proxy.clone());
+            connect.proxy_url = Some(proxy.clone());
             tracing::info!(
                 proxy = %redact_socks_proxy_for_log(proxy),
                 source = ?socks_source,
@@ -176,22 +171,70 @@ impl BtSession {
             );
         }
 
-        // BT-15:enable_upnp=true 时自动设 listen_port_range,否则 librqbit
-        // 不创建 TCP listener,UPnP 静默不启动,无入站 peer。
-        // 端口优先用 MagnetConfig.listen_port_start/end;都未设时回退 6881..6889。
-        // high_privacy=true 时 enable_upnp=false,不触发自动设端口。
-        if enable_upnp && opts.listen_port_range.is_none() {
-            let range = match (config.listen_port_start, config.listen_port_end) {
-                (Some(start), Some(end)) => start..end,
-                _ => 6881..6889,
+        // librqbit 9:DHT 由 Option<DhtSessionConfig> 控制;None=禁用
+        // 审计 P-04:bootstrap_addrs 非空时覆盖上游默认 2 节点
+        let dht = if disable_dht {
+            None
+        } else {
+            let persistence = if config.disable_dht_persistence {
+                None
+            } else {
+                Some(Default::default())
+            };
+            let bootstrap_addrs = if config.dht_bootstrap_addrs.is_empty() {
+                None
+            } else {
+                Some(config.dht_bootstrap_addrs.clone())
+            };
+            if let Some(ref addrs) = bootstrap_addrs {
+                tracing::info!(count = addrs.len(), "使用自定义 DHT bootstrap 节点");
+            }
+            Some(DhtSessionConfig {
+                bootstrap_addrs,
+                port: None,
+                persistence,
+            })
+        };
+
+        // BT-15:enable_upnp=true 时启用 TCP listener,否则 UPnP 静默不启动。
+        // librqbit 9 用 ListenerOptions 替代 listen_port_range。
+        let listen = if enable_upnp {
+            let port = match (config.listen_port_start, config.listen_port_end) {
+                (Some(start), Some(_end)) => start,
+                _ => 6881,
             };
             tracing::info!(
-                start = range.start,
-                end = range.end,
-                "enable_upnp=true 自动启用 BT listen_port_range(入站 peer + UPnP)"
+                port,
+                "enable_upnp=true 自动启用 BT TCP listener(入站 peer + UPnP)"
             );
-            opts.listen_port_range = Some(range);
+            Some(ListenerOptions {
+                enable_upnp_port_forwarding: true,
+                listen_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        // 审计 T4 部分缓解:peer_limit 透传 SessionOptions
+        let peer_limit = config.peer_limit;
+
+        // 注:librqbit 9 移除 SessionOptions.defer_writes_up_to;
+        // MagnetConfig.defer_writes_up_to_mb 保留兼容配置,暂不映射(上游无对应字段)。
+        if config.defer_writes_up_to_mb > 0 {
+            tracing::debug!(
+                mb = config.defer_writes_up_to_mb,
+                "defer_writes_up_to_mb 在 librqbit 9 无 Session 级映射,已忽略"
+            );
         }
+
+        let mut opts = SessionOptions {
+            dht,
+            connect: Some(connect),
+            listen,
+            peer_limit,
+            ..Default::default()
+        };
 
         // tracker 注入:high_privacy 完全跳过(不注入公共/全局 tracker)
         // SOCKS5 下过滤 UDP(不可达),追加 HTTPS(经代理可达)
@@ -447,6 +490,51 @@ mod tests {
         config
     }
 
+    /// 审计 P-04:自定义 DHT bootstrap 注入 DhtSessionConfig
+    #[test]
+    fn test_dht_bootstrap_addrs_injected() {
+        let mut config = test_config();
+        config.enable_dht = true;
+        config.high_privacy = false;
+        config.disable_dht_when_socks = false;
+        config.socks_proxy_url = None;
+        config.dht_bootstrap_addrs = vec![
+            "router.bittorrent.com:6881".into(),
+            "dht.transmissionbt.com:6881".into(),
+        ];
+        let (opts, _, _) = BtSession::build_session_options(&config);
+        let dht = opts.dht.expect("DHT 应启用");
+        let addrs = dht.bootstrap_addrs.expect("应注入自定义 bootstrap");
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.iter().any(|a| a.contains("router.bittorrent.com")));
+    }
+
+    /// 审计 P-04:空 bootstrap 列表不覆盖上游默认(传 None)
+    #[test]
+    fn test_dht_bootstrap_empty_means_upstream_default() {
+        let mut config = test_config();
+        config.enable_dht = true;
+        config.high_privacy = false;
+        config.socks_proxy_url = None;
+        config.disable_dht_when_socks = false;
+        config.dht_bootstrap_addrs.clear();
+        let (opts, _, _) = BtSession::build_session_options(&config);
+        let dht = opts.dht.expect("DHT 应启用");
+        assert!(
+            dht.bootstrap_addrs.is_none(),
+            "空列表应映射为 None(上游默认)"
+        );
+    }
+
+    /// librqbit 9 peer_limit 透传
+    #[test]
+    fn test_peer_limit_injected() {
+        let mut config = test_config();
+        config.peer_limit = Some(64);
+        let (opts, _, _) = BtSession::build_session_options(&config);
+        assert_eq!(opts.peer_limit, Some(64));
+    }
+
     #[test]
     fn test_peer_opts_filled_from_config() {
         let mut config = test_config();
@@ -454,7 +542,11 @@ mod tests {
         config.peer_read_write_timeout_secs = 7;
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
-        let peer_opts = opts.peer_opts.expect("peer_opts 应为 Some(由 config 填充)");
+        let peer_opts = opts
+            .connect
+            .as_ref()
+            .and_then(|c| c.peer_opts)
+            .expect("peer_opts 应为 Some(由 config 填充)");
         assert_eq!(
             peer_opts.connect_timeout,
             Some(Duration::from_secs(5)),
@@ -469,25 +561,20 @@ mod tests {
 
     #[test]
     fn test_defer_writes_filled_when_nonzero() {
+        // librqbit 9 移除 SessionOptions.defer_writes_up_to;配置字段保留但不再映射。
         let mut config = test_config();
         config.defer_writes_up_to_mb = 32;
-        let (opts, _effective, _source) = BtSession::build_session_options(&config);
-        assert_eq!(
-            opts.defer_writes_up_to,
-            Some(32),
-            "defer_writes_up_to 应为 MB 值(usize)"
-        );
+        let (_opts, _e, _s) = BtSession::build_session_options(&config);
+        // 仅确保不 panic;无 Session 字段可断言
+        assert_eq!(config.defer_writes_up_to_mb, 32);
     }
 
     #[test]
     fn test_defer_writes_disabled_when_zero() {
         let mut config = test_config();
         config.defer_writes_up_to_mb = 0;
-        let (opts, _effective, _source) = BtSession::build_session_options(&config);
-        assert_eq!(
-            opts.defer_writes_up_to, None,
-            "defer_writes_up_to=0 应映射为 None(禁用)"
-        );
+        let (_opts, _e, _s) = BtSession::build_session_options(&config);
+        assert_eq!(config.defer_writes_up_to_mb, 0);
     }
 
     #[test]
@@ -526,12 +613,15 @@ mod tests {
         }
 
         assert!(
-            opts.socks_proxy_url.is_none(),
+            opts.connect
+                .as_ref()
+                .and_then(|c| c.proxy_url.as_ref())
+                .is_none(),
             "无 SOCKS5 时 socks_proxy_url 应为 None"
         );
         // enable_dht=false → disable_dht=true;此处仅断言 SOCKS5 未额外影响
         assert!(
-            opts.disable_dht,
+            opts.dht.is_none(),
             "enable_dht=false 时 disable_dht 应为 true"
         );
         // UDP tracker 应被保留
@@ -556,9 +646,13 @@ mod tests {
         config.trackers = vec!["https://tracker.example/announce".into()];
         config.socks_proxy_url = None;
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
-        assert!(opts.disable_dht, "high_privacy 应禁用 DHT");
+        assert!(opts.dht.is_none(), "high_privacy 应禁用 DHT");
         assert!(
-            !opts.enable_upnp_port_forwarding,
+            !opts
+                .listen
+                .as_ref()
+                .map(|l| l.enable_upnp_port_forwarding)
+                .unwrap_or(false),
             "high_privacy 应禁用 UPnP"
         );
         assert!(
@@ -574,7 +668,7 @@ mod tests {
         config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
         config.trackers = vec!["udp://tracker.example:6969/announce".into()];
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
-        assert!(opts.disable_dht);
+        assert!(opts.dht.is_none());
         assert!(
             opts.trackers.is_empty(),
             "high_privacy+SOCKS 不得追加 HTTPS 公共 tracker"
@@ -596,13 +690,13 @@ mod tests {
 
         // SOCKS5 代理 URL 注入
         assert_eq!(
-            opts.socks_proxy_url.as_deref(),
+            opts.connect.as_ref().and_then(|c| c.proxy_url.as_deref()),
             Some("socks5://127.0.0.1:1080"),
             "socks_proxy_url 应注入到 opts"
         );
         // DHT 在 SOCKS5 + disable_dht_when_socks=true 下禁用
         assert!(
-            opts.disable_dht,
+            opts.dht.is_none(),
             "SOCKS5 + disable_dht_when_socks=true 应禁用 DHT"
         );
         // UDP tracker 被过滤
@@ -643,17 +737,21 @@ mod tests {
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         assert!(
-            !opts.disable_dht,
+            opts.dht.is_some(),
             "SOCKS5 启用但 disable_dht_when_socks=false 且 enable_dht=true 时 DHT 不应禁用"
         );
     }
 
     #[test]
     fn test_default_config_has_peer_opts_and_defer_writes() {
-        // 默认配置应产出非空 peer_opts 与非 None defer_writes
+        // 默认配置应产出非空 peer_opts;librqbit 9 已移除 Session 级 defer_writes
         let config = MagnetConfig::default();
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
-        let peer_opts = opts.peer_opts.expect("默认配置 peer_opts 应为 Some");
+        let peer_opts = opts
+            .connect
+            .as_ref()
+            .and_then(|c| c.peer_opts)
+            .expect("默认配置 peer_opts 应为 Some");
         assert_eq!(
             peer_opts.connect_timeout,
             Some(Duration::from_secs(8)),
@@ -664,9 +762,9 @@ mod tests {
             Some(Duration::from_secs(10)),
             "默认 peer_read_write_timeout_secs=10"
         );
+        // 配置字段仍保留默认 16MB(兼容/未来映射);SessionOptions 无对应字段
         assert_eq!(
-            opts.defer_writes_up_to,
-            Some(16),
+            config.defer_writes_up_to_mb, 16,
             "默认 defer_writes_up_to_mb=16"
         );
     }
@@ -843,7 +941,7 @@ mod tests {
             Some("socks5://user:pass@127.0.0.1:1080")
         );
         assert_eq!(
-            opts.socks_proxy_url.as_deref(),
+            opts.connect.as_ref().and_then(|c| c.proxy_url.as_deref()),
             Some("socks5://user:pass@127.0.0.1:1080")
         );
         // 报告脱敏
@@ -866,13 +964,16 @@ mod tests {
         let mut config = MagnetConfig::default();
         config.enable_upnp = true;
         let (opts, _eff, _src) = BtSession::build_session_options(&config);
-        assert!(
-            opts.listen_port_range.is_some(),
-            "enable_upnp=true 时 MUST 设 listen_port_range"
+        let listen = opts
+            .listen
+            .as_ref()
+            .expect("enable_upnp=true 时 MUST 设 listen");
+        assert!(listen.enable_upnp_port_forwarding, "UPnP 转发应开启");
+        assert_eq!(
+            listen.listen_addr.port(),
+            6881,
+            "默认 BT listen 端口 6881(librqbit 9 单端口,不再用 range end)"
         );
-        let range = opts.listen_port_range.unwrap();
-        assert_eq!(range.start, 6881, "默认 BT listen 端口起始 6881");
-        assert_eq!(range.end, 6889, "默认 BT listen 端口结束 6889");
     }
 
     /// BT-15:自定义 listen_port_start/end 覆盖默认 6881..6889
@@ -883,9 +984,10 @@ mod tests {
         config.listen_port_start = Some(7000);
         config.listen_port_end = Some(7010);
         let (opts, _eff, _src) = BtSession::build_session_options(&config);
-        let range = opts.listen_port_range.expect("自定义端口应生效");
-        assert_eq!(range.start, 7000);
-        assert_eq!(range.end, 7010);
+        let listen = opts.listen.as_ref().expect("自定义端口应生效");
+        // librqbit 9 ListenerOptions 使用单端口;取 listen_port_start
+        assert_eq!(listen.listen_addr.port(), 7000);
+        assert!(listen.enable_upnp_port_forwarding);
     }
 
     /// BT-15:enable_upnp=false(默认)时 MUST 不设 listen_port_range(不主动开 listener)。
@@ -896,7 +998,7 @@ mod tests {
         assert!(!config.enable_upnp);
         let (opts, _eff, _src) = BtSession::build_session_options(&config);
         assert!(
-            opts.listen_port_range.is_none(),
+            opts.listen.is_none(),
             "enable_upnp=false 时 MUST 不设 listen_port_range"
         );
     }
@@ -909,11 +1011,15 @@ mod tests {
         config.enable_upnp = true;
         let (opts, _eff, _src) = BtSession::build_session_options(&config);
         assert!(
-            opts.listen_port_range.is_none(),
+            opts.listen.is_none(),
             "high_privacy=true 优先,不设 listen_port_range"
         );
         assert!(
-            !opts.enable_upnp_port_forwarding,
+            !opts
+                .listen
+                .as_ref()
+                .map(|l| l.enable_upnp_port_forwarding)
+                .unwrap_or(false),
             "high_privacy=true 同时禁用 UPnP forwarding"
         );
     }

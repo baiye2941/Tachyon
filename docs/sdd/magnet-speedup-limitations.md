@@ -34,8 +34,12 @@ pub static DHT_BOOTSTRAP: &[&str] = &[
 
 **2026-07-24 更新**:`librqbit` **9.0.0-rc.0** 已新增 `DhtSessionConfig.bootstrap_addrs`
 与 `SessionOptions.dht: Option<DhtSessionConfig>`,**无需 fork** 即可注入 bootstrap。
-默认列表仍为 2 节点;升级 9.x stable 后由 Tachyon `MagnetConfig` 暴露可选列表即可关闭 P-04。
-完整评估见 `docs/sdd/librqbit-upgrade-and-pgo-eval.md`(结论:**不 fork 8.1.1,等 9 stable 升级**)。
+
+**已落地(feat/librqbit-9)**:workspace 升至 `librqbit`/`librqbit-core` **9.0.0-rc.0**;
+`MagnetConfig.dht_bootstrap_addrs` / `peer_limit` 透传 `SessionOptions`;
+`bt_session::build_session_options` 完成 8→9 字段映射(DHT/SOCKS/listen/peer_opts)。
+默认 bootstrap 仍为空→上游 2 节点;配置非空列表即可覆盖。详见
+`docs/sdd/librqbit-upgrade-and-pgo-eval.md`。
 
 ### T8: BEP-6 Fast Extension — 不可行
 

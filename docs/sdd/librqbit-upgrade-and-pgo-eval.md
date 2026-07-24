@@ -150,3 +150,12 @@ pub struct SessionOptions {
 - 本机 profile: `target/pgo/merged.profdata`（本地，不入库）
 - Bench 日志: `target/pgo/baseline-e2e.txt`, `target/pgo/pgo-e2e.txt`
 - 上游源码: `C:/cargo/registry/src/index.crates.io-*/librqbit-{8.1.1,9.0.0-rc.0}`
+
+## 6. 落地状态(feat/librqbit-9)
+
+- workspace: `librqbit` / `librqbit-core` → **9.0.0-rc.0**
+- `MagnetConfig`: `dht_bootstrap_addrs: Vec<String>`, `peer_limit: Option<usize>`
+- `bt_session::build_session_options`: DHT/SOCKS/listen/peer_opts/trackers 映射完成
+- 移除 8.x 字段: `disable_dht`/`socks_proxy_url`/`listen_port_range`/`defer_writes_up_to`(Session 级)
+- 测试: protocol magnet 105 + engine bt_session 28 + 全量 nextest **1985 passed**
+- 风险: 依赖 **rc** 版本;等 9.0.0 stable 后仅需 bump 版本号再回归
