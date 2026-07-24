@@ -22,21 +22,46 @@ RAW_DIR="${PGO_DIR}/raw"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# 解析 llvm-profdata:PATH → 版本后缀 → rustup llvm-tools(Windows 常见)
+resolve_llvm_profdata() {
+  if command -v llvm-profdata >/dev/null 2>&1; then
+    command -v llvm-profdata
+    return
+  fi
+  if command -v llvm-profdata-18 >/dev/null 2>&1; then
+    command -v llvm-profdata-18
+    return
+  fi
+  if command -v llvm-profdata-17 >/dev/null 2>&1; then
+    command -v llvm-profdata-17
+    return
+  fi
+  local sysroot
+  sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+  if [[ -n "$sysroot" ]]; then
+    local cand
+    # Unix: lib/rustlib/<triple>/bin/llvm-profdata
+    # Windows: lib/rustlib/<triple>/bin/llvm-profdata.exe
+    while IFS= read -r cand; do
+      if [[ -x "$cand" ]]; then
+        printf '%s
+' "$cand"
+        return
+      fi
+    done < <(find "$sysroot/lib/rustlib" -name 'llvm-profdata*' 2>/dev/null | head -5)
+  fi
+  return 1
+}
+
 need_llvm() {
-  command -v llvm-profdata >/dev/null 2>&1 \
-    || command -v llvm-profdata-18 >/dev/null 2>&1 \
-    || command -v llvm-profdata-17 >/dev/null 2>&1 \
-    || die "需要 llvm-profdata(安装 llvm 工具链)"
+  LLVM_PROFDATA_BIN="$(resolve_llvm_profdata)" || die "需要 llvm-profdata(rustup component add llvm-tools-preview 或系统 LLVM)"
+  export LLVM_PROFDATA_BIN
+  echo "using llvm-profdata: $LLVM_PROFDATA_BIN"
 }
 
 llvm_profdata() {
-  if command -v llvm-profdata >/dev/null 2>&1; then
-    llvm-profdata "$@"
-  elif command -v llvm-profdata-18 >/dev/null 2>&1; then
-    llvm-profdata-18 "$@"
-  else
-    llvm-profdata-17 "$@"
-  fi
+  need_llvm
+  "$LLVM_PROFDATA_BIN" "$@"
 }
 
 case "${MODE}" in

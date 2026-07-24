@@ -214,6 +214,8 @@ bash scripts/ci/pgo.sh clean
 
 PGO **不进** CI 关键路径(与 mutants/bench 同:本地或 main 采样),避免每次 PR 编译两遍。
 
+实测(2026-07-24,Windows,同会话 `e2e_download`):关键路径 `e2e_execute_download` PGO 相对 baseline **无 >10% 收益**(中位约 +1%,噪声内)。默认 release 保持 LTO-only;详见 `docs/sdd/librqbit-upgrade-and-pgo-eval.md`。
+
 ---
 
 ## 6. 发布构建优化

@@ -28,9 +28,14 @@ pub static DHT_BOOTSTRAP: &[&str] = &[
 `Session::new_with_opts` 内部构造 `DhtConfig { ..Default::default() }` 时
 显式取 `bootstrap_addrs: None`,用户无法通过 `SessionOptions` 注入。
 
-**结论**:要改 bootstrap,需 fork librqbit 或直接用 `librqbit-dht` crate 自建
+**结论(8.1.1)**:要改 bootstrap,需 fork librqbit 或直接用 `librqbit-dht` crate 自建
 `DhtConfig { bootstrap_addrs: Some(...) }`,但这绕过了 librqbit 的 Session 封装,
 需自行实现 DHT + tracker + peer 管理的协调逻辑,工作量与维护风险不匹配。
+
+**2026-07-24 更新**:`librqbit` **9.0.0-rc.0** 已新增 `DhtSessionConfig.bootstrap_addrs`
+与 `SessionOptions.dht: Option<DhtSessionConfig>`,**无需 fork** 即可注入 bootstrap。
+默认列表仍为 2 节点;升级 9.x stable 后由 Tachyon `MagnetConfig` 暴露可选列表即可关闭 P-04。
+完整评估见 `docs/sdd/librqbit-upgrade-and-pgo-eval.md`(结论:**不 fork 8.1.1,等 9 stable 升级**)。
 
 ### T8: BEP-6 Fast Extension — 不可行
 
@@ -72,9 +77,9 @@ P0/P1 阶段已完成的磁力链接提速项(无需 librqbit 上游改动):
 
 如需突破 librqbit 8.1.1 限制,可选路径(按工作量排序):
 
-1. **升级 librqbit**:跟踪上游版本,待 DHT bootstrap / Fast Extension / max_peer_count
-   公开 API 落地后接入(最低成本,但依赖上游排期)
-2. **Fork librqbit**:在 fork 中暴露 `DhtConfig.bootstrap_addrs` 等字段(中等工作量,
-   需持续 rebase 上游)
-3. **替换 BT 引擎**:自研或改用其他 Rust BT crate(如 `rust-bittorrent`),
-   完全控制协议层(最高工作量,不推荐)
+1. **升级 librqbit 9.x**(推荐):9.0.0-rc 已暴露 DHT bootstrap + `peer_limit`;
+   等 stable 后改 `bt_session::build_session_options`(破坏性映射见
+   `docs/sdd/librqbit-upgrade-and-pgo-eval.md`)。**不要**为 bootstrap 单独 fork 8.1.1。
+2. **Fork librqbit**:仅当 9.x 长期不可用或上游收回 bootstrap API 时再考虑
+   (rebase 成本高于升级)。
+3. **替换 BT 引擎**:自研或改用其他 Rust BT crate,完全控制协议层(最高工作量,不推荐)。
