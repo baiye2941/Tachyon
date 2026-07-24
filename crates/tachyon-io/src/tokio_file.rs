@@ -1062,17 +1062,28 @@ mod s05_nofollow_tests {
             Ok(_) => panic!("中间目录 symlink 应被拒绝"),
             Err(e) => e,
         };
-        // ELOOP 或类似错误
+        // openat(O_NOFOLLOW|O_DIRECTORY) 对中间 symlink 的 errno 因平台而异:
+        // - 常见 ELOOP(symlink 不跟随)
+        // - Linux 部分路径/内核组合也可能 ENOTDIR(把 symlink 当目录打开失败)
+        // 安全不变量:open 必须失败,且不得跟随写入 base 外。
         let raw = err.raw_os_error();
         assert!(
             raw == Some(libc::ELOOP)
+                || raw == Some(libc::ENOTDIR)
+                || err.kind() == std::io::ErrorKind::NotADirectory
                 || err.kind() == std::io::ErrorKind::Other
                 || err.to_string().contains("symlink")
+                || err.to_string().contains("directory")
                 || err.to_string().contains("重解析")
                 || err.to_string().contains("符号"),
-            "期望 ELOOP/symlink 错误, got kind={:?} raw={:?} msg={err}",
+            "期望 ELOOP/ENOTDIR(中间 symlink 拒绝), got kind={:?} raw={:?} msg={err}",
             err.kind(),
             raw
+        );
+        // 额外:不得在 symlink 目标(outside)下创建 file.bin
+        assert!(
+            !outside.join("file.bin").exists(),
+            "中间目录 symlink 被跟随时会在 outside 下创建文件,属于 TOCTOU 逃逸"
         );
     }
 

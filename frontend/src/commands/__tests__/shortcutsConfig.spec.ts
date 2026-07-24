@@ -138,7 +138,7 @@ describe('快捷键配置 store', () => {
       if (originalUAData) {
         Object.defineProperty(window.navigator, 'userAgentData', originalUAData)
       } else {
-        delete (window.navigator as any).userAgentData
+        Reflect.deleteProperty(window.navigator as object, 'userAgentData')
       }
       if (originalUA) {
         Object.defineProperty(window.navigator, 'userAgent', originalUA)

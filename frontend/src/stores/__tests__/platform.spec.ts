@@ -14,7 +14,7 @@ describe('isMacPlatform (E-08)', () => {
     } else {
       // remove synthetic property if we added one
       try {
-        delete (window.navigator as any).userAgentData
+        Reflect.deleteProperty(window.navigator as object, 'userAgentData')
       } catch {
         /* ignore */
       }
