@@ -115,21 +115,10 @@ impl WinFile {
 
     #[cfg(not(target_os = "windows"))]
     pub async fn open_standard<P: AsRef<Path>>(path: P) -> DownloadResult<Self> {
+        // 非 Windows:WinFile 回退路径复用 TokioFile openat 链(S-05 no-follow)
         let path = path.as_ref().to_path_buf();
-        // 审计 S-05:打开前拒绝中间目录 reparse,并 no-follow 创建父目录
-        if let Some(parent) = path.parent() {
-            crate::tokio_file::reject_existing_reparse_components(parent)
-                .map_err(DownloadError::Io)?;
-            crate::tokio_file::create_dir_all_nofollow(parent).map_err(DownloadError::Io)?;
-        }
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(DownloadError::Io)?;
+        let file =
+            crate::tokio_file::open_path_nofollow_create(&path).map_err(DownloadError::Io)?;
         Ok(Self {
             path,
             file: Arc::new(file),

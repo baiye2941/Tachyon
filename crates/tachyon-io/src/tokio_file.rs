@@ -20,8 +20,9 @@ pub struct TokioFile {
 
 /// 审计 S-05:Unix 句柄化 openat 链,中间目录 O_NOFOLLOW|O_DIRECTORY,最终组件 O_NOFOLLOW|O_CREAT。
 #[cfg(unix)]
-fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
 
     let mut components: Vec<&std::ffi::OsStr> = Vec::new();
@@ -60,17 +61,21 @@ fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
 
     let last = components.len() - 1;
     for (i, name) in components.iter().enumerate() {
-        let c_name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| {
+        // MSRV 1.85:用 OsStrExt::as_bytes,不用 as_encoded_bytes(1.87+)
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径组件含内部 NUL")
         })?;
         if i < last {
             // 中间目录:不存在则创建,打开时 O_NOFOLLOW|O_DIRECTORY
             let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+            // SAFETY: dir_fd 为有效目录 fd;c_name 为 NUL 结尾 C 字符串;flags 合法。
+            // openat 失败返回 -1,调用方检查后不把非法 fd 传给 OwnedFd。
             let mut fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
             if fd < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::NotFound {
                     // 创建中间目录后重开
+                    // SAFETY: 同上,mkdirat 仅用有效 dir_fd 与 C 字符串路径组件。
                     let mk = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0o755) };
                     if mk < 0 {
                         let e = std::io::Error::last_os_error();
@@ -79,6 +84,7 @@ fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
                             return Err(e);
                         }
                     }
+                    // SAFETY: 同上 openat 合约。
                     fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags) };
                     if fd < 0 {
                         return Err(std::io::Error::last_os_error());
@@ -87,14 +93,17 @@ fn open_path_nofollow_create(path: &Path) -> std::io::Result<std::fs::File> {
                     return Err(err);
                 }
             }
+            // SAFETY: fd >= 0 为 openat 返回的合法 fd,所有权转入 OwnedFd。
             dir_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         } else {
             // 最终组件:O_NOFOLLOW|O_CREAT|O_RDWR
             let flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            // SAFETY: dir_fd 有效;c_name NUL 结尾;mode 0o644 合法。失败时不消费 fd。
             let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // SAFETY: fd >= 0,File 取得所有权。
             return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
         }
     }
@@ -110,6 +119,7 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
     let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
     // 根目录 "/" 上 O_NOFOLLOW 无影响;相对 "." 亦然。
     // 若起始路径本身是 symlink,拒绝(ELOOP),避免从 symlink 基目录起链。
+    // SAFETY: c_path 为有效 C 字符串;flags 合法。失败返回 -1 不包装为 OwnedFd。
     let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if fd < 0 {
         // 基目录可能是已 canonicalize 的真实目录;O_NOFOLLOW 对非 symlink 无害。
@@ -117,14 +127,17 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
         let err = std::io::Error::last_os_error();
         if path == Path::new(".") || path == Path::new("/") {
             let flags2 = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY;
+            // SAFETY: 同上,仅对 "."/"/" 锚点回退打开。
             let fd2 = unsafe { libc::open(c_path.as_ptr(), flags2) };
             if fd2 < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // SAFETY: fd2 >= 0。
             return Ok(unsafe { OwnedFd::from_raw_fd(fd2) });
         }
         return Err(err);
     }
+    // SAFETY: fd >= 0。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -277,10 +290,6 @@ impl TokioFile {
     /// openat(O_NOFOLLOW|O_DIRECTORY) 返回 ELOOP 而非跟随到基目录外。
     #[cfg(unix)]
     pub fn open_sync<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-
         let path = path.as_ref().to_path_buf();
         let file = open_path_nofollow_create(&path)?;
         Ok(Self {

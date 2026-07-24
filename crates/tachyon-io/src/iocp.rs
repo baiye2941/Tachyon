@@ -1481,6 +1481,7 @@ mod tests {
         }
 
         // 模拟 poller 已完成该 slot:state→FREE,release bitmap
+        // SAFETY: 同 alloc 独占合约,模拟 poller 取走 pending。
         unsafe {
             let _ = (*slot.pending.get()).take();
         }
@@ -1524,6 +1525,7 @@ mod tests {
         // 线程 A:提交 I/O,捕获 generation
         let (slot_index, gen_a) = slots.alloc().expect("应有空闲 slot");
         let slot = &slots.slots[slot_index];
+        // SAFETY: slot 刚由 alloc 独占,state=SUBMITTED,无其他线程并发访问 pending。
         unsafe {
             *slot.pending.get() = Some(PendingWrite {
                 completion: tx,
@@ -1532,6 +1534,7 @@ mod tests {
         }
 
         // poller 完成:state→FREE,release bitmap
+        // SAFETY: 同 alloc 独占合约,模拟 poller 取走 pending。
         unsafe {
             let _ = (*slot.pending.get()).take();
         }
