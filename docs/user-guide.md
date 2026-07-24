@@ -245,7 +245,7 @@ cd frontend && bun run build
 | 限制 | 说明 |
 |------|------|
 | GPU 加速为空壳实现 | `tachyon-crypto` 的 `gpu` feature 当前仅编译通过，未完成实际 GPU 哈希管线 |
-| DHT bootstrap 仅 2 节点且不可自定义 | **审计 P-04**:librqbit 8.x 硬编码 2 个 DHT bootstrap,`SessionOptions` 不暴露 `bootstrap_addrs`(见 `docs/sdd/magnet-speedup-limitations.md` T7)。冷启动 metadata 国内常 20–40s;已有缓解:DHT 路由表持久化、tracker 列表扩展、SOCKS5 代理。自定义 bootstrap 需 fork librqbit 或绕过 Session 封装,本仓不维护 fork |
+| DHT bootstrap 可配置(librqbit 9+) | **审计 P-04**:已升 `librqbit` 9.0.0-rc.0;`MagnetConfig.dht_bootstrap_addrs` 非空时覆盖上游默认 2 节点。空列表仍用上游默认。另暴露 `peer_limit`。冷启动国内仍建议配置可达 bootstrap + SOCKS5。见 `docs/sdd/librqbit-upgrade-and-pgo-eval.md` |
 | QUIC 0-RTT 受 feature gate | 仅在 `http3` feature 启用时可用；0-RTT 被拒时透明回退 1-RTT |
 | HTTP/HTTPS 代理与 BT SOCKS5 代理已支持 | `DownloadConfig.proxy`(及 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量)与 `MagnetConfig.socks_proxy_url` 均已实现。**SEC-007 / 审计 S-06**:直连路径由 `PublicDnsResolver`/`reject_forbidden_ip` 过滤私网/链路本地/云元数据 IP;启用 HTTP/SOCKS 代理后,目标域名解析与可达 IP 由代理决定,本地过滤器**不覆盖**代理后端——**代理即 SSRF 信任边界**。仅配置你完全信任的代理;不要在不可信网络上把系统代理当作安全控制。代理凭据在日志中脱敏。 |
 | macOS io_uring 不可用 | macOS 不支持 io_uring，自动回退到 TokioFile |

@@ -605,7 +605,7 @@ stateDiagram-v2
 
 `AdaptiveDownloadScheduler` 根据预测带宽和文件大小计算最优 `fragment_size` 与 `concurrency`，置信度评估帮助判断决策可靠性。**审计 P-03**:plan 时刻冷启动 confidence≈0，生产分片大小由 `default_target_fragments` 配置式确定；execute 期 re-recommend 只调并发（见 §4.2）。
 
-**审计 P-04 / DHT**:librqbit 8.x 硬编码 2 个 DHT bootstrap，`SessionOptions` 不暴露自定义 `bootstrap_addrs`（详 `docs/sdd/magnet-speedup-limitations.md` T7）。本仓缓解：DHT 路由表持久化、tracker 扩展、SOCKS5；不维护 librqbit fork。
+**审计 P-04 / DHT**:已用 librqbit 9.0.0-rc.0；`MagnetConfig.dht_bootstrap_addrs` → `DhtSessionConfig.bootstrap_addrs`，`peer_limit` 透传。空 bootstrap 仍走上游默认 2 节点。Session 映射见 `bt_session::build_session_options`。
 
 **审计 E-05 测试金字塔**:单元测试为主；跨层集成支柱为 `crates/tachyon-engine/tests/chaos_test.rs`（真实 `DownloadTask::run` + 故障注入）、`crates/tachyon-app/tests/panic_log_e2e.rs`、以及 `e2e_download`/`e2e_http_real` bench。扩展时优先垂直切片，而非仅堆单元数。
 

@@ -26,6 +26,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use librqbit::file_info::FileInfo;
+#[cfg(test)]
+use librqbit::spawn_utils::BlockingSpawner;
 use librqbit::{AddTorrent, AddTorrentOptions, Magnet, ManagedTorrent, Session};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex as AsyncMutex;
@@ -624,9 +626,9 @@ impl MagnetProtocol {
         if let Some(live) = entry.handle.live() {
             let snap = live.stats_snapshot();
             let stats = BtPeerStats {
-                live_peers: snap.peer_stats.live,
-                connecting_peers: snap.peer_stats.connecting,
-                queued_peers: snap.peer_stats.queued,
+                live_peers: snap.peer_stats.live as usize,
+                connecting_peers: snap.peer_stats.connecting as usize,
+                queued_peers: snap.peer_stats.queued as usize,
                 downloaded_bytes: snap.downloaded_and_checked_bytes,
                 uploaded_bytes: snap.uploaded_bytes,
             };
@@ -1152,9 +1154,9 @@ impl PeerHealthSource for ManagedTorrentPeerHealth {
         let snap = self.handle.live().map(|live| live.stats_snapshot())?;
         let p = snap.peer_stats;
         Some(PeerCounts {
-            live: p.live,
-            connecting: p.connecting,
-            queued: p.queued,
+            live: p.live as usize,
+            connecting: p.connecting as usize,
+            queued: p.queued as usize,
         })
     }
 }
@@ -1856,8 +1858,9 @@ impl Protocol for MagnetProtocol {
                     let file_size = layout.total_len();
                     let file_name = handle
                         .with_metadata(|m| {
-                            m.name
-                                .clone()
+                            m.info
+                                .name()
+                                .map(|n| n.into_owned())
                                 .unwrap_or_else(|| "unknown_torrent".to_string())
                         })
                         .map_err(|e| {
@@ -1945,15 +1948,16 @@ impl Protocol for MagnetProtocol {
             let only_files_ref = only_files.as_deref();
             let metadata = handle.with_metadata(|m| {
                 let name = m
-                    .name
-                    .clone()
+                    .info
+                    .name()
+                    .map(|n| n.into_owned())
                     .unwrap_or_else(|| "unknown_torrent".to_string());
                 let layout = Self::layout_from_file_infos(&m.file_infos, only_files_ref);
                 // so= 选中时 file_size = 选中文件长度之和; 否则用 torrent 总长
                 let size = if only_files_ref.is_some() {
                     layout.total_len()
                 } else {
-                    m.lengths.total_length()
+                    m.lengths().total_length()
                 };
                 (name, size, layout)
             });
@@ -2205,7 +2209,7 @@ impl Protocol for MagnetProtocol {
                         // 区分"慢但活"(续命)与"死 swarm"(Timeout)
                         let progress: Arc<dyn ProgressSampler> =
                             Arc::new(ManagedTorrentProgress::new(Arc::clone(&handle)));
-                        match handle.stream(file_id) {
+                        match handle.stream(file_id).await {
                             Ok(mut stream) => {
                                 match stream.seek(std::io::SeekFrom::Start(local_start)).await {
                                     Ok(_) => {
@@ -2956,7 +2960,9 @@ mod tests {
             CreateTorrentOptions {
                 name: None,
                 piece_length: Some(piece_len),
+                trackers: Vec::new(),
             },
+            &BlockingSpawner::new(2),
         )
         .await?;
         let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
@@ -2965,9 +2971,9 @@ mod tests {
         let session = Session::new_with_opts(
             PathBuf::from(dir.path()),
             SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )
@@ -3035,7 +3041,9 @@ mod tests {
             CreateTorrentOptions {
                 name: None,
                 piece_length: Some(piece_len),
+                trackers: Vec::new(),
             },
+            &BlockingSpawner::new(2),
         )
         .await?;
         let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
@@ -3043,9 +3051,9 @@ mod tests {
         let session = Session::new_with_opts(
             PathBuf::from(dir.path()),
             SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )
@@ -3526,15 +3534,12 @@ mod tests {
         // 真正场景:cache 仍在但 handle.live() 返回 None(cleanup 后)。
         // 离线测试中无法真实 cleanup,因此只验证 lazy capture 不降低 API 质量:
         // 首次 Some 后第二次仍 Some(同一 live handle)。
-        if first.is_some() {
+        if let Some(first_stats) = first {
             let second = protocol.peer_stats_snapshot(&url);
-            assert!(
-                second.is_some(),
-                "lazy capture:第二次查询应仍返回 Some(同一 live handle)"
-            );
+            let second_stats =
+                second.expect("lazy capture:第二次查询应仍返回 Some(同一 live handle)");
             assert_eq!(
-                first.unwrap().live_peers,
-                second.unwrap().live_peers,
+                first_stats.live_peers, second_stats.live_peers,
                 "lazy capture:两次查询应返回一致统计"
             );
         }
@@ -4225,16 +4230,18 @@ mod tests {
             CreateTorrentOptions {
                 name: None,
                 piece_length: Some(512),
+                trackers: Vec::new(),
             },
+            &BlockingSpawner::new(2),
         )
         .await
         .expect("创建 torrent 失败");
         let session = Session::new_with_opts(
             PathBuf::from(dir.path()),
             SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )
@@ -4284,16 +4291,18 @@ mod tests {
             CreateTorrentOptions {
                 name: None,
                 piece_length: Some(256),
+                trackers: Vec::new(),
             },
+            &BlockingSpawner::new(2),
         )
         .await
         .expect("创建 torrent 失败");
         let session = Session::new_with_opts(
             PathBuf::from(dir.path()),
             SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use librqbit::api::TorrentIdOrHash::{Hash, Id};
+use librqbit::spawn_utils::BlockingSpawner;
 use librqbit::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions, create_torrent,
 };
@@ -1059,7 +1060,9 @@ async fn real_librqbit_added_fixture()
         CreateTorrentOptions {
             name: None,
             piece_length: Some(16 * 1024),
+            trackers: Vec::new(),
         },
+        &BlockingSpawner::new(2),
     )
     .await?;
     let torrent_bytes = torrent.as_bytes()?;
@@ -1068,9 +1071,9 @@ async fn real_librqbit_added_fixture()
     let session = Session::new_with_opts(
         PathBuf::from(target.path()),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1217,9 +1220,9 @@ async fn production_probe_failure_starts_tracked_nonblocking_cleanup()
     let session = Session::new_with_opts(
         root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1340,9 +1343,9 @@ async fn protocol_background_cleanup_request_is_nonblocking_and_tracked()
     let session = Session::new_with_opts(
         root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1431,7 +1434,9 @@ async fn production_probe_registers_cache_miss_added_with_session_coordinator()
         CreateTorrentOptions {
             name: None,
             piece_length: Some(16 * 1024),
+            trackers: Vec::new(),
         },
+        &BlockingSpawner::new(2),
     )
     .await?;
     let torrent_bytes = torrent.as_bytes()?;
@@ -1443,10 +1448,13 @@ async fn production_probe_registers_cache_miss_added_with_session_coordinator()
     let seeder_session = Session::new_with_opts(
         seeder_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: Some(librqbit::ListenerOptions {
+                enable_upnp_port_forwarding: false,
+                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                ..Default::default()
+            }),
             persistence: None,
-            listen_port_range: Some(45_000..45_100),
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1467,16 +1475,17 @@ async fn production_probe_registers_cache_miss_added_with_session_coordinator()
         .ok_or_else(|| std::io::Error::other("seeder torrent must be Added"))?;
     timeout(Duration::from_secs(5), seeder_handle.wait_until_completed()).await??;
     let seeder_port = seeder_session
-        .tcp_listen_port()
+        .listen_addr()
+        .map(|a| a.port())
         .ok_or_else(|| std::io::Error::other("seeder must expose a TCP listen port"))?;
 
     // Client 不预置 torrent 或 cache；probe 必须真实走 cache miss + initial peer metadata resolve。
     let client_session = Session::new_with_opts(
         client_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1586,7 +1595,9 @@ async fn production_download_range_stream_registers_cache_miss_added_with_sessio
         CreateTorrentOptions {
             name: None,
             piece_length: Some(16 * 1024),
+            trackers: Vec::new(),
         },
+        &BlockingSpawner::new(2),
     )
     .await?;
     let torrent_bytes = torrent.as_bytes()?;
@@ -1598,10 +1609,13 @@ async fn production_download_range_stream_registers_cache_miss_added_with_sessio
     let seeder_session = Session::new_with_opts(
         seeder_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: Some(librqbit::ListenerOptions {
+                enable_upnp_port_forwarding: false,
+                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                ..Default::default()
+            }),
             persistence: None,
-            listen_port_range: Some(45_100..45_200),
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1622,16 +1636,17 @@ async fn production_download_range_stream_registers_cache_miss_added_with_sessio
         .ok_or_else(|| std::io::Error::other("seeder torrent must be Added"))?;
     timeout(Duration::from_secs(5), seeder_handle.wait_until_completed()).await??;
     let seeder_port = seeder_session
-        .tcp_listen_port()
+        .listen_addr()
+        .map(|a| a.port())
         .ok_or_else(|| std::io::Error::other("seeder must expose a TCP listen port"))?;
 
     // Client 不预置 torrent 或 cache；download acquisition 必须真实走 cache miss。
     let client_session = Session::new_with_opts(
         client_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1748,7 +1763,9 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
         CreateTorrentOptions {
             name: None,
             piece_length: Some(16 * 1024),
+            trackers: Vec::new(),
         },
+        &BlockingSpawner::new(2),
     )
     .await
     .unwrap();
@@ -1760,10 +1777,13 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
     let seeder_session = Session::new_with_opts(
         seeder_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: Some(librqbit::ListenerOptions {
+                enable_upnp_port_forwarding: false,
+                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                ..Default::default()
+            }),
             persistence: None,
-            listen_port_range: Some(45_200..45_300),
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -1788,14 +1808,14 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
         .await
         .unwrap()
         .unwrap();
-    let seeder_port = seeder_session.tcp_listen_port().unwrap();
+    let seeder_port = seeder_session.listen_addr().map(|a| a.port()).unwrap();
 
     let client_session = Session::new_with_opts(
         client_root.path().to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None, // 测试禁用 DHT
+            listen: None,
             persistence: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )

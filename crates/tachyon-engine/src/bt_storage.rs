@@ -283,9 +283,11 @@ impl TachyonStorageFactory {
     ) -> anyhow::Result<Vec<Arc<dyn AsyncStorage>>> {
         let file_infos = &metadata.file_infos;
         let preferred = self.preferred_root_name.read().clone();
+        // librqbit 9:TorrentMetadata 无顶层 name,走 info.name()
+        let meta_name = metadata.info.name().map(|n| n.into_owned());
         let torrent_name = preferred
             .as_deref()
-            .or(metadata.name.as_deref())
+            .or(meta_name.as_deref())
             .unwrap_or("unknown_torrent");
         let file_names: Vec<String> = file_infos
             .iter()

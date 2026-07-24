@@ -4176,9 +4176,9 @@ mod tests {
         let session = librqbit::Session::new_with_opts(
             dir.path().to_path_buf(),
             librqbit::SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )
@@ -4267,6 +4267,7 @@ mod tests {
         ),
         Box<dyn std::error::Error>,
     > {
+        use librqbit::spawn_utils::BlockingSpawner;
         use librqbit::{
             AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
             create_torrent,
@@ -4285,7 +4286,9 @@ mod tests {
             CreateTorrentOptions {
                 name: None,
                 piece_length: Some(piece_len),
+                trackers: Vec::new(),
             },
+            &BlockingSpawner::new(2),
         )
         .await?;
         let magnet_url = format!("magnet:?xt=urn:btih:{}", torrent.info_hash().as_string());
@@ -4294,9 +4297,9 @@ mod tests {
         let session = Session::new_with_opts(
             std::path::PathBuf::from(dir.path()),
             SessionOptions {
-                disable_dht: true,
+                dht: None, // 测试禁用 DHT
+                listen: None,
                 persistence: None,
-                enable_upnp_port_forwarding: false,
                 ..Default::default()
             },
         )
