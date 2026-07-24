@@ -171,10 +171,11 @@ struct AlignedBuffer {
     len: usize,
 }
 
-// Safety: AlignedBuffer 始终在 driver task 架构下使用，
+// SAFETY: AlignedBuffer 始终在 driver task 架构下使用，
 // 保证同一 buffer 的并发访问被 driver task 串行化。
 #[cfg(target_os = "linux")]
 unsafe impl Send for AlignedBuffer {}
+// SAFETY: 同 Send — driver 串行化对 pending buffer 的访问，无跨线程别名写。
 #[cfg(target_os = "linux")]
 unsafe impl Sync for AlignedBuffer {}
 

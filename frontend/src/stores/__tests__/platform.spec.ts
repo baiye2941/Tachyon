@@ -14,7 +14,6 @@ describe('isMacPlatform (E-08)', () => {
     } else {
       // remove synthetic property if we added one
       try {
-        // @ts-expect-error cleanup
         delete (window.navigator as any).userAgentData
       } catch {
         /* ignore */

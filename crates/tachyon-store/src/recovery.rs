@@ -1942,6 +1942,7 @@ mod tests {
     /// 当前实现先清 tombstone 再写,故 write 失败后 tombstone 已丢失 → RED。
     /// 注入手段:将目标文件设为只读,使 `rename` 失败(读不受影响),
     /// 经探针确认 `load` 成功而 `put_durable` 返回 `RecoveryError::Io`。
+    #[allow(clippy::permissions_set_readonly_false)] // 测试清理:还原临时文件可写
     #[test]
     fn s02b_restore_keeps_tombstone_when_durable_write_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2064,7 +2065,8 @@ mod tests {
         let snap = make_snapshot("active", tachyon_core::DownloadState::Downloading);
         mgr.save_task_snapshot(&snap).unwrap();
 
-        let reservation = mgr.reserve_task_namespace().unwrap();
+        // 必须持有 reservation 至测试结束,以阻塞正常 API
+        let _reservation = mgr.reserve_task_namespace().unwrap();
 
         fn expect_reservation_active(err: RecoveryError) {
             match err {

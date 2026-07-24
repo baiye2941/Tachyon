@@ -1058,7 +1058,10 @@ mod s05_nofollow_tests {
         // 把 mid 换成指向 outside 的 symlink
         fs::remove_dir(&mid).unwrap();
         std::os::unix::fs::symlink(&outside, &mid).unwrap();
-        let err = TokioFile::open_sync(&target).expect_err("中间目录 symlink 应被拒绝");
+        let err = match TokioFile::open_sync(&target) {
+            Ok(_) => panic!("中间目录 symlink 应被拒绝"),
+            Err(e) => e,
+        };
         // ELOOP 或类似错误
         let raw = err.raw_os_error();
         assert!(

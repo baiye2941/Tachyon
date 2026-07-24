@@ -138,7 +138,6 @@ describe('快捷键配置 store', () => {
       if (originalUAData) {
         Object.defineProperty(window.navigator, 'userAgentData', originalUAData)
       } else {
-        // @ts-expect-error cleanup
         delete (window.navigator as any).userAgentData
       }
       if (originalUA) {
