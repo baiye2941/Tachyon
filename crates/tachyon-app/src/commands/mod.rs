@@ -989,6 +989,18 @@ pub(crate) mod tests {
             std::process::id(),
             TEST_CONFIG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        // 测试夹具 magnet 配置:禁用 DHT/UPnP/DHT 持久化并清空 tracker。
+        // download_dir 变更会触发 BtSession 重建,默认 enable_dht=true 会在
+        // 无网络/DHT 受限环境(CI/沙箱)bootstrap DHT 失败。对齐
+        // bt_session::tests::test_config 的最小网络副作用配置,避免真实网络 IO。
+        let test_magnet = {
+            let mut m = tachyon_core::config::MagnetConfig::default();
+            m.enable_dht = false;
+            m.enable_upnp = false;
+            m.disable_dht_persistence = true;
+            m.trackers = Vec::new();
+            m
+        };
         let config_arc = Arc::new(tokio::sync::Mutex::new(AppConfig {
             max_concurrent_tasks: 5,
             download: DownloadConfig {
@@ -998,7 +1010,7 @@ pub(crate) mod tests {
             },
             connection: ConnectionConfig::default(),
             scheduler: Default::default(),
-            magnet: Default::default(),
+            magnet: test_magnet,
             hub: Default::default(),
             clipboard: Default::default(),
             notifications: Default::default(),

@@ -50,7 +50,10 @@ pub enum DownloadError {
     #[error("服务端限流{}", retry_after_secs.map(|s| format!(": 建议 {s}s 后重试")).unwrap_or_default())]
     Throttled { retry_after_secs: Option<u64> },
 
-    /// 权限错误(HTTP 401/403)。重试无法解决,应立即终止该任务。
+    /// 权限/拒绝错误(HTTP 401/403)。
+    ///
+    /// - 401:认证失败,重试无法解决,应立即终止
+    /// - 403:部分 CDN/WAF 对突发连接的软拒绝,可有限重试并降并发
     #[error("权限不足(HTTP {status})")]
     Forbidden { status: u16 },
 
@@ -177,16 +180,16 @@ impl DownloadError {
 
     /// 判断错误是否值得重试
     ///
-    /// - 取消、权限错误不重试
+    /// - 取消、401 认证失败不重试
     /// - 校验失败不重试(数据已损坏)
-    /// - HTTP 4xx 客户端错误不重试(除 408/429 外,重试无法解决)
+    /// - HTTP 4xx 客户端错误不重试(除 403/408/429 外)
+    /// - 403 视为 CDN/WAF 软拒绝,可有限重试
     /// - 超时、网络、协议、I/O、限流、5xx 服务端错误可重试
     pub fn is_retryable(&self) -> bool {
         match self {
             // 绝对不可重试
             DownloadError::Cancelled
             | DownloadError::Paused
-            | DownloadError::Forbidden { .. }
             | DownloadError::ChecksumMismatch { .. }
             | DownloadError::NoExpectedChecksum
             | DownloadError::TaskNotFound(_)
@@ -195,10 +198,14 @@ impl DownloadError {
             | DownloadError::Serialization(_)
             | DownloadError::RangeNotSupported => false,
 
-            // HTTP 4xx 客户端错误不可重试 (429/408 除外)
+            // 401 认证失败不可恢复;403 常是 CDN/WAF 软拒绝,允许有限重试+降并发
+            DownloadError::Forbidden { status } => *status == 403,
+
+            // HTTP 4xx 客户端错误不可重试 (403/408/429 除外)
             DownloadError::Http { status, .. } => {
                 let s = *status;
-                s == 429 // Too Many Requests (限流, 等同 Throttled)
+                s == 403 // Forbidden 软拒绝(与 Forbidden 变体同语义)
+                    || s == 429 // Too Many Requests (限流, 等同 Throttled)
                     || s == 408 // Request Timeout (超时, 可能瞬时)
                     || s >= 500 // 5xx 服务端错误可重试
             }
@@ -521,7 +528,8 @@ mod tests {
         let v = to_json(&err);
         assert_eq!(v["type"], "Forbidden");
         assert_eq!(v["status"], 403);
-        assert_eq!(v["retryable"], false);
+        // 403 视为 CDN/WAF 软拒绝,可有限重试(与 is_retryable 语义一致)
+        assert_eq!(v["retryable"], true);
     }
 
     #[test]
@@ -640,7 +648,14 @@ mod tests {
     fn test_is_retryable_returns_false_for_non_retryable() {
         assert!(!DownloadError::Cancelled.is_retryable());
         assert!(!DownloadError::Paused.is_retryable());
-        assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
+        assert!(
+            DownloadError::Forbidden { status: 403 }.is_retryable(),
+            "403 软拒绝可重试"
+        );
+        assert!(
+            !DownloadError::Forbidden { status: 401 }.is_retryable(),
+            "401 不可重试"
+        );
         assert!(
             !DownloadError::ChecksumMismatch {
                 expected: "a".into(),
@@ -714,7 +729,7 @@ mod tests {
     #[test]
     fn test_is_retryable_returns_false_for_4xx_client_errors() {
         // S-5: HTTP 4xx 客户端错误不应重试
-        for status in [400, 401, 403, 404, 405, 406, 410] {
+        for status in [400, 401, 404, 405, 406, 410] {
             assert!(
                 !DownloadError::Http {
                     status,
@@ -751,7 +766,7 @@ mod tests {
             .is_retryable()
         );
 
-        for status in [500, 502, 503, 504, 429, 408] {
+        for status in [500, 502, 503, 504, 429, 408, 403] {
             assert!(
                 DownloadError::Http {
                     status,
@@ -761,12 +776,23 @@ mod tests {
                 "HTTP {status} 应可重试"
             );
         }
+        assert!(
+            DownloadError::Forbidden { status: 403 }.is_retryable(),
+            "Forbidden 403 应可重试"
+        );
     }
 
     #[test]
     fn test_is_retryable_truth_table_non_retryable_variants() {
         assert!(!DownloadError::Cancelled.is_retryable());
-        assert!(!DownloadError::Forbidden { status: 403 }.is_retryable());
+        assert!(
+            DownloadError::Forbidden { status: 403 }.is_retryable(),
+            "403 软拒绝可重试"
+        );
+        assert!(
+            !DownloadError::Forbidden { status: 401 }.is_retryable(),
+            "401 不可重试"
+        );
         assert!(
             !DownloadError::ChecksumMismatch {
                 expected: "a".into(),
@@ -786,7 +812,7 @@ mod tests {
         );
         assert!(!DownloadError::Other("o".into()).is_retryable());
 
-        for status in [400, 401, 403, 404, 405, 406, 410] {
+        for status in [400, 401, 404, 405, 406, 410] {
             assert!(
                 !DownloadError::Http {
                     status,

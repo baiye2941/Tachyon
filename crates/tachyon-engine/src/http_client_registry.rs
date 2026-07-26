@@ -128,6 +128,24 @@ impl HttpClientRegistry {
         }
     }
 
+    /// 丢弃全部缓存的 HttpClient。
+    ///
+    /// 用途:代理 soft-pressure(零进度 TLS EOF 风暴)后,旧 reqwest 池中可能残留
+    /// 半死 idle 连接;跨任务同身份复用会把故障传给健康任务。clear 后下次
+    /// get_or_create 重建空池。持有 Arc 的在途任务仍可用旧 client 至 drop。
+    pub fn clear(&self) {
+        self.map.clear();
+    }
+
+    /// 当前缓存 client 数(测试/诊断)
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// 获取或创建匹配身份的 HttpClient(Arc 共享)
     #[allow(clippy::too_many_arguments)]
     pub fn get_or_create(
@@ -181,15 +199,6 @@ impl HttpClientRegistry {
                 Ok(arc)
             }
         }
-    }
-
-    /// 当前缓存条目数(测试/诊断)
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 
@@ -366,5 +375,21 @@ mod tests {
             .unwrap();
         assert!(!reg.is_empty(), "有条目后应非空");
         assert_eq!(reg.len(), 1);
+    }
+    #[test]
+    fn test_registry_clear_drops_cached_clients() {
+        let reg = HttpClientRegistry::new();
+        let headers = HashMap::new();
+        let a = reg
+            .get_or_create("UA-clear", None, 5, 10, None, &headers, None)
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        reg.clear();
+        assert!(reg.is_empty());
+        let b = reg
+            .get_or_create("UA-clear", None, 5, 10, None, &headers, None)
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        assert!(!Arc::ptr_eq(&a, &b), "clear 后必须新建 client");
     }
 }

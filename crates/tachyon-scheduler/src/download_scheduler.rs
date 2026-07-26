@@ -57,11 +57,37 @@ impl AdaptiveDownloadScheduler {
     pub fn default_config() -> Self {
         Self::new(SchedulerConfig::default())
     }
+
+    /// 按 RTT 限制冷启动并发上限。
+    ///
+    /// - RTT < 30ms: 不额外限制(loopback/局域网)
+    /// - 30–80ms: 最多 6
+    /// - 80–150ms: 最多 3
+    /// - 150–250ms: 最多 2
+    /// - ≥250ms: 最多 1
+    ///
+    /// 结果仍 clamp 到 [1, max_concurrency]。
+    /// 注:经 HTTP 代理时 probe RTT 可能被压缩到近 0;engine 另有 proxy 冷启动 cap。
+    fn rtt_cold_start_cap(rtt_secs: f64, max_concurrency: u32) -> u32 {
+        let max_c = max_concurrency.max(1);
+        let cap = if rtt_secs < 0.03 {
+            max_c
+        } else if rtt_secs < 0.08 {
+            6
+        } else if rtt_secs < 0.15 {
+            3
+        } else if rtt_secs < 0.25 {
+            2
+        } else {
+            1
+        };
+        cap.min(max_c).max(1)
+    }
 }
 
 impl DownloadScheduler for AdaptiveDownloadScheduler {
     fn observe_bandwidth(&self, bytes_per_sec: u64) {
-        tracing::info!(bandwidth = bytes_per_sec, "带宽分配更新");
+        tracing::debug!(bandwidth = bytes_per_sec, "带宽分配更新");
         {
             let mut pred = self.predictor.write();
             pred.observe(bytes_per_sec as f64);
@@ -171,18 +197,27 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             // 慢启动:早期样本用 ramp 抬升;样本充足后用 holt(+多连接下限)。
             const RAMP_SAMPLE_THRESHOLD: u64 = 8;
             let samples = self.predictor.read().sample_count();
-            if samples < RAMP_SAMPLE_THRESHOLD {
+            let mut c = if samples < RAMP_SAMPLE_THRESHOLD {
                 let ramp = (*self.ramp_concurrency.read()).min(max_c).max(1);
                 holt.max(ramp).min(max_c)
             } else {
                 holt
+            };
+            // 高 RTT 冷启动上限:probe 注入的 RTT 偏大时,限制早期并发,
+            // 降低 CDN/网关对突发多连接的掐断(TLS EOF/504)。样本充足后
+            // 仍走 holt,由 soft-pressure 与 re-recommend 继续调。
+            if samples < RAMP_SAMPLE_THRESHOLD {
+                c = c.min(Self::rtt_cold_start_cap(rtt_secs, max_c));
             }
+            c
         } else {
             // 冷启动(无带宽样本):从 cold_start_initial_concurrency 起步,
             // 避免瞬时打满连接触发 429/限速;样本到位后由 ramp 爬坡。
-            (*self.ramp_concurrency.read())
+            // 同样叠加 RTT 上限。
+            let ramp = (*self.ramp_concurrency.read())
                 .min(max_concurrency.max(1))
-                .max(1)
+                .max(1);
+            ramp.min(Self::rtt_cold_start_cap(rtt_secs, max_concurrency.max(1)))
         };
 
         let recommendation = ScheduleRecommendation {
@@ -249,6 +284,71 @@ mod tests {
         // max_concurrency 为 0 时应至少保证 1 并发
         let rec_0 = sched.recommend(100 * 1024 * 1024, 0);
         assert_eq!(rec_0.concurrency, 1);
+    }
+
+    #[test]
+    fn test_rtt_cold_start_cap_tiers() {
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.01, 16),
+            16,
+            "低 RTT 不限制"
+        );
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.05, 16),
+            6,
+            "50ms 上限 6"
+        );
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.10, 16),
+            3,
+            "100ms 上限 3"
+        );
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.20, 16),
+            2,
+            "200ms 上限 2"
+        );
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.40, 16),
+            1,
+            "400ms 上限 1"
+        );
+        assert_eq!(
+            AdaptiveDownloadScheduler::rtt_cold_start_cap(0.40, 1),
+            1,
+            "不超过 max_concurrency"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_high_rtt_caps_concurrency() {
+        let sched = AdaptiveDownloadScheduler::new(SchedulerConfig {
+            cold_start_initial_concurrency: 16,
+            ..Default::default()
+        });
+        // 默认 RTT=50ms → 上限 6
+        let rec_default = sched.recommend(100 * 1024 * 1024, 16);
+        assert_eq!(
+            rec_default.concurrency, 6,
+            "默认 RTT 50ms 冷启动 concurrency 应 cap 到 6,实际 {}",
+            rec_default.concurrency
+        );
+
+        sched.observe_rtt(Duration::from_millis(200));
+        let rec_high = sched.recommend(100 * 1024 * 1024, 16);
+        assert_eq!(
+            rec_high.concurrency, 2,
+            "RTT 200ms 冷启动 concurrency 应 cap 到 2,实际 {}",
+            rec_high.concurrency
+        );
+
+        sched.observe_rtt(Duration::from_millis(300));
+        let rec_very_high = sched.recommend(100 * 1024 * 1024, 16);
+        assert_eq!(
+            rec_very_high.concurrency, 1,
+            "RTT 300ms 冷启动 concurrency 应 cap 到 1,实际 {}",
+            rec_very_high.concurrency
+        );
     }
 
     #[test]
@@ -772,6 +872,9 @@ mod tests {
             cold_start_ramp_factor: 2.0,
             ..Default::default()
         });
+        // 注入低 RTT(10ms < 30ms),避免默认 50ms 命中 rtt_cold_start_cap 的
+        // 30-80ms 档(上限 6)把第 3 次爬坡压到 6;本测试只验证 ramp 爬坡序列。
+        sched.observe_rtt(Duration::from_millis(10));
 
         // 1. 冷启动:concurrency == 1
         let rec0 = sched.recommend(100 * 1024 * 1024, 8);

@@ -85,6 +85,24 @@ fn http_proxy_remote_dns(proxy_url: &str) -> String {
     }
 }
 
+/// 本地/loopback 地址不走代理(bench server、wiremock、本机服务)。
+///
+/// 否则 `Proxy::all` + 系统 HTTP_PROXY 会把 `127.0.0.1:随机端口` 也塞进代理,
+/// 代理拒绝或无法转发时表现为 "连接被拒绝",掩盖真实本机服务可用。
+fn apply_loopback_no_proxy(proxy: reqwest::Proxy) -> reqwest::Proxy {
+    proxy.no_proxy(Some(
+        reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,.localhost")
+            .expect("静态 no_proxy 列表合法"),
+    ))
+}
+
+/// 配置/基线用的"强制直连"哨兵:不走系统 HTTP(S)/ALL_PROXY。
+fn is_direct_proxy_directive(proxy: Option<&str>) -> bool {
+    proxy
+        .map(str::trim)
+        .is_some_and(|s| s.eq_ignore_ascii_case("direct") || s.eq_ignore_ascii_case("none"))
+}
+
 /// 协议保留头:用户自定义 headers 不得覆盖,否则破坏 Range/If-Range/Host 等引擎语义。
 fn is_reserved_request_header(name: &str) -> bool {
     matches!(
@@ -330,7 +348,11 @@ impl HttpClient {
         // resolve_http_proxy 在仅有 HTTP_PROXY 时也返回它,配合 Proxy::all 覆盖 HTTPS CONNECT。
         // 审计 SEC-007:走代理时 PublicDnsResolver 只解析代理主机,目标域名由代理解析;
         // 本地 reject_forbidden_ip 不覆盖代理后端——代理即 SSRF 信任边界。
-        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
+        // proxy="direct"/"none":强制不走系统代理(reqwest 默认会读 env,必须显式 no_proxy)。
+        // 其它:resolve_http_proxy(显式 > env);None 且无 env 则直连。
+        if is_direct_proxy_directive(proxy) {
+            builder = builder.no_proxy();
+        } else if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:把 socks5:// 转 socks5h:// 让 reqwest 远程解析目标域名,
             // 防止走代理的 HTTP(S) tracker 请求在本地 DNS 泄漏目标域名。
             // (BT peer 路径仍用 socks5://,librqbit 不识别 socks5h://)
@@ -345,7 +367,7 @@ impl HttpClient {
                     e
                 ))
             })?;
-            builder = builder.proxy(proxy);
+            builder = builder.proxy(apply_loopback_no_proxy(proxy));
         }
 
         if connect_secs > 0 {
@@ -481,7 +503,9 @@ impl HttpClient {
             .http2_keep_alive_while_idle(true)
             .http2_prior_knowledge();
 
-        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
+        if is_direct_proxy_directive(proxy) {
+            builder = builder.no_proxy();
+        } else if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
             let proxy_url = http_proxy_remote_dns(&proxy_url);
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
@@ -491,7 +515,7 @@ impl HttpClient {
                     e
                 ))
             })?;
-            builder = builder.proxy(proxy);
+            builder = builder.proxy(apply_loopback_no_proxy(proxy));
         }
         if connect_secs > 0 {
             builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
@@ -532,7 +556,9 @@ impl HttpClient {
             .tcp_nodelay(true)
             .http1_only();
 
-        if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
+        if is_direct_proxy_directive(proxy) {
+            builder = builder.no_proxy();
+        } else if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
             // BT-13:socks5 → socks5h 强制 reqwest 远程 DNS(防本地 DNS 泄漏)
             let proxy_url = http_proxy_remote_dns(&proxy_url);
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
@@ -542,7 +568,7 @@ impl HttpClient {
                     e
                 ))
             })?;
-            builder = builder.proxy(proxy);
+            builder = builder.proxy(apply_loopback_no_proxy(proxy));
         }
         if connect_secs > 0 {
             builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
@@ -1117,7 +1143,12 @@ enum HeadEvalError {
 /// 决策顺序:
 /// 1. 状态码非 2xx → `head_status_should_fallback` 决定是回退还是分类错误
 /// 2. 状态码 2xx 但 `Content-Type` 是 HTML → 终态错误,告知用户该链接不是文件
-/// 3. 否则 → 提取元数据
+/// 3. 2xx 且 `Accept-Ranges` 声明 bytes → **NeedFallback**(必须 GET Range 0-0 证实 206)
+/// 4. 否则 → 提取元数据,且 `supports_range=false`(HEAD  alone 不能证明 Range)
+///
+/// 审计:GitHub/CDN/WAF 常见 HEAD 200 + Accept-Ranges:bytes,但实际 Range 返回 200/403。
+/// 若信任 Accept-Ranges 会多分片规划后整块回退,浪费探测/连接。GET Range 路径已对
+/// 200 强制 supports_range=false;HEAD 不得比 GET 更乐观。
 ///
 /// 所有错误消息均附带 URL 上下文(若发生过重定向,以 `原始 -> 最终` 形式展示)。
 fn evaluate_head_response(
@@ -1147,8 +1178,25 @@ fn evaluate_head_response(
         ))));
     }
 
-    // 提取元数据时使用 final_url(重定向后的真实地址),与文件名解析保持一致
+    // Accept-Ranges 声明 bytes:必须 GET Range 0-0 拿 206,禁止 HEAD 假阳性
+    if head_claims_accept_ranges_bytes(headers) {
+        return Err(HeadEvalError::NeedFallback);
+    }
+
+    // 无 Accept-Ranges 声明:提取元数据,supports_range 保持 false
     Ok(metadata_from_headers(final_url, headers, false))
+}
+
+/// HEAD 是否声明 `Accept-Ranges: bytes`(不区分大小写,兼容 `bytes, none` 等)
+fn head_claims_accept_ranges_bytes(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("accept-ranges")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("bytes"))
+        })
+        .unwrap_or(false)
 }
 
 /// 解析 Retry-After 头部值
@@ -1249,7 +1297,7 @@ fn days_from_epoch(year: u32, month: u32, day: u32) -> i64 {
 /// `range_response = true` 表示响应来自 `GET Range: bytes=0-0`(206 Partial Content):
 /// 文件大小取自 `Content-Range: bytes 0-0/<total>`,`supports_range` 恒为 true(服务端
 /// 已确认支持 Range)。`range_response = false` 表示 HEAD/200:`file_size` 取自
-/// `Content-Length`,`supports_range` 取自 `Accept-Ranges` 头。
+/// `Content-Length`,`supports_range` **恒为 false**(Accept-Ranges 不可单独采信)。
 fn metadata_from_headers(
     url: &str,
     headers: &reqwest::header::HeaderMap,
@@ -1283,11 +1331,10 @@ fn metadata_from_headers(
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        let supports = headers
-            .get("accept-ranges")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("bytes"))
-            .unwrap_or(false);
+        // HEAD/200 路径:禁止仅凭 Accept-Ranges 宣称 supports_range。
+        // 真 Range 能力只由 206(range_response=true)或后续引擎实测证明。
+        // evaluate_head 在见到 Accept-Ranges:bytes 时会 NeedFallback→GET Range 0-0。
+        let supports = false;
         (size, supports)
     };
 
@@ -1328,14 +1375,20 @@ async fn probe_via_get_range(
     {
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| {
+    let response = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
             let chain = error_chain(&e);
-            warn!(url = %tachyon_core::redact_url_for_log(request_url), error = %e, error_chain = %chain, "GET Range 探测连接失败");
-            DownloadError::Network(format!("GET Range 探测失败: {chain}"))
-        })?;
+            warn!(
+                url = %tachyon_core::redact_url_for_log(request_url),
+                error = %e,
+                error_chain = %chain,
+                "GET Range 探测连接失败,回退 plain GET 探测"
+            );
+            // 连接级失败(非 HTTP status)也尝试 plain GET:部分网络对 Range 首包更敏感
+            return probe_via_get_no_range(client, request_url, auth_bearer).await;
+        }
+    };
 
     let final_url = response.url().as_str().to_owned();
     let url_context = format_probe_url_context(request_url, &final_url);
@@ -1379,12 +1432,97 @@ async fn probe_via_get_range(
         );
         return Ok(metadata);
     }
+    // 部分 CDN/WAF 拒绝 Range:0-0(403/405)但允许无 Range 的 GET;
+    // 再退一次 plain GET 仅取头,避免 probe 直接终态失败。
+    if matches!(status.as_u16(), 403 | 405 | 429 | 502 | 503 | 504) {
+        warn!(
+            url = %tachyon_core::redact_url_for_log(&final_url),
+            status = %status,
+            "GET Range 探测被拒,回退 plain GET 探测"
+        );
+        match probe_via_get_no_range(client, request_url, auth_bearer).await {
+            Ok(meta) => return Ok(meta),
+            Err(e) => {
+                warn!(
+                    url = %tachyon_core::redact_url_for_log(request_url),
+                    error = %e,
+                    "plain GET 探测仍失败"
+                );
+                // 保留原始 Range 错误语义(含 status),便于上层 soft-pressure/诊断
+            }
+        }
+    }
     warn!(url = %tachyon_core::redact_url_for_log(&final_url), status = %status, "GET Range 探测返回非成功状态码");
     Err(classify_http_error_with_context(
         status,
         response.headers(),
         &url_context,
     ))
+}
+
+/// HEAD/Range 均被拒时,用无 Range 的 GET 取响应头探测元数据。
+///
+/// 不消费响应体(drop response 后 reqwest 中断读取)。服务端未证明 Range 支持,
+/// 强制 `supports_range=false`,避免后续分片路径放大浪费。
+async fn probe_via_get_no_range(
+    client: &Client,
+    request_url: &str,
+    auth_bearer: Option<&str>,
+) -> DownloadResult<FileMetadata> {
+    debug!(url = %tachyon_core::redact_url_for_log(request_url), "plain GET 探测开始");
+    let mut req = client.get(request_url);
+    if let Some(token) = auth_bearer
+        && let Ok(parsed) = reqwest::Url::parse(request_url)
+        && let Some(host) = parsed.host_str()
+        && host_allows_hf_token(host)
+    {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req.send().await.map_err(|e| {
+        let chain = error_chain(&e);
+        warn!(
+            url = %tachyon_core::redact_url_for_log(request_url),
+            error = %e,
+            error_chain = %chain,
+            "plain GET 探测连接失败"
+        );
+        DownloadError::Network(format!("plain GET 探测失败: {chain}"))
+    })?;
+
+    let final_url = response.url().as_str().to_owned();
+    let url_context = format_probe_url_context(request_url, &final_url);
+    let status = response.status();
+    if !status.is_success() {
+        warn!(
+            url = %tachyon_core::redact_url_for_log(&final_url),
+            status = %status,
+            "plain GET 探测返回非成功状态码"
+        );
+        return Err(classify_http_error_with_context(
+            status,
+            response.headers(),
+            &url_context,
+        ));
+    }
+    if is_html_response(response.headers()) {
+        warn!(
+            url = %tachyon_core::redact_url_for_log(&final_url),
+            "plain GET 探测返回 HTML 页面,拒绝下载"
+        );
+        return Err(DownloadError::Protocol(format!(
+            "{url_context} 返回 HTML 页面而非可下载文件,请确认链接是否正确"
+        )));
+    }
+    let mut metadata = metadata_from_headers(&final_url, response.headers(), false);
+    // 未用 Range 探测成功,不能宣称支持 Range
+    metadata.supports_range = false;
+    info!(
+        url = %tachyon_core::redact_url_for_log(&final_url),
+        file_size = ?metadata.file_size,
+        supports_range = metadata.supports_range,
+        "plain GET 探测完成(强制 supports_range=false)"
+    );
+    Ok(metadata)
 }
 
 /// 对任意字节流应用"200 回退"扫描:跳过前 `start` 字节,截取 `need` 字节。
@@ -1477,7 +1615,7 @@ impl Protocol for HttpClient {
             // 把判定逻辑从 IO 中抽离到 `evaluate_head_response`,便于纯函数测试。
             match evaluate_head_response(status, response.headers(), &url, &final_url) {
                 Ok(metadata) => {
-                    info!(
+                    debug!(
                         url = %tachyon_core::redact_url_for_log(&final_url),
                         file_size = ?metadata.file_size,
                         supports_range = metadata.supports_range,
@@ -1575,7 +1713,7 @@ impl Protocol for HttpClient {
                 .await
                 .map_err(|e| DownloadError::Network(format!("读取响应体失败: {e}")))?;
 
-            info!(
+            debug!(
                 url = %tachyon_core::redact_url_for_log(&url),
                 start,
                 end,
@@ -1646,12 +1784,17 @@ impl Protocol for HttpClient {
             // 校验 Content-Range 与请求区间一致(同 download_range 路径)
             validate_content_range(response.headers(), start, end)?;
 
-            info!(url = %tachyon_core::redact_url_for_log(&url), start, end, "HTTP 流式 Range 响应头已接收,开始流式传输");
+            debug!(url = %tachyon_core::redact_url_for_log(&url), start, end, "HTTP 流式 Range 响应头已接收,开始流式传输");
 
             // 使用 bytes_stream() 获取真正的数据流,
-            // 调用方通过 StreamExt::next() 逐块消费,峰值内存仅包含单个 chunk
+            // 调用方通过 StreamExt::next() 逐块消费,峰值内存仅包含单个 chunk。
+            // 错误链必须展开:reqwest 常把 read_timeout/连接重置包装成
+            // "error decoding response body",仅打印 e 看不出超时根因。
             let stream = response.bytes_stream().map(|result| {
-                result.map_err(|e| DownloadError::Network(format!("读取响应流数据失败: {e}")))
+                result.map_err(|e| {
+                    let chain = error_chain(&e);
+                    DownloadError::Network(format!("读取响应流数据失败: {chain}"))
+                })
             });
 
             Ok(Box::pin(stream) as ByteStream)
@@ -1739,13 +1882,16 @@ impl Protocol for HttpClient {
                 return Err(classify_http_error(status, response.headers()));
             }
 
-            info!(url = %tachyon_core::redact_url_for_log(&url), "HTTP 整块流式响应头已接收,开始流式传输");
+            debug!(url = %tachyon_core::redact_url_for_log(&url), "HTTP 整块流式响应头已接收,开始流式传输");
 
             // 使用 bytes_stream() 逐块产出,峰值内存仅含单个 chunk,
             // 避免大文件整块进内存。流式下载本身不会 OOM,大小上限由引擎层
             // 的 `max_full_stream_bytes` 控制(未知大小时),因此协议层不再额外限制。
             let stream = response.bytes_stream().map(|result| {
-                result.map_err(|e| DownloadError::Network(format!("读取响应流数据失败: {e}")))
+                result.map_err(|e| {
+                    let chain = error_chain(&e);
+                    DownloadError::Network(format!("读取响应流数据失败: {chain}"))
+                })
             });
 
             Ok(Box::pin(stream) as ByteStream)
@@ -2619,14 +2765,17 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_from_head_uses_content_length_and_accept_ranges() {
+    fn test_metadata_from_head_never_trusts_accept_ranges_alone() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("content-length", "1024".parse().unwrap());
         headers.insert("accept-ranges", "bytes".parse().unwrap());
         let meta =
             super::metadata_from_headers("https://cdn.example.com/file.bin", &headers, false);
         assert_eq!(meta.file_size, Some(1024));
-        assert!(meta.supports_range);
+        assert!(
+            !meta.supports_range,
+            "HEAD 元数据不得仅凭 Accept-Ranges 设 supports_range=true"
+        );
     }
 
     #[test]
@@ -2762,8 +2911,8 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_head_normal_2xx_returns_metadata() {
-        // 正常 2xx + 二进制 Content-Type:返回元数据
+    fn test_evaluate_head_accept_ranges_bytes_forces_get_range_confirm() {
+        // HEAD 200 + Accept-Ranges:bytes 不得直接 supports_range=true
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("content-length", "1024".parse().unwrap());
         headers.insert("content-type", "application/octet-stream".parse().unwrap());
@@ -2774,10 +2923,28 @@ mod tests {
             "https://cdn.example.com/file.bin",
             "https://cdn.example.com/file.bin",
         );
+        assert!(
+            matches!(result, Err(super::HeadEvalError::NeedFallback)),
+            "Accept-Ranges:bytes 必须回退 GET Range 证实 206,实际: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_head_normal_2xx_without_accept_ranges() {
+        // 正常 2xx 无 Accept-Ranges:返回元数据且 supports_range=false
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-length", "1024".parse().unwrap());
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        let result = super::evaluate_head_response(
+            reqwest::StatusCode::OK,
+            &headers,
+            "https://cdn.example.com/file.bin",
+            "https://cdn.example.com/file.bin",
+        );
         match result {
             Ok(meta) => {
                 assert_eq!(meta.file_size, Some(1024));
-                assert!(meta.supports_range);
+                assert!(!meta.supports_range, "HEAD  alone 不得宣称 Range 支持");
             }
             other => panic!("预期成功,实际: {other:?}"),
         }
@@ -3037,6 +3204,17 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/ua"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/3")
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
 
             let client = HttpClient::with_timeouts_and_headers(
                 5,
@@ -3067,6 +3245,17 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/hdr"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/1")
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
 
             let mut headers = std::collections::HashMap::new();
             headers.insert("X-Trace".into(), "abc".into());
@@ -3090,6 +3279,20 @@ mod tests {
                         .insert_header("ETag", "\"abc123\"")
                         .insert_header("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
                         .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/file.bin"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/1000")
+                        .insert_header("Content-Length", "1")
+                        .insert_header("ETag", "\"abc123\"")
+                        .insert_header("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
+                        .insert_header("Content-Type", "application/octet-stream")
+                        .set_body_raw(b"x", "application/octet-stream"),
                 )
                 .mount(&server)
                 .await;
@@ -3150,6 +3353,46 @@ mod tests {
             let meta = client.probe(&url).await.unwrap();
             assert_eq!(meta.file_size, Some(5000));
             assert!(meta.supports_range);
+        }
+
+        /// HEAD 403 + Range 403 时,再回退 plain GET 取头(强制 supports_range=false)
+        #[tokio::test]
+        async fn test_probe_range_403_falls_back_to_plain_get() {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/waf"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            // Range 也被拒
+            Mock::given(method("GET"))
+                .and(path("/waf"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            // plain GET 成功(无 Range 头的 GET;wiremock 按注册顺序+匹配度)
+            // Content-Length 必须与 body 长度一致,否则 hyper 在写出响应时 panic
+            Mock::given(method("GET"))
+                .and(path("/waf"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Length", "64")
+                        .insert_header("Content-Type", "application/octet-stream")
+                        .insert_header("Accept-Ranges", "bytes")
+                        .set_body_raw(vec![0u8; 64], "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
+            let client = test_client();
+            let url = format!("{}/waf", server.uri());
+            let meta = client.probe(&url).await.expect("plain GET 回退应成功");
+            assert_eq!(meta.file_size, Some(64));
+            assert!(
+                !meta.supports_range,
+                "plain GET 未证明 Range,必须 supports_range=false"
+            );
         }
 
         /// 审计 HTTP-04:GET Range probe 的 206 必须校验 Content-Range 为 0-0
@@ -3591,6 +3834,17 @@ mod tests {
                 )
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/model.bin"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/4")
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
 
             let client = test_client().with_auth_bearer(Some("hf_secret".into()));
             let url = format!("{}/model.bin", server.uri());
@@ -3613,6 +3867,18 @@ mod tests {
                 )
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/file.bin"))
+                .and(header("Range", "bytes=0-0"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-0/10")
+                        .insert_header("Content-Length", "1")
+                        .set_body_raw(b"x", "application/octet-stream"),
+                )
+                .mount(&server)
+                .await;
+
             let client = test_client();
             let url = format!("{}/file.bin", server.uri());
             let _ = client.probe(&url).await.unwrap();

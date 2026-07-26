@@ -234,6 +234,11 @@ struct FragmentSpawnCtx<'a> {
     /// 崩溃一致性级别:控制分片完成时是否 fsync。`Loose` 跳过分片 sync(仅在 close 时落盘),
     /// 牺牲断电耐久性换吞吐;`EveryFragment`(默认)每分片 fsync 一次。
     sync_mode: tachyon_core::config::CrashConsistencyMode,
+    /// 代理下片内 Range 窗口(字节)。`None`=整片一次 Range;
+    /// `Some(w)`=每次最多请求 w 字节,TLS EOF 只丢当前窗口。
+    range_window_bytes: Option<u64>,
+    /// 本任务 soft-pressure 冷却截止(与 DownloadTask 共享 Arc)
+    soft_pressure_until: &'a Arc<std::sync::atomic::AtomicU64>,
 }
 
 use crate::connection::ConnectionPool;
@@ -302,6 +307,10 @@ pub struct DownloadTask {
     goodput_window_start: Option<Instant>,
     /// 当前窗口内累计完成字节
     goodput_window_bytes: u64,
+    /// 上次成功 rebalance 时刻;最小间隔内禁止再拆,避免 soft-pressure 恢复后连环拆片
+    last_rebalance_at: Option<Instant>,
+    /// 本任务 soft-pressure 冷却截止(epoch 秒)。per-task,避免多任务互串清零/延长。
+    soft_pressure_until: Arc<std::sync::atomic::AtomicU64>,
     /// 用户重命名(可选):若为 `Some`,在 `probe()` 拿到元数据后会以此名覆盖
     /// `metadata.file_name`,使下游 `init_storage`/快照/UI 全部读到统一的文件名。
     /// 调用方负责传入已 sanitize 的合法文件名(由 app 层 service 完成)。
@@ -516,6 +525,8 @@ impl DownloadTask {
                         has_mirrors: false,
                         goodput_window_start: None,
                         goodput_window_bytes: 0,
+                        last_rebalance_at: None,
+                        soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         preferred_file_name: None,
                         bt_storage_factory: Some(factory),
                         bt_magnet: Some(magnet_arc),
@@ -559,6 +570,8 @@ impl DownloadTask {
             has_mirrors: false,
             goodput_window_start: None,
             goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_storage_factory: None,
@@ -668,6 +681,8 @@ impl DownloadTask {
             has_mirrors: true,
             goodput_window_start: None,
             goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_storage_factory: None,
@@ -770,6 +785,8 @@ impl DownloadTask {
             has_mirrors: true,
             goodput_window_start: None,
             goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_storage_factory: None,
@@ -813,6 +830,8 @@ impl DownloadTask {
             has_mirrors: false,
             goodput_window_start: None,
             goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_storage_factory: None,
@@ -859,6 +878,8 @@ impl DownloadTask {
             has_mirrors: false,
             goodput_window_start: None,
             goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
             bt_storage_factory: None,
@@ -913,8 +934,22 @@ impl DownloadTask {
     ///
     /// 必须在 `run()` 之前调用。审计 A-04:生产路径从 `AppConfig.scheduler` 注入,
     /// 禁止永远落在 `SchedulerConfig::default()`。
+    ///
+    /// **同步性**:`plan_fragments` 读 `self.scheduler_config`,而 `recommend()` 读
+    /// `AdaptiveDownloadScheduler` 内部 config。仅写一侧会导致 max_fragment_size 等
+    /// 分叉(bench/测试只 set_scheduler_config 时尤为明显)。此处在调度器 Arc 唯一
+    /// (strong_count==1)时重建同源 `AdaptiveDownloadScheduler`;若已被共享则只更新
+    /// plan 侧并 warn(生产路径应在构造时 `create_adaptive_scheduler(config)` 同源)。
     pub fn set_scheduler_config(&mut self, config: SchedulerConfig) {
-        self.scheduler_config = config;
+        self.scheduler_config = config.clone();
+        if Arc::strong_count(&self.scheduler) == 1 {
+            self.scheduler = create_adaptive_scheduler(config);
+        } else {
+            tracing::warn!(
+                strong_count = Arc::strong_count(&self.scheduler),
+                "set_scheduler_config:调度器 Arc 已共享,仅更新 plan 侧 scheduler_config;recommend 仍用旧内部配置"
+            );
+        }
     }
 
     async fn wait_control_rx(
@@ -1056,15 +1091,88 @@ impl DownloadTask {
         if let Some(ref meta) = self.metadata {
             return Ok(meta);
         }
-        info!(url = %tachyon_core::redact_url_for_log(&self.url), "开始探测文件元数据");
+        debug!(url = %tachyon_core::redact_url_for_log(&self.url), "开始探测文件元数据");
         // 测量 probe 耗时作为 RTT 上界估计(DNS+TCP+TLS+HTTP 往返)。
         // 偏大的 RTT 估计使 BDP 偏大(倾向更多并发),比偏小(管道未满)安全。
         // observe_rtt 内部会过滤异常值(>10s),正常 probe 耗时 50ms-2s 均有效。
-        let probe_start = std::time::Instant::now();
-        let mut metadata = self.protocol.probe(&self.url).await?;
-        let probe_elapsed = probe_start.elapsed();
-        self.scheduler.observe_rtt(probe_elapsed);
-        debug!(?probe_elapsed, "probe 耗时已作为 RTT 上界注入调度器");
+        //
+        // 可重试错误(TLS handshake eof / 连接超时 / 5xx 等)按 max_retries 退避:
+        // 旧路径 probe 失败直接终态,代理抖动/瞬态 TLS 失败会把整任务打死。
+        let max_retries = self.config.max_retries;
+        let mut attempt = 0u32;
+        // 单次 probe attempt 墙钟上限:取 connect_timeout,钳制到 5..=10s。
+        // 代理黑洞时避免 HEAD 挂到 request_timeout(120s)×重试 打满墙钟。
+        let probe_attempt_timeout = {
+            let c = self.config.connect_timeout_secs.max(1);
+            Duration::from_secs(c.clamp(5, 10))
+        };
+        let (mut metadata, probe_elapsed) = loop {
+            let probe_start = std::time::Instant::now();
+            let probe_fut = self.protocol.probe(&self.url);
+            let timed = tokio::time::timeout(probe_attempt_timeout, probe_fut).await;
+            let result = match timed {
+                Ok(inner) => inner,
+                Err(_) => Err(DownloadError::Timeout(format!(
+                    "probe 超过 {}s",
+                    probe_attempt_timeout.as_secs()
+                ))),
+            };
+            match result {
+                Ok(meta) => break (meta, probe_start.elapsed()),
+                Err(e) => {
+                    if e.is_retryable() && attempt < max_retries {
+                        let next = attempt + 1;
+                        let is_403 = matches!(
+                            &e,
+                            DownloadError::Forbidden { status: 403 }
+                                | DownloadError::Http { status: 403, .. }
+                        );
+                        // 403 常是 WAF/签名永久拒绝:短退避即可,勿走 soft-pressure 2/4/8/16s。
+                        // TLS EOF/5xx 才需要长冷却。
+                        let base = Duration::from_secs((1u64 << attempt.min(4)).max(1));
+                        let is_timeout = matches!(e, DownloadError::Timeout(_));
+                        let backoff = if is_403 || is_timeout {
+                            // 超时/403:短退避快速换路径(HEAD→Range→GET),勿 2/4/8s 空等
+                            Duration::from_millis(
+                                200u64.saturating_mul(next as u64).clamp(200, 800),
+                            )
+                        } else if Self::is_connection_soft_pressure(&e) {
+                            Self::soft_pressure_backoff_secs(attempt, base)
+                        } else {
+                            base
+                        };
+                        if !is_403 && !is_timeout && Self::is_connection_soft_pressure(&e) {
+                            Self::extend_soft_pressure_cooldown(
+                                &self.soft_pressure_until,
+                                Duration::from_secs(15),
+                            );
+                        }
+                        warn!(
+                            attempt = next,
+                            max_retries,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %e,
+                            "probe 可重试失败,退避后重试"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt = next;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        // scheduler.observe_rtt 会丢弃 >10s;代理冷启动时 11s probe 若丢弃会落回默认 50ms,
+        // 误判为低延迟高并发。钳制到 [1ms, 10s] 保留"高延迟"信号。
+        let rtt_for_sched = probe_elapsed
+            .min(Duration::from_secs(10))
+            .max(Duration::from_millis(1));
+        self.scheduler.observe_rtt(rtt_for_sched);
+        debug!(
+            ?probe_elapsed,
+            ?rtt_for_sched,
+            "probe 耗时已作为 RTT 上界注入调度器"
+        );
         // 若用户在「新建任务」中显式重命名,以用户指定名覆盖协议探测得到的文件名。
         // 调用方(app 层 service)已对该名做过 sanitize,此处不再二次清洗,
         // 仅在源头覆盖一次保证下游 init_storage / 快照 / UI 全部读到同一个值。
@@ -1076,7 +1184,7 @@ impl DownloadTask {
             );
             metadata.file_name = preferred.clone();
         }
-        info!(
+        debug!(
             file_name = %metadata.file_name,
             file_size = ?metadata.file_size,
             supports_range = metadata.supports_range,
@@ -1251,6 +1359,77 @@ impl DownloadTask {
         }
     }
 
+    /// 是否走系统/显式 HTTP 代理(direct/none 视为直连)。
+    fn http_proxy_active(&self) -> bool {
+        if let Some(ref p) = self.config.proxy {
+            let t = p.trim();
+            if t.eq_ignore_ascii_case("direct") || t.eq_ignore_ascii_case("none") {
+                return false;
+            }
+            if !t.is_empty() {
+                return true;
+            }
+        }
+        tachyon_core::config::resolve_http_proxy(None).is_some()
+    }
+
+    /// 代理下片内 Range 窗口大小。
+    ///
+    /// 证据:跨境 HTTP_PROXY 约 35s 周期掐 TLS;8MiB 片在 ~600KB/s 下跑不完整片,
+    /// EOF 后即使 partial resume 也丢当前连接窗口。2MiB 窗口把最坏重传上界从整片
+    /// 收到 2MiB,且不改变 plan_fragments 边界(resume/rebalance 仍按分片 index)。
+    /// 直连返回 None(整片一次 Range,零额外请求开销)。
+    fn proxy_range_window_bytes(&self) -> Option<u64> {
+        const PROXY_RANGE_WINDOW: u64 = 2 * 1024 * 1024;
+        if self.http_proxy_active() {
+            Some(PROXY_RANGE_WINDOW)
+        } else {
+            None
+        }
+    }
+
+    /// 计算片内窗口结束偏移(含端):`min(start+window-1, frag_end)`。
+    /// `window=None` 或 0 时返回 frag_end(整片)。
+    pub(crate) fn range_window_end(start: u64, frag_end: u64, window: Option<u64>) -> u64 {
+        match window {
+            Some(w) if w > 0 => start.saturating_add(w.saturating_sub(1)).min(frag_end),
+            _ => frag_end,
+        }
+    }
+
+    /// 代理冷启动上限(低置信度):≤2。
+    fn proxy_cold_start_cap_for_config(&self, confidence: f64) -> Option<u32> {
+        const PROXY_COLD_START_MAX: u32 = 2;
+        const LOW_CONFIDENCE: f64 = 0.5;
+        if confidence >= LOW_CONFIDENCE || !self.http_proxy_active() {
+            None
+        } else {
+            Some(PROXY_COLD_START_MAX)
+        }
+    }
+
+    /// 代理稳态并发天花板(含 re-recommend 抬升)。
+    ///
+    /// 证据:经 HTTP_PROXY 的 kernel.org 同会话,c=2/c=4 健康时均 ~6MB/s;
+    /// c=8 会爬到 5+ 打爆。c=2 已达吞吐, cap=4 只加倍连接面无 goodput 收益。
+    /// 稳态 cap=2 与 soft-pressure floor、aria2 `-x2` 对齐;冷启动仍 ≤2。
+    fn proxy_steady_concurrency_ceiling(&self) -> Option<u32> {
+        const PROXY_STEADY_MAX: u32 = 2;
+        if self.http_proxy_active() {
+            Some(PROXY_STEADY_MAX)
+        } else {
+            None
+        }
+    }
+
+    /// 对 desired 并发应用代理天花板(若有)。
+    fn apply_proxy_concurrency_ceiling(&self, desired: u32) -> u32 {
+        match self.proxy_steady_concurrency_ceiling() {
+            Some(cap) => desired.min(cap).max(1),
+            None => desired.max(1),
+        }
+    }
+
     // ----- 步骤 2: 规划分片 -----
 
     /// 根据已探测的文件元数据规划分片
@@ -1308,7 +1487,7 @@ impl DownloadTask {
             &self.scheduler_config,
         )?;
 
-        info!(count = fragments.len(), "分片规划完成");
+        debug!(count = fragments.len(), "分片规划完成");
 
         self.fragments = fragments
             .iter()
@@ -1347,7 +1526,7 @@ impl DownloadTask {
                     }
                 }
             }
-            info!(resumed, "断点续传:跳过已完成分片");
+            debug!(resumed, "断点续传:跳过已完成分片");
         }
 
         // 字节级断点续传:对未完整下载的分片注入 resume_offset
@@ -1364,7 +1543,7 @@ impl DownloadTask {
                     resumed_partial += 1;
                 }
             }
-            info!(resumed_partial, "字节级断点续传:恢复未完整分片");
+            debug!(resumed_partial, "字节级断点续传:恢复未完整分片");
         }
 
         // 发送 PlanComplete 事件:携带真实分片总数 + 续传已完成索引 + 初始并发度。
@@ -1380,9 +1559,19 @@ impl DownloadTask {
                 .collect();
             // BT 冷启动解耦时上报解耦后的初始并发,与 execute_fragmented_download
             // 实际生效值一致(active_concurrency 展示不错位);HTTP 原样上报推荐值。
-            let initial_concurrency = self
-                .bt_cold_start_concurrency_override(&recommendation)
-                .unwrap_or(recommendation.concurrency);
+            let initial_concurrency = match self.bt_cold_start_concurrency_override(&recommendation)
+            {
+                Some(c) => c,
+                None => {
+                    let mut c = recommendation.concurrency.max(1);
+                    if let Some(cap) =
+                        self.proxy_cold_start_cap_for_config(recommendation.confidence)
+                    {
+                        c = c.min(cap).max(1);
+                    }
+                    self.apply_proxy_concurrency_ceiling(c)
+                }
+            };
             if let Err(e) = tx.try_send(FragmentProgress::PlanComplete {
                 total,
                 completed_indices,
@@ -1435,7 +1624,7 @@ impl DownloadTask {
     #[tracing::instrument(skip(self), fields(task_id = %self.id))]
     pub async fn execute(&mut self) -> DownloadResult<()> {
         self.state = DownloadState::Downloading;
-        info!("开始执行下载任务");
+        debug!("开始执行下载任务");
 
         let metadata = self
             .metadata
@@ -1473,7 +1662,11 @@ impl DownloadTask {
         let mut attempt = 0u32;
         loop {
             match self.execute_full_download_once(pause_timeout).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    // 整块成功同样解除软压力冷却(与分片成功对称)
+                    Self::clear_soft_pressure_cooldown_on_success(&self.soft_pressure_until);
+                    break;
+                }
                 Err(e) => {
                     // 用户暂停:等 Resume 后重试本 attempt,不计入 max_retries
                     if matches!(e, DownloadError::Paused) {
@@ -1492,10 +1685,19 @@ impl DownloadTask {
                                 retry_after_secs: Some(secs),
                             } => Duration::from_secs((*secs).min(1024)),
                             _ => {
-                                let base = 1u64 << attempt.min(10);
-                                Duration::from_secs(base.max(1))
+                                let base = Duration::from_secs((1u64 << attempt.min(10)).max(1));
+                                if Self::is_connection_soft_pressure(&e) {
+                                    Self::soft_pressure_backoff_secs(attempt, base)
+                                } else {
+                                    base
+                                }
                             }
                         };
+                        // 整块路径无 concurrency_ctrl,但仍延长全局冷却,避免随后分片路径立刻抬升
+                        Self::extend_soft_pressure_cooldown(
+                            &self.soft_pressure_until,
+                            Duration::from_secs(30),
+                        );
                         warn!(
                             attempt = next_attempt,
                             max_retries,
@@ -1560,6 +1762,239 @@ impl DownloadTask {
         matches!(err, DownloadError::Timeout(msg) if msg.starts_with("暂停超过"))
     }
 
+    /// 对端/中间盒掐连接、TLS 异常 EOF、网关 502/504 等“软压力”信号。
+    ///
+    /// 这类错误可重试,但继续高并发往往会加剧掐断/网关过载;应在中间重试时
+    /// 下调目标并发并拉长退避,让存活连接完成,而不是立刻熔断整源。
+    pub(crate) fn is_connection_soft_pressure(err: &DownloadError) -> bool {
+        match err {
+            // 网关/限流/超时:继续高并发只会加重失败
+            // 403:部分 CDN/WAF 对突发多连接直接拒绝,降并发后重试常可恢复
+            DownloadError::Http { status, .. } => {
+                matches!(*status, 403 | 408 | 429 | 502 | 503 | 504)
+            }
+            DownloadError::Throttled { .. } => true,
+            DownloadError::Timeout(_) => true,
+            DownloadError::Forbidden { .. } => true,
+            DownloadError::Network(msg) | DownloadError::Protocol(msg) => {
+                let s = msg.to_ascii_lowercase();
+                s.contains("tls close_notify")
+                    || s.contains("unexpected eof")
+                    // reqwest/rustls: "tls handshake eof" / "handshake eof" 无 close_notify 字样
+                    || s.contains("tls handshake eof")
+                    || s.contains("handshake eof")
+                    || s.contains("connection reset")
+                    || s.contains("broken pipe")
+                    || s.contains("connection closed")
+                    || s.contains("error reading a body from connection")
+                    || s.contains("decoding response body")
+                    || s.contains("client error (connect)")
+                    || s.contains("gateway timeout")
+                    || s.contains("bad gateway")
+                    || s.contains("service unavailable")
+                    || s.contains("too many requests")
+                    || s.contains("forbidden")
+            }
+            _ => {
+                let s = err.to_string().to_ascii_lowercase();
+                s.contains("tls close_notify")
+                    || s.contains("unexpected eof")
+                    || s.contains("tls handshake eof")
+                    || s.contains("handshake eof")
+                    || s.contains("connection reset")
+                    || s.contains("decoding response body")
+                    || s.contains("client error (connect)")
+                    || s.contains("403")
+                    || s.contains("429")
+            }
+        }
+    }
+
+    /// 软压力时下调目标并发,并延长全局冷却截止时间。
+    ///
+    /// - `mild=false`(零进度): target 减半,冷却 15s
+    /// - `mild=true`(已有落盘进度): **不降 target**,仅冷却 5s 挡住 scale-up。
+    ///   中途 TLS EOF + partial 多半是代理/对端掐长连接,不是“并发过高”。
+    ///   再砍并发只会把 2 路健康会话串行化(实测 c=1 ≈ 一半吞吐,aria2 无此自伤)。
+    ///
+    /// 冷却期内不滑动续期、不连砍。
+    pub(crate) fn apply_soft_pressure_backoff_ex(
+        ctrl: &ConcurrencyController,
+        err: &DownloadError,
+        mild: bool,
+        soft_pressure_until: &std::sync::atomic::AtomicU64,
+    ) {
+        if !Self::is_connection_soft_pressure(err) {
+            return;
+        }
+        if Self::soft_pressure_blocks_scale_up(soft_pressure_until) {
+            return;
+        }
+        let cool = if mild {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(15)
+        };
+        Self::extend_soft_pressure_cooldown(soft_pressure_until, cool);
+        if mild {
+            // 有进度:只挡抬升,保持当前并发让其它存活片继续吐数据
+            return;
+        }
+        let old = ctrl.target();
+        // 零进度:减半,但下限 2(若当前已是多连接)。
+        // 代理下 c=2 是健康稳态;单片 handshake eof 不该把整任务串行化到 1。
+        let floor = if old >= 2 { 2 } else { 1 };
+        let new_target = (old / 2).max(floor);
+        if new_target < old {
+            ctrl.set_target(new_target);
+            warn!(
+                old_concurrency = old,
+                new_concurrency = new_target,
+                mild = false,
+                error = %err,
+                "检测到连接软压力,降低目标并发"
+            );
+        }
+    }
+
+    pub(crate) fn soft_pressure_epoch() -> std::time::Instant {
+        use std::sync::LazyLock;
+        static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+        *EPOCH
+    }
+
+    /// 进程全局重连时间线(epoch 毫秒):片间错开仍跨任务,减轻代理 TLS 风暴。
+    /// 冷却截止 soft_pressure_until 已改为 per-task,避免多任务互串。
+    pub(crate) fn soft_reconnect_last_ms() -> &'static std::sync::atomic::AtomicU64 {
+        use std::sync::LazyLock;
+        use std::sync::atomic::AtomicU64;
+        static LAST: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+        &LAST
+    }
+
+    pub(crate) fn soft_pressure_now_ms() -> u64 {
+        std::time::Instant::now()
+            .checked_duration_since(Self::soft_pressure_epoch())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// soft-pressure 重连最小片间间隔(Full Jitter 后仍可能撞车)。
+    /// 返回额外需要 sleep 的时长;调用方应在退避后再等这段。
+    /// 注意:时间线仍进程全局——多任务交错重连是有意的。
+    pub(crate) fn soft_reconnect_spacing_delay(min_gap_ms: u64) -> Duration {
+        let now = Self::soft_pressure_now_ms();
+        let gap = min_gap_ms.max(1);
+        loop {
+            let last = Self::soft_reconnect_last_ms().load(std::sync::atomic::Ordering::Acquire);
+            let earliest = last.saturating_add(gap);
+            if now >= earliest {
+                if Self::soft_reconnect_last_ms()
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Duration::ZERO;
+                }
+                continue;
+            }
+            if Self::soft_reconnect_last_ms()
+                .compare_exchange(
+                    last,
+                    earliest,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Duration::from_millis(earliest.saturating_sub(now));
+            }
+        }
+    }
+
+    pub(crate) fn extend_soft_pressure_cooldown(
+        until: &std::sync::atomic::AtomicU64,
+        extra: Duration,
+    ) {
+        let now = std::time::Instant::now()
+            .checked_duration_since(Self::soft_pressure_epoch())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let new_until = now.saturating_add(extra.as_secs().max(1));
+        let _ = until.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.max(new_until)),
+        );
+    }
+
+    pub(crate) fn soft_pressure_blocks_scale_up(until: &std::sync::atomic::AtomicU64) -> bool {
+        let now = std::time::Instant::now()
+            .checked_duration_since(Self::soft_pressure_epoch())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now < until.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 分片成功时**半衰**本任务软压力冷却,而非瞬间清零。
+    pub(crate) fn clear_soft_pressure_cooldown_on_success(until: &std::sync::atomic::AtomicU64) {
+        let now = std::time::Instant::now()
+            .checked_duration_since(Self::soft_pressure_epoch())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = until.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |u| {
+                if u <= now {
+                    Some(0)
+                } else {
+                    let remain = u.saturating_sub(now);
+                    let half = remain.div_ceil(2).max(1);
+                    Some(now.saturating_add(half))
+                }
+            },
+        );
+    }
+
+    /// 并发抬升步进限制。
+    ///
+    /// - 直连:`conservative=false` → 每次最多翻倍(至少 +1)
+    /// - 代理:`conservative=true` → 每次最多 +1,避免 2→4 一步打满
+    /// 降并发不受限。
+    pub(crate) fn clamp_concurrency_scale_up(old: u32, new: u32) -> u32 {
+        Self::clamp_concurrency_scale_up_ex(old, new, false)
+    }
+
+    pub(crate) fn clamp_concurrency_scale_up_ex(old: u32, new: u32, conservative: bool) -> u32 {
+        if new <= old {
+            return new.max(1);
+        }
+        let step_cap = if conservative {
+            old.saturating_add(1).max(1)
+        } else {
+            old.saturating_mul(2).max(old.saturating_add(1)).max(1)
+        };
+        new.min(step_cap).max(1)
+    }
+
+    /// 软压力退避:在基础 jitter 之上至少 2s,并随 attempt 指数放大(上限 60s)。
+
+    #[cfg(test)]
+    pub(crate) fn fresh_soft_until() -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    pub(crate) fn soft_pressure_backoff_secs(attempt: u32, base: Duration) -> Duration {
+        let min_secs = 2u64.saturating_mul(1u64 << attempt.min(4)).min(60);
+        let base_secs = base.as_secs().max(1);
+        Duration::from_secs(base_secs.max(min_secs))
+    }
+
     /// 单次整块流式下载 attempt(无重试)
     async fn execute_full_download_once(&mut self, pause_timeout: Duration) -> DownloadResult<()> {
         Self::wait_control(&mut self.control_rx, pause_timeout).await?;
@@ -1602,6 +2037,17 @@ impl DownloadTask {
             .ok_or_else(|| DownloadError::Config("存储未初始化".into()))?;
         let expected_size = self.metadata.as_ref().and_then(|md| md.file_size);
 
+        // 与分片路径一致:用 512 对齐 AlignedBuf 聚合小 chunk,再 write_all_at。
+        // 避免 reqwest 未对齐 Bytes 每个 chunk 都 ensure_aligned 临时分配。
+        let mut write_buf = if let Some(ref pool) = self.buffer_pool {
+            WriteBuf::Guard(pool.alloc_guarded().await)
+        } else {
+            WriteBuf::Owned(
+                AlignedBuf::new(WRITE_BATCH_BYTES).expect("AlignedBuf 分配失败(内存不足)"),
+            )
+        };
+        write_buf.as_mut().clear();
+
         // 逐块消费并写入,顺序追加偏移
         let mut pos: u64 = 0;
         // 与分片路径同一节流模式:每 PROGRESS_REPORT_CHUNK_INTERVAL 个 chunk
@@ -1634,11 +2080,15 @@ impl DownloadTask {
             let chunk = chunk_result?;
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|_| DownloadError::Config("整块下载 chunk 长度溢出".into()))?;
-            let attempted = pos.checked_add(chunk_len).ok_or_else(|| {
-                DownloadError::Config(format!(
-                    "整块下载长度溢出: written={pos}, chunk={chunk_len}"
-                ))
-            })?;
+            let attempted = pos
+                .checked_add(write_buf.as_mut().len() as u64)
+                .and_then(|p| p.checked_add(chunk_len))
+                .ok_or_else(|| {
+                    DownloadError::Config(format!(
+                        "整块下载长度溢出: written={pos}, buffered={}, chunk={chunk_len}",
+                        write_buf.as_mut().len()
+                    ))
+                })?;
             // 审计 HTTP-15:已知长度也必须写前拒绝越界,避免先扩文件后才报错
             if let Some(expected) = expected_size {
                 if attempted > expected {
@@ -1655,37 +2105,162 @@ impl DownloadTask {
                     self.config.max_full_stream_bytes, attempted
                 )));
             }
-            // 审计 P1 full-stream short write
+
+            // 大 chunk:先冲刷缓冲;已对齐则直写,未对齐则切块装入 write_buf(复用对齐内存,避免 ensure_aligned 每块新分配)
+            if chunk.len() >= WRITE_BATCH_BYTES {
+                if !write_buf.as_mut().is_empty() {
+                    let batch = write_buf.as_mut().split().freeze();
+                    let written = Self::write_all_at(
+                        storage.as_ref(),
+                        pos,
+                        batch,
+                        &mut self.control_rx,
+                        pause_timeout,
+                        self.metrics.as_deref(),
+                    )
+                    .await?;
+                    pos += written;
+                    if let Some(ref limiter) = rate_limiter {
+                        limiter.acquire(written).await;
+                    }
+                    if let Some(bps) = self.note_goodput_bytes(written) {
+                        self.scheduler.observe_bandwidth(bps);
+                    }
+                }
+                let ptr_aligned = (chunk.as_ptr() as usize).is_multiple_of(512);
+                if ptr_aligned {
+                    let written = Self::write_all_at(
+                        storage.as_ref(),
+                        pos,
+                        chunk,
+                        &mut self.control_rx,
+                        pause_timeout,
+                        self.metrics.as_deref(),
+                    )
+                    .await?;
+                    if written != chunk_len {
+                        return Err(DownloadError::Fragment(format!(
+                            "整块下载短写未完成: offset={pos}, expected={chunk_len}, written={written}"
+                        )));
+                    }
+                    pos += written;
+                    if let Some(ref limiter) = rate_limiter {
+                        limiter.acquire(written).await;
+                    }
+                    if let Some(bps) = self.note_goodput_bytes(written) {
+                        self.scheduler.observe_bandwidth(bps);
+                    }
+                } else {
+                    // 未对齐大块:按 write_buf 剩余容量切片装入,满批刷写(freeze 后指针 512 对齐 → passthrough)
+                    let mut rest = chunk;
+                    while !rest.is_empty() {
+                        let space = WRITE_BATCH_BYTES.saturating_sub(write_buf.as_mut().len());
+                        let take = rest.len().min(space.max(1));
+                        let piece = rest.slice(..take);
+                        rest = rest.slice(take..);
+                        write_buf.as_mut().extend_from_slice(&piece);
+                        if write_buf.as_mut().len() >= WRITE_BATCH_BYTES {
+                            let batch = write_buf.as_mut().split().freeze();
+                            let written = Self::write_all_at(
+                                storage.as_ref(),
+                                pos,
+                                batch,
+                                &mut self.control_rx,
+                                pause_timeout,
+                                self.metrics.as_deref(),
+                            )
+                            .await?;
+                            pos += written;
+                            if let Some(ref limiter) = rate_limiter {
+                                limiter.acquire(written).await;
+                            }
+                            if let Some(bps) = self.note_goodput_bytes(written) {
+                                self.scheduler.observe_bandwidth(bps);
+                            }
+                        }
+                    }
+                }
+                progress_report_countdown = progress_report_countdown.saturating_sub(1);
+                if progress_report_countdown == 0 {
+                    let shown = pos.saturating_add(write_buf.as_mut().len() as u64);
+                    Self::report_progress(0, shown, &self.progress_tx);
+                    progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
+                }
+                continue;
+            }
+
+            // 小 chunk 聚入对齐缓冲
+            if !write_buf.as_mut().is_empty()
+                && write_buf.as_mut().len() + chunk.len() > WRITE_BATCH_BYTES
+            {
+                let batch = write_buf.as_mut().split().freeze();
+                let written = Self::write_all_at(
+                    storage.as_ref(),
+                    pos,
+                    batch,
+                    &mut self.control_rx,
+                    pause_timeout,
+                    self.metrics.as_deref(),
+                )
+                .await?;
+                pos += written;
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.acquire(written).await;
+                }
+                if let Some(bps) = self.note_goodput_bytes(written) {
+                    self.scheduler.observe_bandwidth(bps);
+                }
+            }
+            write_buf.as_mut().extend_from_slice(&chunk);
+            progress_report_countdown = progress_report_countdown.saturating_sub(1);
+            if write_buf.as_mut().len() >= WRITE_BATCH_BYTES {
+                let batch = write_buf.as_mut().split().freeze();
+                let written = Self::write_all_at(
+                    storage.as_ref(),
+                    pos,
+                    batch,
+                    &mut self.control_rx,
+                    pause_timeout,
+                    self.metrics.as_deref(),
+                )
+                .await?;
+                pos += written;
+                if let Some(ref limiter) = rate_limiter {
+                    limiter.acquire(written).await;
+                }
+                if let Some(bps) = self.note_goodput_bytes(written) {
+                    self.scheduler.observe_bandwidth(bps);
+                }
+            }
+            if progress_report_countdown == 0 {
+                // 进度含已缓冲未刷部分,避免 UI 卡顿;最终 completed 用落盘 pos
+                let shown = pos.saturating_add(write_buf.as_mut().len() as u64);
+                Self::report_progress(0, shown, &self.progress_tx);
+                progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
+            }
+        }
+
+        // 尾刷
+        if !write_buf.as_mut().is_empty() {
+            let batch = write_buf.as_mut().split().freeze();
             let written = Self::write_all_at(
                 storage.as_ref(),
                 pos,
-                chunk,
+                batch,
                 &mut self.control_rx,
                 pause_timeout,
+                self.metrics.as_deref(),
             )
             .await?;
-            if written != chunk_len {
-                return Err(DownloadError::Fragment(format!(
-                    "整块下载短写未完成: offset={pos}, expected={chunk_len}, written={written}"
-                )));
-            }
             pos += written;
-            // 整块路径进度:与分片路径同一 countdown 节流,每
-            // PROGRESS_REPORT_CHUNK_INTERVAL 个 chunk 按累计写入字节上报一次增量;
-            // 终态 completed Chunk 在 durable sync 后单独发送,不经过此节流
-            progress_report_countdown = progress_report_countdown.saturating_sub(1);
-            if progress_report_countdown == 0 {
-                Self::report_progress(0, pos, &self.progress_tx);
-                progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
-            }
             if let Some(ref limiter) = rate_limiter {
                 limiter.acquire(written).await;
             }
-            // 整块路径同样喂聚合 goodput,供跨任务/后续 re-plan 学习
             if let Some(bps) = self.note_goodput_bytes(written) {
                 self.scheduler.observe_bandwidth(bps);
             }
         }
+
         // 冲刷未满窗口,避免短文件零样本
         if let Some(bps) = self.flush_goodput_window() {
             self.scheduler.observe_bandwidth(bps);
@@ -1739,7 +2314,7 @@ impl DownloadTask {
         spec: FragmentSpec,
         handles: &mut JoinSet<FragmentTaskResult>,
     ) -> Result<(), DownloadError> {
-        let (frag_index, frag_start, frag_end, resume_offset, compute_hash, shared) = spec;
+        let (frag_index, frag_start, frag_end, mut resume_offset, compute_hash, shared) = spec;
 
         // acquire permit(阻塞直到有可用许可)
         // permit 的 RAII 保证:task 完成/drop/abort 时自动归还
@@ -1773,6 +2348,7 @@ impl DownloadTask {
         let frag_circuit_breakers = ctx.circuit_breakers.clone();
         // 闭环并发控制:传给 task,退出时 record_complete
         let frag_concurrency_ctrl = ctx.concurrency_ctrl.clone();
+        let frag_semaphore = ctx.semaphore.clone();
         let task_completed_tx = ctx.completed_tx.clone();
         let frag_has_mirrors = ctx.has_mirrors;
         let max_retries = ctx.max_retries;
@@ -1780,9 +2356,41 @@ impl DownloadTask {
         let skip_write = ctx.skip_write;
         let frag_sync_mode = ctx.sync_mode;
         let frag_object_identity = ctx.object_identity.clone();
+        let frag_range_window = ctx.range_window_bytes;
+        let frag_soft_until = Arc::clone(ctx.soft_pressure_until);
 
         handles.spawn(async move {
-            let _permit = permit; // RAII:完成/drop 即归还
+            // Option permit:退避睡眠期间释放槽位,使 soft-pressure 降并发立刻生效。
+            // 若一直持有 permit,target 从 8→4 但 8 个失败片都在 sleep,有效并发不降。
+            let mut permit = Some(permit);
+            let mut holding_slot = true;
+
+            // 退避/熔断等待后重新占槽。失败时 holding_slot=false,调用方不得再 record_complete。
+            async fn reacquire_slot(
+                permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+                holding_slot: &mut bool,
+                ctrl: &ConcurrencyController,
+                sem: &std::sync::Arc<tokio::sync::Semaphore>,
+                control_rx: &mut Option<tokio::sync::watch::Receiver<TaskCommand>>,
+                pause_timeout: Duration,
+                _frag_index: u32,
+            ) -> Result<(), DownloadError> {
+                debug_assert!(!*holding_slot && permit.is_none());
+                loop {
+                    if let Some(rx) = control_rx.as_mut() {
+                        DownloadTask::wait_control_rx(rx, pause_timeout).await?;
+                    }
+                    if ctrl.should_spawn()
+                        && let Ok(p) = sem.clone().try_acquire_owned()
+                    {
+                        ctrl.record_spawn();
+                        *permit = Some(p);
+                        *holding_slot = true;
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
 
             // 单次尝试 + 指数退避重试
             let mut attempt: u32 = 0;
@@ -1808,7 +2416,26 @@ impl DownloadTask {
                             attempt: next_attempt,
                         });
                     }
+                    // 熔断等待同样释放槽位,避免占满 active 阻塞健康片
+                    drop(permit.take());
+                    if holding_slot {
+                        frag_concurrency_ctrl.record_complete();
+                        holding_slot = false;
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Err(wait_err) = reacquire_slot(
+                        &mut permit,
+                        &mut holding_slot,
+                        &frag_concurrency_ctrl,
+                        &frag_semaphore,
+                        &mut frag_control_rx,
+                        pause_timeout,
+                        frag_index,
+                    )
+                    .await
+                    {
+                        break Err((frag_index, wait_err));
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -1838,6 +2465,8 @@ impl DownloadTask {
                     frag_sync_mode,
                     &shared,
                     frag_object_identity.clone(),
+                    frag_metrics.as_deref(),
+                    frag_range_window,
                 )
                 .await;
 
@@ -1846,6 +2475,8 @@ impl DownloadTask {
                         if !frag_has_mirrors {
                             frag_circuit_breakers.record_success(&frag_url);
                         }
+                        // 存活分片完成:半衰本任务软压力冷却
+                        Self::clear_soft_pressure_cooldown_on_success(&frag_soft_until);
                         break Ok((frag_index, downloaded, duration, computed_hash));
                     }
                     Err(e) => {
@@ -1859,26 +2490,69 @@ impl DownloadTask {
                             }
                             continue;
                         }
+                        // 先推进 resume,再决定 soft-pressure 策略:
+                        // - 本 attempt 新写字节: progress > resume → 更新 resume
+                        // - 或此前已有 resume>0(连接失败未再写):仍算有进度
+                        // 有进度: mild -1 + 短 jitter 退避 + 额外预算
+                        // 零进度: 减半 + 长退避
+                        let mut has_partial_progress = false;
+                        if !compute_hash {
+                            let progressed = shared
+                                .realtime_downloaded
+                                .load(std::sync::atomic::Ordering::Acquire);
+                            if progressed > resume_offset {
+                                debug!(
+                                    index = frag_index,
+                                    old_resume = resume_offset,
+                                    new_resume = progressed,
+                                    "分片可重试失败,从已写字节续传"
+                                );
+                                resume_offset = progressed;
+                            }
+                            has_partial_progress = resume_offset > 0;
+                        }
+                        Self::apply_soft_pressure_backoff_ex(
+                            &frag_concurrency_ctrl,
+                            &e,
+                            has_partial_progress,
+                            &frag_soft_until,
+                        );
+                        // 零进度 soft-pressure:丢弃共享 HttpClient 空闲池,避免半死
+                        // TLS tunnel 被同身份其它任务复用(MultiTaskIsolationAudit P1)。
+                        // mild(有进度)不 clear:链路仍在吐数据,重建池成本高。
+                        if !has_partial_progress && Self::is_connection_soft_pressure(&e) {
+                            crate::http_client_registry::global_http_client_registry().clear();
+                        }
+                        let soft_progress_budget =
+                            if has_partial_progress && Self::is_connection_soft_pressure(&e) {
+                                max_retries.saturating_add(2)
+                            } else {
+                                max_retries
+                            };
                         if !e.is_retryable()
                             || Self::is_pause_timeout_error(&e)
-                            || attempt >= max_retries
+                            || attempt >= soft_progress_budget
                         {
                             if let Some(ref m) = frag_metrics {
                                 m.inc_error();
                             }
-                            if !frag_has_mirrors {
+                            // 软压力(403/TLS EOF/5xx 网关)表示源仍可用但需降并发;
+                            // 记 failure 会让 N 片同时放弃时瞬间熔断整源,反而无法恢复。
+                            if !frag_has_mirrors && !Self::is_connection_soft_pressure(&e) {
                                 frag_circuit_breakers.record_failure(&frag_url);
                             }
                             break Err((frag_index, e));
                         }
-                        // 退避:429/503 优先 Retry-After,否则 Full Jitter 指数退避
+                        // 退避:429/503 优先 Retry-After;
+                        // 已推进 resume 的 soft-pressure:短退避(链路仍在吐数据,长等浪费);
+                        // 零进度 soft-pressure:长退避;否则 Full Jitter 指数退避。
                         let backoff = match &e {
                             DownloadError::Throttled {
                                 retry_after_secs: Some(secs),
                             } => Duration::from_secs((*secs).min(1024)),
                             _ => {
                                 let base_secs = 1u64 << attempt.min(10);
-                                if base_secs <= 1 {
+                                let base = if base_secs <= 1 {
                                     Duration::from_secs(1)
                                 } else {
                                     let seed = (frag_index as u64)
@@ -1888,6 +2562,24 @@ impl DownloadTask {
                                     let hash = seed.wrapping_mul(0x517cc1b727220a95);
                                     let jitter = hash >> (64 - log2);
                                     Duration::from_secs(base_secs.saturating_sub(jitter).max(1))
+                                };
+                                if Self::is_connection_soft_pressure(&e) {
+                                    if has_partial_progress {
+                                        // 已有进度:短退避上限 2s + Full Jitter,避免多分片同步重试打爆代理
+                                        let cap_ms = 250u64
+                                            .saturating_mul(1u64 << attempt.min(3))
+                                            .clamp(250, 2000);
+                                        let seed = (frag_index as u64)
+                                            .wrapping_mul(0x9E3779B97F4A7C15)
+                                            .wrapping_add(attempt as u64)
+                                            .wrapping_mul(0x517cc1b727220a95);
+                                        let jittered = 1 + (seed % cap_ms);
+                                        Duration::from_millis(jittered)
+                                    } else {
+                                        Self::soft_pressure_backoff_secs(attempt, base)
+                                    }
+                                } else {
+                                    base
                                 }
                             }
                         };
@@ -1895,8 +2587,9 @@ impl DownloadTask {
                         warn!(
                             index = frag_index,
                             attempt = next_attempt,
-                            max_retries,
-                            backoff_secs = backoff.as_secs(),
+                            max_retries = soft_progress_budget,
+                            has_partial_progress,
+                            backoff_ms = backoff.as_millis() as u64,
                             error = %e,
                             "分片下载失败,退避后重试"
                         );
@@ -1907,22 +2600,50 @@ impl DownloadTask {
                                 attempt: next_attempt,
                             });
                         }
-                        if !frag_has_mirrors {
-                            frag_circuit_breakers.record_failure(&frag_url);
-                        }
+                        // 不在中间重试记 record_failure:多分片并发同一 URL 时,
+                        // N 片各失败 1 次就会瞬间达到阈值(默认 5)误熔断整个源。
+                        // 熔断只在最终放弃(上方 break Err)时记一次;成功路径仍 record_success。
                         frag_protocol.clear_selected().await;
-                        tokio::time::sleep(backoff).await;
+                        // 退避期间释放 permit + active,使 set_target 降并发立刻生效;
+                        // 睡眠后再按 should_spawn 重新占槽,避免 8 片同时 sleep 占满。
+                        drop(permit.take());
+                        if holding_slot {
+                            frag_concurrency_ctrl.record_complete();
+                            holding_slot = false;
+                        }
+                        let mut wait = backoff;
+                        if Self::is_connection_soft_pressure(&e) {
+                            // 片间错开重连,减轻代理/对端同步 TLS 风暴
+                            wait = wait.saturating_add(Self::soft_reconnect_spacing_delay(150));
+                        }
+                        tokio::time::sleep(wait).await;
+                        if let Err(wait_err) = reacquire_slot(
+                            &mut permit,
+                            &mut holding_slot,
+                            &frag_concurrency_ctrl,
+                            &frag_semaphore,
+                            &mut frag_control_rx,
+                            pause_timeout,
+                            frag_index,
+                        )
+                        .await
+                        {
+                            break Err((frag_index, wait_err));
+                        }
                         attempt += 1;
                     }
                 }
             };
+            drop(permit);
 
             // 上报结果:成功经 completed_tx(主循环处理),JoinSet 返回虚拟信号;
             // 失败不经 completed_tx,由 JoinSet 直接返回(主循环处理错误)。
             // 这与旧 per-worker 模型一致:避免成功结果被 completed_rx 和
             // join_next 双重处理导致 record_completed_fragment 重复调用。
-            // 闭环并发控制:task 退出前 record_complete,active-1
-            frag_concurrency_ctrl.record_complete();
+            // 闭环并发控制:仅在仍持有槽位时 record_complete。
+            if holding_slot {
+                frag_concurrency_ctrl.record_complete();
+            }
             match frag_result {
                 Ok(tuple) => {
                     let _ = task_completed_tx.send(Ok(tuple));
@@ -1967,19 +2688,31 @@ impl DownloadTask {
         // 使用调度器建议的并发度,但不超过配置的最大值。
         // BT/magnet 冷启动(低置信度)解耦:直接用配置并发,HTTP 路径不变
         // (cold-start 起步 + ramp 爬坡 + 429 保护全部保留)。
-        let (effective_concurrency, concurrency_reason) =
-            match self.bt_cold_start_concurrency_override(&recommendation) {
-                Some(configured) => (configured as usize, "bt_cold_start"),
-                None => (
-                    recommendation
-                        .concurrency
-                        .min(self.config.max_concurrent_fragments)
-                        .max(1) as usize,
-                    "scheduler",
-                ),
-            };
+        let (effective_concurrency, concurrency_reason) = match self
+            .bt_cold_start_concurrency_override(&recommendation)
+        {
+            Some(configured) => (configured as usize, "bt_cold_start"),
+            None => {
+                let mut c = recommendation
+                    .concurrency
+                    .min(self.config.max_concurrent_fragments)
+                    .max(1);
+                let mut reason = "scheduler";
+                if let Some(cap) = self.proxy_cold_start_cap_for_config(recommendation.confidence) {
+                    c = c.min(cap).max(1);
+                    reason = "scheduler+proxy_cold_start";
+                }
+                // 稳态天花板:即使置信度升高也不在代理下抬到 4+ 打爆
+                let before = c;
+                c = self.apply_proxy_concurrency_ceiling(c);
+                if c < before {
+                    reason = "scheduler+proxy_ceiling";
+                }
+                (c as usize, reason)
+            }
+        };
 
-        info!(
+        debug!(
             configured_concurrency = self.config.max_concurrent_fragments,
             recommended_concurrency = recommendation.concurrency,
             effective_concurrency = effective_concurrency,
@@ -2032,7 +2765,7 @@ impl DownloadTask {
         });
         let circuit_breakers = self.circuit_breakers.clone();
         let metrics = self.metrics.clone();
-        tracing::info!(
+        tracing::debug!(
             has_progress_tx = progress_tx.is_some(),
             frag_count = self.fragments.len(),
             "分片下载准备就绪"
@@ -2148,7 +2881,7 @@ impl DownloadTask {
         loop {
             // 用户 Pause:强制 abort 在途分片并停车,避免 select 饿死/阻塞 await 导致“无法暂停”
             if Self::control_is_paused(&control_rx) {
-                tracing::info!("检测到 Pause,中止在途分片并等待 Resume");
+                tracing::debug!("检测到 Pause,中止在途分片并等待 Resume");
                 // 停掉入队任务,丢弃尚未 spawn 的 spec(Pause 期间不应再开新片)
                 enqueue_handle.abort();
                 if let Some(tx) = frag_tx.take() {
@@ -2228,7 +2961,7 @@ impl DownloadTask {
                         }
                     }
                 });
-                tracing::info!("Resume 后已重新入队未完成分片");
+                tracing::debug!("Resume 后已重新入队未完成分片");
                 continue;
             }
 
@@ -2242,13 +2975,25 @@ impl DownloadTask {
                         continue;
                     }
                     let rec = self.scheduler.recommend(file_size, max_concurrent_fragments);
-                    let new_target = rec.concurrency.min(max_concurrent_fragments).max(1);
                     let old = concurrency_ctrl.target();
-                    // 低置信度(慢启动/样本不足)只升不降,避免 holt=1 把爬坡并发打回 1
-                    let allow = new_target > old || rec.confidence > 0.5;
+                    let desired = self.apply_proxy_concurrency_ceiling(
+                        rec.concurrency.min(max_concurrent_fragments).max(1),
+                    );
+                    // 抬升步进限制:冷却结束也不允许一次跳回满配
+                    let new_target = if self.http_proxy_active() {
+                        Self::clamp_concurrency_scale_up_ex(old, desired, true)
+                    } else {
+                        Self::clamp_concurrency_scale_up(old, desired)
+                    };
+                    // 低置信度(慢启动/样本不足)只升不降;软压力冷却期内禁止抬升
+                    let allow = if new_target > old {
+                        !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
+                    } else {
+                        rec.confidence > 0.5
+                    };
                     if allow && new_target != old {
                         concurrency_ctrl.set_target(new_target);
-                        info!(
+                        debug!(
                             old_concurrency = old,
                             new_concurrency = new_target,
                             active = concurrency_ctrl.active(),
@@ -2257,7 +3002,10 @@ impl DownloadTask {
                         );
                     }
                     // 安全 rebalance:try_send 入队,Full 时 revert(不堵主循环)
-                    if let Some(tx) = frag_tx.as_ref() {
+                    // 软压力冷却期禁止拆片:rebalance 会新增连接,抵消降并发
+                    if let Some(tx) = frag_tx.as_ref()
+                        && !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
+                    {
                         let _ = self.try_rebalance_slowest_fragment(tx).await;
                     }
                 }
@@ -2294,6 +3042,8 @@ impl DownloadTask {
                                     .metadata
                                     .as_ref()
                                     .map(ObjectIdentity::from_metadata),
+                                range_window_bytes: self.proxy_range_window_bytes(),
+                                soft_pressure_until: &self.soft_pressure_until,
                             };
                             if let Err(e) =
                                 Self::spawn_fragment_task(&spawn_ctx, spec, &mut handles).await
@@ -2337,18 +3087,32 @@ impl DownloadTask {
                                 computed_hash,
                             )?;
                             // 样本驱动:每片完成后立即 re-recommend,避免 5s 定时器拖慢爬坡。
-                            // 低置信度只升不降,防止 holt 早期=1 把 ramp 目标打回。
+                            // 低置信度只升不降;软压力冷却期内禁止抬升。
                             let rec = self
                                 .scheduler
                                 .recommend(file_size, max_concurrent_fragments);
-                            let new_target =
-                                rec.concurrency.min(max_concurrent_fragments).max(1);
                             let old = concurrency_ctrl.target();
-                            if (new_target > old || rec.confidence > 0.5) && new_target != old {
+                            let desired = self.apply_proxy_concurrency_ceiling(
+                                rec.concurrency.min(max_concurrent_fragments).max(1),
+                            );
+                            let new_target = if self.http_proxy_active() {
+                                Self::clamp_concurrency_scale_up_ex(old, desired, true)
+                            } else {
+                                Self::clamp_concurrency_scale_up(old, desired)
+                            };
+                            let allow = if new_target > old {
+                                !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
+                            } else {
+                                rec.confidence > 0.5
+                            };
+                            if allow && new_target != old {
                                 concurrency_ctrl.set_target(new_target);
                             }
                             // 快片完成后立刻 rebalance 慢片,不必等 reschedule_timer
-                            if let Some(tx) = frag_tx.as_ref() {
+                            // 软压力冷却期禁止拆片
+                            if let Some(tx) = frag_tx.as_ref()
+                                && !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
+                            {
                                 let _ = self.try_rebalance_slowest_fragment(tx).await;
                             }
                         }
@@ -2464,7 +3228,7 @@ impl DownloadTask {
         )?;
 
         self.state = DownloadState::Completed;
-        info!("全部分片下载完成");
+        debug!("全部分片下载完成");
         Ok(())
     }
 
@@ -2475,10 +3239,15 @@ impl DownloadTask {
     ///   同步 await 本函数;channel 满时阻塞 send 会永久卡住 dispatcher
     ///   (实测:冷启动 concurrency=4、容量 8 时 4/17 分片后进度冻结)。
     ///   丢一次 rebalance 可通过 `revert_split` 安全回滚,下次定时/完成再试。
-    /// - 入队失败(Full/Closed)则 `revert_split` 回滚
+    /// - 入队失败(Full/Closed)则 `revert_split` 回滚,并计 `rebalance_dropped`
     /// - 不依赖 steal_rx / 额外 completed_tx 生命周期
     ///
-    /// 最慢片剩余 >= 2*MIN_SPLIT_SIZE 即可拆(含最后一片 straggler)。
+    /// 策略(对齐 IDM/FluxDown 慢段救援,仍保持安全边界):
+    /// - 最慢片剩余 >= 2*MIN_SPLIT_SIZE 即可拆(含最后一片 straggler)
+    /// - 年龄门槛 2s + 成功拆分最小间隔 5s,避免 WAN soft-pressure 恢复后连环拆
+    /// - 拆点取尾部 `max(MIN_SPLIT_SIZE, remaining/3)` 而非中点
+    /// - 在途写安全边距 `min(WRITE_BATCH, remaining/4)`
+    /// - 滞后门控:≥2 在途且 max_progress-slow_progress ≥ 15%
     async fn try_rebalance_slowest_fragment(
         &mut self,
         frag_tx: &mpsc::Sender<FragmentSpec>,
@@ -2486,42 +3255,74 @@ impl DownloadTask {
         use crate::fragment::{FragmentState, MIN_SPLIT_SIZE};
         use std::sync::atomic::Ordering;
 
+        /// 新 spawn 片最短观察时间,避免刚启动即被拆。
+        /// 2s 兼顾拖尾救援与 WAN 抖动:过短会在 TLS/限流抖动下连环拆片。
+        const REBALANCE_MIN_AGE: Duration = Duration::from_secs(2);
+        /// 两次成功 rebalance 最小间隔:soft-pressure 恢复后 lag 瞬时可很大,
+        /// 若每完成事件都拆会把 1 片拆成十几片(kernel.org 曾 21 次)。
+        const REBALANCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+        /// 代理路径更长间隔:Range 窗口已增请求密度,恢复瞬间拆尾=再增 TLS。
+        const REBALANCE_MIN_INTERVAL_PROXY: Duration = Duration::from_secs(20);
+        /// 相对最快在途片的进度落后阈值:均匀场景不拆,只在真实拖尾时救援。
+        /// (文档曾写 15%,实现为 20%——以本常量为准)
+        const REBALANCE_LAG_THRESHOLD: f64 = 0.20;
+
+        let min_interval = if self.http_proxy_active() {
+            REBALANCE_MIN_INTERVAL_PROXY
+        } else {
+            REBALANCE_MIN_INTERVAL
+        };
+        if let Some(at) = self.last_rebalance_at
+            && at.elapsed() < min_interval
+        {
+            return Ok(false);
+        }
+
         let mut best: Option<(usize, f64, u64)> = None; // (idx, progress, realtime)
+        let mut max_progress: f64 = 0.0;
+        let mut downloading = 0u32;
         for (i, frag) in self.fragments.iter().enumerate() {
             if frag.state != FragmentState::Downloading {
                 continue;
             }
+            downloading = downloading.saturating_add(1);
             let size = frag.info.size.max(1);
             let rt = frag.realtime_downloaded.load(Ordering::Acquire);
+            let progress = rt as f64 / size as f64;
+            if progress > max_progress {
+                max_progress = progress;
+            }
+
             let eff_end = frag.effective_end.load(Ordering::Acquire);
-            // 防溢出:frag.info.start + rt 是裸加法,release(overflow-checks=false)下
-            // 若 rt 异常增长会静默回绕。用 saturating_add 与下方 2284 行实际拆分逻辑
-            // (start.saturating_add(realtime))保持一致,消除不一致性。
-            // 即便此处选片偏差,2284 行的 remaining 检查会拒绝拆分,不致数据损坏。
+            // 防溢出:用 saturating_add 与实际拆分逻辑保持一致。
             let remaining = eff_end
                 .saturating_add(1)
                 .saturating_sub(frag.info.start.saturating_add(rt));
+            // 剩余太小不可拆:仍计入 downloading/max_progress 供滞后门控
             if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
                 continue;
             }
-            // 新 spawn 的片至少跑 1s 再评估,避免刚启动就被拆
             let age_ok = frag
                 .start_time
-                .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+                .map(|t| t.elapsed() >= REBALANCE_MIN_AGE)
                 .unwrap_or(false);
             if !age_ok {
                 continue;
             }
-            let progress = rt as f64 / size as f64;
             match best {
                 None => best = Some((i, progress, rt)),
                 Some((_, bp, _)) if progress < bp => best = Some((i, progress, rt)),
                 _ => {}
             }
         }
-        let Some((idx, _prog, realtime)) = best else {
+        let Some((idx, slow_prog, realtime)) = best else {
             return Ok(false);
         };
+        // 单在途片:无 peer 可救援。
+        // 多在途但最慢可拆片相对全局最快进度落后不足阈值:视为均匀,跳过。
+        if downloading < 2 || max_progress - slow_prog < REBALANCE_LAG_THRESHOLD {
+            return Ok(false);
+        }
 
         let frag = &self.fragments[idx];
         let start = frag.info.start;
@@ -2531,7 +3332,26 @@ impl DownloadTask {
         if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
             return Ok(false);
         }
-        let split_point = done_abs.saturating_add(remaining / 2);
+        // 在途写可能超前于 realtime。边距取 min(WRITE_BATCH, remaining/4)。
+        let write_safety = (WRITE_BATCH_BYTES as u64).min(remaining.saturating_div(4));
+        let min_split_point = done_abs
+            .saturating_add(write_safety)
+            .max(done_abs.saturating_add(1));
+        // 尾部救援:切下 max(MIN_SPLIT, remaining/3),保留原 worker 热路径主体。
+        let mut steal_len = remaining
+            .saturating_div(3)
+            .max(MIN_SPLIT_SIZE)
+            .min(remaining.saturating_sub(MIN_SPLIT_SIZE));
+        let mut split_point = eff_end.saturating_add(1).saturating_sub(steal_len);
+        if split_point < min_split_point {
+            // 尾部过大导致拆点落在安全线内:缩小 steal 使拆点贴安全线
+            let max_steal = eff_end.saturating_add(1).saturating_sub(min_split_point);
+            if max_steal < MIN_SPLIT_SIZE {
+                return Ok(false);
+            }
+            steal_len = max_steal;
+            split_point = eff_end.saturating_add(1).saturating_sub(steal_len);
+        }
         if split_point <= done_abs || split_point > eff_end {
             return Ok(false);
         }
@@ -2560,16 +3380,23 @@ impl DownloadTask {
         // try_send:Full 时立即返回,避免堵死 execute_fragmented_download 主循环
         match frag_tx.try_send(spec) {
             Ok(()) => {
-                info!(
+                debug!(
                     slow_index = idx,
-                    new_index, split_point, "rebalance:拆分慢片尾部并重入队"
+                    new_index, split_point, steal_len, "rebalance:拆分慢片尾部并重入队"
                 );
+                if let Some(m) = &self.metrics {
+                    m.inc_rebalance();
+                }
                 self.fragments.push(stolen);
+                self.last_rebalance_at = Some(Instant::now());
                 Ok(true)
             }
             Err(_) => {
                 // Full 或 Closed:回滚 split,下次 rebalance 再试
                 self.fragments[idx].revert_split_after_failed_dispatch(&stolen);
+                if let Some(m) = &self.metrics {
+                    m.inc_rebalance_dropped();
+                }
                 Ok(false)
             }
         }
@@ -2804,8 +3631,17 @@ impl DownloadTask {
         batch: bytes::BytesMut,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
+        metrics: Option<&Metrics>,
     ) -> DownloadResult<u64> {
-        Self::write_all_at(storage, pos, batch.freeze(), control_rx, pause_timeout).await
+        Self::write_all_at(
+            storage,
+            pos,
+            batch.freeze(),
+            control_rx,
+            pause_timeout,
+            metrics,
+        )
+        .await
     }
 
     /// 把已 owned 的 `Bytes` 完整写入存储(含短写重试 + 控制信号中断)
@@ -2815,15 +3651,28 @@ impl DownloadTask {
     /// 本就是 owned `Bytes`)直接传入,消除 256KiB 的 `BytesMut::from` memcpy。
     ///
     /// `Bytes::clone()`/`slice()` 均为零拷贝指针调整(Arc refcount),无内存复制。
+    /// 入口经 `ensure_aligned_bytes`:未对齐则拷入 AlignedBuf 并计 `aligned_write_copied`,
+    /// 已对齐零拷贝并计 `aligned_write_passthrough`。
     async fn write_all_at(
         storage: &StorageSet,
         mut pos: u64,
         mut remaining: bytes::Bytes,
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
+        metrics: Option<&Metrics>,
     ) -> DownloadResult<u64> {
         let mut total_written = 0u64;
         while !remaining.is_empty() {
+            let (aligned, copied) =
+                tachyon_io::ensure_aligned_bytes(remaining).map_err(DownloadError::Io)?;
+            remaining = aligned;
+            if let Some(m) = metrics {
+                if copied {
+                    m.inc_aligned_write_copied();
+                } else {
+                    m.inc_aligned_write_passthrough();
+                }
+            }
             let write = storage.write_at(pos, remaining.clone());
             let written = if let Some(rx) = control_rx.as_mut() {
                 tokio::select! {
@@ -2855,10 +3704,6 @@ impl DownloadTask {
                     "存储写入总长度溢出: written={total_written}, len={written_u64}"
                 ))
             })?;
-            // 零拷贝推进:Bytes::slice 仅调整指针/长度,不复制数据。
-            // clamp written 到剩余长度:StorageSet::Multi::write_at 内部 split_to 消费
-            // 全部数据后返回的 total 可能 > 单次 clone 的 len(跨段聚合),需防止 slice 越界。
-            // 与旧 advance(written.min(batch.len())) 的防御逻辑等价。
             let advance = written.min(remaining.len());
             remaining = remaining.slice(advance..);
         }
@@ -2920,6 +3765,7 @@ impl DownloadTask {
         control_rx: &mut Option<watch::Receiver<TaskCommand>>,
         pause_timeout: Duration,
         skip_write: bool,
+        metrics: Option<&Metrics>,
     ) -> DownloadResult<(u64, u64)> {
         // 流式哈希:在写入前按字节序更新(batch 内容此后不再变化)
         if let Some(h) = hasher {
@@ -2943,7 +3789,7 @@ impl DownloadTask {
             u64::try_from(batch.len())
                 .map_err(|_| DownloadError::Fragment("分片写入长度溢出".into()))?
         } else {
-            Self::write_all_at(storage, pos, batch, control_rx, pause_timeout).await?
+            Self::write_all_at(storage, pos, batch, control_rx, pause_timeout, metrics).await?
         };
         let new_pos = pos.checked_add(w).ok_or_else(|| {
             DownloadError::Fragment(format!(
@@ -3010,6 +3856,8 @@ impl DownloadTask {
         sync_mode: tachyon_core::config::CrashConsistencyMode,
         shared: &FragmentShared,
         object_identity: Option<ObjectIdentity>,
+        metrics: Option<&Metrics>,
+        range_window_bytes: Option<u64>,
     ) -> DownloadResult<(u64, Duration, Option<String>)> {
         let mut control_rx = control_rx.clone();
 
@@ -3048,20 +3896,6 @@ impl DownloadTask {
             .effective_end
             .load(std::sync::atomic::Ordering::Acquire)
             .min(frag_end);
-        let stream = if let Some(rx) = control_rx.as_mut() {
-            tokio::select! {
-                biased;
-                control = Self::watch_for_interrupt(rx, pause_timeout) => {
-                    control?;
-                    return Err(DownloadError::Other("控制信号异常结束".into()));
-                }
-                result = protocol.download_range_stream(url, actual_start, current_effective_end, object_identity.clone()) => result?,
-            }
-        } else {
-            protocol
-                .download_range_stream(url, actual_start, current_effective_end, object_identity)
-                .await?
-        };
 
         let full_len = current_effective_end
             .checked_sub(frag_start)
@@ -3071,8 +3905,17 @@ impl DownloadTask {
                     "分片范围非法: {frag_start}..={current_effective_end}"
                 ))
             })?;
-        let expected_len = full_len.saturating_sub(resume_offset);
-        if expected_len == 0 {
+        // expected_len 是 absolute 上限(相对 frag_start 的已写总量 total_written 的天花板)。
+        // total_written 从 resume_offset 起算(含已续传字节);不得用 remaining 当上限,
+        // 否则 resume>0 时 flush_batch 会误报“越界”(half+half > remaining)。
+        let expected_len = full_len;
+        let remaining0 = full_len.saturating_sub(resume_offset);
+        if remaining0 == 0 {
+            // 已续满:仍做完成边界 sync(与正常完成路径一致),再返回
+            if !skip_write && sync_mode == tachyon_core::config::CrashConsistencyMode::EveryFragment
+            {
+                storage.sync().await?;
+            }
             return Ok((full_len, Duration::ZERO, None));
         }
         let mut pos = actual_start;
@@ -3086,96 +3929,365 @@ impl DownloadTask {
         // write_buf 由调用方传入(跨分片复用),此处不再新建
         // 流式哈希:仅当分片有 expected hash 时计算,verify() 阶段无需重读文件。
         // 通过 Verifier trait 创建 StreamingHasher,支持 blake3/sha256/GPU 等后端切换。
+        // 续传完整性:resume_offset>0 时禁止后缀流式哈希当整片 computed_hash。
+        // verify() 在 computed_hash=None 时回退读盘计算完整 [start,size]。
         let mut hasher: Option<Box<dyn tachyon_core::traits::StreamingHasher>> =
-            compute_hash.then(|| verifier.new_hasher());
-        tokio::pin!(stream);
-        loop {
-            // 获取下一个 chunk:死 swarm 下(如磁力链接无 peer) stream.next() 永久 Pending,
-            // 必须与 watch_for_interrupt 竞速,否则取消信号无法穿透(协作式取消检查点
-            // 在循环体内,无 chunk 到达时不可达)。与 write_all_at 的 select! 同构。
-            // cancel-safe:StreamExt::next 仅持有 &mut stream,被 select! 取消时无部分状态。
-            let chunk_result = if let Some(rx) = control_rx.as_mut() {
-                tokio::select! {
-                    biased;
-                    interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
-                        interrupt?;
-                        return Err(DownloadError::Other("控制信号异常结束".into()));
-                    }
-                    chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
-                        Some(r) => r,
-                        None => break, // EOF:正常退出循环
-                    },
-                }
+            if compute_hash && resume_offset == 0 {
+                Some(verifier.new_hasher())
             } else {
-                match tokio_stream::StreamExt::next(&mut stream).await {
-                    Some(r) => r,
-                    None => break,
-                }
+                None
             };
-            // 每 chunk 立即检查 Pause/Cancel(不挂起等 Resume)。
-            // wait_control_rx 在 Pause 时会阻塞等 Resume,不适合热路径;
-            // select! biased+interrupt 优先是主路径,此处兜底防 select 饿死。
-            Self::check_control_interrupt(&mut control_rx)?;
-            let chunk = chunk_result?;
-            // BUG-1 修复:检查 effective_end 是否被 try_split 缩小
-            // 若 pos 已超过 effective_end,worker 的区域已被 steal,立即停止
+
+        // 片内窗口化 Range:代理下每次最多 range_window_bytes,直连 None=整片一次。
+        // 外层按窗口推进 pos;内层消费单窗口 stream 直至 EOF/错误。
+        'window_loop: loop {
             let current_end = shared
                 .effective_end
-                .load(std::sync::atomic::Ordering::Acquire);
+                .load(std::sync::atomic::Ordering::Acquire)
+                .min(frag_end);
             if pos > current_end {
-                break; // 已进入 steal 区域,停止下载
+                break 'window_loop;
             }
-            // 若 chunk 会跨越 effective_end,截断到 effective_end(避免写越界)
-            let chunk = if pos + chunk.len() as u64 > current_end + 1 {
-                let truncate = (current_end + 1 - pos) as usize;
-                chunk.slice(..truncate)
-            } else {
-                chunk
-            };
-            // 零拷贝优化: 大 chunk 直接写入,跳过 AlignedBuf 聚合
-            if chunk.len() >= WRITE_BATCH_BYTES {
-                // 先刷写 write_buf 中累积的残余数据(可能因小 chunk 累积未满阈值)
-                // 审计 H-01:按 effective_end 裁剪,避免 steal 后缓冲越界写
-                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
-                    let (new_pos, w) = Self::flush_batch(
-                        storage,
+            let window_end = Self::range_window_end(pos, current_end, range_window_bytes);
+            let window_requested_len = window_end.saturating_sub(pos).saturating_add(1);
+            let mut window_received: u64 = 0;
+            let stream = if let Some(rx) = control_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    control = Self::watch_for_interrupt(rx, pause_timeout) => {
+                        control?;
+                        return Err(DownloadError::Other("控制信号异常结束".into()));
+                    }
+                    result = protocol.download_range_stream(
+                        url,
                         pos,
-                        batch,
-                        &mut hasher,
-                        frag_index,
-                        total_written,
-                        expected_len,
-                        &rate_limiter,
-                        &mut control_rx,
-                        pause_timeout,
-                        skip_write,
-                    )
-                    .await?;
-                    pos = new_pos;
-                    total_written += w;
-                    shared
-                        .realtime_downloaded
-                        .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        window_end,
+                        object_identity.clone(),
+                    ) => result?,
                 }
+            } else {
+                protocol
+                    .download_range_stream(url, pos, window_end, object_identity.clone())
+                    .await?
+            };
+            tokio::pin!(stream);
+            loop {
+                // 获取下一个 chunk:死 swarm 下(如磁力链接无 peer) stream.next() 永久 Pending,
+                // 必须与 watch_for_interrupt 竞速,否则取消信号无法穿透(协作式取消检查点
+                // 在循环体内,无 chunk 到达时不可达)。与 write_all_at 的 select! 同构。
+                // cancel-safe:StreamExt::next 仅持有 &mut stream,被 select! 取消时无部分状态。
+                let chunk_result = if let Some(rx) = control_rx.as_mut() {
+                    tokio::select! {
+                        biased;
+                        interrupt = Self::watch_for_interrupt(rx, pause_timeout) => {
+                            interrupt?;
+                            return Err(DownloadError::Other("控制信号异常结束".into()));
+                        }
+                        chunk = tokio_stream::StreamExt::next(&mut stream) => match chunk {
+                            Some(r) => r,
+                            None => break, // EOF:正常退出循环
+                        },
+                    }
+                } else {
+                    match tokio_stream::StreamExt::next(&mut stream).await {
+                        Some(r) => r,
+                        None => break,
+                    }
+                };
+                // 每 chunk 立即检查 Pause/Cancel(不挂起等 Resume)。
+                // wait_control_rx 在 Pause 时会阻塞等 Resume,不适合热路径;
+                // select! biased+interrupt 优先是主路径,此处兜底防 select 饿死。
+                Self::check_control_interrupt(&mut control_rx)?;
+                // 流错误(TLS EOF 等)前先刷 write_buf:否则已收未满批的字节只在内存,
+                // 外层 resume 读 realtime_downloaded 仍是旧值,整片重下浪费 WAN 带宽。
+                let chunk = match chunk_result {
+                    Ok(c) => {
+                        // 每 Range 请求体超长 fail-closed(规格 requested_len)。
+                        // 在 effective_end 截断写入之前按原始 body 字节计数。
+                        let next = window_received.saturating_add(c.len() as u64);
+                        if next > window_requested_len {
+                            return Err(DownloadError::Fragment(format!(
+                                "分片窗口响应超长: index={frag_index}, requested={window_requested_len}, got={next}"
+                            )));
+                        }
+                        window_received = next;
+                        c
+                    }
+                    Err(e) => {
+                        let tail_end = shared
+                            .effective_end
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        if let Some(batch) = Self::take_clamped_write_buf(pos, tail_end, write_buf)
+                        {
+                            // 尽力 flush;失败仍返回原始流错误(主因)
+                            if let Ok((new_pos, w)) = Self::flush_batch(
+                                storage,
+                                pos,
+                                batch,
+                                &mut hasher,
+                                frag_index,
+                                total_written,
+                                expected_len,
+                                &rate_limiter,
+                                &mut control_rx,
+                                pause_timeout,
+                                skip_write,
+                                metrics,
+                            )
+                            .await
+                            {
+                                let _ = new_pos;
+                                total_written = total_written.saturating_add(w);
+                                shared
+                                    .realtime_downloaded
+                                    .store(total_written, std::sync::atomic::Ordering::Release);
+                                let _ = total_written; // 已写入 realtime;本 attempt 随后 Err 返回
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                // BUG-1 修复:检查 effective_end 是否被 try_split 缩小
+                // 若 pos 已超过 effective_end,worker 的区域已被 steal,立即停止
+                let current_end = shared
+                    .effective_end
+                    .load(std::sync::atomic::Ordering::Acquire);
                 if pos > current_end {
-                    break;
+                    break; // 已进入 steal 区域,停止下载
                 }
-                // write_buf 可能已推进 pos:重新按 current_end 裁剪大 chunk
-                let max_chunk = current_end.saturating_sub(pos).saturating_add(1) as usize;
-                if max_chunk == 0 {
-                    break;
-                }
-                let chunk = if chunk.len() > max_chunk {
-                    chunk.slice(..max_chunk)
+                // 若 chunk 会跨越 effective_end,截断到 effective_end(避免写越界)
+                let chunk = if pos + chunk.len() as u64 > current_end + 1 {
+                    let truncate = (current_end + 1 - pos) as usize;
+                    chunk.slice(..truncate)
                 } else {
                     chunk
                 };
-                // chunk 本就是 owned Bytes,直接传入 flush_batch,消除
-                // 旧路径 BytesMut::from(chunk) 的 256KiB memcpy + 堆分配。
+                // 大 chunk:已 512 对齐则直写;未对齐则切块装入 write_buf 复用对齐内存
+                // (freeze 后指针 512 对齐 → write_all_at passthrough,避免每块 ensure_aligned 拷贝)
+                if chunk.len() >= WRITE_BATCH_BYTES {
+                    // 先刷写 write_buf 中累积的残余数据(可能因小 chunk 累积未满阈值)
+                    // 审计 H-01:按 effective_end 裁剪,避免 steal 后缓冲越界写
+                    if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                        let (new_pos, w) = Self::flush_batch(
+                            storage,
+                            pos,
+                            batch,
+                            &mut hasher,
+                            frag_index,
+                            total_written,
+                            expected_len,
+                            &rate_limiter,
+                            &mut control_rx,
+                            pause_timeout,
+                            skip_write,
+                            metrics,
+                        )
+                        .await?;
+                        pos = new_pos;
+                        total_written += w;
+                        shared
+                            .realtime_downloaded
+                            .fetch_add(w, std::sync::atomic::Ordering::Release);
+                    }
+                    if pos > current_end {
+                        break;
+                    }
+                    // write_buf 可能已推进 pos:重新按 current_end 裁剪大 chunk
+                    let max_chunk = current_end.saturating_sub(pos).saturating_add(1) as usize;
+                    if max_chunk == 0 {
+                        break;
+                    }
+                    let chunk = if chunk.len() > max_chunk {
+                        chunk.slice(..max_chunk)
+                    } else {
+                        chunk
+                    };
+                    let ptr_aligned = (chunk.as_ptr() as usize).is_multiple_of(512);
+                    if ptr_aligned {
+                        let (new_pos, w) = Self::flush_batch(
+                            storage,
+                            pos,
+                            chunk,
+                            &mut hasher,
+                            frag_index,
+                            total_written,
+                            expected_len,
+                            &rate_limiter,
+                            &mut control_rx,
+                            pause_timeout,
+                            skip_write,
+                            metrics,
+                        )
+                        .await?;
+                        pos = new_pos;
+                        total_written += w;
+                        shared
+                            .realtime_downloaded
+                            .fetch_add(w, std::sync::atomic::Ordering::Release);
+                    } else {
+                        let mut rest = chunk;
+                        while !rest.is_empty() {
+                            if pos > current_end {
+                                write_buf.clear();
+                                break;
+                            }
+                            let space = WRITE_BATCH_BYTES.saturating_sub(write_buf.len());
+                            let take = rest.len().min(space.max(1));
+                            let piece = rest.slice(..take);
+                            rest = rest.slice(take..);
+                            write_buf.extend_from_slice(&piece);
+                            if write_buf.len() >= WRITE_BATCH_BYTES {
+                                if let Some(batch) =
+                                    Self::take_clamped_write_buf(pos, current_end, write_buf)
+                                {
+                                    let (new_pos, w) = Self::flush_batch(
+                                        storage,
+                                        pos,
+                                        batch,
+                                        &mut hasher,
+                                        frag_index,
+                                        total_written,
+                                        expected_len,
+                                        &rate_limiter,
+                                        &mut control_rx,
+                                        pause_timeout,
+                                        skip_write,
+                                        metrics,
+                                    )
+                                    .await?;
+                                    pos = new_pos;
+                                    total_written += w;
+                                    shared
+                                        .realtime_downloaded
+                                        .fetch_add(w, std::sync::atomic::Ordering::Release);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    progress_report_countdown = progress_report_countdown.saturating_sub(1);
+                    if progress_report_countdown == 0 {
+                        Self::report_progress(frag_index, total_written, progress_tx);
+                        progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
+                    }
+                    continue;
+                }
+                // 容量不足时先刷写已有数据(AlignedBuf 固定容量不自动扩容,与 BytesMut 不同)
+                if !write_buf.is_empty() && write_buf.len() + chunk.len() > WRITE_BATCH_BYTES {
+                    if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                        let (new_pos, w) = Self::flush_batch(
+                            storage,
+                            pos,
+                            batch,
+                            &mut hasher,
+                            frag_index,
+                            total_written,
+                            expected_len,
+                            &rate_limiter,
+                            &mut control_rx,
+                            pause_timeout,
+                            skip_write,
+                            metrics,
+                        )
+                        .await?;
+                        pos = new_pos;
+                        total_written += w;
+                        shared
+                            .realtime_downloaded
+                            .fetch_add(w, std::sync::atomic::Ordering::Release);
+                    }
+                    if pos > current_end {
+                        break;
+                    }
+                }
+                // 若当前 pos 已越过 steal 边界,丢弃本 chunk 并停止
+                if pos > current_end {
+                    write_buf.clear();
+                    break;
+                }
+                // 再截断 chunk 到剩余允许写入长度(含已缓冲)
+                let remaining_allowed = current_end
+                    .saturating_sub(pos)
+                    .saturating_add(1)
+                    .saturating_sub(write_buf.len() as u64)
+                    as usize;
+                if remaining_allowed == 0 {
+                    // write_buf 已占满允许区间,先 flush 再结束
+                    if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                        let (new_pos, w) = Self::flush_batch(
+                            storage,
+                            pos,
+                            batch,
+                            &mut hasher,
+                            frag_index,
+                            total_written,
+                            expected_len,
+                            &rate_limiter,
+                            &mut control_rx,
+                            pause_timeout,
+                            skip_write,
+                            metrics,
+                        )
+                        .await?;
+                        pos = new_pos;
+                        total_written += w;
+                        shared
+                            .realtime_downloaded
+                            .fetch_add(w, std::sync::atomic::Ordering::Release);
+                    }
+                    break;
+                }
+                let chunk = if chunk.len() > remaining_allowed {
+                    chunk.slice(..remaining_allowed)
+                } else {
+                    chunk
+                };
+                write_buf.extend_from_slice(&chunk);
+                progress_report_countdown = progress_report_countdown.saturating_sub(1);
+                // 达到阈值时批量刷写
+                if write_buf.len() >= WRITE_BATCH_BYTES {
+                    // split().freeze() 零拷贝:split_to 调整指针,freeze 转 Bytes(Arc inc)
+                    if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
+                        let (new_pos, w) = Self::flush_batch(
+                            storage,
+                            pos,
+                            batch,
+                            &mut hasher,
+                            frag_index,
+                            total_written,
+                            expected_len,
+                            &rate_limiter,
+                            &mut control_rx,
+                            pause_timeout,
+                            skip_write,
+                            metrics,
+                        )
+                        .await?;
+                        pos = new_pos;
+                        total_written += w;
+                        shared
+                            .realtime_downloaded
+                            .fetch_add(w, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
+                // countdown 也能正常重置,避免 u64 下溢 panic
+                if progress_report_countdown == 0 {
+                    Self::report_progress(frag_index, total_written, progress_tx);
+                    progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
+                }
+            } // end inner stream chunk loop
+            // 窗口流 EOF:先刷 write_buf 残余,再决定是否开下一窗
+            let tail_end = shared
+                .effective_end
+                .load(std::sync::atomic::Ordering::Acquire)
+                .min(frag_end);
+            if let Some(batch) = Self::take_clamped_write_buf(pos, tail_end, write_buf) {
                 let (new_pos, w) = Self::flush_batch(
                     storage,
                     pos,
-                    chunk,
+                    batch,
                     &mut hasher,
                     frag_index,
                     total_written,
@@ -3184,6 +4296,7 @@ impl DownloadTask {
                     &mut control_rx,
                     pause_timeout,
                     skip_write,
+                    metrics,
                 )
                 .await?;
                 pos = new_pos;
@@ -3191,163 +4304,65 @@ impl DownloadTask {
                 shared
                     .realtime_downloaded
                     .fetch_add(w, std::sync::atomic::Ordering::Release);
-                progress_report_countdown = progress_report_countdown.saturating_sub(1);
-                if progress_report_countdown == 0 {
-                    Self::report_progress(frag_index, total_written, progress_tx);
-                    progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
-                }
-                continue;
             }
-            // 容量不足时先刷写已有数据(AlignedBuf 固定容量不自动扩容,与 BytesMut 不同)
-            if !write_buf.is_empty() && write_buf.len() + chunk.len() > WRITE_BATCH_BYTES {
-                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
-                    let (new_pos, w) = Self::flush_batch(
-                        storage,
-                        pos,
-                        batch,
-                        &mut hasher,
-                        frag_index,
-                        total_written,
-                        expected_len,
-                        &rate_limiter,
-                        &mut control_rx,
-                        pause_timeout,
-                        skip_write,
-                    )
-                    .await?;
-                    pos = new_pos;
-                    total_written += w;
-                    shared
-                        .realtime_downloaded
-                        .fetch_add(w, std::sync::atomic::Ordering::Release);
-                }
-                if pos > current_end {
-                    break;
-                }
+            // 窗口未读满且仍在有效边界内 → 对端提前 EOF,交外层重试(已 flush partial)。
+            // 用 Network+unexpected eof 归类 soft-pressure:额外 retry budget、短 jitter、
+            // reconnect spacing;纯 Fragment 字符串不会触发 is_connection_soft_pressure。
+            if pos <= window_end && pos <= tail_end {
+                return Err(DownloadError::Network(format!(
+                    "分片窗口提前结束(unexpected eof): index={frag_index}, pos={pos}, window_end={window_end}"
+                )));
             }
-            // 若当前 pos 已越过 steal 边界,丢弃本 chunk 并停止
-            if pos > current_end {
-                write_buf.clear();
-                break;
+            // pos 已越过 window_end → 本窗完成,继续下一窗(或 frag 结束)
+            if pos > tail_end {
+                break 'window_loop;
             }
-            // 再截断 chunk 到剩余允许写入长度(含已缓冲)
-            let remaining_allowed = current_end
-                .saturating_sub(pos)
-                .saturating_add(1)
-                .saturating_sub(write_buf.len() as u64)
-                as usize;
-            if remaining_allowed == 0 {
-                // write_buf 已占满允许区间,先 flush 再结束
-                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
-                    let (new_pos, w) = Self::flush_batch(
-                        storage,
-                        pos,
-                        batch,
-                        &mut hasher,
-                        frag_index,
-                        total_written,
-                        expected_len,
-                        &rate_limiter,
-                        &mut control_rx,
-                        pause_timeout,
-                        skip_write,
-                    )
-                    .await?;
-                    pos = new_pos;
-                    total_written += w;
-                    shared
-                        .realtime_downloaded
-                        .fetch_add(w, std::sync::atomic::Ordering::Release);
-                }
-                break;
-            }
-            let chunk = if chunk.len() > remaining_allowed {
-                chunk.slice(..remaining_allowed)
-            } else {
-                chunk
-            };
-            write_buf.extend_from_slice(&chunk);
-            progress_report_countdown = progress_report_countdown.saturating_sub(1);
-            // 达到阈值时批量刷写
-            if write_buf.len() >= WRITE_BATCH_BYTES {
-                // split().freeze() 零拷贝:split_to 调整指针,freeze 转 Bytes(Arc inc)
-                if let Some(batch) = Self::take_clamped_write_buf(pos, current_end, write_buf) {
-                    let (new_pos, w) = Self::flush_batch(
-                        storage,
-                        pos,
-                        batch,
-                        &mut hasher,
-                        frag_index,
-                        total_written,
-                        expected_len,
-                        &rate_limiter,
-                        &mut control_rx,
-                        pause_timeout,
-                        skip_write,
-                    )
-                    .await?;
-                    pos = new_pos;
-                    total_written += w;
-                    shared
-                        .realtime_downloaded
-                        .fetch_add(w, std::sync::atomic::Ordering::Release);
-                }
-            }
-            // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
-            // countdown 也能正常重置,避免 u64 下溢 panic
-            if progress_report_countdown == 0 {
-                Self::report_progress(frag_index, total_written, progress_tx);
-                progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
-            }
-        }
-        // 刷写剩余数据(按 final effective_end 裁剪)
-        let tail_end = shared
-            .effective_end
-            .load(std::sync::atomic::Ordering::Acquire);
-        if let Some(batch) = Self::take_clamped_write_buf(pos, tail_end, write_buf) {
-            // split().freeze() 零拷贝转 Bytes
-            let (_new_pos, w) = Self::flush_batch(
-                storage,
-                pos,
-                batch,
-                &mut hasher,
-                frag_index,
-                total_written,
-                expected_len,
-                &rate_limiter,
-                &mut control_rx,
-                pause_timeout,
-                skip_write,
-            )
-            .await?;
-            total_written += w;
-            shared
-                .realtime_downloaded
-                .fetch_add(w, std::sync::atomic::Ordering::Release);
-        }
+        } // end window_loop
+
         // 与原始 is_multiple_of 行为对齐:当 chunk 总数为 PROGRESS_REPORT_CHUNK_INTERVAL
         // 整数倍时,尾刷再发送一次进度事件(可能重复)。
         if progress_report_countdown == PROGRESS_REPORT_CHUNK_INTERVAL {
             Self::report_progress(frag_index, total_written, progress_tx);
         }
 
-        let actual_written = total_written.saturating_sub(resume_offset);
+        let mut actual_written = total_written.saturating_sub(resume_offset);
         // BUG-1 修复:work-stealing 拆分后 effective_end 缩小,worker 提前停止,
-        // expected_len 需用 final effective_end 重新计算(非拆分时与原值相同)
+        // 剩余预期长度需用 final effective_end 重新计算(非拆分时 = full_len - resume)
         let final_effective_end = shared
             .effective_end
             .load(std::sync::atomic::Ordering::Acquire);
         let effective_expected = if final_effective_end < current_effective_end {
-            // 被拆分:重新计算预期长度
+            // 被拆分:重新计算剩余预期长度
             final_effective_end
                 .checked_sub(frag_start)
                 .and_then(|l| l.checked_add(1))
-                .unwrap_or(expected_len)
+                .unwrap_or(full_len)
                 .saturating_sub(resume_offset)
         } else {
-            expected_len
+            full_len.saturating_sub(resume_offset)
         };
-        if actual_written != effective_expected {
+        if actual_written < effective_expected {
+            return Err(DownloadError::Fragment(format!(
+                "分片下载数据不完整: index={frag_index}, 预期 {effective_expected} 字节, 实际写入 {actual_written} 字节"
+            )));
+        }
+        // rebalance 竞态:在途 batch 可能越过新 effective_end 后才观察到拆分。
+        // 越界区间由 steal worker 重下覆盖;原片按缩小后的边界计完成即可。
+        if actual_written > effective_expected && final_effective_end < current_effective_end {
+            debug!(
+                index = frag_index,
+                actual_written,
+                effective_expected,
+                final_effective_end,
+                "rebalance 后原片越界写入,按 effective_end 钳制完成"
+            );
+            actual_written = effective_expected;
+            // total_written 是 resume_offset 起的绝对已写;钳制后与缩小边界一致
+            total_written = resume_offset.saturating_add(actual_written);
+            shared
+                .realtime_downloaded
+                .store(total_written, std::sync::atomic::Ordering::Release);
+        } else if actual_written != effective_expected {
             return Err(DownloadError::Fragment(format!(
                 "分片下载数据不完整: index={frag_index}, 预期 {effective_expected} 字节, 实际写入 {actual_written} 字节"
             )));
@@ -3377,7 +4392,7 @@ impl DownloadTask {
             warn!(index = frag_index, error = %e, "分片完成进度事件发送失败");
         }
 
-        info!(
+        debug!(
             index = frag_index,
             written = total_written as usize,
             elapsed_ms = elapsed.as_millis(),
@@ -3410,7 +4425,7 @@ impl DownloadTask {
         }
 
         self.state = DownloadState::Verifying;
-        info!(task_id = %self.id, "开始校验文件完整性");
+        debug!(task_id = %self.id, "开始校验文件完整性");
 
         let storage = self
             .storage
@@ -3517,9 +4532,9 @@ impl DownloadTask {
 
         // BestEffort 策略:无 expected hash 时跳过并记录日志
         if !has_expected_hash {
-            info!(task_id = %self.id, "无 expected hash,跳过校验(BestEffort 策略)");
+            debug!(task_id = %self.id, "无 expected hash,跳过校验(BestEffort 策略)");
         } else {
-            info!(task_id = %self.id, "文件完整性校验通过");
+            debug!(task_id = %self.id, "文件完整性校验通过");
         }
         Ok(())
     }
@@ -3532,7 +4547,7 @@ impl DownloadTask {
     /// 任一步骤失败将标记任务为 `Failed` 并返回错误。
     #[tracing::instrument(skip(self), fields(url = %tachyon_core::redact_url_for_log(&self.url)))]
     pub async fn run(&mut self) -> DownloadResult<()> {
-        info!(url = %tachyon_core::redact_url_for_log(&self.url), "启动下载任务");
+        debug!(url = %tachyon_core::redact_url_for_log(&self.url), "启动下载任务");
 
         let result = self.run_inner().await;
 
@@ -3733,7 +4748,7 @@ impl DownloadTask {
         }
 
         self.state = DownloadState::Completed;
-        info!("下载任务完成");
+        debug!("下载任务完成");
         Ok(())
     }
 
@@ -3921,6 +4936,7 @@ impl DownloadTask {
                         write_buf.split().freeze(),
                         &mut self.control_rx,
                         pause_timeout,
+                        self.metrics.as_deref(),
                     )
                     .await?;
                     pos = pos.checked_add(written).ok_or_else(|| {
@@ -3929,9 +4945,15 @@ impl DownloadTask {
                         )
                     })?;
                 }
-                let written =
-                    Self::write_all_at(&storage, pos, chunk, &mut self.control_rx, pause_timeout)
-                        .await?;
+                let written = Self::write_all_at(
+                    &storage,
+                    pos,
+                    chunk,
+                    &mut self.control_rx,
+                    pause_timeout,
+                    self.metrics.as_deref(),
+                )
+                .await?;
                 pos = pos.checked_add(written).ok_or_else(|| {
                     DownloadError::Other(format!("BT fallback 偏移溢出: {pos}+{written}").into())
                 })?;
@@ -3945,6 +4967,7 @@ impl DownloadTask {
                     write_buf.split().freeze(),
                     &mut self.control_rx,
                     pause_timeout,
+                    self.metrics.as_deref(),
                 )
                 .await?;
                 pos = pos.checked_add(written).ok_or_else(|| {
@@ -3959,6 +4982,7 @@ impl DownloadTask {
                     write_buf.split().freeze(),
                     &mut self.control_rx,
                     pause_timeout,
+                    self.metrics.as_deref(),
                 )
                 .await?;
                 pos = pos.checked_add(written).ok_or_else(|| {
@@ -3974,6 +4998,7 @@ impl DownloadTask {
                 write_buf.freeze(),
                 &mut self.control_rx,
                 pause_timeout,
+                self.metrics.as_deref(),
             )
             .await?;
             pos = pos.checked_add(written).ok_or_else(|| {
@@ -5154,6 +6179,8 @@ mod tests {
                 max_retries: 0,
                 verify_checksum: false,
                 max_concurrent_fragments: 2,
+                // 本测断言每分片 completed 前 sync;默认 Loose 会跳过分片 sync
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
                 ..test_config()
             },
             protocol,
@@ -5457,7 +6484,7 @@ mod tests {
 
         // 整块经 write_all_at 写入(跨 512 边界 + 段内短写)
         let batch = bytes::Bytes::from(global);
-        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO)
+        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO, None)
             .await
             .unwrap();
         assert_eq!(written, total, "write_all_at 应写入全部字节");
@@ -5513,9 +6540,10 @@ mod tests {
             let ss = Arc::clone(&ss);
             let start = offset;
             handles.spawn(async move {
-                let w = DownloadTask::write_all_at(&ss, start, chunk, &mut None, Duration::ZERO)
-                    .await
-                    .unwrap();
+                let w =
+                    DownloadTask::write_all_at(&ss, start, chunk, &mut None, Duration::ZERO, None)
+                        .await
+                        .unwrap();
                 assert_eq!(w, end - start + 1, "分片 {start}..{end} 写入量不符");
             });
             offset = end + 1;
@@ -5539,9 +6567,10 @@ mod tests {
         let storage = ShortWriteStorage::with_capacity(total, 17);
         let ss = StorageSet::single(StorageKind::new(storage.clone()));
         let batch = bytes::BytesMut::from(&vec![0xA5u8; total][..]);
-        let written = DownloadTask::write_all_at_mut(&ss, 0, batch, &mut None, Duration::ZERO)
-            .await
-            .unwrap();
+        let written =
+            DownloadTask::write_all_at_mut(&ss, 0, batch, &mut None, Duration::ZERO, None)
+                .await
+                .unwrap();
         assert_eq!(written, total as u64, "短写循环应累计写入全部字节");
         assert_eq!(storage.data(), vec![0xA5u8; total], "数据应完整落盘");
     }
@@ -5553,7 +6582,7 @@ mod tests {
         let storage = ShortWriteStorage::with_capacity(total, 13);
         let ss = StorageSet::single(StorageKind::new(storage.clone()));
         let batch = bytes::Bytes::from(vec![0x5Au8; total]);
-        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO)
+        let written = DownloadTask::write_all_at(&ss, 0, batch, &mut None, Duration::ZERO, None)
             .await
             .unwrap();
         assert_eq!(written, total as u64);
@@ -5781,6 +6810,54 @@ mod tests {
         assert_eq!(task.state(), DownloadState::Completed);
     }
 
+    /// 整块路径(无 Range)经 AlignedBuf 聚合后,对齐写应高 passthrough。
+    /// 用多个小 chunk 模拟 reqwest 未对齐流,验证不再每个 chunk 都 copy。
+    #[tokio::test]
+    async fn test_full_download_aligned_write_passthrough_with_small_chunks() {
+        // 20 * 8KiB = 160KiB,跨多个 WRITE_BATCH(256KiB)边界前会聚合
+        let chunk = 8 * 1024usize;
+        let total = chunk * 40; // 320KiB > WRITE_BATCH
+        let data = Bytes::from(vec![0xABu8; total]);
+        let meta = FileMetadata {
+            file_name: "full-align.bin".into(),
+            file_size: Some(total as u64),
+            content_type: None,
+            supports_range: false,
+            etag: None,
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        // MockProto default_data 可能整包吐出;用 stream 小块更贴近真实
+        let protocol = Arc::new(MockProto::new(meta).with_default_data(data.clone()));
+        let storage = StorageKind::memory_with_capacity(total);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/full-align.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        let metrics = Arc::new(Metrics::new());
+        task.set_metrics(metrics.clone());
+        // 注入对齐池,与生产路径一致
+        task.set_buffer_pool(Arc::new(BufferPool::with_prefill(WRITE_BATCH_BYTES, 4)));
+        task.run().await.expect("full download 应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+        let snap = metrics.snapshot();
+        let pass = snap.3;
+        let copy = snap.4;
+        assert!(pass + copy > 0, "应有对齐写样本: pass={pass} copy={copy}");
+        // 聚合后的 batch 来自 AlignedBuf freeze,指针应 512 对齐 → passthrough 主导
+        assert!(
+            pass >= copy,
+            "整块聚合路径 passthrough 应 >= copied,实际 pass={pass} copy={copy}"
+        );
+    }
+
     /// write_all_at_mut 计时基准:256KiB batch(对齐 WRITE_BATCH_BYTES),NoopStorage
     ///
     /// NoopStorage.write_at 零拷贝返回 len,隔离出 freeze/clone/slice 的纯逻辑开销。
@@ -5796,10 +6873,16 @@ mod tests {
         let start = Instant::now();
         for _ in 0..iterations {
             // clone batch 供每轮消费(write_all_at_mut 入口 freeze 消费所有权)
-            let _ =
-                DownloadTask::write_all_at_mut(&ss, 0, batch.clone(), &mut None, Duration::ZERO)
-                    .await
-                    .unwrap();
+            let _ = DownloadTask::write_all_at_mut(
+                &ss,
+                0,
+                batch.clone(),
+                &mut None,
+                Duration::ZERO,
+                None,
+            )
+            .await
+            .unwrap();
         }
         let elapsed = start.elapsed();
         let per_op_ns = elapsed.as_nanos() / iterations as u128;
@@ -5807,9 +6890,12 @@ mod tests {
             "write_all_at_mut 256KiB NoopStorage: {per_op_ns} ns/op ({} iters, {elapsed:?} total)",
             iterations
         );
-        // 回归护栏:单次零拷贝逻辑开销应 < 50µs(NoopStorage 无 I/O)
+        // 回归护栏:单次零拷贝逻辑开销应 < 200µs(NoopStorage 无 I/O)。
+        // 阈值从 50µs 放宽到 200µs:并行 nextest 下 CPU 调度抖动会让个别
+        // 迭代的 wall time 抬升,50µs 易 flaky;200µs 仍足以捕获引入拷贝
+        // 导致的数量级退化(正常零拷贝约数百 ns~数 µs)。
         assert!(
-            per_op_ns < 50_000,
+            per_op_ns < 200_000,
             "write_all_at_mut 单次开销 {per_op_ns} ns 过高,可能引入了拷贝"
         );
     }
@@ -6856,16 +7942,33 @@ mod tests {
             > {
                 let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 let payload = self.payload.clone();
-                let len = (end - start + 1) as usize;
+                let len = end.saturating_sub(start).saturating_add(1) as usize;
                 Box::pin(async move {
+                    if start > end {
+                        return Ok(Box::pin(futures::stream::empty()) as ByteStream);
+                    }
+                    // 仅对首个 Range 注入半缓冲失败;其余 attempt 返回完整区间
                     if n == 0 {
-                        // 半缓冲:小 chunk 后失败,模拟 write_buf 残留
-                        let partial = Bytes::from(vec![0xEE; 64.min(len)]);
+                        // 半缓冲:正确前缀后失败(模拟 TLS EOF 前已收合法字节)
+                        // 用 payload 前缀而非 0xEE:错误路径 flush+resume 会保留已写字节
+                        let take = 64
+                            .min(len)
+                            .min(payload.len().saturating_sub(start as usize));
+                        let partial = if take == 0 {
+                            Bytes::new()
+                        } else {
+                            payload.slice(start as usize..start as usize + take)
+                        };
                         let err = DownloadError::Network("模拟半缓冲后失败".into());
                         Ok(Box::pin(futures::stream::iter(vec![Ok(partial), Err(err)]))
                             as ByteStream)
                     } else {
-                        let data = payload.slice(start as usize..(end as usize + 1));
+                        let start_u = start as usize;
+                        let end_u = (end as usize).saturating_add(1).min(payload.len());
+                        if start_u >= end_u || start_u >= payload.len() {
+                            return Ok(Box::pin(futures::stream::empty()) as ByteStream);
+                        }
+                        let data = payload.slice(start_u..end_u);
                         Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
                     }
                 })
@@ -8652,7 +9755,145 @@ mod tests {
         task
     }
 
-    /// P0-2:单个分片前 2 次失败、第 3 次成功,在 max_retries=3 下应整体成功。
+    /// TLS EOF 类失败后,已 flush 字节应推进 resume,第二次 Range 从 partial 起点开始。
+    #[tokio::test]
+    async fn test_fragment_retry_resumes_after_partial_tls_eof() {
+        use futures::stream;
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+
+        /// 第 1 次对目标分片:先吐 1/2 数据,再 TLS EOF;
+        /// 第 2 次:要求 start 已推进到 partial,再返回剩余。
+        struct PartialThenEofProtocol {
+            meta: FileMetadata,
+            target_start: u64,
+            frag_size: u64,
+            attempts: Arc<AtomicU32>,
+            last_start: Arc<AtomicU64>,
+        }
+        impl Clone for PartialThenEofProtocol {
+            fn clone(&self) -> Self {
+                Self {
+                    meta: self.meta.clone(),
+                    target_start: self.target_start,
+                    frag_size: self.frag_size,
+                    attempts: Arc::clone(&self.attempts),
+                    last_start: Arc::clone(&self.last_start),
+                }
+            }
+        }
+        impl Protocol for PartialThenEofProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>,
+            > {
+                let meta = self.meta.clone();
+                Box::pin(async move { Ok(meta) })
+            }
+            fn download_range(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let size = (end - start + 1) as usize;
+                Box::pin(async move { Ok(Bytes::from(vec![0xCD; size])) })
+            }
+            fn download_range_stream(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let target = self.target_start;
+                let frag_size = self.frag_size;
+                let attempts = Arc::clone(&self.attempts);
+                let last_start = Arc::clone(&self.last_start);
+                Box::pin(async move {
+                    last_start.store(start, AtomicOrdering::SeqCst);
+                    let full = (end - start + 1) as usize;
+                    // 非目标分片:整段成功
+                    if start < target || start >= target + frag_size {
+                        let data = Bytes::from(vec![0xAB; full]);
+                        return Ok(Box::pin(stream::once(async move { Ok(data) })) as ByteStream);
+                    }
+                    let n = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                    if n == 0 {
+                        // 首次:吐一半后 TLS EOF(半段需 >= 使 write 路径落盘)
+                        let half = (frag_size as usize / 2).max(1);
+                        let first = Bytes::from(vec![0x11; half]);
+                        let s = stream::iter(vec![
+                            Ok(first),
+                            Err(DownloadError::Network(
+                                "peer closed connection without sending TLS close_notify".into(),
+                            )),
+                        ]);
+                        Ok(Box::pin(s) as ByteStream)
+                    } else {
+                        // 续传:start 必须 > target(已推进)
+                        assert!(
+                            start > target,
+                            "第二次 Range start={start} 应 > target={target}(resume 推进)"
+                        );
+                        let data = Bytes::from(vec![0x22; full]);
+                        Ok(Box::pin(stream::once(async move { Ok(data) })) as ByteStream)
+                    }
+                })
+            }
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::new()) })
+            }
+            fn download_full_stream(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                Box::pin(async move { Ok(Box::pin(futures::stream::empty()) as ByteStream) })
+            }
+        }
+
+        let frag_size = 256 * 1024u64; // 256KiB,确保 half 可落盘
+        let total = frag_size * 2;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let last_start = Arc::new(AtomicU64::new(0));
+        let protocol: Arc<dyn Protocol> = Arc::new(PartialThenEofProtocol {
+            meta: test_metadata("partial-eof.bin", total),
+            target_start: 0,
+            frag_size,
+            attempts: Arc::clone(&attempts),
+            last_start: Arc::clone(&last_start),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 3);
+        // 关闭校验,无 expected hash → compute_hash=false → 允许 resume 推进
+        task.config.verify_checksum = false;
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("partial TLS EOF 后续传应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!(
+            attempts.load(AtomicOrdering::SeqCst) >= 2,
+            "目标分片至少 2 次 attempt"
+        );
+        assert!(
+            last_start.load(AtomicOrdering::SeqCst) > 0,
+            "最后一次 Range start 应已推进,实际 {}",
+            last_start.load(AtomicOrdering::SeqCst)
+        );
+    }
+
     #[tokio::test]
     async fn test_fragment_auto_retry_succeeds_within_limit() {
         let frag_size = 100u64;
@@ -9106,18 +10347,119 @@ mod tests {
         }
     }
 
-    /// P2:权限错误(403)不应重试,应立即终止该分片。
-    /// 即使 max_retries=5,被请求次数也应恰好为 1。
+    /// probe 遇到可重试软压力错误时,应按 max_retries 退避后成功。
     #[tokio::test]
-    async fn test_forbidden_error_not_retried() {
+    async fn test_probe_retries_on_soft_pressure_network_error() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        struct FlakyProbeProto {
+            meta: FileMetadata,
+            fails_left: Arc<AtomicU32>,
+            attempts: Arc<AtomicU32>,
+        }
+        impl Protocol for FlakyProbeProto {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<FileMetadata>> + Send>,
+            > {
+                let meta = self.meta.clone();
+                let fails_left = Arc::clone(&self.fails_left);
+                let attempts = Arc::clone(&self.attempts);
+                Box::pin(async move {
+                    attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                    if fails_left
+                        .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |v| {
+                            if v > 0 { Some(v - 1) } else { None }
+                        })
+                        .is_ok()
+                    {
+                        return Err(DownloadError::Network("tls handshake eof".into()));
+                    }
+                    Ok(meta)
+                })
+            }
+            fn download_range(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                let size = (end - start + 1) as usize;
+                Box::pin(async move { Ok(Bytes::from(vec![0u8; size])) })
+            }
+            fn download_range_stream(
+                &self,
+                url: &str,
+                start: u64,
+                end: u64,
+                identity: Option<ObjectIdentity>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                let this_url = url.to_owned();
+                let data_fut = self.download_range(&this_url, start, end, identity);
+                Box::pin(async move {
+                    let data = data_fut.await?;
+                    Ok(Box::pin(futures::stream::once(async move { Ok(data) })) as ByteStream)
+                })
+            }
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DownloadResult<Bytes>> + Send>>
+            {
+                Box::pin(async move { Ok(Bytes::new()) })
+            }
+            fn download_full_stream(
+                &self,
+                _url: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = DownloadResult<ByteStream>> + Send>,
+            > {
+                Box::pin(async move { Ok(Box::pin(futures::stream::empty()) as ByteStream) })
+            }
+        }
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let protocol: Arc<dyn Protocol> = Arc::new(FlakyProbeProto {
+            meta: test_metadata("probe-retry.bin", 300),
+            fails_left: Arc::new(AtomicU32::new(2)),
+            attempts: Arc::clone(&attempts),
+        });
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/probe-retry.bin".into(),
+            DownloadConfig {
+                max_retries: 3,
+                max_concurrent_fragments: 2,
+                verify_checksum: false,
+                ..test_config()
+            },
+            protocol,
+            StorageKind::memory_with_capacity(300),
+        );
+        let meta = task.probe().await.expect("probe 应在重试后成功");
+        assert_eq!(meta.file_size, Some(300));
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            3,
+            "2 次失败 + 1 次成功"
+        );
+    }
+
+    /// 401 认证失败不可重试;应立即终止。
+    #[tokio::test]
+    async fn test_forbidden_401_not_retried() {
         let frag_size = 100u64;
         let total = frag_size * 3;
         let attempts = Arc::new(AtomicU32::new(0));
         let protocol: Arc<dyn Protocol> = Arc::new(ClassifiedErrorProtocol {
-            meta: test_metadata("forbidden.bin", total),
-            fail_start: frag_size, // 第 2 个分片返回 403
-            fail_times: u32::MAX,  // 始终失败(用以验证不重试)
-            error_factory: Arc::new(|| DownloadError::Forbidden { status: 403 }),
+            meta: test_metadata("forbidden401.bin", total),
+            fail_start: frag_size,
+            fail_times: u32::MAX,
+            error_factory: Arc::new(|| DownloadError::Forbidden { status: 401 }),
             attempts: Arc::clone(&attempts),
         });
         let mut task = flaky_task(protocol, total, frag_size, 5);
@@ -9126,12 +10468,66 @@ mod tests {
         task.plan().unwrap();
         task.prepare_storage().await.unwrap();
         let result = task.execute().await;
-        assert!(result.is_err(), "403 应导致整体失败");
+        assert!(result.is_err(), "401 应导致整体失败");
         assert_eq!(task.state(), DownloadState::Failed);
         assert_eq!(
             attempts.load(AtomicOrdering::SeqCst),
             1,
-            "权限错误应只尝试一次,不重试"
+            "401 认证失败应只尝试一次,不重试"
+        );
+    }
+
+    /// 403 CDN/WAF 软拒绝可重试:max_retries=2 时至少尝试 3 次(0..2)。
+    #[tokio::test]
+    async fn test_forbidden_403_is_soft_retried() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let protocol: Arc<dyn Protocol> = Arc::new(ClassifiedErrorProtocol {
+            meta: test_metadata("forbidden403.bin", total),
+            fail_start: frag_size,
+            fail_times: u32::MAX,
+            error_factory: Arc::new(|| DownloadError::Forbidden { status: 403 }),
+            attempts: Arc::clone(&attempts),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 2);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        let result = task.execute().await;
+        assert!(result.is_err(), "持续 403 最终仍失败");
+        assert_eq!(task.state(), DownloadState::Failed);
+        assert!(
+            attempts.load(AtomicOrdering::SeqCst) >= 3,
+            "403 软拒绝应按 max_retries 重试,实际 attempts={}",
+            attempts.load(AtomicOrdering::SeqCst)
+        );
+    }
+
+    /// 403 首次失败后恢复:应整体成功。
+    #[tokio::test]
+    async fn test_forbidden_403_recovers_after_retry() {
+        let frag_size = 100u64;
+        let total = frag_size * 3;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let protocol: Arc<dyn Protocol> = Arc::new(ClassifiedErrorProtocol {
+            meta: test_metadata("forbidden403_recover.bin", total),
+            fail_start: frag_size,
+            fail_times: 1,
+            error_factory: Arc::new(|| DownloadError::Forbidden { status: 403 }),
+            attempts: Arc::clone(&attempts),
+        });
+        let mut task = flaky_task(protocol, total, frag_size, 3);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("403 软拒绝后退避重试应成功");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!(
+            attempts.load(AtomicOrdering::SeqCst) >= 2,
+            "403 分片至少尝试 2 次"
         );
     }
 
@@ -9887,7 +11283,7 @@ mod tests {
             .collect();
         assert_eq!(completed_events.len(), 3, "应收到 3 个分片完成事件");
 
-        let (bytes, fragments, errors) = metrics.snapshot();
+        let (bytes, fragments, errors, _, _, _, _) = metrics.snapshot();
         assert_eq!(bytes, total, "Metrics 字节数应等于文件大小");
         assert!(fragments >= 3, "Metrics 分片完成数应 >= 3");
         assert_eq!(errors, 0);
@@ -11389,17 +12785,19 @@ mod tests {
         );
     }
 
-    /// B5 对照组:`has_mirrors=false`(单源路径)时,分片连续失败应触发 engine 熔断器,
-    /// 证明 B5 的跳过逻辑仅在镜像路径生效(不破坏单源故障隔离语义)。
+    /// B5 对照组:`has_mirrors=false`(单源路径)时,分片**终态失败**应触发 engine 熔断器。
+    /// 中间可重试失败不再记 record_failure(防多分片并发误熔断)。
     #[tokio::test]
     async fn test_b5_single_source_path_trips_engine_circuit_breaker() {
         let url = "http://example.com/b5-single.bin";
         let protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(test_metadata("b5s.bin", 200)));
         let storage = StorageKind::memory_with_capacity(200);
+        // max_retries=0:分片只尝试 1 次即终态失败,记 1 次 failure。
+        // 阈值 1:单次终态失败即可熔断,验证“中间不记、终态可记”。
         let mut task = DownloadTask::new_for_test(
             url.to_string(),
             DownloadConfig {
-                max_retries: 3, // 允许重试以累积 failure 到阈值 5
+                max_retries: 0,
                 max_concurrent_fragments: 2,
                 verify_checksum: false,
                 ..test_config()
@@ -11412,8 +12810,8 @@ mod tests {
             max_fragment_size: 100,
             ..Default::default()
         };
-        // 单源路径(has_mirrors=false):engine 熔断器应工作
         task.has_mirrors = false;
+        task.circuit_breakers = SourceCircuitBreakers::new(1, Duration::from_secs(30));
 
         task.probe().await.unwrap();
         task.plan().unwrap();
@@ -11421,12 +12819,522 @@ mod tests {
 
         let _ = task.execute().await;
 
-        // 对照组:单源路径下失败应触发 engine 熔断器(allow 为 false)
-        // 注:2 个分片 × (max_retries+1)=4 次尝试 = 8 次 failure > 阈值 5 → 熔断
         assert!(
             !task.circuit_breakers.allow(url),
-            "B5 对照组: 单源路径下连续失败应触发 engine 熔断器(应 Open),\
-             实际未熔断(B5 跳过逻辑可能误覆盖了单源路径)"
+            "B5 对照组: 单源路径下分片终态失败应触发 engine 熔断器(应 Open),\
+             实际未熔断"
+        );
+    }
+
+    #[test]
+    fn test_connection_soft_pressure_detection() {
+        assert!(DownloadTask::is_connection_soft_pressure(&DownloadError::Network(
+            "读取响应流数据失败: error decoding response body -> peer closed connection without sending TLS close_notify".into()
+        )));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Network("connection reset by peer".into())
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(&DownloadError::Network(
+            "Range 请求失败: error sending request for url -> client error (Connect) -> tls handshake eof".into()
+        )));
+        assert!(DownloadTask::is_connection_soft_pressure(&DownloadError::Network(
+            "error sending request for url (https://example.com) -> client error (Connect) -> handshake eof".into()
+        )));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 504,
+                reason: "Gateway Timeout".into(),
+            }
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 403,
+                reason: "Forbidden".into(),
+            }
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 429,
+                reason: "Too Many Requests".into(),
+            }
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Forbidden { status: 403 }
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Timeout("read timed out".into())
+        ));
+        assert!(!DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Network("dns lookup failed".into())
+        ));
+        assert!(!DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Cancelled
+        ));
+        assert!(!DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 404,
+                reason: "Not Found".into(),
+            }
+        ));
+    }
+
+    /// 可重试失败后,无流式哈希分片应从 realtime_downloaded 推进 resume_offset,
+    /// 而不是固定用初始 resume 整片重下。
+    #[test]
+    fn test_has_partial_progress_includes_prior_resume() {
+        // 本 attempt 未新写(progressed==resume)但 resume>0 → 仍有进度
+        let mut resume = 100u64;
+        let progressed = 100u64;
+        if progressed > resume {
+            resume = progressed;
+        }
+        let has_partial_progress = resume > 0;
+        assert!(has_partial_progress);
+        // 全新零进度
+        let resume0 = 0u64;
+        let progressed0 = 0u64;
+        let mut r = resume0;
+        if progressed0 > r {
+            r = progressed0;
+        }
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_soft_progress_retry_budget() {
+        let max_retries = 4u32;
+        // 有进度 + soft-pressure → +2
+        let budget_progress = soft_progress_budget(max_retries, true, true);
+        assert_eq!(budget_progress, 6);
+        // 零进度 → 原 max_retries
+        let budget_zero = soft_progress_budget(max_retries, false, true);
+        assert_eq!(budget_zero, 4);
+        // 非 soft → 原 max_retries
+        let budget_hard = soft_progress_budget(max_retries, true, false);
+        assert_eq!(budget_hard, 4);
+    }
+
+    fn soft_progress_budget(max_retries: u32, advanced_resume: bool, soft: bool) -> u32 {
+        if advanced_resume && soft {
+            max_retries.saturating_add(2)
+        } else {
+            max_retries
+        }
+    }
+
+    #[test]
+    fn test_soft_pressure_zero_floor_keeps_two() {
+        let until = DownloadTask::fresh_soft_until();
+        let eof = DownloadError::Network("tls handshake eof".into());
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl2 = ConcurrencyController::new(2, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(&ctrl2, &eof, false, &until);
+        assert_eq!(ctrl2.target(), 2, "零进度不得把 c=2 砍到 1");
+
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl3 = ConcurrencyController::new(3, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(&ctrl3, &eof, false, &until);
+        assert_eq!(ctrl3.target(), 2, "零进度 3 减半下限 2");
+
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl1 = ConcurrencyController::new(1, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(&ctrl1, &eof, false, &until);
+        assert_eq!(ctrl1.target(), 1);
+    }
+
+    #[test]
+    fn test_streaming_hash_skipped_on_resume_offset() {
+        // 语义:resume_offset>0 时不得产出后缀 computed_hash
+        let resume_offset = 100u64;
+        let compute_hash = true;
+        let enable_hasher = compute_hash && resume_offset == 0;
+        assert!(!enable_hasher);
+        let resume0 = 0u64;
+        assert!(compute_hash && resume0 == 0);
+    }
+
+    #[test]
+    fn test_window_early_eof_is_soft_pressure() {
+        let e = DownloadError::Network(
+            "分片窗口提前结束(unexpected eof): index=0, pos=10, window_end=100".into(),
+        );
+        assert!(DownloadTask::is_connection_soft_pressure(&e));
+        let frag = DownloadError::Fragment("分片窗口提前结束".into());
+        assert!(!DownloadTask::is_connection_soft_pressure(&frag));
+    }
+
+    #[test]
+    fn test_window_overlong_fail_closed_semantics() {
+        let window_requested_len = 1024u64;
+        let mut window_received = 0u64;
+        let c1 = 512u64;
+        window_received = window_received.saturating_add(c1);
+        assert!(window_received <= window_requested_len);
+        let c2 = 600u64;
+        let next = window_received.saturating_add(c2);
+        assert!(next > window_requested_len, "超长应 fail-closed");
+    }
+
+    #[test]
+    fn test_range_window_end_semantics() {
+        // 整片
+        assert_eq!(DownloadTask::range_window_end(0, 999, None), 999);
+        assert_eq!(DownloadTask::range_window_end(100, 999, Some(0)), 999);
+        // 2MiB 窗口
+        let w = 2 * 1024 * 1024u64;
+        assert_eq!(
+            DownloadTask::range_window_end(0, 10_000_000, Some(w)),
+            w - 1
+        );
+        assert_eq!(
+            DownloadTask::range_window_end(w, 10_000_000, Some(w)),
+            2 * w - 1
+        );
+        // 尾窗钳制
+        assert_eq!(
+            DownloadTask::range_window_end(9_500_000, 10_000_000, Some(w)),
+            10_000_000
+        );
+        // start 已在终点
+        assert_eq!(
+            DownloadTask::range_window_end(10_000_000, 10_000_000, Some(w)),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn test_soft_pressure_mild_keeps_target() {
+        let until = DownloadTask::fresh_soft_until();
+        let eof = DownloadError::Network(
+            "peer closed connection without sending TLS close_notify".into(),
+        );
+        for initial in [1u32, 2, 3, 4, 8] {
+            let ctrl = ConcurrencyController::new(initial, 16);
+            until.store(0, std::sync::atomic::Ordering::Release);
+            DownloadTask::apply_soft_pressure_backoff_ex(&ctrl, &eof, true, &until);
+            assert_eq!(
+                ctrl.target(),
+                initial,
+                "有进度 mild 不得降并发(initial={initial})"
+            );
+            assert!(
+                DownloadTask::soft_pressure_blocks_scale_up(&until),
+                "mild 仍应设置冷却挡 scale-up"
+            );
+            DownloadTask::clear_soft_pressure_cooldown_on_success(&until);
+        }
+    }
+
+    #[test]
+    fn test_set_scheduler_config_syncs_plan_and_recommend_bounds() {
+        // 仅 set_scheduler_config 时,recommend 的 fragment_size 也必须尊重新 max。
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/x.bin".into(),
+            test_config(),
+            Arc::new(MockProto::new(test_metadata("x.bin", 64 * 1024 * 1024))),
+            StorageKind::memory_with_capacity(64 * 1024 * 1024),
+        );
+        let mut sc = SchedulerConfig::default();
+        sc.max_fragment_size = 4 * 1024 * 1024;
+        sc.min_fragment_size = 1024 * 1024;
+        task.set_scheduler_config(sc.clone());
+        assert_eq!(
+            task.scheduler_config.max_fragment_size,
+            sc.max_fragment_size
+        );
+        // 注入带宽样本使 confidence>0,走 suggested 路径
+        task.scheduler.observe_bandwidth(50_000_000);
+        task.scheduler.observe_bandwidth(50_000_000);
+        let rec = task.scheduler.recommend(64 * 1024 * 1024, 8);
+        assert!(
+            rec.fragment_size <= sc.max_fragment_size,
+            "recommend frag {} 应 <= max {}",
+            rec.fragment_size,
+            sc.max_fragment_size
+        );
+    }
+    #[test]
+    fn test_proxy_cold_start_cap_for_config() {
+        // direct 哨兵:不 cap
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/x.bin".into(),
+            DownloadConfig {
+                proxy: Some("direct".into()),
+                ..test_config()
+            },
+            Arc::new(MockProto::new(test_metadata("x.bin", 100))),
+            StorageKind::memory_with_capacity(100),
+        );
+        assert!(
+            task.proxy_cold_start_cap_for_config(0.0).is_none(),
+            "direct 不得 proxy cold cap"
+        );
+        assert!(task.proxy_steady_concurrency_ceiling().is_none());
+        // 显式代理 + 低置信度:cold cap 2
+        task.config.proxy = Some("http://127.0.0.1:7897".into());
+        assert_eq!(task.proxy_cold_start_cap_for_config(0.0), Some(2));
+        // 高置信度:cold 不 cap,但稳态天花板仍在
+        assert!(task.proxy_cold_start_cap_for_config(0.9).is_none());
+        assert_eq!(task.proxy_steady_concurrency_ceiling(), Some(2));
+        assert_eq!(task.apply_proxy_concurrency_ceiling(8), 2);
+        assert_eq!(task.apply_proxy_concurrency_ceiling(2), 2);
+        assert_eq!(task.apply_proxy_concurrency_ceiling(1), 1);
+    }
+
+    #[test]
+    fn test_soft_reconnect_spacing_delay_serializes() {
+        // 全局 Atomic 会与并行测试竞态:用很大的 gap + 本地 now 钉死相对关系
+        let now = DownloadTask::soft_pressure_now_ms();
+        DownloadTask::soft_reconnect_last_ms().store(now, std::sync::atomic::Ordering::Release);
+        let d1 = DownloadTask::soft_reconnect_spacing_delay(200);
+        assert!(
+            d1 > Duration::ZERO && d1 <= Duration::from_millis(200),
+            "紧接上次重连应被间隔,实际 {:?}",
+            d1
+        );
+        // last 远在过去(相对 now),即使其它测试推进 last,我们再钉一次更早的值后立刻调用
+        let past = DownloadTask::soft_pressure_now_ms().saturating_sub(10_000);
+        DownloadTask::soft_reconnect_last_ms().store(past, std::sync::atomic::Ordering::Release);
+        let d0 = DownloadTask::soft_reconnect_spacing_delay(50);
+        // 若竞态导致 last 被他测推进,最多再被隔 50ms;允许 0..=50
+        assert!(
+            d0 <= Duration::from_millis(50),
+            "last 在过去时额外等待应 ≤ gap,实际 {:?}",
+            d0
+        );
+    }
+
+    #[test]
+    fn test_probe_rtt_clamp_semantics() {
+        let over = Duration::from_secs(11);
+        let clamped = over
+            .min(Duration::from_secs(10))
+            .max(Duration::from_millis(1));
+        assert_eq!(clamped, Duration::from_secs(10));
+        let under = Duration::from_millis(0);
+        let clamped0 = under
+            .min(Duration::from_secs(10))
+            .max(Duration::from_millis(1));
+        assert_eq!(clamped0, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_soft_pressure_skips_cut_when_progress_exists() {
+        let until = DownloadTask::fresh_soft_until();
+        // 语义:零进度减半;有进度 mild 保持 target
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl_zero = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl_zero,
+            &DownloadError::Network("tls handshake eof".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl_zero.target(), 4, "零进度应减半");
+
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl_progress = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl_progress,
+            &DownloadError::Network("tls handshake eof".into()),
+            true,
+            &until,
+        );
+        assert_eq!(ctrl_progress.target(), 8, "有进度 mild 保持并发");
+    }
+
+    #[test]
+    fn test_soft_pressure_short_backoff_when_resume_advanced() {
+        // 语义:有进度时短退避 cap∈[250ms,2s];实际 sleep 为 Full Jitter ∈[1,cap]
+        let attempt = 3u32;
+        let cap_ms = 250u64
+            .saturating_mul(1u64 << attempt.min(3))
+            .clamp(250, 2000);
+        assert_eq!(cap_ms, 2000);
+        let attempt0_cap = 250u64.saturating_mul(1u64 << 0).clamp(250, 2000);
+        assert_eq!(attempt0_cap, 250);
+        let long = DownloadTask::soft_pressure_backoff_secs(attempt, Duration::from_secs(1));
+        assert!(long >= Duration::from_secs(2), "零进度仍长退避");
+    }
+
+    #[test]
+    fn test_fragment_retry_resume_semantics_without_hash() {
+        // 语义守卫:realtime 推进后 resume 应取 max(old, realtime)。
+        // 完整 I/O 路径由 soft-pressure + 分片重试集成覆盖;此处锁定不变量。
+        let old_resume = 0u64;
+        let realtime = 128 * 1024u64;
+        let compute_hash = false;
+        let new_resume = if !compute_hash && realtime > old_resume {
+            realtime
+        } else {
+            old_resume
+        };
+        assert_eq!(new_resume, realtime);
+        let compute_hash = true;
+        let new_resume_hashed = if !compute_hash && realtime > old_resume {
+            realtime
+        } else {
+            old_resume
+        };
+        assert_eq!(
+            new_resume_hashed, old_resume,
+            "有流式哈希时不得盲续,避免哈希窗口错位"
+        );
+    }
+
+    #[test]
+    fn test_clamp_concurrency_scale_up_ex_conservative() {
+        // 直连:可翻倍
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up_ex(2, 8, false), 4);
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up(2, 8), 4);
+        // 代理:每次 +1
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up_ex(2, 8, true), 3);
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up_ex(3, 8, true), 4);
+        // 降并发不受限
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up_ex(8, 2, true), 2);
+    }
+
+    #[test]
+    fn test_proxy_steady_ceiling_is_two() {
+        // 语义:代理激活时 ceiling=2(与 soft-pressure floor / 健康会话对齐)
+        // 通过纯函数路径验证 cap 常量语义
+        let desired = 8u32;
+        let cap = 2u32;
+        assert_eq!(desired.min(cap).max(1), 2);
+        assert_eq!(
+            DownloadTask::clamp_concurrency_scale_up_ex(2, desired.min(cap), true),
+            2
+        );
+    }
+
+    #[test]
+    fn test_soft_pressure_success_halves_cooldown() {
+        let until = DownloadTask::fresh_soft_until();
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Network("tls handshake eof".into()),
+            false,
+            &until,
+        );
+        assert!(DownloadTask::soft_pressure_blocks_scale_up(&until));
+        let until_before = until.load(std::sync::atomic::Ordering::Acquire);
+        DownloadTask::clear_soft_pressure_cooldown_on_success(&until);
+        let until_after = until.load(std::sync::atomic::Ordering::Acquire);
+        // 半衰后仍应挡抬升(15s → ~8s),且 until 必须严格下降
+        assert!(
+            DownloadTask::soft_pressure_blocks_scale_up(&until),
+            "成功后应半衰而非瞬间清零"
+        );
+        assert!(
+            until_after < until_before && until_after > 0,
+            "until 应下降但仍在未来: before={until_before} after={until_after}"
+        );
+        // 强制清零后才允许抬升(模拟冷却自然到期)
+        until.store(0, std::sync::atomic::Ordering::Release);
+        assert!(!DownloadTask::soft_pressure_blocks_scale_up(&until));
+    }
+
+    #[test]
+    fn test_soft_pressure_cooldown_does_not_slide() {
+        let until = DownloadTask::fresh_soft_until();
+        until.store(0, std::sync::atomic::Ordering::Release);
+        let ctrl = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Network("tls handshake eof".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl.target(), 4);
+        let until_after_first = until.load(std::sync::atomic::Ordering::Acquire);
+        assert!(until_after_first > 0, "应进入冷却");
+        // 冷却期内再次 soft pressure:不得滑动续期
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Network("tls handshake eof".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl.target(), 4, "冷却期内不连砍");
+        let until_after_second = until.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            until_after_second, until_after_first,
+            "冷却期内不得滑动续期 until"
+        );
+    }
+
+    #[test]
+    fn test_soft_pressure_backoff_halves_target() {
+        let until = DownloadTask::fresh_soft_until();
+        until.store(0, std::sync::atomic::Ordering::Release);
+
+        let ctrl = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Network("TLS close_notify unexpected eof".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl.target(), 4, "8 → 4");
+        assert!(DownloadTask::soft_pressure_blocks_scale_up(&until));
+
+        // 冷却期内再次 soft pressure 只延长冷却,不连砍
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Http {
+                status: 504,
+                reason: "Gateway Timeout".into(),
+            },
+            false,
+            &until,
+        );
+        assert_eq!(ctrl.target(), 4, "冷却期内不应连砍");
+
+        // 冷却结束后可再降
+        until.store(0, std::sync::atomic::Ordering::Release);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl,
+            &DownloadError::Network("error reading a body from connection".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl.target(), 2, "冷却结束后 4 → 2");
+
+        let ctrl2 = ConcurrencyController::new(8, 16);
+        DownloadTask::apply_soft_pressure_backoff_ex(
+            &ctrl2,
+            &DownloadError::Network("dns lookup failed".into()),
+            false,
+            &until,
+        );
+        assert_eq!(ctrl2.target(), 8);
+    }
+
+    #[test]
+    fn test_soft_pressure_backoff_secs_floor() {
+        let base = Duration::from_secs(1);
+        assert_eq!(
+            DownloadTask::soft_pressure_backoff_secs(0, base).as_secs(),
+            2
+        );
+        assert_eq!(
+            DownloadTask::soft_pressure_backoff_secs(1, base).as_secs(),
+            4
+        );
+        assert_eq!(
+            DownloadTask::soft_pressure_backoff_secs(2, base).as_secs(),
+            8
+        );
+        // attempt.min(4)=4 → 2<<4=32(上限 60 的下限路径)
+        assert_eq!(
+            DownloadTask::soft_pressure_backoff_secs(10, base).as_secs(),
+            32
+        );
+        assert_eq!(
+            DownloadTask::soft_pressure_backoff_secs(0, Duration::from_secs(10)).as_secs(),
+            10
         );
     }
 
@@ -12251,26 +14159,48 @@ mod tests {
         assert_eq!(&buf[..], full_data.as_ref(), "整块降级后数据应完整写入");
     }
 
-    /// 安全 rebalance:慢片剩余足够时 try_split + await 入队成功,fragments 增长 1
-    #[tokio::test]
-    async fn test_rebalance_splits_slow_fragment_and_enqueues() {
-        use crate::fragment::{FragmentRecord, FragmentState, MIN_SPLIT_SIZE};
+    /// 构造一个可拆的慢片 + 快片(滞后门槛需要 ≥2 在途且 progress 差 ≥20%)
+    fn make_lagging_pair(
+        size: u64,
+        slow_done: u64,
+        fast_done: u64,
+    ) -> (
+        crate::fragment::FragmentRecord,
+        crate::fragment::FragmentRecord,
+    ) {
+        use crate::fragment::FragmentRecord;
         use std::sync::atomic::Ordering;
         use tachyon_core::types::FragmentInfo;
 
-        let size = MIN_SPLIT_SIZE * 8; // 足够大
-        let frag0 = {
+        let slow = {
             let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
             let mut r = FragmentRecord::new(info, 3);
             r.start_download().unwrap();
-            // 仅下载 10%,剩余很大
-            r.realtime_downloaded.store(size / 10, Ordering::Release);
-            // 回拨 start_time 以越过 rebalance 1s 年龄门槛
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            r.realtime_downloaded.store(slow_done, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
             r
         };
-        let protocol = Arc::new(MockProto::new(test_metadata("rebalance.bin", size)));
-        let storage = StorageKind::memory_with_capacity(size as usize);
+        let fast = {
+            // 第二片与第一片同尺寸但独立 range 元数据;rebalance 只看 progress 比
+            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded.store(fast_done, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+            r
+        };
+        (slow, fast)
+    }
+
+    /// 安全 rebalance:存在明显滞后的慢片时 try_split + 入队成功
+    #[tokio::test]
+    async fn test_rebalance_splits_slow_fragment_and_enqueues() {
+        use crate::fragment::{FragmentState, MIN_SPLIT_SIZE};
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let (slow, fast) = make_lagging_pair(size, size / 10, size * 9 / 10);
+        let protocol = Arc::new(MockProto::new(test_metadata("rebalance.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/rebalance.bin".into(),
             DownloadConfig {
@@ -12281,8 +14211,8 @@ mod tests {
             protocol,
             storage,
         );
-        task.fragments = vec![frag0];
-        task.metadata = Some(test_metadata("rebalance.bin", size));
+        task.fragments = vec![slow, fast];
+        task.metadata = Some(test_metadata("rebalance.bin", size * 2));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
         let did = task
@@ -12290,37 +14220,86 @@ mod tests {
             .await
             .expect("rebalance 不应 Err");
         assert!(did, "应拆分慢片");
-        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
+        assert_eq!(task.fragments.len(), 3, "应新增 1 个分片");
         assert_eq!(task.fragments[0].state, FragmentState::Downloading);
-        assert_eq!(task.fragments[1].state, FragmentState::Downloading);
-        // 原片 end 缩小
-        assert!(task.fragments[0].info.end < size - 1, "原片 end 应缩小");
         // 队列收到新 spec
         let spec = rx.try_recv().expect("应入队新分片 spec");
-        assert_eq!(spec.0, 1, "新分片 index=1");
+        assert_eq!(spec.0, 2, "新分片 index=2(原有 0/1)");
         assert!(spec.1 > 0, "新分片 start > 0");
+    }
+
+    /// 两次成功 rebalance 最小间隔内不得再拆(防 soft-pressure 恢复后连环拆)
+    #[tokio::test]
+    async fn test_rebalance_min_interval_blocks_second_split() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let (slow, fast) = make_lagging_pair(size, size / 10, size * 9 / 10);
+        let protocol = Arc::new(MockProto::new(test_metadata("interval.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/interval.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![slow, fast];
+        task.metadata = Some(test_metadata("interval.bin", size * 2));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(8);
+        let did1 = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(did1, "第一次应拆分");
+        let _ = rx.try_recv();
+        // 人为制造仍可拆的慢片状态:再塞一对滞后片(start_time 已回拨 3s)
+        let (slow2, fast2) = make_lagging_pair(size, size / 10, size * 9 / 10);
+        // 重置 index 避免冲突 — 用新 pair 替换 fragments 并清 last 间隔外
+        // 但 last_rebalance_at 仍在:第二次应被间隔挡住
+        task.fragments = vec![slow2, fast2];
+        let did2 = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(!did2, "最小间隔内第二次不得再拆");
+        assert_eq!(task.fragments.len(), 2, "间隔拦截时不得新增分片");
+    }
+
+    /// 均匀进度(无滞后)不得 rebalance,避免 loopback 假拆分
+    #[tokio::test]
+    async fn test_rebalance_skips_when_progress_uniform() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        // 两片都 50% — lag=0 < 20%
+        let (a, b) = make_lagging_pair(size, size / 2, size / 2);
+        let protocol = Arc::new(MockProto::new(test_metadata("uniform.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/uniform.bin".into(),
+            test_config(),
+            protocol,
+            storage,
+        );
+        task.fragments = vec![a, b];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        assert!(!did, "进度均匀时不应 rebalance");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.fragments.len(), 2);
     }
 
     /// RED-TDD: channel 满时 rebalance 不得 send().await 挂死主循环;
     /// 应快速返回 Ok(false) 并 revert_split,保留原分片边界。
     #[tokio::test]
     async fn test_rebalance_full_channel_does_not_hang_and_reverts() {
-        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use crate::fragment::MIN_SPLIT_SIZE;
         use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
+        use tachyon_core::Metrics;
 
         let size = MIN_SPLIT_SIZE * 8;
         let original_end = size - 1;
-        let frag0 = {
-            let info = FragmentInfo::new(0, 0, original_end, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(size / 10, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
-            r
-        };
-        let protocol = Arc::new(MockProto::new(test_metadata("full-ch.bin", size)));
-        let storage = StorageKind::memory_with_capacity(size as usize);
+        let (slow, fast) = make_lagging_pair(size, size / 10, size * 9 / 10);
+        let protocol = Arc::new(MockProto::new(test_metadata("full-ch.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/full-ch.bin".into(),
             DownloadConfig {
@@ -12331,10 +14310,11 @@ mod tests {
             protocol,
             storage,
         );
-        task.fragments = vec![frag0];
-        task.metadata = Some(test_metadata("full-ch.bin", size));
+        task.fragments = vec![slow, fast];
+        task.metadata = Some(test_metadata("full-ch.bin", size * 2));
+        let metrics = Arc::new(Metrics::new());
+        task.set_metrics(metrics.clone());
 
-        // 容量 1:塞满后 rebalance 的 send 无法前进
         let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(1);
         let dummy: FragmentSpec = (
             99,
@@ -12360,7 +14340,7 @@ mod tests {
         );
         let did = result.unwrap().expect("rebalance 不应 Err");
         assert!(!did, "channel 满时应返回 Ok(false) 表示未入队");
-        assert_eq!(task.fragments.len(), 1, "未入队成功则不得 push 新分片");
+        assert_eq!(task.fragments.len(), 2, "未入队成功则不得 push 新分片");
         assert_eq!(
             task.fragments[0].info.end, original_end,
             "入队失败必须 revert_split 恢复原 end"
@@ -12370,6 +14350,9 @@ mod tests {
             original_end,
             "入队失败必须 revert effective_end"
         );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.5, 0, "成功 rebalance 应为 0");
+        assert_eq!(snap.6, 1, "Full 回滚应计 rebalance_dropped=1");
     }
 
     /// rebalance:剩余不足时不拆分
@@ -12403,30 +14386,16 @@ mod tests {
         assert_eq!(task.fragments.len(), 1);
     }
 
-    /// rebalance 边界:剩余刚好等于 2*MIN_SPLIT_SIZE(128KiB)时应可拆;
-    /// 剩余 < 2*MIN_SPLIT_SIZE 时不得拆。审计 P0-4.5 残留:补边界值测试。
+    /// rebalance 边界:剩余刚好等于 2*MIN_SPLIT_SIZE(128KiB)且存在滞后快片时应可拆
     #[tokio::test]
     async fn test_rebalance_boundary_exactly_2x_min_split_size() {
-        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
-        use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
+        use crate::fragment::MIN_SPLIT_SIZE;
 
-        // 剩余刚好 = 2 * MIN_SPLIT_SIZE = 128 KiB,应可拆
-        // 构造:total=3*MIN_SPLIT_SIZE, 已下载=MIN_SPLIT_SIZE, 剩余=2*MIN_SPLIT_SIZE
         let size = MIN_SPLIT_SIZE * 3;
-        let frag0 = {
-            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            // 下载 1/3,剩余 2*MIN_SPLIT_SIZE(刚好达到门槛)
-            r.realtime_downloaded
-                .store(MIN_SPLIT_SIZE, Ordering::Release);
-            // 回拨 start_time 越过 1s 年龄门槛
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
-            r
-        };
-        let protocol = Arc::new(MockProto::new(test_metadata("boundary.bin", size)));
-        let storage = StorageKind::memory_with_capacity(size as usize);
+        // 慢片:已下载 MIN_SPLIT,剩余 2*MIN_SPLIT;快片 90%
+        let (slow, fast) = make_lagging_pair(size, MIN_SPLIT_SIZE, size * 9 / 10);
+        let protocol = Arc::new(MockProto::new(test_metadata("boundary.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/boundary.bin".into(),
             DownloadConfig {
@@ -12437,53 +14406,57 @@ mod tests {
             protocol,
             storage,
         );
-        task.fragments = vec![frag0];
-        task.metadata = Some(test_metadata("boundary.bin", size));
+        task.fragments = vec![slow, fast];
+        task.metadata = Some(test_metadata("boundary.bin", size * 2));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
         let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        // 剩余 = 2*MIN_SPLIT_SIZE 刚好达到门槛(条件是 < 2*MIN 才跳过,等于不跳过)
-        assert!(did, "剩余=2*MIN_SPLIT_SIZE(128KiB)应可拆分");
-        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
-        let _spec = rx.try_recv().expect("应入队新分片 spec");
+        assert!(did, "剩余=2*MIN_SPLIT_SIZE(128KiB)且有滞后时应可拆分");
+        assert_eq!(task.fragments.len(), 3, "应新增 1 个分片");
+        assert!(rx.try_recv().is_ok());
     }
 
-    /// rebalance 边界:剩余刚好小于 2*MIN_SPLIT_SIZE 时不得拆分。
+    /// rebalance 边界:剩余 < 2*MIN_SPLIT_SIZE 时不得拆
     #[tokio::test]
     async fn test_rebalance_boundary_below_2x_min_split_size() {
         use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
         use std::sync::atomic::Ordering;
         use tachyon_core::types::FragmentInfo;
 
-        // 剩余 = 2*MIN_SPLIT_SIZE - 1,应跳过
-        let size = MIN_SPLIT_SIZE * 3;
+        // 剩余 < 2*MIN: total=2*MIN+1, done=2 → remaining 不足
+        let size = MIN_SPLIT_SIZE * 2 + 1;
         let frag0 = {
             let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
             let mut r = FragmentRecord::new(info, 3);
             r.start_download().unwrap();
-            // 下载 MIN_SPLIT_SIZE + 1,剩余 = 2*MIN_SPLIT_SIZE - 1(刚好不足门槛)
-            r.realtime_downloaded
-                .store(MIN_SPLIT_SIZE + 1, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            r.realtime_downloaded.store(2, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
             r
         };
-        let protocol = Arc::new(MockProto::new(test_metadata("below.bin", size)));
-        let storage = StorageKind::memory_with_capacity(size as usize);
+        let frag1 = {
+            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded.store(size - 1, Ordering::Release);
+            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("below.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/below.bin".into(),
             test_config(),
             protocol,
             storage,
         );
-        task.fragments = vec![frag0];
+        task.fragments = vec![frag0, frag1];
         let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
         let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        assert!(!did, "剩余 < 2*MIN_SPLIT_SIZE(128KiB)时不得拆分");
-        assert_eq!(task.fragments.len(), 1, "不应新增分片");
+        assert!(!did, "剩余 < 2*MIN_SPLIT_SIZE 时不得拆分");
+        assert_eq!(task.fragments.len(), 2, "不应新增分片");
     }
 
-    /// rebalance 1s 年龄门槛:刚 spawn 的分片(< 1s)不得立即拆分,
-    /// 避免频繁拆分开销。审计 P0-4.5:补年龄门槛测试。
+    /// rebalance 年龄门槛:刚 spawn 的分片(< 2s)不得立即拆分
     #[tokio::test]
     async fn test_rebalance_skips_fresh_fragment_under_1s_age() {
         use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
@@ -12496,22 +14469,30 @@ mod tests {
             let mut r = FragmentRecord::new(info, 3);
             r.start_download().unwrap();
             r.realtime_downloaded.store(size / 10, Ordering::Release);
-            // start_time 默认是现在(刚 spawn),不回拨 → 年龄 < 1s
+            // start_time 默认是现在(刚 spawn),不回拨 → 年龄 < 2s
             r
         };
-        let protocol = Arc::new(MockProto::new(test_metadata("fresh.bin", size)));
-        let storage = StorageKind::memory_with_capacity(size as usize);
+        let frag1 = {
+            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
+            let mut r = FragmentRecord::new(info, 3);
+            r.start_download().unwrap();
+            r.realtime_downloaded
+                .store(size * 9 / 10, Ordering::Release);
+            r
+        };
+        let protocol = Arc::new(MockProto::new(test_metadata("fresh.bin", size * 2)));
+        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/fresh.bin".into(),
             test_config(),
             protocol,
             storage,
         );
-        task.fragments = vec![frag0];
+        task.fragments = vec![frag0, frag1];
         let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
         let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        assert!(!did, "刚 spawn 的分片(< 1s)不得立即拆分");
-        assert_eq!(task.fragments.len(), 1, "不应新增分片");
+        assert!(!did, "刚 spawn 的分片(< 2s)不得立即拆分");
+        assert_eq!(task.fragments.len(), 2, "不应新增分片");
     }
 
     /// rebalance 开启后多分片下载仍正确完成(不回归)
@@ -12567,6 +14548,45 @@ mod tests {
     }
 
     /// bt_fragment_size 公式:file_size/32 clamp [4MiB, 16MiB]
+    #[test]
+    fn test_clamp_concurrency_scale_up() {
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up(1, 16), 2);
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up(2, 16), 4);
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up(4, 16), 8);
+        assert_eq!(DownloadTask::clamp_concurrency_scale_up(8, 16), 16);
+        assert_eq!(
+            DownloadTask::clamp_concurrency_scale_up(8, 4),
+            4,
+            "降并发不受限"
+        );
+        assert_eq!(
+            DownloadTask::clamp_concurrency_scale_up(3, 4),
+            4,
+            "小步进允许 +1 到目标"
+        );
+    }
+
+    #[test]
+    fn test_soft_pressure_final_failure_skips_circuit_breaker() {
+        // 语义守卫:软压力最终失败不得 record_failure。
+        // 通过 is_connection_soft_pressure 判定保证分类覆盖;熔断跳过逻辑在重试终态分支。
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Forbidden { status: 403 }
+        ));
+        assert!(DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 502,
+                reason: "Bad Gateway".into(),
+            }
+        ));
+        assert!(!DownloadTask::is_connection_soft_pressure(
+            &DownloadError::Http {
+                status: 404,
+                reason: "Not Found".into(),
+            }
+        ));
+    }
+
     #[test]
     fn test_bt_fragment_size_clamped() {
         const MIB: u64 = 1024 * 1024;

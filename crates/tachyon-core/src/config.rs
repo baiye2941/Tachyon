@@ -182,18 +182,19 @@ pub enum VerifyStrategy {
 
 /// 崩溃一致性级别:控制下载过程中 fsync 的频率,平衡耐久性与吞吐。
 ///
-/// - `EveryFragment`(默认):每个分片完成时 fsync 数据+父目录,断电后 resume 跳过已 sync 分片。
-///   适合 HDD/SSD 通用场景。HDD 上对 100MB/s 下载吞吐影响 < 5%(每分片 ~5-10ms fsync)。
-/// - `Loose`:仅在 close() 时 fsync 数据+目录,不在分片边界 fsync。崩溃可能丢失所有
-///   未 close 的分片重传。适合临时文件/缓存场景,或 NVMe+UPS 用户追求极致吞吐。
+/// - `Loose`(默认):仅在 close() 时 fsync 数据+目录,不在分片边界 fsync。崩溃可能丢失所有
+///   未 close 的分片重传。默认追极致吞吐(NVMe/高并发分片场景);需要断电可恢复时显式选
+///   `EveryFragment`。缺字段反序列化亦为 Loose;磁盘上已写 `everyFragment` 的配置保持不变。
+/// - `EveryFragment`:每个分片完成时 fsync 数据+父目录,断电后 resume 跳过已 sync 分片。
+///   适合 HDD 或对崩溃恢复有强需求的场景。
 ///
 /// 设计:`Batch` 模式因多任务并发分片需要共享计数器(锁开销可能抵消 fsync 节省),
-/// 暂未实现。如需 Batch 语义,默认 `EveryFragment` + 大分片(8-16MB)已能控制 fsync 频率。
+/// 暂未实现。如需 Batch 语义,可显式 `EveryFragment` + 大分片(8-16MB)控制 fsync 频率。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum CrashConsistencyMode {
-    #[default]
     EveryFragment,
+    #[default]
     Loose,
 }
 
@@ -258,8 +259,7 @@ pub struct DownloadConfig {
     #[serde(default)]
     pub enable_work_stealing: bool,
     /// 崩溃一致性级别:控制分片完成时 fsync 频率,平衡耐久性与吞吐。
-    /// 默认 `EveryFragment`(每分片完成 fsync 一次,断电后 resume 跳过已 sync 分片)。
-    /// HDD 用户若追求吞吐可改 `Batch` 或 `Loose`(牺牲断电耐久性换 fsync 次数)。
+    /// 默认 `Loose`(仅 close 时 fsync,追吞吐)。需断电可恢复时显式设 `EveryFragment`。
     #[serde(default)]
     pub crash_consistency_mode: CrashConsistencyMode,
 }
@@ -391,8 +391,9 @@ pub struct MagnetConfig {
     pub enable_dht: bool,
     /// 是否启用 UPnP 端口转发（默认关闭）
     ///
-    /// 审计 SEC-012:UPnP XML 解析依赖 quick-xml,默认关闭缩小局域网 DoS 面。
-    /// 需要入站加速时可在配置中显式开启。
+    /// 安全说明:UPnP 需解析局域网网关返回的 XML 描述文档,其依赖 quick-xml 曾披露
+    /// 2 个 High 级别 CVE(经 librqbit-upnp 引入)。默认关闭以缩小攻击面,避免恶意
+    /// 局域网网关通过畸形 XML 触发解析漏洞。需要入站加速(如做种)时可在配置中显式开启。
     #[serde(default)]
     pub enable_upnp: bool,
     /// 全局 tracker 服务器列表
@@ -495,9 +496,12 @@ pub struct MagnetConfig {
     pub listen_port_end: Option<u16>,
 
     /// 审计 P-04 / librqbit 9+:自定义 DHT bootstrap 节点(`host:port`)。
-    /// 空列表 = 使用 librqbit 内置默认(当前 2 节点)。非空时覆盖默认列表。
+    ///
+    /// 默认内置一批知名公共 DHT bootstrap 节点,首次安装无 DHT 持久化路由表时
+    /// 可快速完成冷启动(librqbit 上游仅 2 节点,冷启动需数十秒)。
+    /// 用户配置非空时覆盖此默认列表;显式设为空列表则回退到 librqbit 内置默认。
     /// 仅在 `enable_dht=true` 且未因 high_privacy/SOCKS 策略禁用 DHT 时生效。
-    #[serde(default)]
+    #[serde(default = "default_dht_bootstrap_addrs")]
     pub dht_bootstrap_addrs: Vec<String>,
 
     /// 单 torrent 最大 live peer 连接数(librqbit 9+ `SessionOptions.peer_limit`)。
@@ -585,6 +589,22 @@ fn default_trackers() -> Vec<String> {
         "udp://open.stealth.si:80/announce".into(),
         "udp://exodus.desync.com:6969/announce".into(),
         "udp://tracker.torrent.eu.org:451/announce".into(),
+    ]
+}
+
+/// 内置公共 DHT bootstrap 节点默认值
+///
+/// 首次安装无 DHT 持久化路由表时,仅靠 librqbit 上游默认 2 节点冷启动需数十秒。
+/// 内置一批知名公共路由节点可显著缩短首次 DHT 表构建时间。
+/// 这些节点均为 BitTorrent 生态长期维护的公共基础设施,仅用于 DHT 节点发现,
+/// 不涉及任何用户数据传输。
+fn default_dht_bootstrap_addrs() -> Vec<String> {
+    vec![
+        "router.bittorrent.com:6881".to_string(),
+        "dht.transmissionbt.com:6881".to_string(),
+        "router.utorrent.com:6881".to_string(),
+        "dht.aelitis.com:6881".to_string(), // Vuze
+        "router.silotis.us:6881".to_string(),
     ]
 }
 
@@ -723,7 +743,7 @@ impl Default for MagnetConfig {
             high_privacy: false,
             listen_port_start: None,
             listen_port_end: None,
-            dht_bootstrap_addrs: Vec::new(),
+            dht_bootstrap_addrs: default_dht_bootstrap_addrs(),
             peer_limit: None,
         }
     }
@@ -1145,25 +1165,31 @@ impl DownloadConfig {
         // 此处拒绝 userinfo,强制用户通过 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量传凭据
         // (reqwest 原生支持读取这些环境变量,与 BT 侧 detect_socks_proxy 语义一致)。
         if let Some(ref url) = self.proxy {
-            let parsed = url::Url::parse(url)
-                .map_err(|_| e(&format!("proxy 不是合法 URL: {}", redact_proxy_url(url))))?;
-            if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
-                return Err(e(&format!(
-                    "proxy scheme 必须是 http/https/socks5/socks5h,实际: {}",
-                    parsed.scheme()
-                )));
-            }
-            if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
-                return Err(e(&format!(
-                    "proxy 必须包含 host: {}",
-                    redact_proxy_url(url)
-                )));
-            }
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                return Err(e(&format!(
-                    "proxy 禁止含 userinfo(user:pass@),请用 HTTP_PROXY/HTTPS_PROXY 环境变量传递凭据: {}",
-                    redact_proxy_url(url)
-                )));
+            let trimmed = url.trim();
+            // 哨兵:强制直连,不读系统代理(基线 harness / 诊断用)
+            if trimmed.eq_ignore_ascii_case("direct") || trimmed.eq_ignore_ascii_case("none") {
+                // ok
+            } else {
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| e(&format!("proxy 不是合法 URL: {}", redact_proxy_url(url))))?;
+                if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+                    return Err(e(&format!(
+                        "proxy scheme 必须是 http/https/socks5/socks5h,实际: {}",
+                        parsed.scheme()
+                    )));
+                }
+                if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+                    return Err(e(&format!(
+                        "proxy 必须包含 host: {}",
+                        redact_proxy_url(url)
+                    )));
+                }
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err(e(&format!(
+                        "proxy 禁止含 userinfo(user:pass@),请用 HTTP_PROXY/HTTPS_PROXY 环境变量传递凭据: {}",
+                        redact_proxy_url(url)
+                    )));
+                }
             }
         }
         Ok(())
@@ -1712,27 +1738,28 @@ mod tests {
             dir.contains("Downloads") || dir.contains("tachyon-downloads"),
             "unexpected download_dir: {dir}"
         );
-        // crash_consistency_mode 默认 EveryFragment
+        // crash_consistency_mode 默认 Loose(极致吞吐;已落盘 everyFragment 仍保留)
         assert_eq!(
             config.download.crash_consistency_mode,
-            CrashConsistencyMode::EveryFragment,
-            "默认崩溃一致性级别应为 EveryFragment"
+            CrashConsistencyMode::Loose,
+            "默认崩溃一致性级别应为 Loose"
         );
     }
 
     #[test]
     fn test_crash_consistency_mode_serde_roundtrip() {
-        // EveryFragment 默认
+        // EveryFragment 显式值往返
         let json = serde_json::to_string(&CrashConsistencyMode::EveryFragment).unwrap();
         assert_eq!(json, "\"everyFragment\"");
         let m: CrashConsistencyMode = serde_json::from_str(&json).unwrap();
         assert_eq!(m, CrashConsistencyMode::EveryFragment);
 
-        // Loose
+        // Loose(默认变体)往返
         let json = serde_json::to_string(&CrashConsistencyMode::Loose).unwrap();
         assert_eq!(json, "\"loose\"");
         let m: CrashConsistencyMode = serde_json::from_str(&json).unwrap();
         assert_eq!(m, CrashConsistencyMode::Loose);
+        assert_eq!(CrashConsistencyMode::default(), CrashConsistencyMode::Loose);
     }
 
     #[test]
@@ -1757,18 +1784,59 @@ mod tests {
         let mut base = DownloadConfig::default();
         assert_eq!(
             base.crash_consistency_mode,
-            CrashConsistencyMode::EveryFragment,
-            "默认应为 EveryFragment"
+            CrashConsistencyMode::Loose,
+            "默认应为 Loose"
         );
         let patch = DownloadPatch {
-            crash_consistency_mode: Some(CrashConsistencyMode::Loose),
+            crash_consistency_mode: Some(CrashConsistencyMode::EveryFragment),
             ..Default::default()
         };
         patch.apply_to(&mut base);
         assert_eq!(
             base.crash_consistency_mode,
+            CrashConsistencyMode::EveryFragment,
+            "patch 应将 crash_consistency_mode 改为 EveryFragment"
+        );
+    }
+
+    /// 缺字段反序列化必须落到 Loose(新默认),不得静默回 EveryFragment。
+    #[test]
+    fn test_crash_consistency_missing_field_deserializes_loose() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{}
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.crash_consistency_mode,
             CrashConsistencyMode::Loose,
-            "patch 应将 crash_consistency_mode 改为 Loose"
+            "缺 crashConsistencyMode 字段时必须默认 Loose"
+        );
+    }
+
+    /// 已落盘的 everyFragment 必须保留(迁移不强制改写老用户)。
+    #[test]
+    fn test_crash_consistency_explicit_every_fragment_preserved() {
+        let json = r#"{
+            "downloadDir":"/tmp",
+            "maxConcurrentFragments":8,
+            "maxRetries":3,
+            "requestTimeoutSecs":60,
+            "verifyChecksum":true,
+            "userAgent":"Test",
+            "headers":{},
+            "crashConsistencyMode":"everyFragment"
+        }"#;
+        let config: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.crash_consistency_mode,
+            CrashConsistencyMode::EveryFragment,
+            "显式 everyFragment 必须保留"
         );
     }
 

@@ -47,7 +47,7 @@ pub async fn subscribe_progress(
                     if !delta.is_empty() {
                         for tp in delta.values() {
                             if tp.downloaded > 0 || tp.speed > 0 {
-                                tracing::info!(
+                                tracing::debug!(
                                     tid = tp.id,
                                     downloaded = tp.downloaded,
                                     speed = tp.speed,

@@ -395,8 +395,8 @@ fn app_error() {
     let forbidden = AppError::Core(tachyon_core::DownloadError::Forbidden { status: 403 });
     let json = serde_json::to_string(&forbidden).unwrap();
     assert!(
-        json.contains("\"retryable\":false"),
-        "Forbidden 应 retryable=false: {json}"
+        json.contains("\"retryable\":true"),
+        "Forbidden 应 retryable=true(CDN/WAF 软拒绝可有限重试): {json}"
     );
     assert!(
         json.contains("\"status\":403"),

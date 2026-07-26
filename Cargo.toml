@@ -151,6 +151,10 @@ harness = false
 name = "e2e_http_real"
 harness = false
 
+[[bench]]
+name = "throughput_baseline"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
 tachyon-core = { path = "crates/tachyon-core", features = ["test-harness"] }
@@ -192,3 +196,15 @@ strip = true
 # spawn 任务外包 catch_unwind 隔离 panic,使单个下载崩溃不影响其他任务与 UI。
 # 详见 docs 与 AGENTS.md "NEVER 让后台任务 panic 杀全应用" 教训。
 overflow-checks = false
+
+# 核心 crate 单独开启整数溢出检查:下载管线大量 offset/length 算术,
+# release 下静默回绕会导致数据损坏(写错偏移/截断分片),后果远大于性能损失。
+# 非核心 crate(协议/调度/加密等)保持关闭以维持峰值吞吐。
+[profile.release.package.tachyon-engine]
+overflow-checks = true
+
+[profile.release.package.tachyon-core]
+overflow-checks = true
+
+[profile.release.package.tachyon-io]
+overflow-checks = true

@@ -5,7 +5,11 @@ use criterion::{BenchmarkGroup, Criterion, PlottingBackend, measurement::WallTim
 pub mod bench_server;
 
 const SMOKE_SAMPLE_SIZE: usize = 10;
+// SMOKE 计时常量与 bench_config 为跨 bench 二进制共享的辅助项;部分 bench 入口
+// (如 throughput_baseline 仅用 bench_server)未调用,在其编译单元构成 dead_code。
+#[allow(dead_code)]
 const SMOKE_WARM_UP_MS: u64 = 100;
+#[allow(dead_code)]
 const SMOKE_MEASUREMENT_MS: u64 = 200;
 
 pub fn smoke_mode() -> bool {
@@ -15,6 +19,7 @@ pub fn smoke_mode() -> bool {
     )
 }
 
+#[allow(dead_code)]
 pub fn bench_config() -> Criterion {
     let criterion = Criterion::default()
         .configure_from_args()

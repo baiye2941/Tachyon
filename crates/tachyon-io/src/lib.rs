@@ -22,7 +22,9 @@ pub mod storage;
 pub mod tokio_file;
 pub mod winio;
 
-pub use aligned_buf::AlignedBuf;
+pub use aligned_buf::{
+    AlignedBuf, SECTOR_ALIGN, ensure_aligned_bytes, satisfies_no_buffering_alignment,
+};
 pub use buffer::{BufferGuard, BufferPool, BufferPoolStats};
 pub use dir_sync::sync_parent_dir;
 pub use iocp::IoCpStorage;

@@ -234,6 +234,12 @@ impl FragmentRecord {
         if self.state != FragmentState::Downloading {
             return Ok(None);
         }
+        // 续传完整性规格:whole-fragment expected hash 的分片禁止 try_split。
+        // 拆后原片 size/end 缩小但 expected hash 仍覆盖旧整片 → 假失败;
+        // 偷走的尾片 hash=None → BestEffort 跳过校验 → 尾区无完整性。
+        if self.info.hash.is_some() {
+            return Ok(None);
+        }
 
         let start = self.info.start;
         let end = self.info.end;
@@ -434,8 +440,13 @@ pub fn plan_fragments(
         return Ok(vec![FragmentInfo::new(0, 0, file_size - 1, file_size)?]);
     }
 
+    // 调度器建议也必须落入 [min,max]:否则 max_fragment_size 配置对首下路径失效
+    // (bench 强制多分片、用户调小 max 时会静默被 recommendation 绕过)。
     let frag_size = match suggested_frag_size {
-        Some(size) if size > 0 => size,
+        Some(size) if size > 0 => size.clamp(
+            scheduler_config.min_fragment_size,
+            scheduler_config.max_fragment_size,
+        ),
         _ => {
             // 未提供建议大小时,仅依据配置的目标分片数计算,
             // 不再维护独立的 EWMA 带宽模型,避免与 scheduler 的 Holt 模型不一致。
@@ -934,6 +945,24 @@ mod tests {
         // ------ suggested_frag_size 测试 ------
 
         #[test]
+        fn test_plan_fragments_clamps_suggested_size_to_max() {
+            let mut cfg = SchedulerConfig::default();
+            cfg.min_fragment_size = 1024 * 1024;
+            cfg.max_fragment_size = 4 * 1024 * 1024;
+            // 建议 64MiB 应被 clamp 到 4MiB → 16MiB 文件至少 4 片
+            let frags =
+                plan_fragments(16 * 1024 * 1024, true, Some(64 * 1024 * 1024), &cfg).unwrap();
+            assert!(frags.len() >= 4, "expected >=4 frags, got {}", frags.len());
+            for f in &frags {
+                assert!(
+                    f.size <= cfg.max_fragment_size,
+                    "frag size {} > max",
+                    f.size
+                );
+            }
+        }
+
+        #[test]
         fn test_plan_fragments_with_suggested_size() {
             let config = SchedulerConfig::default();
             let file_size = 10 * 1024 * 1024u64;
@@ -992,6 +1021,18 @@ mod tests {
 
     // ── try_split (work-stealing) 测试 ──────────────────────────────
 
+    #[test]
+    fn test_try_split_rejects_when_expected_hash_present() {
+        let mut info = FragmentInfo::new(0, 0, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024).unwrap();
+        info.hash = Some("deadbeef".into());
+        let mut record = FragmentRecord::new(info, 3);
+        record.start_download().unwrap();
+        let r = record.try_split(1024 * 1024, 1).unwrap();
+        assert!(r.is_none(), "有 expected hash 的分片禁止 rebalance 拆分");
+        // 边界未改
+        assert_eq!(record.info.end, 2 * 1024 * 1024 - 1);
+        assert_eq!(record.info.size, 2 * 1024 * 1024);
+    }
     #[test]
     fn test_try_split_basic() {
         // 1MB 分片,从 512KB 处拆分

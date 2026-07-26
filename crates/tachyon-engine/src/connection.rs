@@ -120,8 +120,13 @@ impl ConnectionPool {
 
     /// 获取主机级别的信号量
     ///
-    /// 审计 H-06:统一走 entry API,避免 get-miss 与 insert 之间被 cleanup 插入另一实例。
+    /// 热路径优化:同 host 反复 acquire 时先 `get` 命中,避免每次 `host.to_string()`。
+    /// miss 仍走 entry API(H-06):get-miss 与 insert 之间并发 insert 由 entry 合并为
+    /// 同一 key 的单一 Semaphore,不会出现双实例绕过 per-host 上限。
     fn host_semaphore(&self, host: &str) -> Arc<Semaphore> {
+        if let Some(sem) = self.host_semaphores.get(host) {
+            return sem.clone();
+        }
         self.host_semaphores
             .entry(host.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_per_host as usize)))
@@ -510,6 +515,21 @@ mod tests {
 
     /// 审计 H-06:若错误地在 Arc 仍存活时删条目再 insert,会形成双信号量。
     /// 回归:cleanup 后并发 acquire 仍受 max_per_host 约束(通过 host_active 观测)。
+    #[tokio::test]
+    async fn test_host_semaphore_hit_reuses_same_arc() {
+        let pool = ConnectionPool::new(PoolConfig {
+            max_per_host: 2,
+            max_global: 8,
+            ..Default::default()
+        });
+        let a = pool.host_semaphore("hit.example");
+        let b = pool.host_semaphore("hit.example");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "同 host 命中必须复用同一 Semaphore Arc"
+        );
+        assert_eq!(pool.host_count(), 1);
+    }
     #[tokio::test]
     async fn test_host_semaphore_identity_stable_across_cleanup_race() {
         let pool = Arc::new(ConnectionPool::new(PoolConfig {

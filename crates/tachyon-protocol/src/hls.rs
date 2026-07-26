@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::Future;
 use tachyon_core::safety::extract_filename;
 use tachyon_core::traits::{ByteStream, Protocol};
@@ -287,6 +288,7 @@ const HLS_MAX_CONCURRENT_SEGMENTS: usize = 8;
 /// - `key`: EXT-X-KEY 加密信息(含密钥 URI + IV)
 /// - `data`: 加密的分片数据
 /// - `seq`: 分片序号(无 IV 时用作默认 IV)
+/// - `key_cache`: 按 key URI 缓存已下载的密钥,避免同一 playlist 内重复下载
 ///
 /// # IV 规则
 /// - `key.iv` 为 `Some("0x...")` 时,解析为 16 字节大端 IV
@@ -299,24 +301,38 @@ async fn decrypt_aes128(
     key: &EncryptionKey,
     data: &[u8],
     seq: u128,
+    key_cache: &Arc<DashMap<String, Arc<tokio::sync::OnceCell<Bytes>>>>,
 ) -> DownloadResult<Bytes> {
     use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
     type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
-    // 下载密钥(16 字节)
+    // 获取密钥:通过 OnceCell 保证并发场景下同一 key URI 仅下载一次。
+    // HLS 规范中同一 key URI 的密钥在 playlist 生命周期内不变,
+    // URI 变更意味着密钥变更,因此以 URI 字符串为缓存键。
     let key_uri = key
         .uri
         .as_ref()
         .ok_or_else(|| DownloadError::Protocol("AES-128 密钥缺少 URI".into()))?;
-    let key_bytes = http
-        .get_bytes_with_retry(key_uri, HLS_SEGMENT_MAX_RETRIES)
-        .await?;
-    if key_bytes.len() != 16 {
-        return Err(DownloadError::Protocol(format!(
-            "AES-128 密钥长度非法: 预期 16 字节, 实际 {}",
-            key_bytes.len()
-        )));
-    }
+    let cell = key_cache
+        .entry(key_uri.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+        .value()
+        .clone();
+    let key_bytes = cell
+        .get_or_try_init(|| async {
+            let downloaded = http
+                .get_bytes_with_retry(key_uri, HLS_SEGMENT_MAX_RETRIES)
+                .await?;
+            if downloaded.len() != 16 {
+                return Err(DownloadError::Protocol(format!(
+                    "AES-128 密钥长度非法: 预期 16 字节, 实际 {}",
+                    downloaded.len()
+                )));
+            }
+            Ok(downloaded)
+        })
+        .await?
+        .clone();
     let mut key_arr = [0u8; 16];
     key_arr.copy_from_slice(&key_bytes[..16]);
 
@@ -380,11 +396,19 @@ fn hls_output_filename(url: &str) -> String {
 /// HLS 协议客户端
 pub struct HlsProtocol {
     http: Arc<HttpClient>,
+    /// AES-128 密钥缓存:按 key URI 缓存已下载的密钥。
+    /// 使用 OnceCell 保证并发场景下同一 key URI 仅下载一次:
+    /// 首个到达的任务执行下载,后续并发任务 await 同一 cell 的结果。
+    /// 无 TTL/容量上限:VOD 密钥数量极少(通常 1-3 个),生命周期与实例绑定。
+    key_cache: Arc<DashMap<String, Arc<tokio::sync::OnceCell<Bytes>>>>,
 }
 
 impl HlsProtocol {
     pub fn new(http: Arc<HttpClient>) -> Self {
-        Self { http }
+        Self {
+            http,
+            key_cache: Arc::new(DashMap::new()),
+        }
     }
 
     /// 获取 master playlist 中最高码率的 variant URI
@@ -443,6 +467,7 @@ async fn download_and_decrypt_segment(
     encryption: Option<&EncryptionKey>,
     media_sequence: u64,
     index: usize,
+    key_cache: &Arc<DashMap<String, Arc<tokio::sync::OnceCell<Bytes>>>>,
 ) -> DownloadResult<Bytes> {
     let data = http
         .get_bytes_with_retry(uri, HLS_SEGMENT_MAX_RETRIES)
@@ -456,6 +481,7 @@ async fn download_and_decrypt_segment(
                     &data,
                     // FIX-18.1:IV 序号 = media_sequence + 分片索引(RFC 8216 §4.3.2.4)
                     media_sequence as u128 + index as u128,
+                    key_cache,
                 )
                 .await
             }
@@ -559,9 +585,11 @@ impl Protocol for HlsProtocol {
                     // FIX-18.3:与 download_full_stream 共享 download_and_decrypt_segment。
                     use futures::stream::{self, StreamExt, TryStreamExt};
                     let http = Arc::clone(&hls.http);
+                    let key_cache = Arc::clone(&hls.key_cache);
                     let results: Vec<Bytes> = stream::iter(segments.into_iter().enumerate())
                         .map(|(i, seg)| {
                             let http = Arc::clone(&http);
+                            let key_cache = Arc::clone(&key_cache);
                             async move {
                                 download_and_decrypt_segment(
                                     &http,
@@ -569,6 +597,7 @@ impl Protocol for HlsProtocol {
                                     seg.encryption.as_ref(),
                                     media_sequence,
                                     i,
+                                    &key_cache,
                                 )
                                 .await
                             }
@@ -608,9 +637,11 @@ impl Protocol for HlsProtocol {
                     // 旧实现 unfold 串行 await,高 RTT 多分片场景吞吐受限。
                     use futures::stream::{self, StreamExt};
                     let http = Arc::clone(&hls.http);
+                    let key_cache = Arc::clone(&hls.key_cache);
                     let stream = stream::iter(segments.into_iter().enumerate())
                         .map(move |(i, seg)| {
                             let http = Arc::clone(&http);
+                            let key_cache = Arc::clone(&key_cache);
                             async move {
                                 download_and_decrypt_segment(
                                     &http,
@@ -618,6 +649,7 @@ impl Protocol for HlsProtocol {
                                     seg.encryption.as_ref(),
                                     media_sequence,
                                     i,
+                                    &key_cache,
                                 )
                                 .await
                             }
@@ -1273,6 +1305,72 @@ seg3.ts
             cipher.as_slice(),
             "结果不得等于密文(旧 bug:download_full 直接拼接密文)"
         );
+    }
+
+    /// P0-6:同一 key URI 的密钥只下载一次(密钥缓存)。
+    /// 3 个分片共享同一密钥,wiremock `.expect(1)` 断言 key 端点仅被请求 1 次。
+    #[tokio::test]
+    async fn test_hls_aes128_key_cached_across_segments() {
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri();
+
+        let key: [u8; 16] = [0x77; 16];
+
+        // 加密 3 个分片,各用不同 IV(seq=0,1,2)
+        let plaintexts: [&[u8]; 3] = [b"SEGMENT_AAA", b"SEGMENT_BBB", b"SEGMENT_CCC"];
+        let mut ciphers = Vec::new();
+        for (i, pt) in plaintexts.iter().enumerate() {
+            let mut iv = [0u8; 16];
+            iv[0..16].copy_from_slice(&(i as u128).to_be_bytes());
+            let mut buf = vec![0u8; 16];
+            buf[..pt.len()].copy_from_slice(pt);
+            let cipher = Aes128CbcEnc::new(&key.into(), &iv.into())
+                .encrypt_padded::<Pkcs7>(&mut buf, pt.len())
+                .unwrap()
+                .to_vec();
+            ciphers.push(cipher);
+        }
+
+        let m3u8 = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI=\"{base}/key.bin\"\n#EXTINF:10.000,\nseg0.ts\n#EXTINF:10.000,\nseg1.ts\n#EXTINF:10.000,\nseg2.ts\n#EXT-X-ENDLIST\n"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/playlist.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(m3u8))
+            .mount(&server)
+            .await;
+        // 关键断言:密钥端点只应被请求 1 次(缓存命中后不再下载)
+        Mock::given(method("GET"))
+            .and(path("/key.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(key.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (i, cipher) in ciphers.iter().enumerate() {
+            Mock::given(method("GET"))
+                .and(path(format!("/seg{i}.ts")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(cipher.clone()))
+                .mount(&server)
+                .await;
+        }
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        let stream = hls
+            .download_full_stream(&format!("{base}/playlist.m3u8"))
+            .await
+            .expect("流应建立成功");
+        let mut collected = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            collected.extend_from_slice(&chunk.expect("不应出错"));
+        }
+        assert_eq!(&collected, b"SEGMENT_AAASEGMENT_BBBSEGMENT_CCC");
+        // wiremock 在 MockServer drop 时验证 expect(1):key.bin 仅被请求 1 次
     }
 
     /// 审计 HLS-06:segment 首次 503 后重试成功

@@ -523,7 +523,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     frag_bytes.remove(&fragment_index);
                 }
                 if event_count == 1 || event_count.is_multiple_of(50) {
-                    tracing::info!(
+                    tracing::debug!(
                         event = event_count,
                         idx = fragment_index,
                         done = completed.len(),

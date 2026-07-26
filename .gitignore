@@ -136,3 +136,6 @@ bun.lockb
 .secrets/
 .bitfun/
 /.bitfun/search/flashgrep-index/
+
+# 本地吞吐基线工具副本(winget 抽出的 aria2c,不提交)
+/tools/aria2/

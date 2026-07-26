@@ -765,10 +765,14 @@ poller 批量收完成事件)在 bench 场景下**从未被触发**。这影响�
 io_uring(`iouring.rs` 的 `AlignedBuffer` 已用 `aligned_alloc` 解决,但仅限
 io_uring 的 fixed buffer,不影响 IOCP/WinFile)。
 
-**修复方向**:在 `BufferPool` 预分配时用 512 字节对齐分配(如 `alloc::alloc`
-with `Layout::from_size_align(size, 512)`),或引入 `aligned-vec` crate。
-这样传入 `write_at` 的 `Bytes` buffer 指针满足 512 对齐,IOCP 真异步路径生效。
-需补 bench 证明修复后 IOCP vs TokioFile 收益 >10%。
+**修复方向(已落地,P0)**:
+1. `BufferPool`/`AlignedBuf` 预分配 512 对齐(已有)。
+2. **大 chunk 直写**路径的 reqwest `Bytes` 仍可能未对齐:engine `write_all_at`
+   入口 `ensure_aligned_bytes`——未对齐则拷入 `AlignedBuf`,已对齐零拷贝;
+   metrics `aligned_write_passthrough`/`aligned_write_copied` 可观测命中率。
+3. 默认 `CrashConsistencyMode::Loose`(仅 close 时 fsync);`EveryFragment` 仍可选。
+4. io_uring 对齐快路径去掉全局 `write_lock`(仅 RMW 持锁);引擎分片区间不重叠。
+需补真实 Windows IOCP hit-rate / 吞吐 bench 证明收益 >10%。
 
 #### 第五轮:AlignedBuf 修复落地 + 真实网络验证 + 深度反思
 

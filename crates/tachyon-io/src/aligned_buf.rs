@@ -60,6 +60,29 @@ pub fn satisfies_no_buffering_alignment(offset: u64, data: &[u8]) -> bool {
         && (data.as_ptr() as usize as u64).is_multiple_of(SECTOR_ALIGN as u64)
 }
 
+/// 确保 `Bytes` 缓冲指针满足 `SECTOR_ALIGN`(512)对齐,供 IOCP/WinFile 快路径使用。
+///
+/// - 指针已 512 对齐 → 零拷贝原样返回,`copied=false`
+/// - 指针未对齐 → 拷入 `AlignedBuf` 后 `freeze()`,`copied=true`
+///
+/// **长度不做扇区填充**:尾块长度可能非 512 倍数,仍由后端 fallback 处理;
+/// 本函数只解决"reqwest 堆分配仅 ~16B 对齐"导致的**指针对齐**问题。
+/// 调用方在 `offset` 与 `len` 也扇区对齐时即可命中 NO_BUFFERING 三向契约。
+///
+/// 空切片直接返回,不分配。
+pub fn ensure_aligned_bytes(data: Bytes) -> io::Result<(Bytes, bool)> {
+    if data.is_empty() {
+        return Ok((data, false));
+    }
+    let ptr = data.as_ptr() as usize;
+    if ptr.is_multiple_of(SECTOR_ALIGN) {
+        return Ok((data, false));
+    }
+    let mut buf = AlignedBuf::new(data.len())?;
+    buf.extend_from_slice(&data);
+    Ok((buf.freeze(), true))
+}
+
 /// 底层对齐分配，由 Arc 共享以支持零拷贝 split
 struct AlignedAlloc {
     /// 对齐分配的内存起始指针
@@ -678,6 +701,60 @@ mod tests {
         let ptr = buf.as_ptr() as usize;
         assert!(ptr.is_multiple_of(SECTOR_ALIGN));
         assert_eq!(buf.capacity(), WRITE_BATCH_BYTES);
+    }
+
+    /// 已 512 对齐的 Bytes 应零拷贝返回(copied=false),指针不变。
+    #[test]
+    fn test_ensure_aligned_bytes_passthrough_when_aligned() {
+        let mut buf = AlignedBuf::new(SECTOR_ALIGN).unwrap();
+        buf.extend_from_slice(&[0xABu8; SECTOR_ALIGN]);
+        let aligned = buf.freeze();
+        let ptr_before = aligned.as_ptr() as usize;
+        let (out, copied) = ensure_aligned_bytes(aligned).unwrap();
+        assert!(!copied, "已对齐缓冲不得拷贝");
+        assert_eq!(out.as_ptr() as usize, ptr_before, "零拷贝应保留原指针");
+        assert!(
+            (out.as_ptr() as usize).is_multiple_of(SECTOR_ALIGN),
+            "输出指针仍须 512 对齐"
+        );
+        assert_eq!(out.len(), SECTOR_ALIGN);
+    }
+
+    /// 堆上未对齐 Bytes(典型 reqwest 路径)必须拷贝进 AlignedBuf。
+    #[test]
+    fn test_ensure_aligned_bytes_copies_unaligned_heap_bytes() {
+        // Vec 堆分配通常仅 16 字节对齐;构造后若碰巧 512 对齐则再偏移切片制造未对齐。
+        let mut raw = vec![0xCDu8; SECTOR_ALIGN + 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let owned = Bytes::from(raw);
+        let unaligned = if (owned.as_ptr() as usize).is_multiple_of(SECTOR_ALIGN) {
+            owned.slice(1..1 + SECTOR_ALIGN)
+        } else {
+            owned.slice(..SECTOR_ALIGN)
+        };
+        assert!(
+            !(unaligned.as_ptr() as usize).is_multiple_of(SECTOR_ALIGN),
+            "前置条件:输入指针必须未 512 对齐"
+        );
+        let expected = unaligned.to_vec();
+        let (out, copied) = ensure_aligned_bytes(unaligned).unwrap();
+        assert!(copied, "未对齐缓冲必须拷贝");
+        assert!(
+            (out.as_ptr() as usize).is_multiple_of(SECTOR_ALIGN),
+            "输出指针必须 512 对齐,实际 {:#x}",
+            out.as_ptr() as usize
+        );
+        assert_eq!(out.as_ref(), expected.as_slice());
+    }
+
+    /// 空切片不分配、不拷贝。
+    #[test]
+    fn test_ensure_aligned_bytes_empty_passthrough() {
+        let (out, copied) = ensure_aligned_bytes(Bytes::new()).unwrap();
+        assert!(!copied);
+        assert!(out.is_empty());
     }
 
     /// AlignedBuf freeze 产出的 Bytes 满足 NO_BUFFERING 三向对齐契约:
