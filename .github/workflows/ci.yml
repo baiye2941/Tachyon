@@ -63,8 +63,9 @@ jobs:
           rust="${{ steps.filter.outputs.rust }}"
           frontend="${{ steps.filter.outputs.frontend }}"
           docs="${{ steps.filter.outputs.docs }}"
-          # workflow_dispatch 或 push 到 main 默认全量；paths-filter 在 PR 上最有价值
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          # main push / workflow_dispatch 默认全量,避免 path-filter 半绿误导 README badge
+          # paths-filter 主要服务 PR 节省 billable
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "run_rust=true" >> "$GITHUB_OUTPUT"
             echo "run_frontend=true" >> "$GITHUB_OUTPUT"
             exit 0
