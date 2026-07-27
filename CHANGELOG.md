@@ -2,6 +2,32 @@
 
 本文件记录 Tachyon 面向用户的版本变更。
 
+
+## [0.1.3] — 2026-07-27
+
+### 性能
+
+- `default_target_fragments` 16→64，解除中等文件分片数=并发上限的队列深度归零
+- rebalance 对齐 IDM：空闲 worker 触发、最大剩余字节、对半拆分、收尾 500ms 冷却
+- bench harness 支持源内 slow-zone，便于 straggler 场景复现
+
+### 崩溃一致性
+
+- `Loose` 改为 group-commit（N=8），不再在分片完成边界完全跳过 sync
+- mid-flight partial 上报前 durable（EveryFragment 每次 / Loose 每 2 次）
+- OS kill + resume 全文件 blake3 冒烟；PageCache/真实文件 resume 证据链
+
+### 修复
+
+- 删除 plan 阶段 `confidence>0` 不可达分支
+- 前端 bun audit：brace-expansion≥5.0.8、postcss≥8.5.18
+- CI flaky：magnet seeder 临时端口、mirror 锁开销阈值、store durable 写失败注入
+
+### 工程
+
+- tachyon-engine regions 覆盖率 ≥90%（90.46%）
+- hybrid/magnet 构造与 storage multi sync 测试补齐
+
 ## [0.1.2] — 2026-07-20
 
 ### 安全与发布
