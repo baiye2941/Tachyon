@@ -31,6 +31,15 @@ use crate::magnet_lifecycle::{
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// 绑定 127.0.0.1:0 取 OS 分配端口,避免并行测试固定 45000 冲突(EADDRINUSE)。
+fn ephemeral_localhost_port() -> u16 {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+    port
+}
+
 /// 可控的外部 Session adapter：`add` 开始后保持 pending，直到测试显式交付注册结果。
 ///
 /// 它刻意忽略 coordinator 发出的取消请求，模拟 cleanup 与 `add_torrent` 完成竞速时
@@ -1451,7 +1460,10 @@ async fn production_probe_registers_cache_miss_added_with_session_coordinator()
             dht: None, // 测试禁用 DHT
             listen: Some(librqbit::ListenerOptions {
                 enable_upnp_port_forwarding: false,
-                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                listen_addr: std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    ephemeral_localhost_port(),
+                )),
                 ..Default::default()
             }),
             persistence: None,
@@ -1612,7 +1624,10 @@ async fn production_download_range_stream_registers_cache_miss_added_with_sessio
             dht: None, // 测试禁用 DHT
             listen: Some(librqbit::ListenerOptions {
                 enable_upnp_port_forwarding: false,
-                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                listen_addr: std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    ephemeral_localhost_port(),
+                )),
                 ..Default::default()
             }),
             persistence: None,
@@ -1780,7 +1795,10 @@ async fn concurrent_download_range_stream_cache_miss_does_not_fail_closed() {
             dht: None, // 测试禁用 DHT
             listen: Some(librqbit::ListenerOptions {
                 enable_upnp_port_forwarding: false,
-                listen_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 45000)),
+                listen_addr: std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    ephemeral_localhost_port(),
+                )),
                 ..Default::default()
             }),
             persistence: None,

@@ -1939,10 +1939,8 @@ mod tests {
     /// §3.3 step 4-5:durable write 失败时 tombstone 必须保留,
     /// 且旧 revision save 仍被 tombstone 拒绝。
     ///
-    /// 当前实现先清 tombstone 再写,故 write 失败后 tombstone 已丢失 → RED。
-    /// 注入手段:将目标文件设为只读,使 `rename` 失败(读不受影响),
-    /// 经探针确认 `load` 成功而 `put_durable` 返回 `RecoveryError::Io`。
-    #[allow(clippy::permissions_set_readonly_false)] // 测试清理:还原临时文件可写
+    /// 注入手段:把目标 key 路径替换为**目录**,使 `rename(temp → final)` 失败
+    /// (Windows/Linux 均可靠;仅文件 readonly 在 Linux 上 rename 覆盖仍可能成功)。
     #[test]
     fn s02b_restore_keeps_tombstone_when_durable_write_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1959,41 +1957,37 @@ mod tests {
             .unwrap()
             .insert("rwfail".to_string(), 5);
 
-        // 将目标文件设为只读,迫使 durable write 的 rename 失败。
+        // 目标路径改为目录 → durable rename 必失败,但 load 可走别的路径?
+        // put_durable 写 final_path;将 final_path 换成目录后 rename 失败。
         let path = task_key_path(tmp.path(), "rwfail");
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
 
-        // incoming revision 与 disk 持平,确保走到 durable write 而非 CAS 拒绝。
         let mut incoming = snap.clone();
         incoming.revision = disk.revision;
 
-        let err = mgr.restore_task_snapshot(&incoming).unwrap_err();
+        let err = mgr
+            .restore_task_snapshot(&incoming)
+            .expect_err("目标路径为目录时 durable write 必须失败");
         match err {
             RecoveryError::Io(_) => {}
-            other => {
-                let mut p = std::fs::metadata(&path).unwrap().permissions();
-                p.set_readonly(false);
-                let _ = std::fs::set_permissions(&path, p);
-                panic!("expected Io from failed durable write, got {other:?}");
-            }
+            other => panic!("expected Io from failed durable write, got {other:?}"),
         }
 
-        // 还原可写,便于后续断言与清理。
-        let mut p = std::fs::metadata(&path).unwrap().permissions();
-        p.set_readonly(false);
-        let _ = std::fs::set_permissions(&path, p);
-
-        // tombstone 必须保留:strict durable 写失败后不得清除。
+        // tombstone 必须保留
         assert_eq!(
             mgr.delete_tombstones.lock().unwrap().get("rwfail"),
             Some(&5),
             "durable write 失败后 tombstone 必须保留(不得在写前清除)"
         );
 
-        // 旧 revision save 仍被 tombstone 拒绝:tombstone(5)仍生效,
-        // incoming.revision(1) <= 5 → CAS 拒绝,不得写入。
+        // 清理目录障碍,恢复为可写文件,验证 tombstone 仍挡住旧 revision save
+        std::fs::remove_dir_all(&path).unwrap();
+        // 重新写入原始 revision 快照作为磁盘基线
+        mgr.store
+            .put_durable(&format!("task_{}", snap.id), &disk)
+            .unwrap();
+
         mgr.save_task_snapshot(&incoming).unwrap();
         let after = mgr.load_task_snapshot("rwfail").unwrap().unwrap();
         assert_eq!(
