@@ -2,6 +2,7 @@ use std::{env, time::Duration};
 
 use criterion::{BenchmarkGroup, Criterion, PlottingBackend, measurement::WallTime};
 
+pub mod baseline_args;
 pub mod bench_server;
 
 const SMOKE_SAMPLE_SIZE: usize = 10;

@@ -308,7 +308,7 @@ impl DynStorage {
     /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
     /// - `Iocp`: IOCP 异步后端（仅 Windows；其他平台回退到 Standard）
     /// - `IoUring`: io_uring 零拷贝后端（仅 Linux 5.4+；其他平台回退到 Standard）
-    pub(crate) async fn open_with_strategy(
+    pub async fn open_with_strategy(
         path: &std::path::Path,
         strategy: tachyon_core::config::IoStrategy,
     ) -> DownloadResult<Self> {
@@ -774,7 +774,7 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
 
-    use super::{DynStorage, StorageSet};
+    use super::{DynStorage, MemStorage, StorageSet};
     use tachyon_core::DownloadResult;
     use tachyon_core::config::IoStrategy;
     use tachyon_io::storage::AsyncStorage;
@@ -1022,6 +1022,61 @@ mod tests {
         assert_eq!(read, payload_size);
         assert_eq!(&buf[..5], b"uring");
         storage.close().await.unwrap();
+    }
+
+    /// `DynStorage::from_arc` 必须保留对同一底层存储的读写语义(共享 Arc)。
+    #[tokio::test]
+    async fn test_dyn_storage_from_arc_shares_underlying_storage() {
+        let mem = Arc::new(MemStorage::with_capacity(64));
+        let storage = DynStorage::from_arc(mem.clone());
+
+        storage
+            .write_at(0, Bytes::from_static(b"from-arc"))
+            .await
+            .expect("from_arc 包装后写入应成功");
+
+        let mut buf = [0u8; 8];
+        let read = storage
+            .read_at(0, &mut buf)
+            .await
+            .expect("from_arc 包装后读取应成功");
+        assert_eq!(read, 8);
+        assert_eq!(&buf, b"from-arc");
+
+        // 通过原始 Arc 再读一遍,确认 from_arc 没有复制出独立后端
+        let mut via_arc = [0u8; 8];
+        let n = mem
+            .read_at(0, &mut via_arc)
+            .await
+            .expect("原始 Arc 应可见写入");
+        assert_eq!(n, 8);
+        assert_eq!(&via_arc, b"from-arc");
+
+        storage.sync().await.expect("from_arc sync 应成功");
+        storage.close().await.expect("from_arc close 应成功");
+    }
+
+    /// `StorageSet::multi(...).sync()` 必须遍历全部文件并全部成功。
+    #[tokio::test]
+    async fn test_storage_set_multi_sync_all_files() {
+        let ss = make_multi_storage_set();
+        ss.allocate(8192).await.expect("allocate 应成功");
+        ss.write_at(0, Bytes::from(vec![0x11; 100]))
+            .await
+            .expect("写入 file0 应成功");
+        ss.write_at(4096, Bytes::from(vec![0x22; 100]))
+            .await
+            .expect("写入 file1 应成功");
+
+        ss.sync().await.expect("Multi 路径 sync 应对全部文件成功");
+
+        // sync 后数据仍可读(内存后端 no-op fsync,但契约是 Ok)
+        let mut buf0 = vec![0u8; 100];
+        let mut buf1 = vec![0u8; 100];
+        assert_eq!(ss.read_at(0, &mut buf0).await.unwrap(), 100);
+        assert_eq!(ss.read_at(4096, &mut buf1).await.unwrap(), 100);
+        assert!(buf0.iter().all(|&b| b == 0x11));
+        assert!(buf1.iter().all(|&b| b == 0x22));
     }
 
     #[tokio::test]

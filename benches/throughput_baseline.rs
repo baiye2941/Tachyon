@@ -16,251 +16,22 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+// CLI 参数模型抽在 support::baseline_args,由 tests/throughput_baseline_args.rs
+// 用 #[path] 包含同一份源码做解析测试(bench 二进制 harness=false,内部 #[test]
+// 不会被 nextest 收集)。
+use support::baseline_args::{parse_args, print_help};
 use support::bench_server::ThrottledServer;
 use tachyon_core::Metrics;
 use tachyon_core::config::{DownloadConfig, WRITE_BATCH_BYTES};
 use tachyon_engine::{BufferPool, ConnectionPool, DownloadTask, PoolConfig};
 use tachyon_scheduler::AdaptiveDownloadScheduler;
 use tempfile::TempDir;
-
-#[derive(Clone, Debug)]
-struct Args {
-    size: u64,
-    rtt_ms: u64,
-    bps: u64,
-    url: Option<String>,
-    mirrors: Vec<String>,
-    concurrency: u32,
-    runs: usize,
-    out: Option<PathBuf>,
-    compare_aria2: bool,
-    aria2_connections: u32,
-    /// 强制直连:DownloadConfig.proxy="direct",不读 HTTP_PROXY/系统代理
-    no_proxy: bool,
-    /// 强制 HTTP/1.1(PoolConfig.enable_http2=false),用于代理下 H1/H2 对照
-    http1_only: bool,
-    /// 覆盖 SchedulerConfig.max_fragment_size(MiB)。用于 WAN 多连接对标:
-    /// 默认 64MiB 会使 64MiB 文件退化为单分片(peak_conn=1)。
-    max_frag_mib: Option<u64>,
-    /// 本地双源异构:再起一个慢镜像 server(更高 RTT/更低 bps)
-    local_mirror: bool,
-    mirror_rtt_ms: u64,
-    mirror_bps: u64,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            size: 64 * 1024 * 1024,
-            rtt_ms: 0,
-            bps: 0,
-            url: None,
-            mirrors: Vec::new(),
-            concurrency: 16,
-            runs: 3,
-            out: None,
-            compare_aria2: false,
-            aria2_connections: 16,
-            no_proxy: false,
-            http1_only: false,
-            max_frag_mib: None,
-            local_mirror: false,
-            mirror_rtt_ms: 200,
-            mirror_bps: 5_000_000, // 5MB/s 慢源
-        }
-    }
-}
-
-fn print_help() {
-    eprintln!(
-        "\
-Tachyon 吞吐基线 harness
-
-OPTIONS:
-  --size <N[K|M|G|MiB|GiB]>   本地 server 文件大小 (默认 64MiB)
-  --rtt-ms <u64>              本地主源模拟 RTT 毫秒 (默认 0)
-  --bps <N[K|M|G]>            本地主源带宽上限 bytes/s,0=不限 (默认 0)
-  --url <URL>                 外部主源(跳过本地 server)
-  --mirror <URL>              镜像源,可重复
-  --local-mirror              启动本地慢镜像源(异构 RTT/bps,测 rebalance)
-  --mirror-rtt-ms <u64>       本地慢镜像 RTT 毫秒 (默认 200)
-  --mirror-bps <N[K|M|G]>     本地慢镜像带宽 (默认 5M)
-  --concurrency <u32>         max_concurrent_fragments (默认 16)
-  --runs <usize>              重复次数 (默认 3)
-  --out <path>                写出 JSON 结果
-  --compare-aria2             同机 aria2c -xN -sN 对标(需安装)
-  --aria2-connections <u32>   aria2 -x/-s (默认 16)
-  --no-proxy                  强制直连(proxy=direct),忽略 HTTP_PROXY/系统代理
-  --http1-only                强制 HTTP/1.1(禁用 H2),代理下对照用
-  --max-frag-mib <u64>        覆盖 max_fragment_size(MiB),强制多分片多连接
-  --help                      显示帮助
-
-示例:
-  cargo bench --bench throughput_baseline -- --size 512MiB --runs 3
-  cargo bench --bench throughput_baseline -- --size 64MiB --rtt-ms 100 --bps 50M
-  cargo bench --bench throughput_baseline -- --size 64MiB --local-mirror --mirror-rtt-ms 200
-  cargo bench --bench throughput_baseline -- --url https://.../file.bin --mirror https://mirror/...
-"
-    );
-}
-
-fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    let lower = s.to_ascii_lowercase();
-    let (num, mul) = if let Some(n) = lower.strip_suffix("gib") {
-        (n, 1024u64 * 1024 * 1024)
-    } else if let Some(n) = lower.strip_suffix("mib") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = lower.strip_suffix("kib") {
-        (n, 1024)
-    } else if let Some(n) = lower.strip_suffix('g') {
-        (n, 1000 * 1000 * 1000)
-    } else if let Some(n) = lower.strip_suffix('m') {
-        (n, 1000 * 1000)
-    } else if let Some(n) = lower.strip_suffix('k') {
-        (n, 1000)
-    } else {
-        (s, 1)
-    };
-    let num = num.trim();
-    // 支持小数: 12.5M / 0.5GiB; 整数路径仍走 u64 避免浮点误差
-    if num.contains('.') {
-        let v: f64 = num.parse().map_err(|e| format!("无效大小 '{s}': {e}"))?;
-        if !v.is_finite() || v < 0.0 {
-            return Err(format!("无效大小 '{s}': 必须为非负有限数"));
-        }
-        let product = v * mul as f64;
-        if product > u64::MAX as f64 {
-            return Err(format!("无效大小 '{s}': 溢出 u64"));
-        }
-        Ok(product.round() as u64)
-    } else {
-        num.parse::<u64>()
-            .map(|v| v.saturating_mul(mul))
-            .map_err(|e| format!("无效大小 '{s}': {e}"))
-    }
-}
-
-fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let mut args = Args::default();
-    let mut i = 0usize;
-    while i < argv.len() {
-        let a = &argv[i];
-        match a.as_str() {
-            "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
-            }
-            "--size" => {
-                i += 1;
-                let v = argv.get(i).ok_or("--size 需要参数")?;
-                args.size = parse_size(v)?;
-            }
-            "--rtt-ms" => {
-                i += 1;
-                args.rtt_ms = argv
-                    .get(i)
-                    .ok_or("--rtt-ms 需要参数")?
-                    .parse()
-                    .map_err(|e| format!("--rtt-ms: {e}"))?;
-            }
-            "--bps" => {
-                i += 1;
-                let v = argv.get(i).ok_or("--bps 需要参数")?;
-                args.bps = parse_size(v)?;
-            }
-            "--url" => {
-                i += 1;
-                args.url = Some(argv.get(i).ok_or("--url 需要参数")?.clone());
-            }
-            "--mirror" => {
-                i += 1;
-                args.mirrors
-                    .push(argv.get(i).ok_or("--mirror 需要参数")?.clone());
-            }
-            "--concurrency" => {
-                i += 1;
-                args.concurrency = argv
-                    .get(i)
-                    .ok_or("--concurrency 需要参数")?
-                    .parse()
-                    .map_err(|e| format!("--concurrency: {e}"))?;
-            }
-            "--runs" => {
-                i += 1;
-                args.runs = argv
-                    .get(i)
-                    .ok_or("--runs 需要参数")?
-                    .parse()
-                    .map_err(|e| format!("--runs: {e}"))?;
-                if args.runs == 0 {
-                    return Err("--runs 必须 >= 1".into());
-                }
-            }
-            "--out" => {
-                i += 1;
-                args.out = Some(PathBuf::from(argv.get(i).ok_or("--out 需要参数")?));
-            }
-            "--compare-aria2" => {
-                args.compare_aria2 = true;
-            }
-            "--local-mirror" => {
-                args.local_mirror = true;
-            }
-            "--mirror-rtt-ms" => {
-                i += 1;
-                args.mirror_rtt_ms = argv
-                    .get(i)
-                    .ok_or("--mirror-rtt-ms 需要参数")?
-                    .parse()
-                    .map_err(|e| format!("--mirror-rtt-ms: {e}"))?;
-            }
-            "--mirror-bps" => {
-                i += 1;
-                let v = argv.get(i).ok_or("--mirror-bps 需要参数")?;
-                args.mirror_bps = parse_size(v)?;
-            }
-            "--aria2-connections" => {
-                i += 1;
-                args.aria2_connections = argv
-                    .get(i)
-                    .ok_or("--aria2-connections 需要参数")?
-                    .parse()
-                    .map_err(|e| format!("--aria2-connections: {e}"))?;
-            }
-            "--no-proxy" => {
-                args.no_proxy = true;
-            }
-            "--http1-only" => {
-                args.http1_only = true;
-            }
-            "--max-frag-mib" => {
-                i += 1;
-                args.max_frag_mib = Some(
-                    argv.get(i)
-                        .ok_or("--max-frag-mib 需要参数")?
-                        .parse()
-                        .map_err(|e| format!("--max-frag-mib: {e}"))?,
-                );
-                if args.max_frag_mib == Some(0) {
-                    return Err("--max-frag-mib 必须 >= 1".into());
-                }
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("未知参数: {other} (试 --help)"));
-            }
-            _ => return Err(format!("位置参数未支持: {a}")),
-        }
-        i += 1;
-    }
-    Ok(args)
-}
 
 #[derive(Clone, Debug)]
 struct RunResult {
@@ -332,6 +103,12 @@ fn make_config(dir: &Path, concurrency: u32, no_proxy: bool) -> DownloadConfig {
     config
 }
 
+/// 构造 DownloadTask 并完成基础注入(buffer_pool / metrics / rebalance 开关 / TLS client)
+///
+/// 参数:primary_url、mirrors、config、pool、buffer_pool、metrics、sched_config,
+/// 加 P0-1/P0-2 A/B 量化新增的 rebalance_off、tls。bench 入口函数(非生产 API),
+/// 参数列表直接展开,不引入 builder 间接层。
+#[allow(clippy::too_many_arguments)]
 async fn build_task(
     primary_url: &str,
     mirrors: &[String],
@@ -340,10 +117,72 @@ async fn build_task(
     buffer_pool: Arc<BufferPool>,
     metrics: Arc<Metrics>,
     sched_config: Option<tachyon_core::config::SchedulerConfig>,
+    rebalance_off: bool,
+    tls: bool,
 ) -> Result<DownloadTask, Box<dyn std::error::Error + Send + Sync>> {
     let sc = sched_config.unwrap_or_default();
     let scheduler = Arc::new(AdaptiveDownloadScheduler::new(sc.clone()));
-    let mut task = if mirrors.is_empty() {
+
+    // TLS bench:用 with_danger_accept_invalid_certs 构造自签证书专用 HttpClient。
+    // 注入到 DownloadTask::with_protocol(bench 专用入口),绕过 shared_http_client
+    // 的全局 registry(后者会缓存并复用证书校验严格的客户端,不适用于自签 bench)。
+    let mut task = if tls {
+        use tachyon_core::config::ConnectionConfig;
+        let conn = ConnectionConfig::from(pool.config().clone());
+        let http = tachyon_protocol::HttpClient::with_danger_accept_invalid_certs(
+            &conn,
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+            config.proxy.as_deref(),
+            &config.user_agent,
+            &config.headers,
+        )
+        .map_err(|e| e.to_string())?;
+        let http_arc: std::sync::Arc<dyn tachyon_core::traits::Protocol> = if mirrors.is_empty() {
+            std::sync::Arc::new(http)
+        } else {
+            // 镜像源同样用跳过校验的客户端
+            let primary = std::sync::Arc::new(http);
+            let mirror_protocols: Vec<(
+                String,
+                std::sync::Arc<dyn tachyon_core::traits::Protocol>,
+            )> = mirrors
+                .iter()
+                .filter_map(|m| {
+                    tachyon_protocol::HttpClient::with_danger_accept_invalid_certs(
+                        &conn,
+                        config.connect_timeout_secs,
+                        config.request_timeout_secs,
+                        config.proxy.as_deref(),
+                        &config.user_agent,
+                        &config.headers,
+                    )
+                    .ok()
+                    .map(|c| {
+                        (
+                            m.clone(),
+                            std::sync::Arc::new(c)
+                                as std::sync::Arc<dyn tachyon_core::traits::Protocol>,
+                        )
+                    })
+                })
+                .collect();
+            std::sync::Arc::new(tachyon_engine::MirrorProtocol::with_pool(
+                primary,
+                mirror_protocols,
+                Some(pool.clone()),
+            ))
+        };
+        DownloadTask::with_protocol(
+            primary_url.to_string(),
+            config,
+            Some(pool),
+            scheduler,
+            http_arc,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    } else if mirrors.is_empty() {
         DownloadTask::with_pool_and_scheduler(
             primary_url.to_string(),
             config,
@@ -367,9 +206,18 @@ async fn build_task(
     task.set_buffer_pool(buffer_pool);
     task.set_metrics(metrics);
     task.set_scheduler_config(sc);
+    if rebalance_off {
+        task.set_rebalance_enabled(false);
+    }
     Ok(task)
 }
 
+/// 单次跑一次下载并采集 RunResult(计时 + goodput + retry/rebalance 计数)
+///
+/// 参数透传到 `build_task`:primary_url、mirrors、concurrency、file_size_hint、
+/// no_proxy、http1_only、max_frag_mib,加 P0-1/P0-2 的 rebalance_off、tls。
+/// 参数列表与 `build_task` 一致,bench 内部调用,无需 builder。
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     primary_url: &str,
     mirrors: &[String],
@@ -378,6 +226,8 @@ async fn run_once(
     no_proxy: bool,
     http1_only: bool,
     max_frag_mib: Option<u64>,
+    rebalance_off: bool,
+    tls: bool,
 ) -> Result<RunResult, Box<dyn std::error::Error + Send + Sync>> {
     let dir = TempDir::new()?;
     let config = make_config(dir.path(), concurrency, no_proxy);
@@ -425,6 +275,8 @@ async fn run_once(
         buffer_pool,
         Arc::clone(&metrics),
         sched_config,
+        rebalance_off,
+        tls,
     )
     .await?;
 
@@ -561,6 +413,11 @@ fn serde_json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// `Option<u64>` 序列化为 JSON 数字或 `null`(未配置的 slow_zone 参数)
+fn serde_json_opt_u64(v: Option<u64>) -> String {
+    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
 fn serde_json_str_arr(items: &[String]) -> String {
     let inner = items
         .iter()
@@ -604,11 +461,44 @@ fn main() {
         let (primary, size_hint) = if let Some(url) = &args.url {
             (url.clone(), None)
         } else {
-            let s = ThrottledServer::start(args.size, args.bps, args.rtt_ms).await;
+            // 主源全参数构造:support slow_zone + tls + loss_rate。
+            // --rtt-ms 仍走 TTFB(首字节前 sleep),handshake_rtt 暂留 0(预留扩展点)。
+            let tls_mode = if args.tls {
+                support::bench_server::TlsMode::Tls
+            } else {
+                support::bench_server::TlsMode::Plaintext
+            };
+            let s = ThrottledServer::start_with_tls_and_loss(
+                args.size,
+                args.bps,
+                args.rtt_ms,
+                0,
+                support::bench_server::DEFAULT_CHUNK_SIZE,
+                support::bench_server::BenchProtocol::Auto,
+                args.slow_zone(),
+                tls_mode,
+                args.loss_rate,
+            )
+            .await;
             let url = format!("{}/baseline.bin", s.uri());
             if args.local_mirror {
-                let ms =
-                    ThrottledServer::start(args.size, args.mirror_bps, args.mirror_rtt_ms).await;
+                let mirror_tls_mode = if args.mirror_tls {
+                    support::bench_server::TlsMode::Tls
+                } else {
+                    support::bench_server::TlsMode::Plaintext
+                };
+                let ms = ThrottledServer::start_with_tls_and_loss(
+                    args.size,
+                    args.mirror_bps,
+                    args.mirror_rtt_ms,
+                    0,
+                    support::bench_server::DEFAULT_CHUNK_SIZE,
+                    support::bench_server::BenchProtocol::Auto,
+                    args.mirror_slow_zone(),
+                    mirror_tls_mode,
+                    args.mirror_loss_rate,
+                )
+                .await;
                 mirrors.push(format!("{}/baseline.bin", ms.uri()));
                 mirror_server = Some(ms);
             }
@@ -627,6 +517,12 @@ fn main() {
                 args.mirror_rtt_ms, args.mirror_bps
             );
         }
+        if let Some((zone_start, zone_end, slow_bps)) = args.slow_zone() {
+            println!(
+                "slow_zone: [{zone_start}, {zone_end}) bps={slow_bps} ({})",
+                format_bps(slow_bps as f64)
+            );
+        }
         println!(
             "concurrency={} runs={} rtt_ms={} bps={} size_hint={}",
             args.concurrency,
@@ -638,8 +534,8 @@ fn main() {
                 .unwrap_or_else(|| "unknown".into())
         );
         println!(
-            "hint: 热路径 info 已降 debug; RUST_LOG=warn; no_proxy={} http1_only={} max_frag_mib={:?}",
-            args.no_proxy, args.http1_only, args.max_frag_mib
+            "hint: 热路径 info 已降 debug; RUST_LOG=warn; no_proxy={} http1_only={} max_frag_mib={:?} rebalance_off={} tls={} loss_rate={}",
+            args.no_proxy, args.http1_only, args.max_frag_mib, args.rebalance_off, args.tls, args.loss_rate
         );
         println!();
 
@@ -653,6 +549,8 @@ fn main() {
                 args.no_proxy,
                 args.http1_only,
                 args.max_frag_mib,
+                args.rebalance_off,
+                args.tls,
             )
             .await?;
             print_run(&format!("tachyon run{i}"), &r);
@@ -729,6 +627,17 @@ fn main() {
 \"local_mirror\":{},\
 \"mirror_rtt_ms\":{},\
 \"mirror_bps\":{},\
+\"slow_zone_start\":{},\
+\"slow_zone_len\":{},\
+\"slow_zone_bps\":{},\
+\"tls\":{},\
+\"loss_rate\":{:.4},\
+\"mirror_tls\":{},\
+\"mirror_loss_rate\":{:.4},\
+\"mirror_slow_zone_start\":{},\
+\"mirror_slow_zone_len\":{},\
+\"mirror_slow_zone_bps\":{},\
+\"rebalance_off\":{},\
 \"median_goodput_bps\":{:.3},\
 \"last\":{},\
 \"aria2\":{}\
@@ -742,6 +651,17 @@ fn main() {
                 args.local_mirror,
                 args.mirror_rtt_ms,
                 args.mirror_bps,
+                serde_json_opt_u64(args.slow_zone_start),
+                serde_json_opt_u64(args.slow_zone_len),
+                serde_json_opt_u64(args.slow_zone_bps),
+                args.tls,
+                args.loss_rate,
+                args.mirror_tls,
+                args.mirror_loss_rate,
+                serde_json_opt_u64(args.mirror_slow_zone_start),
+                serde_json_opt_u64(args.mirror_slow_zone_len),
+                serde_json_opt_u64(args.mirror_slow_zone_bps),
+                args.rebalance_off,
                 median,
                 result_to_json(&last),
                 aria2_result

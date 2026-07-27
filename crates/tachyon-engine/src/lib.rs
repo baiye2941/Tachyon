@@ -11,7 +11,7 @@ pub mod connection;
 pub mod downloader;
 pub mod fragment;
 pub mod http_client_registry;
-mod mirror;
+pub mod mirror;
 pub mod rate_limit;
 mod storage_adapter;
 
@@ -27,6 +27,7 @@ pub use downloader::{
 };
 pub use fragment::{BandwidthTracker, FragmentRecord, FragmentState};
 pub use http_client_registry::{HttpClientRegistry, global_http_client_registry};
+pub use mirror::MirrorProtocol;
 pub use rate_limit::RateLimiter;
 pub use tachyon_core::FragmentProgress;
 // 审计 A-01:app 经 engine 门面获取下游类型,禁止直接依赖 io/scheduler/crypto

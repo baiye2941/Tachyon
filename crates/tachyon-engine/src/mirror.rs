@@ -258,7 +258,7 @@ impl Drop for StatsStream {
 }
 
 /// 多镜像源 Protocol 适配器(多源并发 + least-in-flight)
-pub(crate) struct MirrorProtocol {
+pub struct MirrorProtocol {
     /// 所有源(index 0=primary, 1..N=mirrors)
     sources: Vec<Source>,
     /// probe 成功的源 index 集合(download 只从中选;空集则用全部源)
@@ -300,7 +300,7 @@ impl MirrorProtocol {
     /// `pool` 为 Some 时,适配器在选源后按真实命中镜像 URL 的 host 单独
     /// acquire 连接许可(P1:使各镜像能各自占满自己的 per-host 配额),
     /// 引擎层在镜像路径不再对主 URL host 重复 acquire。
-    pub(crate) fn with_pool(
+    pub fn with_pool(
         primary: Arc<dyn Protocol>,
         mirrors: Vec<(String, Arc<dyn Protocol>)>,
         pool: Option<Arc<ConnectionPool>>,

@@ -100,6 +100,14 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"
 http-body = "1"
+# TLS bench server:仅 bench 用,生成自签证书 + 接受 HTTPS 连接(reqwest 已通过 rustls
+# feature 引入客户端侧 TLS)。rcgen 生成自签证书,rustls 0.23 服务端,tokio-rustls 异步
+# 包装。生产代码与 workspace 成员 crate 均不直接依赖。
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+# 丢包模拟:bench server 按概率丢 chunk(模拟 WAN body 截断/连接中断重试路径)
+# rand 复用 workspace 顶层声明(rand = "0.10")
 [workspace.lints.clippy]
 # 审计 E-03: 强制所有 unsafe 块携带 Safety 注释。
 # restriction lint(warn 级),缺注释的 unsafe 块会产生警告,CI -D warnings 升级为报错。
@@ -171,6 +179,11 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 http-body = { workspace = true }
+# TLS bench server:自签证书 + HTTPS 接受(仅 throughput_baseline 用)
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+rand = { workspace = true }
 futures = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }

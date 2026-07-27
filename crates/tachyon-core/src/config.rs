@@ -182,14 +182,14 @@ pub enum VerifyStrategy {
 
 /// 崩溃一致性级别:控制下载过程中 fsync 的频率,平衡耐久性与吞吐。
 ///
-/// - `Loose`(默认):仅在 close() 时 fsync 数据+目录,不在分片边界 fsync。崩溃可能丢失所有
-///   未 close 的分片重传。默认追极致吞吐(NVMe/高并发分片场景);需要断电可恢复时显式选
-///   `EveryFragment`。缺字段反序列化亦为 Loose;磁盘上已写 `everyFragment` 的配置保持不变。
+/// - `Loose`(默认):分片完成边界 **group-commit**(每 N=8 个完成分片 `storage.sync()` 一次),
+///   降低 fsync 频率换吞吐;仍有非零 durable 点,不是「完全取消分片 sync」。
+///   注意:已 durable 的快照在 resume 时会跳过对应分片;未落到 group-commit 边界的
+///   在途分片可能重传。缺字段反序列化亦为 Loose;磁盘上已写 `everyFragment` 的配置保持不变。
 /// - `EveryFragment`:每个分片完成时 fsync 数据+父目录,断电后 resume 跳过已 sync 分片。
 ///   适合 HDD 或对崩溃恢复有强需求的场景。
 ///
-/// 设计:`Batch` 模式因多任务并发分片需要共享计数器(锁开销可能抵消 fsync 节省),
-/// 暂未实现。如需 Batch 语义,可显式 `EveryFragment` + 大分片(8-16MB)控制 fsync 频率。
+/// 设计:更细粒度的可配置 Batch 尺寸若需暴露为配置项,可在此扩展;当前 N 固定为引擎常量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum CrashConsistencyMode {
@@ -1058,7 +1058,7 @@ fn default_medium_bw_threshold() -> u64 {
 }
 
 fn default_target_fragments() -> u32 {
-    16
+    64
 }
 
 fn default_cold_start_initial_concurrency() -> u32 {
@@ -1092,7 +1092,7 @@ impl Default for SchedulerConfig {
             sampling_interval_secs: default_sampling_interval_secs(),
             ewma_alpha: 0.3,
             ewma_beta: default_ewma_beta(),
-            default_target_fragments: 16,
+            default_target_fragments: 64,
             high_bandwidth_threshold: default_high_bw_threshold(),
             medium_bandwidth_threshold: default_medium_bw_threshold(),
             cold_start_initial_concurrency: default_cold_start_initial_concurrency(),
@@ -1926,7 +1926,8 @@ mod tests {
         assert_eq!(config.max_fragment_size, 64 * 1024 * 1024);
         assert_eq!(config.sampling_interval_secs, 5);
         assert!((config.ewma_alpha - 0.3).abs() < f64::EPSILON);
-        assert_eq!(config.default_target_fragments, 16);
+        // Task2: 目标分片数默认从 16 提升到 64，解除与 max_concurrent_fragments 的 1:1 天花板
+        assert_eq!(config.default_target_fragments, 64);
     }
 
     #[test]
@@ -1938,7 +1939,8 @@ mod tests {
             "ewmaAlpha":0.3
         }"#;
         let config: SchedulerConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.default_target_fragments, 16);
+        // Task2: 缺失字段走 default_target_fragments()，新默认 64
+        assert_eq!(config.default_target_fragments, 64);
     }
 
     #[test]
@@ -3317,7 +3319,8 @@ mod tests {
         let cfg = SchedulerConfig::default();
         assert_eq!(cfg.min_fragment_size, 1024 * 1024);
         assert_eq!(cfg.max_fragment_size, 64 * 1024 * 1024);
-        assert_eq!(cfg.default_target_fragments, 16);
+        // Task2: SchedulerConfig::default 目标分片数语义变更 16 → 64
+        assert_eq!(cfg.default_target_fragments, 64);
         assert_eq!(cfg.high_bandwidth_threshold, 100 * 1024 * 1024);
         assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
         assert!((cfg.ewma_alpha - 0.3).abs() < 1e-9);
@@ -3336,7 +3339,8 @@ mod tests {
         assert_eq!(cfg.max_fragment_size, 8_000_000);
         assert_eq!(cfg.ewma_alpha, 0.5);
         // 有 default 的字段应触发 default_* 函数
-        assert_eq!(cfg.default_target_fragments, 16);
+        // Task2: serde 缺省字段触发 default_target_fragments()，期望 64
+        assert_eq!(cfg.default_target_fragments, 64);
         assert_eq!(cfg.high_bandwidth_threshold, 100 * 1024 * 1024);
         assert_eq!(cfg.medium_bandwidth_threshold, 10 * 1024 * 1024);
         assert!((cfg.ewma_beta - 0.09).abs() < 1e-9);

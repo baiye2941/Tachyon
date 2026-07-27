@@ -35,6 +35,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rcgen::CertifiedKey;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -56,6 +58,101 @@ pub enum BenchProtocol {
     Http1Only,
 }
 
+/// bench server 的 TLS 模式
+///
+/// 独立于 `BenchProtocol`(H1/H2 选择),使 TLS 与协议矩阵正交:
+/// `Plaintext + H2`、`Tls + H1`、`Tls + H2` 等组合均可表达。
+/// `Tls` 用 `rcgen` 生成自签证书(localhost),客户端侧需
+/// `danger_accept_invalid_certs(true)`(见 `http::with_danger_accept_invalid_certs`)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsMode {
+    #[default]
+    Plaintext,
+    Tls,
+}
+
+/// 源内「慢区间」配置
+///
+/// 模拟同一个源上某段字节区间劣化(CDN 边缘节点回源、分片落在冷存储等),使
+/// straggler(某个分片恰好落在劣化区间)场景可被基准复现。
+struct SlowZone {
+    /// 慢区间起始偏移(含)
+    start: u64,
+    /// 慢区间结束偏移(不含)
+    end: u64,
+    /// 慢区间带宽上限(bytes/sec);0 表示该区间不限速
+    ///
+    /// 与全局带宽同为 `Arc<AtomicU64>`,可直接交给 `throttled_stream`,
+    /// 无需为每个落入慢区间的请求另行分配。
+    bytes_per_sec: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SlowZone {
+    /// 判断请求 Range 的起始偏移是否落在慢区间内
+    ///
+    /// 判据只看 `start`:真实服务端的限速是按连接的,一个连接要么全程快、
+    /// 要么全程慢,不会逐字节切换。
+    fn covers(&self, start: u64) -> bool {
+        start >= self.start && start < self.end
+    }
+}
+
+/// 包装 Plaintext(TcpStream) 或 Tls(TlsStream<TcpStream>) 两种连接类型,使
+/// `serve_connection` 的 io 参数有统一类型。Rust 不允许多个非 auto trait 在
+/// `dyn` 上组合(`Box<dyn AsyncRead + AsyncWrite + Send>` 无效),故用 enum。
+/// TlsStream 体积显著大于 TcpStream,用 Box 消除 enum 变体大小差异。
+#[allow(clippy::large_enum_variant)]
+enum BenchIo {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for BenchIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BenchIo::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            BenchIo::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for BenchIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            BenchIo::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            BenchIo::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BenchIo::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            BenchIo::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BenchIo::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            BenchIo::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// 节流流式 HTTP server 配置
 struct ServerConfig {
     /// 模拟文件总大小(字节)
@@ -63,6 +160,8 @@ struct ServerConfig {
     /// 带宽上限(bytes/sec);0 表示不限速(loopback 全速)
     /// 用 Arc<AtomicU64> 支持运行时动态调整(动态并发度 bench 用)
     bytes_per_sec: Arc<std::sync::atomic::AtomicU64>,
+    /// 源内慢区间;None 表示全局均匀限速(既有行为)
+    slow_zone: Option<SlowZone>,
     /// 模拟 RTT(首字节前延迟);0 表示无延迟
     rtt: Duration,
     /// chunk 大小(节流粒度)
@@ -75,6 +174,13 @@ struct ServerConfig {
     /// 用于 H2 多路复用 bench:H1 每个并发分片建独立连接各付一次握手,
     /// H2 所有分片复用单连接只付一次握手。
     handshake_rtt: Duration,
+    /// TLS 模式(默认 Plaintext)。`Tls` 时在 `serve_connection` 前包一层
+    /// `TlsAcceptor::accept`,用 `rcgen` 生成的自签证书。
+    tls: TlsMode,
+    /// chunk 丢包率 [0.0, 1.0],0=不丢。`throttled_stream` 按概率丢弃 chunk
+    /// 使 stream 提前结束,reqwest 收到不完整 body 报 connection error,
+    /// 触发 downloader 分片重试/续传路径(模拟真实 TCP 中断 + 重连)。
+    loss_rate: f64,
 }
 
 /// 节流流式 HTTP server
@@ -156,6 +262,100 @@ impl ThrottledServer {
         chunk_size: usize,
         protocol: BenchProtocol,
     ) -> Self {
+        Self::start_inner(
+            file_size,
+            bytes_per_sec,
+            rtt_ms,
+            handshake_rtt_ms,
+            chunk_size,
+            protocol,
+            None,
+            TlsMode::Plaintext,
+            0.0,
+        )
+        .await
+    }
+
+    /// 创建并启动 server(带源内慢区间,OS 分配端口)
+    ///
+    /// - `slow_zone`: `(zone_start, zone_end_exclusive, slow_bps)`;`None` 等价于 `start()`
+    ///
+    /// 请求 Range 的**起始偏移**落在 `[zone_start, zone_end)` 内时,整个响应用
+    /// `slow_bps` 限速,否则用全局 `bytes_per_sec`。判据只看 start:真实服务端
+    /// 限速按连接生效,一个连接要么全程快、要么全程慢——这也正确模拟了「某个
+    /// 分片恰好落在劣化区间」的 straggler 场景。
+    ///
+    /// chunk 大小固定为 `DEFAULT_CHUNK_SIZE`,与 `start()` 一致。
+    pub async fn start_with_slow_zone(
+        file_size: u64,
+        bytes_per_sec: u64,
+        rtt_ms: u64,
+        slow_zone: Option<(u64, u64, u64)>,
+    ) -> Self {
+        Self::start_inner(
+            file_size,
+            bytes_per_sec,
+            rtt_ms,
+            0,
+            DEFAULT_CHUNK_SIZE,
+            BenchProtocol::Auto,
+            slow_zone,
+            TlsMode::Plaintext,
+            0.0,
+        )
+        .await
+    }
+
+    /// 全参数构造入口:支持 slow_zone + handshake_rtt + protocol + TLS + loss_rate
+    ///
+    /// 这是 P0-2 真实基线的主入口,主源与镜像源均用此构造以表达异构配置。
+    /// TLS 自签证书由 `rcgen::generate_simple_self_signed_cert(["localhost"])` 生成。
+    ///
+    /// 9 个参数均不可折叠:`(file_size, bps, rtt)` 描述源基本属性,
+    /// `(handshake_rtt, chunk_size, protocol)` 描述连接层,`(slow_zone, tls, loss_rate)`
+    /// 描述故障注入。bench 场景需正交矩阵,故参数全部展开(非生产 API,不引 builder)。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_tls_and_loss(
+        file_size: u64,
+        bytes_per_sec: u64,
+        rtt_ms: u64,
+        handshake_rtt_ms: u64,
+        chunk_size: usize,
+        protocol: BenchProtocol,
+        slow_zone: Option<(u64, u64, u64)>,
+        tls: TlsMode,
+        loss_rate: f64,
+    ) -> Self {
+        Self::start_inner(
+            file_size,
+            bytes_per_sec,
+            rtt_ms,
+            handshake_rtt_ms,
+            chunk_size,
+            protocol,
+            slow_zone,
+            tls,
+            loss_rate,
+        )
+        .await
+    }
+
+    /// 全参数构造入口(私有):其余 `start_*` 均委托至此
+    ///
+    /// 参数语义见 `start_with_tls_and_loss`,此处仅是私有实现底座,参数列表与之
+    /// 一致以避免在委托链中再展开/折叠参数(徒增间接层)。
+    #[allow(clippy::too_many_arguments)]
+    async fn start_inner(
+        file_size: u64,
+        bytes_per_sec: u64,
+        rtt_ms: u64,
+        handshake_rtt_ms: u64,
+        chunk_size: usize,
+        protocol: BenchProtocol,
+        slow_zone: Option<(u64, u64, u64)>,
+        tls: TlsMode,
+        loss_rate: f64,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("端口绑定失败");
@@ -163,15 +363,47 @@ impl ThrottledServer {
         let config = Arc::new(ServerConfig {
             file_size,
             bytes_per_sec: Arc::new(std::sync::atomic::AtomicU64::new(bytes_per_sec)),
+            slow_zone: slow_zone.map(|(start, end, slow_bps)| SlowZone {
+                start,
+                end,
+                bytes_per_sec: Arc::new(std::sync::atomic::AtomicU64::new(slow_bps)),
+            }),
             rtt: Duration::from_millis(rtt_ms),
             chunk_size,
             handshake_rtt: Duration::from_millis(handshake_rtt_ms),
+            tls,
+            loss_rate,
         });
+        // TLS 自签证书(Tls 模式):用 rcgen 生成 localhost 自签证书 + 私钥,
+        // 构造 rustls ServerConfig。证书链仅 bench 用,客户端侧需
+        // danger_accept_invalid_certs(true) 跳过校验。
+        // rustls 0.23 需显式安装 CryptoProvider(进程级,幂等)。
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_acceptor = if tls == TlsMode::Tls {
+            let CertifiedKey { cert, key_pair } =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .expect("rcgen 生成自签证书失败");
+            let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+            let key_der = rustls::pki_types::PrivateKeyDer::from(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+            );
+            let server_cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .expect("rustls ServerConfig 构造失败");
+            Some(Arc::new(tokio_rustls::TlsAcceptor::from(
+                std::sync::Arc::new(server_cfg),
+            )))
+        } else {
+            None
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let accept_count = Arc::new(AtomicUsize::new(0));
         let bandwidth = Arc::clone(&config.bytes_per_sec);
 
-        let uri = format!("http://127.0.0.1:{actual_port}");
+        // URI scheme 据 TLS 模式切换(客户端构造 https:// URL 走 rustls)
+        let scheme = if tls == TlsMode::Tls { "https" } else { "http" };
+        let uri = format!("{scheme}://127.0.0.1:{actual_port}");
         let accept_count_clone = Arc::clone(&accept_count);
 
         let join = tokio::spawn(async move {
@@ -179,15 +411,16 @@ impl ThrottledServer {
             loop {
                 tokio::select! {
                     accept_result = listener.accept() => {
-                        let (io, _peer) = match accept_result {
+                        let (raw_io, _peer) = match accept_result {
                             Ok(conn) => conn,
                             Err(_) => continue,
                         };
                         // 计数 accept(供 H2 bench 断言连接数)
                         accept_count_clone.fetch_add(1, Ordering::Relaxed);
                         let cfg = Arc::clone(&config);
-                        // protocol 是 Copy,可直接 move 进 task(避免借用 listener 作用域)
+                        // protocol/tls/acceptor 是 Copy 或 Arc,可直接 move 进 task
                         let proto = protocol;
+                        let acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
                             // 连接级握手延迟:在服务任何请求前注入,模拟高 RTT 网络的
                             // TCP+TLS 握手墙钟成本。loopback 上 TCP 握手由内核完成,
@@ -195,6 +428,20 @@ impl ThrottledServer {
                             if !cfg.handshake_rtt.is_zero() {
                                 sleep(cfg.handshake_rtt).await;
                             }
+                            // TLS 模式:在应用层 serve_connection 前包一层 TlsAcceptor。
+                            // 失败视为连接断开(等同真 TLS 握手失败),abort 此 task。
+                            // 用 BenchIo enum 统一 Plain / Tls 两类连接类型。
+                            let io: BenchIo = if let Some(acceptor) = acceptor {
+                                match acceptor.accept(raw_io).await {
+                                    Ok(tls_io) => BenchIo::Tls(Box::new(tls_io)),
+                                    Err(e) => {
+                                        eprintln!("bench server TLS accept 失败: {e}");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                BenchIo::Plain(raw_io)
+                            };
                             let io = TokioIo::new(io);
                             let svc = service_fn(move |req| {
                                 let cfg = Arc::clone(&cfg);
@@ -320,16 +567,22 @@ where
 /// `bytes_per_sec`: Arc<AtomicU64> 支持运行时动态调整;0 表示不限速(无 sleep)
 /// `rtt`: 首字节前延迟(模拟 TTFB)
 /// `chunk_size`: 节流粒度
+/// `loss_rate`: chunk 丢包率 [0.0, 1.0],0=不丢。按概率在某个 chunk 前 stream 提前
+///   `None` 结束,使 HTTP body 截断 → reqwest 报 "error decoding response body"
+///   → 触发 downloader 分片重试/续传路径(模拟真实 TCP 中断 + 重连)。
+///   首个 chunk 不丢(避免零字节响应被误判为协议错误而非传输中断)。
 ///
 /// 节流时序:第一个 chunk 前 sleep(rtt)(模拟 TTFB),后续每个 chunk 前
 /// sleep(chunk_delay)(模拟传输时间)。这是"突发-等待"模式而非平滑流,
 /// TTFB = RTT,但 chunk 间有微小空闲(hyper 写缓冲在 sleep 期间空转)。
 /// 每 chunk 读取当前 bytes_per_sec(支持运行时动态调整带宽)。
+#[allow(clippy::too_many_arguments)]
 fn throttled_stream(
     data: Bytes,
     bytes_per_sec: Arc<std::sync::atomic::AtomicU64>,
     rtt: Duration,
     chunk_size: usize,
+    loss_rate: f64,
 ) -> BoxBody<Bytes, std::io::Error> {
     // 首字节 RTT 延迟(在第一个 chunk 前注入)
     let first_chunk_delay = rtt;
@@ -342,6 +595,16 @@ fn throttled_stream(
         .chunks(chunk_size)
         .map(|slice| data.slice_ref(slice))
         .collect();
+
+    // 丢包用确定性 RNG(种子固定),保证 bench 可复现。loss_rate=0 时 RNG 不构造,
+    // 走纯节流路径(既有行为,零额外开销)。
+    const BENCH_LOSS_SEED: u64 = 0xBEEF_C0FFEE_u64;
+    let rng = if loss_rate > 0.0 {
+        Some(StdRng::seed_from_u64(BENCH_LOSS_SEED))
+    } else {
+        None
+    };
+    let rng = Arc::new(tokio::sync::Mutex::new(rng));
 
     let stream = stream::iter(chunks.into_iter().enumerate().map(move |(i, chunk)| {
         let delay = if i == 0 {
@@ -356,13 +619,33 @@ fn throttled_stream(
                 .map_or(Duration::ZERO, Duration::from_micros)
         };
         let frame: Result<Frame<Bytes>, std::io::Error> = Ok(Frame::data(chunk));
-        (delay, frame)
+        (i, delay, frame)
     }))
-    .then(|(delay, frame)| async move {
-        if !delay.is_zero() {
-            sleep(delay).await;
+    .then(move |(i, delay, frame)| {
+        let rng = Arc::clone(&rng);
+        async move {
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+            // 丢包判定:首个 chunk(i==0)不丢(避免零字节响应歧义);
+            // 后续 chunk 按 loss_rate 概率丢,丢则 stream 提前 None。
+            if loss_rate > 0.0 && i > 0 {
+                let drop = {
+                    let mut g = rng.lock().await;
+                    g.as_mut()
+                        .map(|r| r.random::<f64>() < loss_rate)
+                        .unwrap_or(false)
+                };
+                if drop {
+                    // 返回 Err 终止 body:hyper 会关闭流,reqwest 收到不完整 body
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "bench server 模拟丢包:chunk drop",
+                    ));
+                }
+            }
+            frame
         }
-        frame
     });
 
     Box::pin(StreamBody::new(stream))
@@ -435,12 +718,18 @@ async fn handle(
     let body_len = end - start + 1;
     let data = make_file_data(start, end);
 
-    let body = throttled_stream(
-        data,
-        Arc::clone(&config.bytes_per_sec),
-        config.rtt,
-        config.chunk_size,
-    );
+    // 选速率:起始偏移落在慢区间内则整个响应降速,否则用全局带宽。
+    // 只在此处分流,`throttled_stream` 的节流算法保持不变。
+    let rate = config
+        .slow_zone
+        .as_ref()
+        .filter(|zone| zone.covers(start))
+        .map_or_else(
+            || Arc::clone(&config.bytes_per_sec),
+            |zone| Arc::clone(&zone.bytes_per_sec),
+        );
+
+    let body = throttled_stream(data, rate, config.rtt, config.chunk_size, config.loss_rate);
 
     let mut builder = Response::builder()
         .status(status)

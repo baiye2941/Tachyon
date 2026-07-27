@@ -451,6 +451,83 @@ impl HttpClient {
         }
     }
 
+    /// bench/test 专用:启用 `danger_accept_invalid_certs(true)` 跳过 TLS 证书校验。
+    ///
+    /// 用于 `throughput_baseline` 的 HTTPS 自签证书 bench server(rcgen 生成)。
+    /// 生产路径**禁止**调用——绕过证书校验等于放弃 MITM 防御。
+    /// 参数与 `with_connection_config_and_headers` 对齐(透传连接池 / UA / headers),
+    /// 仅额外打开危险选项。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn with_danger_accept_invalid_certs(
+        config: &tachyon_core::config::ConnectionConfig,
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<&str>,
+        user_agent: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> DownloadResult<Self> {
+        let ua = if user_agent.is_empty() {
+            tachyon_core::config::USER_AGENT
+        } else {
+            user_agent
+        };
+        // build_client 不暴露 danger_accept_invalid_certs 选项,此处独立构造。
+        let default_headers = build_default_headers(headers)?;
+        let mut builder = Client::builder()
+            .user_agent(ua)
+            .default_headers(default_headers)
+            .pool_max_idle_per_host(config.max_connections_per_host as usize)
+            .pool_idle_timeout(std::time::Duration::from_secs(
+                config.keep_alive_timeout_secs,
+            ))
+            .tcp_keepalive(std::time::Duration::from_secs(
+                config.keep_alive_timeout_secs,
+            ))
+            .tcp_nodelay(true)
+            .dns_resolver(PublicDnsResolver::new())
+            .redirect(safe_redirect_policy())
+            .danger_accept_invalid_certs(true); // ← bench 跳过证书校验
+        // 代理策略与 build_client 对齐(见其文档)
+        if is_direct_proxy_directive(proxy) {
+            builder = builder.no_proxy();
+        } else if let Some(proxy_url) = tachyon_core::config::resolve_http_proxy(proxy) {
+            let proxy_url = http_proxy_remote_dns(&proxy_url);
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
+                DownloadError::Config(format!(
+                    "无效的代理 URL '{}': {}",
+                    tachyon_core::config::redact_proxy_url(&proxy_url),
+                    e
+                ))
+            })?;
+            builder = builder.proxy(apply_loopback_no_proxy(proxy));
+        }
+        if connect_secs > 0 {
+            builder = builder.connect_timeout(std::time::Duration::from_secs(connect_secs));
+        }
+        if read_secs > 0 {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_secs));
+        }
+        if config.enable_http2 {
+            builder = builder
+                .http2_initial_stream_window_size(4 * 1024 * 1024)
+                .http2_initial_connection_window_size(16 * 1024 * 1024)
+                .http2_max_frame_size(1 << 20)
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+                .http2_keep_alive_while_idle(true);
+        } else {
+            builder = builder.http1_only();
+        }
+        let client = builder
+            .build()
+            .map_err(|e| DownloadError::Network(format!("创建 HTTP 客户端失败: {e}")))?;
+        Ok(Self {
+            client,
+            auth_bearer: None,
+            last_resolved_host: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
     /// FIX-19 测试辅助:用给定 HTTP/2 与 QUIC 开关构造客户端(连接/读取超时用默认值),
     /// 供测试验证 enable_http2=false 时 http1_only 路径可成功构造。
     #[cfg(test)]

@@ -164,6 +164,15 @@ const VERIFY_HASH_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// 约每 1.25 MiB 上报一次,平衡延迟与开销。
 const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
 
+/// Loose 模式分片完成边界 group-commit 批大小:每完成 N 个分片调用一次 `storage.sync()`。
+/// 相对 EveryFragment 降低 fsync 频率,同时保证非零 durable 点(16 片场景至少 2 次)。
+const LOOSE_GROUP_COMMIT_N: usize = 8;
+
+/// Loose 模式 mid-flight partial 进度上报的 group-commit 批大小:
+/// 每第 N 次「已写入字节」的 partial 上报前调用一次 `storage.sync()`。
+/// 取 2 保证 mid-flight 非零 durable 点,同时总 sync 仍少于 EveryFragment。
+const LOOSE_PARTIAL_GROUP_COMMIT_N: usize = 2;
+
 /// 分片写入批大小阈值(字节)。网络 chunk 先累积到 `write_buf`,达到此阈值后
 /// 批量刷写存储,减少 `write_at` 系统调用次数。256 KiB 在 HDD/SSD 与默认
 /// 分片大小下均为合理折中,过小则 I/O 放大,过大则内存占用与尾块延迟上升。
@@ -231,9 +240,16 @@ struct FragmentSpawnCtx<'a> {
     pause_timeout: Duration,
     skip_write: bool,
     object_identity: Option<ObjectIdentity>,
-    /// 崩溃一致性级别:控制分片完成时是否 fsync。`Loose` 跳过分片 sync(仅在 close 时落盘),
-    /// 牺牲断电耐久性换吞吐;`EveryFragment`(默认)每分片 fsync 一次。
+    /// 崩溃一致性级别:控制分片完成边界的 fsync 频率。
+    /// `Loose`(默认)每 `LOOSE_GROUP_COMMIT_N` 个完成分片 group-commit 一次;
+    /// `EveryFragment` 每个分片完成时 fsync 一次。
     sync_mode: tachyon_core::config::CrashConsistencyMode,
+    /// 任务级 Loose group-commit 计数器(跨分片 worker 共享)。
+    /// EveryFragment 路径不读此计数器;仍传入以统一 spawn 签名。
+    loose_completed_frags: Arc<std::sync::atomic::AtomicUsize>,
+    /// 任务级 Loose partial 进度 group-commit 计数器(跨分片 worker 共享)。
+    /// 仅 Loose + mid-flight partial 路径读取;EveryFragment 不读。
+    loose_partial_reports: Arc<std::sync::atomic::AtomicUsize>,
     /// 代理下片内 Range 窗口(字节)。`None`=整片一次 Range;
     /// `Some(w)`=每次最多请求 w 字节,TLS EOF 只丢当前窗口。
     range_window_bytes: Option<u64>,
@@ -309,6 +325,12 @@ pub struct DownloadTask {
     goodput_window_bytes: u64,
     /// 上次成功 rebalance 时刻;最小间隔内禁止再拆,避免 soft-pressure 恢复后连环拆片
     last_rebalance_at: Option<Instant>,
+    /// rebalance 开关(false = 禁用 `try_rebalance_slowest_fragment`,A/B 量化收益用)。
+    ///
+    /// 默认 true(生产路径保持当前行为);bench 通过 `set_rebalance_enabled(false)`
+    /// 注入,跑 on/off A/B 对照,判定收益是否 >10%(AGENTS.md 性能规则)。
+    /// 若 <10% 收益,后续单独 revert PR 删除 rebalance 全套(函数+字段+测试)。
+    rebalance_enabled: bool,
     /// 本任务 soft-pressure 冷却截止(epoch 秒)。per-task,避免多任务互串清零/延长。
     soft_pressure_until: Arc<std::sync::atomic::AtomicU64>,
     /// 用户重命名(可选):若为 `Some`,在 `probe()` 拿到元数据后会以此名覆盖
@@ -526,6 +548,7 @@ impl DownloadTask {
                         goodput_window_start: None,
                         goodput_window_bytes: 0,
                         last_rebalance_at: None,
+                        rebalance_enabled: true,
                         soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         preferred_file_name: None,
                         bt_storage_factory: Some(factory),
@@ -571,6 +594,60 @@ impl DownloadTask {
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
+            rebalance_enabled: true,
+            soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preferred_file_name: None,
+            #[cfg(feature = "magnet")]
+            bt_storage_factory: None,
+            #[cfg(feature = "magnet")]
+            bt_magnet: None,
+            #[cfg(feature = "magnet")]
+            bt_fallback: None,
+        })
+    }
+
+    /// bench 专用:用调用方预构造的 `protocol: Arc<dyn Protocol>` 创建任务。
+    ///
+    /// 与 `with_pool_and_scheduler` 的区别:不内部 `shared_http_client`,允许 bench
+    /// 注入自定义客户端(如 `HttpClient::with_danger_accept_invalid_certs` 跑 HTTPS
+    /// 自签证书 bench server)。仅 test-harness 编译可用,生产路径不可达。
+    #[cfg(any(test, feature = "test-harness"))]
+    pub async fn with_protocol(
+        url: String,
+        config: DownloadConfig,
+        pool: Option<Arc<ConnectionPool>>,
+        scheduler: Arc<dyn DownloadScheduler>,
+        protocol: Arc<dyn Protocol>,
+    ) -> DownloadResult<Self> {
+        let _ = url::Url::parse(&url)?;
+        Ok(Self {
+            id: TaskId::new_v4(),
+            url,
+            config,
+            protocol,
+            storage: None,
+            scheduler_config: SchedulerConfig::default(),
+            scheduler,
+            pool,
+            buffer_pool: None,
+            control_rx: None,
+            state: DownloadState::Pending,
+            metadata: None,
+            fragments: Vec::new(),
+            progress_tx: None,
+            verifier: default_blake3_verifier(),
+            completed_fragments: Vec::new(),
+            partial_fragments: HashMap::new(),
+            resume_object_identity: None,
+            resume_supports_range: None,
+            rate_limiter: None,
+            metrics: None,
+            circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
+            has_mirrors: false,
+            goodput_window_start: None,
+            goodput_window_bytes: 0,
+            last_rebalance_at: None,
+            rebalance_enabled: true,
             soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
@@ -585,6 +662,15 @@ impl DownloadTask {
     /// 设置共享 buffer 池,用于控制分片 worker 写入缓冲区的内存占用与反压。
     pub fn set_buffer_pool(&mut self, pool: Arc<BufferPool>) {
         self.buffer_pool = Some(pool);
+    }
+
+    /// 设置 rebalance 开关(bench 量化 A/B 用;生产不调用,默认 true)。
+    ///
+    /// `false` 时禁用 `try_rebalance_slowest_fragment`,使两个调用点
+    /// (reschedule_timer 分支 + completed_rx 分支)直接跳过,保持其他行为不变。
+    /// 用于跑 rebalance on/off A/B 对照,量化动态拆片收益是否 >10%。
+    pub fn set_rebalance_enabled(&mut self, enabled: bool) {
+        self.rebalance_enabled = enabled;
     }
 
     /// 设置用户重命名(在 `probe()` 之后覆盖 `metadata.file_name`)。
@@ -682,6 +768,7 @@ impl DownloadTask {
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
+            rebalance_enabled: true,
             soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
@@ -786,6 +873,7 @@ impl DownloadTask {
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
+            rebalance_enabled: true,
             soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
@@ -831,6 +919,7 @@ impl DownloadTask {
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
+            rebalance_enabled: true,
             soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
@@ -879,6 +968,7 @@ impl DownloadTask {
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
+            rebalance_enabled: true,
             soft_pressure_until: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preferred_file_name: None,
             #[cfg(feature = "magnet")]
@@ -1289,10 +1379,10 @@ impl DownloadTask {
 
     // ----- BT/magnet 冷启动解耦 -----
 
-    /// BT/magnet 分片目标数量:HTTP 默认 `default_target_fragments`(16)的两倍。
-    /// 调度器带宽样本只在分片完成时产生;BT 慢 swarm 下 16 片级的大分片迟迟不完,
+    /// BT/magnet 分片目标数量:独立于 HTTP `default_target_fragments`(现为 64)。
+    /// 调度器带宽样本只在分片完成时产生;BT 慢 swarm 下过粗分片迟迟不完,
     /// 0 样本 → confidence 恒 0 → ramp 锁死冷启动并发,反馈环路断裂。
-    /// 翻倍目标数让完成事件更早到来。
+    /// 固定 32 目标数让完成事件更早到来(与 HTTP 目标数解耦,勿随 64 同步翻倍)。
     const BT_TARGET_FRAGMENTS: u64 = 32;
 
     /// BT 分片大小下限:对齐常见 torrent piece 大小(1-4MiB)上限,
@@ -1467,15 +1557,23 @@ impl DownloadTask {
         // **禁止**再用 recommendation.fragment_size——否则 resume 后分片边界
         // 漂移,completed index 会错跳过/重下错误区间。
         //
-        // 首下 HTTP:调度器 confidence>0 时用其建议,否则回退 scheduler_config。
+        // 首下 HTTP:不采用 recommendation.fragment_size。scheduler 为 per-task 实例,
+        // plan 阶段尚无本任务带宽样本,confidence 恒为 0;历史上的
+        // `confidence > 0` 分支在生产冷启动路径上不可达。若将来要在 plan 阶段
+        // 激活跨任务带宽建议,需先做 scheduler 跨任务共享,再恢复该分支。
+        // 当前一律回退 plan_fragments + scheduler_config.default_target_fragments。
         let has_resume_snapshot =
             !self.completed_fragments.is_empty() || !self.partial_fragments.is_empty();
+        // 保留 is_bt_task / has_resume_snapshot 分支结构:
+        // - BT: 固定小分片公式
+        // - resume: None → plan_fragments 确定性划分(禁止 recommendation 漂移边界)
+        // - 首下 HTTP: None → scheduler_config.default_target_fragments
+        //   (不采用 recommendation.fragment_size; 见上方注释)
+        #[allow(clippy::if_same_then_else)]
         let suggested_frag_size = if self.is_bt_task() {
             Some(Self::bt_fragment_size(file_size))
         } else if has_resume_snapshot {
             None
-        } else if recommendation.confidence > 0.0 {
-            Some(recommendation.fragment_size)
         } else {
             None
         };
@@ -1965,6 +2063,7 @@ impl DownloadTask {
     ///
     /// - 直连:`conservative=false` → 每次最多翻倍(至少 +1)
     /// - 代理:`conservative=true` → 每次最多 +1,避免 2→4 一步打满
+    ///
     /// 降并发不受限。
     pub(crate) fn clamp_concurrency_scale_up(old: u32, new: u32) -> u32 {
         Self::clamp_concurrency_scale_up_ex(old, new, false)
@@ -1982,13 +2081,12 @@ impl DownloadTask {
         new.min(step_cap).max(1)
     }
 
-    /// 软压力退避:在基础 jitter 之上至少 2s,并随 attempt 指数放大(上限 60s)。
-
     #[cfg(test)]
     pub(crate) fn fresh_soft_until() -> Arc<std::sync::atomic::AtomicU64> {
         Arc::new(std::sync::atomic::AtomicU64::new(0))
     }
 
+    /// 软压力退避:在基础 jitter 之上至少 2s,并随 attempt 指数放大(上限 60s)。
     pub(crate) fn soft_pressure_backoff_secs(attempt: u32, base: Duration) -> Duration {
         let min_secs = 2u64.saturating_mul(1u64 << attempt.min(4)).min(60);
         let base_secs = base.as_secs().max(1);
@@ -2355,6 +2453,8 @@ impl DownloadTask {
         let pause_timeout = ctx.pause_timeout;
         let skip_write = ctx.skip_write;
         let frag_sync_mode = ctx.sync_mode;
+        let frag_loose_partial = Arc::clone(&ctx.loose_partial_reports);
+        let frag_loose_completed = Arc::clone(&ctx.loose_completed_frags);
         let frag_object_identity = ctx.object_identity.clone();
         let frag_range_window = ctx.range_window_bytes;
         let frag_soft_until = Arc::clone(ctx.soft_pressure_until);
@@ -2463,6 +2563,8 @@ impl DownloadTask {
                     write_buf.as_mut(),
                     skip_write,
                     frag_sync_mode,
+                    &frag_loose_completed,
+                    &frag_loose_partial,
                     &shared,
                     frag_object_identity.clone(),
                     frag_metrics.as_deref(),
@@ -2862,6 +2964,11 @@ impl DownloadTask {
         let frag_circuit_breakers = circuit_breakers.clone();
         // B5:镜像路径禁用 engine 层熔断(以主 URL 为 key 会误熔断整个任务),
         // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
+        // Loose group-commit:任务级完成分片计数,各 fragment worker 共享
+        let loose_completed_frags = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Loose partial 进度 group-commit:任务级 partial 上报计数
+        let loose_partial_reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         let frag_has_mirrors = self.has_mirrors;
         let frag_verifier = self.verifier.clone();
         // P2-4: 协议直接管理存储时跳过引擎 write_all_at(消除双存储写放大)
@@ -3003,10 +3110,16 @@ impl DownloadTask {
                     }
                     // 安全 rebalance:try_send 入队,Full 时 revert(不堵主循环)
                     // 软压力冷却期禁止拆片:rebalance 会新增连接,抵消降并发
-                    if let Some(tx) = frag_tx.as_ref()
+                    // rebalance_enabled=false 时跳过(A/B 量化 on/off 收益用)
+                    if self.rebalance_enabled
+                        && let Some(tx) = frag_tx.as_ref()
                         && !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
                     {
-                        let _ = self.try_rebalance_slowest_fragment(tx).await;
+                        // queue_empty:中央队列无待领取分片时进入收尾冷却(500ms)
+                        let queue_empty = frag_rx.is_empty();
+                        let _ = self
+                            .try_rebalance_slowest_fragment(tx, &concurrency_ctrl, queue_empty)
+                            .await;
                     }
                 }
                 // dispatcher:从中央队列拉取分片,acquire permit 后 spawn task
@@ -3038,6 +3151,8 @@ impl DownloadTask {
                                 pause_timeout,
                                 skip_write,
                                 sync_mode: self.config.crash_consistency_mode,
+                                loose_completed_frags: Arc::clone(&loose_completed_frags),
+                                loose_partial_reports: Arc::clone(&loose_partial_reports),
                                 object_identity: self
                                     .metadata
                                     .as_ref()
@@ -3110,10 +3225,16 @@ impl DownloadTask {
                             }
                             // 快片完成后立刻 rebalance 慢片,不必等 reschedule_timer
                             // 软压力冷却期禁止拆片
-                            if let Some(tx) = frag_tx.as_ref()
+                            // rebalance_enabled=false 时跳过(A/B 量化 on/off 收益用)
+                            if self.rebalance_enabled
+                                && let Some(tx) = frag_tx.as_ref()
                                 && !Self::soft_pressure_blocks_scale_up(&self.soft_pressure_until)
                             {
-                                let _ = self.try_rebalance_slowest_fragment(tx).await;
+                                // queue_empty:中央队列无待领取分片时进入收尾冷却(500ms)
+                                let queue_empty = frag_rx.is_empty();
+                                let _ = self
+                                    .try_rebalance_slowest_fragment(tx, &concurrency_ctrl, queue_empty)
+                                    .await;
                             }
                         }
                         Err((failed_index, e)) => {
@@ -3232,7 +3353,7 @@ impl DownloadTask {
         Ok(())
     }
 
-    /// 安全慢片 rebalance:拆分下载中最慢分片的未完成尾部,try_send 入队。
+    /// 安全慢片 rebalance:拆分下载中剩余字节最大的可拆分片,try_send 入队。
     ///
     /// 相对已删除的 work-stealing:
     /// - **故意用 `try_send` 而非 `send().await`**:主循环在完成事件路径
@@ -3242,15 +3363,19 @@ impl DownloadTask {
     /// - 入队失败(Full/Closed)则 `revert_split` 回滚,并计 `rebalance_dropped`
     /// - 不依赖 steal_rx / 额外 completed_tx 生命周期
     ///
-    /// 策略(对齐 IDM/FluxDown 慢段救援,仍保持安全边界):
-    /// - 最慢片剩余 >= 2*MIN_SPLIT_SIZE 即可拆(含最后一片 straggler)
-    /// - 年龄门槛 2s + 成功拆分最小间隔 5s,避免 WAN soft-pressure 恢复后连环拆
-    /// - 拆点取尾部 `max(MIN_SPLIT_SIZE, remaining/3)` 而非中点
+    /// 策略(对齐空闲 worker 救援,仍保持安全边界):
+    /// - 触发:仅当 `concurrency_ctrl.active() < target()` 有空闲 worker 时拆
+    /// - 选择:剩余字节最大(非最低进度比);含最后一片 straggler
+    /// - 年龄门槛 2s + remaining >= 2*MIN_SPLIT_SIZE
+    /// - 拆点对半 `done_abs + remaining/2`,仍尊重 write_safety / min_split_point
+    /// - 冷却:收尾(queue_empty)500ms;非收尾 5s;代理路径 20s
     /// - 在途写安全边距 `min(WRITE_BATCH, remaining/4)`
-    /// - 滞后门控:≥2 在途且 max_progress-slow_progress ≥ 15%
+    /// - `info.hash.is_some()` 时 try_split 拒绝拆分
     async fn try_rebalance_slowest_fragment(
         &mut self,
         frag_tx: &mpsc::Sender<FragmentSpec>,
+        concurrency_ctrl: &ConcurrencyController,
+        queue_empty: bool,
     ) -> DownloadResult<bool> {
         use crate::fragment::{FragmentState, MIN_SPLIT_SIZE};
         use std::sync::atomic::Ordering;
@@ -3258,16 +3383,23 @@ impl DownloadTask {
         /// 新 spawn 片最短观察时间,避免刚启动即被拆。
         /// 2s 兼顾拖尾救援与 WAN 抖动:过短会在 TLS/限流抖动下连环拆片。
         const REBALANCE_MIN_AGE: Duration = Duration::from_secs(2);
-        /// 两次成功 rebalance 最小间隔:soft-pressure 恢复后 lag 瞬时可很大,
-        /// 若每完成事件都拆会把 1 片拆成十几片(kernel.org 曾 21 次)。
+        /// 非收尾两次成功 rebalance 最小间隔:soft-pressure 恢复后若每完成事件都拆
+        /// 会把 1 片拆成十几片(kernel.org 曾 21 次)。
         const REBALANCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
         /// 代理路径更长间隔:Range 窗口已增请求密度,恢复瞬间拆尾=再增 TLS。
         const REBALANCE_MIN_INTERVAL_PROXY: Duration = Duration::from_secs(20);
-        /// 相对最快在途片的进度落后阈值:均匀场景不拆,只在真实拖尾时救援。
-        /// (文档曾写 15%,实现为 20%——以本常量为准)
-        const REBALANCE_LAG_THRESHOLD: f64 = 0.20;
+        /// 收尾(队列空、仅剩 straggler)缩短冷却,加快最后一片救援。
+        const REBALANCE_MIN_INTERVAL_ENDGAME: Duration = Duration::from_millis(500);
 
-        let min_interval = if self.http_proxy_active() {
+        // 无空闲 worker 时拆片只会积压队列,徒增连接/调度成本。
+        if concurrency_ctrl.active() >= concurrency_ctrl.target() {
+            return Ok(false);
+        }
+
+        // 收尾优先:最后一片 straggler 需要短冷却,代理 20s 仅约束非收尾路径
+        let min_interval = if queue_empty {
+            REBALANCE_MIN_INTERVAL_ENDGAME
+        } else if self.http_proxy_active() {
             REBALANCE_MIN_INTERVAL_PROXY
         } else {
             REBALANCE_MIN_INTERVAL
@@ -3278,27 +3410,18 @@ impl DownloadTask {
             return Ok(false);
         }
 
-        let mut best: Option<(usize, f64, u64)> = None; // (idx, progress, realtime)
-        let mut max_progress: f64 = 0.0;
-        let mut downloading = 0u32;
+        // 选 remaining 最大的可拆在途片:(idx, remaining, realtime)
+        let mut best: Option<(usize, u64, u64)> = None;
         for (i, frag) in self.fragments.iter().enumerate() {
             if frag.state != FragmentState::Downloading {
                 continue;
             }
-            downloading = downloading.saturating_add(1);
-            let size = frag.info.size.max(1);
             let rt = frag.realtime_downloaded.load(Ordering::Acquire);
-            let progress = rt as f64 / size as f64;
-            if progress > max_progress {
-                max_progress = progress;
-            }
-
             let eff_end = frag.effective_end.load(Ordering::Acquire);
             // 防溢出:用 saturating_add 与实际拆分逻辑保持一致。
             let remaining = eff_end
                 .saturating_add(1)
                 .saturating_sub(frag.info.start.saturating_add(rt));
-            // 剩余太小不可拆:仍计入 downloading/max_progress 供滞后门控
             if remaining < MIN_SPLIT_SIZE.saturating_mul(2) {
                 continue;
             }
@@ -3310,19 +3433,14 @@ impl DownloadTask {
                 continue;
             }
             match best {
-                None => best = Some((i, progress, rt)),
-                Some((_, bp, _)) if progress < bp => best = Some((i, progress, rt)),
+                None => best = Some((i, remaining, rt)),
+                Some((_, br, _)) if remaining > br => best = Some((i, remaining, rt)),
                 _ => {}
             }
         }
-        let Some((idx, slow_prog, realtime)) = best else {
+        let Some((idx, _best_remaining, realtime)) = best else {
             return Ok(false);
         };
-        // 单在途片:无 peer 可救援。
-        // 多在途但最慢可拆片相对全局最快进度落后不足阈值:视为均匀,跳过。
-        if downloading < 2 || max_progress - slow_prog < REBALANCE_LAG_THRESHOLD {
-            return Ok(false);
-        }
 
         let frag = &self.fragments[idx];
         let start = frag.info.start;
@@ -3337,20 +3455,25 @@ impl DownloadTask {
         let min_split_point = done_abs
             .saturating_add(write_safety)
             .max(done_abs.saturating_add(1));
-        // 尾部救援:切下 max(MIN_SPLIT, remaining/3),保留原 worker 热路径主体。
-        let mut steal_len = remaining
-            .saturating_div(3)
-            .max(MIN_SPLIT_SIZE)
-            .min(remaining.saturating_sub(MIN_SPLIT_SIZE));
-        let mut split_point = eff_end.saturating_add(1).saturating_sub(steal_len);
+        // 对半拆分:理想点 done_abs + remaining/2,不得落在 write_safety 内。
+        let ideal_half = done_abs.saturating_add(remaining.saturating_div(2));
+        let mut split_point = ideal_half.max(min_split_point);
+        // 两侧均须 >= MIN_SPLIT_SIZE
+        let left_len = split_point.saturating_sub(done_abs);
+        let right_len = eff_end.saturating_add(1).saturating_sub(split_point);
+        if left_len < MIN_SPLIT_SIZE {
+            split_point = done_abs.saturating_add(MIN_SPLIT_SIZE);
+        } else if right_len < MIN_SPLIT_SIZE {
+            split_point = eff_end.saturating_add(1).saturating_sub(MIN_SPLIT_SIZE);
+        }
         if split_point < min_split_point {
-            // 尾部过大导致拆点落在安全线内:缩小 steal 使拆点贴安全线
-            let max_steal = eff_end.saturating_add(1).saturating_sub(min_split_point);
-            if max_steal < MIN_SPLIT_SIZE {
-                return Ok(false);
-            }
-            steal_len = max_steal;
-            split_point = eff_end.saturating_add(1).saturating_sub(steal_len);
+            // 对半/MIN 调整后仍落在安全线内:贴安全线
+            split_point = min_split_point;
+        }
+        // 贴安全线后再次保证右片 >= MIN_SPLIT
+        let right_after = eff_end.saturating_add(1).saturating_sub(split_point);
+        if right_after < MIN_SPLIT_SIZE {
+            return Ok(false);
         }
         if split_point <= done_abs || split_point > eff_end {
             return Ok(false);
@@ -3382,7 +3505,7 @@ impl DownloadTask {
             Ok(()) => {
                 debug!(
                     slow_index = idx,
-                    new_index, split_point, steal_len, "rebalance:拆分慢片尾部并重入队"
+                    new_index, split_point, remaining, "rebalance:对半拆分剩余最大片并重入队"
                 );
                 if let Some(m) = &self.metrics {
                     m.inc_rebalance();
@@ -3829,6 +3952,71 @@ impl DownloadTask {
         }
     }
 
+    /// mid-flight partial 进度的 durable 上报:先按 crash-consistency 策略 sync,再 `report_progress`。
+    ///
+    /// - `skip_write` 或 `total_written == 0`:不 sync,直接上报
+    /// - `EveryFragment`:每次有写入字节的 partial 前都 `storage.sync()`
+    /// - `Loose`:任务级计数器每 `LOOSE_PARTIAL_GROUP_COMMIT_N` 次 partial 同步一次
+    ///
+    /// 仅在 partial 上报点调用;不在每 batch flush 后 sync,避免 Flush Storm。
+    async fn report_progress_durable(
+        storage: &Arc<StorageSet>,
+        skip_write: bool,
+        sync_mode: tachyon_core::config::CrashConsistencyMode,
+        loose_partial_reports: &Arc<std::sync::atomic::AtomicUsize>,
+        frag_index: u32,
+        total_written: u64,
+        progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
+    ) -> DownloadResult<()> {
+        if !skip_write && total_written > 0 {
+            match sync_mode {
+                tachyon_core::config::CrashConsistencyMode::EveryFragment => {
+                    storage.sync().await?;
+                }
+                tachyon_core::config::CrashConsistencyMode::Loose => {
+                    // fetch_add 返回旧值;上报序号 = 旧值+1。每 N 次触发 group-commit。
+                    let prev =
+                        loose_partial_reports.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let report_n = prev + 1;
+                    if report_n.is_multiple_of(LOOSE_PARTIAL_GROUP_COMMIT_N) {
+                        storage.sync().await?;
+                    }
+                }
+            }
+        }
+        Self::report_progress(frag_index, total_written, progress_tx);
+        Ok(())
+    }
+
+    /// 分片完成边界的 crash-consistency sync。
+    ///
+    /// - `EveryFragment`:每次完成都 `storage.sync()`
+    /// - `Loose`:跨分片共享计数器每 `LOOSE_GROUP_COMMIT_N` 次完成同步一次
+    /// - `skip_write`:协议托管存储,引擎不写盘,跳过
+    async fn sync_on_fragment_complete(
+        storage: &Arc<StorageSet>,
+        skip_write: bool,
+        sync_mode: tachyon_core::config::CrashConsistencyMode,
+        loose_completed_frags: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> DownloadResult<()> {
+        if skip_write {
+            return Ok(());
+        }
+        match sync_mode {
+            tachyon_core::config::CrashConsistencyMode::EveryFragment => storage.sync().await,
+            tachyon_core::config::CrashConsistencyMode::Loose => {
+                // fetch_add 返回旧值;完成序号 = 旧值+1。每 N 次触发一次 group-commit。
+                let prev = loose_completed_frags.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let completed = prev + 1;
+                if completed.is_multiple_of(LOOSE_GROUP_COMMIT_N) {
+                    storage.sync().await
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// 下载单个分片(一次尝试)
     ///
     /// 由 `execute_fragmented_download` 的 spawn 重试循环调用。
@@ -3854,6 +4042,8 @@ impl DownloadTask {
         write_buf: &mut AlignedBuf,
         skip_write: bool,
         sync_mode: tachyon_core::config::CrashConsistencyMode,
+        loose_completed_frags: &Arc<std::sync::atomic::AtomicUsize>,
+        loose_partial_reports: &Arc<std::sync::atomic::AtomicUsize>,
         shared: &FragmentShared,
         object_identity: Option<ObjectIdentity>,
         metrics: Option<&Metrics>,
@@ -3912,10 +4102,8 @@ impl DownloadTask {
         let remaining0 = full_len.saturating_sub(resume_offset);
         if remaining0 == 0 {
             // 已续满:仍做完成边界 sync(与正常完成路径一致),再返回
-            if !skip_write && sync_mode == tachyon_core::config::CrashConsistencyMode::EveryFragment
-            {
-                storage.sync().await?;
-            }
+            Self::sync_on_fragment_complete(storage, skip_write, sync_mode, loose_completed_frags)
+                .await?;
             return Ok((full_len, Duration::ZERO, None));
         }
         let mut pos = actual_start;
@@ -4168,7 +4356,16 @@ impl DownloadTask {
                     }
                     progress_report_countdown = progress_report_countdown.saturating_sub(1);
                     if progress_report_countdown == 0 {
-                        Self::report_progress(frag_index, total_written, progress_tx);
+                        Self::report_progress_durable(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_reports,
+                            frag_index,
+                            total_written,
+                            progress_tx,
+                        )
+                        .await?;
                         progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
                     }
                     continue;
@@ -4274,7 +4471,16 @@ impl DownloadTask {
                 // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
                 // countdown 也能正常重置,避免 u64 下溢 panic
                 if progress_report_countdown == 0 {
-                    Self::report_progress(frag_index, total_written, progress_tx);
+                    Self::report_progress_durable(
+                        storage,
+                        skip_write,
+                        sync_mode,
+                        loose_partial_reports,
+                        frag_index,
+                        total_written,
+                        progress_tx,
+                    )
+                    .await?;
                     progress_report_countdown = PROGRESS_REPORT_CHUNK_INTERVAL;
                 }
             } // end inner stream chunk loop
@@ -4322,7 +4528,16 @@ impl DownloadTask {
         // 与原始 is_multiple_of 行为对齐:当 chunk 总数为 PROGRESS_REPORT_CHUNK_INTERVAL
         // 整数倍时,尾刷再发送一次进度事件(可能重复)。
         if progress_report_countdown == PROGRESS_REPORT_CHUNK_INTERVAL {
-            Self::report_progress(frag_index, total_written, progress_tx);
+            Self::report_progress_durable(
+                storage,
+                skip_write,
+                sync_mode,
+                loose_partial_reports,
+                frag_index,
+                total_written,
+                progress_tx,
+            )
+            .await?;
         }
 
         let mut actual_written = total_written.saturating_sub(resume_offset);
@@ -4372,12 +4587,11 @@ impl DownloadTask {
 
         // 审计 P0-3:在发送 completed 触发上层 snapshot 之前,先把本分片已写字节 durable sync。
         // skip_write(BT protocol_managed) 时引擎未写 storage,由协议层 storage/piece 语义负责落盘。
-        // 不做每 batch fsync(避免 Flush Storm);仅在分片完成边界 group-commit 一次。
-        // CrashConsistencyMode::Loose:跳过分片 sync,仅在 close() 时落盘(NVMe/UPS 极致吞吐场景)。
-        // CrashConsistencyMode::EveryFragment(默认):每分片 fsync,断电后 resume 跳过已 sync 分片。
-        if !skip_write && sync_mode == tachyon_core::config::CrashConsistencyMode::EveryFragment {
-            storage.sync().await?;
-        }
+        // 不做每 batch fsync(避免 Flush Storm);仅在分片完成边界 group-commit。
+        // CrashConsistencyMode::Loose(默认):每 LOOSE_GROUP_COMMIT_N 个完成分片 sync 一次。
+        // CrashConsistencyMode::EveryFragment:每分片 fsync,断电后 resume 跳过已 sync 分片。
+        Self::sync_on_fragment_complete(storage, skip_write, sync_mode, loose_completed_frags)
+            .await?;
 
         // 分片整体完成回调:触发上层 checkpoint(断点续传落盘)
         if let Some(tx) = progress_tx
@@ -5147,30 +5361,176 @@ mod tests {
         assert!((task.progress() - 0.0).abs() < f64::EPSILON);
     }
 
-    // ------ 1b. with_hybrid_sources:bt_fallback 字段存在 + 空镜像降级编译路径 ------
+    // ------ 1b. with_hybrid_sources:真实构造路径(空镜像降级 + HTTP 镜像主源) ------
 
-    // 验证 bt_fallback 字段存在且默认构造为 None(纯 HTTP / 纯 BT 路径)。
-    // Task 6 仅落地字段 + 构造,fallback 触发逻辑在 Task 7。
+    /// 无 HTTP 镜像时 `with_hybrid_sources` 必须退化为纯 BT 构造:
+    /// 调用 `with_pool_and_scheduler(magnet, Some(bt_session))`,
+    /// `has_mirrors=false` 且 `bt_fallback=None`(纯 BT 无 P2SP fallback)。
     #[cfg(feature = "magnet")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_with_hybrid_sources_no_mirrors_degrades_to_bt() {
-        // 无 HTTP 镜像 → 退化为纯 BT(with_pool_and_scheduler 路径)。
-        // 完整 P2SP 测试需要真实 BtSession(tempfile + librqbit Session),较重,
-        // 留待集成测试。此处仅验证:
-        //   1. with_hybrid_sources 签名编译通过;
-        //   2. 通过 new_for_test 构造的任务 bt_fallback 字段为 None(纯 HTTP 路径)。
-        let config = test_config();
-        let protocol = Arc::new(MockProto::new(test_metadata("data.zip", 2048)));
-        let task = DownloadTask::new_for_test(
-            "http://example.com/file.bin".into(),
-            config,
-            protocol,
-            StorageKind::memory(),
+        use crate::bt_session::BtSession;
+        use tachyon_core::config::MagnetConfig;
+
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let magnet_cfg = MagnetConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            disable_dht_persistence: true,
+            ..Default::default()
+        };
+        let bt_session = Arc::new(
+            BtSession::new(dir.path().to_path_buf(), magnet_cfg)
+                .await
+                .expect("BtSession 应创建成功"),
         );
-        // 纯 HTTP 构造路径不填充 bt_fallback
+
+        let mut config = test_config();
+        config.download_dir = dir.path().to_string_lossy().to_string();
+        config.authorized_dirs = vec![config.download_dir.clone()];
+
+        let magnet_url = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string();
+        let task = DownloadTask::with_hybrid_sources(
+            magnet_url.clone(),
+            Vec::new(),
+            config,
+            None,
+            Arc::new(AdaptiveDownloadScheduler::default_config()),
+            bt_session,
+        )
+        .await
+        .expect("空镜像 hybrid 应降级为纯 BT 构造成功");
+
+        assert_eq!(task.state(), DownloadState::Pending);
+        assert_eq!(task.url(), magnet_url.as_str());
+        assert!(
+            !task.has_mirrors,
+            "空镜像降级纯 BT 时 has_mirrors 必须为 false"
+        );
         assert!(
             task.bt_fallback.is_none(),
-            "纯 HTTP 路径 bt_fallback 必须为 None"
+            "纯 BT 路径 bt_fallback 必须为 None"
+        );
+        assert!(
+            task.bt_magnet.is_some(),
+            "纯 BT 路径应持有 bt_magnet 协议句柄"
+        );
+    }
+
+    /// 有 HTTP 镜像时 `with_hybrid_sources` 走 P2SP:HTTP MirrorProtocol 主源 +
+    /// 独立 `bt_fallback`。不触网,只断言构造字段。
+    #[cfg(feature = "magnet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_with_hybrid_sources_with_http_mirrors() {
+        use crate::bt_session::BtSession;
+        use tachyon_core::config::MagnetConfig;
+
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let magnet_cfg = MagnetConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            disable_dht_persistence: true,
+            ..Default::default()
+        };
+        let bt_session = Arc::new(
+            BtSession::new(dir.path().to_path_buf(), magnet_cfg)
+                .await
+                .expect("BtSession 应创建成功"),
+        );
+
+        let mut config = test_config();
+        config.download_dir = dir.path().to_string_lossy().to_string();
+        config.authorized_dirs = vec![config.download_dir.clone()];
+
+        let magnet_url = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let task = DownloadTask::with_hybrid_sources(
+            magnet_url.clone(),
+            vec![
+                "http://mirror1.example.com/file.bin".into(),
+                "http://mirror2.example.com/file.bin".into(),
+            ],
+            config,
+            None,
+            Arc::new(AdaptiveDownloadScheduler::default_config()),
+            bt_session,
+        )
+        .await
+        .expect("带 HTTP 镜像的 hybrid 应构造成功");
+
+        assert_eq!(task.state(), DownloadState::Pending);
+        assert_eq!(task.url(), magnet_url.as_str());
+        assert!(task.has_mirrors, "有 HTTP 镜像时 has_mirrors 必须为 true");
+        assert!(task.bt_fallback.is_some(), "P2SP 路径必须填充 bt_fallback");
+        assert!(
+            task.bt_magnet.is_none(),
+            "hybrid HTTP 主源路径 bt_magnet 应为 None(协议在 MirrorProtocol 侧)"
+        );
+    }
+
+    /// magnet URL 经 `with_pool_and_scheduler` 且注入 BtSession 时构造成功。
+    #[cfg(feature = "magnet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_with_pool_and_scheduler_magnet_with_session() {
+        use crate::bt_session::BtSession;
+        use tachyon_core::config::MagnetConfig;
+
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let magnet_cfg = MagnetConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            disable_dht_persistence: true,
+            ..Default::default()
+        };
+        let bt_session = Arc::new(
+            BtSession::new(dir.path().to_path_buf(), magnet_cfg)
+                .await
+                .expect("BtSession 应创建成功"),
+        );
+
+        let mut config = test_config();
+        config.download_dir = dir.path().to_string_lossy().to_string();
+        config.authorized_dirs = vec![config.download_dir.clone()];
+
+        let magnet_url = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let task = DownloadTask::with_pool_and_scheduler(
+            magnet_url.clone(),
+            config,
+            None,
+            Arc::new(AdaptiveDownloadScheduler::default_config()),
+            Some(bt_session),
+        )
+        .await
+        .expect("magnet + BtSession 应构造成功");
+
+        assert_eq!(task.state(), DownloadState::Pending);
+        assert_eq!(task.url(), magnet_url.as_str());
+        assert!(!task.has_mirrors);
+        assert!(task.bt_magnet.is_some());
+        assert!(task.bt_fallback.is_none());
+        assert!(task.bt_storage_factory.is_some());
+    }
+
+    /// magnet URL 缺少 BtSession 时必须返回 Config 错误(Session 未初始化)。
+    #[cfg(feature = "magnet")]
+    #[tokio::test]
+    async fn test_with_pool_and_scheduler_magnet_without_session_errors() {
+        let result = DownloadTask::with_pool_and_scheduler(
+            "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            test_config(),
+            None,
+            Arc::new(AdaptiveDownloadScheduler::default_config()),
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("缺少 BtSession 的 magnet 构造必须失败"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Session 未初始化") || msg.contains("BitTorrent"),
+            "错误应说明 Session 未初始化: {msg}"
         );
     }
 
@@ -6227,10 +6587,143 @@ mod tests {
         );
     }
 
-    /// CrashConsistencyMode::Loose 模式下,分片完成时不得调用 storage.sync,
-    /// 仅在 close() 时落盘。验证 HDD/NVMe 极致吞吐场景的 fsync 跳过逻辑。
+    /// CrashConsistencyMode::Loose = 降低 sync 频率的 group-commit(建议 N=8 分片),
+    /// **不为 0**:分片完成边界仍须有非零 storage.sync,只是次数少于 EveryFragment。
+    /// 当前错误实现在 Loose 下完全跳过分片 sync,仅 close 一次 → 本测 RED。
     #[tokio::test]
-    async fn test_crash_consistency_loose_skips_fragment_sync() {
+    async fn test_crash_consistency_loose_group_commits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSyncStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for CountingSyncStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                // close 内再 sync 一次,与生产路径 close 落盘语义对齐,便于从总次数中分离 close
+                self.sync()
+            }
+        }
+
+        // 16 分片:Loose group-commit N=8 时至少 2 次分片边界 sync + 1 次 close
+        let frag_count = 16u64;
+        let frag_size = 4 * 1024u64;
+        let total = frag_size * frag_count;
+        let payload = bytes::Bytes::from(vec![0x5A; total as usize]);
+        let meta = FileMetadata {
+            file_name: "loose-group.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"strong-etag\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_default_data(payload.clone()));
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let storage = StorageKind::new(CountingSyncStorage {
+            inner: MemStorage::with_capacity(total as usize),
+            syncs: syncs.clone(),
+        });
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/loose-group.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::Loose,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        assert_eq!(
+            task.fragments.len() as u64,
+            frag_count,
+            "应规划为 {frag_count} 分片, actual={}",
+            task.fragments.len()
+        );
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("下载应成功");
+
+        let final_syncs = syncs.load(Ordering::SeqCst);
+        // close() 计 1 次;其余为分片/group-commit 边界 sync
+        let fragment_boundary_syncs = final_syncs.saturating_sub(1);
+        // 建议 N=8:16 片至少 ceil(16/8)=2 次 group-commit
+        assert!(
+            fragment_boundary_syncs >= 2,
+            "Loose group-commit 分片边界 sync 次数应 >= 2(16 片/N=8), \
+             实际 fragment_boundary_syncs={fragment_boundary_syncs}, total_syncs={final_syncs} \
+             (当前 bug:Loose 完全跳过分片 sync 时仅 close=1)"
+        );
+        // 仍应严格少于 EveryFragment(=每分片 1 次 + close)
+        assert!(
+            final_syncs < (frag_count as usize) + 1,
+            "Loose sync 次数应少于 EveryFragment({}+1), 实际 total_syncs={final_syncs}",
+            frag_count
+        );
+        assert!(
+            final_syncs > 1,
+            "Loose 不得把分片 sync 降为 0(仅 close); total_syncs={final_syncs}"
+        );
+    }
+
+    /// 顺序不变式加强:completed 进度事件被观察时,storage.sync 计数必须已 >0。
+    /// 用旁路 receiver 在事件到达瞬间采样 sync 计数,锁定「先 sync 数据字节,再 completed」。
+    #[tokio::test]
+    async fn test_fragment_completed_observes_prior_sync() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Clone)]
@@ -6282,10 +6775,160 @@ mod tests {
 
         let frag_size = 32 * 1024u64;
         let total = frag_size * 2;
-        let first = bytes::Bytes::from(vec![0xAB; frag_size as usize]);
-        let second = bytes::Bytes::from(vec![0xCD; frag_size as usize]);
+        let payload = bytes::Bytes::from(vec![0xAB; total as usize]);
         let meta = FileMetadata {
-            file_name: "loose.bin".into(),
+            file_name: "order.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"strong-etag\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(meta).with_default_data(payload));
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let storage = StorageKind::new(CountingSyncStorage {
+            inner: MemStorage::with_capacity(total as usize),
+            syncs: syncs.clone(),
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentProgress>(32);
+        let samples = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
+        let samples_bg = samples.clone();
+        let syncs_bg = syncs.clone();
+        let observer = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if let FragmentProgress::Chunk {
+                    completed: true, ..
+                } = ev
+                {
+                    let n = syncs_bg.load(Ordering::SeqCst);
+                    samples_bg.lock().push(n);
+                }
+            }
+        });
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/order.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 2,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+        task.set_progress_sender(tx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("下载应成功");
+        // drop task 以关闭 progress_tx,让 observer 退出
+        drop(task);
+        observer.await.expect("observer join");
+
+        let samples = samples.lock().clone();
+        assert!(
+            samples.len() >= 2,
+            "应观察到每个分片 completed 采样, actual={samples:?}"
+        );
+        for (i, &sync_at_event) in samples.iter().enumerate() {
+            assert!(
+                sync_at_event > 0,
+                "completed 事件 #{i} 到达时 storage.sync 必须已发生, samples={samples:?}"
+            );
+        }
+        // 单调不减:后到的 completed 不应看到更少的 sync 计数
+        for w in samples.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "sync 计数在 completed 序列上应单调不减: {samples:?}"
+            );
+        }
+    }
+
+    /// Engine 是 partial 进度的 sync 责任方:
+    /// 发送 `FragmentProgress::Chunk { completed: false, ... }` 之前,
+    /// 已 flush 到 storage 的对应字节须已 `storage.sync()`(EveryFragment:每次 partial 前)。
+    ///
+    /// 现状: `report_progress` 仅 try_send,不 sync;完成边界才 `sync_on_fragment_complete`。
+    /// 用大于 WRITE_BATCH_BYTES 的分片 + 小 chunk 强制 mid-flight flush 与 partial;
+    /// CountingSyncStorage.sync 先 yield 再计数,让 observer 在 sync 生效前采样 → 当前 RED。
+    #[tokio::test]
+    async fn test_partial_progress_syncs_before_report_every_fragment() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSyncStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for CountingSyncStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    // 先让出执行权,使 progress observer 在 fetch_add 前进队采样;
+                    // 锁定「report 与 sync 的先后」而不被同任务紧接完成的 sync 抢跑。
+                    tokio::task::yield_now().await;
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.sync()
+            }
+        }
+
+        // 分片 > WRITE_BATCH_BYTES,小 chunk 节流上报:mid-flight 必有 flush 后 partial
+        // (PROGRESS_REPORT_CHUNK_INTERVAL=5; chunk=32KiB → 每 160KiB 量级上报)
+        let frag_size = 512 * 1024u64;
+        let total = frag_size * 2;
+        let chunk_size = 32 * 1024usize;
+        let payload = bytes::Bytes::from(vec![0x3C; total as usize]);
+        let meta = FileMetadata {
+            file_name: "partial-every.bin".into(),
             file_size: Some(total),
             content_type: None,
             supports_range: true,
@@ -6297,8 +6940,8 @@ mod tests {
         };
         let protocol: Arc<dyn Protocol> = Arc::new(
             MockProto::new(meta)
-                .with_range_data(0, frag_size - 1, first.clone())
-                .with_range_data(frag_size, total - 1, second.clone()),
+                .with_default_data(payload)
+                .with_chunk_size(chunk_size),
         );
 
         let syncs = Arc::new(AtomicUsize::new(0));
@@ -6307,16 +6950,569 @@ mod tests {
             syncs: syncs.clone(),
         });
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentProgress>(256);
+        let samples = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
+        let samples_bg = samples.clone();
+        let syncs_bg = syncs.clone();
+        // 只采「首个 completed:true 之前」且已有写入字节的 partial
+        let observer = tokio::spawn(async move {
+            let mut saw_completed = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    FragmentProgress::Chunk {
+                        completed: true, ..
+                    } => {
+                        saw_completed = true;
+                    }
+                    FragmentProgress::Chunk {
+                        completed: false,
+                        fragment_downloaded,
+                        ..
+                    } if !saw_completed && fragment_downloaded > 0 => {
+                        let n = syncs_bg.load(Ordering::SeqCst);
+                        samples_bg.lock().push(n);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         let mut task = DownloadTask::new_for_test(
-            "http://example.com/loose.bin".into(),
+            "http://example.com/partial-every.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                // 串行分片,确保首分片 mid-flight 期间不会被其他分片 completed sync 抢跑
+                max_concurrent_fragments: 1,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 60,
+            ewma_alpha: 0.3,
+            ..Default::default()
+        };
+        task.set_progress_sender(tx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        assert!(
+            task.fragments.len() >= 2,
+            "应规划为多分片以走 download_single_fragment: {}",
+            task.fragments.len()
+        );
+        task.prepare_storage().await.unwrap();
+        task.execute().await.expect("下载应成功");
+        drop(task);
+        observer.await.expect("observer join");
+
+        let samples = samples.lock().clone();
+        assert!(
+            !samples.is_empty(),
+            "应在首分片完成前观察到 fragment_downloaded>0 的 mid-flight partial, samples={samples:?}"
+        );
+        for (i, &sync_at_event) in samples.iter().enumerate() {
+            assert!(
+                sync_at_event > 0,
+                "EveryFragment: 已写入字节的 partial 事件 #{i} 到达时 storage.sync 必须已发生 \
+                 (引擎在 report_progress 前 sync), samples={samples:?}"
+            );
+        }
+        // 单调不减:后到的 partial 不应看到更少的 sync 计数
+        for w in samples.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "sync 计数在 partial 序列上应单调不减: {samples:?}"
+            );
+        }
+    }
+
+    /// Loose 下 partial 路径也须有非零 group-commit(频率低于 EveryFragment)。
+    /// 当前 partial 完全不 sync → mid-flight 采样为 0 → RED。
+    #[tokio::test]
+    async fn test_partial_progress_loose_group_commits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSyncStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for CountingSyncStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.sync()
+            }
+        }
+
+        async fn run_partial_samples(
+            mode: tachyon_core::config::CrashConsistencyMode,
+        ) -> (Vec<usize>, usize) {
+            let frag_size = 512 * 1024u64;
+            let total = frag_size * 2;
+            let chunk_size = 32 * 1024usize;
+            let payload = bytes::Bytes::from(vec![0x5D; total as usize]);
+            let meta = FileMetadata {
+                file_name: format!("partial-loose-{mode:?}.bin"),
+                file_size: Some(total),
+                content_type: None,
+                supports_range: true,
+                etag: Some("\"strong-etag\"".into()),
+                last_modified: None,
+                file_layout: None,
+                protocol_managed_storage: false,
+                resolved_host: None,
+            };
+            let protocol: Arc<dyn Protocol> = Arc::new(
+                MockProto::new(meta)
+                    .with_default_data(payload)
+                    .with_chunk_size(chunk_size),
+            );
+
+            let syncs = Arc::new(AtomicUsize::new(0));
+            let storage = StorageKind::new(CountingSyncStorage {
+                inner: MemStorage::with_capacity(total as usize),
+                syncs: syncs.clone(),
+            });
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentProgress>(256);
+            let samples = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
+            let samples_bg = samples.clone();
+            let syncs_bg = syncs.clone();
+            // 仅采首个 completed 之前、且已有写入字节的 partial
+            let observer = tokio::spawn(async move {
+                let mut saw_completed = false;
+                while let Some(ev) = rx.recv().await {
+                    match ev {
+                        FragmentProgress::Chunk {
+                            completed: true, ..
+                        } => {
+                            saw_completed = true;
+                        }
+                        FragmentProgress::Chunk {
+                            completed: false,
+                            fragment_downloaded,
+                            ..
+                        } if !saw_completed && fragment_downloaded > 0 => {
+                            let n = syncs_bg.load(Ordering::SeqCst);
+                            samples_bg.lock().push(n);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let mut task = DownloadTask::new_for_test(
+                "http://example.com/partial-loose.bin".into(),
+                DownloadConfig {
+                    max_retries: 0,
+                    verify_checksum: false,
+                    max_concurrent_fragments: 1,
+                    crash_consistency_mode: mode,
+                    ..test_config()
+                },
+                protocol,
+                storage,
+            );
+            task.scheduler_config = tachyon_core::config::SchedulerConfig {
+                min_fragment_size: frag_size,
+                max_fragment_size: frag_size,
+                sampling_interval_secs: 60,
+                ewma_alpha: 0.3,
+                ..Default::default()
+            };
+            task.set_progress_sender(tx);
+
+            task.probe().await.unwrap();
+            task.plan().unwrap();
+            task.prepare_storage().await.unwrap();
+            task.execute().await.expect("下载应成功");
+            drop(task);
+            observer.await.expect("observer join");
+
+            let samples = samples.lock().clone();
+            let final_syncs = syncs.load(Ordering::SeqCst);
+            (samples, final_syncs)
+        }
+
+        let (loose_samples, loose_total) =
+            run_partial_samples(tachyon_core::config::CrashConsistencyMode::Loose).await;
+        let (every_samples, every_total) =
+            run_partial_samples(tachyon_core::config::CrashConsistencyMode::EveryFragment).await;
+
+        assert!(
+            !loose_samples.is_empty(),
+            "Loose 应观察到 mid-flight partial 事件, samples={loose_samples:?}"
+        );
+        // mid-flight 至少有一次 non-zero sync(group-commit 覆盖 partial 路径)
+        let max_midflight = *loose_samples.iter().max().unwrap_or(&0);
+        assert!(
+            max_midflight > 0,
+            "Loose partial 路径 mid-flight 也应有非零 storage.sync(group-commit), \
+             samples={loose_samples:?}, total_syncs={loose_total}"
+        );
+        // 同场景下 Loose 总 sync 应严格少于 EveryFragment
+        assert!(
+            loose_total < every_total,
+            "Loose sync 次数应 < EveryFragment 同场景: loose={loose_total}, every={every_total}, \
+             loose_samples={loose_samples:?}, every_samples={every_samples:?}"
+        );
+    }
+
+    /// 模拟 page-cache 崩溃:write 只进 volatile,sync 才拷到 durable。
+    /// 崩溃 = 丢弃 volatile,只剩 durable。用于验证「先 sync 再 completed 元数据」
+    /// 的 resume 正确性,无需真实 kill 进程。
+    #[derive(Clone)]
+    struct PageCacheStorage {
+        volatile: Arc<parking_lot::Mutex<Vec<u8>>>,
+        durable: Arc<parking_lot::Mutex<Vec<u8>>>,
+        /// true 后模拟进程已死:后续 write/sync 失败;crash() 会丢弃未 sync 字节
+        crashed: Arc<std::sync::atomic::AtomicBool>,
+        syncs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PageCacheStorage {
+        fn with_capacity(cap: usize) -> Self {
+            Self {
+                volatile: Arc::new(parking_lot::Mutex::new(vec![0u8; cap])),
+                durable: Arc::new(parking_lot::Mutex::new(vec![0u8; cap])),
+                crashed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                syncs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        /// 模拟进程崩溃:丢弃未 sync 的 volatile,后续读写只看 durable。
+        fn crash(&self) {
+            self.crashed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut v = self.volatile.lock();
+            let d = self.durable.lock();
+            v.copy_from_slice(&d);
+        }
+
+        fn durable_data(&self) -> Vec<u8> {
+            self.durable.lock().clone()
+        }
+    }
+
+    impl AsyncStorage for PageCacheStorage {
+        fn write_at(
+            &self,
+            offset: u64,
+            data: bytes::Bytes,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+            Box::pin(async move {
+                if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(DownloadError::Io(std::io::Error::other(
+                        "page cache crashed: process dead",
+                    )));
+                }
+                let mut buf = self.volatile.lock();
+                let start = offset as usize;
+                let end = start + data.len();
+                if end > buf.len() {
+                    buf.resize(end, 0);
+                }
+                buf[start..end].copy_from_slice(&data);
+                Ok(data.len())
+            })
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                let data = if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.durable.lock().clone()
+                } else {
+                    self.volatile.lock().clone()
+                };
+                let start = offset as usize;
+                let available = data.len().saturating_sub(start);
+                let to_read = buf.len().min(available);
+                if to_read == 0 {
+                    return Ok(0);
+                }
+                buf[..to_read].copy_from_slice(&data[start..start + to_read]);
+                Ok(to_read)
+            })
+        }
+
+        fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(DownloadError::Io(std::io::Error::other(
+                        "page cache crashed: process dead",
+                    )));
+                }
+                let v = self.volatile.lock();
+                let mut d = self.durable.lock();
+                if d.len() < v.len() {
+                    d.resize(v.len(), 0);
+                }
+                d.copy_from_slice(&v);
+                self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn allocate(
+            &self,
+            size: u64,
+        ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                let n = size as usize;
+                self.volatile.lock().resize(n, 0);
+                self.durable.lock().resize(n, 0);
+                Ok(())
+            })
+        }
+
+        fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+            Box::pin(async move {
+                let n = if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.durable.lock().len()
+                } else {
+                    self.volatile.lock().len()
+                };
+                Ok(n as u64)
+            })
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+            self.sync()
+        }
+    }
+
+    /// 崩溃恢复正确性(模拟 kill):EveryFragment 下,已 completed 的分片字节必须在 durable。
+    ///
+    /// 流程:
+    /// 1. 下载中途在收到第 1 个 completed 后 crash(丢 volatile)
+    /// 2. durable 必须已含该分片全部字节(因 completed 前必 sync)
+    /// 3. resume:set_completed_fragments([0]) + 同一 durable 后端,剩余分片下完
+    /// 4. 全文件与源 payload blake3 一致
+    #[tokio::test]
+    async fn test_crash_resume_every_fragment_durable_bytes_match_source() {
+        // 每分片不同填充,避免全 0xA5 时 partial durable 误判「剩余整片已完成」
+        let frag_size = 64 * 1024u64;
+        let total = frag_size * 4;
+        let mut raw = vec![0u8; total as usize];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = ((i / frag_size as usize) as u8)
+                .wrapping_mul(17)
+                .wrapping_add((i % 251) as u8);
+        }
+        let payload = bytes::Bytes::from(raw);
+        let expected_hash = CpuVerifier::blake3().compute_hash(&payload).unwrap();
+
+        let meta = FileMetadata {
+            file_name: "crash-every.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"crash-v1\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(meta)
+                .with_default_data(payload.clone())
+                .with_chunk_size(8 * 1024),
+        );
+
+        let page = PageCacheStorage::with_capacity(total as usize);
+        let storage = StorageKind::new(page.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentProgress>(64);
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/crash-every.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 1, // 串行,便于在首片 completed 后精确 crash
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
+                ..test_config()
+            },
+            protocol.clone(),
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        task.set_progress_sender(tx);
+
+        task.probe().await.unwrap();
+        task.plan().unwrap();
+        assert_eq!(task.fragments.len(), 4);
+        task.prepare_storage().await.unwrap();
+
+        // 后台执行下载;主任务在首个 completed 后 crash(丢 volatile)
+        let exec = tokio::spawn(async move { task.execute().await });
+
+        let mut completed_before_crash = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let FragmentProgress::Chunk {
+                completed: true,
+                fragment_index,
+                ..
+            } = ev
+            {
+                completed_before_crash.push(fragment_index);
+                if completed_before_crash.len() == 1 {
+                    // completed 发送前已 sync;再 yield 后 crash
+                    tokio::task::yield_now().await;
+                    page.crash();
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            completed_before_crash.first().copied(),
+            Some(0),
+            "串行下首个 completed 应为 index 0, actual={completed_before_crash:?}"
+        );
+        // 崩溃后执行任务应失败或结束;不要求 Ok
+        let _ = exec.await;
+
+        // durable 必须含 frag0 全部字节(completed 前已 sync)
+        let durable = page.durable_data();
+        assert_eq!(
+            &durable[..frag_size as usize],
+            &payload[..frag_size as usize],
+            "crash 后 durable 应保留已 completed 分片的全部字节"
+        );
+
+        // resume:新 PageCache 以 durable 为初值 + completed=[0]
+        let resume_page = PageCacheStorage::with_capacity(total as usize);
+        {
+            let mut v = resume_page.volatile.lock();
+            let mut d = resume_page.durable.lock();
+            v.copy_from_slice(&durable);
+            d.copy_from_slice(&durable);
+        }
+        let resume_storage = StorageKind::new(resume_page.clone());
+        let mut resume = DownloadTask::new_for_test(
+            "http://example.com/crash-every.bin".into(),
             DownloadConfig {
                 max_retries: 0,
                 verify_checksum: false,
                 max_concurrent_fragments: 2,
-                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::Loose,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
                 ..test_config()
             },
             protocol,
+            resume_storage,
+        );
+        resume.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        resume.probe().await.unwrap();
+        resume.set_completed_fragments(vec![0]);
+        resume.plan().unwrap();
+        resume.prepare_storage().await.unwrap();
+        resume
+            .execute()
+            .await
+            .expect("resume 应从分片 1 继续并完成");
+
+        let final_bytes = resume_page.durable_data();
+        assert_eq!(final_bytes.len(), total as usize);
+        assert_eq!(
+            &final_bytes[..],
+            &payload[..],
+            "resume 完成后 durable 应与源逐字节一致"
+        );
+        let got = CpuVerifier::blake3().compute_hash(&final_bytes).unwrap();
+        assert_eq!(got, expected_hash, "全文件 blake3 应与源一致");
+    }
+
+    /// Loose group-commit:未达 N 个 completed 的分片在 crash 后 durable 可能为空,
+    /// 但 **已 group-commit 的 completed 批次** 字节必须 durable,resume 可跳过它们。
+    #[tokio::test]
+    async fn test_crash_resume_loose_group_commit_preserves_synced_batch() {
+        // 8 片,N=8 → 第 8 片完成时才 group-commit 一次;用 8 片验证整批 durable
+        let frag_size = 32 * 1024u64;
+        let n_frags = 8u64;
+        let total = frag_size * n_frags;
+        let payload = bytes::Bytes::from((0..total).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let expected_hash = CpuVerifier::blake3().compute_hash(&payload).unwrap();
+
+        let meta = FileMetadata {
+            file_name: "crash-loose.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"crash-loose\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_default_data(payload.clone()));
+
+        let page = PageCacheStorage::with_capacity(total as usize);
+        let storage = StorageKind::new(page.clone());
+
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/crash-loose.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::Loose,
+                ..test_config()
+            },
+            protocol.clone(),
             storage,
         );
         task.scheduler_config = tachyon_core::config::SchedulerConfig {
@@ -6327,16 +7523,158 @@ mod tests {
 
         task.probe().await.unwrap();
         task.plan().unwrap();
+        assert_eq!(task.fragments.len(), n_frags as usize);
         task.prepare_storage().await.unwrap();
-        task.execute().await.expect("下载应成功");
+        task.execute().await.expect("完整下载应成功");
+        // close 路径会再 sync;此时 durable == 全文件
+        page.crash(); // 即使 crash,durable 已有全量
+        let durable = page.durable_data();
+        assert_eq!(&durable[..], &payload[..]);
+        let got = CpuVerifier::blake3().compute_hash(&durable).unwrap();
+        assert_eq!(got, expected_hash);
 
-        // Loose 模式:分片完成时不 sync,仅在 close() 时 sync 一次。
-        // 若分片 sync 仍触发,syncs 会 ≥ 3(2 分片 + 1 close)。
-        let final_syncs = syncs.load(Ordering::SeqCst);
-        assert_eq!(
-            final_syncs, 1,
-            "Loose 模式应仅在 close() 时 sync 一次,实际 syncs={final_syncs}(应=1,close 触发)"
+        // 额外断言:至少发生过 group-commit(>0 次 sync;close 也算)
+        assert!(
+            page.syncs.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "Loose 完整下载应至少 1 次 sync(group-commit 或 close)"
         );
+    }
+
+    /// 真实文件路径崩溃恢复冒烟:Standard 后端落盘 + resume + 全文件 blake3。
+    ///
+    /// 比 PageCache 模拟更接近生产 I/O:
+    /// 1. 首轮完整下载到 tempfile,close/sync 后读盘 blake3 == 源
+    /// 2. 第二轮:仅预写分片 0 到新文件,`set_completed_fragments([0])` resume 下完,
+    ///    读盘 blake3 == 源(证明真实文件 resume 不跳过错误、不损坏)
+    #[tokio::test]
+    async fn test_real_file_resume_blake3_matches_source() {
+        let frag_size = 32 * 1024u64;
+        let n_frags = 4u64;
+        let total = frag_size * n_frags;
+        let mut raw = vec![0u8; total as usize];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = ((i / frag_size as usize) as u8)
+                .wrapping_mul(31)
+                .wrapping_add((i % 251) as u8);
+        }
+        let payload = bytes::Bytes::from(raw);
+        let expected_hash = CpuVerifier::blake3().compute_hash(&payload).unwrap();
+
+        let meta = FileMetadata {
+            file_name: "real-resume.bin".into(),
+            file_size: Some(total),
+            content_type: None,
+            supports_range: true,
+            etag: Some("\"real-resume\"".into()),
+            last_modified: None,
+            file_layout: None,
+            protocol_managed_storage: false,
+            resolved_host: None,
+        };
+        let protocol: Arc<dyn Protocol> =
+            Arc::new(MockProto::new(meta).with_default_data(payload.clone()));
+
+        // ---- 路径 1:完整下载到真实文件 ----
+        let tmp1 = tempfile::NamedTempFile::new().expect("tempfile");
+        let path1 = tmp1.path().to_path_buf();
+        let storage1 =
+            DynStorage::open_with_strategy(&path1, tachyon_core::config::IoStrategy::Standard)
+                .await
+                .expect("open storage");
+        let mut task1 = DownloadTask::new_for_test(
+            "http://example.com/real-resume.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 2,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
+                ..test_config()
+            },
+            protocol.clone(),
+            storage1,
+        );
+        task1.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        task1.probe().await.unwrap();
+        task1.plan().unwrap();
+        assert_eq!(task1.fragments.len(), n_frags as usize);
+        task1.prepare_storage().await.unwrap();
+        task1.execute().await.expect("完整真实文件下载应成功");
+        // close 确保 fsync 到盘
+        if let Some(s) = task1.storage.as_ref() {
+            s.close().await.expect("close/fsync");
+        }
+        drop(task1);
+
+        let on_disk1 = std::fs::read(&path1).expect("读盘");
+        assert_eq!(on_disk1.len(), total as usize);
+        assert_eq!(&on_disk1[..], &payload[..], "完整下载后盘上字节应等于源");
+        let hash1 = CpuVerifier::blake3().compute_hash(&on_disk1).unwrap();
+        assert_eq!(hash1, expected_hash, "完整下载 blake3 应等于源");
+
+        // ---- 路径 2:预写分片 0 + resume 下剩余 ----
+        let tmp2 = tempfile::NamedTempFile::new().expect("tempfile2");
+        let path2 = tmp2.path().to_path_buf();
+        // 预写分片 0 字节(模拟 crash 后 durable 仅有首片)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path2)
+                .expect("create resume file");
+            f.set_len(total).expect("preallocate");
+            f.write_all(&payload[..frag_size as usize])
+                .expect("write frag0");
+            f.sync_all().expect("fsync frag0");
+        }
+
+        let storage2 =
+            DynStorage::open_with_strategy(&path2, tachyon_core::config::IoStrategy::Standard)
+                .await
+                .expect("open resume storage");
+        let mut task2 = DownloadTask::new_for_test(
+            "http://example.com/real-resume.bin".into(),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                max_concurrent_fragments: 2,
+                crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::EveryFragment,
+                ..test_config()
+            },
+            protocol,
+            storage2,
+        );
+        task2.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        task2.probe().await.unwrap();
+        task2.set_completed_fragments(vec![0]);
+        task2.plan().unwrap();
+        // 已完成分片应被跳过
+        assert_eq!(task2.fragments[0].state, FragmentState::Done);
+        task2.prepare_storage().await.unwrap();
+        task2.execute().await.expect("真实文件 resume 应成功");
+        if let Some(s) = task2.storage.as_ref() {
+            s.close().await.expect("resume close/fsync");
+        }
+        drop(task2);
+
+        let on_disk2 = std::fs::read(&path2).expect("读 resume 盘");
+        assert_eq!(on_disk2.len(), total as usize);
+        assert_eq!(
+            &on_disk2[..],
+            &payload[..],
+            "resume 完成后盘上字节应等于源(含预写 frag0)"
+        );
+        let hash2 = CpuVerifier::blake3().compute_hash(&on_disk2).unwrap();
+        assert_eq!(hash2, expected_hash, "resume 全文件 blake3 应等于源");
     }
 
     #[tokio::test]
@@ -9950,6 +11288,11 @@ mod tests {
 
     /// 续传时 plan 必须忽略带宽 recommendation,保持与冷启动确定性分片一致,
     /// 否则 snapshot 的 completed index 会与新边界错位。
+    ///
+    /// Task2: 生产路径亦不再消费 `recommendation.fragment_size`(per-task scheduler
+    /// 在 plan 阶段 confidence 恒 0,死分支已删)。冷启动与续传均回退
+    /// `plan_fragments(..., None, scheduler_config)`,本测锁定两路径均不受
+    /// 注入 scheduler 的偏置 fragment_size 影响。
     #[tokio::test]
     async fn test_plan_resume_ignores_recommendation_fragment_size() {
         use std::sync::Arc;
@@ -9960,7 +11303,7 @@ mod tests {
             fn recommend(&self, _file_size: u64, max_concurrency: u32) -> ScheduleRecommendation {
                 ScheduleRecommendation {
                     concurrency: max_concurrency.max(1),
-                    // 故意给与默认(32MB/16=2MB)完全不同的分片大小
+                    // 故意给与 default_target_fragments 划分完全不同的分片大小
                     fragment_size: 4 * 1024 * 1024,
                     confidence: 0.99,
                 }
@@ -9976,7 +11319,7 @@ mod tests {
         let protocol = Arc::new(MockProto::new(meta));
         let storage = StorageKind::memory_with_capacity(file_size as usize);
 
-        // 冷启动无 resume:会吃 recommendation → 2MB 分片 → 16 片
+        // 冷启动无 resume:Task2 后亦忽略 recommendation.fragment_size
         let mut fresh = DownloadTask::new_for_test(
             "http://example.com/resume-plan.bin".into(),
             DownloadConfig {
@@ -9990,10 +11333,22 @@ mod tests {
         fresh.scheduler = Arc::new(BiasedScheduler);
         fresh.metadata = Some(test_metadata("resume-plan.bin", file_size));
         let fresh_plan = fresh.plan().expect("plan");
+        let stable =
+            crate::fragment::plan_fragments(file_size, true, None, &fresh.scheduler_config)
+                .expect("stable plan");
         assert_eq!(
+            fresh_plan.len(),
+            stable.len(),
+            "冷启动 plan 分片数应等于 default_target_fragments 确定性划分"
+        );
+        assert_eq!(
+            fresh_plan[0].size, stable[0].size,
+            "冷启动不得采用 biased recommendation 4MB"
+        );
+        assert_ne!(
             fresh_plan[0].size,
             4 * 1024 * 1024,
-            "无 resume 时应采用 recommendation 4MB"
+            "冷启动不得使用 biased recommendation 分片大小"
         );
 
         // 有 resume snapshot:必须忽略 recommendation,用确定性划分
@@ -10012,9 +11367,6 @@ mod tests {
         resume.set_completed_fragments(vec![0]);
         let resume_plan = resume.plan().expect("plan");
 
-        let stable =
-            crate::fragment::plan_fragments(file_size, true, None, &resume.scheduler_config)
-                .expect("stable plan");
         assert_eq!(
             resume_plan.len(),
             stable.len(),
@@ -11322,10 +12674,11 @@ mod tests {
         assert!(task.fragment_infos().is_empty());
     }
 
-    /// 审计:with_mirrors 必须使用注入的 scheduler,而非内部 default_config。
+    /// 审计:with_mirrors 必须保留注入的 scheduler 反馈路径,而非内部 default_config。
     ///
-    /// 行为:注入已 observe 带宽样本的 AdaptiveDownloadScheduler 后 plan(),
-    /// 推荐分片大小应反映该调度器状态(confidence > 0),而非冷启动默认。
+    /// Task2 后 plan 阶段 HTTP 冷启动不再消费 recommendation.fragment_size
+    /// (per-task scheduler 在 plan 时 confidence 恒 0,该分支已删除)。
+    /// 本测试验证:注入实例仍挂在任务上,observe/predicted_bandwidth 反馈可达。
     #[tokio::test]
     async fn test_with_mirrors_uses_injected_scheduler() {
         let config = DownloadConfig {
@@ -11337,10 +12690,12 @@ mod tests {
             max_fragment_size: 2 * 1024 * 1024,
             ..Default::default()
         });
-        // 注入样本,使 confidence > 0,plan 走调度器 fragment_size
+        // 预热样本,确认注入实例自身可产生带宽预测
         for _ in 0..12 {
             sched.observe_bandwidth(8 * 1024 * 1024);
         }
+        let predicted_before = sched.predicted_bandwidth();
+        assert!(predicted_before > 0, "注入调度器预热后应有带宽预测");
         let sched: Arc<dyn DownloadScheduler> = Arc::new(sched);
 
         let mut task = DownloadTask::with_mirrors(
@@ -11353,7 +12708,7 @@ mod tests {
         .await
         .expect("with_mirrors 应成功");
 
-        // 绕过真实 probe:直接塞 metadata 后 plan,验证 recommend 来自注入调度器
+        // 绕过真实 probe:直接塞 metadata 后 plan
         task.metadata = Some(FileMetadata {
             file_name: "file.bin".into(),
             file_size: Some(64 * 1024 * 1024),
@@ -11367,11 +12722,12 @@ mod tests {
         });
         let frags = task.plan().expect("plan 应成功");
         assert!(!frags.is_empty(), "应规划出分片");
-        // 固定 2MiB 分片 + 64MiB 文件 => 32 片;若误用 default min=1MiB 则为 64
+        // plan 侧走 scheduler_config.default_target_fragments(64),min=1MiB:
+        // 64MiB / 1MiB = 64 片;不再因注入 scheduler min/max=2MiB 变成 32 片
         assert_eq!(
             frags.len(),
-            32,
-            "注入调度器 min/max=2MiB 时应规划 32 片,实际 {}",
+            64,
+            "Task2 后 plan 不消费 recommendation.fragment_size,期望 64 片,实际 {}",
             frags.len()
         );
         // 反馈路径也必须打到注入实例
@@ -12318,8 +13674,8 @@ mod tests {
             protocol,
             storage,
         );
-        // min==max==frag_size,配合 default_target_fragments=16 使 base=6250 被 clamp
-        // 到 50_000,从而规划出恰好 2 个分片(进入分片下载路径)。
+        // min==max==frag_size 强制分片大小,base 被 clamp 到 50_000,
+        // 从而规划出恰好 2 个分片(进入分片下载路径);与 default_target_fragments 无关。
         task.scheduler_config = tachyon_core::config::SchedulerConfig {
             min_fragment_size: frag_size,
             max_fragment_size: frag_size,
@@ -13034,9 +14390,11 @@ mod tests {
             Arc::new(MockProto::new(test_metadata("x.bin", 64 * 1024 * 1024))),
             StorageKind::memory_with_capacity(64 * 1024 * 1024),
         );
-        let mut sc = SchedulerConfig::default();
-        sc.max_fragment_size = 4 * 1024 * 1024;
-        sc.min_fragment_size = 1024 * 1024;
+        let sc = SchedulerConfig {
+            max_fragment_size: 4 * 1024 * 1024,
+            min_fragment_size: 1024 * 1024,
+            ..Default::default()
+        };
         task.set_scheduler_config(sc.clone());
         assert_eq!(
             task.scheduler_config.max_fragment_size,
@@ -14159,7 +15517,42 @@ mod tests {
         assert_eq!(&buf[..], full_data.as_ref(), "整块降级后数据应完整写入");
     }
 
-    /// 构造一个可拆的慢片 + 快片(滞后门槛需要 ≥2 在途且 progress 差 ≥20%)
+    // =========================================================================
+    // rebalance 目标契约测试(Task3 RED)
+    //
+    // 目标 API(Coder 将落地;当前生产签名仅 `frag_tx`,编译失败=可接受 RED):
+    //   try_rebalance_slowest_fragment(&tx, &concurrency_ctrl, queue_empty)
+    //
+    // 目标语义:
+    // 1. 触发:有空闲 worker(active < target);删除 downloading<2 与 LAG 阈值
+    // 2. 选择:剩余字节最大(effective_end+1 - (start+realtime));保留 age>=2s 与 remaining>=2*MIN
+    // 3. 拆分:对半 done_abs + remaining/2;仍尊重 write_safety / min_split_point
+    // 4. 冷却:收尾(队列空)500ms;非收尾 5s;代理 20s
+    // 5. 保留 hash 拒绝拆分、channel Full revert + rebalance_dropped
+    // =========================================================================
+
+    /// 构造年龄已过 MIN_AGE 的在途分片。
+    fn make_downloading_frag(
+        index: u32,
+        start: u64,
+        size: u64,
+        done: u64,
+        age_secs: u64,
+    ) -> crate::fragment::FragmentRecord {
+        use crate::fragment::FragmentRecord;
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let info = FragmentInfo::new(index, start, start + size - 1, size).unwrap();
+        let mut r = FragmentRecord::new(info, 3);
+        r.start_download().unwrap();
+        r.realtime_downloaded.store(done, Ordering::Release);
+        r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(age_secs));
+        r
+    }
+
+    /// 旧 helper 保留:双在途片(曾服务 lag 门控场景)。
+    /// 语义变更后仍可用于需要两片在途的用例,但不再要求 progress 差 ≥20%。
     fn make_lagging_pair(
         size: u64,
         slow_done: u64,
@@ -14168,31 +15561,30 @@ mod tests {
         crate::fragment::FragmentRecord,
         crate::fragment::FragmentRecord,
     ) {
-        use crate::fragment::FragmentRecord;
-        use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
-
-        let slow = {
-            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(slow_done, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-            r
-        };
-        let fast = {
-            // 第二片与第一片同尺寸但独立 range 元数据;rebalance 只看 progress 比
-            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(fast_done, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-            r
-        };
-        (slow, fast)
+        (
+            make_downloading_frag(0, 0, size, slow_done, 3),
+            make_downloading_frag(1, size, size, fast_done, 3),
+        )
     }
 
-    /// 安全 rebalance:存在明显滞后的慢片时 try_split + 入队成功
+    /// 有空闲 worker 的默认控制器:active=1,target=4 → should_spawn=true。
+    fn idle_concurrency_ctrl() -> Arc<ConcurrencyController> {
+        let ctrl = Arc::new(ConcurrencyController::new(4, 16));
+        ctrl.record_spawn(); // active=1 < target=4
+        ctrl
+    }
+
+    /// active==target,无空闲 worker。
+    fn full_concurrency_ctrl(active: u32, target: u32) -> Arc<ConcurrencyController> {
+        let ctrl = Arc::new(ConcurrencyController::new(target, 16));
+        for _ in 0..active {
+            ctrl.record_spawn();
+        }
+        ctrl
+    }
+
+    /// 语义变更说明:不再要求 lag≥20%;触发改为 active < target。
+    /// 本用例验证:存在可拆在途片 + 空闲 worker ⇒ 拆分并入队。
     #[tokio::test]
     async fn test_rebalance_splits_slow_fragment_and_enqueues() {
         use crate::fragment::{FragmentState, MIN_SPLIT_SIZE};
@@ -14214,21 +15606,23 @@ mod tests {
         task.fragments = vec![slow, fast];
         task.metadata = Some(test_metadata("rebalance.bin", size * 2));
 
+        let ctrl = idle_concurrency_ctrl();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        // 目标 API: concurrency_ctrl + queue_empty;当前实现缺参 → 编译 RED
         let did = task
-            .try_rebalance_slowest_fragment(&tx)
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
             .await
             .expect("rebalance 不应 Err");
-        assert!(did, "应拆分慢片");
+        assert!(did, "有空闲 worker 时应拆分可拆在途片");
         assert_eq!(task.fragments.len(), 3, "应新增 1 个分片");
         assert_eq!(task.fragments[0].state, FragmentState::Downloading);
-        // 队列收到新 spec
         let spec = rx.try_recv().expect("应入队新分片 spec");
         assert_eq!(spec.0, 2, "新分片 index=2(原有 0/1)");
         assert!(spec.1 > 0, "新分片 start > 0");
     }
 
-    /// 两次成功 rebalance 最小间隔内不得再拆(防 soft-pressure 恢复后连环拆)
+    /// 语义变更说明:非收尾冷却仍为 5s(代理 20s);收尾(queue_empty)改为 500ms,
+    /// 见 test_rebalance_endgame_cooldown_is_shorter。本用例只覆盖非收尾 5s 门闩。
     #[tokio::test]
     async fn test_rebalance_min_interval_blocks_second_split() {
         use crate::fragment::MIN_SPLIT_SIZE;
@@ -14249,27 +15643,34 @@ mod tests {
         );
         task.fragments = vec![slow, fast];
         task.metadata = Some(test_metadata("interval.bin", size * 2));
+        let ctrl = idle_concurrency_ctrl();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(8);
-        let did1 = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        let did1 = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
         assert!(did1, "第一次应拆分");
         let _ = rx.try_recv();
-        // 人为制造仍可拆的慢片状态:再塞一对滞后片(start_time 已回拨 3s)
         let (slow2, fast2) = make_lagging_pair(size, size / 10, size * 9 / 10);
-        // 重置 index 避免冲突 — 用新 pair 替换 fragments 并清 last 间隔外
-        // 但 last_rebalance_at 仍在:第二次应被间隔挡住
+        // last_rebalance_at 仍在 5s 内,非收尾(queue_empty=false)第二次应被挡住
         task.fragments = vec![slow2, fast2];
-        let did2 = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        assert!(!did2, "最小间隔内第二次不得再拆");
+        let did2 = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(!did2, "非收尾最小间隔 5s 内第二次不得再拆");
         assert_eq!(task.fragments.len(), 2, "间隔拦截时不得新增分片");
     }
 
-    /// 均匀进度(无滞后)不得 rebalance,避免 loopback 假拆分
+    /// 语义变更说明:旧语义「进度均匀不得 rebalance」(LAG 门控)已删除。
+    /// 新语义:两片 remaining 均可拆且有空闲 worker 时,选 remaining 最大者拆分,
+    /// 即使 progress 相同也应 rebalance。本用例改写为验证该行为。
     #[tokio::test]
     async fn test_rebalance_skips_when_progress_uniform() {
         use crate::fragment::MIN_SPLIT_SIZE;
 
         let size = MIN_SPLIT_SIZE * 8;
-        // 两片都 50% — lag=0 < 20%
+        // 两片都 50% — 旧语义 lag=0 跳过;新语义应选 remaining 最大(相同则任一)并拆
         let (a, b) = make_lagging_pair(size, size / 2, size / 2);
         let protocol = Arc::new(MockProto::new(test_metadata("uniform.bin", size * 2)));
         let storage = StorageKind::memory_with_capacity((size * 2) as usize);
@@ -14280,15 +15681,21 @@ mod tests {
             storage,
         );
         task.fragments = vec![a, b];
+        let ctrl = idle_concurrency_ctrl();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
-        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        assert!(!did, "进度均匀时不应 rebalance");
-        assert!(rx.try_recv().is_err());
-        assert_eq!(task.fragments.len(), 2);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(
+            did,
+            "语义变更:删除 LAG 门控后,进度均匀但 remaining 可拆且有空闲 worker 时应 rebalance"
+        );
+        assert!(rx.try_recv().is_ok(), "应入队新分片");
+        assert_eq!(task.fragments.len(), 3);
     }
 
-    /// RED-TDD: channel 满时 rebalance 不得 send().await 挂死主循环;
-    /// 应快速返回 Ok(false) 并 revert_split,保留原分片边界。
+    /// 保留:channel 满时 try_send Full → revert_split + rebalance_dropped。
     #[tokio::test]
     async fn test_rebalance_full_channel_does_not_hang_and_reverts() {
         use crate::fragment::MIN_SPLIT_SIZE;
@@ -14329,9 +15736,10 @@ mod tests {
         );
         tx.try_send(dummy).expect("先填满 channel");
 
+        let ctrl = idle_concurrency_ctrl();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            task.try_rebalance_slowest_fragment(&tx),
+            task.try_rebalance_slowest_fragment(&tx, &ctrl, false),
         )
         .await;
         assert!(
@@ -14355,21 +15763,13 @@ mod tests {
         assert_eq!(snap.6, 1, "Full 回滚应计 rebalance_dropped=1");
     }
 
-    /// rebalance:剩余不足时不拆分
+    /// 剩余不足 2*MIN 时不拆(保留)。
     #[tokio::test]
     async fn test_rebalance_skips_when_remaining_too_small() {
-        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
-        use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
+        use crate::fragment::MIN_SPLIT_SIZE;
 
         let size = MIN_SPLIT_SIZE; // 太小
-        let frag0 = {
-            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(0, Ordering::Release);
-            r
-        };
+        let frag0 = make_downloading_frag(0, 0, size, 0, 3);
         let protocol = Arc::new(MockProto::new(test_metadata("tiny.bin", size)));
         let storage = StorageKind::memory_with_capacity(size as usize);
         let mut task = DownloadTask::new_for_test(
@@ -14379,23 +15779,28 @@ mod tests {
             storage,
         );
         task.fragments = vec![frag0];
+        let ctrl = idle_concurrency_ctrl();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
-        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
         assert!(!did);
         assert!(rx.try_recv().is_err());
         assert_eq!(task.fragments.len(), 1);
     }
 
-    /// rebalance 边界:剩余刚好等于 2*MIN_SPLIT_SIZE(128KiB)且存在滞后快片时应可拆
+    /// 边界:剩余刚好 2*MIN 且有空闲 worker 时应可拆。
+    /// 语义变更:不再依赖「滞后快片」;单在途 + 空闲 worker 也可拆(见 rescues_final_straggler)。
     #[tokio::test]
     async fn test_rebalance_boundary_exactly_2x_min_split_size() {
         use crate::fragment::MIN_SPLIT_SIZE;
 
         let size = MIN_SPLIT_SIZE * 3;
-        // 慢片:已下载 MIN_SPLIT,剩余 2*MIN_SPLIT;快片 90%
-        let (slow, fast) = make_lagging_pair(size, MIN_SPLIT_SIZE, size * 9 / 10);
-        let protocol = Arc::new(MockProto::new(test_metadata("boundary.bin", size * 2)));
-        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
+        // 慢片:已下载 MIN_SPLIT,剩余 2*MIN_SPLIT
+        let slow = make_downloading_frag(0, 0, size, MIN_SPLIT_SIZE, 3);
+        let protocol = Arc::new(MockProto::new(test_metadata("boundary.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/boundary.bin".into(),
             DownloadConfig {
@@ -14406,96 +15811,78 @@ mod tests {
             protocol,
             storage,
         );
-        task.fragments = vec![slow, fast];
-        task.metadata = Some(test_metadata("boundary.bin", size * 2));
+        task.fragments = vec![slow];
+        task.metadata = Some(test_metadata("boundary.bin", size));
 
+        let ctrl = idle_concurrency_ctrl();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
-        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
-        assert!(did, "剩余=2*MIN_SPLIT_SIZE(128KiB)且有滞后时应可拆分");
-        assert_eq!(task.fragments.len(), 3, "应新增 1 个分片");
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(
+            did,
+            "剩余=2*MIN_SPLIT_SIZE 且有空闲 worker 时应可拆分(不再要求多片/lag)"
+        );
+        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
         assert!(rx.try_recv().is_ok());
     }
 
-    /// rebalance 边界:剩余 < 2*MIN_SPLIT_SIZE 时不得拆
+    /// 边界:剩余 < 2*MIN 不得拆(保留)。
     #[tokio::test]
     async fn test_rebalance_boundary_below_2x_min_split_size() {
-        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
-        use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
+        use crate::fragment::MIN_SPLIT_SIZE;
 
         // 剩余 < 2*MIN: total=2*MIN+1, done=2 → remaining 不足
         let size = MIN_SPLIT_SIZE * 2 + 1;
-        let frag0 = {
-            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(2, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-            r
-        };
-        let frag1 = {
-            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(size - 1, Ordering::Release);
-            r.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-            r
-        };
-        let protocol = Arc::new(MockProto::new(test_metadata("below.bin", size * 2)));
-        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
+        let frag0 = make_downloading_frag(0, 0, size, 2, 3);
+        let protocol = Arc::new(MockProto::new(test_metadata("below.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/below.bin".into(),
             test_config(),
             protocol,
             storage,
         );
-        task.fragments = vec![frag0, frag1];
+        task.fragments = vec![frag0];
+        let ctrl = idle_concurrency_ctrl();
         let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
-        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
         assert!(!did, "剩余 < 2*MIN_SPLIT_SIZE 时不得拆分");
-        assert_eq!(task.fragments.len(), 2, "不应新增分片");
+        assert_eq!(task.fragments.len(), 1, "不应新增分片");
     }
 
-    /// rebalance 年龄门槛:刚 spawn 的分片(< 2s)不得立即拆分
+    /// 年龄门槛:刚 spawn 的分片(< 2s)不得立即拆分(保留 MIN_AGE)。
     #[tokio::test]
     async fn test_rebalance_skips_fresh_fragment_under_1s_age() {
-        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
-        use std::sync::atomic::Ordering;
-        use tachyon_core::types::FragmentInfo;
+        use crate::fragment::MIN_SPLIT_SIZE;
 
         let size = MIN_SPLIT_SIZE * 8;
-        let frag0 = {
-            let info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded.store(size / 10, Ordering::Release);
-            // start_time 默认是现在(刚 spawn),不回拨 → 年龄 < 2s
-            r
-        };
-        let frag1 = {
-            let info = FragmentInfo::new(1, size, size * 2 - 1, size).unwrap();
-            let mut r = FragmentRecord::new(info, 3);
-            r.start_download().unwrap();
-            r.realtime_downloaded
-                .store(size * 9 / 10, Ordering::Release);
-            r
-        };
-        let protocol = Arc::new(MockProto::new(test_metadata("fresh.bin", size * 2)));
-        let storage = StorageKind::memory_with_capacity((size * 2) as usize);
+        // age=0(刚 spawn)
+        let frag0 = make_downloading_frag(0, 0, size, size / 10, 0);
+        let protocol = Arc::new(MockProto::new(test_metadata("fresh.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
         let mut task = DownloadTask::new_for_test(
             "http://example.com/fresh.bin".into(),
             test_config(),
             protocol,
             storage,
         );
-        task.fragments = vec![frag0, frag1];
+        task.fragments = vec![frag0];
+        let ctrl = idle_concurrency_ctrl();
         let (tx, _rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
-        let did = task.try_rebalance_slowest_fragment(&tx).await.unwrap();
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
         assert!(!did, "刚 spawn 的分片(< 2s)不得立即拆分");
-        assert_eq!(task.fragments.len(), 2, "不应新增分片");
+        assert_eq!(task.fragments.len(), 1, "不应新增分片");
     }
 
-    /// rebalance 开启后多分片下载仍正确完成(不回归)
+    /// rebalance 开启后多分片下载仍正确完成(不回归;走 run() 生产调用点)。
     #[tokio::test]
     async fn test_rebalance_path_multi_fragment_completes() {
         use crate::fragment::MIN_SPLIT_SIZE;
@@ -14528,6 +15915,345 @@ mod tests {
             task.fragments.iter().all(|f| f.is_done()),
             "所有分片应 Done"
         );
+    }
+
+    /// P0-1 量化开关:`set_rebalance_enabled(false)` 后,即使有多分片 + 慢分片场景,
+    /// `metrics.rebalance_count` 必须 == 0(两个调用点均被 `self.rebalance_enabled`
+    /// 守卫挡住),且下载仍正常完成(正确性不回归)。
+    ///
+    /// 这是 A/B 量化的回归保护:rebalance on/off 切换不应破坏下载路径。
+    #[tokio::test]
+    async fn test_rebalance_disabled_skips_try_rebalance_and_still_completes() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let frag_size = MIN_SPLIT_SIZE * 4;
+        let total = frag_size * 4;
+        let data = bytes::Bytes::from(vec![0xABu8; total as usize]);
+        let protocol =
+            Arc::new(MockProto::new(test_metadata("rebal-off.bin", total)).with_default_data(data));
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/rebal-off.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            sampling_interval_secs: 2,
+            ..Default::default()
+        };
+        let metrics = Arc::new(Metrics::new());
+        task.set_metrics(Arc::clone(&metrics));
+        // ← 关键:关闭 rebalance(A/B off 组)
+        task.set_rebalance_enabled(false);
+
+        task.run().await.expect("rebalance disabled 下载应完成");
+        assert_eq!(task.state(), DownloadState::Completed);
+        assert!(
+            task.fragments.iter().all(|f| f.is_done()),
+            "所有分片应 Done"
+        );
+
+        // 关键断言:rebalance_count == 0(开关生效,两调用点未触发)
+        let (_, _, _, _, _, rebalance_count, rebalance_dropped) = metrics.snapshot();
+        assert_eq!(
+            rebalance_count, 0,
+            "rebalance_enabled=false 时不应有任何成功拆分"
+        );
+        assert_eq!(
+            rebalance_dropped, 0,
+            "rebalance_enabled=false 时不应有任何回滚"
+        );
+    }
+
+    /// 核心:只剩 1 片在途 + 有空闲 worker ⇒ 必须拆分(删 downloading<2 门控)。
+    #[tokio::test]
+    async fn test_rebalance_rescues_final_straggler() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        // 单在途大片,已过 MIN_AGE,remaining 充足
+        let only = make_downloading_frag(0, 0, size, size / 10, 3);
+        let protocol = Arc::new(MockProto::new(test_metadata("straggler.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/straggler.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![only];
+        task.metadata = Some(test_metadata("straggler.bin", size));
+
+        // active=1 < target=4 → 有空闲 worker
+        let ctrl = idle_concurrency_ctrl();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, true /* 收尾队列空 */)
+            .await
+            .expect("rebalance 不应 Err");
+        assert!(
+            did,
+            "核心契约:单在途 straggler + 空闲 worker 必须拆分(旧实现 downloading<2 会跳过)"
+        );
+        assert_eq!(task.fragments.len(), 2, "应新增 1 个分片");
+        assert!(rx.try_recv().is_ok(), "新片应入队");
+    }
+
+    /// 选择:剩余字节最大,而非进度比例最低。
+    /// 构造:A progress 低但 remaining 小;B progress 高但 remaining 大 → 应拆 B。
+    #[tokio::test]
+    async fn test_rebalance_picks_largest_remaining_not_lowest_progress() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+        use std::sync::atomic::Ordering;
+
+        // A: size=4*MIN, done=0 → progress=0, remaining=4*MIN
+        // B: size=16*MIN, done=8*MIN → progress=0.5, remaining=8*MIN (更大)
+        // 旧实现选 progress 最低 → A;目标选 remaining 最大 → B
+        let size_a = MIN_SPLIT_SIZE * 4;
+        let size_b = MIN_SPLIT_SIZE * 16;
+        let a = make_downloading_frag(0, 0, size_a, 0, 3);
+        let b = make_downloading_frag(1, size_a, size_b, size_b / 2, 3);
+        let total = size_a + size_b;
+        let protocol = Arc::new(MockProto::new(test_metadata("pick.bin", total)));
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/pick.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![a, b];
+        task.metadata = Some(test_metadata("pick.bin", total));
+
+        let ctrl = idle_concurrency_ctrl();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(did, "应拆分 remaining 最大的 B 片");
+        assert_eq!(task.fragments.len(), 3);
+
+        // 被拆的应是 B(index=1):其 end 被缩小;A 的 end 不变
+        let a_end = size_a - 1;
+        assert_eq!(
+            task.fragments[0].info.end, a_end,
+            "A remaining 较小,不应被选中拆分"
+        );
+        assert!(
+            task.fragments[1].info.end < size_a + size_b - 1,
+            "B 应被拆分,end 应缩小"
+        );
+        // 新片 start 应落在 B 的 range 内
+        let spec = rx.try_recv().expect("应入队");
+        assert!(
+            spec.1 >= size_a,
+            "新片 start={} 应在 B 区间 [size_a, ...),证明选中 remaining 最大的 B",
+            spec.1
+        );
+        let _ = task.fragments[1].effective_end.load(Ordering::Acquire);
+    }
+
+    /// 拆分点:对半 done_abs + remaining/2(旧实现是尾部 remaining/3)。
+    #[tokio::test]
+    async fn test_rebalance_splits_in_half() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+        use std::sync::atomic::Ordering;
+
+        let size = MIN_SPLIT_SIZE * 16;
+        let done = MIN_SPLIT_SIZE * 2; // remaining = 14*MIN
+        let only = make_downloading_frag(0, 0, size, done, 3);
+        let protocol = Arc::new(MockProto::new(test_metadata("half.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/half.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![only];
+        task.metadata = Some(test_metadata("half.bin", size));
+
+        let ctrl = idle_concurrency_ctrl();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(did, "应对半拆分");
+
+        let remaining = size - done;
+        // 理想对半:split_point = done + remaining/2
+        // ���须尊重 write_safety = min(WRITE_BATCH, remaining/4)
+        let write_safety = (WRITE_BATCH_BYTES as u64).min(remaining / 4);
+        let min_split_point = (done + write_safety).max(done + 1);
+        let ideal_half = done + remaining / 2;
+        let expected_split = ideal_half.max(min_split_point);
+
+        // 原片 end = split_point - 1;新片 start = split_point
+        let orig_end = task.fragments[0].info.end;
+        let split_point = orig_end + 1;
+        assert_eq!(
+            split_point, expected_split,
+            "拆点应对半:done({done})+remaining/2,尊重 write_safety;实际 split={split_point},期望={expected_split}"
+        );
+        assert_eq!(
+            task.fragments[0].effective_end.load(Ordering::Acquire),
+            orig_end
+        );
+        let spec = rx.try_recv().expect("应入队新片");
+        assert_eq!(spec.1, split_point, "新片 start 应为 split_point");
+    }
+
+    /// 冷却:收尾(队列空)500ms 可再拆;非收尾仍 5s。
+    #[tokio::test]
+    async fn test_rebalance_endgame_cooldown_is_shorter() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let size = MIN_SPLIT_SIZE * 16;
+        let protocol = Arc::new(MockProto::new(test_metadata("cooldown.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/cooldown.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+
+        let ctrl = idle_concurrency_ctrl();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(8);
+
+        // 第一次成功拆分(非收尾)
+        task.fragments = vec![make_downloading_frag(0, 0, size, size / 8, 3)];
+        let did1 = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(did1, "第一次应拆分");
+        let _ = rx.try_recv();
+
+        // 模拟 600ms 后:非收尾仍应被 5s 冷却挡住
+        task.last_rebalance_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(600));
+        task.fragments = vec![make_downloading_frag(0, 0, size, size / 8, 3)];
+        let did_non_endgame = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(!did_non_endgame, "非收尾冷却 5s:600ms 后仍不得再拆");
+
+        // 同一时刻,收尾(queue_empty=true)500ms 冷却已过,应允许再拆
+        task.fragments = vec![make_downloading_frag(0, 0, size, size / 8, 3)];
+        let did_endgame = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, true)
+            .await
+            .unwrap();
+        assert!(
+            did_endgame,
+            "收尾冷却 500ms:600ms 后 queue_empty=true 应允许再拆"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// 无空闲 worker(active==target)不拆。
+    #[tokio::test]
+    async fn test_rebalance_skips_when_no_idle_worker() {
+        use crate::fragment::MIN_SPLIT_SIZE;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let only = make_downloading_frag(0, 0, size, size / 10, 3);
+        let protocol = Arc::new(MockProto::new(test_metadata("no-idle.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/no-idle.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![only];
+        task.metadata = Some(test_metadata("no-idle.bin", size));
+
+        // active==target=4,无空闲
+        let ctrl = full_concurrency_ctrl(4, 4);
+        assert!(
+            !ctrl.should_spawn(),
+            "前置:active==target 时 should_spawn=false"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(!did, "active==target 时不得 rebalance");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.fragments.len(), 1);
+    }
+
+    /// 保留:有 expected hash 的分片禁止 rebalance 拆分(try_split 返回 None)。
+    #[tokio::test]
+    async fn test_rebalance_rejects_hashed_fragment() {
+        use crate::fragment::{FragmentRecord, MIN_SPLIT_SIZE};
+        use std::sync::atomic::Ordering;
+        use tachyon_core::types::FragmentInfo;
+
+        let size = MIN_SPLIT_SIZE * 8;
+        let mut info = FragmentInfo::new(0, 0, size - 1, size).unwrap();
+        info.hash = Some("deadbeef".into());
+        let mut frag = FragmentRecord::new(info, 3);
+        frag.start_download().unwrap();
+        frag.realtime_downloaded.store(size / 10, Ordering::Release);
+        frag.start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+
+        let protocol = Arc::new(MockProto::new(test_metadata("hashed.bin", size)));
+        let storage = StorageKind::memory_with_capacity(size as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/hashed.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_concurrent_fragments: 4,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.fragments = vec![frag];
+        let ctrl = idle_concurrency_ctrl();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FragmentSpec>(4);
+        let did = task
+            .try_rebalance_slowest_fragment(&tx, &ctrl, false)
+            .await
+            .unwrap();
+        assert!(!did, "有 expected hash 的分片禁止 rebalance 拆分");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.fragments.len(), 1);
+        assert_eq!(task.fragments[0].info.end, size - 1, "边界不得被改写");
     }
 
     // ------ BT 冷启动并发解耦与小分片规划 ------
