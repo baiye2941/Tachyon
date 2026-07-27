@@ -946,9 +946,11 @@ mod tests {
 
         #[test]
         fn test_plan_fragments_clamps_suggested_size_to_max() {
-            let mut cfg = SchedulerConfig::default();
-            cfg.min_fragment_size = 1024 * 1024;
-            cfg.max_fragment_size = 4 * 1024 * 1024;
+            let cfg = SchedulerConfig {
+                min_fragment_size: 1024 * 1024,
+                max_fragment_size: 4 * 1024 * 1024,
+                ..Default::default()
+            };
             // 建议 64MiB 应被 clamp 到 4MiB → 16MiB 文件至少 4 片
             let frags =
                 plan_fragments(16 * 1024 * 1024, true, Some(64 * 1024 * 1024), &cfg).unwrap();
@@ -1016,6 +1018,124 @@ mod tests {
                 10,
                 "应使用 SchedulerConfig::default_target_fragments 而非 PoolConfig::max_global"
             );
+        }
+
+        // ------ Task2: default_target_fragments 16→64 验收（当前默认仍为 16 时应 RED）------
+
+        /// 断言分片覆盖完整文件、无重叠、无空洞。
+        fn assert_full_coverage(frags: &[FragmentInfo], file_size: u64) {
+            if file_size == 0 {
+                assert!(frags.is_empty());
+                return;
+            }
+            assert!(!frags.is_empty(), "非空文件应至少有一片");
+            assert_eq!(frags[0].start, 0, "首片应从 0 开始");
+            let total: u64 = frags.iter().map(|f| f.size).sum();
+            assert_eq!(total, file_size, "分片总长度必须等于文件大小");
+            for window in frags.windows(2) {
+                assert_eq!(
+                    window[0].end + 1,
+                    window[1].start,
+                    "相邻分片不得重叠或留空洞"
+                );
+            }
+            let last = frags.last().unwrap();
+            assert_eq!(last.end, file_size - 1, "末片须覆盖到文件末尾");
+        }
+
+        #[test]
+        fn test_plan_fragments_mid_range_exceeds_max_concurrent() {
+            // Task2: default_target_fragments=64 后，[16MiB,1GiB] 内多数尺寸片数应 > 并发上限 16，
+            // 避免队列深度归零。当前默认仍为 16 时片数恒为 16，本测试应失败（RED）。
+            let config = SchedulerConfig::default();
+            assert_eq!(
+                config.default_target_fragments, 64,
+                "SchedulerConfig 默认目标分片数应为 64"
+            );
+            // max_concurrent_fragments 默认 16（DownloadConfig）；此处硬编码对照合同
+            let max_concurrent = 16u32;
+            // 边界 16MiB 触及 min_fragment_size 后恰为 16 片，不要求 >16；
+            // 从 32MiB 起目标 64 应产生更深队列。
+            let sizes_mib = [32u64, 64, 128, 256, 512, 1024];
+            for size_mib in sizes_mib {
+                let file_size = size_mib * 1024 * 1024;
+                let frags = plan_fragments(file_size, true, None, &config)
+                    .expect("plan_fragments 不应失败");
+                assert!(
+                    frags.len() as u32 > max_concurrent,
+                    "{size_mib}MiB 文件片数 {} 应 > max_concurrent_fragments({max_concurrent})",
+                    frags.len()
+                );
+                assert_full_coverage(&frags, file_size);
+            }
+        }
+
+        #[test]
+        fn test_plan_fragments_small_file_min_size_protects_count() {
+            // Task2: 小文件仍受 min_fragment_size=1MB 保护，8MiB 约 8 片，不因目标 64 而切碎。
+            let config = SchedulerConfig::default();
+            let file_size = 8 * 1024 * 1024u64;
+            let frags =
+                plan_fragments(file_size, true, None, &config).expect("plan_fragments 不应失败");
+            assert_eq!(
+                frags.len(),
+                8,
+                "8MiB / min_fragment_size(1MB) 应约 8 片，实际 {}",
+                frags.len()
+            );
+            assert_full_coverage(&frags, file_size);
+        }
+
+        #[test]
+        fn test_plan_fragments_huge_file_count_capped() {
+            // Task2: 超大文件片数不得超过 1_000_000 硬上限（plan_fragments 内 MAX_FRAGMENT_COUNT）。
+            let config = SchedulerConfig::default();
+            let file_size = 5 * 1024 * 1024 * 1024u64; // 5GiB
+            let frags =
+                plan_fragments(file_size, true, None, &config).expect("plan_fragments 不应失败");
+            assert!(
+                frags.len() <= 1_000_000,
+                "5GiB 片数 {} 不得超过 MAX_FRAGMENT_COUNT",
+                frags.len()
+            );
+            // 目标 64 时 5GiB 片大小约 80MB→clamp 到 max 64MB，片数约 80，仍须完整覆盖
+            assert_full_coverage(&frags, file_size);
+        }
+
+        #[test]
+        fn test_plan_fragments_sixteen_mib_hits_min_bound() {
+            // Task2: 16MiB 在 default_target_fragments=64 时 base=256KiB，clamp 到 min 1MB → 恰 16 片。
+            // 当前默认 16 时也是 16 片；与 default 断言一并锁定新语义。
+            let config = SchedulerConfig::default();
+            assert_eq!(config.default_target_fragments, 64);
+            let file_size = 16 * 1024 * 1024u64;
+            let frags =
+                plan_fragments(file_size, true, None, &config).expect("plan_fragments 不应失败");
+            assert_eq!(frags.len(), 16, "16MiB 应触及 min_fragment_size，片数 16");
+            assert_full_coverage(&frags, file_size);
+        }
+
+        #[test]
+        fn test_plan_fragments_suggested_clamps_to_min() {
+            // suggested 过小仍 clamp 到 min；与 max clamp 测试对称，不受目标分片数变更影响。
+            let cfg = SchedulerConfig {
+                min_fragment_size: 1024 * 1024,
+                max_fragment_size: 64 * 1024 * 1024,
+                ..Default::default()
+            };
+            let file_size = 16 * 1024 * 1024u64;
+            let frags =
+                plan_fragments(file_size, true, Some(64 * 1024), &cfg).expect("plan 不应失败");
+            assert!(frags.len() >= 4, "clamp 到 min 后 16MiB 至少数片");
+            for f in &frags {
+                assert!(
+                    f.size >= cfg.min_fragment_size || f.size == file_size,
+                    "frag size {} < min",
+                    f.size
+                );
+                assert!(f.size <= cfg.max_fragment_size);
+            }
+            assert_full_coverage(&frags, file_size);
         }
     }
 

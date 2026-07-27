@@ -794,7 +794,7 @@ mod tests {
     /// 中等带宽 + 未触达 max_fragment_size 时,不得把并发压成 1。
     ///
     /// 10MB/s × 3s = 30MB frag(未 clamp 到 64MB)⇒ 旧公式 bandwidth_based=1。
-    /// 1GB 文件仍有 ~34 片;多连接下限应抬到 default_target_fragments(16)。
+    /// 1GB 文件仍有 ~34 片;多连接下限应抬到 default_target_fragments(现为 64,再 min 片数/max_c)。
     #[test]
     fn test_recommend_multi_conn_floor_when_bandwidth_based_collapses() {
         let sched = AdaptiveDownloadScheduler::default_config();
