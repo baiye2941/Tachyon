@@ -4,9 +4,9 @@
 
 **基于 Rust + Tauri v2 的高性能桌面下载器**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&event=push&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml?query=branch%3Amain)
+[![CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/ci.yml?branch=main&event=push&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/baiye2941/Tachyon/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 [![Release](https://img.shields.io/github/v/release/baiye2941/Tachyon?style=flat-square&logo=github&label=release)](https://github.com/baiye2941/Tachyon/releases/latest)
-[![Release CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/release.yml?event=push&style=flat-square&label=release%20ci)](https://github.com/baiye2941/Tachyon/actions/workflows/release.yml)
+[![Release CI](https://img.shields.io/github/actions/workflow/status/baiye2941/Tachyon/release.yml?event=push&style=flat-square&label=release%20ci)](https://github.com/baiye2941/Tachyon/actions/workflows/release.yml?query=event%3Apush)
 ![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust)
 ![Edition](https://img.shields.io/badge/edition-2024-blue?style=flat-square)
 ![Coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25%20regions-brightgreen?style=flat-square)
