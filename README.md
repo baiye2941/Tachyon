@@ -20,7 +20,7 @@
 
 ## 简介
 
-Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能桌面下载器。后端使用 Rust 编写，以 Cargo workspace 组织 10 个 crate；前端基于 Tauri v2 + SolidJS，UI 采用 TailwindCSS v4。
+Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能桌面下载器。后端使用 Rust 编写，以 Cargo workspace 组织 10 个 crate；前端基于 Tauri v2 + SolidJS，UI 采用 TailwindCSS v4。当前版本 **v0.1.3**。
 
 **它主要解决这些问题：**
 
@@ -34,17 +34,18 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | 能力 | 说明 |
 |------|------|
 | 多线程分片下载 | `DownloadTask` 动态分片规划，`JoinSet` 并发执行 |
-| 分片字节级实时进度 | 详情页分片矩阵在下载过程中实时显示每片字节级充能进度（250ms 聚合推送，快照式自愈） |
-| 多协议传输 | HTTP/HTTPS、QUIC（编译期可选）、BitTorrent 磁力链接 |
-| BT 代理支持 | SOCKS5 代理覆盖 tracker 与 peer 流量，支持自动检测系统代理 |
+| 分片字节级实时进度 | 详情页分片矩阵实时显示每片字节级进度（约 250ms 聚合推送，快照式自愈） |
+| 多协议传输 | HTTP/HTTPS、BitTorrent 磁力链接；QUIC/HTTP3 为编译期可选 feature |
+| BT 代理支持 | SOCKS5 覆盖 tracker 与 peer；未显式配置时自动检测 `ALL_PROXY` / `HTTP_PROXY` |
 | 高性能存储引擎 | Linux io_uring、Windows IOCP / WinFile、TokioFile 自动回退 |
 | 智能调度 | `AdaptiveDownloadScheduler` + `HoltLinearPredictor` 双指数平滑 |
-| 多源并发下载 | MirrorProtocol 多镜像源 least-in-flight 调度 + 质量加权选源 |
+| 多源并发下载 | `MirrorProtocol` least-in-flight 调度 + 质量加权选源 |
 | 断点续传 | 任务快照持久化，分片级与字节级续传，快照一致性校验防进度虚高 |
-| 流式哈希校验 | BLAKE3 / SHA-256 CPU 校验，GPU 校验预留 |
-| 限速控制 | 无锁令牌桶，支持跨任务全局限速（进程内共享 RateLimiter） |
+| 流式哈希校验 | BLAKE3 / SHA-256 CPU 流式校验（GPU 路径已移除） |
+| 限速控制 | 无锁令牌桶，支持跨任务全局限速（进程内共享 `RateLimiter`） |
 | HuggingFace Hub 集成 | 模型浏览、LFS 解析、Token 管理、本地模型扫描 |
 | 浏览器资源嗅探 | 基于扩展名识别视频 / 音频 / 文档 / 压缩包等资源 |
+| 任务控制 | 暂停 / 恢复 / 取消 / 删除；暂停走协作式控制通道，磁力下载注入 session coordinator |
 
 ---
 
@@ -58,26 +59,26 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 | Tauri API | ^2.11.0 | 前后端 IPC |
 | TailwindCSS | ^4.3.1 | 原子化 CSS |
 | Vite | ^8.1.0 | 构建工具 |
-| Bun | 1.x | 包管理 |
+| Bun | 1.x | 包管理与脚本运行 |
 | Vitest | ^4.1.9 | 单元测试 |
 | Playwright | ^1.61.0 | E2E 测试 |
-| Storybook | 10.4.6 | 组件开发 |
+| Storybook | 10.5.5 | 组件开发 |
 | solid-i18n | ^1.1.0 | 中 / 英国际化 |
 
 ### 后端（Rust workspace 10 crate）
 
 | Crate | 职责 |
 |------|------|
-| `tachyon-core` | 类型、trait、错误体系、配置、安全校验 |
-| `tachyon-engine` | 分片引擎、并发许可器、多源竞速、限速器 |
+| `tachyon-core` | 核心类型、trait、错误体系、配置、安全校验 |
+| `tachyon-engine` | 分片引擎、连接管理、多源竞速、限速、任务执行 |
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 |
-| `tachyon-io` | 跨平台异步 I/O（io_uring / IOCP）、BufferPool 池化 |
-| `tachyon-protocol` | HTTP/HTTPS、QUIC、BitTorrent 协议实现 |
-| `tachyon-crypto` | BLAKE3 / SHA-256 校验、GPU 加速预留 |
+| `tachyon-io` | 跨平台异步 I/O（io_uring / IOCP / WinFile）、`BufferPool` |
+| `tachyon-protocol` | HTTP/HTTPS、BitTorrent（默认 magnet）、可选 HTTP3 |
+| `tachyon-crypto` | BLAKE3 / SHA-256 CPU 流式哈希与完整性校验 |
 | `tachyon-sniffer` | 浏览器资源类型识别与捕获过滤 |
 | `tachyon-store` | 断点续传快照、文件系统 KV |
-| `tachyon-hub` | HuggingFace Hub API 客户端 |
-| `tachyon-app` | Tauri 应用入口、IPC 命令注册、生命周期管理 |
+| `tachyon-hub` | HuggingFace Hub API 客户端（模型列表 / LFS / Token） |
+| `tachyon-app` | Tauri 应用入口、IPC 命令、生命周期管理（bin: `tachyon`） |
 
 更多架构细节见 [docs/architecture.md](docs/architecture.md)。
 
@@ -85,27 +86,35 @@ Tachyon 是一款面向大文件、AI 模型仓库和浏览器资源的高性能
 
 ## 安装
 
-### 环境要求
+### 预构建安装包（推荐）
 
-| 依赖 | 最低版本 | 说明 |
-|------|----------|------|
-| Rust | 1.85 | 见 `rust-toolchain.toml` |
-| Bun | 1.x | 前端包管理 |
-| cargo-tauri | 2.x | Tauri CLI |
+从 [GitHub Releases](https://github.com/baiye2941/Tachyon/releases/latest) 下载最新版：
 
-### 构建
+- **Windows**：`.msi` / setup.exe
+- **macOS**：`.dmg`（当前发布 aarch64）
+- **Linux**：`.deb` / `.rpm` / `.AppImage`
+
+安装包附带 Tauri updater `.sig`、`.sha256` 与 cosign 校验材料。
+
+### 从源码构建
+
+| 依赖 | 最低 / 说明 |
+|------|-------------|
+| Rust | MSRV **1.85**（`Cargo.toml` `rust-version`）；`rust-toolchain.toml` 使用 `stable` + rustfmt/clippy |
+| Bun | 1.x（`frontend/package.json` `packageManager`） |
+| Tauri CLI | 2.x（`cargo tauri`） |
 
 ```bash
 git clone https://github.com/baiye2941/Tachyon.git
 cd Tachyon
 
-# 调试构建（默认 HTTP + magnet）
+# 调试构建（默认开启 HTTP + magnet）
 cargo build
 
 # 发布构建
 cargo build --release
 
-# QUIC/HTTP3(reqwest http3 为 unstable,需显式开启)
+# QUIC/HTTP3（reqwest http3 为 unstable，需显式开启）
 RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
 ```
 
@@ -115,8 +124,19 @@ RUSTFLAGS='--cfg reqwest_unstable' cargo build --features tachyon-protocol/http3
 # 前端开发服务器
 cd frontend && bun install && bun run dev
 
-# 同时启动前端 + Rust 后端
+# 同时启动前端 + Rust 后端（Tauri）
 cargo tauri dev
+```
+
+前端常用脚本：
+
+```bash
+cd frontend
+bun run test          # Vitest
+bun run test:e2e      # Playwright
+bun run storybook     # Storybook :6006
+bun run typecheck
+bun run lint
 ```
 
 ---
@@ -125,15 +145,15 @@ cargo tauri dev
 
 ### GUI 快速开始
 
-1. 启动应用：`cargo tauri dev` 或运行构建产物。
+1. 启动应用：`cargo tauri dev` 或运行 Release 安装包。
 2. 在「新建任务」中粘贴下载链接，或从 HuggingFace Hub 浏览模型。
 3. 选择保存路径，点击下载；任务列表实时显示速度、进度与分片状态。
-4. 打开任务详情页可查看分片矩阵：下载中分片显示字节级充能进度与实时百分比。
+4. 打开任务详情页可查看分片矩阵：下载中分片显示字节级进度与百分比。
 5. 支持暂停、恢复、取消、删除；重启后会自动恢复未完成任务。
 
-### HuggingFace 模型下载示例
+### HuggingFace 模型下载
 
-在 HF 浏览器面板输入模型 ID（如 `bert-base-uncased`），选择分支与文件后批量创建下载任务。需要访问私有仓库时设置环境变量：
+在 HF 浏览器面板输入模型 ID（如 `bert-base-uncased`），选择分支与文件后批量创建下载任务。访问私有仓库时设置：
 
 ```bash
 export HF_TOKEN=your_token_here
@@ -141,7 +161,9 @@ export HF_TOKEN=your_token_here
 
 ### BT / 磁力链接
 
-在设置页的「磁力链接」标签可配置 SOCKS5 代理（覆盖 tracker 与 peer 流量）。留空时自动检测 `ALL_PROXY` / `HTTP_PROXY` 环境变量并转为 `socks5://` 使用。
+设置页「磁力链接」可配置 SOCKS5 代理（覆盖 tracker 与 peer）。留空时自动检测 `ALL_PROXY` / `HTTP_PROXY` 并转为 `socks5://`。
+
+国内网络下 BT 通常需要 SOCKS5；仅配置 `HTTP_PROXY` 往往不够（UDP tracker / DHT / peer TCP 仍可能直连失败）。
 
 ### 配置说明
 
@@ -152,6 +174,7 @@ export HF_TOKEN=your_token_here
 - `max_retries`：分片失败重试次数
 - `rate_limit_bytes_per_sec`：全局限速
 - `io_strategy`：I/O 后端策略
+- `magnet.socks_proxy_url`：BT SOCKS5 代理
 
 完整配置与 Feature 说明见 [docs/user-guide.md](docs/user-guide.md)。
 
@@ -179,22 +202,31 @@ graph TB
     SCH --> CORE
 ```
 
-详细架构、流程图、模块说明见 [docs/architecture.md](docs/architecture.md)。
+依赖层序（禁止跨层绕行）：
+
+`tachyon-core` → `{tachyon-protocol, tachyon-io, tachyon-crypto, tachyon-scheduler}` → `tachyon-engine` → `tachyon-app`；`tachyon-hub` / `tachyon-sniffer` / `tachyon-store` 按各自 `Cargo.toml` 依赖。
+
+详细架构见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
 ## 测试与质量
 
-项目当前保有 Rust 测试 1800+、前端测试 800+，CI 全平台（Windows / Linux / macOS）门禁通过。
+当前仓库约有：
+
+- **Rust**：`#[test]` / `#[tokio::test]` 属性约 **2090+**（`crates/` 内统计）
+- **前端**：约 **87** 个 Vitest 规格文件、约 **900+** 用例
+
+CI 门禁覆盖构建 / 格式 / Clippy / 测试 / 覆盖率 / 审计 / 前端等；`test` job 跑 Windows / Linux / macOS，Clippy 与 MSRV 当前在 Linux + Windows。主 CI 关注正确性；变异测试（`Mutants`）为独立 workflow，不污染主 CI badge。
 
 ```bash
-# Rust 测试(nextest,比 cargo test 快 2-3 倍)
+# Rust 测试（nextest，通常比 cargo test 更快）
 cargo nextest run --all
 
-# Clippy 零警告(CI 以 -D warnings 运行)
+# Clippy 零警告（CI 以 -D warnings 运行）
 cargo clippy --all-targets --all-features -- -D warnings
 
-# 覆盖率门禁(逐 crate + regions 90,与 CI 同源)
+# 覆盖率门禁（逐 crate + regions ≥ 90，与 CI 同源）
 bash scripts/ci/coverage.sh
 
 # 前端测试
@@ -211,10 +243,10 @@ cd frontend && bun run test
 2. 代码标识符使用英文；注释、文档、提交信息使用中文。
 3. 提交信息格式：`<类型>(<范围>): <简要描述>`。
 4. 确保 `cargo clippy --all-targets --all-features -- -D warnings` 零警告。
-5. 新功能需附带测试，核心 crate 覆盖率不低于 90%。
-6. 所有 unsafe 代码必须有 Safety 注释。
+5. 新功能需附带测试，核心 crate 覆盖率不低于 90% regions。
+6. 所有 `unsafe` 代码必须有 Safety 注释。
 
-更多细节见 [docs/user-guide.md](docs/user-guide.md)。
+更多细节见 [docs/user-guide.md](docs/user-guide.md) 与 [AGENTS.md](AGENTS.md)。
 
 ---
 
