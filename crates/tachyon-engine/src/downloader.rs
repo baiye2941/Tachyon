@@ -4997,10 +4997,7 @@ impl DownloadTask {
     #[cfg(feature = "magnet")]
     fn should_try_bt_fallback(&self, err: &DownloadError) -> bool {
         self.bt_fallback.is_some()
-            && !matches!(
-                err,
-                DownloadError::Cancelled | DownloadError::Paused
-            )
+            && !matches!(err, DownloadError::Cancelled | DownloadError::Paused)
     }
 
     #[cfg(not(feature = "magnet"))]
@@ -12420,11 +12417,7 @@ mod tests {
         for i in 0..2u64 {
             let start = i * frag_size;
             let end = start + frag_size - 1;
-            mock = mock.with_range_data(
-                start,
-                end,
-                Bytes::from(vec![0xABu8; frag_size as usize]),
-            );
+            mock = mock.with_range_data(start, end, Bytes::from(vec![0xABu8; frag_size as usize]));
         }
         mock = mock.with_chunk_delay(Duration::from_millis(40));
         let protocol: Arc<dyn Protocol> = Arc::new(mock);

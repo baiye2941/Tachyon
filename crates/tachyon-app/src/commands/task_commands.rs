@@ -498,12 +498,7 @@ pub(crate) async fn probe_and_save_metadata(
         }
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
-            mark_task_failed_with_reason_and_cleanup(
-                state,
-                task_id,
-                Some(e.to_string()),
-            )
-            .await;
+            mark_task_failed_with_reason_and_cleanup(state, task_id, Some(e.to_string())).await;
             None
         }
     }
@@ -620,11 +615,7 @@ pub(crate) fn extract_fail_reason(
     match result {
         Ok(()) => None,
         Err(e) => {
-            let status = state
-                .domain
-                .task_repository
-                .get(task_id)
-                .map(|t| t.status);
+            let status = state.domain.task_repository.get(task_id).map(|t| t.status);
             if matches!(
                 status,
                 Some(DownloadState::Cancelled | DownloadState::Paused)
