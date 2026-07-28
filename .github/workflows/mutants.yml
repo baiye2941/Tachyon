@@ -1,0 +1,50 @@
+# 变异测试 (cargo-mutants)
+#
+# 从主 CI 拆出: job 超时在 GHA 记为 cancelled, continue-on-error 挡不住,
+# 会把整次 CI workflow 标红,污染 README badge。
+# 本 workflow 独立展示,失败不影响 CI 通过状态。
+name: Mutants
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/tachyon-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/ci/mutants.sh'
+      - '.github/workflows/mutants.yml'
+  schedule:
+    # 每周一 03:00 UTC 全量抽检
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: 变异测试 (tachyon-core)
+    runs-on: ubuntu-latest
+    # 主 CI 已覆盖正确性; 本 job 可拉长, 避免 45m 硬砍
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: mutants
+      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - name: 安装 cargo-mutants
+        run: cargo binstall -y --force cargo-mutants
+      - name: 变异测试 (tachyon-core)
+        run: bash scripts/ci/mutants.sh

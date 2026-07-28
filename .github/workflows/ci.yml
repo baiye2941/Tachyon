@@ -358,29 +358,6 @@ jobs:
           TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2
           TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2
 
-  # 审计 E-01: 变异测试验证测试断言强度。极慢,仅 main push 运行,不阻断 ci-pass。
-  # continue-on-error: 超时/失败不把整次 workflow 标红(badge 看 push 状态时更干净)
-  mutants:
-    name: 变异测试 (cargo-mutants)
-    needs: [changes]
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.run_rust == 'true'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-ubuntu-deps
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: stable
-          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
-          cache-key-suffix: mutants
-      - uses: cargo-bins/cargo-binstall@v1.21.0
-      - name: 安装 cargo-mutants
-        run: cargo binstall -y --force cargo-mutants
-      - name: 变异测试 (tachyon-core)
-        run: bash scripts/ci/mutants.sh
-
   frontend:
     name: 前端检查
     needs: [changes]
