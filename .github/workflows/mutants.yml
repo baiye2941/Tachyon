@@ -43,7 +43,7 @@ jobs:
           toolchain: stable
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: mutants
-      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - uses: cargo-bins/cargo-binstall@v1.21.1
       - name: 安装 cargo-mutants
         run: cargo binstall -y --force cargo-mutants
       - name: 变异测试 (tachyon-core)
