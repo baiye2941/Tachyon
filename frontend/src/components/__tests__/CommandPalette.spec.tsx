@@ -709,4 +709,15 @@ describe("CommandPalette", () => {
       expect(panel!.classList.contains("cmd-panel--narrow")).toBe(true);
     });
   });
+
+  describe("边框流光", () => {
+    it("命令面板挂载 glow-border 类(hover 边框流光)", async () => {
+      const { container } = renderPalette();
+      await waitForRaf();
+
+      const panel = container.querySelector(".cmd-panel");
+      expect(panel).toBeTruthy();
+      expect(panel!.classList.contains("glow-border")).toBe(true);
+    });
+  });
 });

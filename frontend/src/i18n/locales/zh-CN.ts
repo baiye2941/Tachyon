@@ -269,6 +269,8 @@ const zhCN = {
   "detail.retryWithMirrorHint": "通过 hf-mirror.com 镜像重新下载",
   "detail.copy.aria": "复制",
   "detail.copied.aria": "已复制",
+  "detail.url.expand": "展开完整链接",
+  "detail.url.collapse": "收起链接",
   "detail.resizeHandleAria": "调整详情面板宽度",
   "detail.section.diagnostics": "失败诊断",
   "detail.diagnostics.expand": "展开诊断",
@@ -297,6 +299,47 @@ const zhCN = {
   "error.hint.notFound": "链接已失效(404),请确认链接正确或更换镜像源",
   "error.title.timeout": "连接超时",
   "error.hint.timeout": "网络响应过慢,请检查网络后重试或更换镜像源",
+  "error.title.noPeers": "无可用节点",
+  "error.hint.noPeers":
+    "磁力链接长时间找不到 peer。可能是死种、tracker 不可达,或 SOCKS 下 DHT 已关闭。建议:换带 tr=https:// 的磁力、检查代理,或稍后重试",
+  "error.title.btStall": "磁力传输停滞",
+  "error.hint.btStall":
+    "已连接但长时间无数据。可能是死 swarm 或 peer 不提供该分片。可重试、补充 HTTPS tracker,或检查代理",
+  "detail.peer.title": "节点发现",
+  "detail.peer.discovering": "发现节点中",
+  "detail.peer.zeroLive": "0 可用节点",
+  "detail.peer.live": "可用 {n}",
+  "detail.peer.connecting": "连接中 {n}",
+  "detail.peer.queued": "排队 {n}",
+  "detail.peer.whyNoPeers": "为什么找不到节点?",
+  "detail.peer.hint.socks":
+    "系统代理/SOCKS 下 DHT 与 UDP tracker 不可用,只能靠 HTTP(S) tracker 找节点。请:①订阅并同步 Tracker 列表 ②磁力自带 tr=https:// ③或关闭系统代理后直连再试",
+  "detail.peer.hint.direct":
+    "当前无可用节点。国内直连下 DHT/UDP 也常被干扰。请补充 HTTPS tracker、换热种,或检查网络/防火墙",
+  "settings.magnet.socksHttpsHint":
+    "启用 SOCKS 后:UDP tracker 过滤、DHT 强制关闭、自动追加 HTTPS tracker。发现 peer 几乎只靠 HTTP(S) announce",
+  "settings.magnet.sectionSubscription": "Tracker 订阅",
+  "settings.magnet.subscriptionEnabled": "启用公共 Tracker 订阅",
+  "settings.magnet.subscriptionUrl": "订阅源 URL",
+  "settings.magnet.subscriptionUrlHint":
+    "默认 best.txt(精选)。SOCKS 下 UDP 会被过滤,仍保留 HTTP/HTTPS。也可选手动输入镜像地址。",
+  "settings.magnet.subscriptionPreset.best": "精选 best",
+  "settings.magnet.subscriptionPreset.http": "仅 HTTP(S)",
+  "settings.magnet.subscriptionPreset.all": "完整 all",
+  "settings.magnet.subscriptionLastUpdated": "上次成功:{t}",
+  "settings.magnet.subscriptionNeverUpdated": "尚未成功更新过",
+  "settings.magnet.subscriptionListCount": "列表 {n} 条",
+  "settings.magnet.subscriptionRefresh": "立即更新并同步列表",
+  "settings.magnet.subscriptionRefreshing": "正在拉取…",
+  "settings.magnet.subscriptionRefreshSuccess":
+    "已同步到 Tracker 列表:共 {n} 条(订阅源贡献 {s} 条)。BT Session 已重建,新磁力任务生效。",
+  "settings.magnet.subscriptionRefreshFailed": "订阅更新失败:{error}",
+  "settings.magnet.subscriptionDisabledToast": "请先打开「启用公共 Tracker 订阅」",
+  "settings.magnet.subscriptionUrlEmpty": "订阅源 URL 不能为空",
+  "settings.magnet.subscriptionSyncHint":
+    "成功后下方 Tracker 列表会自动刷新。手动添加的条目会保留并排在前面。",
+  "settings.magnet.subscriptionCollapsed":
+    "订阅源已禁用 · 当前列表共 {n} 条 tracker,打开开关后可配置订阅源",
   "error.title.ssl": "证书错误",
   "error.hint.ssl": "SSL/TLS 证书校验失败,可能是系统时间错误或中间人攻击",
   "error.title.diskFull": "磁盘空间不足",
@@ -544,17 +587,17 @@ const zhCN = {
   "settings.magnet.peerReadWriteTimeout": "Peer 读写超时",
   "settings.magnet.forceTrackerInterval": "强制 Tracker 间隔",
   "settings.magnet.deferWritesUpToMb": "延迟写入缓冲",
-  "settings.magnet.disableDhtWhenSocks": "SOCKS5 时禁用 DHT",
+  "settings.magnet.disableDhtWhenSocks": "SOCKS5 时禁用 DHT(推荐)",
   "settings.magnet.peerConnectTimeoutHint":
     "1-300 秒。超时后淘汰死 peer,快于默认 10s 可加速 swarm 刷新。",
   "settings.magnet.peerReadWriteTimeoutHint":
-    "1-600 秒。单次读写无数据的淘汰阈值,过大易卡死 swarm。",
+    "1-600 秒。读写超时过短会导致慢 peer 被误杀。",
   "settings.magnet.forceTrackerIntervalHint":
-    "0=禁用(遵循 tracker 默认),30-3600 秒强制重 announce。较短间隔加速冷启动 peer 发现。",
+    "0=禁用(遵循 tracker interval),30-3600 秒。更短间隔可更勤 announce。",
   "settings.magnet.deferWritesUpToMbHint":
     "0=禁用(同步写入),1-256 MB。攒满后批量落盘,减少慢盘 I/O 等待。",
   "settings.magnet.disableDhtWhenSocksHint":
-    "DHT 走 UDP,SOCKS5 不代理 UDP。启用此项避免无谓的超时等待。",
+    "SOCKS5 不代理 UDP。即使关闭本开关,运行时仍会禁 DHT,避免 bootstrap 失败刷屏。要 DHT 请直连或 TUN 放行 UDP 且不走 SOCKS。",
   "settings.magnet.restartRequired": "需重启生效",
   "settings.magnet.newTaskOnly": "对新任务生效",
   "settings.magnet.sectionPeer": "Peer 超时",

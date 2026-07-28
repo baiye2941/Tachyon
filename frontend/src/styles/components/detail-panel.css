@@ -208,40 +208,6 @@
    Detail Panel — Stats, Info, Menu, Diagnostics
    ============================================ */
 
-.detail-stat-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-}
-
-.detail-stat-cell {
-  padding: 8px 6px 8px 0;
-  border-bottom: 1px solid var(--color-border-subtle);
-  min-width: 0;
-}
-
-.detail-stat-label {
-  font-size: 11px;
-  color: var(--color-text-tertiary);
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  white-space: nowrap;
-}
-
-.detail-stat-value {
-  font-family: var(--font-mono);
-  font-size: 14px;
-  color: var(--color-text-primary);
-  margin-top: 2px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.detail-stat-value--highlight {
-  color: var(--color-accent-primary);
-  font-weight: 600;
-}
-
 .detail-info-row {
   display: flex;
   align-items: center;
@@ -265,6 +231,116 @@
   margin-top: 2px;
   overflow-wrap: break-word;
   word-break: break-all;
+}
+
+/* 可折叠长值(下载链接):默认单行省略,展开恢复 break-all */
+.detail-info-value--clamped {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: normal;
+}
+
+/* ============================================
+   Peer Discovery — BT 节点发现状态卡
+   圆点为真实语义状态(仅此处使用):常亮=有可用节点,
+   脉冲=发现中/连接中,琥珀=0 可用。
+   ============================================ */
+.peer-discovery {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-subtle);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.peer-discovery-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.peer-discovery-title {
+  font-weight: 500;
+  color: var(--color-text-title);
+}
+
+.peer-discovery-count {
+  margin-left: auto;
+  font-size: 11px;
+  text-align: right;
+}
+
+.peer-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.peer-dot--live {
+  background: var(--color-accent-primary);
+}
+
+.peer-dot--searching {
+  background: var(--color-accent-primary);
+  animation: peer-dot-pulse 1.6s ease-in-out infinite;
+}
+
+.peer-dot--stalled {
+  background: var(--color-warning);
+}
+
+@keyframes peer-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* 长提示折叠行:复用 disclosure 视觉,弱化一档 */
+.peer-discovery-why {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 6px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  transition: color 150ms ease;
+}
+
+.peer-discovery-why:hover {
+  color: var(--color-text-secondary);
+}
+
+.peer-discovery-why:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.peer-discovery-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .peer-dot--searching {
+    animation: none;
+    opacity: 0.7;
+  }
 }
 
 .detail-menu {
@@ -544,20 +620,6 @@
   letter-spacing: -0.01em;
 }
 
-.detail-action-delete {
-  color: var(--color-error);
-  background: color-mix(in srgb, var(--color-error) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-error) 20%, transparent);
-}
-
-.detail-action-delete:hover {
-  background: color-mix(in srgb, var(--color-error) 18%, transparent);
-}
-
-.detail-action-delete:active {
-  transform: scale(0.98);
-}
-
 /* Tags */
 .detail-tags-header {
   display: flex;
@@ -619,16 +681,4 @@
 .detail-tags-input {
   flex: 1;
   min-width: 0;
-}
-
-.bandwidth-sparkline svg {
-  width: 100%;
-  height: 40px;
-  display: block;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .bandwidth-sparkline-chevron {
-    transition: none;
-  }
 }

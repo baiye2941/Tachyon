@@ -10,6 +10,9 @@ export interface GeneralTabProps {
   onChooseDownloadDir: () => void;
   onExportBackup: () => void;
   onImportBackup: () => void;
+  /** 导出/导入进行中状态(原页脚常驻按钮的 loading 反馈,随唯一入口迁入备份区) */
+  exporting: boolean;
+  importing: boolean;
 }
 
 export default function GeneralTab(props: GeneralTabProps) {
@@ -50,35 +53,38 @@ export default function GeneralTab(props: GeneralTabProps) {
         </div>
       </div>
 
-      <ToggleItem
-        label={t("settings.notifications.enabled")}
-        value={props.draft.notifications.enabled}
-        onChange={(v) => props.setDraft("notifications", "enabled", v)}
-      />
-      <div
-        style={{
-          "font-size": "11px",
-          color: "var(--color-text-tertiary)",
-          "margin-top": "-12px",
-        }}
-      >
-        {t("settings.notifications.enabledHint")}
+      {/* hint 与开关包在同组内小间距排列,不再用负 margin 贴合 */}
+      <div class="flex flex-col gap-1">
+        <ToggleItem
+          label={t("settings.notifications.enabled")}
+          value={props.draft.notifications.enabled}
+          onChange={(v) => props.setDraft("notifications", "enabled", v)}
+        />
+        <div
+          style={{
+            "font-size": "11px",
+            color: "var(--color-text-tertiary)",
+          }}
+        >
+          {t("settings.notifications.enabledHint")}
+        </div>
       </div>
 
       {/* P1-23-A: 剪贴板监听开关 */}
-      <ToggleItem
-        label={t("settings.clipboard.enableWatch")}
-        value={props.draft.clipboard.enableWatch}
-        onChange={(v) => props.setDraft("clipboard", "enableWatch", v)}
-      />
-      <div
-        style={{
-          "font-size": "11px",
-          color: "var(--color-text-tertiary)",
-          "margin-top": "-12px",
-        }}
-      >
-        {t("settings.clipboard.enableWatchHint")}
+      <div class="flex flex-col gap-1">
+        <ToggleItem
+          label={t("settings.clipboard.enableWatch")}
+          value={props.draft.clipboard.enableWatch}
+          onChange={(v) => props.setDraft("clipboard", "enableWatch", v)}
+        />
+        <div
+          style={{
+            "font-size": "11px",
+            color: "var(--color-text-tertiary)",
+          }}
+        >
+          {t("settings.clipboard.enableWatchHint")}
+        </div>
       </div>
 
       <div
@@ -111,6 +117,7 @@ export default function GeneralTab(props: GeneralTabProps) {
             <Button
               variant="secondary"
               size="sm"
+              loading={props.exporting}
               onClick={props.onExportBackup}
             >
               {t("settings.backup.export")}
@@ -129,6 +136,7 @@ export default function GeneralTab(props: GeneralTabProps) {
             <Button
               variant="secondary"
               size="sm"
+              loading={props.importing}
               onClick={props.onImportBackup}
             >
               {t("settings.backup.import")}

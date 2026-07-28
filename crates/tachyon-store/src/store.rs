@@ -237,6 +237,10 @@ impl FileStore {
             )
         })?;
 
+        // 启动时清理本目录内原子写残留临时文件(崩溃中断 rename 后遗留)。
+        // 仅匹配自身命名规则 `<safe_key>.tmp.<pid>-<n>`,不触碰无关文件或子目录。
+        cleanup_stale_atomic_write_temps(&dir);
+
         Ok(Self {
             dir,
             write_lock: RwLock::new(()),
@@ -424,6 +428,46 @@ fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 清理 FileStore 原子写残留临时文件。
+///
+/// 命名规则与 `write_entry` 一致:`<safe_key>.tmp.<pid>-<n>`。
+/// 只删除本 store 目录内的普通文件;子目录、`.lock`、`.json` 与无关文件保留。
+fn cleanup_stale_atomic_write_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if is_atomic_write_temp_name(name)
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "清理原子写残留临时文件失败"
+            );
+        }
+    }
+}
+
+fn is_atomic_write_temp_name(name: &str) -> bool {
+    // 形如 `task_alpha.tmp.4242-7` 或 percent-encoded key 后的 `.tmp.<pid>-<n>`。
+    // 要求至少一段前缀 + `.tmp.` + 非空后缀,排除 `.lock` / `.json`。
+    let Some((prefix, suffix)) = name.rsplit_once(".tmp.") else {
+        return false;
+    };
+    !prefix.is_empty() && !suffix.is_empty() && !name.ends_with(".json") && name != ".lock"
+}
+
 impl Store for FileStore {
     fn get(&self, key: &str) -> std::io::Result<Option<String>> {
         let path = self.path_for(key);
@@ -453,7 +497,7 @@ impl Store for FileStore {
                 let mut attempts = 0;
                 loop {
                     match std::fs::remove_file(&path) {
-                        Ok(()) => return Ok(true),
+                        Ok(()) => break,
                         Err(e)
                             if e.kind() == std::io::ErrorKind::PermissionDenied && attempts < 5 =>
                         {
@@ -467,8 +511,10 @@ impl Store for FileStore {
             #[cfg(not(target_os = "windows"))]
             {
                 std::fs::remove_file(&path)?;
-                Ok(true)
             }
+            // 成功删除后同步目录项,使 delete 的 durable 语义与 set_durable 对齐。
+            sync_directory(&self.dir)?;
+            Ok(true)
         } else {
             Ok(false)
         }
@@ -916,6 +962,39 @@ mod tests {
 
         let leftover = collect_temp_files(tmp.path());
         assert!(leftover.is_empty(), "目录中残留临时文件: {leftover:?}");
+    }
+
+    #[test]
+    fn file_open_removes_stale_atomic_write_temps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join("task_alpha.tmp.4242-7");
+        std::fs::write(&stale, b"partial atomic write").unwrap();
+        assert!(stale.exists());
+
+        let _store = FileStore::open(tmp.path()).unwrap();
+
+        assert!(
+            !stale.exists(),
+            "FileStore::open 应清理自身命名规则的原子写残留临时文件"
+        );
+    }
+
+    #[test]
+    fn file_open_preserves_files_outside_atomic_write_temp_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keep_json = tmp.path().join("task_alpha.json");
+        let keep_note = tmp.path().join("notes.txt");
+        let keep_subdir = tmp.path().join("task_alpha.tmp.dir");
+        std::fs::write(&keep_json, br#"{"ok":true}"#).unwrap();
+        std::fs::write(&keep_note, b"keep me").unwrap();
+        std::fs::create_dir(&keep_subdir).unwrap();
+        std::fs::write(keep_subdir.join("inner"), b"x").unwrap();
+
+        let _store = FileStore::open(tmp.path()).unwrap();
+
+        assert!(keep_json.exists(), "正式 json 条目不得被清理");
+        assert!(keep_note.exists(), "无关普通文件不得被清理");
+        assert!(keep_subdir.is_dir(), "相似名称子目录不得被清理");
     }
 
     /// B7-temp: rename 失败路径应清理真正的临时文件

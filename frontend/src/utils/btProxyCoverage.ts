@@ -35,19 +35,19 @@ export function computeBtProxyCoverage(config: BtProxyCoverageInput): BtProxyCov
       socksEndpointRedacted: null,
     }
   }
-
-  // SOCKS 启用:peer TCP / HTTP tracker 经 socks_proxy_url;UDP/DHT 看 disableDhtWhenSocks;
-  // uTP 基于 UDP(SOCKS5 不代理 UDP)-> MayBypass;UPnP 局域网 -> MayBypass/Disabled
+  // SOCKS 启用:peer TCP / HTTP tracker 经代理;
+  // UDP tracker+DHT:SOCKS5 不代理 UDP,运行时强制禁 DHT → 恒 Blocked
+  // uTP 基于 UDP → MayBypass;UPnP 局域网 → MayBypass/Disabled
   return {
     socksEnabled: true,
     peerTcp: "ViaProxy",
     httpTracker: "ViaProxy",
-    udpTrackerDht: config.disableDhtWhenSocks ? "Blocked" : "MayBypass",
+    udpTrackerDht: "Blocked",
     utp: "MayBypass",
     upnp,
     socksSource: "explicit",
     socksEndpointRedacted: null,
-  }
+  };
 }
 
 // 保留 MagnetConfig 重导出以兼容调用方(完整配置也满足 BtProxyCoverageInput 结构)

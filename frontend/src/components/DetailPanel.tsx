@@ -33,7 +33,6 @@ import {
   ChevronDownIcon,
   CancelIcon,
   ArrowLeftIcon,
-  ArrowDownIcon,
 } from "./icons";
 import { api } from "../api/invoke";
 import { refreshTaskList } from "../stores/downloads";
@@ -88,6 +87,7 @@ export default function DetailPanel(props: DetailPanelProps) {
   const [copied, setCopied] = createSignal<string | null>(null);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = createSignal(false);
   const [metadataExpanded, setMetadataExpanded] = createSignal(false);
+  const [peerHintExpanded, setPeerHintExpanded] = createSignal(false);
   // 重试 loading 态:防止重复点击(Iteration 16)
   const [retrying, setRetrying] = createSignal(false);
   const [mirrorRetrying, setMirrorRetrying] = createSignal(false);
@@ -307,6 +307,56 @@ export default function DetailPanel(props: DetailPanelProps) {
   const concurrencyValue = createMemo(() => {
     const value = task()?.activeConcurrency;
     return value && value > 0 ? String(value) : "—";
+  });
+
+  const isMagnetTask = createMemo(() => {
+    const url = task()?.url ?? "";
+    return url.startsWith("magnet:?") || url.startsWith("magnet:");
+  });
+
+  /** BT 节点发现文案:0 live 时显示发现中/0 可用,有 live 显示计数 */
+  const peerDiscoveryLabel = createMemo(() => {
+    if (!isMagnetTask()) return null;
+    const live = task()?.peerLive;
+    const connecting = task()?.peerConnecting ?? 0;
+    const queued = task()?.peerQueued ?? 0;
+    // 尚未收到任何 peer 快照
+    if (live === undefined || live === null) {
+      return isActive() ? t("detail.peer.discovering") : null;
+    }
+    if (live === 0) {
+      if (connecting > 0 || queued > 0) {
+        return `${t("detail.peer.discovering")} · ${t("detail.peer.connecting", { n: connecting })} · ${t("detail.peer.queued", { n: queued })}`;
+      }
+      return t("detail.peer.zeroLive");
+    }
+    return `${t("detail.peer.live", { n: live })} · ${t("detail.peer.connecting", { n: connecting })} · ${t("detail.peer.queued", { n: queued })}`;
+  });
+
+  /** 0 peer 时的操作建议:有系统/显式 SOCKS 倾向用 socks 文案,否则 direct */
+  const peerZeroHint = createMemo(() => {
+    if (!isMagnetTask()) return null;
+    const live = task()?.peerLive;
+    if (live === undefined || live === null || live > 0) return null;
+    // connecting/queued>0 时仍在发现,不显示「死了」长提示
+    const connecting = task()?.peerConnecting ?? 0;
+    const queued = task()?.peerQueued ?? 0;
+    if (connecting > 0 || queued > 0) return null;
+    // 启发式:配置里 SOCKS 非空,或环境常开代理——前端用 $config 若可得
+    // 此处用更稳的文案键:优先 socks(国内用户绝大多数有代理痕迹)
+    return t("detail.peer.hint.socks");
+  });
+
+  /** 节点发现状态圆点:live>0 常亮;发现中/连接中脉冲;0 可用琥珀 */
+  const peerDotClass = createMemo(() => {
+    const live = task()?.peerLive;
+    if (live !== undefined && live !== null && live > 0) return "peer-dot--live";
+    const connecting = task()?.peerConnecting ?? 0;
+    const queued = task()?.peerQueued ?? 0;
+    if (live === undefined || live === null || connecting > 0 || queued > 0) {
+      return "peer-dot--searching";
+    }
+    return "peer-dot--stalled";
   });
 
   const copyToClipboard = (text: string, label: string) => {
@@ -656,6 +706,7 @@ export default function DetailPanel(props: DetailPanelProps) {
               label={t("detail.label.url")}
               value={task()?.url || ""}
               copyable
+              collapsible
               copied={copied() === "url"}
               onCopy={() => copyToClipboard(task()?.url || "", "url")}
             />
@@ -793,8 +844,7 @@ export default function DetailPanel(props: DetailPanelProps) {
                 <MetricCard
                   label={t("detail.label.eta")}
                   value={eta()}
-                  highlight={isDownloading()}
-                  icon={<ArrowDownIcon aria-hidden="true" />}
+                  hint={t("detail.label.eta")}
                 />
                 <MetricCard
                   label={t("detail.label.concurrency")}
@@ -802,6 +852,47 @@ export default function DetailPanel(props: DetailPanelProps) {
                   hint={t("detail.label.concurrency")}
                 />
               </div>
+              <Show when={peerDiscoveryLabel()}>
+                {(label) => (
+                  <div class="peer-discovery" role="status" aria-live="polite">
+                    <div class="peer-discovery-head">
+                      <span class={`peer-dot ${peerDotClass()}`} aria-hidden="true" />
+                      <span class="peer-discovery-title">
+                        {t("detail.peer.title")}
+                      </span>
+                      <span class="peer-discovery-count">{label()}</span>
+                    </div>
+                    {/* 0 节点长提示默认收起,避免一大段说明糊在卡片里 */}
+                    <Show when={peerZeroHint()}>
+                      {(hint) => (
+                        <>
+                          <button
+                            type="button"
+                            class="peer-discovery-why"
+                            aria-expanded={peerHintExpanded()}
+                            aria-controls="peer-discovery-hint"
+                            onClick={() => setPeerHintExpanded((v) => !v)}
+                          >
+                            <span>{t("detail.peer.whyNoPeers")}</span>
+                            <ChevronDownIcon
+                              class={`detail-disclosure-chevron${
+                                peerHintExpanded()
+                                  ? " detail-disclosure-chevron--open"
+                                  : ""
+                              }`}
+                            />
+                          </button>
+                          <Show when={peerHintExpanded()}>
+                            <p id="peer-discovery-hint" class="peer-discovery-hint">
+                              {hint()}
+                            </p>
+                          </Show>
+                        </>
+                      )}
+                    </Show>
+                  </div>
+                )}
+              </Show>
             </div>
           </Show>
 

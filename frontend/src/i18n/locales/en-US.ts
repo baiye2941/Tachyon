@@ -274,6 +274,8 @@ const enUS = {
   "detail.retryWithMirrorHint": "Redownload via hf-mirror.com",
   "detail.copy.aria": "Copy",
   "detail.copied.aria": "Copied",
+  "detail.url.expand": "Show full link",
+  "detail.url.collapse": "Collapse link",
   "detail.resizeHandleAria": "Resize detail panel width",
   "detail.section.diagnostics": "Failure diagnostics",
   "detail.diagnostics.expand": "Expand diagnostics",
@@ -305,6 +307,47 @@ const enUS = {
   "error.title.timeout": "Connection timeout",
   "error.hint.timeout":
     "Network is slow. Check your connection, retry, or use a mirror.",
+  "error.title.noPeers": "No peers available",
+  "error.hint.noPeers":
+    "No peers found for this magnet. The swarm may be dead, trackers unreachable, or DHT disabled under SOCKS. Try a magnet with tr=https://, check the proxy, or retry later.",
+  "error.title.btStall": "BitTorrent transfer stalled",
+  "error.hint.btStall":
+    "Connected but no data for a while. The swarm may be dead or peers lack this piece. Retry, add HTTPS trackers, or check the proxy.",
+  "detail.peer.title": "Peer discovery",
+  "detail.peer.discovering": "Discovering peers",
+  "detail.peer.zeroLive": "0 live peers",
+  "detail.peer.live": "Live {n}",
+  "detail.peer.connecting": "Connecting {n}",
+  "detail.peer.queued": "Queued {n}",
+  "detail.peer.whyNoPeers": "Why no peers?",
+  "detail.peer.hint.socks":
+    "Under system/SOCKS proxy, DHT and UDP trackers are unavailable. Peer discovery relies on HTTP(S) trackers. Do: (1) refresh tracker subscription (2) use magnets with tr=https:// (3) or try direct (no system proxy).",
+  "detail.peer.hint.direct":
+    "No live peers. On some networks DHT/UDP is also unreliable. Add HTTPS trackers, try a hotter swarm, or check firewall/network.",
+  "settings.magnet.socksHttpsHint":
+    "With SOCKS: UDP trackers filtered, DHT forced off, HTTPS trackers auto-appended. Discovery is almost only HTTP(S) announce.",
+  "settings.magnet.sectionSubscription": "Tracker subscription",
+  "settings.magnet.subscriptionEnabled": "Enable public tracker subscription",
+  "settings.magnet.subscriptionUrl": "Subscription URL",
+  "settings.magnet.subscriptionUrlHint":
+    "Default is best.txt (curated). Under SOCKS, UDP entries are filtered; HTTP/HTTPS remain. You can paste a CDN mirror URL.",
+  "settings.magnet.subscriptionPreset.best": "best (curated)",
+  "settings.magnet.subscriptionPreset.http": "HTTP(S) only",
+  "settings.magnet.subscriptionPreset.all": "all",
+  "settings.magnet.subscriptionLastUpdated": "Last success: {t}",
+  "settings.magnet.subscriptionNeverUpdated": "Never updated successfully",
+  "settings.magnet.subscriptionListCount": "{n} in list",
+  "settings.magnet.subscriptionRefresh": "Refresh & sync list",
+  "settings.magnet.subscriptionRefreshing": "Fetching…",
+  "settings.magnet.subscriptionRefreshSuccess":
+    "Synced to Tracker list: {n} total ({s} from source). BT session rebuilt; applies to new magnet tasks.",
+  "settings.magnet.subscriptionRefreshFailed": "Subscription failed: {error}",
+  "settings.magnet.subscriptionDisabledToast": "Enable public tracker subscription first",
+  "settings.magnet.subscriptionUrlEmpty": "Subscription URL cannot be empty",
+  "settings.magnet.subscriptionSyncHint":
+    "On success the Tracker list below refreshes automatically. Manually added entries are kept and sorted first.",
+  "settings.magnet.subscriptionCollapsed":
+    "Subscription disabled · {n} trackers in list. Turn on the toggle to configure the feed.",
   "error.title.ssl": "Certificate error",
   "error.hint.ssl":
     "SSL/TLS certificate validation failed. Check system time or possible MITM.",
@@ -565,17 +608,17 @@ const enUS = {
   "settings.magnet.peerReadWriteTimeout": "Peer read/write timeout",
   "settings.magnet.forceTrackerInterval": "Forced tracker interval",
   "settings.magnet.deferWritesUpToMb": "Deferred write buffer",
-  "settings.magnet.disableDhtWhenSocks": "Disable DHT under SOCKS5",
+  "settings.magnet.disableDhtWhenSocks": "Disable DHT under SOCKS5 (recommended)",
   "settings.magnet.peerConnectTimeoutHint":
     "1-300s. Drops dead peers faster than the default 10s to refresh the swarm.",
   "settings.magnet.peerReadWriteTimeoutHint":
-    "1-600s. Eviction threshold for a read/write with no data; too large stalls the swarm.",
+    "1-600s. Too short may kill slow but valid peers.",
   "settings.magnet.forceTrackerIntervalHint":
-    "0=disabled (honor tracker default), 30-3600s forces re-announce. Shorter intervals speed up cold-start peer discovery.",
+    "0=disabled (use tracker interval), 30-3600s. Shorter = more frequent announce.",
   "settings.magnet.deferWritesUpToMbHint":
-    "0=disabled (synchronous writes), 1-256 MB. Buffers then flushes in batches to reduce slow-disk I/O wait.",
+    "0=disabled (sync writes), 1-256 MB. Buffers then flushes in batches to reduce slow-disk I/O wait.",
   "settings.magnet.disableDhtWhenSocksHint":
-    "DHT runs over UDP, which SOCKS5 does not proxy. Enable to avoid needless timeout waits.",
+    "SOCKS5 does not proxy UDP. Even if you turn this off, runtime still disables DHT to avoid failed bootstrap spam. For DHT, use direct connectivity or TUN with UDP and without SOCKS.",
   "settings.magnet.restartRequired": "Restart required",
   "settings.magnet.newTaskOnly": "New tasks only",
   "settings.magnet.sectionPeer": "Peer timeouts",

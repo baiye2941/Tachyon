@@ -311,3 +311,79 @@ describe("TaskItem", () => {
     expect(row).toBeTruthy();
   });
 });
+
+describe("TaskItem 速度重复显示修复", () => {
+  // speed = 1 MiB/s,formatSpeed 得 "1.0 MB/s"
+  const downloadingTask: TaskInfo = {
+    ...task,
+    id: "dup-speed-1",
+    status: "downloading",
+    progress: 0.5,
+    downloaded: 512 * 1024,
+    speed: 1024 * 1024,
+  };
+
+  /** 统计子串出现次数(字面量切分,避免正则转义噪音) */
+  const countOccurrences = (text: string, needle: string) =>
+    text.split(needle).length - 1;
+
+  beforeEach(() => {
+    $taskColumns.resetColumns();
+  });
+
+  afterEach(() => {
+    cleanup();
+    // 恢复默认列配置,避免污染其他用例
+    $taskColumns.resetColumns();
+  });
+
+  it("speed 列可见时 meta 行不重复显示速度,整行速度文本仅 1 次", () => {
+    const { container } = renderWithI18n(() => (
+      <TaskItem
+        task={downloadingTask}
+        index={0}
+        isSelected={false}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    // speed 列单元格(下载中带 active-speed 标记)应含速度
+    const speedCell = container.querySelector(".task-list-cell--active-speed");
+    expect(speedCell?.textContent).toContain("1.0 MB/s");
+
+    // meta 行不应再拼速度
+    const meta = container.querySelector(".task-file-meta");
+    expect(meta?.textContent).not.toContain("1.0 MB/s");
+
+    // 整行速度文本仅出现 1 次
+    const row = screen.getByRole("button", { name: /annual-report-2025\.pdf/ });
+    expect(countOccurrences(row.textContent ?? "", "1.0 MB/s")).toBe(1);
+  });
+
+  it("speed 列隐藏时 meta 行兜底显示速度,整行速度文本仍仅 1 次", () => {
+    $taskColumns.toggleVisibility("speed");
+
+    const { container } = renderWithI18n(() => (
+      <TaskItem
+        task={downloadingTask}
+        index={0}
+        isSelected={false}
+        isMultiSelected={false}
+        isMultiSelectMode={false}
+        onClick={() => {}}
+        density="comfortable"
+      />
+    ));
+
+    // speed 列已隐藏,meta 行兜底含速度
+    const meta = container.querySelector(".task-file-meta");
+    expect(meta?.textContent).toContain("1.0 MB/s");
+
+    // 整行速度文本仍仅出现 1 次
+    const row = screen.getByRole("button", { name: /annual-report-2025\.pdf/ });
+    expect(countOccurrences(row.textContent ?? "", "1.0 MB/s")).toBe(1);
+  });
+});

@@ -35,8 +35,25 @@ export interface FailureInsight {
 function parseExplicitError(reason: string): FailureInsight {
   const lower = reason.toLowerCase()
   let insight: Omit<FailureInsight, 'rawReason'>
-  // HTTP 状态码类
-  if (/401|403|unauthor|forbidden/.test(lower)) {
+  // BT/磁力:无可用 peer(优先于通用 timeout,因中文错误也含「超时」)
+  if (
+    /无可用 peer|no available peer|live\s*=\s*0/.test(reason) ||
+    /无可用 peer/.test(lower)
+  ) {
+    insight = {
+      category: 'network',
+      title: tr('error.title.noPeers'),
+      hint: tr('error.hint.noPeers'),
+      retryable: true,
+    }
+  } else if (/stall 超时|stall timeout|死 swarm|dead swarm/.test(reason)) {
+    insight = {
+      category: 'network',
+      title: tr('error.title.btStall'),
+      hint: tr('error.hint.btStall'),
+      retryable: true,
+    }
+  } else if (/401|403|unauthor|forbidden/.test(lower)) {
     insight = {
       category: 'auth',
       title: tr('error.title.accessDenied'),
@@ -50,7 +67,7 @@ function parseExplicitError(reason: string): FailureInsight {
       hint: tr('error.hint.notFound'),
       retryable: false,
     }
-  } else if (/timeout|timed out/.test(lower)) {
+  } else if (/timeout|timed out|超时/.test(lower)) {
     insight = {
       category: 'network',
       title: tr('error.title.timeout'),

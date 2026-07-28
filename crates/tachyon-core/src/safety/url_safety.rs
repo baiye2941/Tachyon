@@ -196,6 +196,11 @@ fn classify_restricted_ipv6(ip: Ipv6Addr) -> Option<RestrictedIpKind> {
         return classify_restricted_ipv4(mapped);
     }
 
+    // IPv6 过渡技术嵌入的 IPv4 同样走 IPv4 受限分类,堵住 NAT64/6to4/Teredo 绕过。
+    if let Some(embedded) = extract_transition_embedded_ipv4(ip) {
+        return classify_restricted_ipv4(embedded);
+    }
+
     let segments = ip.segments();
     let first_segment = segments[0];
     let unique_local = (first_segment & 0xfe00) == 0xfc00;
@@ -213,6 +218,33 @@ fn classify_restricted_ipv6(ip: Ipv6Addr) -> Option<RestrictedIpKind> {
     } else {
         None
     }
+}
+
+/// 从 NAT64 / 6to4 / Teredo 地址提取嵌入的 IPv4。
+///
+/// - NAT64 well-known prefix `64:ff9b::/96`(RFC 6052):后 32 位为 IPv4
+/// - 6to4 `2002::/16`(RFC 3056):第 16–47 位为 IPv4
+/// - Teredo `2001:0000::/32`(RFC 4380):末 32 位为 client IPv4 的按位取反
+fn extract_transition_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = ip.octets();
+    // NAT64: 64:ff9b::/96
+    if o[0] == 0x00
+        && o[1] == 0x64
+        && o[2] == 0xff
+        && o[3] == 0x9b
+        && o[4..12].iter().all(|&b| b == 0)
+    {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 6to4: 2002::/16
+    if o[0] == 0x20 && o[1] == 0x02 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // Teredo: 2001:0000::/32, client IPv4 = last 4 octets XOR 0xFF
+    if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x00 && o[3] == 0x00 {
+        return Some(Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]));
+    }
+    None
 }
 
 pub fn reject_forbidden_ip(ip: IpAddr) -> DownloadResult<()> {
@@ -416,6 +448,40 @@ mod tests {
         assert!(reject_forbidden_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_ok());
         assert!(reject_forbidden_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_ok());
         assert!(reject_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()).is_ok());
+    }
+
+    /// NAT64 / 6to4 / Teredo 嵌入受限 IPv4 必须拒绝;嵌入公网 IPv4 放行。
+    #[test]
+    fn rejects_restricted_ipv4_embedded_in_ipv6_transition_addresses() {
+        // NAT64 64:ff9b::/96 嵌入 127.0.0.1
+        let nat64_loopback: IpAddr = "64:ff9b::7f00:1".parse().unwrap();
+        // NAT64 嵌入 10.0.0.1
+        let nat64_private: IpAddr = "64:ff9b::a00:1".parse().unwrap();
+        // 6to4 2002:0a00:0001:: 嵌入 10.0.0.1
+        let sixto4_private: IpAddr = "2002:0a00:0001::1".parse().unwrap();
+        // Teredo: client IPv4 = 10.0.0.1 → 末 4 字节 XOR 0xFF = f5.ff.ff.fe
+        let teredo_private: IpAddr = "2001:0000:4136:e378:8000:63bf:f5ff:fffe".parse().unwrap();
+
+        for ip in [
+            nat64_loopback,
+            nat64_private,
+            sixto4_private,
+            teredo_private,
+        ] {
+            assert!(
+                reject_forbidden_ip(ip).is_err(),
+                "{ip} 嵌入受限 IPv4 应被拒绝"
+            );
+        }
+
+        // 嵌入公网 8.8.8.8 应放行
+        let nat64_public: IpAddr = "64:ff9b::808:808".parse().unwrap();
+        let sixto4_public: IpAddr = "2002:0808:0808::1".parse().unwrap();
+        // Teredo client 8.8.8.8 → XOR = f7.f7.f7.f7
+        let teredo_public: IpAddr = "2001:0000:4136:e378:8000:63bf:f7f7:f7f7".parse().unwrap();
+        for ip in [nat64_public, sixto4_public, teredo_public] {
+            assert!(reject_forbidden_ip(ip).is_ok(), "{ip} 嵌入公网 IPv4 应放行");
+        }
     }
 
     #[test]

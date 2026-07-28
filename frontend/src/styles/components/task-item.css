@@ -1,10 +1,15 @@
 /* ============================================
-   Task Row (premium feel: horizontal hover gradient + selected left 2px bamboo stripe + micro lift)
+   任务行(高级感:hover 横向背景渐变 + 选中态左侧 2px 竹纹 + 微 lift)
+   本文件是 .task-row 系列规则的唯一事实源
    ============================================ */
 .task-row {
   /* 显式定位:光迹(.task-item-light-trail, absolute)的包含块,
      不依赖 contain: paint 的规范副作用 */
   position: relative;
+  /* flex 布局声明合并自原 task-list.css,不可丢失 */
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
   background: transparent;
   box-shadow: inset 2px 0 0 transparent;
   transition:
@@ -51,12 +56,12 @@
   box-shadow: inset 2px 0 0 var(--color-accent-primary);
 }
 
-/* Row press: extremely subtle scale for haptic feedback without breaking list layout */
+/* 行按下:极轻微的 scale,提供触觉反馈且不破坏列表布局 */
 .task-row:active {
   transform: scale(0.995);
 }
 
-/* Light theme row hover: dark gradient for restrained visibility */
+/* 浅色主题下行 hover 用黑渐变,保持克制可见 */
 [data-theme="light"] .task-row:hover {
   background: linear-gradient(
     90deg,
@@ -66,8 +71,14 @@
   );
 }
 
-.task-row {
-  padding: 12px 16px;
+/* 拖拽排序:放置目标行底部 2px 指示条 */
+.task-row--drop-target {
+  box-shadow: inset 0 -2px 0 0 var(--color-accent-primary);
+}
+
+/* 拖拽排序:拖拽中列表内行整体降低不透明度 */
+.task-list--dragging .task-row {
+  opacity: 0.6;
 }
 
 .task-row--compact {
@@ -107,50 +118,23 @@
   margin-top: 2px;
 }
 
-.task-col-progress {
-  min-width: 60px;
-  width: 120px;
-  text-align: right;
-  font-size: 14px;
-  color: var(--color-text-secondary);
-  font-family: "Geist Mono", monospace;
-}
-
-.task-col-progress--compact {
-  font-size: 12px;
-}
-
-.task-col-speed {
-  min-width: 60px;
-  width: 100px;
-  text-align: right;
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  font-family: "Geist Mono", monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-col-speed--compact {
-  font-size: 12px;
-}
-
-.task-col-speed--active {
-  color: var(--color-speed-active);
-}
-
-.task-col-status {
-  min-width: 48px;
-  width: 80px;
-}
-
 .task-row-progress {
   margin-top: 9px;
 }
 
 .task-row-progress--compact {
   margin-top: 5px;
+}
+
+/* 移动端/超窄屏:减小行内边距(自 task-list.css 迁入) */
+@media (max-width: 640px) {
+  .task-list--narrow .task-row {
+    padding: 8px 12px;
+  }
+
+  .task-list--narrow .task-row--compact {
+    padding: 4px 12px;
+  }
 }
 
 /* Task Item stagger entry

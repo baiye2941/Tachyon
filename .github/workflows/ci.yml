@@ -380,6 +380,9 @@ jobs:
       - name: ESLint 检查
         working-directory: frontend
         run: bun run lint
+      - name: 硬编码颜色检查
+        working-directory: frontend
+        run: bun run lint:colors
       - name: 前端单元测试
         working-directory: frontend
         run: bun run test

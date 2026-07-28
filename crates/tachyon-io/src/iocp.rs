@@ -243,6 +243,41 @@ impl CompletionSlots {
     }
 }
 
+/// 共享 IOCP runtime:进程内单 CompletionPort + 单 poller + 共享 slots。
+/// 多文件 init 只关联句柄,不再线性 spawn 线程。
+#[cfg(target_os = "windows")]
+struct SharedIocpRuntime {
+    port: *mut std::ffi::c_void,
+    slots: std::sync::Arc<CompletionSlots>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    poller: Option<std::thread::JoinHandle<()>>,
+    refcount: usize,
+}
+
+// SAFETY: port 仅在 refcount 保护下创建/关闭;slots/shutdown 均为 Arc。
+#[cfg(target_os = "windows")]
+unsafe impl Send for SharedIocpRuntime {}
+
+#[cfg(target_os = "windows")]
+static SHARED_IOCP: std::sync::Mutex<Option<SharedIocpRuntime>> = std::sync::Mutex::new(None);
+
+/// 测试/观测:共享 poller 累计 spawn 次数(进程内单调)。
+#[cfg(target_os = "windows")]
+static SHARED_POLLER_SPAWN_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 读取共享 poller 累计 spawn 次数。非 Windows 返回 0。
+pub fn shared_poller_spawn_count() -> usize {
+    #[cfg(target_os = "windows")]
+    {
+        SHARED_POLLER_SPAWN_COUNT.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
+}
+
 #[cfg(target_os = "windows")]
 struct PendingWriteCancelGuard {
     file_handle: usize,
@@ -684,30 +719,68 @@ impl IoCpStorage {
         // Safety: file 是合法的 File 句柄,as_raw_handle() 返回内核分配的 HANDLE
         let file_handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
 
-        // 创建完成端口并关联文件句柄。
-        // Safety:
-        // - file_handle 来自合法的 OpenOptions::open(),是有效的文件句柄
-        // - ExistingCompletionPort=null 表示创建新的完成端口并关联 file_handle
-        // - CompletionKey=0 不使用键关联(通过 OVERLAPPED 获取上下文)
-        // - NumberOfConcurrentThreads=0 让系统根据 CPU 核心数自动选择
-        let port_handle = unsafe {
-            windows_sys::Win32::System::IO::CreateIoCompletionPort(
-                file_handle,
-                std::ptr::null_mut(),
-                0,
-                0,
-            )
-        };
-        if port_handle.is_null() {
-            return Err(DownloadError::Io(std::io::Error::last_os_error()));
-        }
-
-        // 同步完成的 WriteFile 直接返回结果,不再向完成端口投递包,
-        // 避免 fast path 已释放 OVERLAPPED 后 poller 再收到完成事件。
+        // 同步完成的 WriteFile 直接返回结果,不再向完成端口投递包。
         const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 1;
-        // Safety:
-        // - file_handle 已成功关联 IOCP
-        // - 标志值来自 Windows FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 常量
+
+        // 获取/创建进程级共享 IOCP runtime,再把本文件关联到既有 port。
+        let (port_handle, shared_slots, shared_shutdown) = {
+            let mut guard = SHARED_IOCP.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                // Safety: ExistingCompletionPort=null 创建新 port;关联 INVALID_HANDLE 仅建 port。
+                let port_handle = unsafe {
+                    windows_sys::Win32::System::IO::CreateIoCompletionPort(
+                        windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                    )
+                };
+                if port_handle.is_null() {
+                    return Err(DownloadError::Io(std::io::Error::last_os_error()));
+                }
+                let slots = std::sync::Arc::new(CompletionSlots::new());
+                let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = shutdown.clone();
+                let slots_for_poller = slots.clone();
+                let port_raw = port_handle as usize;
+                let poller = match std::thread::Builder::new()
+                    .name("iocp-poller".into())
+                    .spawn(move || {
+                        let port = port_raw as windows_sys::Win32::Foundation::HANDLE;
+                        Self::poller_loop(port, &shutdown_flag, &slots_for_poller);
+                    }) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        // SAFETY: port_handle 刚由 CreateIoCompletionPort 创建且非 null,
+                        // spawn 失败时尚未交共享 runtime 持有,CloseHandle 释放内核对象。
+                        unsafe {
+                            windows_sys::Win32::Foundation::CloseHandle(port_handle);
+                        }
+                        return Err(DownloadError::Io(error));
+                    }
+                };
+                SHARED_POLLER_SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                *guard = Some(SharedIocpRuntime {
+                    port: port_handle,
+                    slots,
+                    shutdown,
+                    poller: Some(poller),
+                    refcount: 0,
+                });
+            }
+            let rt = guard.as_mut().expect("just ensured Some");
+            // Safety: 把 file 关联到既有 port。
+            let associated = unsafe {
+                windows_sys::Win32::System::IO::CreateIoCompletionPort(file_handle, rt.port, 0, 0)
+            };
+            if associated.is_null() {
+                return Err(DownloadError::Io(std::io::Error::last_os_error()));
+            }
+            rt.refcount = rt.refcount.saturating_add(1);
+            (rt.port, rt.slots.clone(), rt.shutdown.clone())
+        };
+
+        // Safety: file 已关联共享 IOCP
         let notification_mode_set = unsafe {
             windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes(
                 file_handle,
@@ -715,39 +788,20 @@ impl IoCpStorage {
             )
         };
         if notification_mode_set == 0 {
-            // Safety: port_handle 是上面成功创建的合法 IOCP 句柄
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(port_handle);
+            // 关联成功但设置失败:归还 refcount
+            let mut guard = SHARED_IOCP.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rt) = guard.as_mut() {
+                rt.refcount = rt.refcount.saturating_sub(1);
             }
             return Err(DownloadError::Io(std::io::Error::last_os_error()));
         }
 
-        let shutdown_flag = self.shutdown.clone();
-        let slots = self.slots.clone();
-        // 通过 usize 传递句柄到线程(*mut c_void 不实现 Send)
-        let port_raw = port_handle as usize;
-
-        // 启动 IOCP 轮询线程
-        let poller = match std::thread::Builder::new()
-            .name("iocp-poller".into())
-            .spawn(move || {
-                // Safety: port_raw 来自成功的 CreateIoCompletionPort,转换回 HANDLE 安全
-                let port = port_raw as windows_sys::Win32::Foundation::HANDLE;
-                Self::poller_loop(port, &shutdown_flag, &slots);
-            }) {
-            Ok(poller) => poller,
-            Err(error) => {
-                // Safety: port_handle 是上面成功创建的合法 IOCP 句柄。
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(port_handle);
-                }
-                return Err(DownloadError::Io(error));
-            }
-        };
-
+        // 实例使用共享 slots/shutdown;port 仅作引用标记(不在 Drop 时关闭,除非 refcount=0)
+        self.slots = shared_slots;
+        self.shutdown = shared_shutdown;
         self.file = Some(file);
         self.port = Some(port_handle);
-        self.poller = Some(poller);
+        self.poller = None; // poller 由共享 runtime 持有
         self.state = IoCpState::Ready;
 
         tracing::info!(
@@ -948,25 +1002,33 @@ impl Drop for IoCpStorage {
             }
         }
 
-        // 1. 请求轮询线程退出
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        // 2. 关闭 IOCP 端口,让 GetQueuedCompletionStatusEx 返回错误退出循环
-        if let Some(port) = self.port.take() {
-            // Safety: port 值来自成功的 CreateIoCompletionPort,是合法的 IOCP 句柄
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(port);
+        // 共享 runtime:仅在最后一个实例 drop 时关闭 port 并 join poller。
+        let _ = self.port.take();
+        let _ = self.poller.take();
+        {
+            let mut guard = SHARED_IOCP.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rt) = guard.as_mut() {
+                rt.refcount = rt.refcount.saturating_sub(1);
+                if rt.refcount == 0 {
+                    rt.shutdown
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if !rt.port.is_null() {
+                        // SAFETY: refcount 归零后本线程独占 runtime;port 仍有效且非 null,
+                        // CloseHandle 关闭完成端口句柄以唤醒/结束 poller 等待。
+                        unsafe {
+                            windows_sys::Win32::Foundation::CloseHandle(rt.port);
+                        }
+                        rt.port = std::ptr::null_mut();
+                    }
+                    if let Some(handle) = rt.poller.take() {
+                        let _ = handle.join();
+                    }
+                    *guard = None;
+                }
             }
         }
 
-        // 3. 等待轮询线程退出
-        if let Some(handle) = self.poller.take() {
-            let _ = handle.join();
-        }
-
-        // 4. 文件句柄在 self.file drop 时自动关闭
-
+        // 文件句柄在 self.file drop 时自动关闭
         if self.state != IoCpState::Closed {
             self.state = IoCpState::Closed;
         }

@@ -95,6 +95,12 @@ export default function TaskItem(props: TaskItemProps) {
     return hot?.speed ?? props.task.speed;
   });
 
+  // meta 行速度仅在 speed 列隐藏时兜底显示,避免与 speed 列单元格重复。
+  // createMemo 内读 store,保证列可见性切换时响应式更新
+  const showMetaSpeed = createMemo(
+    () => liveSpeed() > 0 && !$taskColumns.visibleKeys().includes("speed"),
+  );
+
   /** 列渲染用的 task 视图:hot 字段覆盖 cold 实体 */
   const displayTask = createMemo(() => {
     const hot = getHotProgress(props.task.id);
@@ -250,7 +256,7 @@ export default function TaskItem(props: TaskItemProps) {
                             : tr("taskList.unknownSize")}
                           {" · "}
                           {props.task.url.split(":")[0]?.toUpperCase() ?? ""}
-                          {liveSpeed() > 0 &&
+                          {showMetaSpeed() &&
                             ` · ${formatSpeed(liveSpeed())}`}
                         </div>
                       </Show>

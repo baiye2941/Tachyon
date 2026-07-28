@@ -73,7 +73,7 @@ export default function ConnectionTab(props: ConnectionTabProps) {
       {/* 审计 HTTP-10:enable_quic=true 但未编译 http3 时提示降级 */}
       <Show when={quicCap()}>{(cap) => (
         <Show when={cap().enableQuic && !cap().effectiveQuic}>
-          <div style={{ "font-size": "11px", color: "var(--color-warning, #f59e0b)", "margin-top": "-8px" }}>
+          <div style={{ "font-size": "11px", color: "var(--color-warning)", "margin-top": "-8px" }}>
             {t("settings.connection.quicNotCompiled")}
           </div>
         </Show>

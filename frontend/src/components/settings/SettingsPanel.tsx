@@ -78,6 +78,9 @@ export interface ConfigDraft {
     enableDht: boolean;
     enableUpnp: boolean;
     trackers: string[];
+    trackerSubscriptionEnabled: boolean;
+    trackerSubscriptionUrl: string;
+    trackerSubscriptionLastUpdated: string | null;
     disableDhtPersistence: boolean;
     socksProxyUrl: string | null;
     peerConnectTimeoutSecs: number;
@@ -188,6 +191,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
       enableDht: true,
       enableUpnp: true,
       trackers: [],
+      trackerSubscriptionEnabled: false,
+      trackerSubscriptionUrl: "https://cf.trackerslist.com/best.txt",
+      trackerSubscriptionLastUpdated: null,
       disableDhtPersistence: false,
       socksProxyUrl: null,
       peerConnectTimeoutSecs: 8,
@@ -249,6 +255,10 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: cfg.magnet.enableDht,
         enableUpnp: cfg.magnet.enableUpnp,
         trackers: cfg.magnet.trackers,
+        trackerSubscriptionEnabled: cfg.magnet.trackerSubscriptionEnabled ?? false,
+        trackerSubscriptionUrl:
+          cfg.magnet.trackerSubscriptionUrl ?? "https://cf.trackerslist.com/best.txt",
+        trackerSubscriptionLastUpdated: cfg.magnet.trackerSubscriptionLastUpdated ?? null,
         disableDhtPersistence: cfg.magnet.disableDhtPersistence,
         socksProxyUrl: cfg.magnet.socksProxyUrl,
         // 新增字段:向后兼容旧版后端快照(字段可能缺失),缺失时回退后端默认值
@@ -325,6 +335,9 @@ export default function SettingsPanel(props: SettingsPanelProps) {
         enableDht: draft.magnet.enableDht,
         enableUpnp: draft.magnet.enableUpnp,
         trackers: draft.magnet.trackers,
+        trackerSubscriptionEnabled: draft.magnet.trackerSubscriptionEnabled,
+        trackerSubscriptionUrl: draft.magnet.trackerSubscriptionUrl,
+        trackerSubscriptionLastUpdated: draft.magnet.trackerSubscriptionLastUpdated,
         disableDhtPersistence: draft.magnet.disableDhtPersistence,
         socksProxyUrl: draft.magnet.socksProxyUrl || null,
         peerConnectTimeoutSecs: draft.magnet.peerConnectTimeoutSecs,
@@ -461,6 +474,8 @@ export default function SettingsPanel(props: SettingsPanelProps) {
             onChooseDownloadDir={handleChooseDownloadDir}
             onExportBackup={handleExportBackup}
             onImportBackup={handleImportBackup}
+            exporting={exporting()}
+            importing={importing()}
           />
         );
       case "download":
@@ -612,30 +627,13 @@ export default function SettingsPanel(props: SettingsPanelProps) {
           </div>
 
           <div
-            class="flex items-center justify-between gap-2"
+            class="flex items-center justify-end gap-2"
             style={{
               padding: "12px 20px",
               "border-top": "1px solid var(--color-border-subtle)",
             }}
           >
-            <div class="flex items-center gap-2">
-              <Button
-                variant="secondary"
-                size="sm"
-                loading={exporting()}
-                onClick={handleExportBackup}
-              >
-                {t("settings.exportBackup")}
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                loading={importing()}
-                onClick={handleImportBackup}
-              >
-                {t("settings.importBackup")}
-              </Button>
-            </div>
+            {/* 备份按钮已迁入 GeneralTab 备份区(唯一入口),页脚只留取消/保存 */}
             <div class="flex items-center gap-2">
               <Button
                 variant="secondary"

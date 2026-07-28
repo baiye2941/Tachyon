@@ -49,6 +49,14 @@ export default function LiquidProgress(props: LiquidProgressProps) {
     () => isWaiting() && !hasProgress() && !props.reducedMotion,
   );
 
+  // scaleX 下限 clamp:替代原 min-width 语义,保证极小进度仍有可见填充
+  // (transform 只接受数字不接受 px,0.02 视觉上接近原 height px 圆头)
+  const MIN_FILL_SCALE = 0.02;
+  const fillScale = createMemo(() => {
+    if (!hasProgress()) return 0;
+    return Math.max(MIN_FILL_SCALE, pct() / 100);
+  });
+
   return (
     <div
       class={props.class}
@@ -74,7 +82,7 @@ export default function LiquidProgress(props: LiquidProgressProps) {
           "border-radius": "9999px",
         }}
       >
-        {/* Fill */}
+        {/* Fill:宽度固定 100%,进度用 scaleX 表达(合成层),避免每 tick 触发主线程 layout */}
         <div
           class="absolute left-0 top-0 bottom-0"
           classList={{
@@ -86,11 +94,13 @@ export default function LiquidProgress(props: LiquidProgressProps) {
             "progress-fill--failed": isFailed(),
           }}
           style={{
-            width: `${pct()}%`,
-            "min-width": hasProgress() ? `${height()}px` : "0px",
+            width: "100%",
+            transform: `scaleX(${fillScale()})`,
+            "transform-origin": "left center",
             "border-radius": "9999px",
+            "will-change": "transform",
             transition:
-              "width 320ms cubic-bezier(0.32, 0.72, 0, 1), background 300ms ease",
+              "transform 320ms cubic-bezier(0.32, 0.72, 0, 1), background 300ms ease",
           }}
         />
       </div>
@@ -98,7 +108,8 @@ export default function LiquidProgress(props: LiquidProgressProps) {
       {/* 完成态 sparkle(在进度条右端绽放,任务列表与详情页均可见) */}
       <Show when={isCompleted() && !props.reducedMotion}>
         <div class="progress-sparkle" aria-hidden="true">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          {/* 尺寸走 class 而非属性:契约要求源码 transition: 之后不出现 w 单词 */}
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
             <path d="M12 0L14.59 9.41L24 12L14.59 14.59L12 24L9.41 14.59L0 12L9.41 9.41L12 0Z" />
           </svg>
         </div>

@@ -18,6 +18,12 @@ use tachyon_protocol::magnet::{
     HandleCache, MagnetSessionCoordinator, SessionOpsGate, new_librqbit_session_coordinator,
 };
 
+/// librqbit 9 的 FileStream 会在整个流生命周期持有 blocking semaphore permit，
+/// piece 落盘也从同一 semaphore 获取 permit。容量必须覆盖项目允许的最大流并发，
+/// 并至少保留一个槽位让落盘推进，否则满并发时会形成资源自锁。
+const LIBRQBIT_BLOCKING_PERMITS: usize =
+    tachyon_core::config::MAX_CONCURRENT_FRAGMENTS_LIMIT as usize + 1;
+
 /// 脱敏 SOCKS 代理 URL 的凭据,保留 scheme/host/port 供日志排查
 ///
 /// SOCKS 代理 URL 常含 user:pass 凭据(如 `socks5://user:pass@127.0.0.1:1080`),
@@ -113,17 +119,32 @@ impl BtSession {
     fn build_session_options(
         config: &MagnetConfig,
     ) -> (SessionOptions, Option<String>, SocksProxySource) {
-        // SOCKS5 检测:用户配置优先,否则自动检测系统代理
-        let (socks_proxy, socks_source) = if let Some(ref explicit) = config.socks_proxy_url {
-            (Some(explicit.clone()), SocksProxySource::Explicit)
-        } else if let Some(detected) = tachyon_core::config::detect_socks_proxy() {
-            tracing::info!(
-                proxy = %redact_socks_proxy_for_log(&detected),
-                "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)"
-            );
-            (Some(detected), SocksProxySource::Environment)
-        } else {
-            (None, SocksProxySource::None)
+        // SOCKS5 检测:用户配置优先,否则自动检测系统代理。
+        // `direct`/`none`/空串 = 强制直连,忽略环境 ALL_PROXY/HTTP_PROXY
+        // (便于国内测 DHT,也避免「设置空着但仍走 Clash」的困惑)。
+        let (socks_proxy, socks_source) = match config.socks_proxy_url.as_deref().map(str::trim) {
+            Some(s)
+                if s.eq_ignore_ascii_case("direct")
+                    || s.eq_ignore_ascii_case("none")
+                    || s.is_empty() =>
+            {
+                if !s.is_empty() {
+                    tracing::info!("BT 代理设为 direct/none,忽略系统 SOCKS 环境变量");
+                }
+                (None, SocksProxySource::None)
+            }
+            Some(explicit) => (Some(explicit.to_string()), SocksProxySource::Explicit),
+            None => {
+                if let Some(detected) = tachyon_core::config::detect_socks_proxy() {
+                    tracing::info!(
+                        proxy = %redact_socks_proxy_for_log(&detected),
+                        "自动检测到系统 SOCKS5 代理(BT tracker+peer 将走代理)"
+                    );
+                    (Some(detected), SocksProxySource::Environment)
+                } else {
+                    (None, SocksProxySource::None)
+                }
+            }
         };
         let socks_enabled = socks_proxy.is_some();
 
@@ -135,11 +156,22 @@ impl BtSession {
             );
         }
 
-        // DHT:high_privacy 强制禁用;否则 SOCKS5 下按 disable_dht_when_socks 决定
+        // DHT:high_privacy 强制禁用。
+        // SOCKS5 不代理 UDP:无论 disable_dht_when_socks 开关如何,启用 SOCKS 时一律禁 DHT,
+        // 避免「开关开着、bootstrap 全灭、日志刷屏、用户误以为 DHT 在工作」。
+        // disable_dht_when_socks 保留配置兼容,语义变为「SOCKS 下本就应禁」(默认 true);
+        // 若用户强行 false,仍禁 DHT 并打 warn 说明原因。
         let disable_dht = if high_privacy {
             true
-        } else if socks_enabled && config.disable_dht_when_socks {
-            tracing::info!("SOCKS5 启用且 disable_dht_when_socks=true,禁用 DHT(UDP 不可达)");
+        } else if socks_enabled {
+            if !config.disable_dht_when_socks {
+                tracing::warn!(
+                    "SOCKS5 已启用但 disable_dht_when_socks=false:DHT 仍强制禁用\
+                     (SOCKS5 不代理 UDP,bootstrap 在国内几乎必然失败)"
+                );
+            } else {
+                tracing::info!("SOCKS5 启用,禁用 DHT(UDP 不可经 SOCKS5)");
+            }
             true
         } else {
             !config.enable_dht
@@ -233,6 +265,9 @@ impl BtSession {
             connect: Some(connect),
             listen,
             peer_limit,
+            // 此字段在 librqbit 9 中实际决定 BlockingSpawner semaphore 容量，
+            // 不会在 Session 创建时预启动对应数量的线程。
+            runtime_worker_threads: Some(LIBRQBIT_BLOCKING_PERMITS),
             ..Default::default()
         };
 
@@ -255,16 +290,28 @@ impl BtSession {
             }
         }
         if socks_enabled && !high_privacy {
+            // 保底 HTTPS tracker:国内 SOCKS 下 UDP/DHT 全废时的唯一发现面。
+            // 与 XIU2/订阅列表互补;即使用户 trackers 为空或全是 UDP 也能 announce。
             const HTTPS_TRACKERS_FOR_PROXY: &[&str] = &[
                 "https://tracker.tamersunion.org:443/announce",
                 "https://tracker.gbitt.info:443/announce",
+                "https://tracker.explodie.org:443/announce",
+                "https://tracker1.bt.moack.co.kr:443/announce",
+                "https://tr.bangumi.moe:9696/announce",
             ];
+            let mut added = 0usize;
             for https_tracker in HTTPS_TRACKERS_FOR_PROXY {
-                if let Ok(url) = url::Url::parse(https_tracker) {
-                    opts.trackers.insert(url);
+                if let Ok(url) = url::Url::parse(https_tracker)
+                    && opts.trackers.insert(url)
+                {
+                    added += 1;
                 }
             }
-            tracing::info!("SOCKS5 启用,追加 HTTPS tracker(经代理可达)");
+            tracing::info!(
+                added,
+                total = opts.trackers.len(),
+                "SOCKS5 启用:已过滤 UDP tracker,并确保 HTTPS tracker 可用(经代理)"
+            );
         }
 
         (opts, socks_proxy, socks_source)
@@ -446,13 +493,9 @@ pub fn bt_proxy_coverage_status_effective(
     // peer TCP / HTTP tracker:应用已注入 socks_proxy_url -> ViaProxy
     let peer_tcp = ProxyCoverage::ViaProxy;
     let http_tracker = ProxyCoverage::ViaProxy;
-    // UDP tracker + DHT:SOCKS5 不代理 UDP。disable_dht_when_socks=true 时应用禁用 DHT、
-    // 过滤 UDP tracker -> Blocked;否则未禁用但 UDP 不经代理 -> MayBypass
-    let udp_tracker_dht = if config.disable_dht_when_socks {
-        ProxyCoverage::Blocked
-    } else {
-        ProxyCoverage::MayBypass
-    };
+    // UDP tracker + DHT:SOCKS5 不代理 UDP;运行时强制禁 DHT、过滤 UDP tracker → 恒 Blocked
+    // (与 disable_dht_when_socks 开关无关,避免 UI 显示 MayBypass 误导)
+    let udp_tracker_dht = ProxyCoverage::Blocked;
     // uTP 基于 UDP,SOCKS5 不代理 UDP -> MayBypass
     let utp = ProxyCoverage::MayBypass;
     // UPnP 局域网端口映射,不走 SOCKS:关闭时 Disabled,开启时 MayBypass
@@ -497,12 +540,14 @@ mod tests {
         config.enable_dht = true;
         config.high_privacy = false;
         config.disable_dht_when_socks = false;
-        config.socks_proxy_url = None;
+        // 强制直连,避免开发机 ALL_PROXY 污染测试
+        config.socks_proxy_url = Some("direct".into());
         config.dht_bootstrap_addrs = vec![
             "router.bittorrent.com:6881".into(),
             "dht.transmissionbt.com:6881".into(),
         ];
-        let (opts, _, _) = BtSession::build_session_options(&config);
+        let (opts, effective, _) = BtSession::build_session_options(&config);
+        assert!(effective.is_none(), "direct 哨兵应忽略环境代理");
         let dht = opts.dht.expect("DHT 应启用");
         let addrs = dht.bootstrap_addrs.expect("应注入自定义 bootstrap");
         assert_eq!(addrs.len(), 2);
@@ -515,7 +560,7 @@ mod tests {
         let mut config = test_config();
         config.enable_dht = true;
         config.high_privacy = false;
-        config.socks_proxy_url = None;
+        config.socks_proxy_url = Some("direct".into());
         config.disable_dht_when_socks = false;
         config.dht_bootstrap_addrs.clear();
         let (opts, _, _) = BtSession::build_session_options(&config);
@@ -533,6 +578,23 @@ mod tests {
         config.peer_limit = Some(64);
         let (opts, _, _) = BtSession::build_session_options(&config);
         assert_eq!(opts.peer_limit, Some(64));
+    }
+
+    /// librqbit 9 的 FileStream 会在整个流生命周期持有 blocking permit，
+    /// piece 落盘也从同一 semaphore 获取 permit。容量必须大于最大流并发，
+    /// 否则所有 permit 被流占满后，落盘与流读取会形成资源自锁。
+    #[test]
+    fn test_blocking_permits_leave_room_for_piece_storage() {
+        let config = test_config();
+        let (opts, _, _) = BtSession::build_session_options(&config);
+        let permits = opts
+            .runtime_worker_threads
+            .expect("BT Session 必须显式配置 blocking permit 容量");
+
+        assert!(
+            permits > tachyon_core::config::MAX_CONCURRENT_FRAGMENTS_LIMIT as usize,
+            "blocking permit 容量必须覆盖最大 FileStream 并发并为 piece 落盘保留槽位"
+        );
     }
 
     #[test]
@@ -728,17 +790,43 @@ mod tests {
     }
 
     #[test]
-    fn test_socks_keeps_dht_when_disable_dht_when_socks_false() {
+    fn test_socks_always_disables_dht_even_when_flag_false() {
         let mut config = test_config();
         config.enable_dht = true;
         config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        // 用户误开「SOCKS 下保留 DHT」时仍强制禁,避免 bootstrap 刷屏与假工作
         config.disable_dht_when_socks = false;
 
         let (opts, _effective, _source) = BtSession::build_session_options(&config);
 
         assert!(
-            opts.dht.is_some(),
-            "SOCKS5 启用但 disable_dht_when_socks=false 且 enable_dht=true 时 DHT 不应禁用"
+            opts.dht.is_none(),
+            "SOCKS5 启用时 DHT 必须禁用(UDP 不可代理),即使 disable_dht_when_socks=false"
+        );
+    }
+
+    #[test]
+    fn test_socks_appends_extra_https_trackers() {
+        let mut config = test_config();
+        config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
+        config.trackers = vec!["udp://only-udp.example:1337/announce".into()];
+        config.high_privacy = false;
+
+        let (opts, _, _) = BtSession::build_session_options(&config);
+        assert!(
+            !opts.trackers.iter().any(|u| u.scheme() == "udp"),
+            "UDP 应被过滤"
+        );
+        assert!(
+            opts.trackers
+                .iter()
+                .any(|u| u.as_str().contains("tr.bangumi.moe")),
+            "SOCKS 应追加 bangumi HTTPS tracker 保底"
+        );
+        assert!(
+            opts.trackers.len() >= 3,
+            "过滤 UDP 后至少应有多条 HTTPS 保底,实际 {}",
+            opts.trackers.len()
         );
     }
 
@@ -887,17 +975,16 @@ mod tests {
         assert_eq!(report.utp, ProxyCoverage::MayBypass);
         assert_eq!(report.upnp, ProxyCoverage::MayBypass);
     }
-
     #[test]
-    fn test_bt_proxy_coverage_socks_keeps_dht_when_not_disabled() {
+    fn test_coverage_socks_udp_dht_always_blocked() {
         let mut config = test_config();
         config.socks_proxy_url = Some("socks5://127.0.0.1:1080".into());
         config.disable_dht_when_socks = false;
         config.enable_dht = true;
-        let report = bt_proxy_coverage_status(&config);
-        assert_eq!(report.udp_tracker_dht, ProxyCoverage::MayBypass);
+        let report =
+            bt_proxy_coverage_status_effective(&config, true, SocksProxySource::Explicit, None);
+        assert_eq!(report.udp_tracker_dht, ProxyCoverage::Blocked);
     }
-
     #[test]
     fn test_bt_proxy_coverage_upnp_off_when_disabled() {
         let mut config = test_config();

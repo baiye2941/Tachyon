@@ -817,7 +817,8 @@ fn test_strip_udp_trackers_percent_encoded() {
 pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
     if !tachyon_core::looks_like_magnet_url(uri) {
         return Err(DownloadError::Config(format!(
-            "磁力链接必须以 magnet:? 开头: {uri}"
+            "磁力链接必须以 magnet:? 开头: {}",
+            tachyon_core::redact_url_for_log(uri)
         )));
     }
 
@@ -837,7 +838,8 @@ pub fn validate_magnet_uri(uri: &str) -> DownloadResult<()> {
 
     if !has_valid_xt {
         return Err(DownloadError::Protocol(format!(
-            "磁力链接缺少有效的 xt=urn:btih: 参数(info_hash 须为 40 位 hex 或 32 位 base32): {uri}"
+            "磁力链接缺少有效的 xt=urn:btih: 参数(info_hash 须为 40 位 hex 或 32 位 base32): {}",
+            tachyon_core::redact_url_for_log(uri)
         )));
     }
 
@@ -1380,7 +1382,8 @@ where
                             if wait == Duration::MAX {
                                 return Some((
                                     Err(DownloadError::Timeout(format!(
-                                        "无可用 peer({}),且 peer_wait 已禁用(stall={})",
+                                        "无可用 peer({}),已禁用 peer 等待(stall={});\
+                                         请检查代理/DHT,或在磁力链接中补充 tr=https:// tracker",
                                         format_peer_counts(counts),
                                         format_duration_human(stall)
                                     ))),
@@ -1392,7 +1395,9 @@ where
                             if started.elapsed() >= wait {
                                 return Some((
                                     Err(DownloadError::Timeout(format!(
-                                        "无可用 peer({}),等待 {}秒后超时",
+                                        "无可用 peer({}),等待 {} 秒后超时;\
+                                         可能原因:死种/tracker 不可达/SOCKS 下 DHT 已关;\
+                                         建议:换带 tr=https:// 的磁力、检查代理,或稍后重试",
                                         format_peer_counts(counts),
                                         wait.as_secs()
                                     ))),
@@ -2808,6 +2813,27 @@ mod tests {
         // 含空格的超长畸形串(模拟恶意输入)
         let uri = "magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert!(validate_magnet_uri(uri).is_err());
+    }
+
+    #[test]
+    fn test_validate_magnet_uri_error_display_redacts_sensitive_parameters() {
+        let uri =
+            "magnet:?xt=urn:btih:short&dn=Quarterly-Acquisition&tr=https://tracker.example/secret";
+        let err = validate_magnet_uri(uri).expect_err("畸形 hash 应失败");
+        let msg = err.to_string();
+        assert!(!msg.contains(uri), "错误消息不得包含完整 magnet URI: {msg}");
+        assert!(
+            !msg.contains("Quarterly-Acquisition") && !msg.contains("dn="),
+            "错误消息不得泄露 dn 参数: {msg}"
+        );
+        assert!(
+            !msg.contains("secret") && !msg.contains("tr="),
+            "错误消息不得泄露 tracker 参数: {msg}"
+        );
+        assert!(
+            msg.contains("magnet:"),
+            "错误消息应保留脱敏后的 magnet 标识: {msg}"
+        );
     }
 
     #[test]
@@ -4707,8 +4733,9 @@ mod tests {
         match item {
             Err(DownloadError::Timeout(msg)) => {
                 assert!(
-                    msg.contains("无可用 peer") && msg.contains("peer_wait 已禁用"),
-                    "应产出'无可用 peer,且 peer_wait 已禁用'Timeout,实际: {msg}"
+                    msg.contains("无可用 peer")
+                        && (msg.contains("peer_wait 已禁用") || msg.contains("已禁用 peer 等待")),
+                    "应产出'无可用 peer + peer_wait 已禁用'Timeout,实际: {msg}"
                 );
             }
             other => panic!("应产出 Timeout,实际: {other:?}"),

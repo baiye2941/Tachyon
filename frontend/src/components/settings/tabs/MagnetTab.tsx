@@ -1,7 +1,8 @@
 import type { SetStoreFunction } from "solid-js/store";
-import { For, Show, createMemo } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import { tr } from "../../../i18n";
 import { addToast } from "../../../stores/toast";
+import { api } from "../../../api/invoke";
 import NumberInput from "../items/NumberInput";
 import SectionLabel from "../items/SectionLabel";
 import ToggleItem from "../items/ToggleItem";
@@ -11,6 +12,8 @@ import { computeBtProxyCoverage, type BtProxyCoverageReport } from "../../../uti
 import type { ProxyCoverage, SocksProxySource } from "../../../types";
 import type { ConfigDraft } from "../SettingsPanel";
 import { getBtProxyCoverageResource } from "../../../stores/btProxyCoverageCache";
+import { errorMessage } from "../../../utils/appError";
+import Button from "../../../shared/ui/Button";
 
 export interface MagnetTabProps {
   draft: ConfigDraft;
@@ -19,7 +22,77 @@ export interface MagnetTabProps {
 
 export default function MagnetTab(props: MagnetTabProps) {
   const t = tr;
+  const [refreshing, setRefreshing] = createSignal(false);
 
+  const refreshSubscription = async () => {
+    if (!props.draft.magnet.trackerSubscriptionEnabled) {
+      addToast(t("settings.magnet.subscriptionDisabledToast"), "error");
+      return;
+    }
+    const url = props.draft.magnet.trackerSubscriptionUrl.trim();
+    if (!url) {
+      addToast(t("settings.magnet.subscriptionUrlEmpty"), "error");
+      return;
+    }
+    // 先把开关/URL/用户列表写入配置,再拉取(命令读后端配置)
+    setRefreshing(true);
+    try {
+      await api.updateConfig({
+        magnet: {
+          trackerSubscriptionEnabled: true,
+          trackerSubscriptionUrl: url,
+          // 把当前列表固化为用户列表,避免被订阅覆盖
+          trackerSubscriptionUserTrackers: [...props.draft.magnet.trackers],
+        },
+      });
+      const result = await api.refreshTrackerSubscription();
+      // 重新拉全量配置,把合并后的 trackers 同步进草稿列表(用户可见)
+      const fresh = await api.getConfig();
+      props.setDraft("magnet", "trackers", fresh.magnet.trackers ?? []);
+      props.setDraft(
+        "magnet",
+        "trackerSubscriptionLastUpdated",
+        fresh.magnet.trackerSubscriptionLastUpdated ?? result.lastUpdated,
+      );
+      props.setDraft(
+        "magnet",
+        "trackerSubscriptionUrl",
+        fresh.magnet.trackerSubscriptionUrl ?? url,
+      );
+      addToast(
+        t("settings.magnet.subscriptionRefreshSuccess", {
+          n: result.trackersCount,
+          s: result.subscribedCount,
+        }),
+        "success",
+      );
+    } catch (e) {
+      addToast(
+        t("settings.magnet.subscriptionRefreshFailed", { error: errorMessage(e) }),
+        "error",
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const presetUrls = [
+    {
+      id: "best",
+      label: t("settings.magnet.subscriptionPreset.best"),
+      url: "https://cf.trackerslist.com/best.txt",
+    },
+    {
+      id: "http",
+      label: t("settings.magnet.subscriptionPreset.http"),
+      url: "https://cf.trackerslist.com/http.txt",
+    },
+    {
+      id: "all",
+      label: t("settings.magnet.subscriptionPreset.all"),
+      url: "https://cf.trackerslist.com/all.txt",
+    },
+  ] as const;
   return (
     <div class="flex flex-col gap-5">
       <ToggleItem
@@ -86,6 +159,17 @@ export default function MagnetTab(props: MagnetTabProps) {
         >
           {t("settings.magnet.socksProxyUrlHint")}
         </span>
+        <Show when={(props.draft.magnet.socksProxyUrl ?? "").trim() !== ""}>
+          <span
+            class="text-xs"
+            style={{
+              color: "var(--color-accent-primary)",
+              "line-height": "1.4",
+            }}
+          >
+            {t("settings.magnet.socksHttpsHint")}
+          </span>
+        </Show>
       </div>
 
       {/* FIX-16: BT 代理流量覆盖状态(隐私可见性) —— 展示各流量类别是否经代理/可能绕过 */}
@@ -153,6 +237,114 @@ export default function MagnetTab(props: MagnetTabProps) {
         {t("settings.magnet.disableDhtWhenSocksHint")}
       </div>
 
+
+      <SectionLabel text={t("settings.magnet.sectionSubscription")} />
+      <ToggleItem
+        label={t("settings.magnet.subscriptionEnabled")}
+        value={props.draft.magnet.trackerSubscriptionEnabled}
+        onChange={(v) => props.setDraft("magnet", "trackerSubscriptionEnabled", v)}
+      />
+      {/* 订阅关闭时折叠为一行摘要,打开时完整卡片淡入 */}
+      <Show
+        when={props.draft.magnet.trackerSubscriptionEnabled}
+        fallback={
+          <div class="sub-collapsed">
+            {t("settings.magnet.subscriptionCollapsed", {
+              n: props.draft.magnet.trackers.length,
+            })}
+          </div>
+        }
+      >
+        <div class="sub-card">
+          <div class="flex flex-col gap-1">
+            <span class="sub-card-title">
+              {t("settings.magnet.subscriptionUrl")}
+            </span>
+            <span class="sub-card-hint">
+              {t("settings.magnet.subscriptionUrlHint")}
+            </span>
+          </div>
+
+          <div class="flex flex-wrap gap-1.5">
+            <For each={[...presetUrls]}>
+              {(p) => {
+                const active = () =>
+                  props.draft.magnet.trackerSubscriptionUrl === p.url;
+                return (
+                  <button
+                    type="button"
+                    class="chip"
+                    classList={{ "chip--active": active() }}
+                    onClick={() =>
+                      props.setDraft("magnet", "trackerSubscriptionUrl", p.url)
+                    }
+                  >
+                    {p.label}
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+
+          <input
+            type="url"
+            class="input sub-url-input"
+            value={props.draft.magnet.trackerSubscriptionUrl}
+            onInput={(e) =>
+              props.setDraft(
+                "magnet",
+                "trackerSubscriptionUrl",
+                e.currentTarget.value,
+              )
+            }
+            onBlur={(e) =>
+              props.setDraft(
+                "magnet",
+                "trackerSubscriptionUrl",
+                e.currentTarget.value.trim(),
+              )
+            }
+            placeholder="https://cf.trackerslist.com/best.txt"
+            spellcheck={false}
+            autocomplete="off"
+          />
+
+          <div class="sub-card-foot">
+            <Show
+              when={props.draft.magnet.trackerSubscriptionLastUpdated}
+              fallback={
+                <span class="sub-meta sub-meta--dim">
+                  {t("settings.magnet.subscriptionNeverUpdated")}
+                </span>
+              }
+            >
+              {(ts) => (
+                <span class="sub-meta">
+                  {t("settings.magnet.subscriptionLastUpdated", { t: ts() })}
+                  {" · "}
+                  {t("settings.magnet.subscriptionListCount", {
+                    n: props.draft.magnet.trackers.length,
+                  })}
+                </span>
+              )}
+            </Show>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={refreshing()}
+              onClick={() => void refreshSubscription()}
+            >
+              {refreshing()
+                ? t("settings.magnet.subscriptionRefreshing")
+                : t("settings.magnet.subscriptionRefresh")}
+            </Button>
+          </div>
+
+          <span class="sub-sync-hint">
+            {t("settings.magnet.subscriptionSyncHint")}
+          </span>
+        </div>
+      </Show>
       <TrackerList
         trackers={props.draft.magnet.trackers}
         onAdd={(url) => {
@@ -233,11 +425,11 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
 
   const statusColor = (s: ProxyCoverage): string => {
     switch (s) {
-      case "ViaProxy": return "var(--color-success, #22c55e)";
+      case "ViaProxy": return "var(--color-success)";
       case "Blocked":
-      case "Disabled": return "var(--color-text-secondary, #888)";
-      case "MayBypass": return "var(--color-warning, #f59e0b)";
-      default: return "var(--color-text-secondary, #888)";
+      case "Disabled": return "var(--color-text-secondary)";
+      case "MayBypass": return "var(--color-warning)";
+      default: return "var(--color-text-secondary)";
     }
   };
 
@@ -258,8 +450,8 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
           "margin-top": "6px",
           padding: "8px 10px",
           "border-radius": "6px",
-          "border": "1px solid var(--color-border, #333)",
-          background: "var(--color-bg-secondary, #1a1a1a)",
+          "border": "1px solid var(--color-border-default)",
+          background: "var(--color-bg-secondary)",
         }}
       >
         <div style={{ "font-size": "12px", "font-weight": 600, "margin-bottom": "4px" }}>
@@ -269,7 +461,7 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
           <div
             style={{
               "font-size": "11px",
-              color: "var(--color-text-secondary, #888)",
+              color: "var(--color-text-secondary)",
               "margin-bottom": "4px",
             }}
           >
@@ -283,7 +475,7 @@ function BtProxyCoveragePanel(props: { draft: ConfigDraft }) {
           <div
             style={{
               "font-size": "11px",
-              color: "var(--color-warning, #f59e0b)",
+              color: "var(--color-warning)",
               "margin-bottom": "4px",
             }}
           >

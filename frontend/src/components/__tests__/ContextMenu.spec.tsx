@@ -257,6 +257,102 @@ describe("ContextMenu 可访问性", () => {
     expect(onCancel).toHaveBeenCalledWith("task-1");
   });
 
+  it("Tab 应在菜单项内循环,焦点不逃逸到菜单外", () =>
+    new Promise<void>((resolve) => {
+      const { container } = render(() => (
+        <ContextMenu
+          x={100}
+          y={100}
+          visible={true}
+          task={mockTask}
+          onClose={() => {}}
+          onPause={vi.fn()}
+          onResume={vi.fn()}
+          onCancel={vi.fn()}
+          onOpenFolder={vi.fn()}
+          onCopyLink={vi.fn()}
+          onRedownload={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      ));
+
+      requestAnimationFrame(() => {
+        const items =
+          container.querySelectorAll<HTMLElement>('[role="menuitem"]');
+        const menu = container.querySelector('[role="menu"]')!;
+        // 初始焦点在第一项,Tab 应移到第二项而非逃逸
+        expect(document.activeElement).toBe(items[0]);
+        fireEvent.keyDown(document, { key: "Tab" });
+        expect(document.activeElement).toBe(items[1]);
+        expect(menu.contains(document.activeElement)).toBe(true);
+        // 最后一项再 Tab 应循环回第一项
+        items[items.length - 1]!.focus();
+        fireEvent.keyDown(document, { key: "Tab" });
+        expect(document.activeElement).toBe(items[0]);
+        expect(menu.contains(document.activeElement)).toBe(true);
+        resolve();
+      });
+    }));
+
+  it("Shift+Tab 应反向循环,焦点不逃逸到菜单外", () =>
+    new Promise<void>((resolve) => {
+      const { container } = render(() => (
+        <ContextMenu
+          x={100}
+          y={100}
+          visible={true}
+          task={mockTask}
+          onClose={() => {}}
+          onPause={vi.fn()}
+          onResume={vi.fn()}
+          onCancel={vi.fn()}
+          onOpenFolder={vi.fn()}
+          onCopyLink={vi.fn()}
+          onRedownload={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      ));
+
+      requestAnimationFrame(() => {
+        const items =
+          container.querySelectorAll<HTMLElement>('[role="menuitem"]');
+        const menu = container.querySelector('[role="menu"]')!;
+        // 第一项 Shift+Tab 应循环到最后一项
+        expect(document.activeElement).toBe(items[0]);
+        fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+        expect(document.activeElement).toBe(items[items.length - 1]);
+        expect(menu.contains(document.activeElement)).toBe(true);
+        resolve();
+      });
+    }));
+
+  it("Tab 应被 preventDefault 拦截,不触发浏览器默认焦点迁移", () =>
+    new Promise<void>((resolve) => {
+      render(() => (
+        <ContextMenu
+          x={100}
+          y={100}
+          visible={true}
+          task={mockTask}
+          onClose={() => {}}
+          onPause={vi.fn()}
+          onResume={vi.fn()}
+          onCancel={vi.fn()}
+          onOpenFolder={vi.fn()}
+          onCopyLink={vi.fn()}
+          onRedownload={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      ));
+
+      requestAnimationFrame(() => {
+        // fireEvent 返回 dispatchEvent 结果:被 preventDefault 时为 false
+        const notPrevented = fireEvent.keyDown(document, { key: "Tab" });
+        expect(notPrevented).toBe(false);
+        resolve();
+      });
+    }));
+
   it('已完成任务不显示"取消任务"', () => {
     const { container } = render(() => (
       <ContextMenu

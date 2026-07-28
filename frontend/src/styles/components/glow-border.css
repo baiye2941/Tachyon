@@ -1,0 +1,61 @@
+
+/* ============================================
+   Glow Border — hover 才出现的边框流光
+   原理:@property 注册可动画角度,conic-gradient 亮段旋转,
+   ::before 用 mask 合成只露出 1px 边框环。纯 CSS,零 JS 开销。
+   注意:只用 :hover 触发(用户要求鼠标到才出现),不用 :focus-within。
+   ============================================ */
+@property --glow-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.glow-border {
+  position: relative;
+}
+
+.glow-border::before {
+  content: "";
+  position: absolute;
+  /* inset:0 而非 -1px:避免 .cmd-panel 的 overflow:hidden 裁切伪元素 */
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--glow-angle),
+    transparent 0%,
+    var(--color-accent-primary) 10%,
+    transparent 28%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 280ms ease;
+  pointer-events: none;
+}
+
+.glow-border:hover::before {
+  opacity: 1;
+  animation: glow-border-spin 2.4s linear infinite;
+}
+
+@keyframes glow-border-spin {
+  to {
+    --glow-angle: 360deg;
+  }
+}
+
+/* 降级:减少动态偏好时停转,保留静态微光 */
+@media (prefers-reduced-motion: reduce) {
+  .glow-border:hover::before {
+    animation: none;
+    opacity: 0.6;
+  }
+}

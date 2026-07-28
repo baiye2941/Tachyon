@@ -105,6 +105,12 @@ fn new_http_client() -> Result<HttpClient, tachyon_core::DownloadError> {
         .map_err(|e| tachyon_core::DownloadError::Config(format!("创建 Hub HTTP 客户端失败: {e}")))
 }
 
+/// 供 tachyon-app 等上层拉取公开文本列表(如 Tracker 订阅)复用。
+/// 不暴露 token,仅默认超时客户端。
+pub fn new_http_client_for_app() -> Result<HttpClient, tachyon_core::DownloadError> {
+    new_http_client()
+}
+
 /// 审计 SEC-004:HF token 仅允许发往官方 huggingface.co 主机。
 ///
 /// `hf-mirror.com` 等第三方镜像不得接收 `Authorization: Bearer`（否则构成凭据披露）。

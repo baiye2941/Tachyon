@@ -9,6 +9,8 @@ pub mod task_commands;
 // Re-exports: Tauri commands and public types
 #[cfg(feature = "magnet")]
 pub use self::config_commands::get_bt_proxy_coverage;
+#[cfg(feature = "magnet")]
+pub use self::config_commands::{TrackerSubscriptionResult, refresh_tracker_subscription};
 pub use self::config_commands::{authorize_download_directory, get_config, update_config};
 pub use self::fragment_commands::{TaskFragmentsView, get_task_fragments};
 pub use self::hub_commands::{
@@ -169,9 +171,18 @@ pub struct TaskInfo {
     pub fragments_total: u32,
     pub fragments_done: u32,
     /// 当前下载并发度,前端推算 downloading 带宽用
-    /// 由 PlanComplete 初始化,运行中不更新(静态初始值)
+    /// 由 PlanComplete 初始化,运行中随 downloading_set 更新
     #[serde(default)]
     pub active_concurrency: u32,
+    /// BT/磁力:当前 live peer 数(0 = 尚无可用节点)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_live: Option<u32>,
+    /// BT/磁力:正在连接的 peer 数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_connecting: Option<u32>,
+    /// BT/磁力:排队中的 peer 数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_queued: Option<u32>,
     pub created_at: String,
     /// 任务保存路径。
     /// 存储 canonical 原值;序列化到前端时剥除 Windows `\\?\` verbatim 前缀(显示用)。
@@ -369,6 +380,13 @@ pub struct TaskProgress {
     pub fragments_total: u32,
     #[serde(default)]
     pub active_concurrency: u32,
+    /// BT peer 发现快照(可选;HTTP 任务不发)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_live: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_connecting: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_queued: Option<u32>,
     /// 文件总大小。探测完成后由后端写入,通过进度事件同步到前端,
     /// 避免前端在探测完成前显示 0B(只能靠 get_task_list 全量刷新)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1156,6 +1174,9 @@ pub(crate) mod tests {
             fragments_total: 4,
             fragments_done: 2,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             created_at: "2025-01-01T00:00:00+08:00".to_string(),
             save_path: "/downloads/file.zip".to_string(),
             error_reason: None,
@@ -1212,6 +1233,9 @@ pub(crate) mod tests {
             fragments_total: 0,
             fragments_done: 0,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             created_at: "2025-01-01T00:00:00+08:00".to_string(),
             save_path: save_path.to_string(),
             error_reason: None,
@@ -1321,6 +1345,9 @@ pub(crate) mod tests {
             fragments_done: 0,
             fragments_total: 0,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             file_size: None,
             completed_delta: vec![],
             started_delta: vec![],
@@ -2090,6 +2117,9 @@ mod fragment_bytes_tests {
             fragments_done: 0,
             fragments_total: 0,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             file_size: None,
             completed_delta: vec![],
             started_delta: vec![],
@@ -2116,6 +2146,9 @@ mod fragment_bytes_tests {
             fragments_done: 1,
             fragments_total: 4,
             active_concurrency: 2,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             file_size: Some(1024),
             completed_delta: vec![],
             started_delta: vec![],

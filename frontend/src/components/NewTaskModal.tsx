@@ -400,6 +400,9 @@ export default function NewTaskModal(props: NewTaskModalProps) {
           >
             {tr("newTask.urlLabel")}
           </label>
+          {/* 流光框只圈输入框本体:label/校验提示/HF 预览在框外,
+              否则流光环上沿浮在 label 上方,视觉上多出一截 */}
+          <div class="glow-border" style={{ "border-radius": "var(--radius-md)" }}>
           <textarea
             id="new-task-url-input"
             ref={urlInputRef}
@@ -445,6 +448,8 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               }
             }}
           />
+          </div>
+
           {/* 实时校验反馈 */}
           <Show when={parsedLines().length > 0}>
             <div
@@ -527,6 +532,10 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               style={{
                 "font-size": "12px",
                 color: "var(--color-text-secondary)",
+                // flex item 默认 min-width:auto 不收缩,无空格长单词不断行,会撑破 480px 弹窗
+                "min-width": 0,
+                "overflow-wrap": "break-word",
+                "word-break": "break-all",
               }}
             >
               {validCount() === 1
@@ -536,6 +545,7 @@ export default function NewTaskModal(props: NewTaskModalProps) {
             <Button
               variant="ghost"
               size="sm"
+              class="flex-shrink-0"
               loading={probing()}
               disabled={probing() || validCount() !== 1}
               onClick={handleProbe}
@@ -667,6 +677,11 @@ export default function NewTaskModal(props: NewTaskModalProps) {
             {tr("newTask.saveTo")}
           </label>
           <div class="flex items-center gap-2">
+            {/* 保存路径输入框同样挂 hover 流光(与 URL 输入框一致,只圈输入框本体) */}
+            <div
+              class="glow-border"
+              style={{ flex: 1, "min-width": 0, "border-radius": "var(--radius-md)" }}
+            >
             <input
               id="new-task-save-input"
               type="text"
@@ -674,8 +689,9 @@ export default function NewTaskModal(props: NewTaskModalProps) {
               value={savePath()}
               onInput={(e) => setSavePath(e.currentTarget.value)}
               class="input"
-              style={{ flex: 1, padding: "10px 12px", "font-size": "14px" }}
+              style={{ width: "100%", padding: "10px 12px", "font-size": "14px" }}
             />
+            </div>
             <Button
               variant="secondary"
               size="md"

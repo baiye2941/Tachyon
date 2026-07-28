@@ -251,6 +251,18 @@ impl ChunkReaderPool {
 // Chunk reader 进度处理逻辑（从 task_commands::task_fn 提取）
 // ---------------------------------------------------------------------------
 
+/// 从 repository 取 downloaded 种子;已知 file_size 时钳制到 ≤ file_size,
+/// 避免历史双计(RangeNotSupported 降级未清零)把 UI 推过 100%。
+fn seed_from_repository(task_repository: &TaskRepository, task_id: &str) -> u64 {
+    let Some(task) = task_repository.get(task_id) else {
+        return 0;
+    };
+    match task.file_size.filter(|&s| s > 0) {
+        Some(fs) => task.downloaded.min(fs),
+        None => task.downloaded,
+    }
+}
+
 /// 运行 chunk reader 进度处理
 ///
 /// 与原 task_fn 中 spawn 的 chunk_reader_handle 逻辑完全一致，
@@ -265,7 +277,6 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
         on_progress,
         fragment_state_store,
     } = job;
-
     // 已完成分片集合,用于断点续传 checkpoint
     let mut completed: BTreeSet<u32> = BTreeSet::new();
     // 从 tasks 读取 probe 阶段已写入的 total_frags(PlanComplete 到达时覆盖为真实值)
@@ -278,6 +289,9 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
     let mut frag_bytes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let mut total_downloaded: u64 = 0;
     let mut event_count: u64 = 0;
+    // 是否已处理过 PlanComplete。第二次 = 运行时重规划(RangeNotSupported 等),
+    // 不得用 probe 阶段的 fragments_total 判断(首拉前 repository 常已非 0)。
+    let mut seen_plan_complete = false;
     // checkpoint 批量合并
     let mut pending_completed: Vec<u32> = Vec::new();
     const CHECKPOINT_BATCH_SIZE: usize = 5;
@@ -296,7 +310,14 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 completed_indices,
                 initial_concurrency,
             } => {
-                // 覆盖真实分片数(替代 probe 估算)
+                // 同一次下载会话中的第二次 PlanComplete = 运行时重规划
+                // (典型:RangeNotSupported 降级为整块)。旧分片 partial 字节
+                // 必须清零,否则会与整块重下字节双计(UI 显示 > file_size)。
+                // 首次 PlanComplete 仍走快照/repository 种子路径(断点续传)。
+                let is_runtime_replan = seen_plan_complete;
+                seen_plan_complete = true;
+
+                // 覆盖真实分片数(替代 probe 估算 / 旧规划)
                 total_frags = total;
                 // 初始化 FragmentStateStore
                 let state = crate::projection::TaskFragmentState::from_plan(
@@ -304,75 +325,121 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     completed_indices.clone(),
                 );
                 fragment_state_store.init(&task_id, state);
-                // 初始化 completed 集合(续传已完成分片)
+                // 初始化 completed 集合(续传已完成分片 / 重规划后通常为空)
                 completed = completed_indices.into_iter().collect();
 
-                // 从快照种子 total_downloaded / frag_bytes,避免续传后进度回退与双重计数。
-                // 有 snapshot 时用 snap.downloaded + partial_fragments;
-                // 无 snapshot 时 fallback 到 task_repository 中现有 downloaded。
-                match load_plan_snapshot(Arc::clone(&task_store), task_id.clone()).await {
-                    Ok(Ok(Some(snap))) => {
-                        // 一致性校验:快照已完成分片必须 ⊆ PlanComplete 宣告的
-                        // completed_indices。引擎在对象身份不兼容等场景会丢弃
-                        // 续传数据全量重下,此时 completed_indices 不含快照分片;
-                        // 照收快照种子会让 total_downloaded 虚高(种子+重下双计),
-                        // 且 checkpoint 会把虚高值写回快照。校验失败种子归 0:
-                        // repository 的 downloaded 正是被拒快照恢复出的同一个
-                        // 陈旧值(重启经 snapshot_to_task_info 恢复、resume 不清
-                        // 字节),引擎已明确从头重下,只能从零累计真实重下字节。
-                        let snapshot_matches_plan = snap
-                            .completed_fragments
-                            .iter()
-                            .all(|idx| completed.contains(idx));
-                        if snapshot_matches_plan {
-                            frag_bytes = snap.partial_fragments;
-                            total_downloaded = snap.downloaded;
-                        } else {
-                            // 缺失索引(快照有而 plan 未采纳的分片),截断防爆日志
-                            let missing: Vec<u32> = snap
-                                .completed_fragments
-                                .iter()
-                                .filter(|idx| !completed.contains(idx))
-                                .take(8)
-                                .copied()
-                                .collect();
+                if is_runtime_replan {
+                    // 运行时重规划:丢弃内存累计 + 持久化快照中的虚高字节,
+                    // 防止崩溃窗口期内陈旧种子复活。
+                    frag_bytes.clear();
+                    total_downloaded = 0;
+                    pending_completed.clear();
+                    last_speed_sample = 0;
+                    last_speed_time = tokio::time::Instant::now();
+                    let ts = Arc::clone(&task_store);
+                    let tid = task_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ts.update_snapshot(&tid, |snap| {
+                            snap.completed_fragments.clear();
+                            snap.partial_fragments.clear();
+                            snap.downloaded = 0;
+                            snap.total_fragments = total;
+                        })
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
                             tracing::warn!(
                                 task_id = %task_id,
-                                snap_completed = snap.completed_fragments.len(),
-                                plan_completed = completed.len(),
-                                missing_indices = ?missing,
-                                "快照与 PlanComplete 续传决策不一致,种子归 0 全量重下"
+                                error = %e,
+                                "运行时重规划清零快照失败"
                             );
-                            total_downloaded = 0;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "运行时重规划清零快照 spawn_blocking 失败"
+                            );
                         }
                     }
-                    Ok(Ok(None)) => {
-                        total_downloaded = task_repository
-                            .get(&task_id)
-                            .map(|t| t.downloaded)
-                            .unwrap_or(0);
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "PlanComplete 加载快照失败,fallback 到 repository downloaded"
-                        );
-                        total_downloaded = task_repository
-                            .get(&task_id)
-                            .map(|t| t.downloaded)
-                            .unwrap_or(0);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "PlanComplete 快照 blocking 任务失败,fallback 到 repository downloaded"
-                        );
-                        total_downloaded = task_repository
-                            .get(&task_id)
-                            .map(|t| t.downloaded)
-                            .unwrap_or(0);
+                    tracing::info!(
+                        task_id = %task_id,
+                        total_frags,
+                        "运行时重规划 PlanComplete:进度与快照已清零"
+                    );
+                } else {
+                    // 从快照种子 total_downloaded / frag_bytes,避免续传后进度回退与双重计数。
+                    // 有 snapshot 时用 snap.downloaded + partial_fragments;
+                    // 无 snapshot 时 fallback 到 task_repository 中现有 downloaded。
+                    match load_plan_snapshot(Arc::clone(&task_store), task_id.clone()).await {
+                        Ok(Ok(Some(snap))) => {
+                            // 一致性校验:快照已完成分片必须 ⊆ PlanComplete 宣告的
+                            // completed_indices。引擎在对象身份不兼容等场景会丢弃
+                            // 续传数据全量重下,此时 completed_indices 不含快照分片;
+                            // 照收快照种子会让 total_downloaded 虚高(种子+重下双计),
+                            // 且 checkpoint 会把虚高值写回快照。校验失败种子归 0:
+                            // repository 的 downloaded 正是被拒快照恢复出的同一个
+                            // 陈旧值(重启经 snapshot_to_task_info 恢复、resume 不清
+                            // 字节),引擎已明确从头重下,只能从零累计真实重下字节。
+                            let snapshot_matches_plan = snap
+                                .completed_fragments
+                                .iter()
+                                .all(|idx| completed.contains(idx));
+                            // 防御:历史双计(RangeNotSupported 降级未清零)会把
+                            // snap.downloaded 推过 file_size。照收会 UI 虚高,
+                            // 且 checkpoint 继续写回。已知 file_size 时拒收。
+                            let snapshot_bytes_sane = snap
+                                .file_size
+                                .filter(|&s| s > 0)
+                                .is_none_or(|fs| snap.downloaded <= fs);
+                            if snapshot_matches_plan && snapshot_bytes_sane {
+                                frag_bytes = snap.partial_fragments;
+                                total_downloaded = snap.downloaded;
+                            } else {
+                                // 缺失索引(快照有而 plan 未采纳的分片),截断防爆日志
+                                let missing: Vec<u32> = snap
+                                    .completed_fragments
+                                    .iter()
+                                    .filter(|idx| !completed.contains(idx))
+                                    .take(8)
+                                    .copied()
+                                    .collect();
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    snap_completed = snap.completed_fragments.len(),
+                                    plan_completed = completed.len(),
+                                    snap_downloaded = snap.downloaded,
+                                    snap_file_size = ?snap.file_size,
+                                    snapshot_matches_plan,
+                                    snapshot_bytes_sane,
+                                    missing_indices = ?missing,
+                                    "快照与 PlanComplete 续传决策不一致或字节虚高,种子归 0 全量重下"
+                                );
+                                total_downloaded = 0;
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            // repository 也可能因历史双计虚高;已知 file_size 时钳制
+                            total_downloaded = seed_from_repository(&task_repository, &task_id);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "PlanComplete 加载快照失败,fallback 到 repository downloaded"
+                            );
+                            total_downloaded = seed_from_repository(&task_repository, &task_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "PlanComplete 快照 blocking 任务失败,fallback 到 repository downloaded"
+                            );
+                            total_downloaded = seed_from_repository(&task_repository, &task_id);
+                        }
                     }
                 }
 
@@ -407,6 +474,7 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     total_frags,
                     total_downloaded,
                     frags_done,
+                    is_runtime_replan,
                     "PlanComplete 已处理"
                 );
             }
@@ -492,6 +560,27 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                     callback(&task_id, None, &bytes_snapshot);
                 }
             }
+            FragmentProgress::PeerStats {
+                live,
+                connecting,
+                queued,
+            } => {
+                if let Some(mut task) = task_repository.get_mut(&task_id) {
+                    task.peer_live = Some(live);
+                    task.peer_connecting = Some(connecting);
+                    task.peer_queued = Some(queued);
+                }
+                if let Some(ref callback) = on_progress {
+                    let bytes_snapshot: Vec<FragmentByteEntry> = frag_bytes
+                        .iter()
+                        .map(|(&k, &v)| FragmentByteEntry {
+                            index: k,
+                            downloaded: v,
+                        })
+                        .collect();
+                    callback(&task_id, None, &bytes_snapshot);
+                }
+            }
             FragmentProgress::Chunk {
                 fragment_index,
                 completed: chunk_completed,
@@ -513,11 +602,19 @@ async fn run_chunk_reader(job: ChunkReaderJob) {
                 // 注意:完成事件必须在 insert 之后 remove。若先 remove 则 insert
                 // 返回 None(old=0),会把整片大小再次累加,导致字节双重计数
                 // (前端显示 ≈ 2× 文件大小,完成后被 file_size 覆盖跳回)。
+                //
+                // rebalance 拆片后原片 completed 会把 fragment_downloaded 从高值
+                // 钳回缩小后的 size(旧区间被 steal worker 重下)。差量 MUST 可负:
+                // 仅用 saturating_sub 只加不减 → 原片虚高字节残留 + 新片再计
+                // = downloaded 持续越过 file_size(截图 517→550)。
                 let old = frag_bytes
                     .insert(fragment_index, fragment_downloaded)
                     .unwrap_or(0);
-                total_downloaded =
-                    total_downloaded.saturating_add(fragment_downloaded.saturating_sub(old));
+                if fragment_downloaded >= old {
+                    total_downloaded = total_downloaded.saturating_add(fragment_downloaded - old);
+                } else {
+                    total_downloaded = total_downloaded.saturating_sub(old - fragment_downloaded);
+                }
                 if chunk_completed {
                     // 已完成的分片不再保留在 partial map 中
                     frag_bytes.remove(&fragment_index);
@@ -738,6 +835,9 @@ mod tests {
             fragments_total,
             fragments_done,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             save_path: format!("/tmp/{id}.bin"),
             error_reason: None,
@@ -1246,6 +1346,9 @@ mod tests {
                 fragments_total: 2,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -1334,6 +1437,9 @@ mod tests {
                 fragments_total: 1,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -1392,6 +1498,105 @@ mod tests {
         );
     }
 
+    /// rebalance 拆片后原片 completed 会把 fragment_downloaded 从高值钳回
+    /// 缩小后的 size。差量必须可负,否则虚高字节残留 + 新片再计 →
+    /// downloaded 越过 file_size(截图 517.9→550.8)。
+    #[tokio::test]
+    async fn rebalance_clamp_decreases_total_downloaded_no_overshoot() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let task_store = test_task_store();
+        let task_id = "rebalance-clamp-overshoot".to_string();
+        // 文件 1000 字节,初始单片,rebalance 拆成 [0,499] + [500,999]
+        let file_size = 1000u64;
+
+        task_repository.insert(
+            task_id.clone(),
+            make_task_info(&task_id, file_size, 0, 1, 0),
+        );
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 1,
+                completed_indices: vec![],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 原片 0 流式推进到 800(仍按整片 [0,999] 计)
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: false,
+                fragment_downloaded: 800,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, 800).await;
+
+        // rebalance:原片钳制完成到缩小后 size=500;偷走的半片 1 从 0 到 500
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                completed: true,
+                fragment_downloaded: 500, // 从 800 回落到 500
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, 500).await;
+
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                completed: false,
+                fragment_downloaded: 300,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, 800).await;
+
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 1,
+                completed: true,
+                fragment_downloaded: 500,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, file_size).await;
+
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, file_size,
+            "rebalance 钳制后不得虚高: got {} expected {}",
+            task.downloaded, file_size
+        );
+        assert!(
+            task.downloaded <= file_size,
+            "downloaded 不得越过 file_size"
+        );
+        // 若差量只加不减:800 残留 + 新片 500 = 1300 虚高
+        assert_ne!(task.downloaded, 1300, "旧只加不减逻辑会得到 800+500=1300");
+    }
+
     /// 回归:暂停后 chunk reader 消化队列中已落盘字节的进度事件时,
     /// 字节必须继续入账(快照 checkpoint 依赖),但速度必须归 0——
     /// 不得覆盖 pause_task 清零值,否则前端列表显示"暂停后仍在下载"。
@@ -1418,6 +1623,9 @@ mod tests {
                 fragments_total: 2,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -1497,6 +1705,9 @@ mod tests {
                     fragments_total: 1,
                     fragments_done: 0,
                     active_concurrency: 0,
+                    peer_live: None,
+                    peer_connecting: None,
+                    peer_queued: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     save_path: "/tmp/file.bin".to_string(),
                     error_reason: None,
@@ -1574,6 +1785,9 @@ mod tests {
                 fragments_total: 4,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -1664,6 +1878,9 @@ mod tests {
                 fragments_total: 4,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -1763,6 +1980,9 @@ mod tests {
                 fragments_total: 2,
                 fragments_done: 0,
                 active_concurrency: 0,
+                peer_live: None,
+                peer_connecting: None,
+                peer_queued: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 save_path: "/tmp/file.bin".to_string(),
                 error_reason: None,
@@ -2046,6 +2266,201 @@ mod tests {
         assert_eq!(
             task.fragments_done, 0,
             "completed_indices 为空时 fragments_done 应为 0"
+        );
+    }
+
+    /// 运行时重规划(第二次 PlanComplete)必须清零旧 partial 字节。
+    ///
+    /// 回归场景:HTTP 200 fallback 触发 RangeNotSupported 降级时,引擎
+    /// 中止分片并整块重下。若 chunk_reader 保留降级前 total_downloaded,
+    /// 整块流再从 0 累加 → UI 显示 downloaded > file_size(截图 517.9/489.8)。
+    /// 期望:第二次 PlanComplete 清零,后续 Chunk 从 0 起计。
+    #[tokio::test]
+    async fn runtime_replan_plan_complete_resets_downloaded_no_double_count() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "runtime-replan-reset".to_string();
+        let file_size = 1000u64;
+
+        // 首拉前 repository 可能已有 probe 估算的 fragments_total(非 0)。
+        // 重规划判定不得依赖该值,否则会把首次 PlanComplete 误判为 replan。
+        let task = make_task_info(&task_id, file_size, 0, 4, 0);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        // 已有污染快照(模拟降级前 checkpoint 写入的 partial)
+        let mut partial = HashMap::new();
+        partial.insert(0, 100_u64);
+        partial.insert(1, 50_u64);
+        let snapshot = make_resume_snapshot(&task, vec![], partial, 250);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store: Arc::clone(&task_store),
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        // 首次 PlanComplete:分片路径
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 4,
+                completed_indices: vec![],
+                initial_concurrency: 2,
+            })
+            .await
+            .unwrap();
+
+        // 降级前 partial 进度(模拟 Range 在途已写字节)
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 280,
+                completed: false,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, 280).await;
+
+        // 第二次 PlanComplete:RangeNotSupported 重规划为单分片整块
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 1,
+                completed_indices: vec![],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+
+        // 整块路径从 0 重下 400 字节:期望 0+400=400,而非 280+400=680
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 400,
+                completed: false,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, 400).await;
+
+        // 整块完成
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: file_size,
+                completed: true,
+            })
+            .await
+            .unwrap();
+        wait_for_downloaded(&task_repository, &task_id, file_size).await;
+
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, file_size,
+            "运行时重规划后不得双计旧 partial: got {} expected {}",
+            task.downloaded, file_size
+        );
+        assert_eq!(task.fragments_total, 1, "重规划后 fragments_total 应为 1");
+        assert_eq!(task.fragments_done, 1, "整块完成后 fragments_done 应为 1");
+        assert!(
+            (task.progress - 1.0).abs() < f64::EPSILON,
+            "完成进度应为 1.0, 实际 {}",
+            task.progress
+        );
+
+        // 快照也必须被清零后重写,避免崩溃窗口陈旧种子复活
+        let snap = task_store
+            .load_snapshot(&task_id)
+            .unwrap()
+            .expect("重规划后仍应有快照");
+        assert!(
+            snap.downloaded <= file_size,
+            "快照 downloaded 不得虚高: {}",
+            snap.downloaded
+        );
+        assert_eq!(
+            snap.downloaded, file_size,
+            "完成 checkpoint 后快照 downloaded 应为 file_size"
+        );
+    }
+
+    /// 历史双计污染的快照(downloaded > file_size)首次 PlanComplete 必须拒收。
+    ///
+    /// 用户截图场景:修复前已把 517.9MB 写进快照;修复后 resume 若照收种子,
+    /// UI 仍虚高。期望:种子归 0,从真实重下字节累计。
+    #[tokio::test]
+    async fn plan_complete_rejects_inflated_snapshot_downloaded_over_file_size() {
+        let pool = ChunkReaderPool::new(1);
+        pool.spawn_workers();
+        let task_repository = TaskRepository::new();
+        let (task_store, _tmp) = test_task_store_kept();
+        let task_id = "plan-complete-inflated-snap".to_string();
+        let file_size = 1000u64;
+
+        // repository + 快照同为虚高 1200(> file_size 1000)
+        let task = make_task_info(&task_id, file_size, 1200, 1, 0);
+        task_repository.insert(task_id.clone(), task.clone());
+
+        let snapshot = make_resume_snapshot(&task, vec![], HashMap::new(), file_size);
+        task_store.save_snapshot(&snapshot).unwrap();
+
+        let (progress_tx, progress_rx) = mpsc::channel::<FragmentProgress>(256);
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = ChunkReaderJob {
+            task_id: task_id.clone(),
+            progress_rx,
+            task_repository: task_repository.clone(),
+            task_store,
+            done_tx,
+            on_progress: None,
+            fragment_state_store: crate::projection::FragmentStateStore::new(),
+        };
+        pool.submit_async(job).await.unwrap();
+
+        progress_tx
+            .send(FragmentProgress::PlanComplete {
+                total: 1,
+                completed_indices: vec![],
+                initial_concurrency: 1,
+            })
+            .await
+            .unwrap();
+
+        // 真实重下 100 字节:应从 0 起,而非 1200+100
+        progress_tx
+            .send(FragmentProgress::Chunk {
+                fragment_index: 0,
+                fragment_downloaded: 100,
+                completed: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_downloaded(&task_repository, &task_id, 100).await;
+        drop(progress_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx).await;
+
+        let task = task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.downloaded, 100,
+            "虚高快照 downloaded>file_size 应拒收;期望 0+100=100, 实际 {}",
+            task.downloaded
+        );
+        assert!(
+            task.progress < 0.2,
+            "progress 应约 0.1, 实际 {}",
+            task.progress
         );
     }
 

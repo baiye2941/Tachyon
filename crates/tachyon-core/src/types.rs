@@ -527,8 +527,9 @@ pub struct DownloadStateChange {
 /// 分片进度事件
 ///
 /// 通过 `progress_tx` 通道发送给上层(tachyon-app)。
-/// 四变体:控制帧(PlanComplete,一次性可靠)、开始帧(Started,低频可丢)、
-/// 数据帧(Chunk,高频可丢)、重试帧(Retry,低频可丢)。
+/// 五变体:控制帧(PlanComplete,一次性可靠)、开始帧(Started,低频可丢)、
+/// 数据帧(Chunk,高频可丢)、重试帧(Retry,低频可丢)、
+/// BT 节点统计帧(PeerStats,低频可丢)。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FragmentProgress {
@@ -563,6 +564,15 @@ pub enum FragmentProgress {
     /// `attempt` 为该分片本次将进行的 attempt 序号(从 1 起,对应失败后递增的计数)。
     /// app 层每收到一次累加 `TaskInfo.retry_count`(任务级累计重试次数)。
     Retry { fragment_index: u32, attempt: u32 },
+    /// BT/磁力节点发现快照(live/connecting/queued)
+    ///
+    /// 低频 `try_send`(可丢):仅用于 UI「发现中/0 peer」提示,不参与正确性。
+    /// HTTP 任务不发此变体。
+    PeerStats {
+        live: u32,
+        connecting: u32,
+        queued: u32,
+    },
 }
 
 #[cfg(test)]
@@ -1149,11 +1159,7 @@ mod tests {
                 assert_eq!(completed_indices, vec![0, 1, 2]);
                 assert_eq!(initial_concurrency, 4);
             }
-            FragmentProgress::Chunk { .. }
-            | FragmentProgress::Started { .. }
-            | FragmentProgress::Retry { .. } => {
-                panic!("应为 PlanComplete")
-            }
+            _ => panic!("应为 PlanComplete"),
         }
     }
 
@@ -1176,11 +1182,7 @@ mod tests {
                 assert!(completed);
                 assert_eq!(fragment_downloaded, 1024);
             }
-            FragmentProgress::PlanComplete { .. }
-            | FragmentProgress::Started { .. }
-            | FragmentProgress::Retry { .. } => {
-                panic!("应为 Chunk")
-            }
+            _ => panic!("应为 Chunk"),
         }
     }
 
@@ -1197,11 +1199,7 @@ mod tests {
             FragmentProgress::Started { fragment_index } => {
                 assert_eq!(fragment_index, 7);
             }
-            FragmentProgress::PlanComplete { .. }
-            | FragmentProgress::Chunk { .. }
-            | FragmentProgress::Retry { .. } => {
-                panic!("应为 Started")
-            }
+            _ => panic!("应为 Started"),
         }
     }
 
@@ -1220,11 +1218,7 @@ mod tests {
                 assert_eq!(*fragment_index, 3);
                 assert_eq!(*attempt, 2);
             }
-            FragmentProgress::PlanComplete { .. }
-            | FragmentProgress::Chunk { .. }
-            | FragmentProgress::Started { .. } => {
-                panic!("应为 Retry")
-            }
+            _ => panic!("应为 Retry"),
         }
         let json = serde_json::to_string(&progress).unwrap();
         assert!(json.contains("\"retry\""));
@@ -1239,11 +1233,35 @@ mod tests {
                 assert_eq!(fragment_index, 3);
                 assert_eq!(attempt, 2);
             }
-            FragmentProgress::PlanComplete { .. }
-            | FragmentProgress::Chunk { .. }
-            | FragmentProgress::Started { .. } => {
-                panic!("反序列化应为 Retry")
+            _ => panic!("反序列化应为 Retry"),
+        }
+    }
+
+    #[test]
+    fn test_fragment_progress_peer_stats_serialization() {
+        let progress = FragmentProgress::PeerStats {
+            live: 0,
+            connecting: 2,
+            queued: 5,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        // rename_all=camelCase on enum → variant "peerStats"
+        assert!(
+            json.contains("peerStats"),
+            "PeerStats 变体应序列化为 peerStats,实际: {json}"
+        );
+        let de: FragmentProgress = serde_json::from_str(&json).unwrap();
+        match de {
+            FragmentProgress::PeerStats {
+                live,
+                connecting,
+                queued,
+            } => {
+                assert_eq!(live, 0);
+                assert_eq!(connecting, 2);
+                assert_eq!(queued, 5);
             }
+            _ => panic!("应为 PeerStats"),
         }
     }
 

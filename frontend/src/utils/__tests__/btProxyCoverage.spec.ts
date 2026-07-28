@@ -45,7 +45,7 @@ describe('computeBtProxyCoverage', () => {
     expect(r.upnp).toBe<ProxyCoverage>('MayBypass')
   })
 
-  it('SOCKS 启用但未禁用 DHT 时 UDP/DHT 可能绕过', () => {
+  it('SOCKS 启用时即使未勾选禁用 DHT,UDP/DHT 仍为 Blocked(与运行时强制一致)', () => {
     const r = computeBtProxyCoverage(
       baseConfig({
         socksProxyUrl: 'socks5://127.0.0.1:1080',
@@ -53,7 +53,7 @@ describe('computeBtProxyCoverage', () => {
         enableDht: true,
       }),
     )
-    expect(r.udpTrackerDht).toBe<ProxyCoverage>('MayBypass')
+    expect(r.udpTrackerDht).toBe<ProxyCoverage>('Blocked')
   })
 
   it('SOCKS 启用且 UPnP 关闭时 UPnP 为 Disabled', () => {

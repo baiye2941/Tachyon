@@ -328,8 +328,8 @@ describe('SettingsPanel', () => {
     expect((screen.getByLabelText('Peer 读写超时') as HTMLInputElement).value).toBe('10')
     expect((screen.getByLabelText('强制 Tracker 间隔') as HTMLInputElement).value).toBe('120')
     expect((screen.getByLabelText('延迟写入缓冲') as HTMLInputElement).value).toBe('16')
-    // 新增 toggle "SOCKS5 时禁用 DHT" 应可见
-    expect(screen.getByText('SOCKS5 时禁用 DHT')).toBeDefined()
+    // 新增 toggle "SOCKS5 时禁用 DHT" 应可见(文案带「(推荐)」后缀,正则子串匹配)
+    expect(screen.getByText(/SOCKS5 时禁用 DHT/)).toBeDefined()
     // 需重启生效 / 对新任务生效 标记应可见
     expect(screen.getAllByText('需重启生效').length).toBeGreaterThan(0)
     expect(screen.getByText('对新任务生效')).toBeDefined()
@@ -375,10 +375,10 @@ describe('SettingsPanel', () => {
 
     fireEvent.click(screen.getByText('磁力链接'))
     await waitFor(() => {
-      expect(screen.getByText('SOCKS5 时禁用 DHT')).toBeDefined()
+      expect(screen.getByText(/SOCKS5 时禁用 DHT/)).toBeDefined()
     })
 
-    const toggleLabel = screen.getByText('SOCKS5 时禁用 DHT')
+    const toggleLabel = screen.getByText(/SOCKS5 时禁用 DHT/)
     // label 被包在左侧分组 div 内,需向上找到 .justify-between 容器再取 button
     const toggleBtn = toggleLabel.closest('.flex.items-center.justify-between')!.querySelector('button')!
     fireEvent.click(toggleBtn)

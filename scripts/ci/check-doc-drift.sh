@@ -53,6 +53,15 @@ for wf in .github/workflows/ci.yml .github/workflows/release.yml; do
     fail "$wf 手写 cargo audit --ignore（应 bash scripts/ci/audit.sh 从 deny.toml 解析）"
     grep -nE 'cargo[[:space:]]+audit[[:space:]]+--ignore' "$wf" | head -5 || true
   fi
+  # 审计 E-04: nextest SSOT retries=0；禁止 workflow 覆盖为 --retries N（N>0）
+  if grep -nE -- '--retries([[:space:]]+|=)([1-9][0-9]*)\b' "$wf" >/dev/null 2>&1; then
+    # 仅匹配非注释行（grep 行首空白后不是 #）
+    bad_retries="$(grep -nE -- '--retries([[:space:]]+|=)([1-9][0-9]*)\b' "$wf" | grep -vE '^[[:space:]]*[0-9]+:[[:space:]]*#' || true)"
+    if [[ -n "$bad_retries" ]]; then
+      fail "$wf 使用 nextest --retries N（N>0）；应依赖 .config/nextest.toml retries=0（审计 E-04）"
+      echo "$bad_retries" | head -5 || true
+    fi
+  fi
 done
 
 # 3) 禁止 ci-pass 再写 needs.*.result（GHA 假绿）——只匹配表达式，忽略注释

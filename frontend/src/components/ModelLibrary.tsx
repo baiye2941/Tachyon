@@ -336,7 +336,7 @@ export default function ModelLibrary() {
                             padding: '2px 6px',
                             'border-radius': '4px',
                             background: 'var(--color-status-completed)',
-                            color: '#fff',
+                            color: 'var(--color-accent-foreground)',
                           }}
                         >
                           {tr('hub.card.downloaded')}

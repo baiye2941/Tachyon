@@ -15,7 +15,7 @@ export default function ToggleItem(props: ToggleItemProps) {
   return (
     <div class="flex items-center justify-between">
       <div class="flex items-center" style={{ gap: "8px" }}>
-        <span style={{ "font-size": "13px", color: "var(--color-text-title)" }}>
+        <span style={{ "font-size": "13px", color: "var(--color-text-secondary)" }}>
           {props.label}
         </span>
         <Show when={badgeText()}>

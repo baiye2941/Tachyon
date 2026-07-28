@@ -65,6 +65,14 @@ describe('commandRisk (P1-11a)', () => {
       expect(destructive).toContain('export_backup')
     })
 
+    it('回归:后端校验 confirmation token 的命令 MUST 为 destructive', () => {
+      // refresh_tracker_subscription 曾误登记 mutate,invoke 包装器不附
+      // confirmation token,后端必拒("需要确认令牌"),订阅刷新必失败。
+      // 后端校验 token 的命令(与 update_config 同级)一律 destructive。
+      expect(getRiskTier('refresh_tracker_subscription')).toBe('destructive')
+      expect(getRiskTier('authorize_download_directory')).toBe('destructive')
+    })
+
     it('风险表至少覆盖 15 个命令(无遗漏)', () => {
       // invoke.ts 暴露的命令数
       expect(Object.keys(COMMAND_RISK).length).toBeGreaterThanOrEqual(15)

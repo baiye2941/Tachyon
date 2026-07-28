@@ -102,3 +102,22 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+/* ============================================
+   Theme Ripple — 主题切换水波扩散
+   关闭 View Transitions 默认交叉淡入,由 useTheme 的
+   clip-path 圆形扩散动画接管 ::view-transition-new(root)。
+   ============================================ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 2;
+}

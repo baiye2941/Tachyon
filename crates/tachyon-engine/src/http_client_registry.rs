@@ -345,6 +345,41 @@ mod tests {
         assert!(!Arc::ptr_eq(&a, &c), "pool_max_idle_per_host 不同应分离");
     }
 
+    /// enable_http2 true/false 必须分离 client 身份(H2 单连接策略可配置开关)。
+    #[test]
+    fn test_registry_separates_enable_http2_flag() {
+        use tachyon_core::config::ConnectionConfig;
+        let reg = HttpClientRegistry::new();
+        let headers = HashMap::new();
+        let h2 = ConnectionConfig {
+            enable_http2: true,
+            enable_quic: false,
+            max_connections_per_host: 8,
+            max_global_connections: 256,
+            keep_alive_timeout_secs: 90,
+            connect_timeout_secs: 10,
+        };
+        let h1 = ConnectionConfig {
+            enable_http2: false,
+            ..h2.clone()
+        };
+        let a = reg
+            .get_or_create("UA-H2", None, 5, 10, Some(&h2), &headers, None)
+            .unwrap();
+        let b = reg
+            .get_or_create("UA-H2", None, 5, 10, Some(&h1), &headers, None)
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "enable_http2 不同必须分离 client,禁止 H1/H2 共用同一连接池身份"
+        );
+        // 相同 enable_http2 仍应复用
+        let c = reg
+            .get_or_create("UA-H2", None, 5, 10, Some(&h2), &headers, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &c), "相同 enable_http2 应复用");
+    }
+
     /// headers 不同应分离(覆盖 headers 排序 + hash 路径)。
     #[test]
     fn test_registry_separates_different_headers() {

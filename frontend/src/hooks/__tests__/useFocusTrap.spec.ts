@@ -189,4 +189,92 @@ describe("useFocusTrap", () => {
     expect(FOCUSABLE_SELECTOR).toContain("input");
     expect(FOCUSABLE_SELECTOR).toContain('[tabindex]:not([tabindex="-1"])');
   });
+
+  it("两层弹层叠加时 Escape 只触发栈顶 onEscape,栈顶卸载后触发下一层", () => {
+    const outerDiv = document.createElement("div");
+    outerDiv.append(document.createElement("button"));
+    document.body.append(outerDiv);
+    const innerDiv = document.createElement("div");
+    innerDiv.append(document.createElement("button"));
+    document.body.append(innerDiv);
+
+    const onEscapeOuter = vi.fn();
+    const onEscapeInner = vi.fn();
+
+    const disposeOuter = createRoot((dispose) => {
+      useFocusTrap({
+        active: true,
+        container: outerDiv,
+        onEscape: onEscapeOuter,
+      });
+      return dispose;
+    });
+    const disposeInner = createRoot((dispose) => {
+      useFocusTrap({
+        active: true,
+        container: innerDiv,
+        onEscape: onEscapeInner,
+      });
+      return dispose;
+    });
+
+    // 栈顶(inner)响应,底层(outer)不响应,禁止 Esc 双关
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    expect(onEscapeInner).toHaveBeenCalledTimes(1);
+    expect(onEscapeOuter).not.toHaveBeenCalled();
+
+    // 栈顶卸载后,下一层恢复响应
+    disposeInner();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    expect(onEscapeOuter).toHaveBeenCalledTimes(1);
+
+    disposeOuter();
+    outerDiv.remove();
+    innerDiv.remove();
+  });
+
+  it("叠加时 Tab 循环仅栈顶陷阱响应", () => {
+    const outerDiv = document.createElement("div");
+    const outerBtn1 = document.createElement("button");
+    const outerBtn2 = document.createElement("button");
+    outerDiv.append(outerBtn1, outerBtn2);
+    document.body.append(outerDiv);
+    const innerDiv = document.createElement("div");
+    const innerBtn1 = document.createElement("button");
+    const innerBtn2 = document.createElement("button");
+    innerDiv.append(innerBtn1, innerBtn2);
+    document.body.append(innerDiv);
+
+    const disposeOuter = createRoot((dispose) => {
+      useFocusTrap({ active: true, container: outerDiv });
+      return dispose;
+    });
+    const disposeInner = createRoot((dispose) => {
+      useFocusTrap({ active: true, container: innerDiv });
+      return dispose;
+    });
+
+    // 焦点在底层容器末尾时,底层陷阱不得响应 Tab(栈顶优先)
+    outerBtn2.focus();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", bubbles: true }),
+    );
+    expect(document.activeElement).toBe(outerBtn2);
+
+    // 栈顶陷阱正常循环:末尾 Tab 回到首位
+    innerBtn2.focus();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", bubbles: true }),
+    );
+    expect(document.activeElement).toBe(innerBtn1);
+
+    disposeInner();
+    disposeOuter();
+    outerDiv.remove();
+    innerDiv.remove();
+  });
 });

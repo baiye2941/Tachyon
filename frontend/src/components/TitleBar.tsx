@@ -8,6 +8,7 @@ type AppWindow = {
   toggleMaximize: () => Promise<void>
   close: () => Promise<void>
   isMaximized: () => Promise<boolean>
+  startDragging: () => Promise<void>
   onResized: (handler: () => void | Promise<void>) => Promise<() => void>
 }
 
@@ -77,6 +78,33 @@ export default function TitleBar() {
     }
   }
 
+  /** 自定义标题栏拖动:data-tauri-drag-region 为主路径;
+   *  mousedown → startDragging 作 Windows WebView2 回退(部分环境属性拖动不生效)。
+   *  仅左键;忽略按钮/菜单等交互控件上的事件。 */
+  const handleDragMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0) return
+    const target = e.target
+    if (!(target instanceof Element)) return
+    if (target.closest('button, a, input, textarea, select, [role="menu"], [role="menuitem"]')) {
+      return
+    }
+    // 双击走最大化,不启动拖动
+    if (e.detail > 1) return
+    void appWindow?.startDragging().catch(() => {
+      // 浏览器/无权限时静默
+    })
+  }
+
+  /** 标题栏空白区双击切换最大化(对齐原生 Windows 标题栏) */
+  const handleDragDoubleClick = (e: MouseEvent) => {
+    const target = e.target
+    if (!(target instanceof Element)) return
+    if (target.closest('button, a, input, textarea, select, [role="menu"], [role="menuitem"]')) {
+      return
+    }
+    void handleMaximize()
+  }
+
   // 应用菜单项(spec 7.2):设置 / 快捷键 / 关于 / 退出
   const menuItems: MenuItem[] = [
     { id: 'settings', labelKey: 'titleBar.menu.settings', action: () => $ui.openSettings(), separatorAfter: true },
@@ -119,12 +147,15 @@ export default function TitleBar() {
         'border-bottom': '1px solid var(--color-border-subtle)',
       }}
       data-tauri-drag-region
+      onMouseDown={handleDragMouseDown}
+      onDblClick={handleDragDoubleClick}
     >
       {/* Brand + 应用菜单 */}
       <div class="flex items-center" style={{ height: '100%' }}>
         <div
           class="flex items-center gap-2"
           style={{ padding: "0 12px", height: "100%" }}
+          data-tauri-drag-region
         >
           {/* brand 材质方块:深底 + 电青闪电(对齐参考稿 sidebar brand)。
               深底 surface-2 + 闪电 fill accent,暗色下高对比可辨。 */}
@@ -138,6 +169,7 @@ export default function TitleBar() {
               color: "var(--color-accent-primary)",
               "box-shadow": "var(--shadow-inset-bevel)",
             }}
+            data-tauri-drag-region
           >
             <LightningIcon />
           </div>
@@ -149,6 +181,7 @@ export default function TitleBar() {
               color: "var(--color-text-title)",
               "letter-spacing": "-0.01em",
             }}
+            data-tauri-drag-region
           >
             Tachyon
           </span>
@@ -198,11 +231,12 @@ export default function TitleBar() {
         </div>
       </div>
 
-      {/* Drag region */}
+      {/* Drag region:属性 + startDragging 回退;中间空白是主拖动手感区 */}
       <div class="flex-1 h-full" data-tauri-drag-region />
 
       {/* Window controls */}
-      <div class="flex items-center">
+      {/* 按钮空隙不属任何 button,closest 守卫覆盖不到,容器拦截 dblclick 冒泡防误触最大化 */}
+      <div class="flex items-center" onDblClick={(e) => e.stopPropagation()}>
         <button
           class="win-btn"
           onClick={handleMinimize}

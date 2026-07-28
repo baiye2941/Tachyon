@@ -1,5 +1,5 @@
 import { errorMessage } from "../utils/appError";
-import { createSignal, batch } from "solid-js";
+import { createSignal, batch, type Accessor, type Setter } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import type {
   TaskInfo,
@@ -33,9 +33,80 @@ export interface HotProgress {
   fragmentsDone: number;
 }
 
-const [hotProgress, setHotProgress] = createSignal<Map<string, HotProgress>>(
-  new Map(),
-);
+type HotProgressSignal = [
+  get: Accessor<HotProgress | undefined>,
+  set: Setter<HotProgress | undefined>,
+];
+
+const hotProgressValues = new Map<string, HotProgress>();
+const hotProgressSignals = new Map<string, HotProgressSignal>();
+const [hotProgressVersion, setHotProgressVersion] = createSignal(0);
+
+function hotProgressEquals(
+  previous: HotProgress | undefined,
+  next: HotProgress | undefined,
+): boolean {
+  return (
+    previous?.downloaded === next?.downloaded &&
+    previous?.speed === next?.speed &&
+    previous?.progress === next?.progress &&
+    previous?.fragmentsDone === next?.fragmentsDone
+  );
+}
+
+function createHotProgressSignal(
+  value: HotProgress | undefined,
+): HotProgressSignal {
+  // eslint 规则要求 createSignal 返回值就地解构,再组装为元组返回
+  const [get, set] = createSignal<HotProgress | undefined>(value, {
+    equals: hotProgressEquals,
+  });
+  return [get, set];
+}
+
+function replaceHotProgress(newTasks: TaskInfo[]) {
+  const remainingIds = new Set(hotProgressSignals.keys());
+
+  for (const task of newTasks) {
+    const value: HotProgress = {
+      downloaded: task.downloaded,
+      speed: task.speed,
+      progress: task.progress,
+      fragmentsDone: task.fragmentsDone,
+    };
+    const signal = hotProgressSignals.get(task.id);
+
+    hotProgressValues.set(task.id, value);
+    if (signal) {
+      signal[1](value);
+      remainingIds.delete(task.id);
+    } else {
+      hotProgressSignals.set(task.id, createHotProgressSignal(value));
+    }
+  }
+
+  for (const id of remainingIds) {
+    hotProgressValues.delete(id);
+    hotProgressSignals.get(id)?.[1](undefined);
+    hotProgressSignals.delete(id);
+  }
+
+  setHotProgressVersion((version) => version + 1);
+}
+
+function updateHotProgress(updates: Map<string, HotProgress>) {
+  for (const [id, value] of updates) {
+    hotProgressValues.set(id, value);
+    const signal = hotProgressSignals.get(id);
+    if (signal) {
+      signal[1](value);
+    } else {
+      hotProgressSignals.set(id, createHotProgressSignal(value));
+    }
+  }
+
+  setHotProgressVersion((version) => version + 1);
+}
 
 const VALID_STATUSES = new Set<string>([
   "pending",
@@ -93,29 +164,23 @@ export function setTasks(newTasks: TaskInfo[]) {
   batch(() => {
     setTasksRaw(reconcile(newTasks, { key: "id" }));
     rebuildIndexMap();
-    // 同步初始化 hot 层:从全量任务列表提取高频字段
-    const hotMap = new Map<string, HotProgress>();
-    for (const t of newTasks) {
-      hotMap.set(t.id, {
-        downloaded: t.downloaded,
-        speed: t.speed,
-        progress: t.progress,
-        fragmentsDone: t.fragmentsDone,
-      });
-    }
-    setHotProgress(hotMap);
+    // 全量同步复用每任务 signal,只通知值真正变化的 task 订阅者
+    replaceHotProgress(newTasks);
   });
 }
 
 export { setSelectedId, setCurrentFilter };
 
 export const $hotProgress = {
-  get: hotProgress,
+  get: () => {
+    hotProgressVersion();
+    return hotProgressValues;
+  },
 };
 
-/** 读取单任务 hot 进度;缺失时返回 undefined(调用方回退 cold task) */
+/** 读取单任务 hot 进度;每个 task 独立跟踪,缺失时回退 cold task */
 export function getHotProgress(taskId: string): HotProgress | undefined {
-  return hotProgress().get(taskId);
+  return hotProgressSignals.get(taskId)?.[0]();
 }
 
 export const $tasks = {
@@ -184,10 +249,10 @@ export const $selectedTask = {
 const speedStats = createRootMemo(() => {
   let speed = 0;
   let count = 0;
-  const hot = hotProgress();
+  hotProgressVersion();
   for (let i = 0; i < tasks.length; i++) {
     if (DOWNLOADING_SET.has(tasks[i]!.status)) {
-      const hp = hot.get(tasks[i]!.id);
+      const hp = getHotProgress(tasks[i]!.id);
       speed += hp?.speed ?? (tasks[i]!.speed || 0);
       count++;
     }
@@ -249,6 +314,13 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       // retryCount:字段缺失保持原值;有值(含 0)时覆盖
       const newRetryCount =
         p.retryCount !== undefined ? p.retryCount : task.retryCount;
+      // BT peer 快照:字段缺失保持原值;有值(含 0)时覆盖
+      const newPeerLive =
+        p.peerLive !== undefined ? p.peerLive : task.peerLive;
+      const newPeerConnecting =
+        p.peerConnecting !== undefined ? p.peerConnecting : task.peerConnecting;
+      const newPeerQueued =
+        p.peerQueued !== undefined ? p.peerQueued : task.peerQueued;
 
       // hot 层:高频字段变化时更新 hotProgress signal
       const hotChanged =
@@ -271,14 +343,17 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
         pushTaskSpeed(id, newSpeed);
       }
 
-      // 审计 FT-04:cold 字段(fragmentsTotal/concurrency/errorReason/retryCount)不能被
+      // 审计 FT-04:cold 字段(fragmentsTotal/concurrency/errorReason/retryCount/peer*)不能被
       // hot/status/size 三类条件代理,否则详情线程列与错误文案会卡在旧值
       const oldConcurrency = task.activeConcurrency ?? 0;
       const coldChanged =
         newFragmentsTotal !== task.fragmentsTotal ||
         newConcurrency !== oldConcurrency ||
         newErrorReason !== task.errorReason ||
-        newRetryCount !== task.retryCount;
+        newRetryCount !== task.retryCount ||
+        newPeerLive !== task.peerLive ||
+        newPeerConnecting !== task.peerConnecting ||
+        newPeerQueued !== task.peerQueued;
       const sizeChanged = newSize !== task.fileSize;
       const hasChanged =
         hotChanged || newStatus !== oldStatus || coldChanged || sizeChanged;
@@ -296,6 +371,9 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
           activeConcurrency: newConcurrency,
           errorReason: newErrorReason,
           retryCount: newRetryCount,
+          peerLive: newPeerLive ?? undefined,
+          peerConnecting: newPeerConnecting ?? undefined,
+          peerQueued: newPeerQueued ?? undefined,
         });
       }
 
@@ -352,15 +430,9 @@ export function updateProgress(payload: Record<string, ProgressPayload>) {
       }
     }
 
-    // 批量更新 hot 层 signal
+    // 批量写入受影响 task 的 signal,未更新 task 不会收到通知
     if (hotUpdates.size > 0) {
-      setHotProgress((prev) => {
-        const next = new Map(prev);
-        for (const [id, hp] of hotUpdates) {
-          next.set(id, hp);
-        }
-        return next;
-      });
+      updateHotProgress(hotUpdates);
     }
   });
 }

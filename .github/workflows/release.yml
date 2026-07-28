@@ -163,9 +163,10 @@ jobs:
       - name: 安装 cargo-nextest
         if: steps.check.outputs.skip != 'true'
         run: cargo binstall -y --force cargo-nextest
-      - name: 运行测试(nextest, 失败重试 2 次)
+      - name: 运行测试(nextest)
         if: steps.check.outputs.skip != 'true'
-        run: cargo nextest run --all --locked --retries 2
+        # 审计 E-04: 与 ci.yml / .config/nextest.toml 对齐 retries=0，禁止 --retries N
+        run: cargo nextest run --all --locked
       - name: 文档构建(零警告)
         if: steps.check.outputs.skip != 'true'
         run: cargo doc --no-deps --all-features --locked

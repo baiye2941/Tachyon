@@ -34,6 +34,10 @@ function resolveContainer(
   return typeof container === "function" ? container() : container;
 }
 
+// 模块级焦点陷阱栈:多层弹层叠加(如 DetailPanel 上开 NewTaskModal)时,
+// 仅栈顶陷阱响应 Escape 与 Tab 循环,避免一次按键同时关闭两层
+const trapStack: symbol[] = [];
+
 /**
  * 焦点陷阱 hook(Iteration 08)。
  *
@@ -56,6 +60,10 @@ export function useFocusTrap(options: FocusTrapOptions) {
 
     if (!active || !container) return;
 
+    // 注册入栈,cleanup 时出栈
+    const trapId = Symbol("focus-trap");
+    trapStack.push(trapId);
+
     // 保存焦点
     previouslyFocused = (restoreFocus ??
       document.activeElement) as HTMLElement | null;
@@ -72,6 +80,9 @@ export function useFocusTrap(options: FocusTrapOptions) {
     }
 
     keyHandler = (e: KeyboardEvent) => {
+      // 仅栈顶陷阱响应键盘,避免叠加弹层 Esc 双关/Tab 串层
+      if (trapStack[trapStack.length - 1] !== trapId) return;
+
       if (e.key === "Escape" && onEscape) {
         e.preventDefault();
         onEscape();
@@ -101,6 +112,9 @@ export function useFocusTrap(options: FocusTrapOptions) {
         document.removeEventListener("keydown", keyHandler);
         keyHandler = null;
       }
+      // 出栈(允许非栈顶先清理,保持栈完整)
+      const stackIndex = trapStack.indexOf(trapId);
+      if (stackIndex >= 0) trapStack.splice(stackIndex, 1);
       if (previouslyFocused && "focus" in previouslyFocused) {
         previouslyFocused.focus();
         previouslyFocused = null;

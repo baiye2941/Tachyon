@@ -25,12 +25,15 @@ describe('toast store', () => {
     expect(toasts[0]?.type).toBe('success')
   })
 
-  it('3000ms 后 toast 自动消失', () => {
+  it('3000ms 后 toast 仍保留在 store(生命周期归 ToastItem 组件)', () => {
     toastModule.addToast('自动消失')
     expect(toastModule.toasts()).toHaveLength(1)
 
     vi.advanceTimersByTime(3000)
-    expect(toastModule.toasts()).toHaveLength(0)
+    // store 层不再硬移除:addToast 内联 setTimeout 曾与 ToastItem 组件计时器
+    // (startTimer/startExit) 竞争,导致 hover 暂停与 200ms 退出动画失效。
+    // 生命周期归 ToastItem 组件,本用例防双计时器竞争回归。
+    expect(toastModule.toasts()).toHaveLength(1)
   })
 
   it('removeToast 手动移除指定 toast', () => {

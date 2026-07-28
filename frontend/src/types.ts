@@ -24,6 +24,12 @@ export interface TaskInfo {
   savePath: string
   /** 当前活跃并发分片数。后端 ProgressPayload 高频同步,可选以兼容旧版快照 */
   activeConcurrency?: number
+  /** BT/磁力:live peer 数;0 表示尚无可用节点 */
+  peerLive?: number | null
+  /** BT/磁力:正在连接的 peer 数 */
+  peerConnecting?: number | null
+  /** BT/磁力:排队中的 peer 数 */
+  peerQueued?: number | null
   /** 失败原因原文(仅 status='failed' 时有值),后端 TaskInfo.error_reason */
   errorReason?: string
   /** 任务级重试计数:分片/整块可重试失败累计,经快照与 progress 事件同步 */
@@ -82,12 +88,21 @@ export interface HubConfig {
   sourceMode: HfSourceMode
 }
 
+/** 磁力链接配置 — 与后端 MagnetConfig 对齐 */
 export interface MagnetConfig {
   metadataTimeoutSecs: number
   downloadTimeoutSecs: number
   enableDht: boolean
   enableUpnp: boolean
   trackers: string[]
+  /** 是否启用公共 Tracker 订阅(XIU2 等) */
+  trackerSubscriptionEnabled?: boolean
+  /** 订阅源 URL(默认 best.txt) */
+  trackerSubscriptionUrl?: string
+  /** 最近成功更新时间 RFC3339 */
+  trackerSubscriptionLastUpdated?: string | null
+  /** 用户手动维护的 tracker(订阅合并时保留) */
+  trackerSubscriptionUserTrackers?: string[]
   disableDhtPersistence: boolean
   peerWaitTimeoutSecs: number
   socksProxyUrl: string | null
@@ -207,6 +222,10 @@ export interface MagnetPatch {
   enableDht?: boolean
   enableUpnp?: boolean
   trackers?: string[]
+  trackerSubscriptionEnabled?: boolean
+  trackerSubscriptionUrl?: string
+  trackerSubscriptionLastUpdated?: string | null
+  trackerSubscriptionUserTrackers?: string[]
   disableDhtPersistence?: boolean
   peerWaitTimeoutSecs?: number
   socksProxyUrl?: string | null
@@ -217,6 +236,14 @@ export interface MagnetPatch {
   disableDhtWhenSocks?: boolean
   allowPrivatePeers?: boolean
   peerAddrs?: string[]
+}
+
+/** Tracker 订阅刷新结果 */
+export interface TrackerSubscriptionResult {
+  trackersCount: number
+  subscribedCount: number
+  lastUpdated: string
+  sourceUrl: string
 }
 
 /** 调度器配置白名单补丁 */
@@ -277,6 +304,10 @@ export interface ProgressPayload {
   fragmentsDone: number
   fragmentsTotal: number
   activeConcurrency: number
+  /** BT peer 发现快照(可选;HTTP 任务不发) */
+  peerLive?: number | null
+  peerConnecting?: number | null
+  peerQueued?: number | null
   /** 文件总大小,探测完成后由后端通过进度事件同步,避免详情页显示 0B */
   fileSize?: number | null
   completedDelta?: number[]

@@ -271,6 +271,10 @@
    ============================================ */
 
 :root {
+  /* 原生控件(select 弹层/滚动条等)按深色渲染:未声明时 WebView2 默认浅色,
+     磁盘 I/O 策略下拉弹层曾白底浅字不可读 */
+  color-scheme: dark;
+
   /* 断点 token:统一管理,避免散落硬编码 */
   --bp-sm: 640px;   /* 手机/极窄窗 */
   --bp-md: 768px;   /* 平板/窄桌面(侧边栏强制轨道、DetailPanel 全屏) */
@@ -316,6 +320,9 @@
 }
 
 [data-theme="light"] {
+  /* 原生控件按浅色渲染(覆盖 :root 的 color-scheme: dark) */
+  color-scheme: light;
+
   /* 背景层级:反转为浅冷灰白(Linear 浅底系,非纯白) */
   --black-0: #f4f5f7;
   --black-1: #eceef1;

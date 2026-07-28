@@ -297,6 +297,14 @@ pub trait TaskRunner: Send + Sync {
     /// 调用方负责传入已 sanitize 的合法文件名。
     fn set_preferred_file_name(&mut self, name: String);
 
+    /// 注入任务级期望校验和(整文件 hex)。
+    ///
+    /// 用于 LFS oid / 可信来源的全文件完整性;与分片级 `FragmentInfo.hash` 互补。
+    /// 默认空实现兼容旧 Mock。
+    fn set_expected_checksum(&mut self, checksum: Option<String>) {
+        let _ = checksum;
+    }
+
     /// 探测远程文件元数据
     fn probe(&mut self)
     -> Pin<Box<dyn Future<Output = DownloadResult<&FileMetadata>> + Send + '_>>;
@@ -337,6 +345,10 @@ impl<T: TaskRunner + ?Sized> TaskRunner for Box<T> {
 
     fn set_preferred_file_name(&mut self, name: String) {
         (**self).set_preferred_file_name(name)
+    }
+
+    fn set_expected_checksum(&mut self, checksum: Option<String>) {
+        (**self).set_expected_checksum(checksum)
     }
 
     fn probe(
@@ -489,6 +501,7 @@ mod tests {
         partial_fragments_set: bool,
         progress_sender_set: bool,
         preferred_file_name: Option<String>,
+        expected_checksum: Option<String>,
         probe_called: bool,
         run_called: bool,
     }
@@ -519,6 +532,10 @@ mod tests {
 
         fn set_preferred_file_name(&mut self, name: String) {
             self.state.lock().unwrap().preferred_file_name = Some(name);
+        }
+
+        fn set_expected_checksum(&mut self, checksum: Option<String>) {
+            self.state.lock().unwrap().expected_checksum = checksum;
         }
 
         fn probe(

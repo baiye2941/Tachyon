@@ -168,10 +168,11 @@ const PROGRESS_REPORT_CHUNK_INTERVAL: u64 = 5;
 /// 相对 EveryFragment 降低 fsync 频率,同时保证非零 durable 点(16 片场景至少 2 次)。
 const LOOSE_GROUP_COMMIT_N: usize = 8;
 
-/// Loose 模式 mid-flight partial 进度上报的 group-commit 批大小:
-/// 每第 N 次「已写入字节」的 partial 上报前调用一次 `storage.sync()`。
-/// 取 2 保证 mid-flight 非零 durable 点,同时总 sync 仍少于 EveryFragment。
-const LOOSE_PARTIAL_GROUP_COMMIT_N: usize = 2;
+/// Loose 模式 mid-flight partial 的 group-commit 字节水位。
+/// 任务级累计已写入字节每跨过该水位调用一次 `storage.sync()`。
+/// 取 `WRITE_BATCH_BYTES`(=256 KiB):与写合并批次对齐,使 sync 由写入量决定、
+/// 与网络 chunk 切分无关;小文件 mid-flight 仍有非零 durable 点。
+const LOOSE_PARTIAL_GROUP_COMMIT_BYTES: u64 = tachyon_core::config::WRITE_BATCH_BYTES as u64;
 
 /// 分片写入批大小阈值(字节)。网络 chunk 先累积到 `write_buf`,达到此阈值后
 /// 批量刷写存储,减少 `write_at` 系统调用次数。256 KiB 在 HDD/SSD 与默认
@@ -247,9 +248,10 @@ struct FragmentSpawnCtx<'a> {
     /// 任务级 Loose group-commit 计数器(跨分片 worker 共享)。
     /// EveryFragment 路径不读此计数器;仍传入以统一 spawn 签名。
     loose_completed_frags: Arc<std::sync::atomic::AtomicUsize>,
-    /// 任务级 Loose partial 进度 group-commit 计数器(跨分片 worker 共享)。
+    /// 任务级 Loose partial 进度 group-commit 字节水位(跨分片 worker 共享)。
     /// 仅 Loose + mid-flight partial 路径读取;EveryFragment 不读。
-    loose_partial_reports: Arc<std::sync::atomic::AtomicUsize>,
+    /// 累计已计入 group-commit 的写入字节。
+    loose_partial_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// 代理下片内 Range 窗口(字节)。`None`=整片一次 Range;
     /// `Some(w)`=每次最多请求 w 字节,TLS EOF 只丢当前窗口。
     range_window_bytes: Option<u64>,
@@ -305,6 +307,9 @@ pub struct DownloadTask {
     resume_object_identity: Option<ObjectIdentity>,
     /// 断点快照中的 supports_range(None=未知/旧快照,Some(false)=强制整块)
     resume_supports_range: Option<bool>,
+    /// 任务级期望校验和(整文件 hex)。LFS oid 等可信来源注入;
+    /// 与分片级 FragmentInfo.hash 互补,verify 阶段整文件比对。
+    expected_checksum: Option<String>,
     /// 外部共享限速器(跨任务全局限速)。
     /// 为 Some 时优先使用;为 None 时由 config.rate_limit_bytes_per_sec 创建 per-task 限速器。
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -378,20 +383,31 @@ impl WriteBuf {
     }
 }
 
-/// 审计 HTTP-15:经全局注册表获取/共享 HttpClient(同身份复用 TCP/TLS/H2)
+/// 审计 HTTP-15:经全局注册表获取/共享 HttpClient(同身份复用 TCP/TLS)
+///
+/// **强制 HTTP/1.1(多 TCP)**:分片并发的产品语义是「N 片 = N 条独立连接」,
+/// 聚合带宽 ≈ N × 单连接限速(见 docs/sdd/perf-research.md)。
+/// 默认 `enable_http2=true` 时 reqwest 把多 Range 复用到**同一条 TCP**,
+/// CDN/Clash 按连接限流时出现「并发 9 仍 ~8MB/s」(用户实测 wo 网盘)。
+/// 下载引擎路径因此覆盖为 `http1_only`,让每片独立握手/独立限速桶。
+/// 用户 UI「启用 HTTP/2」仍写入 ConnectionConfig,但引擎下载客户端不沿用
+/// 该开关做多路复用(H2 适合 API/小请求,不适合多连接打满带宽)。
 fn shared_http_client(
     config: &DownloadConfig,
     pool: &Option<Arc<ConnectionPool>>,
 ) -> DownloadResult<HttpClient> {
-    let conn = pool
+    let mut conn = pool
         .as_ref()
-        .map(|p| tachyon_core::config::ConnectionConfig::from(p.config().clone()));
+        .map(|p| tachyon_core::config::ConnectionConfig::from(p.config().clone()))
+        .unwrap_or_default();
+    // 多分片下载必须多 TCP;H2 单连接复用会抵消并发收益
+    conn.enable_http2 = false;
     let arc = crate::http_client_registry::global_http_client_registry().get_or_create(
         &config.user_agent,
         config.proxy.as_deref(),
         config.connect_timeout_secs,
         config.request_timeout_secs,
-        conn.as_ref(),
+        Some(&conn),
         &config.headers,
         config.auth_bearer.as_deref(),
     )?;
@@ -542,6 +558,7 @@ impl DownloadTask {
                         partial_fragments: HashMap::new(),
                         resume_object_identity: None,
                         resume_supports_range: None,
+                        expected_checksum: None,
                         rate_limiter: None,
                         metrics: None,
                         circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -588,6 +605,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -641,6 +659,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -762,6 +781,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -868,6 +888,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -914,6 +935,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -963,6 +985,7 @@ impl DownloadTask {
             partial_fragments: HashMap::new(),
             resume_object_identity: None,
             resume_supports_range: None,
+            expected_checksum: None,
             rate_limiter: None,
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
@@ -1020,6 +1043,14 @@ impl DownloadTask {
     /// 注入断点快照中的 supports_range(probe 后覆盖远端声明)
     pub fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
         self.resume_supports_range = supports_range;
+    }
+
+    /// 注入任务级期望校验和(整文件 hex)。
+    ///
+    /// 须在 `run()`/`verify()` 前调用。有值时 `verify` 读盘计算整文件哈希并比对;
+    /// 亦使 `Require` 在无分片 hash 时不再 fail-fast。
+    pub fn set_expected_checksum(&mut self, checksum: Option<String>) {
+        self.expected_checksum = checksum.filter(|s| !s.is_empty());
     }
 
     /// 设置调度器配置(规划参数 / sampling_interval 等)。
@@ -1401,6 +1432,37 @@ impl DownloadTask {
     /// 高置信判定(`confidence > 0.5`)保持同一水位。
     const BT_COLD_START_CONFIDENCE: f64 = 0.5;
 
+    /// 向 progress 通道上报 BT peer 发现快照(可丢)。
+    ///
+    /// 仅 magnet/BT 任务且持有 `bt_magnet`/`bt_fallback` 时生效;HTTP 空操作。
+    /// UI 用于「0 peer / 发现中」提示,不参与正确性。
+    #[cfg(feature = "magnet")]
+    fn try_emit_peer_stats(&self) {
+        let Some(tx) = self.progress_tx.as_ref() else {
+            return;
+        };
+        let Some(magnet) = self.bt_magnet.as_ref().or(self.bt_fallback.as_ref()) else {
+            return;
+        };
+        let Some(stats) = magnet.peer_stats_snapshot(&self.url) else {
+            // 尚无 live 统计时也推 0,让 UI 显示「发现中」而非空白
+            let _ = tx.try_send(FragmentProgress::PeerStats {
+                live: 0,
+                connecting: 0,
+                queued: 0,
+            });
+            return;
+        };
+        let _ = tx.try_send(FragmentProgress::PeerStats {
+            live: stats.live_peers as u32,
+            connecting: stats.connecting_peers as u32,
+            queued: stats.queued_peers as u32,
+        });
+    }
+
+    #[cfg(not(feature = "magnet"))]
+    fn try_emit_peer_stats(&self) {}
+
     /// 判定当前任务是否为 BT/magnet 下载。
     ///
     /// 判据:URL 为 magnet scheme(与构造期协议选择 `new` 同一判据),
@@ -1452,17 +1514,99 @@ impl DownloadTask {
     }
 
     /// 是否走系统/显式 HTTP 代理(direct/none 视为直连)。
+    /// 含本机 loopback 代理;并发 cap 请用 [`Self::remote_http_proxy_active`]。
+    #[allow(dead_code)] // 测试与诊断谓词;生产 cap 路径走 remote_http_proxy_active
     fn http_proxy_active(&self) -> bool {
-        if let Some(ref p) = self.config.proxy {
+        self.resolved_http_proxy_url().is_some()
+    }
+
+    /// 解析当前生效的 HTTP 代理 URL(配置优先,否则环境变量)。
+    /// `direct`/`none`/空串 → None。
+    fn resolved_http_proxy_url(&self) -> Option<String> {
+        if let Some(p) = &self.config.proxy {
             let t = p.trim();
             if t.eq_ignore_ascii_case("direct") || t.eq_ignore_ascii_case("none") {
-                return false;
+                return None;
             }
             if !t.is_empty() {
-                return true;
+                return Some(t.to_string());
             }
         }
-        tachyon_core::config::resolve_http_proxy(None).is_some()
+        tachyon_core::config::resolve_http_proxy(None)
+    }
+
+    /// 代理 URL 是否指向本机(loopback)。
+    ///
+    /// 本机 Clash/v2rayN(`127.0.0.1:7897` 等)不是跨境共享代理瓶颈:
+    /// 旧实现把「任意 HTTP_PROXY」一律 cap=2,导致国内网盘经本地代理时
+    /// 并发永远跑不满(用户日志:total_frags=17 但 activeConcurrency 锁 2)。
+    /// 无法解析 host 时保守视为非 loopback(仍套 cap)。
+    pub(crate) fn is_loopback_proxy_url(proxy_url: &str) -> bool {
+        if let Some(host) = Self::proxy_url_host(proxy_url) {
+            return Self::host_is_loopback(&host);
+        }
+        false
+    }
+
+    /// 从代理 URL 提取 host(兼容 socks5 等非 WHATWG special scheme)。
+    ///
+    /// `url` crate 对 socks5 常把 authority 放进 path 而非 host;此处做兜底。
+    fn proxy_url_host(proxy_url: &str) -> Option<String> {
+        if let Ok(parsed) = url::Url::parse(proxy_url)
+            && let Some(h) = parsed.host_str()
+        {
+            return Some(h.to_string());
+        }
+        // 兜底:scheme://[userinfo@]host[:port][/...]
+        // socks5 等非 special scheme 时 url crate 常把 authority 放 path。
+        let after_scheme = match proxy_url.split_once("://") {
+            Some((_, rest)) => rest,
+            None => proxy_url,
+        };
+        let authority = after_scheme.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return None;
+        }
+        let host_port = match authority.rsplit_once('@') {
+            Some((_, hp)) => hp,
+            None => authority,
+        };
+        // IPv6 bracket form → 去掉括号再返回
+        if let Some(rest) = host_port.strip_prefix('[') {
+            let end = rest.find(']')?;
+            return Some(rest[..end].to_string());
+        }
+        let host = match host_port.rsplit_once(':') {
+            Some((h, port)) if !h.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => host_port,
+        };
+        let host = host.trim();
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
+    }
+
+    fn host_is_loopback(host: &str) -> bool {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.") {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+        false
+    }
+
+    /// 远程(非 loopback)HTTP 代理是否生效。
+    ///
+    /// 仅远程代理触发冷启动/稳态 cap、保守抬升步进;本机代理与直连同等对待并发。
+    fn remote_http_proxy_active(&self) -> bool {
+        match self.resolved_http_proxy_url() {
+            Some(url) => !Self::is_loopback_proxy_url(&url),
+            None => false,
+        }
     }
 
     /// 代理下片内 Range 窗口大小。
@@ -1470,10 +1614,10 @@ impl DownloadTask {
     /// 证据:跨境 HTTP_PROXY 约 35s 周期掐 TLS;8MiB 片在 ~600KB/s 下跑不完整片,
     /// EOF 后即使 partial resume 也丢当前连接窗口。2MiB 窗口把最坏重传上界从整片
     /// 收到 2MiB,且不改变 plan_fragments 边界(resume/rebalance 仍按分片 index)。
-    /// 直连返回 None(整片一次 Range,零额外请求开销)。
+    /// 直连/本机代理返回 None(整片一次 Range,零额外请求开销)。
     fn proxy_range_window_bytes(&self) -> Option<u64> {
         const PROXY_RANGE_WINDOW: u64 = 2 * 1024 * 1024;
-        if self.http_proxy_active() {
+        if self.remote_http_proxy_active() {
             Some(PROXY_RANGE_WINDOW)
         } else {
             None
@@ -1489,32 +1633,36 @@ impl DownloadTask {
         }
     }
 
-    /// 代理冷启动上限(低置信度):≤2。
+    /// 远程代理冷启动上限(低置信度):≤2。
+    /// 本机代理(Clash loopback)不 cap——否则 17 片任务永远锁在 2。
     fn proxy_cold_start_cap_for_config(&self, confidence: f64) -> Option<u32> {
         const PROXY_COLD_START_MAX: u32 = 2;
         const LOW_CONFIDENCE: f64 = 0.5;
-        if confidence >= LOW_CONFIDENCE || !self.http_proxy_active() {
+        if confidence >= LOW_CONFIDENCE || !self.remote_http_proxy_active() {
             None
         } else {
             Some(PROXY_COLD_START_MAX)
         }
     }
 
-    /// 代理稳态并发天花板(含 re-recommend 抬升)。
+    /// 远程代理稳态并发天花板(含 re-recommend 抬升)。
     ///
-    /// 证据:经 HTTP_PROXY 的 kernel.org 同会话,c=2/c=4 健康时均 ~6MB/s;
+    /// 证据:经**跨境** HTTP_PROXY 的 kernel.org 同会话,c=2/c=4 健康时均 ~6MB/s;
     /// c=8 会爬到 5+ 打爆。c=2 已达吞吐, cap=4 只加倍连接面无 goodput 收益。
     /// 稳态 cap=2 与 soft-pressure floor、aria2 `-x2` 对齐;冷启动仍 ≤2。
+    ///
+    /// **本机 loopback 代理不套此 cap**:本地转发不是共享出口瓶颈,应允许
+    /// 调度器按 max_concurrent_fragments 跑满(国内 CDN/网盘常见需求)。
     fn proxy_steady_concurrency_ceiling(&self) -> Option<u32> {
         const PROXY_STEADY_MAX: u32 = 2;
-        if self.http_proxy_active() {
+        if self.remote_http_proxy_active() {
             Some(PROXY_STEADY_MAX)
         } else {
             None
         }
     }
 
-    /// 对 desired 并发应用代理天花板(若有)。
+    /// 对 desired 并发应用远程代理天花板(若有)。
     fn apply_proxy_concurrency_ceiling(&self, desired: u32) -> u32 {
         match self.proxy_steady_concurrency_ceiling() {
             Some(cap) => desired.min(cap).max(1),
@@ -2455,7 +2603,7 @@ impl DownloadTask {
         let pause_timeout = ctx.pause_timeout;
         let skip_write = ctx.skip_write;
         let frag_sync_mode = ctx.sync_mode;
-        let frag_loose_partial = Arc::clone(&ctx.loose_partial_reports);
+        let frag_loose_partial = Arc::clone(&ctx.loose_partial_bytes);
         let frag_loose_completed = Arc::clone(&ctx.loose_completed_frags);
         let frag_object_identity = ctx.object_identity.clone();
         let frag_range_window = ctx.range_window_bytes;
@@ -2968,8 +3116,8 @@ impl DownloadTask {
         // 改由 MirrorProtocol 的 per-source stats 接管故障隔离。
         // Loose group-commit:任务级完成分片计数,各 fragment worker 共享
         let loose_completed_frags = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Loose partial 进度 group-commit:任务级 partial 上报计数
-        let loose_partial_reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Loose partial 进度 group-commit:任务级累计写入字节水位
+        let loose_partial_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let frag_has_mirrors = self.has_mirrors;
         let frag_verifier = self.verifier.clone();
@@ -3083,13 +3231,15 @@ impl DownloadTask {
                     if Self::control_is_paused(&control_rx) {
                         continue;
                     }
+                    // BT:周期性上报 peer 发现快照,供 UI「0 peer / 发现中」
+                    self.try_emit_peer_stats();
                     let rec = self.scheduler.recommend(file_size, max_concurrent_fragments);
                     let old = concurrency_ctrl.target();
                     let desired = self.apply_proxy_concurrency_ceiling(
                         rec.concurrency.min(max_concurrent_fragments).max(1),
                     );
                     // 抬升步进限制:冷却结束也不允许一次跳回满配
-                    let new_target = if self.http_proxy_active() {
+                    let new_target = if self.remote_http_proxy_active() {
                         Self::clamp_concurrency_scale_up_ex(old, desired, true)
                     } else {
                         Self::clamp_concurrency_scale_up(old, desired)
@@ -3154,7 +3304,7 @@ impl DownloadTask {
                                 skip_write,
                                 sync_mode: self.config.crash_consistency_mode,
                                 loose_completed_frags: Arc::clone(&loose_completed_frags),
-                                loose_partial_reports: Arc::clone(&loose_partial_reports),
+                                loose_partial_bytes: Arc::clone(&loose_partial_bytes),
                                 object_identity: self
                                     .metadata
                                     .as_ref()
@@ -3212,7 +3362,7 @@ impl DownloadTask {
                             let desired = self.apply_proxy_concurrency_ceiling(
                                 rec.concurrency.min(max_concurrent_fragments).max(1),
                             );
-                            let new_target = if self.http_proxy_active() {
+                            let new_target = if self.remote_http_proxy_active() {
                                 Self::clamp_concurrency_scale_up_ex(old, desired, true)
                             } else {
                                 Self::clamp_concurrency_scale_up(old, desired)
@@ -3401,7 +3551,7 @@ impl DownloadTask {
         // 收尾优先:最后一片 straggler 需要短冷却,代理 20s 仅约束非收尾路径
         let min_interval = if queue_empty {
             REBALANCE_MIN_INTERVAL_ENDGAME
-        } else if self.http_proxy_active() {
+        } else if self.remote_http_proxy_active() {
             REBALANCE_MIN_INTERVAL_PROXY
         } else {
             REBALANCE_MIN_INTERVAL
@@ -3588,6 +3738,20 @@ impl DownloadTask {
                 .collect();
             // 整块下载路径会从 Pending 走 start_download → complete_download_fast
             debug!(count = self.fragments.len(), "已重新规划为单分片覆盖整文件");
+        }
+        // 通知 app 层重规划:旧分片进度全部作废,必须清零 total_downloaded。
+        // 否则 chunk_reader 会把降级前 partial 字节与整块重下字节双计
+        // (UI 显示 > file_size 且 100% 仍在下)。completed_indices 空 =
+        // 全量重下;total 以当前 fragments 为准(通常 1)。
+        if let Some(tx) = &self.progress_tx {
+            let total = self.fragments.len() as u32;
+            if let Err(e) = tx.try_send(FragmentProgress::PlanComplete {
+                total,
+                completed_indices: Vec::new(),
+                initial_concurrency: 1,
+            }) {
+                warn!(error = %e, "RangeNotSupported 重规划 PlanComplete 发送失败");
+            }
         }
         // 重置存储分配,丢弃 execute_fragmented_download 期间部分写入的残留,
         // 避免 execute_full_download_once 写入与旧数据拼接产生损坏。
@@ -3954,39 +4118,58 @@ impl DownloadTask {
         }
     }
 
-    /// mid-flight partial 进度的 durable 上报:先按 crash-consistency 策略 sync,再 `report_progress`。
+    /// mid-flight partial 进度的 durable 上报。
     ///
-    /// - `skip_write` 或 `total_written == 0`:不 sync,直接上报
     /// - `EveryFragment`:每次有写入字节的 partial 前都 `storage.sync()`
-    /// - `Loose`:任务级计数器每 `LOOSE_PARTIAL_GROUP_COMMIT_N` 次 partial 同步一次
+    /// - `Loose`:数据 sync 已在写路径按字节水位处理;此处只上报进度,避免与 chunk 切分耦合
     ///
-    /// 仅在 partial 上报点调用;不在每 batch flush 后 sync,避免 Flush Storm。
+    /// 仅在 partial 上报点调用。
     async fn report_progress_durable(
         storage: &Arc<StorageSet>,
         skip_write: bool,
         sync_mode: tachyon_core::config::CrashConsistencyMode,
-        loose_partial_reports: &Arc<std::sync::atomic::AtomicUsize>,
         frag_index: u32,
         total_written: u64,
         progress_tx: &Option<tokio::sync::mpsc::Sender<FragmentProgress>>,
     ) -> DownloadResult<()> {
-        if !skip_write && total_written > 0 {
-            match sync_mode {
-                tachyon_core::config::CrashConsistencyMode::EveryFragment => {
-                    storage.sync().await?;
-                }
-                tachyon_core::config::CrashConsistencyMode::Loose => {
-                    // fetch_add 返回旧值;上报序号 = 旧值+1。每 N 次触发 group-commit。
-                    let prev =
-                        loose_partial_reports.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    let report_n = prev + 1;
-                    if report_n.is_multiple_of(LOOSE_PARTIAL_GROUP_COMMIT_N) {
-                        storage.sync().await?;
-                    }
-                }
-            }
+        if !skip_write
+            && total_written > 0
+            && matches!(
+                sync_mode,
+                tachyon_core::config::CrashConsistencyMode::EveryFragment
+            )
+        {
+            storage.sync().await?;
         }
         Self::report_progress(frag_index, total_written, progress_tx);
+        Ok(())
+    }
+
+    /// Loose 模式:任务级累计写入字节跨过水位时 group-commit。
+    ///
+    /// 在实际 `flush_batch` 推进 `total_written` 后调用,使 sync 次数由写入量决定,
+    /// 与网络 chunk 如何切分、partial 上报 countdown 无关。
+    async fn maybe_loose_sync_on_written_bytes(
+        storage: &Arc<StorageSet>,
+        skip_write: bool,
+        sync_mode: tachyon_core::config::CrashConsistencyMode,
+        loose_partial_bytes: &Arc<std::sync::atomic::AtomicU64>,
+        written_delta: u64,
+    ) -> DownloadResult<()> {
+        if skip_write
+            || written_delta == 0
+            || !matches!(sync_mode, tachyon_core::config::CrashConsistencyMode::Loose)
+        {
+            return Ok(());
+        }
+        let prev =
+            loose_partial_bytes.fetch_add(written_delta, std::sync::atomic::Ordering::AcqRel);
+        let new = prev.saturating_add(written_delta);
+        let prev_marks = prev / LOOSE_PARTIAL_GROUP_COMMIT_BYTES;
+        let new_marks = new / LOOSE_PARTIAL_GROUP_COMMIT_BYTES;
+        if new_marks > prev_marks {
+            storage.sync().await?;
+        }
         Ok(())
     }
 
@@ -4045,7 +4228,7 @@ impl DownloadTask {
         skip_write: bool,
         sync_mode: tachyon_core::config::CrashConsistencyMode,
         loose_completed_frags: &Arc<std::sync::atomic::AtomicUsize>,
-        loose_partial_reports: &Arc<std::sync::atomic::AtomicUsize>,
+        loose_partial_bytes: &Arc<std::sync::atomic::AtomicU64>,
         shared: &FragmentShared,
         object_identity: Option<ObjectIdentity>,
         metrics: Option<&Metrics>,
@@ -4278,6 +4461,14 @@ impl DownloadTask {
                         shared
                             .realtime_downloaded
                             .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        Self::maybe_loose_sync_on_written_bytes(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_bytes,
+                            w,
+                        )
+                        .await?;
                     }
                     if pos > current_end {
                         break;
@@ -4314,6 +4505,14 @@ impl DownloadTask {
                         shared
                             .realtime_downloaded
                             .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        Self::maybe_loose_sync_on_written_bytes(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_bytes,
+                            w,
+                        )
+                        .await?;
                     } else {
                         let mut rest = chunk;
                         while !rest.is_empty() {
@@ -4350,6 +4549,14 @@ impl DownloadTask {
                                     shared
                                         .realtime_downloaded
                                         .fetch_add(w, std::sync::atomic::Ordering::Release);
+                                    Self::maybe_loose_sync_on_written_bytes(
+                                        storage,
+                                        skip_write,
+                                        sync_mode,
+                                        loose_partial_bytes,
+                                        w,
+                                    )
+                                    .await?;
                                 } else {
                                     break;
                                 }
@@ -4362,7 +4569,6 @@ impl DownloadTask {
                             storage,
                             skip_write,
                             sync_mode,
-                            loose_partial_reports,
                             frag_index,
                             total_written,
                             progress_tx,
@@ -4395,6 +4601,14 @@ impl DownloadTask {
                         shared
                             .realtime_downloaded
                             .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        Self::maybe_loose_sync_on_written_bytes(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_bytes,
+                            w,
+                        )
+                        .await?;
                     }
                     if pos > current_end {
                         break;
@@ -4434,6 +4648,14 @@ impl DownloadTask {
                         shared
                             .realtime_downloaded
                             .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        Self::maybe_loose_sync_on_written_bytes(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_bytes,
+                            w,
+                        )
+                        .await?;
                     }
                     break;
                 }
@@ -4468,6 +4690,14 @@ impl DownloadTask {
                         shared
                             .realtime_downloaded
                             .fetch_add(w, std::sync::atomic::Ordering::Release);
+                        Self::maybe_loose_sync_on_written_bytes(
+                            storage,
+                            skip_write,
+                            sync_mode,
+                            loose_partial_bytes,
+                            w,
+                        )
+                        .await?;
                     }
                 }
                 // 进度上报检查:移到刷写块外,确保小 chunk 累积不满 WRITE_BATCH_BYTES 时
@@ -4477,7 +4707,6 @@ impl DownloadTask {
                         storage,
                         skip_write,
                         sync_mode,
-                        loose_partial_reports,
                         frag_index,
                         total_written,
                         progress_tx,
@@ -4512,6 +4741,14 @@ impl DownloadTask {
                 shared
                     .realtime_downloaded
                     .fetch_add(w, std::sync::atomic::Ordering::Release);
+                Self::maybe_loose_sync_on_written_bytes(
+                    storage,
+                    skip_write,
+                    sync_mode,
+                    loose_partial_bytes,
+                    w,
+                )
+                .await?;
             }
             // 窗口未读满且仍在有效边界内 → 对端提前 EOF,交外层重试(已 flush partial)。
             // 用 Network+unexpected eof 归类 soft-pressure:额外 retry budget、短 jitter、
@@ -4534,7 +4771,6 @@ impl DownloadTask {
                 storage,
                 skip_write,
                 sync_mode,
-                loose_partial_reports,
                 frag_index,
                 total_written,
                 progress_tx,
@@ -4738,6 +4974,53 @@ impl DownloadTask {
             debug!(index, "分片校验通过");
         }
 
+        // 任务级整文件校验(LFS oid 等):分片 hash 之外的可信来源。
+        if let Some(expected) = self.expected_checksum.clone() {
+            has_expected_hash = true;
+            let file_size = self
+                .metadata
+                .as_ref()
+                .and_then(|m| m.file_size)
+                .or_else(|| {
+                    let total: u64 = self.fragments.iter().map(|f| f.info.size).sum();
+                    Some(total)
+                })
+                .unwrap_or(0);
+            let chunk_size = VERIFY_HASH_CHUNK_SIZE;
+            let mut offset = 0u64;
+            let mut buf = vec![0u8; chunk_size];
+            let mut hasher = self.verifier.new_hasher();
+            let mut bytes_read_since_check: u64 = 0;
+            let mut control_rx = self.control_rx.clone();
+            let pause_timeout = Duration::from_secs(self.config.pause_timeout_secs);
+            while offset < file_size {
+                let read_len = ((file_size - offset).min(chunk_size as u64)) as usize;
+                let read = storage.read_at(offset, &mut buf[..read_len]).await?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+                offset += read as u64;
+                bytes_read_since_check = bytes_read_since_check.saturating_add(read as u64);
+                if bytes_read_since_check >= VERIFY_CANCEL_CHECK_BYTES {
+                    if let Some(rx) = control_rx.as_mut() {
+                        Self::wait_control_rx(rx, pause_timeout).await?;
+                    }
+                    bytes_read_since_check = 0;
+                }
+            }
+            let computed = hasher.finalize();
+            if computed != expected {
+                warn!(expected = %expected, actual = %computed, "任务级整文件校验失败");
+                self.state = DownloadState::Failed;
+                return Err(DownloadError::ChecksumMismatch {
+                    expected,
+                    actual: computed,
+                });
+            }
+            debug!(task_id = %self.id, "任务级整文件校验通过");
+        }
+
         // Require 策略:必须有 expected hash
         if self.config.verify_strategy == tachyon_core::config::VerifyStrategy::Require
             && !has_expected_hash
@@ -4890,6 +5173,18 @@ impl DownloadTask {
         // 步骤 2: 规划分片 (纯 CPU, 不阻塞)
         self.check_cancelled()?;
         self.plan()?;
+
+        // Require 且 plan 后仍无任何 expected hash(分片级或任务级):在发起字节下载前 fail-fast,
+        // 避免完整下载后再在 verify 抛 NoExpectedChecksum 的陷阱。
+        let has_any_expected = self.expected_checksum.is_some()
+            || self.fragments.iter().any(|f| f.info.hash.is_some());
+        if self.config.verify_checksum
+            && self.config.verify_strategy == tachyon_core::config::VerifyStrategy::Require
+            && !has_any_expected
+        {
+            self.state = DownloadState::Failed;
+            return Err(DownloadError::NoExpectedChecksum);
+        }
 
         // 步骤 3: 预分配存储 (与取消信号竞速)
         {
@@ -5277,6 +5572,10 @@ impl tachyon_core::traits::TaskRunner for DownloadTask {
 
     fn set_resume_supports_range(&mut self, supports_range: Option<bool>) {
         self.set_resume_supports_range(supports_range);
+    }
+
+    fn set_expected_checksum(&mut self, checksum: Option<String>) {
+        self.set_expected_checksum(checksum);
     }
 
     fn set_progress_sender(&mut self, tx: tokio::sync::mpsc::Sender<FragmentProgress>) {
@@ -7230,6 +7529,117 @@ mod tests {
         );
     }
 
+    /// Loose 数据 group-commit 必须以累计写入字节为水位，而不是网络层如何切 chunk。
+    #[tokio::test]
+    async fn test_loose_sync_count_is_independent_of_network_chunk_partitioning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct LooseSyncProbeStorage {
+            inner: MemStorage,
+            syncs: Arc<AtomicUsize>,
+        }
+
+        impl AsyncStorage for LooseSyncProbeStorage {
+            fn write_at(
+                &self,
+                offset: u64,
+                data: bytes::Bytes,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + '_>> {
+                self.inner.write_at(offset, data)
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                buf: &'a mut [u8],
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<usize>> + Send + 'a>> {
+                self.inner.read_at(offset, buf)
+            }
+
+            fn sync(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                let syncs = self.syncs.clone();
+                Box::pin(async move {
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn allocate(
+                &self,
+                size: u64,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                self.inner.allocate(size)
+            }
+
+            fn file_size(&self) -> Pin<Box<dyn Future<Output = DownloadResult<u64>> + Send + '_>> {
+                self.inner.file_size()
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = DownloadResult<()>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        async fn count_for_chunk_size(chunk_size: usize) -> usize {
+            let total = 4 * 1024 * 1024u64;
+            let fragment_size = 2 * 1024 * 1024u64;
+            let meta = FileMetadata {
+                file_name: format!("loose-sync-{chunk_size}.bin"),
+                file_size: Some(total),
+                content_type: None,
+                supports_range: true,
+                etag: Some("\"strong-etag\"".into()),
+                last_modified: None,
+                file_layout: None,
+                protocol_managed_storage: false,
+                resolved_host: None,
+            };
+            let protocol: Arc<dyn Protocol> = Arc::new(
+                MockProto::new(meta)
+                    .with_default_data(bytes::Bytes::from(vec![0x5D; total as usize]))
+                    .with_chunk_size(chunk_size),
+            );
+            let syncs = Arc::new(AtomicUsize::new(0));
+            let storage = StorageKind::new(LooseSyncProbeStorage {
+                inner: MemStorage::with_capacity(total as usize),
+                syncs: syncs.clone(),
+            });
+            let mut task = DownloadTask::new_for_test(
+                "http://example.com/loose-sync.bin".into(),
+                DownloadConfig {
+                    max_retries: 0,
+                    verify_checksum: false,
+                    max_concurrent_fragments: 1,
+                    crash_consistency_mode: tachyon_core::config::CrashConsistencyMode::Loose,
+                    ..test_config()
+                },
+                protocol,
+                storage,
+            );
+            task.scheduler_config = tachyon_core::config::SchedulerConfig {
+                min_fragment_size: fragment_size,
+                max_fragment_size: fragment_size,
+                sampling_interval_secs: 60,
+                ewma_alpha: 0.3,
+                ..Default::default()
+            };
+            task.probe().await.expect("probe 应成功");
+            task.plan().expect("plan 应成功");
+            assert!(task.fragments.len() >= 2, "必须走分片 worker 路径");
+            task.prepare_storage().await.expect("storage 应准备成功");
+            task.execute().await.expect("下载应成功");
+            syncs.load(Ordering::SeqCst)
+        }
+
+        let small_chunks = count_for_chunk_size(16 * 1024).await;
+        let large_chunks = count_for_chunk_size(64 * 1024).await;
+        assert_eq!(
+            small_chunks, large_chunks,
+            "相同 4 MiB 写入量仅改变网络 chunk 切分时，Loose 数据 sync 次数必须一致:              16KiB chunks={small_chunks}, 64KiB chunks={large_chunks}"
+        );
+    }
+
     /// 模拟 page-cache 崩溃:write 只进 volatile,sync 才拷到 durable。
     /// 崩溃 = 丢弃 volatile,只剩 durable。用于验证「先 sync 再 completed 元数据」
     /// 的 resume 正确性,无需真实 kill 进程。
@@ -8567,6 +8977,137 @@ mod tests {
 
         assert!(matches!(result, Err(DownloadError::NoExpectedChecksum)));
         assert_eq!(task.state(), DownloadState::Failed);
+    }
+
+    /// Require 在 plan 后已能确定无 expected hash 时必须 fail-fast，
+    /// 禁止先完整下载再在 verify 阶段才抛 NoExpectedChecksum。
+    #[tokio::test]
+    async fn test_run_require_without_checksum_rejects_before_downloading_bytes() {
+        #[derive(Clone)]
+        struct CountingProtocol {
+            metadata: FileMetadata,
+            payload: Bytes,
+            data_calls: Arc<AtomicU32>,
+        }
+
+        impl Protocol for CountingProtocol {
+            fn probe(
+                &self,
+                _url: &str,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>> {
+                let metadata = self.metadata.clone();
+                Box::pin(async move { Ok(metadata) })
+            }
+
+            fn download_range(
+                &self,
+                _url: &str,
+                start: u64,
+                end: u64,
+                _identity: Option<ObjectIdentity>,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+                self.data_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let bytes = self.payload.slice(start as usize..=end as usize);
+                Box::pin(async move { Ok(bytes) })
+            }
+
+            fn download_range_stream(
+                &self,
+                url: &str,
+                start: u64,
+                end: u64,
+                identity: Option<ObjectIdentity>,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+                let data = self.download_range(url, start, end, identity);
+                Box::pin(async move {
+                    let bytes = data.await?;
+                    Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })) as ByteStream)
+                })
+            }
+
+            fn download_full(
+                &self,
+                _url: &str,
+            ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+                self.data_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let bytes = self.payload.clone();
+                Box::pin(async move { Ok(bytes) })
+            }
+        }
+
+        let payload = Bytes::from_static(b"require must reject before GET");
+        let data_calls = Arc::new(AtomicU32::new(0));
+        let protocol: Arc<dyn Protocol> = Arc::new(CountingProtocol {
+            metadata: test_metadata("require-preflight.bin", payload.len() as u64),
+            payload: payload.clone(),
+            data_calls: Arc::clone(&data_calls),
+        });
+        let mut task = make_task(
+            protocol,
+            StorageKind::memory_with_capacity(payload.len()),
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Require,
+                ..test_config()
+            },
+        );
+
+        let result = task.run().await;
+
+        assert!(matches!(result, Err(DownloadError::NoExpectedChecksum)));
+        assert_eq!(
+            data_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "Require 无 checksum 来源必须在任何 range/full 下载前拒绝"
+        );
+    }
+
+    /// 任务级 expected checksum:正确哈希下载成功,错误哈希 ChecksumMismatch。
+    #[tokio::test]
+    async fn test_run_with_task_level_checksum_detects_corruption() {
+        let payload = Bytes::from_static(b"task-level checksum body");
+        let good = CpuVerifier::blake3().compute_hash(&payload).unwrap();
+        let bad = "0".repeat(good.len());
+
+        // 正确哈希应成功
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(test_metadata("ok.bin", payload.len() as u64))
+                .with_default_data(payload.clone()),
+        );
+        let mut task = make_task(
+            protocol,
+            StorageKind::memory_with_capacity(payload.len()),
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Require,
+                max_retries: 0,
+                ..test_config()
+            },
+        );
+        task.set_expected_checksum(Some(good.clone()));
+        task.run().await.expect("正确任务级 checksum 应成功");
+
+        // 错误哈希应 ChecksumMismatch,且确实发生了下载(非 fail-fast)
+        let protocol2: Arc<dyn Protocol> = Arc::new(
+            MockProto::new(test_metadata("bad.bin", payload.len() as u64))
+                .with_default_data(payload.clone()),
+        );
+        let mut task2 = make_task(
+            protocol2,
+            StorageKind::memory_with_capacity(payload.len()),
+            DownloadConfig {
+                verify_checksum: true,
+                verify_strategy: tachyon_core::config::VerifyStrategy::Require,
+                max_retries: 0,
+                ..test_config()
+            },
+        );
+        task2.set_expected_checksum(Some(bad));
+        let err = task2.run().await.expect_err("错误任务级 checksum 应失败");
+        assert!(
+            matches!(err, DownloadError::ChecksumMismatch { .. }),
+            "应 ChecksumMismatch,实际 {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -14460,26 +15001,152 @@ mod tests {
     }
 
     #[test]
-    fn test_soft_pressure_mild_keeps_target() {
-        let until = DownloadTask::fresh_soft_until();
-        let eof = DownloadError::Network(
-            "peer closed connection without sending TLS close_notify".into(),
+    fn test_proxy_cold_start_cap_for_config() {
+        // direct 哨兵:不 cap
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/x.bin".into(),
+            DownloadConfig {
+                proxy: Some("direct".into()),
+                ..test_config()
+            },
+            Arc::new(MockProto::new(test_metadata("x.bin", 100))),
+            StorageKind::memory_with_capacity(100),
         );
-        for initial in [1u32, 2, 3, 4, 8] {
-            let ctrl = ConcurrencyController::new(initial, 16);
-            until.store(0, std::sync::atomic::Ordering::Release);
-            DownloadTask::apply_soft_pressure_backoff_ex(&ctrl, &eof, true, &until);
-            assert_eq!(
-                ctrl.target(),
-                initial,
-                "有进度 mild 不得降并发(initial={initial})"
-            );
-            assert!(
-                DownloadTask::soft_pressure_blocks_scale_up(&until),
-                "mild 仍应设置冷却挡 scale-up"
-            );
-            DownloadTask::clear_soft_pressure_cooldown_on_success(&until);
-        }
+        assert!(
+            task.proxy_cold_start_cap_for_config(0.0).is_none(),
+            "direct 不得 proxy cold cap"
+        );
+        assert!(task.proxy_steady_concurrency_ceiling().is_none());
+
+        // 本机 Clash loopback:不 cap(国内网盘经本地代理应能跑满并发)
+        task.config.proxy = Some("http://127.0.0.1:7897".into());
+        assert!(
+            task.proxy_cold_start_cap_for_config(0.0).is_none(),
+            "loopback 代理不得 cold cap"
+        );
+        assert!(
+            task.proxy_steady_concurrency_ceiling().is_none(),
+            "loopback 代理不得 steady cap"
+        );
+        assert_eq!(task.apply_proxy_concurrency_ceiling(8), 8);
+
+        // 远程代理 + 低置信度:cold cap 2;高置信度 cold 不 cap,稳态仍 2
+        task.config.proxy = Some("http://proxy.example.com:8080".into());
+        assert_eq!(task.proxy_cold_start_cap_for_config(0.0), Some(2));
+        assert!(task.proxy_cold_start_cap_for_config(0.9).is_none());
+        assert_eq!(task.proxy_steady_concurrency_ceiling(), Some(2));
+        assert_eq!(task.apply_proxy_concurrency_ceiling(8), 2);
+        assert_eq!(task.apply_proxy_concurrency_ceiling(2), 2);
+        assert_eq!(task.apply_proxy_concurrency_ceiling(1), 1);
+    }
+
+    /// 下载路径 shared_http_client 必须强制 HTTP/1.1(多 TCP)。
+    /// 即便 ConnectionPool 开启 HTTP/2,下载客户端身份也必须是 enable_http2=false。
+    #[test]
+    fn test_shared_http_client_forces_http1_multi_tcp() {
+        use crate::connection::{ConnectionPool, PoolConfig};
+        use crate::http_client_registry::global_http_client_registry;
+        use std::collections::HashMap;
+        use tachyon_core::config::ConnectionConfig;
+
+        let reg = global_http_client_registry();
+        reg.clear();
+
+        // 池配置宣称 H2(会把 max_per_host 16→100);shared 必须仍强制 H1
+        let pool = Arc::new(ConnectionPool::new(PoolConfig {
+            enable_http2: true,
+            max_per_host: 16,
+            ..Default::default()
+        }));
+        let pool_max = pool.config().max_per_host;
+        let config = DownloadConfig {
+            user_agent: "Tachyon-H1-Force-Test".into(),
+            proxy: Some("direct".into()),
+            ..test_config()
+        };
+        let _download_client = super::shared_http_client(&config, &Some(Arc::clone(&pool)))
+            .expect("shared_http_client");
+
+        let headers = HashMap::new();
+        // 与 shared 对齐的 H1 身份(同 max_per_host)
+        let h1_conn = ConnectionConfig {
+            enable_http2: false,
+            max_connections_per_host: pool_max,
+            ..Default::default()
+        };
+        let h1 = reg
+            .get_or_create(
+                &config.user_agent,
+                config.proxy.as_deref(),
+                config.connect_timeout_secs,
+                config.request_timeout_secs,
+                Some(&h1_conn),
+                &headers,
+                None,
+            )
+            .expect("h1");
+        // 同参数再 shared 必须复用 H1,不新建
+        let before = reg.len();
+        let _again = super::shared_http_client(&config, &Some(pool)).expect("shared again");
+        assert_eq!(
+            reg.len(),
+            before,
+            "再次 shared_http_client 应复用 H1 身份,不得新建"
+        );
+
+        // 显式 H2 身份必须与 H1 分离
+        let h2_conn = ConnectionConfig {
+            enable_http2: true,
+            max_connections_per_host: pool_max,
+            ..Default::default()
+        };
+        let h2 = reg
+            .get_or_create(
+                &config.user_agent,
+                config.proxy.as_deref(),
+                config.connect_timeout_secs,
+                config.request_timeout_secs,
+                Some(&h2_conn),
+                &headers,
+                None,
+            )
+            .expect("h2");
+        assert!(
+            !std::sync::Arc::ptr_eq(&h1, &h2),
+            "下载路径 H1 与显式 H2 必须分离"
+        );
+    }
+    #[test]
+    fn test_is_loopback_proxy_url() {
+        assert!(DownloadTask::is_loopback_proxy_url("http://127.0.0.1:7897"));
+        assert!(DownloadTask::is_loopback_proxy_url(
+            "socks5://127.0.0.1:7897"
+        ));
+        assert!(DownloadTask::is_loopback_proxy_url("http://localhost:7890"));
+        assert!(DownloadTask::is_loopback_proxy_url("http://[::1]:7897"));
+        assert!(!DownloadTask::is_loopback_proxy_url(
+            "http://proxy.example.com:8080"
+        ));
+        assert!(!DownloadTask::is_loopback_proxy_url("http://10.0.0.1:7897"));
+        assert!(!DownloadTask::is_loopback_proxy_url(
+            "socks5://192.168.1.1:1080"
+        ));
+
+        // loopback 仍算 http_proxy_active,但不算 remote(不触发 cap)
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/x.bin".into(),
+            DownloadConfig {
+                proxy: Some("http://127.0.0.1:7897".into()),
+                ..test_config()
+            },
+            Arc::new(MockProto::new(test_metadata("x.bin", 100))),
+            StorageKind::memory_with_capacity(100),
+        );
+        assert!(task.http_proxy_active(), "loopback 仍是代理路径");
+        assert!(!task.remote_http_proxy_active(), "loopback 不得算远程代理");
+        task.config.proxy = Some("http://proxy.example.com:8080".into());
+        assert!(task.http_proxy_active());
+        assert!(task.remote_http_proxy_active());
     }
 
     #[test]
@@ -14511,33 +15178,6 @@ mod tests {
             rec.fragment_size,
             sc.max_fragment_size
         );
-    }
-    #[test]
-    fn test_proxy_cold_start_cap_for_config() {
-        // direct 哨兵:不 cap
-        let mut task = DownloadTask::new_for_test(
-            "http://example.com/x.bin".into(),
-            DownloadConfig {
-                proxy: Some("direct".into()),
-                ..test_config()
-            },
-            Arc::new(MockProto::new(test_metadata("x.bin", 100))),
-            StorageKind::memory_with_capacity(100),
-        );
-        assert!(
-            task.proxy_cold_start_cap_for_config(0.0).is_none(),
-            "direct 不得 proxy cold cap"
-        );
-        assert!(task.proxy_steady_concurrency_ceiling().is_none());
-        // 显式代理 + 低置信度:cold cap 2
-        task.config.proxy = Some("http://127.0.0.1:7897".into());
-        assert_eq!(task.proxy_cold_start_cap_for_config(0.0), Some(2));
-        // 高置信度:cold 不 cap,但稳态天花板仍在
-        assert!(task.proxy_cold_start_cap_for_config(0.9).is_none());
-        assert_eq!(task.proxy_steady_concurrency_ceiling(), Some(2));
-        assert_eq!(task.apply_proxy_concurrency_ceiling(8), 2);
-        assert_eq!(task.apply_proxy_concurrency_ceiling(2), 2);
-        assert_eq!(task.apply_proxy_concurrency_ceiling(1), 1);
     }
 
     #[test]
@@ -15585,6 +16225,10 @@ mod tests {
             ..Default::default()
         };
 
+        // 捕获进度事件:降级必须再发一次 PlanComplete,告知 app 层清零旧 partial
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+        task.set_progress_sender(progress_tx);
+
         task.run()
             .await
             .expect("RangeNotSupported 应触发整块降级,不应失败");
@@ -15606,7 +16250,36 @@ mod tests {
             Some(false),
             "降级后 metadata.supports_range 必须为 false(供快照持久化)"
         );
-        // 3. 终态 + 数据正确
+        // 3. 进度通道必须有 ≥2 次 PlanComplete(首次 plan + 降级重规划)
+        let mut plan_completes = 0u32;
+        let mut replan_total = None;
+        while let Ok(ev) = progress_rx.try_recv() {
+            if let FragmentProgress::PlanComplete {
+                total,
+                completed_indices,
+                ..
+            } = ev
+            {
+                plan_completes += 1;
+                if plan_completes >= 2 {
+                    replan_total = Some(total);
+                    assert!(
+                        completed_indices.is_empty(),
+                        "重规划 PlanComplete 的 completed_indices 必须为空(全量重下)"
+                    );
+                }
+            }
+        }
+        assert!(
+            plan_completes >= 2,
+            "RangeNotSupported 降级必须再发 PlanComplete 清零 app 层进度,实际 {plan_completes} 次"
+        );
+        assert_eq!(
+            replan_total,
+            Some(1),
+            "重规划 PlanComplete.total 应为 1(单分片整块)"
+        );
+        // 4. 终态 + 数据正确
         assert_eq!(task.state(), DownloadState::Completed);
         let mut buf = vec![0u8; total_size as usize];
         task.storage

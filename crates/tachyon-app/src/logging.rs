@@ -18,19 +18,20 @@
 //!
 //! - `log_dir()` 支持 `TACHYON_LOG_DIR` 环境变量覆盖,测试与用户均可重定向日志目录。
 //! - panic 格式化与写盘逻辑抽为纯函数 `format_panic_line` / `write_panic_line`,
-//!   便于单元测试,避免依赖全局 `OnceLock` 与真实 panic。
+//!   便于单元测试,避免依赖全局路径锁死与真实 panic。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, Once};
 
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// panic.log 的绝对路径(panic hook 直写此处,绕过非阻塞缓冲)。
 ///
-/// 用 `OnceLock` 而非直接 capture 到 hook 闭包,是因为 hook 是全局静态的,
-/// 路径在 `init_logging` 时确定,panic 时从全局读取,避免闭包持有 `&PathBuf` 生命周期问题。
-static PANIC_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// hook 全局只安装一次;路径用 Mutex 保存,允许测试/重入 `init_logging`
+/// 切换当前上下文目录,避免第二次 init 仍写到首个目录。
+static PANIC_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static PANIC_HOOK_INIT: Once = Once::new();
 
 /// 日志初始化返回的守卫。
 ///
@@ -107,7 +108,9 @@ fn install_panic_hook() {
         let line = format_panic_line(&location, &msg, &bt);
 
         // 1. 直写 panic.log:绕过非阻塞缓冲,保证 panic 落盘后再 unwind
-        if let Some(path) = PANIC_LOG_PATH.get() {
+        if let Ok(guard) = PANIC_LOG_PATH.lock()
+            && let Some(path) = guard.as_ref()
+        {
             let _ = write_panic_line(path, &line);
         }
 
@@ -131,10 +134,12 @@ pub fn init_logging() -> LogGuard {
     let panic_log_path = dir.join("panic.log");
     // 提前创建日志目录,失败时退化为 stderr-only(panic hook 仍尝试写,写失败静默)
     let dir_ok = std::fs::create_dir_all(&dir).is_ok();
-    let _ = PANIC_LOG_PATH.set(panic_log_path);
+    if let Ok(mut guard) = PANIC_LOG_PATH.lock() {
+        *guard = Some(panic_log_path);
+    }
 
-    // 先装 panic hook:即使后续 tracing 初始化 panic 也能落盘
-    install_panic_hook();
+    // 先装 panic hook:即使后续 tracing 初始化 panic 也能落盘(全局只装一次)
+    PANIC_HOOK_INIT.call_once(install_panic_hook);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -251,5 +256,57 @@ mod tests {
         // 全局 subscriber/panic hook 在同一进程内可能已被其他测试初始化,
         // init_logging 内部用 try_init 容忍,此处仅验证不 panic
         let _guard = init_logging();
+    }
+
+    /// 并行/多次 init_logging 上下文不得共享首个 panic 路径。
+    #[test]
+    fn test_parallel_logging_contexts_do_not_share_panic_path() {
+        let dir_a = tempfile::tempdir().expect("dir_a");
+        let dir_b = tempfile::tempdir().expect("dir_b");
+
+        // SAFETY: 测试进程内串行设置 TACHYON_LOG_DIR;路径随后由 init 固化到 Mutex。
+        unsafe {
+            std::env::set_var("TACHYON_LOG_DIR", dir_a.path());
+        }
+        let _ga = init_logging();
+        let path_a = {
+            let g = PANIC_LOG_PATH.lock().expect("lock");
+            g.clone().expect("path_a")
+        };
+        assert_eq!(path_a, dir_a.path().join("panic.log"));
+
+        unsafe {
+            std::env::set_var("TACHYON_LOG_DIR", dir_b.path());
+        }
+        let _gb = init_logging();
+        let path_b = {
+            let g = PANIC_LOG_PATH.lock().expect("lock");
+            g.clone().expect("path_b")
+        };
+        assert_eq!(
+            path_b,
+            dir_b.path().join("panic.log"),
+            "第二次 init_logging 必须切换当前 panic 路径,不得锁死在首个目录"
+        );
+
+        // 触发一次受控 panic 写入,验证落在当前(B)目录
+        let line = format_panic_line(
+            "test.rs:1:1",
+            "parallel context",
+            &std::backtrace::Backtrace::force_capture(),
+        );
+        write_panic_line(&path_b, &line).expect("写 B panic.log");
+        assert!(path_b.exists(), "当前上下文 B 应生成 panic.log");
+        assert!(
+            !dir_a.path().join("panic.log").exists()
+                || std::fs::metadata(dir_a.path().join("panic.log"))
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(true),
+            "切换到 B 后不应再依赖 A 作为当前 panic 目标"
+        );
+
+        unsafe {
+            std::env::remove_var("TACHYON_LOG_DIR");
+        }
     }
 }

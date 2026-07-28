@@ -405,7 +405,7 @@ export default function CommandPalette(props: CommandPaletteProps) {
           }}
         >
           <Motion.div
-            class="cmd-panel flex flex-col"
+            class="cmd-panel glow-border flex flex-col"
             classList={{ "cmd-panel--narrow": isSmall() }}
             initial={{ opacity: 0, y: -12, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}

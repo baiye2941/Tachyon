@@ -9,6 +9,7 @@ import {
   XIcon,
   CancelIcon,
   StackIcon,
+  RowsIcon,
   ListBulletsIcon,
   GridFourIcon,
 } from "../icons";
@@ -44,7 +45,7 @@ export default function ToolbarDefault(props: ToolbarProps) {
       </Button>
 
       <div class="relative flex items-center gap-2 min-w-0 flex-1">
-        <div class="relative flex-1 min-w-0" style={{ "max-width": "420px" }}>
+        <div class="glow-border relative flex-1 min-w-0" style={{ "max-width": "420px", "border-radius": "var(--radius-md)" }}>
           <div
             class="absolute pointer-events-none flex items-center justify-center"
             style={{
@@ -324,7 +325,7 @@ export default function ToolbarDefault(props: ToolbarProps) {
             when={props.groupBy === "status"}
             fallback={<StackIcon />}
           >
-            <ListBulletsIcon />
+            <RowsIcon />
           </Show>
         </Button>
       </Show>

@@ -14,11 +14,9 @@ export function addToast(toast: Omit<ToastMessage, 'id'>) {
   const newToast: ToastMessage = { ...toast, id, duration: toast.duration ?? 5000 }
   setToasts(prev => [...prev.slice(-2), newToast])
 
-  const timer = setTimeout(() => {
-    removeToast(id)
-  }, newToast.duration)
-
-  return () => clearTimeout(timer)
+  // 生命周期归 ToastItem 组件(startTimer/startExit + hover 暂停),
+  // store 层不做硬移除,避免双计时器竞争导致 hover 暂停与退出动画失效
+  return id
 }
 
 export function dismissToast(id: string) {
@@ -120,7 +118,7 @@ function ToastItem(props: { toast: ToastMessage }) {
   return (
     <div
       class="pointer-events-auto toast-item"
-      classList={{ 'toast--exiting': exiting() }}
+      classList={{ closing: exiting() }}
       style={{
         background: 'var(--color-bg-elevated)',
         border: '1px solid var(--color-border-default)',

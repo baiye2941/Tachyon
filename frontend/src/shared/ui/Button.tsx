@@ -1,4 +1,4 @@
-import { mergeProps, type JSX, type Component, For, createSignal, onCleanup } from 'solid-js'
+import { mergeProps, type JSX, type Component, For, Show, createSignal, onCleanup } from 'solid-js'
 import { Dynamic } from 'solid-js/web'
 
 /**
@@ -154,6 +154,26 @@ const Button: Component<ButtonProps> = (rawProps) => {
       onMouseLeave={props.onMouseLeave}
       style={{ position: 'relative', overflow: 'hidden', ...props.style }}
     >
+      {/* loading 视觉表达:内联 svg 圆弧,currentColor 跟随按钮文本色,
+          aria-hidden 避免读屏重复(disabled + aria-busy 已表达状态) */}
+      <Show when={props.loading}>
+        <svg
+          class="btn-spinner"
+          aria-hidden="true"
+          viewBox="0 0 24 24"
+          fill="none"
+        >
+          <circle
+            cx="12"
+            cy="12"
+            r="9"
+            stroke="currentColor"
+            stroke-width="2.5"
+            stroke-linecap="round"
+            stroke-dasharray="42 15"
+          />
+        </svg>
+      </Show>
       {props.children}
       <For each={ripples()}>
         {(ripple) => (

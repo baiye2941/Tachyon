@@ -36,4 +36,6 @@
 @import "./styles/components/status-bar.css";
 @import "./styles/components/progress.css";
 @import "./styles/components/modals.css";
+@import "./styles/components/settings.css";
+@import "./styles/components/glow-border.css";
 @import "./styles/components/misc.css";

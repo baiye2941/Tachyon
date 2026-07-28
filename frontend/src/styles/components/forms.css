@@ -37,6 +37,17 @@
   color: var(--color-text-tertiary);
 }
 
+/* 原生 select 的下拉弹层与选项:color-scheme(tokens.css 按主题声明)决定
+   原生弹层渲染,option 显式配色做兜底,防止白底浅字不可读 */
+select.input {
+  color-scheme: inherit;
+}
+
+select.input option {
+  background-color: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+}
+
 /* Toggle */
 .toggle {
   width: 40px;

@@ -52,7 +52,7 @@ graph TB
     subgraph INFRA["基础设施层"]
         PROTO["tachyon-protocol<br/>HTTP/HTTPS · QUIC · BitTorrent Magnet"]
         IO["tachyon-io<br/>io_uring · IOCP · BufferPool · 直接 async write"]
-        CRYPT["tachyon-crypto<br/>BLAKE3 · SHA-256 · GPU 预留"]
+        CRYPT["tachyon-crypto<br/>BLAKE3 · SHA-256"]
         STORE["tachyon-store<br/>KV 存储 · 快照恢复"]
         HUB["tachyon-hub<br/>HuggingFace Hub API"]
         SNIFF["tachyon-sniffer<br/>资源嗅探与捕获"]
@@ -99,7 +99,7 @@ graph TB
 | `tachyon-scheduler` | 智能调度、带宽预测、优先级队列 | `src/{scheduler,predictor,download_scheduler}.rs` |
 | `tachyon-io` | 跨平台异步文件 I/O，多后端自动选择 | `src/{iouring,iocp,winio,tokio_file,buffer,storage}.rs` |
 | `tachyon-protocol` | HTTP/HTTPS/QUIC/BitTorrent Magnet 协议统一抽象 | `src/{http,magnet}.rs` |
-| `tachyon-crypto` | CPU 哈希校验 + GPU 加速预留 | `src/{cpu,gpu}.rs` |
+| `tachyon-crypto` | CPU 流式哈希校验（BLAKE3 / SHA-256） | `src/cpu.rs` |
 | `tachyon-sniffer` | 浏览器资源类型识别与过滤捕获 | `src/{capture,filter,resources}.rs` |
 | `tachyon-store` | 断点续传快照持久化，基于文件系统 KV | `src/{kv,recovery,store}.rs` |
 | `tachyon-hub` | HuggingFace Hub API 客户端 | `src/{api,classify,lfs,token}.rs` |
@@ -271,9 +271,8 @@ librqbit 内部 `TorrentStreams::iter_next_pieces` 交错调度这些区间覆�
 | 实现 | 说明 |
 |------|------|
 | `CpuVerifier` | BLAKE3（默认）或 SHA-256，流式增量哈希 |
-| `GpuVerifier` | 基于 wgpu 的 GPU 哈希（`gpu` feature，当前为空壳实现） |
 
-安全特性：`Verifier::verify()` 使用常量时间字符串比较，防止时序侧信道。
+安全特性：`Verifier::verify()` 使用常量时间字符串比较，防止时序侧信道。GPU 哈希路径已删除；完整性校验统一走 CPU 流式/读盘路径。
 
 ### 4.7 tachyon-hub — HuggingFace Hub 集成
 

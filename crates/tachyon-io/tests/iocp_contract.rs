@@ -126,3 +126,36 @@ async fn test_iocp_contract_windows_concurrent_offset_writes()
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn test_iocp_shared_poller_threads_are_constant_across_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    // 可观察契约:连续 init 多个文件后,iocp-poller 线程增量最多 1
+    // (共享 runtime),不得随文件数线性增长。
+    fn count_iocp_poller_threads() -> usize {
+        // Windows: 用 toolhelp 枚举当前进程线程名不可直接拿,改用模块暴露的
+        // 共享 runtime spawn 计数(生产实现必须维护该可观测指标)。
+        tachyon_io::iocp::shared_poller_spawn_count()
+    }
+
+    let before = count_iocp_poller_threads();
+    let mut storages = Vec::new();
+    let mut dirs = Vec::new();
+    for i in 0..4 {
+        let (dir, path) = create_temp_file(&format!("iocp_shared_{i}.bin"))?;
+        let mut s = IoCpStorage::new(&path);
+        s.init()?;
+        storages.push(s);
+        dirs.push(dir);
+    }
+    let after = count_iocp_poller_threads();
+    let delta = after.saturating_sub(before);
+    assert!(
+        delta <= 1,
+        "4 个 IoCpStorage::init 后 iocp-poller spawn 增量应 ≤1(共享 runtime),实际 delta={delta}, before={before}, after={after}"
+    );
+    drop(storages);
+    drop(dirs);
+    Ok(())
+}

@@ -63,25 +63,30 @@ impl AdaptiveDownloadScheduler {
     /// - RTT < 30ms: 不额外限制(loopback/局域网)
     /// - 30–80ms: 最多 6
     /// - 80–150ms: 最多 3
-    /// - 150–250ms: 最多 2
-    /// - ≥250ms: 最多 1
+    /// - ≥150ms: 最多 2
     ///
-    /// 结果仍 clamp 到 [1, max_concurrency]。
+    /// 下限恒为 2(当 max_concurrency ≥ 2):与 soft-pressure 零进度 floor 对齐。
+    /// 旧版 ≥250ms 压到 1 会在「慢 probe 当 RTT」(如 CDN HEAD 失败再 GET Range 206)
+    /// 场景把多分片任务锁死单连接;大分片下样本极慢,RAMP 阈值永远达不到,爬坡闭环断裂。
+    /// 真需单连接的限流由 soft-pressure / max_concurrency=1 / proxy 路径负责,不在冷启动用 1 封顶。
+    ///
+    /// 结果仍 clamp 到 [1, max_concurrency](max_concurrency=1 时仍为 1)。
     /// 注:经 HTTP 代理时 probe RTT 可能被压缩到近 0;engine 另有 proxy 冷启动 cap。
     fn rtt_cold_start_cap(rtt_secs: f64, max_concurrency: u32) -> u32 {
         let max_c = max_concurrency.max(1);
+        // 与 soft-pressure 零进度 floor 对齐:冷启动不主动压到 1
+        const COLD_START_FLOOR: u32 = 2;
         let cap = if rtt_secs < 0.03 {
             max_c
         } else if rtt_secs < 0.08 {
             6
         } else if rtt_secs < 0.15 {
             3
-        } else if rtt_secs < 0.25 {
-            2
         } else {
-            1
+            // ≥150ms(含旧 ≥250ms 档):最多 2,不再压到 1
+            2
         };
-        cap.min(max_c).max(1)
+        cap.min(max_c).max(1).max(COLD_START_FLOOR.min(max_c))
     }
 }
 
@@ -195,6 +200,10 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
                 holt = holt.max(floor);
             }
             // 慢启动:早期样本用 ramp 抬升;样本充足后用 holt(+多连接下限)。
+            // RTT 冷启动 cap **仅**在零样本时生效:probe 墙钟当 RTT 在
+            // HEAD→Range 回退 CDN 上常 ≥250ms,若 samples∈[1,7] 仍 cap,
+            // ramp 抬到 4/8 也会被压回 2——千兆链路永远跑不满(实测 17 片/c=2/~6MB/s)。
+            // 有任意带宽样本后,由 ramp/holt + soft-pressure 负责,不再用 probe RTT 锁死。
             const RAMP_SAMPLE_THRESHOLD: u64 = 8;
             let samples = self.predictor.read().sample_count();
             let mut c = if samples < RAMP_SAMPLE_THRESHOLD {
@@ -203,17 +212,14 @@ impl DownloadScheduler for AdaptiveDownloadScheduler {
             } else {
                 holt
             };
-            // 高 RTT 冷启动上限:probe 注入的 RTT 偏大时,限制早期并发,
-            // 降低 CDN/网关对突发多连接的掐断(TLS EOF/504)。样本充足后
-            // 仍走 holt,由 soft-pressure 与 re-recommend 继续调。
-            if samples < RAMP_SAMPLE_THRESHOLD {
+            if samples == 0 {
                 c = c.min(Self::rtt_cold_start_cap(rtt_secs, max_c));
             }
             c
         } else {
             // 冷启动(无带宽样本):从 cold_start_initial_concurrency 起步,
             // 避免瞬时打满连接触发 429/限速;样本到位后由 ramp 爬坡。
-            // 同样叠加 RTT 上限。
+            // 仅此分支套 RTT 上限(与有样本路径对称:samples==0)。
             let ramp = (*self.ramp_concurrency.read())
                 .min(max_concurrency.max(1))
                 .max(1);
@@ -310,13 +316,13 @@ mod tests {
         );
         assert_eq!(
             AdaptiveDownloadScheduler::rtt_cold_start_cap(0.40, 16),
-            1,
-            "400ms 上限 1"
+            2,
+            "400ms 上限 2(冷启动 floor,不再压到 1)"
         );
         assert_eq!(
             AdaptiveDownloadScheduler::rtt_cold_start_cap(0.40, 1),
             1,
-            "不超过 max_concurrency"
+            "max_concurrency=1 时仍为 1"
         );
     }
 
@@ -345,9 +351,19 @@ mod tests {
         sched.observe_rtt(Duration::from_millis(300));
         let rec_very_high = sched.recommend(100 * 1024 * 1024, 16);
         assert_eq!(
-            rec_very_high.concurrency, 1,
-            "RTT 300ms 冷启动 concurrency 应 cap 到 1,实际 {}",
+            rec_very_high.concurrency, 2,
+            "RTT 300ms 零样本冷启动 concurrency 应 cap 到 2(floor),实际 {}",
             rec_very_high.concurrency
+        );
+
+        // 有带宽样本后:RTT cap 必须解除,否则大分片任务永远锁在 2
+        // (observe 同时抬 ramp:4→8,recommend 应能超过 RTT floor)
+        sched.observe_bandwidth(6 * 1024 * 1024);
+        let rec_after_sample = sched.recommend(100 * 1024 * 1024, 16);
+        assert!(
+            rec_after_sample.concurrency > 2,
+            "有带宽样本后不得再被 probe-RTT cap 锁在 2,实际 {}",
+            rec_after_sample.concurrency
         );
     }
 

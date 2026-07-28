@@ -1,4 +1,4 @@
-import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, QuicCapability, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport } from '../types'
+import type { TaskInfo, AppConfig, ConfigPatch, SnifferResource, HubFileInfo, DownloadProgress, AppInfo, QuicCapability, HfModelInfo, LocalModel, FileVerifyResult, ModelFavorite, TaskFragmentsView, CaptureConfig, BtProxyCoverageReport, TrackerSubscriptionResult } from '../types'
 import { confirmDestructive, getRiskTier } from '../utils/commandRisk'
 import { tr } from '../i18n'
 import { isBrowserDev, removeMockTask, getMockTaskFragments } from '../stores/mockData'
@@ -170,6 +170,9 @@ export const api = {
   getBtProxyCoverage: () => invoke<BtProxyCoverageReport | null>('get_bt_proxy_coverage'),
   /** 更新应用配置(破坏性操作,需确认令牌。SettingsPanel 已自行确认,跳过 invoke 内 window.confirm) */
   updateConfig: (patch: ConfigPatch) => invoke<void>('update_config', { patch }, true),
+  /** 从订阅源拉取公共 Tracker 列表并合并(需确认令牌;Settings 已自行确认则 skipConfirm) */
+  refreshTrackerSubscription: () =>
+    invoke<TrackerSubscriptionResult>('refresh_tracker_subscription', undefined, true),
   /** 获取嗅探资源列表 */
   getSnifferResources: () => invoke<SnifferResource[]>('get_sniffer_resources'),
   /** 添加嗅探过滤规则 */

@@ -361,6 +361,29 @@ describe("NewTaskModal", () => {
     });
   });
 
+  describe("默认文件名溢出回归", () => {
+    it("无空格长文件名完整展示,span 允许收缩并强制断词", async () => {
+      render(() => <NewTaskModal onClose={() => {}} />);
+
+      // 构造约 180 字符无空格文件名(真实场景:长哈希命名的模型权重)
+      const longName = `${"a".repeat(180)}.mp4`;
+      const url = `https://example.com/${longName}`;
+      const urlInput = screen.getByLabelText(/下载链接/) as HTMLTextAreaElement;
+      fireEvent.input(urlInput, {
+        target: { value: url },
+        currentTarget: { value: url },
+      });
+
+      const span = await screen.findByText(/默认文件名/);
+      // 文件名完整展示(未截断)
+      expect(span.textContent).toContain(longName);
+      // flex item 默认 min-width:auto 不收缩,长单词不断行会撑破 480px 弹窗
+      expect(span.style.minWidth).toBe("0px");
+      expect(span.style.wordBreak).toBe("break-all");
+      expect(span.style.overflowWrap).toBe("break-word");
+    });
+  });
+
   describe("审计 FT-09 部分失败不关弹窗", () => {
     it("全部 createTask 失败时不调用 onClose 且保留 URL 文本", async () => {
       const { api } = await import("../../api/invoke");
@@ -413,6 +436,17 @@ describe("NewTaskModal", () => {
       const text = (screen.getByLabelText(/下载链接/) as HTMLTextAreaElement).value;
       expect(text).toContain("https://example.com/bad.bin");
       expect(text).not.toContain("https://example.com/ok.bin");
+    });
+  });
+
+  describe("边框流光", () => {
+    it("URL 输入区挂载 glow-border 类(hover 边框流光)", () => {
+      const { container } = render(() => <NewTaskModal onClose={() => {}} />);
+
+      const urlInput = container.querySelector("#new-task-url-input");
+      const wrapper = urlInput?.closest(".glow-border");
+      expect(wrapper).not.toBeNull();
+      expect(wrapper?.contains(urlInput!)).toBe(true);
     });
   });
 });

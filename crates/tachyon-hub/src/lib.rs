@@ -25,5 +25,5 @@ pub mod classify;
 pub mod lfs;
 pub mod token;
 
-pub use api::{HfCardData, HfFile, HfLfsInfo, HfModelInfo, HubApi};
+pub use api::{HfCardData, HfFile, HfLfsInfo, HfModelInfo, HubApi, new_http_client_for_app};
 pub use classify::{FileCategory, classify_file};

@@ -103,7 +103,7 @@ export default function StatusBar(props: StatusBarProps) {
               ? i18n.t("status.theme.light")
               : i18n.t("status.theme.dark")) as string
           }
-          onClick={toggleTheme}
+          onClick={(e) => toggleTheme({ x: e.clientX, y: e.clientY })}
         >
           {theme() === "dark" ? <SunIcon /> : <MoonIcon />}
         </Button>

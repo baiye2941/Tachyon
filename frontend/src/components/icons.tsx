@@ -85,6 +85,7 @@ export const FunnelSimpleIcon = makeRegular("funnelSimple", 18);
 export const CaretDoubleLeftIcon = makeRegular("caretDoubleLeft", 18);
 export const WarningCircleIcon = makeRegular("warningCircle", 18);
 export const StackIcon = makeRegular("stack", 18);
+export const RowsIcon = makeRegular("rows", 18);
 export const HashIcon = makeRegular("hash", 18);
 export const CheckCircleIcon = makeRegular("checkCircle", 18);
 export const LightningIcon = makeRegular("lightning", 18);

@@ -158,6 +158,41 @@ describe('downloads store', () => {
     expect(downloadsModule.$tasks.get()[1]?.fragmentsDone).toBe(2)
   })
 
+  it('更新 task A 不通知订阅 task B 的 hot progress selector', () => {
+    downloadsModule.setTasks([
+      makeTask('task-a', { status: 'downloading', speed: 100, downloaded: 100, progress: 0.1 }),
+      makeTask('task-b', { status: 'downloading', speed: 200, downloaded: 200, progress: 0.2 }),
+    ])
+
+    let taskBSelectorRuns = 0
+    const dispose = createRoot((disposeOuter) => {
+      createEffect(() => {
+        downloadsModule.getHotProgress('task-b')
+        taskBSelectorRuns++
+      })
+      return disposeOuter
+    })
+
+    expect(taskBSelectorRuns).toBe(1)
+
+    downloadsModule.updateProgress({
+      'task-a': {
+        id: 'task-a',
+        progress: 0.5,
+        downloaded: 500,
+        speed: 150,
+        status: 'downloading',
+        fragmentsDone: 3,
+        fragmentsTotal: 4,
+        activeConcurrency: 1,
+      },
+    })
+
+    expect(downloadsModule.getHotProgress('task-b')?.speed).toBe(200)
+    expect(taskBSelectorRuns).toBe(1)
+    dispose()
+  })
+
   it('updateProgress 对未变化任务不触发 reactive 更新', () => {
     downloadsModule.setTasks([
       makeTask('t1', { status: 'downloading', speed: 100, downloaded: 100, progress: 0.1, fragmentsDone: 1 }),

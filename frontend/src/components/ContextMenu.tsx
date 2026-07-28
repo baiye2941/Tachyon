@@ -184,6 +184,20 @@ export default function ContextMenu(props: ContextMenuProps) {
       return;
     }
 
+    // 菜单打开期间拦截 Tab:焦点在菜单项内循环,禁止逃逸到遮罩下页面
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const next = e.shiftKey
+        ? activeIndex >= 0
+          ? (activeIndex - 1 + focusable.length) % focusable.length
+          : focusable.length - 1
+        : activeIndex >= 0
+          ? (activeIndex + 1) % focusable.length
+          : 0;
+      focusable[next]!.focus();
+      return;
+    }
+
     if (e.key === "ArrowDown") {
       e.preventDefault();
       const next = activeIndex >= 0 ? (activeIndex + 1) % focusable.length : 0;

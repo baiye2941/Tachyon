@@ -47,6 +47,132 @@ pub async fn update_config(
     update_config_inner(&state, patch).await
 }
 
+/// 从订阅 URL 拉取公共 Tracker 列表并合并进配置。
+///
+/// - 默认源 XIU2 `http.txt`(仅 HTTP/HTTPS,适合 SOCKS)
+/// - 用户手动 tracker 优先保留
+/// - 写入 `trackers` 后走 `update_config_inner`,会重建 BT Session
+/// - 需要确认令牌(与 update_config 同级)
+#[cfg(feature = "magnet")]
+#[tauri::command]
+pub async fn refresh_tracker_subscription(
+    state: tauri::State<'_, AppState>,
+    confirmation_token: Option<String>,
+) -> Result<TrackerSubscriptionResult, AppError> {
+    match confirmation_token {
+        Some(token) => {
+            state
+                .service
+                .confirmation_service
+                .validate_and_consume(&token, "refresh_tracker_subscription")?;
+        }
+        None => {
+            return Err(AppError::Config(
+                "更新 Tracker 订阅需要确认令牌,请先确认操作".to_string(),
+            ));
+        }
+    }
+    refresh_tracker_subscription_inner(&state).await
+}
+
+/// Tracker 订阅刷新结果(供前端展示)
+#[cfg(feature = "magnet")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackerSubscriptionResult {
+    pub trackers_count: usize,
+    pub subscribed_count: usize,
+    pub last_updated: String,
+    pub source_url: String,
+}
+
+#[cfg(feature = "magnet")]
+pub(crate) async fn refresh_tracker_subscription_inner(
+    state: &AppState,
+) -> Result<TrackerSubscriptionResult, AppError> {
+    use tachyon_core::config::{
+        TRACKER_SUBSCRIPTION_MAX, merge_tracker_lists, parse_tracker_list_text,
+    };
+
+    let (url, user_trackers, socks_active, enabled) = {
+        let cfg = state.domain.config.lock().await;
+        let socks = cfg
+            .magnet
+            .socks_proxy_url
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            || tachyon_core::config::resolve_http_proxy(None).is_some()
+            || tachyon_core::config::detect_socks_proxy().is_some();
+        let mut user = cfg.magnet.tracker_subscription_user_trackers.clone();
+        // 兼容旧配置:用户列表为空时,把当前 trackers 当作用户维护项
+        if user.is_empty() && !cfg.magnet.trackers.is_empty() {
+            user = cfg.magnet.trackers.clone();
+        }
+        (
+            cfg.magnet.tracker_subscription_url.clone(),
+            user,
+            socks,
+            cfg.magnet.tracker_subscription_enabled,
+        )
+    };
+
+    if !enabled {
+        return Err(AppError::Config(
+            "Tracker 订阅未启用,请先在设置中打开订阅开关".to_string(),
+        ));
+    }
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::Config("Tracker 订阅 URL 不能为空".to_string()));
+    }
+
+    // hub 已封装 HttpClient,避免 app 直接依赖 protocol crate
+    let client = tachyon_hub::api::new_http_client_for_app()
+        .map_err(|e| AppError::Config(format!("创建 HTTP 客户端失败: {e}")))?;
+    let text = client
+        .get_text(&url, &[])
+        .await
+        .map_err(|e| AppError::Config(format!("拉取 Tracker 列表失败({url}): {e}")))?;
+
+    let mut subscribed = parse_tracker_list_text(&text);
+    // SOCKS 下只保留 HTTP(S);直连也可全要,但默认 http.txt 本就几乎无 UDP
+    let http_only = socks_active;
+    if http_only {
+        subscribed.retain(|u| {
+            let l = u.to_ascii_lowercase();
+            l.starts_with("http://") || l.starts_with("https://")
+        });
+    }
+    if subscribed.is_empty() {
+        return Err(AppError::Config(format!(
+            "订阅源未解析到有效 tracker(上限 {TRACKER_SUBSCRIPTION_MAX}): {url}"
+        )));
+    }
+    let subscribed_count = subscribed.len();
+    let merged = merge_tracker_lists(&user_trackers, &subscribed, http_only);
+    let last_updated = chrono::Utc::now().to_rfc3339();
+
+    let patch = tachyon_core::config::ConfigPatch {
+        magnet: Some(tachyon_core::config::MagnetPatch {
+            trackers: Some(merged.clone()),
+            tracker_subscription_last_updated: Some(Some(last_updated.clone())),
+            // 固化用户列表,避免下次把订阅结果当成用户列表
+            tracker_subscription_user_trackers: Some(user_trackers),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    update_config_inner(state, patch).await?;
+
+    Ok(TrackerSubscriptionResult {
+        trackers_count: merged.len(),
+        subscribed_count,
+        last_updated,
+        source_url: url,
+    })
+}
+
 /// 审计 SEC-002:显式授权下载目录(需确认令牌),禁止 create_task 静默扩权
 #[tauri::command]
 pub async fn authorize_download_directory(
@@ -1283,6 +1409,9 @@ mod tests {
             fragments_total: 4,
             fragments_done: 1,
             active_concurrency: 0,
+            peer_live: None,
+            peer_connecting: None,
+            peer_queued: None,
             created_at: "2026-05-29T00:00:00Z".to_string(),
             save_path: "/custom/file.bin".to_string(),
             error_reason: None,

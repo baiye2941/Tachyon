@@ -78,6 +78,12 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   create_task_from_sniffer: 'mutate',
   set_sniffer_capture_config: 'mutate',
   // 破坏性:数据删除 / 安全策略变更 / 备份导入导出 / 撤销类恢复
+  //
+  // 分级契约:destructive 不仅是语义分级,也是 invoke 包装器附加后端
+  // confirmation token 的唯一触发条件(invoke.ts getRiskTier === 'destructive')。
+  // 后端校验 confirmation_token 的命令 MUST 登记 destructive;登记低了
+  // 不附 token,后端必拒("需要确认令牌"),曾致 refresh_tracker_subscription
+  // 被误登记 mutate 后订阅刷新必失败。
   delete_task: 'destructive',
   undo_cancel_task: 'destructive',
   undo_delete_task: 'destructive',
@@ -85,6 +91,9 @@ export const COMMAND_RISK: Record<string, RiskTier> = {
   authorize_download_directory: 'destructive',
   export_backup: 'destructive',
   import_backup: 'destructive',
+  // 拉取远程 tracker 列表合并进配置:后端与 update_config 同级校验 token
+  // (调用方传 skipConfirm=true,"立即更新"按钮点击即用户确认,不弹窗)
+  refresh_tracker_subscription: 'destructive',
 }
 
 /** 破坏性命令的确认提示 i18n key */

@@ -138,7 +138,7 @@ pub const STALL_TIMEOUT_SECS_LIMIT: u64 = 86400;
 ///
 /// 死 swarm 下无 peer 时,协议层会持续轮询 peer 健康状态并等待 peer 上线,
 /// 超过此上限则产出 `Err(Timeout)` 让引擎重试/失败。1 小时上限避免永久挂起,
-/// 实际默认 2 分钟(default_peer_wait_timeout_secs)平衡恢复概率与用户体验。
+/// 实际默认 60 秒(default_peer_wait_timeout_secs)平衡恢复概率与用户体验。
 pub const PEER_WAIT_TIMEOUT_SECS_LIMIT: u64 = 3600;
 
 /// 单主机最大连接数上限
@@ -403,6 +403,25 @@ pub struct MagnetConfig {
     /// 格式：`udp://host:port/announce` 或 `http://host:port/announce`
     #[serde(default)]
     pub trackers: Vec<String>,
+    /// 是否启用公共 Tracker 列表订阅(默认 false)
+    ///
+    /// 启用后可从订阅 URL(如 XIU2 best.txt)拉取 tracker 并合并进 `trackers`。
+    /// 合并结果仍走 validate + update_config 路径,会触发 BT Session 重建。
+    #[serde(default)]
+    pub tracker_subscription_enabled: bool,
+    /// Tracker 订阅源 URL(纯文本,一行一个 announce URL)
+    ///
+    /// 默认 XIU2 精选列表 best.txt;SOCKS 下 UDP 仍会被过滤,仅 HTTP/HTTPS 生效。
+    #[serde(default = "default_tracker_subscription_url")]
+    pub tracker_subscription_url: String,
+    /// 订阅最近一次成功更新时间(RFC3339);None=从未成功拉取
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker_subscription_last_updated: Option<String>,
+    /// 用户手动维护的 tracker(订阅合并时保留,不被订阅覆盖清空)
+    ///
+    /// 若为空且 `trackers` 非空:兼容旧配置,把当前 trackers 视为用户列表。
+    #[serde(default)]
+    pub tracker_subscription_user_trackers: Vec<String>,
     /// 单次读取无数据 stall 超时(秒),默认 60(二级逃生舱)
     ///
     /// 磁力链接的 `FileStream` 读取在找不到 peer 时会永久挂起。引擎层
@@ -525,12 +544,12 @@ fn default_stall_timeout_secs() -> u64 {
 
 /// 无 peer 时智能等待默认值(秒)
 ///
-/// P1-T6: 从 300s(5 分钟)降到 120s(2 分钟)。
-/// 国内死 swarm(tracker 全墙、DHT 关闭、PEX 无 peer)场景下,5 分钟等待
-/// 体验差;120s 仍给 tracker 重试(默认 force_tracker_interval=120s)一轮机会,
-/// 失败后让引擎重试/P2SP 回退 HTTP 源,而非长时间空等。
+/// 从 120s 再降到 60s:国内死 swarm(tracker 全墙、DHT 在 SOCKS 下关闭、
+/// 纯 btih 无 tr=)场景下,2 分钟空等仍像「死机」;60s 与 stall 同量级,
+/// 更快失败并给出中文原因,用户可换源/补 tr=/检查代理。
+/// force_tracker_interval 默认 120s 仍独立运行,不阻塞本超时。
 fn default_peer_wait_timeout_secs() -> u64 {
-    120
+    60
 }
 
 /// peer 连接超时默认值(秒)
@@ -553,6 +572,94 @@ fn default_peer_read_write_timeout_secs() -> u64 {
 /// 120s 比 tracker 默认 interval(30min-2h)更频繁,加速死 swarm peer 刷新。
 fn default_force_tracker_interval_secs() -> u64 {
     120
+}
+
+fn default_tracker_subscription_url() -> String {
+    "https://cf.trackerslist.com/best.txt".to_string()
+}
+
+/// 订阅合并后 trackers 数量上限(防 announce 风暴)
+pub const TRACKER_SUBSCRIPTION_MAX: usize = 80;
+
+/// 解析公共 Tracker 列表文本(XIU2 等:一行一个 URL,可夹空行/注释)
+///
+/// - 忽略空行与 `#` 开头注释
+/// - 只保留 `http://` / `https://` / `udp://` 开头的合法 URL
+/// - 去重(保序)
+/// - 截断到 `TRACKER_SUBSCRIPTION_MAX`
+pub fn parse_tracker_list_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // aria2 逗号拼接格式:拆开再处理
+        for part in line.split(',') {
+            let u = part.trim();
+            if u.is_empty() {
+                continue;
+            }
+            let lower = u.to_ascii_lowercase();
+            if !(lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("udp://"))
+            {
+                continue;
+            }
+            if url::Url::parse(u).is_err() {
+                continue;
+            }
+            if seen.insert(u.to_string()) {
+                out.push(u.to_string());
+                if out.len() >= TRACKER_SUBSCRIPTION_MAX {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 合并用户 tracker 与订阅 tracker。
+///
+/// - 用户列表优先(保序在前)
+/// - 订阅列表去重追加
+/// - 若 `http_https_only`,过滤掉 `udp://`(SOCKS 场景)
+/// - 总数不超过 `TRACKER_SUBSCRIPTION_MAX`
+pub fn merge_tracker_lists(
+    user: &[String],
+    subscribed: &[String],
+    http_https_only: bool,
+) -> Vec<String> {
+    let allow = |u: &str| {
+        let lower = u.to_ascii_lowercase();
+        if http_https_only {
+            lower.starts_with("http://") || lower.starts_with("https://")
+        } else {
+            lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("udp://")
+        }
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for src in [user, subscribed] {
+        for u in src {
+            let t = u.trim();
+            if t.is_empty() || !allow(t) {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+                if out.len() >= TRACKER_SUBSCRIPTION_MAX {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 延迟写入缓冲默认值(MB)
@@ -599,12 +706,14 @@ fn default_trackers() -> Vec<String> {
 /// 这些节点均为 BitTorrent 生态长期维护的公共基础设施,仅用于 DHT 节点发现,
 /// 不涉及任何用户数据传输。
 fn default_dht_bootstrap_addrs() -> Vec<String> {
+    // 国内常见:部分历史节点 DNS 失效(如 silotis → os error 11001)会刷 bootstrap WARN。
+    // 仅保留解析稳定、社区常用的节点;用户仍可通过 dht_bootstrap_addrs 覆盖。
     vec![
         "router.bittorrent.com:6881".to_string(),
         "dht.transmissionbt.com:6881".to_string(),
         "router.utorrent.com:6881".to_string(),
+        "dht.libtorrent.org:25401".to_string(),
         "dht.aelitis.com:6881".to_string(), // Vuze
-        "router.silotis.us:6881".to_string(),
     ]
 }
 
@@ -729,6 +838,10 @@ impl Default for MagnetConfig {
             enable_dht: true,
             enable_upnp: false,
             trackers: default_trackers(),
+            tracker_subscription_enabled: false,
+            tracker_subscription_url: default_tracker_subscription_url(),
+            tracker_subscription_last_updated: None,
+            tracker_subscription_user_trackers: Vec::new(),
             stall_timeout_secs: default_stall_timeout_secs(),
             disable_dht_persistence: false,
             peer_wait_timeout_secs: default_peer_wait_timeout_secs(),
@@ -1385,6 +1498,10 @@ pub struct MagnetPatch {
     pub enable_dht: Option<bool>,
     pub enable_upnp: Option<bool>,
     pub trackers: Option<Vec<String>>,
+    pub tracker_subscription_enabled: Option<bool>,
+    pub tracker_subscription_url: Option<String>,
+    pub tracker_subscription_last_updated: Option<Option<String>>,
+    pub tracker_subscription_user_trackers: Option<Vec<String>>,
     pub stall_timeout_secs: Option<u64>,
     pub disable_dht_persistence: Option<bool>,
     pub peer_wait_timeout_secs: Option<u64>,
@@ -1441,6 +1558,18 @@ impl MagnetPatch {
         }
         if let Some(v) = &self.trackers {
             base.trackers = v.clone();
+        }
+        if let Some(v) = self.tracker_subscription_enabled {
+            base.tracker_subscription_enabled = v;
+        }
+        if let Some(v) = &self.tracker_subscription_url {
+            base.tracker_subscription_url = v.clone();
+        }
+        if let Some(v) = &self.tracker_subscription_last_updated {
+            base.tracker_subscription_last_updated = v.clone();
+        }
+        if let Some(v) = &self.tracker_subscription_user_trackers {
+            base.tracker_subscription_user_trackers = v.clone();
         }
         if let Some(v) = self.stall_timeout_secs {
             base.stall_timeout_secs = v;
@@ -3020,6 +3149,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tracker_list_text_basic() {
+        let text = r#"
+# comment
+https://tracker.example.com:443/announce
+
+udp://tracker.udp.example:1337/announce
+not-a-url
+http://t.example/announce
+https://tracker.example.com:443/announce
+"#;
+        let list = parse_tracker_list_text(text);
+        assert_eq!(list.len(), 3, "应去重并忽略非法行: {list:?}");
+        assert_eq!(list[0], "https://tracker.example.com:443/announce");
+        assert!(list.iter().any(|u| u.starts_with("udp://")));
+        assert!(list.iter().any(|u| u.starts_with("http://")));
+    }
+
+    #[test]
+    fn test_parse_tracker_list_text_aria2_csv() {
+        let text = "https://a.example/announce,https://b.example/announce";
+        let list = parse_tracker_list_text(text);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_tracker_lists_user_first_and_http_only() {
+        let user = vec![
+            "https://user.example/announce".into(),
+            "udp://user-udp.example:1/announce".into(),
+        ];
+        let sub = vec![
+            "https://sub.example/announce".into(),
+            "https://user.example/announce".into(), // 与用户重复
+            "udp://sub-udp.example:2/announce".into(),
+        ];
+        let merged = merge_tracker_lists(&user, &sub, true);
+        assert_eq!(
+            merged,
+            vec![
+                "https://user.example/announce".to_string(),
+                "https://sub.example/announce".to_string(),
+            ]
+        );
+        let with_udp = merge_tracker_lists(&user, &sub, false);
+        assert!(with_udp.iter().any(|u| u.contains("user-udp")));
+        assert!(with_udp.iter().any(|u| u.contains("sub-udp")));
+        assert_eq!(with_udp[0], "https://user.example/announce");
+    }
+
+    #[test]
     fn test_clipboard_config_default() {
         let cfg = ClipboardConfig::default();
         assert!(!cfg.enable_watch, "默认应关闭剪贴板监听");
@@ -3135,8 +3314,8 @@ mod tests {
     fn test_magnet_patch_peer_wait_timeout_applies() {
         let mut base = MagnetConfig::default();
         assert_eq!(
-            base.peer_wait_timeout_secs, 120,
-            "默认 2 分钟(P1-T6 降低死 swarm 等待)"
+            base.peer_wait_timeout_secs, 60,
+            "默认 60 秒(死 swarm 更快失败)"
         );
         let patch = MagnetPatch {
             peer_wait_timeout_secs: Some(120),
@@ -3217,7 +3396,7 @@ mod tests {
     fn test_serde_default_magnet_peer_wait_timeout() {
         let json = r#"{"trackers":[]}"#;
         let cfg: MagnetConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.peer_wait_timeout_secs, 120);
+        assert_eq!(cfg.peer_wait_timeout_secs, 60);
     }
 
     #[test]
@@ -3452,6 +3631,10 @@ mod tests {
             enable_dht: Some(false),
             enable_upnp: Some(false),
             trackers: Some(vec!["https://custom.tracker:443/announce".into()]),
+            tracker_subscription_enabled: Some(true),
+            tracker_subscription_url: Some("https://cf.trackerslist.com/best.txt".into()),
+            tracker_subscription_last_updated: Some(Some("2026-07-28T00:00:00Z".into())),
+            tracker_subscription_user_trackers: Some(vec!["https://user.example/announce".into()]),
             stall_timeout_secs: Some(90),
             disable_dht_persistence: Some(true),
             peer_wait_timeout_secs: Some(100),
@@ -3475,6 +3658,19 @@ mod tests {
         assert!(!cfg.enable_dht);
         assert!(!cfg.enable_upnp);
         assert_eq!(cfg.trackers, vec!["https://custom.tracker:443/announce"]);
+        assert!(cfg.tracker_subscription_enabled);
+        assert_eq!(
+            cfg.tracker_subscription_url,
+            "https://cf.trackerslist.com/best.txt"
+        );
+        assert_eq!(
+            cfg.tracker_subscription_last_updated.as_deref(),
+            Some("2026-07-28T00:00:00Z")
+        );
+        assert_eq!(
+            cfg.tracker_subscription_user_trackers,
+            vec!["https://user.example/announce".to_string()]
+        );
         assert_eq!(cfg.stall_timeout_secs, 90);
         assert!(cfg.disable_dht_persistence);
         assert_eq!(cfg.peer_wait_timeout_secs, 100);

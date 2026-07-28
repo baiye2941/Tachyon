@@ -1,0 +1,107 @@
+
+/* ============================================
+   Settings — 订阅配置卡片(Tracker 订阅等)
+   关闭时折叠为一行摘要,打开时完整卡片淡入。
+   颜色全部走语义 token,禁止硬编码。
+   ============================================ */
+
+/* 折叠态:一行摘要,虚线边框表达「未启用」 */
+.sub-collapsed {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--color-border-default);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.sub-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-subtle);
+  animation: sub-card-in 200ms ease;
+}
+
+@keyframes sub-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sub-card-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-title);
+}
+
+.sub-card-hint {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  line-height: 1.4;
+}
+
+/* 预设源 chip:默认次级底,选中主色填充 */
+.chip {
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--color-bg-primary);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border-subtle);
+  transition:
+    border-color 150ms ease,
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.chip:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+
+.chip--active,
+.chip--active:hover {
+  background: var(--color-accent-primary);
+  color: var(--color-bg-primary);
+  border-color: transparent;
+}
+
+/* 订阅源 URL 输入框:在 .input 基础上收窄字号 + 等宽 */
+.sub-url-input {
+  font-size: 13px;
+  font-family: var(--font-mono);
+  padding: 8px 12px;
+}
+
+.sub-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sub-meta {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.sub-meta--dim {
+  color: var(--color-text-tertiary);
+}
+
+.sub-sync-hint {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  line-height: 1.4;
+}

@@ -1,20 +1,5 @@
 
 
-@keyframes logo-shimmer {
-  0%,
-  100% {
-    /* 去 AI 味:0.6→1 + brightness 1→1.3 太活泼,收敛为 0.8→1 + 1→1.15 */
-    opacity: 0.8;
-    filter: brightness(1);
-  }
-
-  50% {
-    opacity: 1;
-    filter: brightness(1.15);
-  }
-}
-
-
 @keyframes chunk-pulse {
   0%,
   100% {
@@ -85,12 +70,13 @@
 
 
 @keyframes shimmer {
+  /* 合成层化:渐变层整体平移(参考 chunk-shine),transform 可合成零 paint */
   0% {
-    background-position: -200% 0;
+    transform: translateX(-100%);
   }
 
   100% {
-    background-position: 200% 0;
+    transform: translateX(100%);
   }
 }
 
@@ -212,15 +198,16 @@
 }
 
 @keyframes status-breathe {
+  /* 合成层化:只动 opacity/transform(可合成,零 paint)。
+     动画跑在 .status-indicator-active::after 光晕环上,本体不动 */
   0%,
   100% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent-primary) 25%, transparent);
-    opacity: 1;
+    opacity: 0;
+    transform: scale(0.85);
   }
   50% {
-    /* 去 AI 味:6px→3px,opacity 范围 1→0.85 再收到 1→0.9 */
-    box-shadow: 0 0 3px 1px color-mix(in srgb, var(--color-accent-primary) 12%, transparent);
     opacity: 0.9;
+    transform: scale(1);
   }
 }
 
@@ -351,5 +338,31 @@
   100% {
     transform: scale(2.6);
     opacity: 0;
+  }
+}
+
+/* Toast 入场:opacity 0→1 + translateY(8px)→0 */
+@keyframes toast-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Toast 出场:toast-in 反向(200ms 退出窗口,配合 .toast-item.closing) */
+@keyframes toast-out {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateY(8px);
   }
 }
