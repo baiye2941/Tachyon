@@ -517,6 +517,7 @@ impl DownloadTask {
                             session.handle_cache(),
                         )
                         .with_ops_gate(session.ops_gate())
+                        .with_session_coordinator(session.session_coordinator())
                         .with_storage_factory(factory.clone().boxed()),
                     );
                     let protocol: Arc<dyn Protocol> = magnet_arc.clone();
@@ -843,6 +844,7 @@ impl DownloadTask {
                 bt_session.handle_cache(),
             )
             .with_ops_gate(bt_session.ops_gate())
+            .with_session_coordinator(bt_session.session_coordinator())
             .with_storage_factory(bt_factory),
         );
 
@@ -4909,29 +4911,17 @@ impl DownloadTask {
             self.control_rx = rx;
         }
 
-        // 步骤 4: 执行下载 (与取消信号竞速:execute 内部的流读取循环已 select! 化,
-        // 此处再包一层 wait_for_cancel 作纵深防御,与步骤 1/3/5 同构)
+        // 步骤 4: 执行下载
+        //
+        // **禁止** take 走 control_rx:execute 内部靠 watch_for_interrupt / check_control
+        // 协作式处理 Pause 与 Cancel。若此处 take,Pause 信号进不了热路径,
+        // UI 显示暂停但 IO 继续(v0.1.3 用户报告)。
+        // Cancel 同样由 execute 内部 select 穿透;外层不再重复 wait_for_cancel。
         //
         // HTTP 全熔断 fallback:主源(execute)失败且 `bt_fallback` 可用时,切 BT
         // `download_full_stream` 整文件下载。仅 P2SP 混合模式(`with_hybrid_sources`)
         // 持有 bt_fallback;纯 HTTP / 纯 BT 路径无 fallback,失败直接向上传播。
-        let execute_err = {
-            let mut rx = self.control_rx.take();
-            let r = match rx.as_mut() {
-                Some(rx) => {
-                    tokio::select! {
-                        r = self.execute() => r,
-                        _ = Self::wait_for_cancel(rx) => {
-                            self.state = DownloadState::Cancelled;
-                            return Err(DownloadError::Cancelled);
-                        }
-                    }
-                }
-                None => self.execute().await,
-            };
-            self.control_rx = rx;
-            r
-        };
+        let execute_err = self.execute().await;
         match execute_err {
             Ok(()) => {}
             Err(ref e) if self.should_try_bt_fallback(e) => {
@@ -4996,18 +4986,21 @@ impl DownloadTask {
     /// 判断主源下载失败后是否应尝试 BT fallback。
     ///
     /// 条件:`bt_fallback` 存在(P2SP 混合模式,即 `with_hybrid_sources` 构造)
-    /// **且**失败错误不是 `DownloadError::Cancelled`。纯 HTTP / 纯 BT 路径无
+    /// **且**失败错误不是 `Cancelled`/`Paused`。纯 HTTP / 纯 BT 路径无
     /// `bt_fallback`,不触发,失败直接向上传播。
     ///
-    /// **排除 `Cancelled`**:用户主动取消(`DownloadError::Cancelled`)是确定的终态语义,
-    /// 不应再启动一次无意义的 BT 整文件下载,也不应掩盖取消语义。`Cancelled` 需立即向上
-    /// 传播,由 `run_inner` 的 `Err(e) => return Err(e)` 兜底分支处理。
+    /// **排除 `Cancelled` / `Paused`**:用户主动取消或协作暂停是确定的控制语义,
+    /// 不应再启动一次无意义的 BT 整文件下载,也不应掩盖取消/暂停语义。
     ///
     /// **layout 兼容性**:严格 fallback 需「单文件 BT + 单文件 HTTP + 大小一致」才允许,
     /// 该校验在 `execute_bt_fallback` 内通过 BT `probe()` metadata 比对实现(见其文档)。
     #[cfg(feature = "magnet")]
     fn should_try_bt_fallback(&self, err: &DownloadError) -> bool {
-        self.bt_fallback.is_some() && !matches!(err, DownloadError::Cancelled)
+        self.bt_fallback.is_some()
+            && !matches!(
+                err,
+                DownloadError::Cancelled | DownloadError::Paused
+            )
     }
 
     #[cfg(not(feature = "magnet"))]
@@ -5362,6 +5355,46 @@ mod tests {
     }
 
     // ------ 1b. with_hybrid_sources:真实构造路径(空镜像降级 + HTTP 镜像主源) ------
+
+    /// 回归:纯 magnet 构造必须注入 session_coordinator,否则 probe 直接失败:
+    /// "磁力链接生命周期 coordinator 不可用"。
+    #[cfg(feature = "magnet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_with_pool_and_scheduler_magnet_injects_session_coordinator() {
+        use crate::bt_session::BtSession;
+        use tachyon_core::config::MagnetConfig;
+
+        let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+        let magnet_cfg = MagnetConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            disable_dht_persistence: true,
+            ..Default::default()
+        };
+        let bt_session = Arc::new(
+            BtSession::new(dir.path().to_path_buf(), magnet_cfg)
+                .await
+                .expect("BtSession 应创建成功"),
+        );
+        let mut config = test_config();
+        config.download_dir = dir.path().to_string_lossy().to_string();
+        config.authorized_dirs = vec![config.download_dir.clone()];
+        let magnet_url = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string();
+        let task = DownloadTask::with_pool_and_scheduler(
+            magnet_url,
+            config,
+            None,
+            Arc::new(AdaptiveDownloadScheduler::default_config()),
+            Some(bt_session),
+        )
+        .await
+        .expect("magnet 任务应构造成功");
+        let magnet = task
+            .bt_magnet
+            .as_ref()
+            .expect("纯 magnet 路径必须持有 bt_magnet");
+        let _coord = magnet.session_coordinator_for_test();
+    }
 
     /// 无 HTTP 镜像时 `with_hybrid_sources` 必须退化为纯 BT 构造:
     /// 调用 `with_pool_and_scheduler(magnet, Some(bt_session))`,
@@ -12374,6 +12407,81 @@ mod tests {
             matches!(result, Err(DownloadError::Paused)),
             "期望 Err(Paused), got {result:?}"
         );
+    }
+
+    /// 回归:run() 在 execute 阶段必须响应 Pause。
+    /// 若 run_inner 对 control_rx 做 take,Pause 信号进不了热路径,UI 暂停但 IO 继续。
+    #[tokio::test]
+    async fn test_run_honors_pause_during_execute() {
+        // 2 分片 + 慢 chunk:给 Pause 留出窗口(chunk_delay 仅在 chunk_size 设置时生效)
+        let frag_size = 8 * 1024u64;
+        let total = frag_size * 2;
+        let mut mock = MockProto::new(test_metadata("run-pause.bin", total)).with_chunk_size(1024);
+        for i in 0..2u64 {
+            let start = i * frag_size;
+            let end = start + frag_size - 1;
+            mock = mock.with_range_data(
+                start,
+                end,
+                Bytes::from(vec![0xABu8; frag_size as usize]),
+            );
+        }
+        mock = mock.with_chunk_delay(Duration::from_millis(40));
+        let protocol: Arc<dyn Protocol> = Arc::new(mock);
+        let storage = StorageKind::memory_with_capacity(total as usize);
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/run-pause.bin".into(),
+            DownloadConfig {
+                verify_checksum: false,
+                max_retries: 0,
+                max_concurrent_fragments: 1,
+                pause_timeout_secs: 30,
+                ..test_config()
+            },
+            protocol,
+            storage,
+        );
+        task.scheduler_config = tachyon_core::config::SchedulerConfig {
+            min_fragment_size: frag_size,
+            max_fragment_size: frag_size,
+            ..Default::default()
+        };
+        let (tx, rx) = watch::channel(TaskCommand::Start);
+        task.set_control_rx(rx);
+
+        let handle = tokio::spawn(async move {
+            let result = task.run().await;
+            (task, result)
+        });
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        tx.send(TaskCommand::Pause).expect("send Pause");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        if handle.is_finished() {
+            let (task, result) = handle.await.expect("join");
+            assert!(
+                matches!(result, Err(DownloadError::Paused)),
+                "Pause 后 run 结束必须是 Err(Paused), got {result:?}, state={:?}",
+                task.state()
+            );
+            assert_eq!(task.state(), DownloadState::Paused);
+        } else {
+            assert!(
+                !handle.is_finished(),
+                "Pause 后任务应挂起等 Resume,不得继续下载到完成"
+            );
+            tx.send(TaskCommand::Resume).expect("send Resume");
+            let (task, result) = tokio::time::timeout(Duration::from_secs(8), handle)
+                .await
+                .expect("Resume 后应在 8s 内结束")
+                .expect("join");
+            match result {
+                Ok(()) => assert_eq!(task.state(), DownloadState::Completed),
+                Err(DownloadError::Paused) => assert_eq!(task.state(), DownloadState::Paused),
+                other => panic!("意外结果: {other:?}, state={:?}", task.state()),
+            }
+        }
     }
 
     #[tokio::test]

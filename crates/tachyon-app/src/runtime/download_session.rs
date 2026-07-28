@@ -17,8 +17,8 @@ use tokio::sync::{Mutex, watch};
 use crate::commands::task_commands::{
     PreRunCheck, ResumeOrCancel, build_download_task, ensure_download_dir, extract_fail_reason,
     finalize_task_state, inject_resume_snapshot, mark_task_failed_and_cleanup,
-    probe_and_save_metadata, should_stop_before_run, validate_and_prepare_url,
-    wait_chunk_reader_done, wait_for_resume_or_cancel,
+    mark_task_failed_with_reason_and_cleanup, probe_and_save_metadata, should_stop_before_run,
+    validate_and_prepare_url, wait_chunk_reader_done, wait_for_resume_or_cancel,
 };
 use crate::commands::{
     AppState, TaskCommand, cleanup_runtime, hf_race_counterpart_url, persist_task_snapshot,
@@ -218,7 +218,15 @@ impl DownloadSession {
         {
             Ok(t) => t,
             Err(()) => {
-                mark_task_failed_and_cleanup(&self.state, &self.task_id).await;
+                let reason = if tachyon_core::looks_like_magnet_url(&self.url) {
+                    Some(
+                        "磁力下载不可用: BitTorrent Session 未初始化或构造失败。请检查 SOCKS5 代理/磁力配置后重试。"
+                            .to_string(),
+                    )
+                } else {
+                    Some("下载任务构造失败".to_string())
+                };
+                mark_task_failed_with_reason_and_cleanup(&self.state, &self.task_id, reason).await;
                 return;
             }
         };

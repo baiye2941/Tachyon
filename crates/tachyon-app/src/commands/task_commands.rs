@@ -498,18 +498,40 @@ pub(crate) async fn probe_and_save_metadata(
         }
         Err(e) => {
             tracing::error!(task_id = %task_id, error = %e, "元数据探测失败");
-            mark_task_failed_and_cleanup(state, task_id).await;
+            mark_task_failed_with_reason_and_cleanup(
+                state,
+                task_id,
+                Some(e.to_string()),
+            )
+            .await;
             None
         }
     }
 }
 
 pub(crate) async fn mark_task_failed_and_cleanup(state: &AppState, task_id: &str) {
-    update_task_status(
-        &state.domain.task_repository,
-        task_id,
-        DownloadState::Failed,
-    );
+    mark_task_failed_with_reason_and_cleanup(state, task_id, None).await;
+}
+
+/// 标记失败并写入 error_reason(磁力/探测失败等 UI 需要可读原因)。
+pub(crate) async fn mark_task_failed_with_reason_and_cleanup(
+    state: &AppState,
+    task_id: &str,
+    reason: Option<String>,
+) {
+    if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
+        task.status = DownloadState::Failed;
+        task.speed = 0;
+        if reason.is_some() {
+            task.error_reason = reason;
+        }
+    } else {
+        update_task_status(
+            &state.domain.task_repository,
+            task_id,
+            DownloadState::Failed,
+        );
+    }
     cleanup_runtime(state, task_id);
 }
 
@@ -539,6 +561,7 @@ pub(crate) async fn finalize_task_state(
                     task.downloaded = final_size;
                     task.speed = 0;
                     task.status = DownloadState::Completed;
+                    task.error_reason = None;
                     tracing::info!(task_id = %task_id, file_size = final_size, "下载任务完成");
                 }
             }
@@ -547,9 +570,24 @@ pub(crate) async fn finalize_task_state(
             if let Some(mut task) = state.domain.task_repository.get_mut(task_id) {
                 if task.status == DownloadState::Cancelled {
                     tracing::info!(task_id = %task_id, "下载失败但任务已被取消,保留取消状态");
+                } else if matches!(e, tachyon_core::DownloadError::Paused) {
+                    // 用户协作暂停:保持/落为 Paused,禁止误标 Failed
+                    task.status = DownloadState::Paused;
+                    task.speed = 0;
+                    task.error_reason = None;
+                    tracing::info!(task_id = %task_id, "下载协作暂停,保持 Paused");
+                } else if matches!(e, tachyon_core::DownloadError::Timeout(msg) if msg.contains("暂停"))
+                    || (matches!(e, tachyon_core::DownloadError::Timeout(_))
+                        && task.status == DownloadState::Paused)
+                {
+                    task.status = DownloadState::Paused;
+                    task.speed = 0;
+                    task.error_reason = None;
+                    tracing::info!(task_id = %task_id, "暂停超时,保持 Paused");
                 } else {
                     task.status = DownloadState::Failed;
                     task.speed = 0;
+                    task.error_reason = Some(e.to_string());
                     tracing::error!(task_id = %task_id, error = %e, "下载任务失败");
                 }
             }
@@ -582,11 +620,15 @@ pub(crate) fn extract_fail_reason(
     match result {
         Ok(()) => None,
         Err(e) => {
-            if state
+            let status = state
                 .domain
                 .task_repository
                 .get(task_id)
-                .is_some_and(|t| t.status == DownloadState::Cancelled)
+                .map(|t| t.status);
+            if matches!(
+                status,
+                Some(DownloadState::Cancelled | DownloadState::Paused)
+            ) || matches!(e, tachyon_core::DownloadError::Paused)
             {
                 None
             } else {
@@ -4297,5 +4339,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(task.status, DownloadState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_task_state_paused_keeps_paused_not_failed() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Downloading);
+        let err = tachyon_core::DownloadError::Paused;
+        finalize_task_state(&state, &task_id, Err(&err), Some(100)).await;
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            DownloadState::Paused,
+            "协作暂停不得 finalize 成 Failed"
+        );
+        assert!(task.error_reason.is_none());
+        assert_eq!(task.speed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_task_state_other_error_sets_failed_reason() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Downloading);
+        let err = tachyon_core::DownloadError::Network("tracker 超时".into());
+        finalize_task_state(&state, &task_id, Err(&err), None).await;
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Failed);
+        assert!(
+            task.error_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("tracker")),
+            "失败必须写入可读 error_reason, got {:?}",
+            task.error_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_task_failed_with_reason_sets_error_reason() {
+        let state = test_state();
+        let task_id = insert_test_task(&state, DownloadState::Downloading);
+        mark_task_failed_with_reason_and_cleanup(
+            &state,
+            &task_id,
+            Some("BitTorrent Session 未初始化".into()),
+        )
+        .await;
+        let task = state.domain.task_repository.get(&task_id).unwrap();
+        assert_eq!(task.status, DownloadState::Failed);
+        assert_eq!(
+            task.error_reason.as_deref(),
+            Some("BitTorrent Session 未初始化")
+        );
     }
 }
