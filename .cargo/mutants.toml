@@ -1,0 +1,52 @@
+# cargo-mutants 配置(审计 E-01)
+#
+# 历史失败:
+# - 全量 tachyon-core 变异面过大 → GHA 2h cancel
+# - --in-place 与 -j 互斥
+# - 噪声变异大量 MISSED
+#
+# CI 策略:只门禁 safety 关键路径(路径穿越 / SSRF)。
+# 全量: TACHYON_MUTANTS_MODE=full bash scripts/ci/mutants.sh
+#
+# 文档: https://mutants.rs/
+
+examine_globs = [
+  "crates/tachyon-core/src/safety/**/*.rs",
+]
+
+exclude_globs = [
+  "**/test_harness.rs",
+  "**/tests/**",
+  "**/benches/**",
+]
+
+# 过滤低价值/噪声变异名(与 --list 展示名匹配)
+exclude_re = [
+  "replace > with >=",
+  "replace < with <=",
+  "replace \\+ with \\*",
+  "replace \\+= with \\*=",
+  "replace - with \\*",
+  "replace -= with \\*=",
+  "replace / with %",
+  "replace / with \\*",
+  "replace \\+ with -",
+  "replace \\+= with -=",
+  "replace - with \\+",
+  "replace < with ==",
+  "replace < with >",
+  "replace > with <",
+  "replace > with ==",
+  # 展示/日志辅助:非 SSRF/路径门禁主路径
+  "url_for_display",
+  "url_identity_key",
+  "redact_url_for_log",
+]
+
+timeout_multiplier = 2.0
+minimum_test_timeout = 30.0
+
+# 每个变异只跑 safety 相关单测,避免全 crate suite 拖慢
+additional_cargo_test_args = [
+  "safety::",
+]

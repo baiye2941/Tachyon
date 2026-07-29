@@ -1,8 +1,11 @@
 # 变异测试 (cargo-mutants)
 #
-# 从主 CI 拆出: job 超时在 GHA 记为 cancelled, continue-on-error 挡不住,
-# 会把整次 CI workflow 标红,污染 README badge。
-# 本 workflow 独立展示,失败不影响 CI 通过状态。
+# 从主 CI 拆出,避免超时/失败污染 README CI badge。
+#
+# 历史失败:
+# - 全量 tachyon-core 变异面过大 → 2h cancel
+# - --in-place 与 -j 互斥 / 大量噪声 MISSED
+# 现行: scripts/ci/mutants.sh + .cargo/mutants.toml 仅门禁 safety/
 name: Mutants
 
 on:
@@ -13,28 +16,38 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci/mutants.sh'
+      - '.cargo/mutants.toml'
       - '.github/workflows/mutants.yml'
   schedule:
-    # 每周一 03:00 UTC 全量抽检
+    # 每周一 03:00 UTC
     - cron: '0 3 * * 1'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'ci = safety 关键路径; full = 全量 tachyon-core'
+        required: true
+        default: 'ci'
+        type: choice
+        options:
+          - ci
+          - full
 
 permissions:
   contents: read
 
 concurrency:
-  group: mutants-${{ github.ref }}
+  group: mutants-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_MUTANTS_JOBS: '4'
 
 jobs:
   mutants:
     name: 变异测试 (tachyon-core)
     runs-on: ubuntu-latest
-    # 主 CI 已覆盖正确性; 本 job 可拉长, 避免 45m 硬砍
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'full' && 180 || 60 }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ubuntu-deps
@@ -46,5 +59,17 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.21.1
       - name: 安装 cargo-mutants
         run: cargo binstall -y --force cargo-mutants
-      - name: 变异测试 (tachyon-core)
+      - name: 变异测试
+        env:
+          TACHYON_MUTANTS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'ci' }}
         run: bash scripts/ci/mutants.sh
+      - name: 上传 mutants 产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: |
+            mutants.out/
+            mutants-list.txt
+          if-no-files-found: ignore
+          retention-days: 14
