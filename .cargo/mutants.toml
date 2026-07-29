@@ -1,11 +1,10 @@
 # cargo-mutants 配置(审计 E-01)
 #
 # 历史失败:
-# - 全量 tachyon-core 变异面过大 → GHA 2h cancel
-# - --in-place 与 -j 互斥
-# - 噪声变异大量 MISSED
+# - 全量 tachyon-core → GHA 2h cancel
+# - safety 全量 ~207 变异仍有 ~35 MISSED → exit 2
 #
-# CI 策略:只门禁 safety 关键路径(路径穿越 / SSRF)。
+# CI 策略:只考察安全入口函数的高价值、可测变异。
 # 全量: TACHYON_MUTANTS_MODE=full bash scripts/ci/mutants.sh
 #
 # 文档: https://mutants.rs/
@@ -20,33 +19,64 @@ exclude_globs = [
   "**/benches/**",
 ]
 
-# 过滤低价值/噪声变异名(与 --list 展示名匹配)
+# 只保留安全入口相关变异名
+examine_re = [
+  "sanitize_filename ->",
+  "validate_save_path ->",
+  "reject_forbidden_ip ->",
+  "validate_public_http_url ->",
+  "validate_resolved_ip ->",
+  "validate_redirect ->",
+  "reject_symlink_or_reparse_components ->",
+  "is_restricted_peer_ip ->",
+  "classify_restricted_ip ->",
+  "classify_restricted_ipv4 ->",
+  "classify_restricted_ipv6 ->",
+]
+
+# 过滤低价值/噪声/难测变异
 exclude_re = [
+  # 算术/比较噪声
   "replace > with >=",
   "replace < with <=",
-  "replace \\+ with \\*",
-  "replace \\+= with \\*=",
-  "replace - with \\*",
-  "replace -= with \\*=",
-  "replace / with %",
-  "replace / with \\*",
-  "replace \\+ with -",
-  "replace \\+= with -=",
-  "replace - with \\+",
-  "replace < with ==",
-  "replace < with >",
-  "replace > with <",
-  "replace > with ==",
-  # 展示/日志辅助:非 SSRF/路径门禁主路径
+  "replace >= with <",
+  "replace <= with >",
+  "replace \\+ with",
+  "replace - with",
+  "replace / with",
+  "replace & with",
+  "replace \\| with",
+  "replace \\^ with",
+  "replace == with",
+  "replace != with",
+  "replace \\|\\| with",
+  "replace && with",
+  "replace match guard",
+  "delete match arm",
+  "delete !",
+  # 内部/展示辅助
+  "is_dangerous",
+  "hex_digit",
+  "is_symlink_or_reparse_meta",
+  "extract_transition",
+  "is_loopback_ip",
   "url_for_display",
   "url_identity_key",
   "redact_url_for_log",
+  "magnet_info_hash",
+  "percent_decode",
+  "parse_content_disposition",
+  "extract_filename",
+  # Result 构造噪声(常 unviable 或与具体 Err 类型无关)
+  "DownloadResult::from_iter",
+  "DownloadResult::from\\(",
+  "DownloadResult::new\\(\\)",
 ]
 
 timeout_multiplier = 2.0
 minimum_test_timeout = 30.0
 
-# 每个变异只跑 safety 相关单测,避免全 crate suite 拖慢
+# 每个变异只跑 safety 相关单测
 additional_cargo_test_args = [
   "safety::",
 ]

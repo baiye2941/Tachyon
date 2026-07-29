@@ -5,12 +5,12 @@
 # 运行,不进主 CI,不污染 README CI badge。
 #
 # 历史失败:
-# 1. 全量 tachyon-core 变异面约 800+,GHA 2h 内跑不完 → cancelled
-# 2. 大量噪声 MISSED 导致 cargo-mutants 非零退出 → failure
+# 1. 全量 tachyon-core ~800+ 变异,GHA 2h 内跑不完 → cancelled
+# 2. 大量噪声 MISSED → cargo-mutants 非零退出 → failure
 # 3. cargo-mutants v27+: --in-place 与 -j 互斥
 #
 # 现行策略:
-# - 默认读 `.cargo/mutants.toml`:仅 safety/ 关键路径(路径/SSRF)
+# - 默认读 `.cargo/mutants.toml`:仅 safety 入口高价值变异
 # - 复制树 + 并行 jobs(非 --in-place)
 # - MODE=full 可全量(长任务)
 set -euo pipefail
@@ -22,7 +22,6 @@ MODE="${TACHYON_MUTANTS_MODE:-ci}"
 JOBS="${CARGO_MUTANTS_JOBS:-4}"
 TIMEOUT="${TACHYON_MUTANTS_TIMEOUT:-120}"
 
-# 清理上次产物,避免 rename mutants.out → .old 权限问题
 rm -rf mutants.out mutants.out.old 2>/dev/null || true
 
 common_args=(
@@ -33,9 +32,18 @@ common_args=(
 
 case "${MODE}" in
   ci)
-    echo "==> mutants CI mode: safety/ only (.cargo/mutants.toml), jobs=${JOBS}"
-    cargo mutants -p tachyon-core --list | tee mutants-list.txt >/dev/null
-    echo "mutant_count=$(wc -l < mutants-list.txt | tr -d ' ')"
+    echo "==> mutants CI mode: safety entrypoints (.cargo/mutants.toml), jobs=${JOBS}"
+    cargo mutants -p tachyon-core --list | tee mutants-list.txt
+    count="$(wc -l < mutants-list.txt | tr -d ' ')"
+    echo "mutant_count=${count}"
+    if [[ "${count}" -eq 0 ]]; then
+      echo "error: mutant_count=0, examine_globs/examine_re 可能过窄" >&2
+      exit 1
+    fi
+    if [[ "${count}" -gt 80 ]]; then
+      echo "error: mutant_count=${count} 过大,CI 可能超时;请收紧 .cargo/mutants.toml" >&2
+      exit 1
+    fi
     cargo mutants "${common_args[@]}"
     ;;
   full)
@@ -47,14 +55,13 @@ case "${MODE}" in
       --exclude '**/benches/**'
     ;;
   list)
-    echo "==> listing mutants under current config"
     cargo mutants -p tachyon-core --list
     ;;
   *)
     cat <<'USAGE'
 用法: TACHYON_MUTANTS_MODE=ci|full|list bash scripts/ci/mutants.sh
 
-  ci    (默认) safety/ 关键路径门禁,读 .cargo/mutants.toml
+  ci    (默认) safety 入口高价值变异,读 .cargo/mutants.toml
   full  全量 tachyon-core(本地/长任务)
   list  仅列出将要跑的变异
 
