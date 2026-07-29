@@ -1551,7 +1551,7 @@ impl DownloadTask {
     /// 从代理 URL 提取 host(兼容 socks5 等非 WHATWG special scheme)。
     ///
     /// `url` crate 对 socks5 常把 authority 放进 path 而非 host;此处做兜底。
-    fn proxy_url_host(proxy_url: &str) -> Option<String> {
+    pub(crate) fn proxy_url_host(proxy_url: &str) -> Option<String> {
         if let Ok(parsed) = url::Url::parse(proxy_url)
             && let Some(h) = parsed.host_str()
         {
@@ -1588,7 +1588,7 @@ impl DownloadTask {
         }
     }
 
-    fn host_is_loopback(host: &str) -> bool {
+    pub(crate) fn host_is_loopback(host: &str) -> bool {
         let host = host.trim().trim_start_matches('[').trim_end_matches(']');
         if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.") {
             return true;
@@ -1615,7 +1615,7 @@ impl DownloadTask {
     /// EOF 后即使 partial resume 也丢当前连接窗口。2MiB 窗口把最坏重传上界从整片
     /// 收到 2MiB,且不改变 plan_fragments 边界(resume/rebalance 仍按分片 index)。
     /// 直连/本机代理返回 None(整片一次 Range,零额外请求开销)。
-    fn proxy_range_window_bytes(&self) -> Option<u64> {
+    pub(crate) fn proxy_range_window_bytes(&self) -> Option<u64> {
         const PROXY_RANGE_WINDOW: u64 = 2 * 1024 * 1024;
         if self.remote_http_proxy_active() {
             Some(PROXY_RANGE_WINDOW)
@@ -11361,6 +11361,122 @@ mod tests {
         );
     }
 
+    /// 审计 S-03:file_size==0 跳过(未知长度不在此职责)
+    #[test]
+    fn test_known_length_fragment_completion_skips_zero_file_size() {
+        use crate::fragment::FragmentRecord;
+        use tachyon_core::types::FragmentInfo;
+
+        let a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 99,
+                size: 100,
+                downloaded: 0,
+                hash: None,
+            },
+            3,
+        );
+        assert!(assert_known_length_fragment_completion(&[a], 0).is_ok());
+        assert!(assert_known_length_fragment_completion(&[], 0).is_ok());
+    }
+
+    /// 审计 S-03:空分片列表 + 已知长度 → Err
+    #[test]
+    fn test_known_length_fragment_completion_rejects_empty_list() {
+        let err = assert_known_length_fragment_completion(&[], 100).unwrap_err();
+        assert!(err.to_string().contains("空"), "应报告空列表: {err}");
+    }
+
+    /// 审计 S-03:区间非法(end_excl <= start) → Err
+    #[test]
+    fn test_known_length_fragment_completion_rejects_illegal_range() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        // 先铺满 [0,99],第二片 start 对齐 cursor=100,但 end < start
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 99,
+                size: 100,
+                downloaded: 100,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Done;
+        let mut b = FragmentRecord::new(
+            FragmentInfo {
+                index: 1,
+                start: 100,
+                end: 50, // end_excl=51 <= start=100
+                size: 0,
+                downloaded: 0,
+                hash: None,
+            },
+            3,
+        );
+        b.state = FragmentState::Done;
+        let err = assert_known_length_fragment_completion(&[a, b], 200).unwrap_err();
+        assert!(
+            err.to_string().contains("区间非法"),
+            "应报告区间非法: {err}"
+        );
+    }
+
+    /// 审计 S-03:size 字段与 [start,end] 区间长度不一致 → Err
+    #[test]
+    fn test_known_length_fragment_completion_rejects_size_field_mismatch() {
+        use crate::fragment::{FragmentRecord, FragmentState};
+        use tachyon_core::types::FragmentInfo;
+
+        let mut a = FragmentRecord::new(
+            FragmentInfo {
+                index: 0,
+                start: 0,
+                end: 99,
+                size: 50, // 区间长度应为 100
+                downloaded: 50,
+                hash: None,
+            },
+            3,
+        );
+        a.state = FragmentState::Done;
+        let err = assert_known_length_fragment_completion(&[a], 100).unwrap_err();
+        assert!(
+            err.to_string().contains("size") || err.to_string().contains("不一致"),
+            "应报告 size 与区间不一致: {err}"
+        );
+    }
+
+    /// 审计 S-03:validate 对 None/0 跳过
+    #[test]
+    fn test_validate_known_length_fragment_completion_skips_unknown() {
+        use crate::fragment::FragmentRecord;
+        use tachyon_core::types::FragmentInfo;
+
+        let make = || {
+            FragmentRecord::new(
+                FragmentInfo {
+                    index: 0,
+                    start: 0,
+                    end: 99,
+                    size: 100,
+                    downloaded: 0,
+                    hash: None,
+                },
+                3,
+            )
+        };
+        DownloadTask::validate_known_length_fragment_completion(&[make()], None)
+            .expect("None 应跳过");
+        DownloadTask::validate_known_length_fragment_completion(&[make()], Some(0))
+            .expect("Some(0) 应跳过");
+    }
+
     /// 验证 Pending -> Downloading -> Done 完整路径
     #[test]
     fn test_fragment_record_pending_to_done() {
@@ -15147,6 +15263,90 @@ mod tests {
         task.config.proxy = Some("http://proxy.example.com:8080".into());
         assert!(task.http_proxy_active());
         assert!(task.remote_http_proxy_active());
+    }
+
+    #[test]
+    fn test_proxy_url_host_parses_special_and_socks_fallback() {
+        // WHATWG special scheme:url crate 直接给 host
+        assert_eq!(
+            DownloadTask::proxy_url_host("http://proxy.example.com:8080"),
+            Some("proxy.example.com".into())
+        );
+        assert_eq!(
+            DownloadTask::proxy_url_host("https://user:pass@10.0.0.2:443/path"),
+            Some("10.0.0.2".into())
+        );
+        // IPv6:url crate host_str 可能带括号;统一去括号比较
+        let v6 = DownloadTask::proxy_url_host("http://[2001:db8::1]:7890")
+            .map(|h| h.trim_matches(|c| c == '[' || c == ']').to_string());
+        assert_eq!(v6.as_deref(), Some("2001:db8::1"));
+
+        // socks5 等非 special:url crate 常无 host,走 authority 兜底
+        assert_eq!(
+            DownloadTask::proxy_url_host("socks5://127.0.0.1:7897"),
+            Some("127.0.0.1".into())
+        );
+        assert_eq!(
+            DownloadTask::proxy_url_host("socks5://user:pass@192.168.1.1:1080"),
+            Some("192.168.1.1".into())
+        );
+        let socks_v6 = DownloadTask::proxy_url_host("socks5h://[::1]:1080")
+            .map(|h| h.trim_matches(|c| c == '[' || c == ']').to_string());
+        assert_eq!(socks_v6.as_deref(), Some("::1"));
+
+        // 无 scheme / 空 authority
+        assert_eq!(
+            DownloadTask::proxy_url_host("proxy.example.com:8080"),
+            Some("proxy.example.com".into())
+        );
+        assert_eq!(DownloadTask::proxy_url_host("http://"), None);
+        assert_eq!(DownloadTask::proxy_url_host(""), None);
+
+        // 端口非数字时整段当 host(不误切)
+        assert_eq!(
+            DownloadTask::proxy_url_host("socks5://name:notaport"),
+            Some("name:notaport".into())
+        );
+    }
+
+    #[test]
+    fn test_host_is_loopback_variants() {
+        assert!(DownloadTask::host_is_loopback("localhost"));
+        assert!(DownloadTask::host_is_loopback("LOCALHOST."));
+        assert!(DownloadTask::host_is_loopback("127.0.0.1"));
+        assert!(DownloadTask::host_is_loopback("::1"));
+        assert!(DownloadTask::host_is_loopback("[::1]"));
+        assert!(!DownloadTask::host_is_loopback("proxy.example.com"));
+        assert!(!DownloadTask::host_is_loopback("10.0.0.1"));
+        assert!(!DownloadTask::host_is_loopback(""));
+    }
+
+    #[test]
+    fn test_proxy_range_window_only_for_remote_proxy() {
+        let mut task = DownloadTask::new_for_test(
+            "http://example.com/x.bin".into(),
+            test_config(),
+            Arc::new(MockProto::new(test_metadata("x.bin", 100))),
+            StorageKind::memory_with_capacity(100),
+        );
+        // 直连:无窗口
+        assert_eq!(task.proxy_range_window_bytes(), None);
+
+        // 本机代理:仍无窗口(不触发远程 cap 路径)
+        task.config.proxy = Some("http://127.0.0.1:7897".into());
+        assert_eq!(task.proxy_range_window_bytes(), None);
+
+        // 远程代理:2MiB 窗口
+        task.config.proxy = Some("http://proxy.example.com:8080".into());
+        assert_eq!(task.proxy_range_window_bytes(), Some(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_is_loopback_proxy_url_unparseable_host_is_non_loopback() {
+        // 无法解析 host 时保守视为非 loopback(仍套 cap)
+        assert!(!DownloadTask::is_loopback_proxy_url("not-a-url"));
+        assert!(!DownloadTask::is_loopback_proxy_url("://"));
+        assert!(!DownloadTask::is_loopback_proxy_url("socks5://"));
     }
 
     #[test]
