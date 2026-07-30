@@ -134,6 +134,7 @@ pub fn allocate_windows(file: &std::fs::File, size: u64) -> DownloadResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_imports, dead_code)]
     use tempfile::NamedTempFile;
 
     // 引用待实现的 helper 函数。当前不存在,触发 E0425 编译失败(RED 状态)。

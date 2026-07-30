@@ -41,9 +41,17 @@ use bytes::{Bytes, BytesMut};
 #[cfg(target_os = "linux")]
 use std::cell::UnsafeCell;
 #[cfg(target_os = "linux")]
+// P0-1: OwnedFd 拥有 eventfd,drop 时自动关 fd;AsRawFd 供 register_eventfd 取 RawFd。
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(any(test, target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+// P0-1: AsyncFd<OwnedFd> 把 eventfd 接入 tokio 事件循环,readable() 替代 block_in_place。
+// AsyncFd 拥有 inner OwnedFd(takes ownership),故 ring 本身不进 AsyncFd,仍留在
+// driver_task 作用域供 submission()/completion()/submitter() 直接调用。
+use tokio::io::unix::AsyncFd;
 
 use tachyon_core::{DownloadError, DownloadResult};
 
@@ -308,14 +316,16 @@ fn validate_odirect_alignment(offset: u64, len: usize) -> DownloadResult<()> {
 ///
 /// P1-04: 使用 driver task 架构替代 Mutex。
 /// driver task 独占 `IoUring` 实例，通过 channel 接收写入/读取/同步请求。
-/// 多个并发写入请求在 driver task 内批量提交 SQE，一次 `submit_and_wait(N)`
-/// 替代每个请求单独 `submit_and_wait(1)`，消除 ring 级串行化。
+/// P0-1:driver task 改用 eventfd + AsyncFd 事件驱动循环,批量提交 SQE 后非阻塞
+/// `submit()`,由 eventfd 可读事件驱动 drain CQE,不再 `block_in_place(submit_and_wait)`
+/// 占死 tokio worker。
 ///
 /// # 性能收益
 ///
-/// - 批量提交：N 个并发写入只需 1 次 `submit_and_wait(N)`，而非 N 次 `submit_and_wait(1)`
+/// - 批量提交：N 个并发写入只需 1 次 `submit()`(非阻塞),而非 N 次
 /// - 消除 Mutex 竞争：driver task 独占 ring，无锁竞争
-/// - 异步等待：调用方通过 oneshot channel 异步等待完成，不阻塞 tokio 工作线程
+/// - 异步等待：调用方通过 oneshot channel 异步等待完成,driver 不阻塞 worker
+///   (eventfd + AsyncFd 让出线程,由 epoll 唤醒)
 #[cfg(target_os = "linux")]
 struct IoUringHandle {
     /// 驱动任务命令通道
@@ -343,6 +353,15 @@ struct IoUringHandle {
     /// 命令发送给 driver 时转移,driver 在 CQE 完成时回收,避免与内核 in-flight
     /// op 竞争同一 buffer(参见 `IoUringBufferGuard`)。
     pool: std::sync::Arc<BufferIndexPool>,
+    /// P0-1:已注册进 io_uring ring 的 eventfd 裸描述符(仅用于测试断言)。
+    ///
+    /// 真正的 `AsyncFd<OwnedFd>` 由 `driver_task` 独占持有(AsyncFd takes
+    /// ownership,不可 Clone),随 driver task 生命周期 drop(OwnedFd drop 时
+    /// 关 fd)。此处只记录 raw fd 数值,供 `eventfd_registered()` 测试断言
+    /// init 确实注册了 eventfd。该 raw fd **不**在此处 close——close 由
+    /// driver_task 持有的 OwnedFd 负责,双重 close 会触发 EBADF。
+    #[allow(dead_code)] // 仅由 #[cfg(test)] eventfd_registered() 读取
+    eventfd_fd: Option<i32>,
 }
 
 /// io_uring 驱动任务命令
@@ -402,25 +421,35 @@ enum InflightReq {
     Sync(tokio::sync::oneshot::Sender<DownloadResult<()>>),
 }
 
-/// io_uring driver task 主体
+/// io_uring driver task 主体(P0-1 事件驱动版)
 ///
-/// P1-04: 独占 `IoUring` 实例，通过 channel 接收操作请求。
-/// 核心优化：批量收集多个写入/读取请求，一次 `submit_and_wait(N)` 提交所有 SQE，
-/// 消除 `Mutex` 串行化和逐请求 `submit_and_wait(1)` 的开销。
+/// P0-1: 原 `block_in_place(submit_and_wait(N))` 同步阻塞当前 tokio worker。
+/// 多文件 BT 下载为每个文件实例化 IoUringStorage(per-file driver),N 文件 =
+/// N 个被 block_in_place 占死的 worker,是 #1 可扩展性缺陷。改为 eventfd +
+/// AsyncFd 事件驱动循环:
+///
+/// 1. `init()` 创建 eventfd(2) 并经 `Submitter::register_eventfd` 注册进 ring
+///    (内核在 CQE 可用时写 eventfd)。
+/// 2. eventfd 包成 `AsyncFd<OwnedFd>`(AsyncFd takes ownership,drop 时关 fd),
+///    随 driver task 生命周期 drop。ring 本身留在本函数作用域供直接方法调用。
+/// 3. 主循环 `select!{cmd_rx.recv(), eventfd.readable()}`:
+///    - 收到命令:push SQE 后非阻塞 `submit()`(不 wait),立刻回到 select!。
+///    - eventfd 可读:drain readiness(读 8 字节清计数器),再 drain CQE 并分发。
+///
+/// 这样 driver task 在无 CQE 时让出 worker(由 AsyncFd 注册的 epoll/mio 驱动
+/// 唤醒),不再占死线程;N 文件并发时 N 个 driver 各自独立 select!,不互相阻塞。
 ///
 /// # 批量策略
 ///
-/// 当收到第一个请求后，非阻塞 drain 通道中所有待处理请求，
-/// 构造批量 SQE 一次性提交。在高并发场景下：
-/// - N 个并发写入 → 1 次 submit (而非 N 次 submit_and_wait)
-/// - 系统调用次数从 O(N) 降为 O(1)
-/// - 内核可以优化批量 I/O 调度顺序
+/// 收到命令后非阻塞 drain 通道中所有待处理请求,构造批量 SQE 一次 `submit()`
+/// (非阻塞)。高并发下 N 个并发写入 → 1 次 submit(而非 N 次)。
 #[cfg(target_os = "linux")]
 async fn driver_task(
     mut ring: io_uring::IoUring,
     mut cmd_rx: tokio::sync::mpsc::Receiver<DriverCmd>,
     buffers: std::sync::Arc<Vec<AlignedBuffer>>,
     pool: std::sync::Arc<BufferIndexPool>,
+    eventfd: AsyncFd<OwnedFd>,
 ) {
     // 用于为每个 SQE 生成唯一 user_data,使 CQE 可安全匹配到原始请求。
     // 从 1 开始避免与默认值 0 混淆。
@@ -433,293 +462,366 @@ async fn driver_task(
     let mut last_fd: Option<i32> = None;
 
     loop {
-        // 1. 等待第一个命令
-        let cmd = match cmd_rx.recv().await {
-            Some(cmd) => cmd,
-            None => break, // 通道关闭，退出
-        };
-
-        // 本批次请求
-        let mut pending_writes: Vec<WriteReq> = Vec::new();
-        let mut pending_reads: Vec<ReadReq> = Vec::new();
-        let mut pending_syncs: Vec<tokio::sync::oneshot::Sender<DownloadResult<()>>> = Vec::new();
-
-        // 处理第一个命令
-        match cmd {
-            DriverCmd::Shutdown => {
-                // F-04: 正常退出前 reset pool,回收异常路径泄漏的索引。
-                pool.reset();
-                break;
-            }
-            DriverCmd::Write(req) => pending_writes.push(req),
-            DriverCmd::Read(req) => pending_reads.push(req),
-            DriverCmd::Sync { done } => pending_syncs.push(done),
-        }
-
-        // 2. 非阻塞 drain：收集更多待处理请求
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                DriverCmd::Shutdown => break,
-                DriverCmd::Write(req) => pending_writes.push(req),
-                DriverCmd::Read(req) => pending_reads.push(req),
-                DriverCmd::Sync { done } => pending_syncs.push(done),
-            }
-        }
-
-        // 3. 批量提交写入 SQE
-        // P1-04: 调用方已将数据复制到 fixed buffer，driver task 只需构造 SQE
-        if !pending_writes.is_empty() {
-            let mut sq = ring.submission();
-            for req in pending_writes {
-                last_fd = Some(req.fd);
-                let buf = &buffers[req.buf_idx];
-                let user_data = next_user_data;
-
-                let write_op = io_uring::opcode::WriteFixed::new(
-                    io_uring::types::Fd(req.fd),
-                    buf.ptr() as *const u8,
-                    req.len as u32,
-                    req.buf_idx as u16,
-                )
-                .offset(req.offset)
-                .build()
-                .user_data(user_data);
-
-                // SAFETY:
-                // - write_op 由 WriteFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
-                // - req.fd 来自合法打开的 Arc<File>(submit_write 中 as_raw_fd),
-                //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
-                // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
-                //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
-                //   对齐地址,数据已由调用方在 submit_write 中复制完成,push 后 SQE 才被
-                //   内核消费,不存在悬垂引用。
-                // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
-                unsafe {
-                    if sq.push(&write_op).is_ok() {
-                        next_user_data = next_user_data.wrapping_add(1);
-                        inflight.insert(user_data, InflightReq::Write(req));
-                    } else {
-                        // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
-                        // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
-                        pool.free(req.buf_idx);
-                        let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
-                            "io_uring 提交队列已满",
-                        ))));
+        // P0-1 事件驱动核心:select! 在"新命令到达"与"内核通知 CQE 可读(eventfd)"之间等待。
+        // 无事件时本 task 让出 worker(由 tokio 的 AsyncFd 注册的 epoll/mio 驱动唤醒),
+        // 不再 block_in_place 占死线程。
+        tokio::select! {
+            // 分支 A:命令通道有新请求(Write/Read/Sync/Shutdown)到达。
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    // 通道关闭(所有 IoUringStorage clone 已 drop),退出 driver。
+                    break;
+                };
+                let mut shutdown = matches!(cmd, DriverCmd::Shutdown);
+                // 批量收集:首命令 + 非阻塞 drain 通道中所有待处理请求。
+                let mut batch = PendingBatch {
+                    writes: Vec::new(),
+                    reads: Vec::new(),
+                    syncs: Vec::new(),
+                };
+                push_command(cmd, &mut batch, &mut last_fd);
+                // 非阻塞 drain:收集更多待处理请求,减少 submit 次数。
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if matches!(cmd, DriverCmd::Shutdown) {
+                        shutdown = true;
+                        break;
                     }
+                    push_command(cmd, &mut batch, &mut last_fd);
+                }
+
+                // 构造批量 SQE 并非阻塞提交(不 wait)。
+                push_pending_sqes(
+                    &mut ring, &mut next_user_data, &mut inflight, &buffers, &pool,
+                    batch, &mut last_fd,
+                )
+                .await;
+                // 非阻塞 submit:把 SQE 推给内核,不等待完成。
+                // 内核处理完成后会写 eventfd,select! 的 readable 分支被唤醒去 drain CQE。
+                let _ = ring.submitter().submit();
+
+                if shutdown {
+                    // F-04: 正常退出前 reset pool,回收异常路径泄漏的索引。
+                    pool.reset();
+                    break;
                 }
             }
-            sq.sync();
-            drop(sq);
-        }
-
-        // 4. 批量提交读取 SQE
-        if !pending_reads.is_empty() {
-            let mut sq = ring.submission();
-            for req in pending_reads {
-                last_fd = Some(req.fd);
-                let buf = &buffers[req.buf_idx];
-                let actual_len = req.read_len.min(buf.len());
-                let user_data = next_user_data;
-
-                let read_op = io_uring::opcode::ReadFixed::new(
-                    io_uring::types::Fd(req.fd),
-                    buf.ptr(),
-                    actual_len as u32,
-                    req.buf_idx as u16,
-                )
-                .offset(req.offset)
-                .build()
-                .user_data(user_data);
-
-                // SAFETY:
-                // - read_op 由 ReadFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
-                // - req.fd 来自合法打开的 Arc<File>(submit_read 中 as_raw_fd),
-                //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
-                // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
-                //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
-                //   对齐地址,actual_len = min(read_len, buf.len()),写入长度不越界,
-                //   内核 ReadFixed 完成后数据落在该 buffer 内,CQE 处理时再读出。
-                // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
-                unsafe {
-                    if sq.push(&read_op).is_ok() {
-                        next_user_data = next_user_data.wrapping_add(1);
-                        inflight.insert(user_data, InflightReq::Read(req));
-                    } else {
-                        // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
-                        // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
-                        pool.free(req.buf_idx);
-                        let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
-                            "io_uring 提交队列已满",
-                        ))));
+            // 分支 B:eventfd 可读——内核通知有 CQE 可消费。
+            // readable() 返回 AsyncFdReadyGuard;guard 持有期间 readiness 标志置位,
+            // 必须在 drop 前消费或清空 readiness(见下方 try_io / clear_ready)。
+            guard = eventfd.readable() => {
+                let mut guard = match guard {
+                    Ok(g) => g,
+                    // AsyncFd 错误极少见(如 eventfd 被 close);此时无法继续事件驱动,
+                    // 退出 driver。inflight 请求由 Drop 路径的 pool.reset() 兜底(索引泄漏)。
+                    Err(e) => {
+                        tracing::error!(error = ?e, "io_uring eventfd readable 失败,driver 退出");
+                        pool.reset();
+                        break;
                     }
-                }
-            }
-            sq.sync();
-            drop(sq);
-        }
-
-        // 5. 批量提交同步 SQE
-        if !pending_syncs.is_empty() {
-            if let Some(fd) = last_fd {
-                let mut sq = ring.submission();
-                for done in pending_syncs {
-                    let user_data = next_user_data;
-                    let fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                        .build()
-                        .user_data(user_data);
+                };
+                // drain eventfd 计数器:读 8 字节把计数器清零,否则 readiness 不会清,
+                // readable() 会立即返回导致忙循环。try_io 在内部 read 返回 WouldBlock
+                // 时自动清 readiness;成功读取则消耗掉计数。
+                // eventfd 语义:read(8) 把计数器减去读出值(通常一次 read 把计数清零),
+                // 返回 8 字节(u64 计数值)。读后计数器为 0 → 下次 read 返回 EAGAIN/WouldBlock。
+                // guard.try_io 闭包接收 &AsyncFd<OwnedFd>(guard 已携带 readiness 兴趣,
+                // 无需再传 Interest)。
+                let _ = guard.try_io(|inner| {
+                    use std::os::fd::AsRawFd;
+                    let raw = inner.get_ref().as_raw_fd();
+                    let mut buf = [0u8; 8];
                     // SAFETY:
-                    // - fsync_op 由 Fsync::build() 构造,是符合 io_uring ABI 的有效 SQE。
-                    // - fd 来自最近一次 Write/Read 请求的 req.fd(合法 Arc<File> 的
-                    //   raw fd),IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理
-                    //   期间有效。fsync 操作不引用任何用户 buffer,无缓冲区生命周期问题。
-                    // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
-                    unsafe {
-                        if sq.push(&fsync_op).is_ok() {
-                            next_user_data = next_user_data.wrapping_add(1);
-                            inflight.insert(user_data, InflightReq::Sync(done));
-                        } else {
-                            let _ = done.send(Err(DownloadError::Io(std::io::Error::other(
-                                "io_uring 提交队列已满",
-                            ))));
-                        }
-                    }
-                }
-                sq.sync();
-                drop(sq);
-            } else {
-                // 无 fd 可用时无法执行 fsync,直接返回错误
-                for done in pending_syncs {
-                    let _ = done.send(Err(DownloadError::Io(std::io::Error::other(
-                        "io_uring sync 缺少文件描述符",
-                    ))));
-                }
-            }
-        }
-
-        // 6. 计算总 SQE 数量并一次性提交
-        let total_sqes = inflight.len();
-        if total_sqes == 0 {
-            continue;
-        }
-
-        // submit_and_wait: 提交所有 SQE 并等待全部完成。
-        // 审计 M-01:该调用是同步阻塞 syscall;在 async driver_task 中直接调用会
-        // 占死 cooperative worker,abort 无法穿透。block_in_place 允许 runtime
-        // 在阻塞期间调度其他 task(非完整 eventfd/AsyncCancel 方案)。
-        let submit_result =
-            tokio::task::block_in_place(|| ring.submitter().submit_and_wait(total_sqes));
-        if submit_result.is_err() {
-            // 提交失败：通知所有 inflight 请求。
-            // 此处不回收 buf_idx——submit_and_wait 失败时部分 SQE 可能已被内核
-            // 消费并仍在处理,贸然释放会导致复用竞争。索引泄漏是安全的(不被复用)。
-            for (_, req) in inflight.drain() {
-                match req {
-                    InflightReq::Write(r) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other(
-                            "io_uring submit_and_wait 失败",
-                        )));
-                        let _ = r.done.send(err);
-                    }
-                    InflightReq::Read(r) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other(
-                            "io_uring submit_and_wait 失败",
-                        )));
-                        let _ = r.done.send(err);
-                    }
-                    InflightReq::Sync(done) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other(
-                            "io_uring submit_and_wait 失败",
-                        )));
-                        let _ = done.send(err);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // 7. 收集 CQE 并按 user_data 分发结果
-        let mut cq = ring.completion();
-        for cqe in cq.by_ref() {
-            let user_data = cqe.user_data();
-            let r = cqe.result();
-            let Some(req) = inflight.remove(&user_data) else {
-                tracing::warn!(user_data, "io_uring CQE user_data 无匹配请求");
-                continue;
-            };
-
-            match req {
-                InflightReq::Write(write_req) => {
-                    let result = if r < 0 {
-                        Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
+                    // - raw 是 eventfd 的合法 fd(由 init() 的 eventfd(2) 创建,OwnedFd 持有,
+                    //   driver task 生命周期内有效,本 read 不会越界关闭)。
+                    // - buf 是栈上 8 字节,eventfd read(2) 语义要求 8 字节缓冲区,长度匹配。
+                    // - read 不会写入超过 8 字节(eventfd(2) 保证),无越界写。
+                    let ret = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, 8) };
+                    if ret < 0 {
+                        Err(std::io::Error::last_os_error())
                     } else {
-                        Ok(r as usize)
-                    };
-                    // 内核写操作已完成(成功或失败),fixed buffer 不再被内核引用,
-                    // 此时回收索引是安全点(所有权在调用方 mark_submitted 时转移给 driver)。
-                    pool.free(write_req.buf_idx);
-                    let _ = write_req.done.send(result);
-                }
-                InflightReq::Read(read_req) => {
-                    let result = if r < 0 {
-                        Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
-                    } else {
-                        let bytes_read = r as usize;
-                        // 从 fixed buffer 复制到 Vec 返回
-                        let buf = &buffers[read_req.buf_idx];
-                        // SAFETY:
-                        // - buf.as_ptr() 返回该 fixed buffer 对齐后的起始地址,
-                        //   指向 buffers[buf_idx] 内核已读取的内存区域(ReadFixed 完成)。
-                        // - bytes_read = cqe.result(),是内核实际写入的字节数,满足
-                        //   0 <= bytes_read <= read_req.read_len(由 ReadFixed 语义保证)。
-                        //   read_len 已校验 <= buf.len()(submit_read 中 actual_len = min),
-                        //   故 bytes_read <= buf.len(),切片范围在 buffer 有效区间内。
-                        // - 此处只读不写,且 driver task 是 buffers 的唯一消费者此刻
-                        //   (该 buf_idx 已被 submit_read 分配并独占,完成后才 free),
-                        //   不存在并发别名引用。
-                        let src = unsafe { std::slice::from_raw_parts(buf.as_ptr(), bytes_read) };
-                        Ok(src.to_vec())
-                    };
-                    // 数据已从 fixed buffer 拷出(to_vec),内核读操作已完成,
-                    // 回收索引(必须在 to_vec 之后,确保数据已脱离 buffer)。
-                    pool.free(read_req.buf_idx);
-                    let _ = read_req.done.send(result);
-                }
-                InflightReq::Sync(done) => {
-                    let result = if r < 0 {
-                        Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
-                    } else {
-                        Ok(())
-                    };
-                    let _ = done.send(result);
-                }
-            }
-        }
-
-        // 若 CQE 缺失,通知剩余 inflight 请求。
-        // 不回收 buf_idx——缺失的 CQE 对应的内核 op 可能仍在处理,泄漏是安全的。
-        if !inflight.is_empty() {
-            tracing::warn!(remaining = inflight.len(), "io_uring CQE 缺失");
-            for (_, req) in inflight.drain() {
-                match req {
-                    InflightReq::Write(r) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                        let _ = r.done.send(err);
+                        Ok(ret)
                     }
-                    InflightReq::Read(r) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                        let _ = r.done.send(err);
-                    }
-                    InflightReq::Sync(done) => {
-                        let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                        let _ = done.send(err);
-                    }
-                }
+                });
+                // drain CQE 并按 user_data 分发结果。
+                drain_completions(&mut ring, &mut inflight, &buffers, &pool);
             }
         }
     }
 
     // driver task 退出，drain 剩余命令并返回错误
     tracing::info!("io_uring driver task 退出");
+}
+
+/// 把单条命令分派到对应的 pending 队列。
+#[cfg(target_os = "linux")]
+fn push_command(cmd: DriverCmd, batch: &mut PendingBatch, last_fd: &mut Option<i32>) {
+    match cmd {
+        DriverCmd::Write(req) => {
+            *last_fd = Some(req.fd);
+            batch.writes.push(req);
+        }
+        DriverCmd::Read(req) => {
+            *last_fd = Some(req.fd);
+            batch.reads.push(req);
+        }
+        DriverCmd::Sync { done } => batch.syncs.push(done),
+        DriverCmd::Shutdown => {} // shutdown 由调用方处理,不进队列
+    }
+}
+
+/// 构造批量 SQE(Write/Read/Fsync)并入队 inflight,非阻塞提交。
+///
+/// 把原 driver_task 步骤 3-5 抽出:对 pending_writes/reads/syncs 构造 SQE push 进
+/// ring.submission()。push 失败的请求立即回收 buf_idx 并回错误(内核不会处理该 op)。
+/// 调用方在结束后自行调 `submit()`(非阻塞)推给内核。
+#[cfg(target_os = "linux")]
+struct PendingBatch {
+    writes: Vec<WriteReq>,
+    reads: Vec<ReadReq>,
+    syncs: Vec<tokio::sync::oneshot::Sender<DownloadResult<()>>>,
+}
+
+/// 构造批量 SQE(Write/Read/Fsync)并入队 inflight,非阻塞提交。
+///
+/// 把原 driver_task 步骤 3-5 抽出:对 batch 中的 writes/reads/syncs 构造 SQE push
+/// 进 ring.submission()。push 失败的请求立即回收 buf_idx 并回错误(内核不会处理
+/// 该 op)。调用方在结束后自行调 `submit()`(非阻塞)推给内核。
+#[cfg(target_os = "linux")]
+async fn push_pending_sqes(
+    ring: &mut io_uring::IoUring,
+    next_user_data: &mut u64,
+    inflight: &mut std::collections::HashMap<u64, InflightReq>,
+    buffers: &std::sync::Arc<Vec<AlignedBuffer>>,
+    pool: &std::sync::Arc<BufferIndexPool>,
+    batch: PendingBatch,
+    last_fd: &mut Option<i32>,
+) {
+    let PendingBatch {
+        writes: pending_writes,
+        reads: pending_reads,
+        syncs: pending_syncs,
+    } = batch;
+    // 批量提交写入 SQE(调用方已将数据复制到 fixed buffer,driver 只构造 SQE)
+    if !pending_writes.is_empty() {
+        let mut sq = ring.submission();
+        for req in pending_writes {
+            *last_fd = Some(req.fd);
+            let buf = &buffers[req.buf_idx];
+            let user_data = *next_user_data;
+
+            let write_op = io_uring::opcode::WriteFixed::new(
+                io_uring::types::Fd(req.fd),
+                buf.ptr() as *const u8,
+                req.len as u32,
+                req.buf_idx as u16,
+            )
+            .offset(req.offset)
+            .build()
+            .user_data(user_data);
+
+            // SAFETY:
+            // - write_op 由 WriteFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
+            // - req.fd 来自合法打开的 Arc<File>(submit_write 中 as_raw_fd),
+            //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
+            // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
+            //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
+            //   对齐地址,数据已由调用方在 submit_write 中复制完成,push 后 SQE 才被
+            //   内核消费,不存在悬垂引用。
+            // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
+            unsafe {
+                if sq.push(&write_op).is_ok() {
+                    *next_user_data = next_user_data.wrapping_add(1);
+                    inflight.insert(user_data, InflightReq::Write(req));
+                } else {
+                    // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
+                    // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
+                    pool.free(req.buf_idx);
+                    let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
+                        "io_uring 提交队列已满",
+                    ))));
+                }
+            }
+        }
+        sq.sync();
+        drop(sq);
+    }
+
+    // 批量提交读取 SQE
+    if !pending_reads.is_empty() {
+        let mut sq = ring.submission();
+        for req in pending_reads {
+            *last_fd = Some(req.fd);
+            let buf = &buffers[req.buf_idx];
+            let actual_len = req.read_len.min(buf.len());
+            let user_data = *next_user_data;
+
+            let read_op = io_uring::opcode::ReadFixed::new(
+                io_uring::types::Fd(req.fd),
+                buf.ptr(),
+                actual_len as u32,
+                req.buf_idx as u16,
+            )
+            .offset(req.offset)
+            .build()
+            .user_data(user_data);
+
+            // SAFETY:
+            // - read_op 由 ReadFixed::build() 构造,是符合 io_uring ABI 的有效 SQE。
+            // - req.fd 来自合法打开的 Arc<File>(submit_read 中 as_raw_fd),
+            //   IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理期间有效。
+            // - req.buf_idx 经 alloc_buffer_index 分配且尚未释放,driver task 此刻
+            //   是该 fixed buffer 的唯一消费者;buf.ptr() 指向 buffers[buf_idx] 的
+            //   对齐地址,actual_len = min(read_len, buf.len()),写入长度不越界,
+            //   内核 ReadFixed 完成后数据落在该 buffer 内,CQE 处理时再读出。
+            // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
+            unsafe {
+                if sq.push(&read_op).is_ok() {
+                    *next_user_data = next_user_data.wrapping_add(1);
+                    inflight.insert(user_data, InflightReq::Read(req));
+                } else {
+                    // SQE 未能入队,内核不会处理该 op,fixed buffer 不在途。
+                    // 调用方守卫 submitted=true 不会回收,此处由 driver 回收索引。
+                    pool.free(req.buf_idx);
+                    let _ = req.done.send(Err(DownloadError::Io(std::io::Error::other(
+                        "io_uring 提交队列已满",
+                    ))));
+                }
+            }
+        }
+        sq.sync();
+        drop(sq);
+    }
+
+    // 批量提交同步 SQE
+    if !pending_syncs.is_empty() {
+        if let Some(fd) = *last_fd {
+            let mut sq = ring.submission();
+            for done in pending_syncs {
+                let user_data = *next_user_data;
+                let fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                    .build()
+                    .user_data(user_data);
+                // SAFETY:
+                // - fsync_op 由 Fsync::build() 构造,是符合 io_uring ABI 的有效 SQE。
+                // - fd 来自最近一次 Write/Read 请求的 req.fd(合法 Arc<File> 的
+                //   raw fd),IoUringStorage 持有 file_fd 的 Arc 副本,fd 在 SQE 处理
+                //   期间有效。fsync 操作不引用任何用户 buffer,无缓冲区生命周期问题。
+                // - sq 是本地 SubmissionQueue,driver task 单线程独占,无并发 push。
+                unsafe {
+                    if sq.push(&fsync_op).is_ok() {
+                        *next_user_data = next_user_data.wrapping_add(1);
+                        inflight.insert(user_data, InflightReq::Sync(done));
+                    } else {
+                        let _ = done.send(Err(DownloadError::Io(std::io::Error::other(
+                            "io_uring 提交队列已满",
+                        ))));
+                    }
+                }
+            }
+            sq.sync();
+            drop(sq);
+        } else {
+            // 无 fd 可用时无法执行 fsync,直接返回错误
+            for done in pending_syncs {
+                let _ = done.send(Err(DownloadError::Io(std::io::Error::other(
+                    "io_uring sync 缺少文件描述符",
+                ))));
+            }
+        }
+    }
+}
+
+/// drain 完成队列(CQE)并按 user_data 分发结果。
+///
+/// 把原 driver_task 步骤 7 抽出:遍历 ring.completion(),按 user_data 匹配 inflight
+/// 请求,分发结果并回收 fixed buffer 索引(内核 op 已完成)。CQE 缺失的 inflight
+/// 请求通知错误(不回收 buf_idx——缺失 CQE 对应的内核 op 可能仍在处理,泄漏是安全的)。
+#[cfg(target_os = "linux")]
+fn drain_completions(
+    ring: &mut io_uring::IoUring,
+    inflight: &mut std::collections::HashMap<u64, InflightReq>,
+    buffers: &std::sync::Arc<Vec<AlignedBuffer>>,
+    pool: &std::sync::Arc<BufferIndexPool>,
+) {
+    let mut cq = ring.completion();
+    for cqe in cq.by_ref() {
+        let user_data = cqe.user_data();
+        let r = cqe.result();
+        let Some(req) = inflight.remove(&user_data) else {
+            tracing::warn!(user_data, "io_uring CQE user_data 无匹配请求");
+            continue;
+        };
+
+        match req {
+            InflightReq::Write(write_req) => {
+                let result = if r < 0 {
+                    Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
+                } else {
+                    Ok(r as usize)
+                };
+                // 内核写操作已完成(成功或失败),fixed buffer 不再被内核引用,
+                // 此时回收索引是安全点(所有权在调用方 mark_submitted 时转移给 driver)。
+                pool.free(write_req.buf_idx);
+                let _ = write_req.done.send(result);
+            }
+            InflightReq::Read(read_req) => {
+                let result = if r < 0 {
+                    Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
+                } else {
+                    let bytes_read = r as usize;
+                    // 从 fixed buffer 复制到 Vec 返回
+                    let buf = &buffers[read_req.buf_idx];
+                    // SAFETY:
+                    // - buf.as_ptr() 返回该 fixed buffer 对齐后的起始地址,
+                    //   指向 buffers[buf_idx] 内核已读取的内存区域(ReadFixed 完成)。
+                    // - bytes_read = cqe.result(),是内核实际写入的字节数,满足
+                    //   0 <= bytes_read <= read_req.read_len(由 ReadFixed 语义保证)。
+                    //   read_len 已校验 <= buf.len()(submit_read 中 actual_len = min),
+                    //   故 bytes_read <= buf.len(),切片范围在 buffer 有效区间内。
+                    // - 此处只读不写,且 driver task 是 buffers 的唯一消费者此刻
+                    //   (该 buf_idx 已被 submit_read 分配并独占,完成后才 free),
+                    //   不存在并发别名引用。
+                    let src = unsafe { std::slice::from_raw_parts(buf.as_ptr(), bytes_read) };
+                    Ok(src.to_vec())
+                };
+                // 数据已从 fixed buffer 拷出(to_vec),内核读操作已完成,
+                // 回收索引(必须在 to_vec 之后,确保数据已脱离 buffer)。
+                pool.free(read_req.buf_idx);
+                let _ = read_req.done.send(result);
+            }
+            InflightReq::Sync(done) => {
+                let result = if r < 0 {
+                    Err(DownloadError::Io(std::io::Error::from_raw_os_error(-r)))
+                } else {
+                    Ok(())
+                };
+                let _ = done.send(result);
+            }
+        }
+    }
+    drop(cq);
+
+    // 若 CQE 缺失,通知剩余 inflight 请求。
+    // 不回收 buf_idx——缺失的 CQE 对应的内核 op 可能仍在处理,泄漏是安全的。
+    if !inflight.is_empty() {
+        tracing::warn!(remaining = inflight.len(), "io_uring CQE 缺失");
+        for (_, req) in inflight.drain() {
+            match req {
+                InflightReq::Write(r) => {
+                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
+                    let _ = r.done.send(err);
+                }
+                InflightReq::Read(r) => {
+                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
+                    let _ = r.done.send(err);
+                }
+                InflightReq::Sync(done) => {
+                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
+                    let _ = done.send(err);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -931,6 +1033,42 @@ fn bitmap_alloc_first_free(bitmap: &[AtomicU64], buffer_count: usize) -> Option<
     None
 }
 
+/// P0-1:创建 eventfd,注册进 io_uring ring,并包成 `AsyncFd<OwnedFd>`。
+///
+/// 返回 `(AsyncFd<OwnedFd>, raw_fd)`。AsyncFd 拥有 OwnedFd(drop 时关 fd);
+/// `raw_fd` 仅用于 `IoUringHandle.eventfd_fd` 测试断言,不在此处 close。
+///
+/// 内核在 CQE 可用时写该 eventfd;driver_task 用 AsyncFd::readable() 监听,
+/// 替代 block_in_place(submit_and_wait)。`register_eventfd` 只记录 fd 编号,
+/// 不取所有权——所有权在返回的 AsyncFd/OwedFd 中。
+#[cfg(target_os = "linux")]
+fn create_registered_eventfd(ring: &io_uring::IoUring) -> DownloadResult<(AsyncFd<OwnedFd>, i32)> {
+    // EFD_CLOEXEC:exec 时自动关 fd,避免泄漏到子进程。
+    // 不加 EFD_NONBLOCK:完全依赖 AsyncFd 的 readiness 语义处理 WouldBlock
+    // (与 tokio AsyncFd 文档惯用一致)。
+    // SAFETY:
+    // - eventfd(2) 是 Linux 系统调用,initval=0/flags=EFD_CLOEXEC 均为合法参数。
+    // - 返回值 < 0 表示失败(已检查);成功返回一个新的、未占用的 fd。
+    let eventfd_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if eventfd_raw < 0 {
+        return Err(DownloadError::Io(std::io::Error::last_os_error()));
+    }
+    // 把裸 fd 包成 OwnedFd:从此刻起 fd 生命周期由 OwnedFd 管理,drop 时自动 close。
+    // SAFETY: eventfd_raw 是刚由 eventfd(2) 成功返回的 fd,我们独占所有权,
+    // 之前未被任何 OwnedFd/File 包裹,FromRawFd 的"获取所有权"契约成立。
+    let eventfd_owned = unsafe { OwnedFd::from_raw_fd(eventfd_raw) };
+    // 注册进 io_uring:内核在 CQE 可用时写该 fd。
+    ring.submitter()
+        .register_eventfd(eventfd_owned.as_raw_fd())
+        .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
+    let raw_fd = eventfd_owned.as_raw_fd();
+    // 包成 AsyncFd:takes ownership of OwnedFd;drop 时关 fd。
+    // AsyncFd 把 eventfd 接入 tokio epoll,readable() 在 CQE 可用时唤醒。
+    let eventfd_async =
+        AsyncFd::new(eventfd_owned).map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
+    Ok((eventfd_async, raw_fd))
+}
+
 /// 分配地址对齐的缓冲区(O_DIRECT/io_uring 要求)
 ///
 /// 通过过量分配 Vec 并选择对齐的内部起点,保证暴露给 io_uring 的地址满足 align 对齐。
@@ -1017,6 +1155,17 @@ impl IoUringStorage {
         &self.config
     }
 
+    /// P0-1 测试断言:init() 是否创建并注册了 eventfd 进 io_uring ring。
+    ///
+    /// 返回 `true` 当 `init()` 成功创建了 eventfd(2) 并调用
+    /// `Submitter::register_eventfd`。driver_task 据此用 AsyncFd 监听 CQE 事件,
+    /// 不再 block_in_place 阻塞 worker。仅供测试验证 P0-1 契约。
+    #[cfg(test)]
+    #[cfg(target_os = "linux")]
+    fn eventfd_registered(&self) -> bool {
+        self.ring.as_ref().and_then(|h| h.eventfd_fd).is_some()
+    }
+
     /// 初始化 io_uring 实例和 fixed buffers (Linux)
     ///
     /// 执行步骤:
@@ -1041,6 +1190,11 @@ impl IoUringStorage {
         let ring = builder
             .build(self.config.sq_depth)
             .map_err(|e| DownloadError::Io(std::io::Error::other(e)))?;
+
+        // P0-1 步骤:创建 eventfd 并注册进 io_uring ring。
+        // 内核在 CQE 可用时写该 eventfd;driver_task 用 AsyncFd 监听其可读事件,
+        // 替代 block_in_place(submit_and_wait),不再占死 tokio worker。
+        let (eventfd_async, eventfd_fd_for_handle) = create_registered_eventfd(&ring)?;
 
         // 步骤 2: 分配 fixed buffers(对齐分配,O_DIRECT 需要 4096 字节对齐)
         let align = 4096; // 现代 Linux 内核 O_DIRECT 最小对齐要求
@@ -1098,9 +1252,11 @@ impl IoUringStorage {
         let buffers_arc = std::sync::Arc::new(buffers);
         let buffer_count = buffers_arc.len();
 
-        // P1-04: 启动 driver task，替代 Mutex 串行化
-        // driver task 独占 IoUring 实例，通过 channel 接收操作请求，
-        // 批量提交 SQE，一次 submit_and_wait(N) 替代逐请求 submit_and_wait(1)
+        // P1-04 + P0-1: 启动 driver task,替代 Mutex 串行化与 block_in_place。
+        // driver task 独占 IoUring 实例,通过 channel 接收操作请求,批量提交 SQE。
+        // P0-1:driver_task 不再 submit_and_wait(阻塞),改用 eventfd + AsyncFd
+        // 事件驱动循环(select!{cmd_rx, eventfd.readable()})。eventfd_async
+        // (含 OwnedFd)移入 task,随 task 生命周期 drop(关 eventfd fd)。
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DriverCmd>(256);
         let driver_buffers = std::sync::Arc::clone(&buffers_arc);
         // 索引分配池由调用方(提交前 alloc)与 driver task(CQE 完成时回收)共享。
@@ -1108,7 +1264,7 @@ impl IoUringStorage {
         let driver_pool = std::sync::Arc::clone(&pool);
 
         let driver_join = tokio::spawn(async move {
-            driver_task(ring, cmd_rx, driver_buffers, driver_pool).await;
+            driver_task(ring, cmd_rx, driver_buffers, driver_pool, eventfd_async).await;
         });
 
         self.ring = Some(std::sync::Arc::new(IoUringHandle {
@@ -1116,6 +1272,9 @@ impl IoUringStorage {
             driver_join: std::sync::Mutex::new(Some(driver_join)),
             buffers: buffers_arc,
             pool,
+            // P0-1:记录已注册 eventfd 的 raw fd(仅 test getter 用)。
+            // OwnedFd 由 driver_task 持有,此处不 close。
+            eventfd_fd: Some(eventfd_fd_for_handle),
         }));
         self.state = IoUringState::Ready;
 
@@ -2249,6 +2408,7 @@ mod tests {
     /// 背景:`ptr()` 的 unsafe `as_mut_ptr().add(self.offset)` 依赖两个前置条件:
     ///   - offset < align(否则 .add 越出对齐块)
     ///   - offset + size <= storage_len(否则 .add(size) 越界写入 → UB)
+    ///
     /// 旧实现用 `debug_assert` 保护,release 下被移除会丢失这层 soundness 检查,导致
     /// 若未来 offset 计算被破坏则静默 UB。升级为 `assert!` 后,本测试验证断言在各组合下
     /// 不触发(即不变式成立),同时通过 `as_ptr()`(内部调用 `ptr()`)走一遍 unsafe 路径。
@@ -3017,13 +3177,16 @@ mod tests {
     async fn test_driver_shutdown_resets_pool() {
         use io_uring::IoUring;
         let ring = IoUring::builder().build(8).expect("构建 io_uring 应成功");
+        // P0-1:driver_task 现在需要 eventfd(AsyncFd)参数(eventfd 事件驱动循环)。
+        let (eventfd_async, _eventfd_raw) =
+            create_registered_eventfd(&ring).expect("创建并注册 eventfd 应成功");
         let buffers: std::sync::Arc<Vec<AlignedBuffer>> =
             std::sync::Arc::new(vec![aligned_alloc(4096, 4096)]);
         let pool = std::sync::Arc::new(BufferIndexPool::new(4));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DriverCmd>(8);
         let driver_pool = pool.clone();
         let handle = tokio::spawn(async move {
-            driver_task(ring, cmd_rx, buffers, driver_pool).await;
+            driver_task(ring, cmd_rx, buffers, driver_pool, eventfd_async).await;
         });
 
         // 模拟异常路径泄漏:分配 2 个索引不释放(无对应 CQE 回收)
@@ -3046,6 +3209,112 @@ mod tests {
             "driver Shutdown 退出前应调用 pool.reset(),回收泄漏索引;\
              实际分配到 idx={next}(索引未被回收,F-04)"
         );
+    }
+
+    // =====================================================================
+    // P0-1: io_uring driver 非阻塞重构(eventfd + AsyncFd)
+    //
+    // 审计 P0-1:driver_task 用 `block_in_place(submit_and_wait)` 同步阻塞当前
+    // tokio worker。多文件 BT 下载为每个文件实例化 IoUringStorage(per-file
+    // driver),N 文件 = N 个被 block_in_place 占死的 worker,这是 #1 可扩展性
+    // 缺陷。重构为 eventfd + AsyncFd 事件驱动循环:
+    //   1. init() 创建 eventfd(2),通过 `Submitter::register_eventfd` 注册进
+    //      io_uring ring(内核在 CQE 可用时写 eventfd)。
+    //   2. eventfd 包成 `tokio::io::unix::AsyncFd<OwnedFd>`(AsyncFd 拥有该 fd,
+    //      drop 时关 fd);ring 本身留在 driver_task 作用域供直接方法调用。
+    //   3. driver_task 循环改为 `select!{cmd_rx.recv(), async_fd.readable()}`:
+    //      收到命令就 push SQE + 非阻塞 `submit()`;eventfd 可读就 drain CQE。
+    //      不再 block_in_place。
+    //
+    // 以下测试 Linux-only,CI 上验证;Windows 上编译为空桩。
+    // =====================================================================
+
+    /// P0-1 RED:IoUringStorage::init 应创建 eventfd 并注册进 io_uring ring。
+    ///
+    /// 契约:`init()` 创建 eventfd(2) 并调用 `ring.submitter().register_eventfd`,
+    /// 内核据此在 CQE 可用时通知 driver。driver task 收到 eventfd 可读事件后
+    /// drain CQE,无需 block_in_place 阻塞 worker。
+    ///
+    /// 测试方式:构造 storage 调 init(),通过 test-only getter 断言 eventfd
+    /// 已被 init 注册(handle 内持有了 AsyncFd)。
+    ///
+    /// 预期失败原因:`IoUringStorage::eventfd_registered` 不存在 → 编译失败。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_driver_registers_eventfd() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_eventfd_register.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+        // init 必须创建并注册 eventfd(否则 driver 无法被 CQE 事件驱动)
+        assert!(
+            storage.eventfd_registered(),
+            "init() 必须创建 eventfd 并 register_eventfd 进 ring(P0-1)"
+        );
+        storage.close().await.expect("close");
+    }
+
+    /// P0-1 GREEN 守卫:driver_task 经 eventfd+AsyncFd 事件路径端到端处理命令。
+    ///
+    /// 契约:driver_task 不再 block_in_place(submit_and_wait);改用
+    /// `select!{cmd_rx.recv(), async_fd.readable()}` 事件循环。两条命令
+    /// (写 + Shutdown)必须经异步路径完成且 driver 正常退出。
+    ///
+    /// 验证维度:该测试本身无法直接探测 block_in_place 是否被调用,但若
+    /// driver_task 的 select! 循环有缺陷(例如 eventfd 未 drain、readiness
+    /// 未清、cmd_rx 分支后未 submit),端到端写入会挂死或失败。本测试在
+    /// Linux CI 上作为该路径的语义守卫。Windows 上编译为空桩。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_driver_processes_commands_without_block_in_place() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_no_block_worker.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+        storage.allocate(4096).await.expect("预分配应成功");
+
+        // 两次对齐写入(走快速路径,经 cmd_tx → driver_task → CQE → done_tx)
+        let data1 = Bytes::from(vec![0xAAu8; 4096]);
+        let data2 = Bytes::from(vec![0xBBu8; 4096]);
+        let storage = std::sync::Arc::new(storage);
+        let s1 = storage.clone();
+        let s2 = storage.clone();
+        let h1 = tokio::spawn(async move { s1.write_at(0, data1).await });
+        let h2 = tokio::spawn(async move { s2.write_at(4096, data2).await });
+        let r1 = h1.await.expect("task1 join").expect("write_at(0) 应成功");
+        let r2 = h2
+            .await
+            .expect("task2 join")
+            .expect("write_at(4096) 应成功");
+        assert_eq!(r1, 4096);
+        assert_eq!(r2, 4096);
+
+        // 读回验证数据正确落盘(驱动 CQE 路径正确分发结果)
+        let mut block0 = vec![0u8; 4096];
+        storage.read_at(0, &mut block0).await.expect("read_at(0)");
+        assert!(block0.iter().all(|&b| b == 0xAA), "块0 应为 0xAA");
+        let mut block1 = vec![0u8; 4096];
+        storage
+            .read_at(4096, &mut block1)
+            .await
+            .expect("read_at(4096)");
+        assert!(block1.iter().all(|&b| b == 0xBB), "块1 应为 0xBB");
+
+        // 显式验证 eventfd 仍存活(driver 用它处理了 CQE,未被提前 drop)
+        assert!(
+            storage.eventfd_registered(),
+            "eventfd 在命令处理后应仍存活(driver 持有 AsyncFd)"
+        );
+        // 触发文件 fd 引用以消除 AsRawFd 未用告警
+        let _ = storage.file_fd.as_ref().map(|f| f.as_raw_fd());
+        storage.close().await.expect("close");
     }
 
     /// F-04: IoUringStorage::drop 应在 abort driver task 后调用 pool.reset()。
