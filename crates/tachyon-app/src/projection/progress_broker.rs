@@ -95,7 +95,7 @@ pub struct ProgressBroker {
     /// 任务终态通知发射器(在 Tauri setup 中注入)
     notification_emitter: Arc<Mutex<Option<Arc<dyn NotificationEmitter>>>>,
     /// 已发送通知的任务终态,用于同一任务同一终态去重
-    notified_states: Arc<DashMap<String, DownloadState>>,
+    pub(crate) notified_states: Arc<DashMap<String, DownloadState>>,
 }
 
 impl ProgressBroker {
@@ -296,6 +296,22 @@ impl ProgressBroker {
     pub fn sender(&self) -> &broadcast::Sender<ProgressEvent> {
         &self.progress_tx
     }
+
+    /// 任务被删除时清理该 task 在 4 个 pending map 中的 orphan entry
+    ///
+    /// 修复 P0-4 内存泄漏:`delete_task` / 终态路径此前只移除 `task_repository`
+    /// 中的记录,但 `pending_completed` / `pending_started` /
+    /// `pending_fragment_bytes` / `notified_states` 仍保留 task_id key,
+    /// 导致 orphan key 在进程生命周期内永不释放。本方法由 `cleanup_runtime`
+    /// 和 `delete_task_inner` 在移除任务后调用,确保 4 个 map 同步清理。
+    ///
+    /// 对不存在的 task_id 调用是安全的(DashMap::remove 返回 None,无 panic)。
+    pub fn on_task_removed(&self, task_id: &str) {
+        self.pending_completed.remove(task_id);
+        self.pending_started.remove(task_id);
+        self.pending_fragment_bytes.remove(task_id);
+        self.notified_states.remove(task_id);
+    }
 }
 
 /// 根据任务列表构建全量进度事件
@@ -305,6 +321,20 @@ fn build_progress_event(
     pending_started: &DashMap<String, Vec<u32>>,
     pending_fragment_bytes: &DashMap<String, Vec<FragmentByteProgress>>,
 ) -> ProgressEvent {
+    // P0-4 惰性清理:收集 repository 中当前活跃的 task_id 集合,
+    // 移除 3 个 pending map 中已不在 repository 的 orphan key。
+    // 这是 on_task_removed 的防御性兜底——即使某条删除路径遗漏调用,
+    // 聚合器每 250ms 调用本函数也会惰性清理,防 orphan 无限累积。
+    // notified_states 不惰性清:终态去重记忆必须留存,避免重发通知。
+    let active_keys: std::collections::HashSet<String> = task_repository
+        .inner()
+        .iter()
+        .map(|e| e.key().clone())
+        .collect();
+    pending_completed.retain(|k, _| active_keys.contains(k));
+    pending_started.retain(|k, _| active_keys.contains(k));
+    pending_fragment_bytes.retain(|k, _| active_keys.contains(k));
+
     task_repository
         .iter()
         .map(|r| {
@@ -1203,6 +1233,121 @@ mod tests {
             e1.get("t-ord"),
             e2.get("t-ord"),
             "同集合不同序传入,TaskProgress 应相等(快照需排序稳定)"
+        );
+    }
+
+    // ----- P0-4: orphan-key 内存泄漏修复 -----
+
+    /// 辅助:确认 task_id 在 4 个 map 中均存在 key
+    fn assert_broker_has_task_keys(broker: &ProgressBroker, task_id: &str, has: bool) {
+        let msg = if has { "应存在" } else { "应已被清理" };
+        assert_eq!(
+            broker.pending_completed.contains_key(task_id),
+            has,
+            "pending_completed {msg}"
+        );
+        assert_eq!(
+            broker.pending_started.contains_key(task_id),
+            has,
+            "pending_started {msg}"
+        );
+        assert_eq!(
+            broker.pending_fragment_bytes.contains_key(task_id),
+            has,
+            "pending_fragment_bytes {msg}"
+        );
+        assert_eq!(
+            broker.notified_states.contains_key(task_id),
+            has,
+            "notified_states {msg}"
+        );
+    }
+
+    /// 辅助:向 broker 的 4 个 map 写入 task_id 的 entry,模拟一次进度上报
+    fn seed_broker_maps(broker: &ProgressBroker, task_id: &str) {
+        // mark_dirty_with_delta 写入 pending_started + pending_completed + pending_fragment_bytes
+        broker.mark_dirty_with_delta(
+            task_id,
+            Some(ProgressDelta::Started(0)),
+            vec![FragmentByteProgress {
+                index: 0,
+                downloaded: 1,
+            }],
+        );
+        broker.mark_dirty_with_delta(task_id, Some(ProgressDelta::Completed(0)), vec![]);
+        // notified_states 需直接写(通常由 emit_terminal_notifications 写入)
+        broker
+            .notified_states
+            .insert(task_id.to_string(), DownloadState::Completed);
+    }
+
+    /// 切片 1: on_task_removed 清空 4 个 map 的 task_id key
+    ///
+    /// 任务被删除时,broker 必须移除该 task 在 4 个 pending map 中的 entry,
+    /// 否则 orphan key 在进程生命周期内永不释放(确认的 CRITICAL 内存泄漏)。
+    #[test]
+    fn test_on_task_removed_clears_all_four_maps() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository);
+        seed_broker_maps(&broker, "t-leak");
+        assert_broker_has_task_keys(&broker, "t-leak", true);
+
+        broker.on_task_removed("t-leak");
+
+        assert_broker_has_task_keys(&broker, "t-leak", false);
+    }
+
+    /// 切片 1: on_task_removed 对不存在的 task_id 不 panic(幂等安全)
+    #[test]
+    fn test_on_task_removed_no_panic_for_missing_task() {
+        let repository = make_test_repository();
+        let broker = ProgressBroker::new_no_aggregator(repository);
+        // 不存在的 task_id,移除应静默无 panic
+        broker.on_task_removed("never-existed");
+    }
+
+    /// 切片 5: build_progress_event 惰性清理 orphan keys(防御性兜底)
+    ///
+    /// 即使某条删除路径遗漏调用 on_task_removed,聚合器每 250ms 调用的
+    /// build_progress_event 也应惰性移除 repository 中已不存在的 task_id key,
+    /// 防止 orphan 无限累积。notified_states 保留(终态去重记忆必须留存)。
+    #[test]
+    fn test_build_progress_event_lazy_removes_orphan_keys() {
+        let repository = make_test_repository();
+        // repository 为空(无活跃任务)
+        let pending_completed = DashMap::new();
+        let pending_started = DashMap::new();
+        let pending_fragment_bytes = DashMap::new();
+        // 手动注入 orphan key(模拟某路径未调 on_task_removed 的残留)
+        pending_completed.insert("orphan-1".to_string(), vec![1, 2]);
+        pending_started.insert("orphan-1".to_string(), vec![0]);
+        pending_fragment_bytes.insert(
+            "orphan-1".to_string(),
+            vec![FragmentByteProgress {
+                index: 0,
+                downloaded: 1,
+            }],
+        );
+
+        // build_progress_event 应惰性清理这些 orphan
+        let event = build_progress_event(
+            &repository,
+            &pending_completed,
+            &pending_started,
+            &pending_fragment_bytes,
+        );
+        assert!(event.is_empty(), "空 repository 不应产出事件");
+        assert!(
+            !pending_completed.contains_key("orphan-1"),
+            "惰性清理应移除 pending_completed 的 orphan key"
+        );
+        assert!(
+            !pending_started.contains_key("orphan-1"),
+            "惰性清理应移除 pending_started 的 orphan key"
+        );
+        assert!(
+            !pending_fragment_bytes.contains_key("orphan-1"),
+            "惰性清理应移除 pending_fragment_bytes 的 orphan key"
         );
     }
 }
