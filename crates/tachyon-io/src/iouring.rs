@@ -131,12 +131,16 @@ pub struct IoUringStorage {
     file_fd: Option<std::sync::Arc<std::fs::File>>,
     /// 引擎状态
     state: IoUringState,
-    /// 非对齐写入读-改-写(RMW)临界区串行化锁
+    /// 非对齐写入读-改-写(RMW)临界区串行化锁(per-block 分片)
     ///
     /// 为什么需要锁:RMW 路径先读回对齐块、覆盖用户数据区间、再整块写回,
     /// 这是非原子序列。两个并发 RMW 落在同一对齐块时会产生 lost-update:
     /// A 读块 → B 读块 → A 写块 → B 写块,B 的写回覆盖 A 的修改。
-    /// 用锁串行化"读-改-写"临界区即可消除数据竞争。
+    ///
+    /// P2-5(per-block 分片):此前用全局单 Mutex 串行所有 RMW,即使落在不同 4K
+    /// 块的 RMW 也互斥。现改为 256 槽分片锁数组,按 aligned_offset 取模分桶,
+    /// 使不同 4K 块的 RMW 并行。256 槽覆盖典型 1MB 分片(~256 个 4K 块)的全部
+    /// 落点而不冲突。同块 RMW 仍串行(消除 lost-update),不同块 RMW 并行。
     ///
     /// 为什么用 tokio::sync::Mutex:RMW 临界区内的 submit_read/submit_write
     /// 都是 async(经 channel 向 driver task 发命令并 await 结果),guard 必须
@@ -147,7 +151,16 @@ pub struct IoUringStorage {
     /// offset 由 SQE.offset 指定,内核保证不交错),无需锁。锁粒度只覆盖非对齐
     /// RMW 路径,对齐写入零串行化,保持高并发吞吐。
     #[cfg(target_os = "linux")]
-    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    write_locks: std::sync::Arc<[tokio::sync::Mutex<()>; WRITE_LOCK_SHARDS]>,
+    /// P2-5 C1 修复:truncate 全局串行化锁(保护跨块 EOF 竞态)。
+    ///
+    /// 分片锁只串行化 per-block 的 RMW 读写,但 RMW 结尾的 `truncate_to(target)`
+    /// 修改的是全局文件 EOF,跨块并发 RMW 会互相截断丢失数据
+    /// (详见 P2-5 交叉验证 C1)。此全局锁专门串行化 truncate 步骤:
+    /// 持锁时重读 `file_size()` 得实时 EOF,target = max(原 target, 实时 EOF),
+    /// 确保不截断掉并发写入者已落盘的数据。
+    #[cfg(target_os = "linux")]
+    eof_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     // === Linux-only 字段(条件编译) ===
     // io_uring 实例持有者,在 Linux 上通过 Box 持有
     // 避免在非 Linux 平台上引入 io_uring crate 依赖
@@ -257,6 +270,21 @@ fn validate_fixed_buffer_write_len(len: usize, buffer_len: usize) -> DownloadRes
 /// 此处按最严格的 4096 字节校验，以避免运行时出现难以排查的 `EINVAL`。
 #[cfg(target_os = "linux")]
 const O_DIRECT_ALIGN: usize = 4096;
+
+/// P2-5:RMW per-block 分片锁槽数。
+///
+/// 按 `aligned_offset` 取模分桶,使不同 4K 块的 RMW 并行。256 槽覆盖典型 1MB
+/// 分片(~256 个 4K 块)的全部落点而不冲突。每槽一个 tokio::sync::Mutex,
+/// Arc<[Mutex; 256]> 在 IoUringStorage::new 中一次性构造。
+#[cfg(target_os = "linux")]
+const WRITE_LOCK_SHARDS: usize = 256;
+
+/// P2-5:按 aligned_offset 选择分片锁索引。
+#[cfg(target_os = "linux")]
+fn write_lock_shard(aligned_offset: u64) -> usize {
+    // aligned_offset 已是 4K 对齐,右移 12 位得块序号,取模分桶
+    (aligned_offset as usize >> 12) % WRITE_LOCK_SHARDS
+}
 
 /// 校验 O_DIRECT 写入/读取的 offset 与 length 是否满足对齐要求。
 #[cfg(target_os = "linux")]
@@ -961,7 +989,14 @@ impl IoUringStorage {
             file_fd: None,
             state: IoUringState::Created,
             #[cfg(target_os = "linux")]
-            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            write_locks: {
+                // 构造 256 槽 Mutex 数组(全 zero-init)
+                let sharded: [tokio::sync::Mutex<()>; WRITE_LOCK_SHARDS] =
+                    std::array::from_fn(|_| tokio::sync::Mutex::new(()));
+                std::sync::Arc::new(sharded)
+            },
+            #[cfg(target_os = "linux")]
+            eof_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(target_os = "linux")]
             ring: None,
         }
@@ -1220,6 +1255,14 @@ impl IoUringStorage {
     /// 预分配尺寸误当成"已有数据大小"而拒绝截掉 padding。
     #[cfg(target_os = "linux")]
     async fn submit_allocate(&self, size: u64) -> DownloadResult<()> {
+        // off_t 溢出防御:纵深校验,即使 caller allocate 入口已校验。
+        // u64 > i64::MAX 时 `as libc::off_t` 静默截断为负数,fallocate 行为未定义。
+        let size = i64::try_from(size).map_err(|_| {
+            invalid_input(format!(
+                "io_uring submit_allocate size {size} 超过 i64 最大值 {},fallocate 无法处理",
+                i64::MAX
+            ))
+        })?;
         let file_guard = match &self.file_fd {
             Some(f) => f.clone(),
             None => {
@@ -1235,6 +1278,7 @@ impl IoUringStorage {
             let fd = file_guard.as_raw_fd();
             // Safety:
             // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活,确保 fd 有效
+            // - size 已由 i64::try_from 校验为合法 off_t,不会静默截断
             // - mode=FALLOC_FL_KEEP_SIZE、offset=0、len=size 均为合法的 fallocate 参数
             // - 内核负责实际的磁盘空间预分配,不破坏 Rust 内存安全
             let ret =
@@ -1263,6 +1307,15 @@ impl IoUringStorage {
     /// 的处理一致,避免阻塞 tokio 工作线程。
     #[cfg(target_os = "linux")]
     async fn truncate_to(&self, target_size: u64) -> DownloadResult<()> {
+        // off_t 溢出防御:ftruncate 的 length 参数为 i64(off_t)。
+        // u64 > i64::MAX 时 `as libc::off_t` 静默截断为负数,ftruncate 行为未定义。
+        // 此前依赖调用方契约保证,现入口处显式校验(与 allocate / alloc.rs 模式一致)。
+        let target_size = i64::try_from(target_size).map_err(|_| {
+            invalid_input(format!(
+                "io_uring truncate_to size 超过 i64 最大值 {},ftruncate 无法处理",
+                i64::MAX
+            ))
+        })?;
         let file_guard = match &self.file_fd {
             Some(f) => f.clone(),
             None => {
@@ -1278,9 +1331,7 @@ impl IoUringStorage {
             let fd = file_guard.as_raw_fd();
             // SAFETY:
             // - fd 来自合法打开的 Arc<File>,file_guard 在调用期间保持 Arc 存活
-            // - ftruncate 的 length 参数为 i64(off_t);target_size <= i64::MAX
-            //   由调用方保证(write_at 中 target = max(size_before, offset+len),
-            //   均 usize 范围内,且 allocate 入口已校验 size <= i64::MAX)
+            // - target_size 已由 i64::try_from 校验为合法 off_t,不会静默截断
             // - ftruncate 把文件截断到指定长度,不破坏 Rust 内存安全
             let ret = unsafe { libc::ftruncate(fd, target_size as libc::off_t) };
             if ret != 0 {
@@ -1500,14 +1551,17 @@ impl AsyncStorage for IoUringStorage {
                         //
                         // B1 修复:RMW 是非原子序列(读块→改→写块),两个并发 RMW 落
                         // 同一对齐块会产生 lost-update(A 读→B 读→A 写→B 写,B 覆盖 A)。
-                        // 用 write_lock 串行化整个 RMW 临界区,持锁从 submit_read 到
+                        // P2-5:per-block 分片锁——按 aligned_offset 选择分片,
+                        // 不同 4K 块的 RMW 并行,同块 RMW 串行(消除 lost-update)。
+                        // 用锁串行化整个 RMW 临界区,持锁从 submit_read 到
                         // submit_write 完成。
-                        let _rmw_guard = self.write_lock.lock().await;
+                        let aligned_offset = _offset & !align_mask;
+                        let shard = write_lock_shard(aligned_offset);
+                        let _rmw_guard = self.write_locks[shard].lock().await;
                         // F-05-3:写前记录逻辑大小。padded write 之后只能截掉"本次
                         // 扩展出的 padding",绝不能把写前已有内容(含 concurrent
                         // fast write / 更大 allocate 结果)截小。
                         let size_before = self.file_size().await.unwrap_or(0);
-                        let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
                         let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
@@ -1546,13 +1600,24 @@ impl AsyncStorage for IoUringStorage {
                         // F-05-1 + F-05-3:若 padded write 把 EOF 撑过用户写入末尾,
                         // 只截掉 padding 扩展。target = max(写前大小, 用户写入末尾),
                         // 避免 concurrent fast write 的数据被 truncate 冲掉。
-                        // truncate 必须在 RMW 临界区内执行。
+                        //
+                        // P2-5 C1 修复:truncate 必须在 eof_lock 内执行——分片锁只保护
+                        // per-block 的 RMW 读写,但 truncate 修改全局 EOF。跨块并发 RMW
+                        // 各自在分片锁内读到 stale size_before,交错 truncate 会互相截断
+                        // 丢失数据。eof_lock 串行化所有 truncate,持锁时重读实时 file_size(),
+                        // target = max(原 target, 实时 EOF),确保不截掉并发写入者已落盘的数据。
                         let write_end = _offset + _data.len() as u64;
                         if written.saturating_sub(front_pad) >= _data.len() {
                             let padded_end = aligned_offset + padded_len as u64;
                             let target = size_before.max(write_end);
                             if padded_end > target {
-                                self.truncate_to(target).await?;
+                                let _eof_guard = self.eof_lock.lock().await;
+                                // 持 eof_lock 后重读实时 EOF:并发写入者可能已扩展文件
+                                let realtime_eof = self.file_size().await.unwrap_or(target);
+                                let safe_target = target.max(realtime_eof);
+                                if padded_end > safe_target {
+                                    self.truncate_to(safe_target).await?;
+                                }
                             }
                         }
                         // 锁释放在此(drop _rmw_guard)——RMW 临界区结束(truncate 已在锁内完成)。
@@ -1603,12 +1668,14 @@ impl AsyncStorage for IoUringStorage {
                         // 区间,再整块写回。padding 区保留文件真实旧数据,而非零,避免
                         // 零覆盖邻近已写数据并撑大文件。详见 write_at 慢速路径注释。
                         //
-                        // B1 修复:RMW 非原子,并发同块 lost-update。write_lock 串行化
-                        // 整个 RMW 临界区(submit_read → 改 → submit_write)。
-                        let _rmw_guard = self.write_lock.lock().await;
+                        // B1 修复:RMW 非原子,并发同块 lost-update。per-block 分片锁
+                        // 串行化整个 RMW 临界区(submit_read → 改 → submit_write)。
+                        // P2-5:按 aligned_offset 分片,不同块并行。
+                        let aligned_offset = _offset & !align_mask;
+                        let shard = write_lock_shard(aligned_offset);
+                        let _rmw_guard = self.write_locks[shard].lock().await;
                         // F-05-3:写前记录逻辑大小,详见 write_at 注释。
                         let size_before = self.file_size().await.unwrap_or(0);
-                        let aligned_offset = _offset & !align_mask;
                         let front_pad = (_offset - aligned_offset) as usize;
                         let total_len = front_pad + _data.len();
                         let padded_len = ((total_len as u64 + align_mask) & !align_mask) as usize;
@@ -1630,13 +1697,19 @@ impl AsyncStorage for IoUringStorage {
 
                         validate_fixed_buffer_write_len(padded_len, self.config.buffer_size)?;
                         let written = self.submit_write(aligned_offset, &buf).await?;
-                        // F-05-1 + F-05-3:只截 padding,不截写前已有内容。详见 write_at。
+                        // F-05-1 + F-05-3 + P2-5 C1:truncate 在 eof_lock 内执行,
+                        // 持锁时重读实时 EOF。详见 write_at 慢速路径注释。
                         let write_end = _offset + _data.len() as u64;
                         if written.saturating_sub(front_pad) >= _data.len() {
                             let padded_end = aligned_offset + padded_len as u64;
                             let target = size_before.max(write_end);
                             if padded_end > target {
-                                self.truncate_to(target).await?;
+                                let _eof_guard = self.eof_lock.lock().await;
+                                let realtime_eof = self.file_size().await.unwrap_or(target);
+                                let safe_target = target.max(realtime_eof);
+                                if padded_end > safe_target {
+                                    self.truncate_to(safe_target).await?;
+                                }
                             }
                         }
                         drop(_rmw_guard);
@@ -1828,6 +1901,27 @@ mod tests {
         assert_eq!(config.buffer_count, 16);
         assert!(!config.sqpoll);
         assert_eq!(config.sqpoll_idle_ms, 1000);
+    }
+
+    /// P2-5:write_lock_shard 正确将 4K 对齐 offset 映射到 [0, 256) 槽。
+    /// 不同 4K 块映射到不同/相同槽(分片),同块恒同槽(串行化)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_write_lock_shard_maps_aligned_offsets() {
+        // offset 0 → block 0 → shard 0
+        assert_eq!(write_lock_shard(0), 0);
+        // offset 4096 → block 1 → shard 1
+        assert_eq!(write_lock_shard(4096), 1);
+        // offset 256*4096 → block 256 → shard 0 (回绕)
+        assert_eq!(write_lock_shard(256 * 4096), 0);
+        // 同一 4K 块的不同 offset 片段经对齐后映射到同一 shard
+        let aligned = 0x5000 & !0xFFF; // = 0x5000 = 20480 = block 5
+        assert_eq!(write_lock_shard(aligned), 5);
+        // 不同块(相隔远)映射到不同 shard
+        let a = write_lock_shard(0);
+        let b = write_lock_shard(4096);
+        assert_ne!(a, b, "相邻 4K 块应映射到不同 shard");
+        assert!(a < WRITE_LOCK_SHARDS && b < WRITE_LOCK_SHARDS);
     }
 
     #[test]
@@ -2059,7 +2153,12 @@ mod tests {
             file_path: PathBuf::from("/tmp/iouring_oversized_write.bin"),
             file_fd: None,
             state: IoUringState::Ready,
-            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            write_locks: {
+                let sharded: [tokio::sync::Mutex<()>; WRITE_LOCK_SHARDS] =
+                    std::array::from_fn(|_| tokio::sync::Mutex::new(()));
+                std::sync::Arc::new(sharded)
+            },
+            eof_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             ring: None,
         };
 
@@ -2749,6 +2848,71 @@ mod tests {
         }
     }
 
+    /// P2-5 C2 回归测试:两个 RMW 落在不同 4K 块、文件初始逻辑 EOF 小于两个 padded_end,
+    /// 验证跨块并发 RMW 不互相截断丢失数据。
+    ///
+    /// 复现 C1 场景(修复前):RMW-A(offset 0,100B,padded_end=4096)与
+    /// RMW-B(offset 4096,100B,padded_end=8192)并行,各自读到 stale size_before=0,
+    /// 交错 truncate 互相截断。修复后 eof_lock 串行化 truncate + 重读实时 EOF,
+    /// 两段数据均保留,文件大小 = max(write_end_A, write_end_B)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_iouring_concurrent_rmw_different_block_no_data_loss() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            let path = dir.path().join(format!("iouring_crossblock_{round}.bin"));
+            let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+            if storage.init().is_err() {
+                eprintln!("skip: io_uring init failed");
+                return;
+            }
+            // 不调 allocate——逻辑 EOF 保持 0,复现下载初期常态
+            let storage = std::sync::Arc::new(storage);
+
+            // RMW-A: offset=0, 写 100 字节 0xAA → padded_end=4096, target=max(0,100)=100
+            // RMW-B: offset=4096, 写 100 字节 0xBB → padded_end=8192, target=max(0,4200)=4200
+            let s1 = storage.clone();
+            let h1 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xAAu8; 100]);
+                s1.write_at(0, data).await
+            });
+            let s2 = storage.clone();
+            let h2 = tokio::spawn(async move {
+                let data = Bytes::from(vec![0xBBu8; 100]);
+                s2.write_at(4096, data).await
+            });
+
+            let r1 = h1.await.expect("task1 join");
+            let r2 = h2.await.expect("task2 join");
+            r1.expect("RMW-A write_at(0) 应成功");
+            r2.expect("RMW-B write_at(4096) 应成功");
+
+            // 验证:两段数据都应可读回(C1 修复前 B 的数据会被 A 的 truncate 截掉)
+            let mut block_a = vec![0u8; 100];
+            storage.read_at(0, &mut block_a).await.expect("read A");
+            assert!(
+                block_a.iter().all(|&b| b == 0xAA),
+                "round {round}: [0,100) 应为 0xAA,实际 {:?}",
+                &block_a[..16]
+            );
+
+            let mut block_b = vec![0u8; 100];
+            storage.read_at(4096, &mut block_b).await.expect("read B");
+            assert!(
+                block_b.iter().all(|&b| b == 0xBB),
+                "round {round}: [4096,4196) 应为 0xBB(不应被截断),实际 {:?}",
+                &block_b[..16]
+            );
+
+            // 文件大小应 = max(100, 4200) = 4200
+            let size = storage.file_size().await.expect("file_size");
+            assert_eq!(size, 4200, "round {round}: 文件大小应为 4200,实际 {size}");
+
+            storage.close().await.expect("close");
+        }
+    }
+
     // =====================================================================
     // F-04 RED 测试:io_uring driver 异常槽位回收
     //
@@ -2952,7 +3116,12 @@ mod tests {
             file_path: PathBuf::from("/tmp/iouring_unavailable.bin"),
             file_fd: None,
             state: IoUringState::Unavailable,
-            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            write_locks: {
+                let sharded: [tokio::sync::Mutex<()>; WRITE_LOCK_SHARDS] =
+                    std::array::from_fn(|_| tokio::sync::Mutex::new(()));
+                std::sync::Arc::new(sharded)
+            },
+            eof_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             ring: None,
         };
 
@@ -3034,5 +3203,59 @@ mod tests {
             "sync_parent_dir 对已存在文件的父目录应返回 Ok: {:?}",
             sync_result.err()
         );
+    }
+
+    /// truncate_to 的 off_t 溢出防御:u64 > i64::MAX 时必须返回 InvalidInput,
+    /// 而非 `as libc::off_t` 静默截断为负数导致 ftruncate 行为未定义。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_truncate_to_rejects_size_over_i64_max() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_truncate_overflow.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+        let result = storage.truncate_to(u64::MAX).await;
+        let err = result.expect_err("u64::MAX 应被 i64::try_from 拒绝,不应静默截断");
+        match err {
+            DownloadError::Io(io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "应为 InvalidInput,实际: {io_err}"
+                );
+            }
+            other => panic!("期望 DownloadError::Io(InvalidInput),实际: {other:?}"),
+        }
+    }
+
+    /// submit_allocate 的 off_t 溢出防御:即使 caller allocate 已校验,
+    /// submit_allocate 自身也应有防御性校验(纵深防御)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_submit_allocate_rejects_size_over_i64_max() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_alloc_overflow.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+        // allocate 入口已有 i64::try_from 校验(downloader.rs:1711),此处验证
+        // submit_allocate 自身的防御性校验(绕过 allocate 直接调 submit_allocate)
+        let result = storage.submit_allocate(u64::MAX).await;
+        let err = result.expect_err("u64::MAX 应被 i64::try_from 拒绝");
+        match err {
+            DownloadError::Io(io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "应为 InvalidInput,实际: {io_err}"
+                );
+            }
+            other => panic!("期望 DownloadError::Io(InvalidInput),实际: {other:?}"),
+        }
     }
 }

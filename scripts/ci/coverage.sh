@@ -6,7 +6,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-IGNORE='(test_harness|iocp|winio|iouring)'
+# ignore: test_harness(测试基础设施) + iocp/winio(Windows 平台 IO 后端,Linux CI 不编译)
+# 安全审计 P0-2: iouring 从 ignore 移除——它是 Linux 上完整编译的性能关键路径,
+# 应进入覆盖率门禁。iocp/winio 在 Linux 上 #[cfg(target_os="windows")] 不编译,保留 ignore 无副作用。
+IGNORE='(test_harness|iocp|winio)'
 CRATES=(tachyon-core tachyon-engine tachyon-store tachyon-io tachyon-crypto tachyon-scheduler)
 THRESHOLD="${COVERAGE_THRESHOLD:-90}"
 JSON_OUT="${COVERAGE_JSON:-target/llvm-cov/coverage.json}"

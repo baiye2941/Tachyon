@@ -969,14 +969,37 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
     }
 }
 
+/// 安全审计 F-1:最大重定向跳数。
+///
+/// 此前 `safe_redirect_policy` 内硬编码字面量 `10`,与 `validate_redirect` 的
+/// `max_redirects` 参数语义分离。现提取为命名常量,统一重定向跳数上限。
+const MAX_REDIRECTS: usize = 10;
+
+/// 校验重定向目标 URL 的字符串层面安全(scheme/host/IP-literal)。
+///
+/// **注意**:此函数只做 URL 字符串校验(`validate_public_http_url`),不做 DNS 解析。
+/// 真正的 DNS-rebinding 防御(IP pinning)由 `PublicDnsResolver`(`reqwest::dns::Resolve`
+/// 实现)在连接时执行——它对每个解析出的 addr 调 `reject_forbidden_ip`,且 reqwest
+/// 使用该 resolver 返回的已校验地址建连,resolve 内部无 TOCTOU 窗口。
+///
+/// 安全审计 F-1:此前 `validate_resolved_ip`/`validate_redirect`(`url_safety.rs`)设计为
+/// 协议层在重定向前解析+校验 IP,但它们内部调用 `std::to_socket_addrs` 做独立 DNS 解析,
+/// 与 `PublicDnsResolver` 重复,且解析出的 IP 不会被 reqwest 用于建连(产生 TOCTOU)。
+/// 故不接入 `validate_redirect`;IP 校验统一走 `PublicDnsResolver` 单一路径。
 fn validate_redirect_target(url: &reqwest::Url) -> DownloadResult<()> {
     tachyon_core::validate_public_http_url(url)
 }
 
+/// 构建安全重定向策略:跳数上限 + 目标 URL 字符串校验。
+///
+/// **IP 层防御**:reqwest 跟随重定向时,会通过注入的 `PublicDnsResolver` 解析目标 host,
+/// resolver 内对每个 addr 调 `reject_forbidden_ip`,内网/元数据 IP 被拒绝。故重定向
+/// 目标的 SSRF IP 防御在 resolver 层生效,无需在此闭包内重复 DNS 解析(避免双重 DNS
+/// TOCTOU,见 `validate_redirect_target` 文档)。
 fn safe_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 10 {
-            return attempt.error("重定向次数超过 10 次");
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error(format!("重定向次数超过 {MAX_REDIRECTS} 次"));
         }
         if let Err(err) = validate_redirect_target(attempt.url()) {
             return attempt.error(err.to_string());
@@ -2104,6 +2127,22 @@ mod tests {
     fn test_redirect_target_validation_accepts_public() {
         let target = reqwest::Url::parse("https://example.com/file.bin").unwrap();
         assert!(super::validate_redirect_target(&target).is_ok());
+    }
+
+    /// 安全审计 F-1:重定向跳数上限必须用命名常量 MAX_REDIRECTS,
+    /// 而非散落在闭包内的魔法字面量 10。此测试验证常量存在且值合理(编译期检查)。
+    #[test]
+    fn test_max_redirects_constant_is_reasonable() {
+        const _: () = {
+            assert!(
+                MAX_REDIRECTS >= 5,
+                "MAX_REDIRECTS 应 >= 5(允许正常重定向链)"
+            );
+            assert!(
+                MAX_REDIRECTS <= 20,
+                "MAX_REDIRECTS 应 <= 20(防无限重定向 DoS)"
+            );
+        };
     }
 
     /// 验证 PublicDnsResolver 拒绝 localhost 解析(生产模式)。

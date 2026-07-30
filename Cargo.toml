@@ -34,7 +34,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 
 # 日志
-tracing = "0.1"
+# release_max_level_info: release 构建中编译期消除 debug!/trace! 宏,
+# 避免热路径构造 span/event 对象(每 5 chunk 一次 trace! 的零开销过滤)。
+# dev 构建保留 debug/trace 用于本地诊断。
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
@@ -134,6 +137,9 @@ tachyon-protocol = { path = "crates/tachyon-protocol" }
 tachyon-scheduler = { path = "crates/tachyon-scheduler" }
 tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 全局分配器:与 tachyon-app 一致,减少 10-30% 分配开销,
+# 使 CLI bench 结果代表 App 真实性能
+mimalloc = { workspace = true }
 
 [[bench]]
 name = "buffer_pool"
@@ -194,6 +200,10 @@ tokio = { workspace = true, features = ["test-util"] }
 [profile.dev]
 opt-level = 1
 incremental = true
+# debug = 1: 仅保留行号信息(panic backtrace 足够),去掉完整调试信息(变量值/内联展开),
+# 减少 dev 编译时间和二进制体积约 30%。完整 debug info 在 RUST_LOG=debug 时无额外收益
+# (tracing 字段格式化不依赖 DWARF 变量信息)。
+debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2

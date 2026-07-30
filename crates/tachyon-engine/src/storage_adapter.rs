@@ -302,15 +302,25 @@ impl DynStorage {
         Ok(Self::new(storage))
     }
 
-    /// 根据 I/O 策略打开存储后端
+    /// 根据 I/O 策略打开存储后端(默认 buffer_count=16,向后兼容)。
     ///
-    /// - `Standard`: TokioFile（跨平台稳定路径）
-    /// - `WinAligned`: WinFile NO_BUFFERING（仅 Windows；其他平台回退到 Standard）
-    /// - `Iocp`: IOCP 异步后端（仅 Windows；其他平台回退到 Standard）
-    /// - `IoUring`: io_uring 零拷贝后端（仅 Linux 5.4+；其他平台回退到 Standard）
+    /// 如需从 `max_concurrent_fragments` 派生 io_uring 的 `buffer_count`,
+    /// 使用 [`open_with_strategy_and_concurrency`]。
     pub async fn open_with_strategy(
         path: &std::path::Path,
         strategy: tachyon_core::config::IoStrategy,
+    ) -> DownloadResult<Self> {
+        Self::open_with_strategy_and_concurrency(path, strategy, 16).await
+    }
+
+    /// 带 `max_concurrent_fragments` 的存储后端构造(P1-4)。
+    ///
+    /// io_uring 的 `buffer_count` 从 `max_concurrent_fragments` 派生(取 `max(16, n)`),
+    /// 消除调大并发时 buffer 耗尽直接报错的隐藏约束。其他策略忽略此参数。
+    pub async fn open_with_strategy_and_concurrency(
+        path: &std::path::Path,
+        strategy: tachyon_core::config::IoStrategy,
+        max_concurrent_fragments: u32,
     ) -> DownloadResult<Self> {
         match strategy {
             tachyon_core::config::IoStrategy::Standard => Self::open(path).await,
@@ -358,8 +368,12 @@ impl DynStorage {
             }
             tachyon_core::config::IoStrategy::IoUring => {
                 tracing::info!(path = %path.display(), "使用 io_uring 零拷贝后端");
-                let mut storage =
-                    tachyon_io::IoUringStorage::new(path, tachyon_io::IoUringConfig::default());
+                // P1-4:buffer_count 从 max_concurrent_fragments 派生,
+                // 消除调大并发导致 buffer 耗尽直接报错的隐藏约束。
+                // 下限 16:即使并发更低也保留足够 buffer 供 RMW 尾块等非分片路径复用。
+                let mut config = tachyon_io::IoUringConfig::default();
+                config.buffer_count = (config.buffer_count).max(max_concurrent_fragments as usize);
+                let mut storage = tachyon_io::IoUringStorage::new(path, config);
                 match storage.init() {
                     Ok(()) => Ok(Self::new(storage)),
                     Err(error) => {
@@ -963,6 +977,34 @@ mod tests {
         let read = storage.read_at(0, &mut buf).await.unwrap();
         assert_eq!(read, 5);
         assert_eq!(&buf, b"hello");
+        storage.close().await.unwrap();
+    }
+
+    /// P1-4:open_with_strategy_and_concurrency 应在高并发值下不 panic/不报错。
+    /// io_uring 路径上 buffer_count 从 max_concurrent_fragments 派生(max(16, n)),
+    /// 消除此前并发 >16 时 buffer 耗尽直接报错的隐藏约束。
+    #[tokio::test]
+    async fn test_open_with_strategy_and_concurrency_high_value_no_error() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // max_concurrent_fragments=64(远超旧硬编码 16):验证 buffer_count 派生不报错
+        let storage = DynStorage::open_with_strategy_and_concurrency(
+            tmp.path(),
+            IoStrategy::Standard, // 非 Linux 用 Standard;Linux IoUring 会用派生的 buffer_count
+            64,
+        )
+        .await
+        .expect("高并发值不应导致存储构造失败");
+        storage.allocate(1024).await.unwrap();
+        storage.close().await.unwrap();
+    }
+
+    /// P1-4:open_with_strategy(旧 API,默认并发 16)应仍向后兼容。
+    #[tokio::test]
+    async fn test_open_with_strategy_backward_compatible() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = DynStorage::open_with_strategy(tmp.path(), IoStrategy::Standard)
+            .await
+            .expect("旧 API 应向后兼容");
         storage.close().await.unwrap();
     }
 

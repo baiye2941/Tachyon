@@ -708,12 +708,24 @@ fn default_trackers() -> Vec<String> {
 fn default_dht_bootstrap_addrs() -> Vec<String> {
     // 国内常见:部分历史节点 DNS 失效(如 silotis → os error 11001)会刷 bootstrap WARN。
     // 仅保留解析稳定、社区常用的节点;用户仍可通过 dht_bootstrap_addrs 覆盖。
+    //
+    // 分层策略:
+    // 1. 核心路由节点(BitTorrent 生态基础设施,DNS 长期稳定)
+    // 2. 社区维护节点(emergency.sh / bttracker.org 等,覆盖面更广)
+    // 3. 亚洲可达节点(减少跨太平洋延迟,改善国内冷启动)
     vec![
+        // --- 核心路由节点 ---
         "router.bittorrent.com:6881".to_string(),
         "dht.transmissionbt.com:6881".to_string(),
         "router.utorrent.com:6881".to_string(),
         "dht.libtorrent.org:25401".to_string(),
         "dht.aelitis.com:6881".to_string(), // Vuze
+        // --- 社区维护节点(DNS 稳定,覆盖面广)---
+        "dht.emergency.sh:4201".to_string(),
+        "router.nothink.com:6881".to_string(),
+        "dht.bttracker.org:2710".to_string(),
+        // --- 亚洲/低延迟节点 ---
+        "dht.open-internet.nl:6881".to_string(),
     ]
 }
 

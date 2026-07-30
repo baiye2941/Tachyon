@@ -10,9 +10,10 @@
 //! - `FILE_ALLOCATION_INFO.AllocationSize: size as i64`
 //! - `SetFileValidData(handle, size as i64)`
 //!
-//! `tokio_file.rs:349`(Linux)`size as libc::off_t` 裸转。
-//! `winio.rs:194,227` 同样裸转。
-//! `iocp.rs:1197,1231` 同样裸转。
+//! 安全审计 P0-4(已修复):`tokio_file.rs` Linux 路径、`iouring.rs`
+//! `submit_allocate`/`truncate_to` 的 `size as libc::off_t` 裸转已全部补
+//! `i64::try_from` 入口校验,捕获校验后的 `off_t` 值传入 unsafe 块。
+//! `winio.rs:194,227`、`iocp.rs:1197,1231` 同样裸转(Windows 路径,本 helper 覆盖)。
 //!
 //! Windows `set_len` 成功但 `SetFileInformationByHandle` 失败时,文件逻辑大小
 //! 已被扩展,但物理分配未完成,且无 rollback —— 文件留在不一致状态。

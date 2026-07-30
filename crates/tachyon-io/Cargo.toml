@@ -22,8 +22,15 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
+[features]
+# Loom 并发模型测试:启用后用 loom::sync::atomic 替换 std 原子,
+# 穷举线程交错验证 BufferIndexPool/CompletionSlots 的并发不变量。
+# 独立测试文件复制核心逻辑(方案 B),生产代码零侵入。
+loom = []
+
 [dev-dependencies]
 tempfile.workspace = true
+loom = "0.7"
 
 [lints]
 workspace = true
