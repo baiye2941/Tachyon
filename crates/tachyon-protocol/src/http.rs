@@ -765,6 +765,52 @@ impl HttpClient {
         Ok((text, final_url))
     }
 
+    /// 带可重试退避的文本 GET(含 final_url),用于 HLS playlist 获取。
+    ///
+    /// 与 `get_bytes_with_retry` 同构的重试逻辑,补齐 `get_text_with_final_url`
+    /// 此前无重试的缺陷:瞬态 TLS handshake EOF / 503 / 5xx 不应一次失败整个
+    /// HLS 下载(playlist 获取是 probe 的单点,无重试会直接中断)。segment 获取
+    /// 已有 `get_bytes_with_retry`,playlist 获取此前缺失。
+    ///
+    /// `max_retries` 为额外重试次数(总 attempt = max_retries + 1)。
+    pub async fn get_text_with_final_url_retry(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_retries: u32,
+    ) -> DownloadResult<(String, String)> {
+        let mut attempt = 0u32;
+        loop {
+            match self.get_text_with_final_url(url, headers).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if e.is_retryable() && attempt < max_retries {
+                        let backoff = match &e {
+                            DownloadError::Throttled {
+                                retry_after_secs: Some(secs),
+                            } => Duration::from_secs((*secs).min(60)),
+                            _ => {
+                                Duration::from_millis(200u64.saturating_mul(1u64 << attempt.min(5)))
+                            }
+                        };
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries,
+                            ?backoff,
+                            error = %e,
+                            url = %tachyon_core::redact_url_for_log(url),
+                            "playlist 获取可重试失败"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// 带可重试退避的二进制 GET(审计 HLS-06:segment/key 瞬断不应一次失败)。
     ///
     /// `max_retries` 为额外重试次数(总 attempt = max_retries + 1)。

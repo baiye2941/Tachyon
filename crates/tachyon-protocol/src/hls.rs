@@ -451,7 +451,12 @@ impl HlsProtocol {
         url: &str,
     ) -> DownloadResult<(Playlist, String)> {
         // 审计 HLS-09:用重定向后 final URL 作为相对 URI 基址
-        let (content, final_url) = self.http.get_text_with_final_url(url, &[]).await?;
+        // P0-m3u8:playlist 获取加重试,补齐 get_text_with_final_url 无重试缺陷
+        // (瞬态 TLS handshake EOF / 503 不应一次失败整个 HLS 下载)
+        let (content, final_url) = self
+            .http
+            .get_text_with_final_url_retry(url, &[], HLS_SEGMENT_MAX_RETRIES)
+            .await?;
         let playlist = parse_m3u8(&content, Some(&final_url))?;
         match playlist {
             Playlist::Master { .. } => {
@@ -459,8 +464,10 @@ impl HlsProtocol {
                     .ok_or_else(|| DownloadError::Protocol("master playlist 无 variant".into()))?;
                 // 解析为绝对 URI:基址为 master 的 final_url
                 let best_uri = resolve_uri(best, Some(&final_url))?;
-                let (content, media_final) =
-                    self.http.get_text_with_final_url(&best_uri, &[]).await?;
+                let (content, media_final) = self
+                    .http
+                    .get_text_with_final_url_retry(&best_uri, &[], HLS_SEGMENT_MAX_RETRIES)
+                    .await?;
                 let media = parse_m3u8(&content, Some(&media_final))?;
                 match media {
                     Playlist::Media { .. } => Ok((media, media_final)),
@@ -1458,6 +1465,53 @@ seg3.ts
             .download_full(&format!("{base}/pl.m3u8"))
             .await
             .expect("503 后应重试成功");
+        assert_eq!(data.as_ref(), b"SEGDATA");
+    }
+
+    /// 验证 m3u8 播放列表获取(probe/fetch_media_playlist)在瞬态错误时重试。
+    ///
+    /// 根因:fetch_media_playlist 的 get_text_with_final_url 此前无重试,
+    /// 瞬态 TLS handshake EOF / 503 直接失败整个 HLS 下载。segment 有重试
+    /// 但 playlist 获取是单点故障。本测试验证 playlist 获取首次失败后重试成功。
+    #[tokio::test]
+    async fn test_hls_playlist_fetch_retries_on_transient_error() {
+        use wiremock::MockServer;
+        use wiremock::matchers::path;
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let m3u8 = format!(
+            "#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:1.0,
+{base}/seg0.ts
+#EXT-X-ENDLIST
+"
+        );
+        // playlist 首次 503(瞬态),第二次 200
+        Mock::given(method("GET"))
+            .and(path("/pl.m3u8"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pl.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(m3u8))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/seg0.ts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SEGDATA".to_vec()))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::with_timeouts(5, 10, None).unwrap();
+        let hls = HlsProtocol::new(Arc::new(http));
+        // playlist 首次 503 应重试成功,而非直接失败整个下载
+        let data = hls
+            .download_full(&format!("{base}/pl.m3u8"))
+            .await
+            .expect("playlist 首次 503 后应重试成功");
         assert_eq!(data.as_ref(), b"SEGDATA");
     }
 
