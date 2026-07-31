@@ -187,6 +187,60 @@ async fn test_with_hybrid_sources_with_http_mirrors() {
     );
 }
 
+/// 切片 1 (P1-P2SP): hybrid 构造时 BT 应作为 MirrorProtocol 的并发源之一。
+///
+/// 此前 BT 独立存于 bt_fallback 字段,不进 MirrorProtocol.sources,仅在 HTTP
+/// 全失败时串行 fallback。P2SP 改为 BT 加入 sources 参与并发竞速。
+/// 2 个 HTTP 镜像 + BT = 3 个源(primary + 2 mirror + 1 BT)。
+#[cfg(feature = "magnet")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hybrid_sources_bt_is_mirror_source() {
+    use crate::bt_session::BtSession;
+    use tachyon_core::config::MagnetConfig;
+
+    let dir = tempfile::TempDir::new().expect("创建临时目录失败");
+    let magnet_cfg = MagnetConfig {
+        enable_dht: false,
+        enable_upnp: false,
+        disable_dht_persistence: true,
+        ..Default::default()
+    };
+    let bt_session = Arc::new(
+        BtSession::new(dir.path().to_path_buf(), magnet_cfg)
+            .await
+            .expect("BtSession 应创建成功"),
+    );
+    let mut config = test_config();
+    config.download_dir = dir.path().to_string_lossy().to_string();
+    config.authorized_dirs = vec![config.download_dir.clone()];
+    let magnet_url = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98".to_string();
+    let task = DownloadTask::with_hybrid_sources(
+        magnet_url.clone(),
+        vec![
+            "http://mirror1.example.com/file.bin".into(),
+            "http://mirror2.example.com/file.bin".into(),
+        ],
+        config,
+        None,
+        Arc::new(AdaptiveDownloadScheduler::default_config()),
+        bt_session,
+    )
+    .await
+    .expect("带 HTTP 镜像的 hybrid 应构造成功");
+
+    // BT 应作为并发源加入 MirrorProtocol(非仅独立 bt_fallback)
+    // 2 HTTP 镜像 + 1 BT = primary + 2 + 1 = 4 个源
+    assert!(
+        task.mirror_source_count.is_some_and(|n| n >= 4),
+        "BT 应作为并发源加入 MirrorProtocol(期望 >=4 个源含 BT),实际 {:?}",
+        task.mirror_source_count
+    );
+    assert!(
+        task.bt_fallback.is_some(),
+        "bt_fallback 仍须保留用于 cleanup"
+    );
+}
+
 /// magnet URL 经 `with_pool_and_scheduler` 且注入 BtSession 时构造成功。
 #[cfg(feature = "magnet")]
 #[tokio::test(flavor = "multi_thread")]
@@ -450,60 +504,65 @@ async fn make_offline_bt_fallback(
     Ok((protocol, magnet_url, content, dir))
 }
 
-/// I-2 集成测试:spec 5.4「HTTP 失败 BT 接管」场景。
+/// I-2 集成测试:P1-P2SP「HTTP 失败 BT 并发接管」场景。
 ///
-/// 构造 P2SP 混合任务:主协议为 `MockProto`(模拟 HTTP 主源全熔断 —— probe 成功
-/// 返回 metadata,但 `download_range` 因无 range_data 失败),`bt_fallback` 为离线
-/// 预置的 `MagnetProtocol`(tempfile + initial_check,无真实 peer)。
+/// 构造 P2SP 混合任务:protocol 为 `MirrorProtocol`(MockProto HTTP 主源 + 离线
+/// `MagnetProtocol` BT 源并发竞速)。MockProto probe 成功返回 metadata,但
+/// `download_range` 无 range_data 失败,模拟 HTTP 全熔断;BT 作为并发源接管。
 ///
-/// `run()` 流程:probe(MockProto 成功)→ init_storage → plan → prepare_storage →
-/// execute(MockProto 失败,`max_retries=0` 立即失败,无退避)→
-/// `should_try_bt_fallback(Network 错误)=true` → `execute_bt_fallback`:
-///   - `bt_proto.probe(magnet_url)` 命中 from_handle 预缓存,layout 校验通过
-///     (单文件 + 大小一致);
-///   - `download_full_stream` 读预置文件字节流;
-///   - `write_stream_to_storage_with_fallback` 写入 storage;
-/// → verify(校验关闭,直接通过)→ Completed。
+/// P1-P2SP 改造前:BT 独立于 MirrorProtocol,BT 仅在 HTTP execute() 全失败后串行
+/// fallback 调用 `execute_bt_fallback`。改造后:BT 作为 MirrorProtocol.sources 之一
+/// 参与并发,HTTP 失败时 BT 在 least-in-flight 层接管(无需串行 fallback)。
 ///
 /// 断言:任务最终 Completed,storage 中数据 == BT 预置文件内容(证明 BT 接管写入)。
 #[cfg(feature = "magnet")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_bt_fallback_triggered_on_http_failure() {
+    use crate::mirror::MirrorProtocol;
+
     let file_size = 4096usize;
     let (bt_protocol, magnet_url, bt_content, _dir) = make_offline_bt_fallback(file_size, 1024)
         .await
         .expect("构造离线 BT fallback 失败");
 
-    // 主协议(MockProto):probe 成功(返回与 BT 一致大小,使 execute_bt_fallback 的
-    // layout 兼容校验通过),但 download_range 无 range_data → 失败,模拟 HTTP 全熔断。
+    // 主协议(MockProto):probe 成功(返回与 BT 一致大小),但 download_range 无 range_data
+    // → 失败,模拟 HTTP 全熔断。BT 作为并发源接管。
     let http_meta = test_metadata("data.bin", file_size as u64);
     let http_protocol: Arc<dyn Protocol> = Arc::new(MockProto::new(http_meta));
+
+    // P1-P2SP:构造 MirrorProtocol 含 HTTP(MockProto)+ BT 两个并发源。
+    // BT 作为 mirror 源,HTTP 失败时 least-in-flight 切到 BT 接管。
+    // 保留独立 bt_arc 用于 bt_fallback cleanup(stop torrent)。
+    let bt_arc: Arc<tachyon_protocol::MagnetProtocol> = Arc::new(bt_protocol);
+    let protocol: Arc<dyn Protocol> = Arc::new(MirrorProtocol::new(
+        http_protocol,
+        vec![(magnet_url.clone(), bt_arc.clone() as Arc<dyn Protocol>)],
+    ));
 
     // max_retries=0:execute 首次失败立即向上返回,避免重试退避拖慢测试。
     let mut config = test_config();
     config.max_retries = 0;
 
     let mut task = DownloadTask::new_for_test(
-        // url 必须为 magnet_url:execute_bt_fallback 内 bt_proto.probe(&self.url)
-        // 用此 url 命中 from_handle 预缓存。
+        // url 必须为 magnet_url:BT probe 命中 from_handle 预缓存
         magnet_url,
         config,
-        http_protocol,
+        protocol,
         StorageKind::memory_with_capacity(file_size),
     );
-    // 手动注入 bt_fallback(模拟 with_hybrid_sources 的填充结果)。
-    task.bt_fallback = Some(Arc::new(bt_protocol));
+    // 保留 bt_fallback 用于 cleanup(stop torrent)
+    task.bt_fallback = Some(bt_arc);
 
-    task.run().await.expect("BT fallback 后下载应成功完成");
+    task.run().await.expect("BT 并发接管后下载应成功完成");
 
     assert_eq!(
         task.state(),
         DownloadState::Completed,
-        "HTTP 熔断 + BT 接管后任务应 Completed"
+        "HTTP 熔断 + BT 并发接管后任务应 Completed"
     );
     assert!((task.progress() - 1.0).abs() < f64::EPSILON, "进度应为 1.0");
 
-    // 验证 storage 数据 == BT 预置文件内容(证明数据由 BT fallback 写入,非 HTTP)
+    // 验证 storage 数据 == BT 预置文件内容(证明数据由 BT 接管写入,非 HTTP)
     let mut buf = vec![0u8; file_size];
     task.storage
         .as_ref()
