@@ -334,6 +334,10 @@ pub struct DownloadTask {
     /// `MirrorProtocol` 的 per-source stats(quality 衰减 + least-in-flight 降权)
     /// 接管故障隔离。单源路径仍用 engine 熔断(语义不变)。
     has_mirrors: bool,
+    /// 测试/观测:MirrorProtocol 的源数量(含 primary + 镜像 + BT)。
+    /// 用于断言 P1-P2SP 改造后 BT 是否作为并发源加入。None=非 mirror 路径。
+    #[cfg_attr(not(test), allow(dead_code))]
+    mirror_source_count: Option<usize>,
     /// 任务级聚合 goodput 窗口起点(多并发分片共享)
     goodput_window_start: Option<Instant>,
     /// 当前窗口内累计完成字节
@@ -604,6 +608,7 @@ impl DownloadTask {
                         metrics: None,
                         circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
                         has_mirrors: false,
+                        mirror_source_count: None,
                         goodput_window_start: None,
                         goodput_window_bytes: 0,
                         last_rebalance_at: None,
@@ -651,6 +656,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
+            mirror_source_count: None,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -705,6 +711,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
+            mirror_source_count: None,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -801,6 +808,7 @@ impl DownloadTask {
         }
 
         let protocol = Arc::new(MirrorProtocol::with_pool(primary, mirrors, pool.clone()));
+        let mirror_source_count = Some(protocol.source_count());
 
         Ok(Self {
             id: TaskId::new_v4(),
@@ -827,6 +835,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: true,
+            mirror_source_count,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -878,7 +887,7 @@ impl DownloadTask {
         // 否则回退 with_timeouts
         let build_http = || -> DownloadResult<HttpClient> { shared_http_client(&config, &pool) };
         let primary = Arc::new(build_http()?);
-        let mirrors: Vec<(String, Arc<dyn Protocol>)> = http_mirrors
+        let mut mirrors: Vec<(String, Arc<dyn Protocol>)> = http_mirrors
             .iter()
             .filter_map(|m| {
                 build_http()
@@ -886,9 +895,9 @@ impl DownloadTask {
                     .map(|c| (m.clone(), Arc::new(c) as Arc<dyn Protocol>))
             })
             .collect();
-        let protocol = Arc::new(MirrorProtocol::with_pool(primary, mirrors, pool.clone()));
 
-        // BT fallback:独立持有,不塞入 MirrorProtocol(但共享 handle_cache)
+        // BT fallback:独立持有用于 cleanup,同时塞入 MirrorProtocol 作并发源
+        // P1-P2SP:BT 加入 sources 参与并发竞速(非仅 HTTP 全失败才 fallback)
         // P2-4: 注入自定义 StorageFactory,消除双存储写放大
         use librqbit::storage::StorageFactoryExt;
         let bt_factory = crate::bt_storage::TachyonStorageFactory::new(
@@ -908,6 +917,12 @@ impl DownloadTask {
             .with_session_coordinator(bt_session.session_coordinator())
             .with_storage_factory(bt_factory),
         );
+        // P1-P2SP:BT 作为 MirrorProtocol 的并发源之一(与 HTTP 镜像在 least-in-flight
+        // 层并发竞速分片)。URL 用 magnet 原始链接(host_of 对无 host 降级不限流)。
+        mirrors.push((magnet_url.clone(), bt_fallback.clone() as Arc<dyn Protocol>));
+        let protocol = Arc::new(MirrorProtocol::with_pool(primary, mirrors, pool.clone()));
+        // 捕获源数量(含 BT)供测试断言,在 protocol move 进 Self 前读取
+        let mirror_source_count = Some(protocol.source_count());
 
         Ok(Self {
             id: TaskId::new_v4(),
@@ -934,6 +949,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: true,
+            mirror_source_count,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -981,6 +997,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
+            mirror_source_count: None,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -1031,6 +1048,7 @@ impl DownloadTask {
             metrics: None,
             circuit_breakers: SourceCircuitBreakers::new(5, Duration::from_secs(30)),
             has_mirrors: false,
+            mirror_source_count: None,
             goodput_window_start: None,
             goodput_window_bytes: 0,
             last_rebalance_at: None,
@@ -1936,18 +1954,10 @@ impl DownloadTask {
         // UI 显示暂停但 IO 继续(v0.1.3 用户报告)。
         // Cancel 同样由 execute 内部 select 穿透;外层不再重复 wait_for_cancel。
         //
-        // HTTP 全熔断 fallback:主源(execute)失败且 `bt_fallback` 可用时,切 BT
-        // `download_full_stream` 整文件下载。仅 P2SP 混合模式(`with_hybrid_sources`)
-        // 持有 bt_fallback;纯 HTTP / 纯 BT 路径无 fallback,失败直接向上传播。
-        let execute_err = self.execute().await;
-        match execute_err {
-            Ok(()) => {}
-            Err(ref e) if self.should_try_bt_fallback(e) => {
-                tracing::warn!(error = %e, "主源下载失败,尝试 BT fallback");
-                self.execute_bt_fallback().await?;
-            }
-            Err(e) => return Err(e),
-        }
+        // P1-P2SP:HTTP 镜像与 BT 在 MirrorProtocol 的 least-in-flight 层并发竞速分片
+        // (BT 已作为 sources 之一加入,非 HTTP 全失败才 fallback)。execute 失败即整体
+        // 失败(含 BT 路径在内已全部尝试)。纯 BT 路径(bt_magnet)仍走单协议 execute。
+        self.execute().await?;
 
         // 步骤 5: 校验 (与取消信号竞速)
         {
@@ -2012,6 +2022,7 @@ impl DownloadTask {
     ///
     /// **layout 兼容性**:严格 fallback 需「单文件 BT + 单文件 HTTP + 大小一致」才允许,
     /// 该校验在 `execute_bt_fallback` 内通过 BT `probe()` metadata 比对实现(见其文档)。
+    #[cfg_attr(not(test), allow(dead_code))] // P1-P2SP 后生产不再调用,仅测试断言判定逻辑
     #[cfg(feature = "magnet")]
     fn should_try_bt_fallback(&self, err: &DownloadError) -> bool {
         self.bt_fallback.is_some()
@@ -2048,6 +2059,8 @@ impl DownloadTask {
     /// - BT `file_count > 1` → 多文件 torrent,HTTP 单文件 layout 不兼容,返回错误;
     /// - BT `file_size != HTTP file_size` → 大小不一致,返回错误;
     /// - 单文件 + 大小一致(或 HTTP 无 size 信息) → 继续 `download_full_stream`。
+    #[allow(dead_code)]
+    // P1-P2SP 后 BT 在 MirrorProtocol 内并发,此整文件 fallback 不再被调用,保留供未来退化路径
     #[cfg(feature = "magnet")]
     async fn execute_bt_fallback(&mut self) -> DownloadResult<()> {
         let bt_proto = self.bt_fallback.as_ref().ok_or_else(|| {

@@ -276,9 +276,28 @@ impl ObjectIdentity {
 
     /// 镜像源是否可与 baseline 混拼同一逻辑对象。
     ///
-    /// 规则与 resume 相同:仅 strong ETag 或 Last-Modified 可证明;仅 size 不可混拼。
+    /// 比 resume 宽松:resume 防半下数据与新版混用(仅 strong ETag/Last-Modified 可证);
+    /// mirror 用于多源分片并发(含 BT web seed),当一方无可证明身份
+    /// (无 strong ETag 且无 Last-Modified,如 BT 源 probe 恒返回 None)但
+    /// file_size 一致时允许混拼——BT 内容正确性由 piece 哈希保证,
+    /// size 一致即足够安全;最终 verify 拦截任何损坏。
     pub fn compatible_for_mirror(&self, other: &Self) -> bool {
-        self.compatible_for_resume(other)
+        // 先试严格身份证明(strong ETag 或 Last-Modified 双方一致)
+        if self.compatible_for_resume(other) {
+            return true;
+        }
+        // P1-P2SP:一方无可证明身份(无 strong ETag 且无 Last-Modified,如 BT 源)
+        // 但 file_size 一致时允许 mirror 混拼。双方都有(可能冲突的)身份时
+        // 不靠 size 放行(两个不同 strong ETag 是明确换版信号,即使同长也拒绝)。
+        let a_no_identity = self.strong_etag_key().is_none() && self.last_modified.is_none();
+        let b_no_identity = other.strong_etag_key().is_none() && other.last_modified.is_none();
+        if (a_no_identity || b_no_identity)
+            && let (Some(a), Some(b)) = (self.file_size, other.file_size)
+            && a == b
+        {
+            return true;
+        }
+        false
     }
 
     fn strong_etag_key(&self) -> Option<String> {
@@ -742,9 +761,14 @@ mod tests {
         };
         assert!(!ObjectIdentity::is_strong_etag("W/\"weak\""));
         assert!(a.if_range_value().is_none());
-        // 仅 weak ETag + size 不得证明 resume/mirror 兼容
+        // 仅 weak ETag + size 不得证明 resume 兼容(防同长换版半下混用)
         assert!(!a.compatible_for_resume(&b));
-        assert!(!a.compatible_for_mirror(&b));
+        // P1-P2SP:mirror 比 resume 宽松,weak ETag + size 一致时允许混拼
+        // (weak etag 是可接受验证器,size 一致即安全,最终 verify 兜底)
+        assert!(
+            a.compatible_for_mirror(&b),
+            "weak etag + size 一致时 mirror 应允许混拼"
+        );
     }
 
     #[test]
@@ -785,8 +809,43 @@ mod tests {
             file_size: Some(1024),
         };
         assert!(!a.compatible_for_resume(&b));
-        assert!(!a.compatible_for_mirror(&b));
+        // P1-P2SP:双方均无身份但 size 一致时,mirror 允许混拼(一方可为 BT,
+        // BT 无 ETag/Last-Modified,size 一致 + BT piece 哈希保内容正确)
+        assert!(
+            a.compatible_for_mirror(&b),
+            "双方无身份但 size 一致时 mirror 应允许混拼"
+        );
         assert!(a.if_range_value().is_none());
+    }
+
+    /// P1-P2SP:HTTP 源(strong ETag)+ BT 源(无身份)但 file_size 一致时,
+    /// mirror 应允许混拼(BT 作并发源接管 HTTP 失败),resume 仍不可。
+    #[test]
+    fn test_object_identity_bt_p2sp_http_and_bt_compatible_for_mirror() {
+        let http = ObjectIdentity {
+            etag: Some("\"abc123\"".into()),
+            last_modified: None,
+            file_size: Some(4096),
+        };
+        let bt = ObjectIdentity {
+            etag: None,
+            last_modified: None,
+            file_size: Some(4096),
+        };
+        // resume:HTTP 有 strong ETag,BT 无 → 不可(防 BT 字节与 HTTP 半下混用)
+        assert!(
+            !http.compatible_for_resume(&bt),
+            "HTTP 有 ETag + BT 无身份,resume 不可"
+        );
+        // mirror:file_size 一致 + 一方无身份 → 允许(BT 接管 HTTP 失败,size 一致即可)
+        assert!(
+            http.compatible_for_mirror(&bt),
+            "HTTP+BT size 一致时 mirror 应允许 BT 作并发源"
+        );
+        assert!(
+            bt.compatible_for_mirror(&http),
+            "对称:BT+HTTP mirror 也应允许"
+        );
     }
 
     #[test]

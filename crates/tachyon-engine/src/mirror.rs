@@ -319,6 +319,12 @@ impl MirrorProtocol {
         }
     }
 
+    /// 测试/观测:返回源数量(含 primary)。用于断言 BT 是否作为并发源加入。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
     /// 清除 probe 结果 + 重置选源状态(修复 BUG-B:不清选中源会导致失败源永久饿死)
     ///
     /// 审计 M-02:**不得** 将 `in_flight` 全清零。在途计数仅由 `StatsStream`
@@ -643,6 +649,14 @@ impl Protocol for MirrorProtocol {
                 }
             });
 
+            // P1-P2SP:MirrorProtocol 混合多源(可能含 BT protocol_managed_storage=true),
+            // 但引擎 StorageSet 统一写入所有源的字节。强制 protocol_managed_storage=false,
+            // 避免 BT probe 胜出时 skip_write=true 导致 HTTP 源字节未落盘(数据丢失)。
+            // 注:BT 源的 librqbit 存储是其 FileStream 的 piece 后端,与引擎 StorageSet
+            // 写入独立;引擎总是写接收到的字节到 StorageSet(可能有 BT 侧写放大,
+            // 属性能问题非正确性,后续按源路由优化)。
+            let mut meta = meta;
+            meta.protocol_managed_storage = false;
             Ok(meta)
         })
     }
