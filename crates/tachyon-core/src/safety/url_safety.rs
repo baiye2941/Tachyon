@@ -60,6 +60,18 @@ pub fn validate_public_http_url(url: &Url) -> DownloadResult<()> {
 /// 第二次解析返回内网 IP(如 169.254.169.254 云元数据服务)。
 /// 此函数在 URL 字符串校验之后、发起连接之前调用,确保所有解析结果均为安全 IP。
 ///
+/// # 生产路径未接入(安全审计 F-1)
+///
+/// 此函数设计为"协议层在重定向前解析+校验 IP",但它内部调用
+/// `std::to_socket_addrs` 做独立 DNS 解析,与 `PublicDnsResolver`(`tachyon-protocol`
+/// 的 `reqwest::dns::Resolve` 实现)重复——后者已对每个解析出的 addr 调
+/// `reject_forbidden_ip`,且 reqwest 使用其返回的已校验地址建连。
+///
+/// 若同时接入此函数,会产生双重 DNS + TOCTOU(此函数解析的 IP 不会被 reqwest
+/// 用于建连)。故生产路径不调用此函数;DNS+IP 校验统一走 `PublicDnsResolver` 单一路径。
+///
+/// 此函数保留供测试/手动校验/未来 IP pinning 重构使用。
+///
 /// # 返回值
 ///
 /// 返回所有已验证的安全 IP 地址列表。**协议层必须使用这些 IP 进行连接**
@@ -329,6 +341,49 @@ pub fn magnet_info_hash(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 从 magnet URI 提取 Web Seed (BEP 19) URL 列表(ws= 参数)。
+///
+/// BEP 19 允许在 magnet 链接中声明 HTTP/HTTPS web seed URL,
+/// 下载器可从这些 HTTP 源并行拉取数据,与 BT peer 互补加速。
+///
+/// 多个 `ws=` 参数可出现,全部提取。URL 需通过 `validate_public_http_url` 校验,
+/// 不可达的内网/loopback 地址会被过滤(SSRF 防护)。
+///
+/// 返回空 Vec 表示磁力链接无 web seed 或 URL 全部被 SSRF 校验拒绝。
+/// 非 magnet 链接返回空 Vec。
+pub fn extract_web_seeds_from_magnet(url: &str) -> Vec<String> {
+    const MAGNET_PREFIX: &str = "magnet:?";
+    let Some(query) = url
+        .get(..MAGNET_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(MAGNET_PREFIX))
+        .and_then(|_| url.get(MAGNET_PREFIX.len()..))
+    else {
+        return Vec::new();
+    };
+
+    let mut web_seeds = Vec::new();
+    for param in query.split('&') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("ws") {
+            continue;
+        }
+        let ws_url = value.trim();
+        if ws_url.is_empty() {
+            continue;
+        }
+        // SSRF 校验:web seed 必须是公网 HTTP/HTTPS URL
+        if let Ok(parsed) = Url::parse(ws_url)
+            && validate_public_http_url(&parsed).is_ok()
+        {
+            web_seeds.push(ws_url.to_string());
+        }
+        // SSRF 校验失败的 web seed 静默跳过;调用方可通过返回值为空判断
+    }
+    web_seeds
 }
 
 pub fn redact_url_for_log(url: &str) -> String {
@@ -802,6 +857,83 @@ mod tests {
             magnet_info_hash("magnet:?xt=urn:sha1:6GJXEQ5SGFF7BWMQL74VTOAXZC36XSJG").is_none(),
             "非 btih 的 xt 应返回 None"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_web_seeds_from_magnet: BEP 19 web seed 提取
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn web_seeds_extracts_single_https_url() {
+        let url = "magnet:?xt=urn:btih:abcdef&dn=test&ws=https://example.com/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds, vec!["https://example.com/file.iso"]);
+    }
+
+    #[test]
+    fn web_seeds_extracts_multiple_urls() {
+        let url = "magnet:?xt=urn:btih:abcdef&ws=https://a.com/file.iso&ws=https://b.com/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds.len(), 2);
+        assert!(seeds.contains(&"https://a.com/file.iso".to_string()));
+        assert!(seeds.contains(&"https://b.com/file.iso".to_string()));
+    }
+
+    #[test]
+    fn web_seeds_extracts_http_url() {
+        let url = "magnet:?xt=urn:btih:abcdef&ws=http://example.com/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds, vec!["http://example.com/file.iso"]);
+    }
+
+    #[test]
+    fn web_seeds_returns_empty_when_no_ws_param() {
+        let url = "magnet:?xt=urn:btih:abcdef&dn=test&tr=udp://tracker.example:1337";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn web_seeds_returns_empty_for_non_magnet() {
+        let seeds = extract_web_seeds_from_magnet("https://example.com/file.iso");
+        assert!(seeds.is_empty());
+    }
+
+    /// test-harness feature 放行 loopback(wiremock 测试需要),生产路径才过滤。
+    #[test]
+    #[cfg(not(feature = "test-harness"))]
+    fn web_seeds_filters_loopback_ssrf() {
+        let url = "magnet:?xt=urn:btih:abcdef&ws=http://127.0.0.1:8080/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert!(seeds.is_empty(), "loopback web seed 应被 SSRF 校验过滤");
+    }
+
+    #[test]
+    fn web_seeds_filters_private_ip_ssrf() {
+        let url = "magnet:?xt=urn:btih:abcdef&ws=http://192.168.1.1/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert!(seeds.is_empty(), "内网 IP web seed 应被 SSRF 校验过滤");
+    }
+
+    #[test]
+    fn web_seeds_skips_empty_value() {
+        let url = "magnet:?xt=urn:btih:abcdef&ws=&ws=https://example.com/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds, vec!["https://example.com/file.iso"]);
+    }
+
+    #[test]
+    fn web_seeds_case_insensitive_param_name() {
+        let url = "magnet:?xt=urn:btih:abcdef&WS=https://example.com/file.iso";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds, vec!["https://example.com/file.iso"]);
+    }
+
+    #[test]
+    fn web_seeds_finds_ws_among_other_params() {
+        let url = "magnet:?xt=urn:btih:abcdef&dn=test&tr=udp://tracker.example:1337&ws=https://example.com/file.iso&tr=udp://tracker2.example:6969";
+        let seeds = extract_web_seeds_from_magnet(url);
+        assert_eq!(seeds, vec!["https://example.com/file.iso"]);
     }
 
     #[test]

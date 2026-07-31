@@ -450,11 +450,12 @@ impl AsyncStorage for TokioFile {
             // F-14: fallocate 的 len 参数为 i64(off_t)。若 size > i64::MAX,
             // `size as i64` 会静默截断为负数,导致 fallocate 行为未定义或 EINVAL。
             // 入口处显式校验,拒绝溢出的 size(参照 iouring.rs:1685 模式)。
-            libc::off_t::try_from(size).map_err(|_| {
+            // 捕获校验后的 off_t 值,避免闭包内再用原始 u64 裸转。
+            let size: libc::off_t = libc::off_t::try_from(size).map_err(|_| {
                 DownloadError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "tokio_file allocate size {size} 超过 i64 最大值 {},fallocate 无法处理",
+                        "tokio_file allocate size 超过 i64 最大值 {},fallocate 无法处理",
                         i64::MAX
                     ),
                 ))
@@ -465,8 +466,9 @@ impl AsyncStorage for TokioFile {
                 // Safety:
                 // - file 是合法打开的 Arc<File>,在 spawn_blocking 闭包执行期间保持存活
                 // - as_raw_fd() 返回的文件描述符在该期间有效
+                // - size 已由 libc::off_t::try_from 校验为合法 i64,不会静默截断
                 // - mode=0、offset=0、len=size 均为合法的 fallocate 参数
-                let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
+                let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size) };
                 if ret != 0 {
                     return Err(DownloadError::Io(std::io::Error::last_os_error()));
                 }
@@ -698,6 +700,26 @@ mod tests {
         let storage = TokioFile::open(tmp.path()).await.unwrap();
         storage.allocate(1024).await.unwrap();
         assert_eq!(storage.file_size().await.unwrap(), 1024);
+    }
+
+    /// off_t 溢出防御:u64 > i64::MAX 时必须返回 InvalidInput,
+    /// 而非 `as libc::off_t` 静默截断为负数导致 fallocate 行为未定义。
+    #[tokio::test]
+    async fn test_allocate_rejects_size_over_i64_max() {
+        let tmp = NamedTempFile::new().unwrap();
+        let storage = TokioFile::open(tmp.path()).await.unwrap();
+        let result = storage.allocate(u64::MAX).await;
+        let err = result.expect_err("u64::MAX 应被 libc::off_t::try_from 拒绝");
+        match err {
+            DownloadError::Io(io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "应为 InvalidInput,实际: {io_err}"
+                );
+            }
+            other => panic!("期望 DownloadError::Io(InvalidInput),实际: {other:?}"),
+        }
     }
 
     /// Windows:预分配后文件物理分配大小应达到请求大小

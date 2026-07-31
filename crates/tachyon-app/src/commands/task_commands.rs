@@ -1370,6 +1370,10 @@ pub(crate) async fn delete_task_inner(
         .task_service
         .delete_task(&task_id, delete_local_file)
         .await?;
+    // P0-4: 清理 ProgressBroker 中该任务的 orphan entry,避免 4 个 pending map
+    // 残留 task_id key 导致进程生命周期内内存泄漏(delete 不走 cleanup_runtime,
+    // 故在此显式调用)
+    state.runtime.progress_broker.on_task_removed(&task_id);
     // wait_for_handle 已移除 handle/channel;再 cleanup 兜底并发路径残留
     state.runtime.supervisor.cleanup(&task_id);
     Ok(())
@@ -2308,6 +2312,72 @@ mod tests {
             "command channel 应已移除"
         );
         assert!(get_task_detail_inner(&state, id).await.is_err());
+    }
+
+    /// 切片 2 (P0-4): delete_task_inner 清理 ProgressBroker orphan keys
+    ///
+    /// 任务删除后,ProgressBroker 的 4 个 pending map 必须不再保留该 task_id 的
+    /// entry,否则 orphan key 在进程生命周期内永不释放(确认的 CRITICAL 内存泄漏)。
+    #[tokio::test]
+    async fn test_delete_task_inner_clears_broker_orphan_keys() {
+        use crate::commands::FragmentByteProgress;
+        use crate::runtime::chunk_reader_pool::ProgressDelta;
+        use tachyon_core::types::DownloadState;
+
+        let state = test_state();
+        let id = create_task_inner(
+            &state,
+            "https://example.com/p04-broker-leak.bin".to_string(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 模拟进度上报:向 broker 的 4 个 map 写入该 task 的 entry
+        let broker = &state.runtime.progress_broker;
+        broker.mark_dirty_with_delta(
+            &id,
+            Some(ProgressDelta::Started(0)),
+            vec![FragmentByteProgress {
+                index: 0,
+                downloaded: 1,
+            }],
+        );
+        broker.mark_dirty_with_delta(&id, Some(ProgressDelta::Completed(0)), vec![]);
+        broker
+            .notified_states
+            .insert(id.clone(), DownloadState::Completed);
+        // 确认 4 个 map 确实有 key(测试前置)
+        assert!(broker.pending_completed.contains_key(&id));
+        assert!(broker.pending_started.contains_key(&id));
+        assert!(broker.pending_fragment_bytes.contains_key(&id));
+        assert!(broker.notified_states.contains_key(&id));
+
+        delete_task_inner(&state, id.clone(), false)
+            .await
+            .expect("delete 应成功");
+
+        // 删除后 4 个 map 不应再保留该 task_id 的 orphan key
+        assert!(
+            !broker.pending_completed.contains_key(&id),
+            "删除后 pending_completed 不应残留 orphan key"
+        );
+        assert!(
+            !broker.pending_started.contains_key(&id),
+            "删除后 pending_started 不应残留 orphan key"
+        );
+        assert!(
+            !broker.pending_fragment_bytes.contains_key(&id),
+            "删除后 pending_fragment_bytes 不应残留 orphan key"
+        );
+        assert!(
+            !broker.notified_states.contains_key(&id),
+            "删除后 notified_states 不应残留 orphan key"
+        );
     }
 
     #[tokio::test]

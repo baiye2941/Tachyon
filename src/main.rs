@@ -5,6 +5,11 @@
 
 mod cli_proxy;
 
+// 全局分配器:与 tachyon-app 保持一致,减少 10-30% 分配开销。
+// CLI 工具用于磁力链接下载和 bench,缺失 mimalloc 会使 bench 结果不代表 App 真实性能。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 use tachyon_core::config::DownloadConfig;
 use tachyon_engine::bt_session::BtSession;

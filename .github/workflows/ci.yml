@@ -157,6 +157,35 @@ jobs:
       - name: 运行测试(nextest)
         run: cargo nextest run --all --locked
 
+  # release-profile 崩溃一致性门禁:
+  # panic_log_e2e 验证 release-only bug 地基(panic.log 落盘,windows_subsystem=windows 下 stderr 丢失);
+  # os_kill_resume 验证 OS 进程级 kill + resume + blake3 校验。
+  # CI test job 用 dev profile,release 行为(overflow-checks 分 crate、LTO、strip)
+  # 仅在打包时隐式验证。本 job 补充 release 下的显式门禁。
+  test-release:
+    name: Release 崩溃一致性测试
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ${{ runner.os }}-stable-release-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: test-release
+      - uses: cargo-bins/cargo-binstall@v1.21.1
+      - name: 安装 cargo-nextest
+        run: cargo binstall -y --force --locked cargo-nextest
+      - name: 运行 release 崩溃一致性测试
+        run: cargo nextest run --all --release --locked -- panic_log_e2e os_kill_resume
+
   docs:
     name: 文档构建
     needs: [changes]
@@ -336,6 +365,10 @@ jobs:
         run: bash scripts/ci/miri.sh
 
   # bench: 仅 main push 采样，不进 ci-pass 关键路径（噪声大，非正确性门禁）
+  # 安全审计 P0-1/P0-3/P1-1:
+  # - --save-baseline ci-baseline: 建立性能回归基线(后续 PR 可 --baseline ci-baseline 对比)
+  # - throughput_baseline: 唯一支持 aria2 对标的 bench,产出 goodput/对齐命中率/rebalance 计数 JSON
+  # - rebalance A/B: --rebalance-off vs 默认(on),量化动态拆片收益(AGENTS.md 要求 >10%)
   bench:
     name: 性能基准采样
     needs: [changes]
@@ -353,10 +386,148 @@ jobs:
           toolchain: stable
           shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
           cache-key-suffix: bench
-      - name: 运行 Criterion 快速采样(核心 e2e 路径)
+      - name: 运行 Criterion 快速采样(核心 e2e 路径,保存回归基线)
         run: |
-          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2
-          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --save-baseline ci-baseline
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --save-baseline ci-baseline
+      - name: throughput_baseline 采样(goodput/对齐命中率/rebalance 计数)
+        run: |
+          TACHYON_BENCH_MODE=ci cargo bench --bench throughput_baseline -- --size 16MiB --runs 3 --rebalance-off 2>&1 | tee rebalance_off.txt
+          TACHYON_BENCH_MODE=ci cargo bench --bench throughput_baseline -- --size 16MiB --runs 3 2>&1 | tee rebalance_on.txt
+      - name: 归档性能采样结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            rebalance_off.txt
+            rebalance_on.txt
+          retention-days: 30
+
+  # P0-3: PR 级性能回归门禁(信息性,不进 ci-pass 关键路径)。
+  # 设计依据(AGENTS.md 教训):Windows runner 上 criterion 抖动可达 -47%~+88%,
+  # 严格阻断会造成假失败,故本 job 仅信息性 —— 回归 >10% 时让 job 失败以便人工排查,
+  # 但不阻断 ci-pass(不在其 needs 列表中)。
+  #
+  # 机制说明(criterion 0.8 行为,已核对源码):
+  # - criterion 0.8 无 --threshold 标志,且任何情况下都不会因回归而 exit 非零
+  #   (仅 cargo-criterion 基线/profile-time 配置错误才 exit 1)。
+  # - 故本 job 用 --baseline ci-baseline 触发对比输出,再解析 criterion 的
+  #   `change: [lower upper]` 区间,若 upper > 0.10(即回归 >10%)则让 job 失败。
+  # - baseline 来源:actions/cache 缓存 target/criterion,key 含 base_ref,
+  #   使 PR 对比的是目标分支的基线。
+  # - cache-miss 降级:无基线可对比时,用 --save-baseline 建立基线供未来 PR,不失败。
+  bench-regression:
+    name: 性能回归检测 (信息性)
+    needs: [changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.run_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # ci 模式:与 bench job 一致的缩减采样
+      TACHYON_BENCH_MODE: ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: bench-regression
+      # 缓存 criterion 基线:以目标分支(base_ref)为 key,PR 对比的是基线分支的性能。
+      # restore-keys 提供 OS 级部分回退(命中即视为 cache hit 复用旧基线)。
+      - name: 恢复 criterion 基线缓存
+        id: restore-cache
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}-${{ github.base_ref }}
+          restore-keys: |
+            criterion-baseline-${{ runner.os }}-
+      # cache HIT:读基线对比,解析回归 >10% 则失败。
+      - name: 对比基线(检测 >10% 回归)
+        if: steps.restore-cache.outputs.cache-hit == 'true'
+        run: |
+          set -uo pipefail
+          # --baseline ci-baseline:读取已存基线做对比(criterion 会打印 change 区间)
+          # 落盘完整输出供解析与归档
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --baseline ci-baseline 2>&1 | tee bench_compare_e2e_download.txt
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --baseline ci-baseline 2>&1 | tee bench_compare_e2e_http_real.txt
+          # 解析 criterion 输出:每个 bench 的 `change: [lower point upper]` 区间,
+          # upper(第 3 个数)为分数(0.10 = 10%)。任一 bench 的 upper > 0.10 视为回归超阈值。
+          python3 - <<'PY'
+          import re, sys, glob
+          threshold = 0.10
+          # criterion change 行格式: `change: [lower point_estimate upper] (p = ...)`
+          pattern = re.compile(r'change:\s*\[\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*\]')
+          regressions = []
+          files = sorted(glob.glob('bench_compare_*.txt'))
+          if not files:
+              print('::error::未找到 bench 对比输出文件')
+              sys.exit(1)
+          for f in files:
+              with open(f, encoding='utf-8', errors='replace') as fh:
+                  for line in fh:
+                      m = pattern.search(line)
+                      if not m:
+                          continue
+                      lower = float(m.group(1))
+                      upper = float(m.group(3))
+                      # 取区间上界判断最坏情况回归幅度
+                      if upper > threshold:
+                          regressions.append((f, upper, lower))
+          if regressions:
+              print('::error::检测到性能回归超过 10%% 阈值:')
+              for f, upper, lower in regressions:
+                  pct = upper * 100
+                  print(f'  - {f}: change [{lower:.4f}, {upper:.4f}] -> {pct:.2f}% 超阈值')
+              sys.exit(1)
+          print('性能回归检测通过:所有 bench 回归幅度均 <= 10% 阈值')
+          PY
+      # cache MISS:无基线可对比,建立基线供未来 PR,不失败(信息性降级)。
+      - name: 建立基线(首次,跳过对比)
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "::notice::首次建立 baseline,跳过对比(cache 未命中)"
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_download -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --save-baseline ci-baseline
+          TACHYON_BENCH_MODE=ci cargo bench --bench e2e_http_real -- --sample-size 10 --warm-up-time 1 --measurement-time 2 --save-baseline ci-baseline
+      # 归档 criterion 基线目录,便于人工核查 / 未来 job 复用(30 天保留)。
+      - name: 归档 criterion 基线
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline
+          path: target/criterion
+          retention-days: 30
+      # 归档对比输出文本(仅对比分支产生),便于离线复盘回归明细。
+      - name: 归档对比输出
+        if: always() && steps.restore-cache.outputs.cache-hit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-regression-output
+          path: bench_compare_*.txt
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # 安全审计 P0-2b: loom 并发不变量测试进入 CI 门禁。
+  # loom_concurrency.rs(574 行)对 BufferIndexPool(iouring)和 CompletionSlots(iocp)
+  # 的位图 alloc/free 做穷举线程交错验证。此前是 optional feature,CI 从不运行。
+  loom:
+    name: Loom 并发测试
+    needs: [changes]
+    if: needs.changes.outputs.run_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-${{ hashFiles('**/Cargo.lock') }}
+          cache-key-suffix: loom
+      - name: 运行 loom 并发不变量测试
+        run: cargo test -p tachyon-io --features loom --test loom_concurrency
 
   frontend:
     name: 前端检查
@@ -396,10 +567,11 @@ jobs:
     if: always()
     # bench 已移出关键路径（main 采样保留，失败不阻断 ci-pass）
     # 审计 C2:MSRV 必须纳入汇总,否则 1.85 编译失败仍可能显示 CI 全绿
+    # 安全审计 P0-2b: loom 并发测试纳入关键路径
     # skipped 视为通过：path filter 跳过的重 job 不阻断
     # 注意：needs.*.result 在 GHA 中不会展开为各 job 结果列表（会变成字面量 "Array"），
     # 必须逐个引用 needs.<job>.result，否则 failure 会被静默放过（假绿）。
-    needs: [changes, fmt, clippy, test, docs, audit, cargo-audit, taplo, doc-drift, coverage, miri, frontend, msrv]
+    needs: [changes, fmt, clippy, test, test-release, docs, audit, cargo-audit, taplo, doc-drift, coverage, miri, loom, frontend, msrv]
     steps:
       - name: 检查所有 CI 作业是否成功
         env:
@@ -407,6 +579,7 @@ jobs:
           R_FMT: ${{ needs.fmt.result }}
           R_CLIPPY: ${{ needs.clippy.result }}
           R_TEST: ${{ needs.test.result }}
+          R_TEST_RELEASE: ${{ needs.test-release.result }}
           R_DOCS: ${{ needs.docs.result }}
           R_AUDIT: ${{ needs.audit.result }}
           R_CARGO_AUDIT: ${{ needs.cargo-audit.result }}
@@ -414,6 +587,7 @@ jobs:
           R_DOC_DRIFT: ${{ needs.doc-drift.result }}
           R_COVERAGE: ${{ needs.coverage.result }}
           R_MIRI: ${{ needs.miri.result }}
+          R_LOOM: ${{ needs.loom.result }}
           R_FRONTEND: ${{ needs.frontend.result }}
           R_MSRV: ${{ needs.msrv.result }}
         run: |
@@ -431,6 +605,7 @@ jobs:
           check fmt "$R_FMT"
           check clippy "$R_CLIPPY"
           check test "$R_TEST"
+          check test-release "$R_TEST_RELEASE"
           check docs "$R_DOCS"
           check audit "$R_AUDIT"
           check cargo-audit "$R_CARGO_AUDIT"
@@ -438,6 +613,7 @@ jobs:
           check doc-drift "$R_DOC_DRIFT"
           check coverage "$R_COVERAGE"
           check miri "$R_MIRI"
+          check loom "$R_LOOM"
           check frontend "$R_FRONTEND"
           check msrv "$R_MSRV"
           if [ "$failed" -ne 0 ]; then

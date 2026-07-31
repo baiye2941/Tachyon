@@ -190,6 +190,12 @@ pub fn parse_m3u8(content: &str, base_url: Option<&str>) -> DownloadResult<Playl
                 variant.uri = resolved_uri;
                 variants.push(pending_variant.take().unwrap());
             } else if let Some(duration) = pending_duration.take() {
+                // 安全审计 F-04:分片数上限,防止恶意超大播放列表 OOM
+                if segments.len() >= MAX_HLS_SEGMENTS {
+                    return Err(DownloadError::Protocol(format!(
+                        "HLS 分片数超过上限 {MAX_HLS_SEGMENTS},疑似恶意播放列表"
+                    )));
+                }
                 segments.push(MediaSegment {
                     uri: resolved_uri,
                     duration,
@@ -280,6 +286,14 @@ const HLS_SEGMENT_MAX_RETRIES: u32 = 3;
 /// AES-128 按分片独立可并行;有序产出由 `buffered` 保证。
 /// 8 在高 RTT 多分片场景下饱和连接,带宽受限时不致过度放大。
 const HLS_MAX_CONCURRENT_SEGMENTS: usize = 8;
+
+/// 安全审计 F-04:HLS 分片数上限,防止 `MediaSegment` Vec 无限增长放大内存。
+/// `parse_m3u8` 把整个文件 `lines().collect()` 进内存后再逐行 push 分片,
+/// 无上限时百万行 m3u8 的 segments Vec 会无限增长(每个 MediaSegment 结构体)。
+/// 注:`lines().collect()` 本身会读全文,上游 `MAX_GET_TEXT_SIZE=64MB`(http.rs)是第一道防线;
+/// 本上限是第二道,限制解析后的 segment 结构体数量。
+/// 100_000 是合理上限:10 小时直播 + 6s 分片 = 6000 段,远低于此值。
+const MAX_HLS_SEGMENTS: usize = 100_000;
 
 /// AES-128-CBC 解密 HLS 加密分片
 ///
@@ -705,6 +719,38 @@ segment2.ts
         let content = "#EXT-X-VERSION:3\n#EXTINF:10,\nseg.ts\n";
         let result = parse_m3u8(content, None);
         assert!(result.is_err(), "缺少 #EXTM3U 头应报错");
+    }
+
+    /// 安全审计 F-04:恶意超大播放列表(超 MAX_HLS_SEGMENTS)应被拒绝,
+    /// 而非无限 push 到 segments Vec 导致 OOM。
+    #[test]
+    fn test_parse_m3u8_rejects_too_many_segments() {
+        let mut content = String::from("#EXTM3U\n");
+        for i in 0..=MAX_HLS_SEGMENTS {
+            content.push_str(&format!("#EXTINF:1.0,\nseg{i}.ts\n"));
+        }
+        let result = parse_m3u8(&content, None);
+        let err = result.expect_err("超过 MAX_HLS_SEGMENTS 应被拒绝");
+        assert!(
+            matches!(err, DownloadError::Protocol(ref msg) if msg.contains("超过上限")),
+            "期望 Protocol 错误提及上限,实际: {err:?}"
+        );
+    }
+
+    /// 边界:恰好 MAX_HLS_SEGMENTS 个分片应被接受(不 off-by-one)。
+    #[test]
+    fn test_parse_m3u8_accepts_exactly_max_segments() {
+        let mut content = String::from("#EXTM3U\n");
+        for i in 0..MAX_HLS_SEGMENTS {
+            content.push_str(&format!("#EXTINF:1.0,\nseg{i}.ts\n"));
+        }
+        let playlist = parse_m3u8(&content, None).expect("恰好 MAX 应被接受");
+        match playlist {
+            Playlist::Media { segments, .. } => {
+                assert_eq!(segments.len(), MAX_HLS_SEGMENTS);
+            }
+            _ => panic!("应为 Media playlist"),
+        }
     }
 
     #[test]
