@@ -1904,6 +1904,42 @@ mod tests {
         });
     }
 
+    /// IOCP 主路径(对齐 buffer,走 submit_iocp_write)应正确写入并返回字节数。
+    ///
+    /// 此前所有 write_at 测试用堆 vec(非对齐→fallback seek_write)从未走主 IOCP 路径。
+    /// 本测试用 AlignedBuf(extend_from_slice 推进 pos 后 freeze 产出非零长度 Bytes)
+    /// 强制走主路径,断言写入字节数正确且数据落盘。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_iocp_main_path_returns_correct_bytes() {
+        use crate::aligned_buf::AlignedBuf;
+        use crate::storage::AsyncStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_iocp_aligned.dat");
+        let mut storage = IoCpStorage::new(&path);
+        storage.init().expect("IOCP init 应成功");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 4096B 对齐 buffer:AlignedBuf::new(cap) 后 pos=0,须 extend_from_slice
+            // 推进 pos 才使 freeze() 产出非零长度 Bytes(as_mut_slice 填充不推进 pos)。
+            let mut aligned = AlignedBuf::new(4096).expect("AlignedBuf");
+            aligned.extend_from_slice(&[0x42u8; 4096]);
+            let data = aligned.freeze();
+            assert_eq!(data.len(), 4096, "AlignedBuf freeze 后长度应非零");
+            assert!(
+                crate::aligned_buf::satisfies_no_buffering_alignment(0, &data),
+                "测试数据必须三重对齐命中主 IOCP 路径"
+            );
+            let written = storage.write_at(0, data).await.expect("write_at 应成功");
+            assert_eq!(
+                written, 4096,
+                "IOCP 主路径应返回正确字节数 4096,实际 {written}"
+            );
+        });
+    }
+
     /// 验证未初始化时写入返回 NotConnected 错误
     #[cfg(target_os = "windows")]
     #[test]
@@ -2220,7 +2256,7 @@ mod tests {
         // offset=0 扇区对齐 → 走主 IOCP 路径(命中 submit_iocp_write 的 slot alloc)
         storage.allocate(8192).await.unwrap();
         let mut aligned = AlignedBuf::new(512).expect("AlignedBuf 分配");
-        aligned.as_mut_slice().fill(0x42);
+        aligned.extend_from_slice(&[0x42u8; 512]);
         let aligned_data = aligned.freeze();
         // 确认确实走主 IOCP 路径(三重对齐满足)
         assert!(
@@ -2311,7 +2347,7 @@ mod tests {
         for i in 0..8u64 {
             let s = storage.clone();
             let mut aligned = AlignedBuf::new(512).expect("AlignedBuf");
-            aligned.as_mut_slice().fill(i as u8);
+            aligned.extend_from_slice(&[i as u8; 512]);
             let data = aligned.freeze();
             let offset = i * 512;
             handles.push(tokio::spawn(async move { s.write_at(offset, data).await }));
