@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">Tachyon — 高性能桌面下载器</title>
+  <desc id="desc">Rust + Tauri v2 高性能桌面下载器：分片并发 · BT/HF 原生支持</desc>
+  <defs>
+    <linearGradient id="void" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#050608"/>
+      <stop offset="100%" stop-color="#0a0b0f"/>
+    </linearGradient>
+    <linearGradient id="vel" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#35dde2"/>
+      <stop offset="100%" stop-color="#00e5ff"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#111319"/>
+      <stop offset="100%" stop-color="#0a0b0f"/>
+    </linearGradient>
+    <linearGradient id="fillA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#00e5ff"/>
+      <stop offset="100%" stop-color="#35dde2"/>
+    </linearGradient>
+    <linearGradient id="fillB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2dd4bf"/>
+      <stop offset="100%" stop-color="#14b8a6"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1a1d24" stroke-width="1"/>
+    </pattern>
+    <clipPath id="frame">
+      <rect width="1200" height="360" rx="24"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="360" fill="url(#void)"/>
+    <rect width="1200" height="360" fill="url(#grid)" opacity="0.45"/>
+    <path d="M-20 280 C200 230, 420 320, 680 250 S 980 200, 1240 270" fill="none" stroke="#35dde2" stroke-width="1.5" opacity="0.35"/>
+    <circle cx="1040" cy="56" r="2" fill="#f472b6" opacity="0.8"/>
+    <circle cx="1088" cy="92" r="1.5" fill="#f472b6" opacity="0.5"/>
+
+    <g id="title-block" transform="translate(48 36)">
+      <rect x="0" y="0" width="156" height="24" rx="8" fill="#111319" stroke="#23262e"/>
+      <circle cx="14" cy="12" r="3.5" fill="#35dde2"/>
+      <text x="26" y="16" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">DESKTOP DOWNLOADER</text>
+
+      <text x="0" y="72" fill="#edeff3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="56" font-weight="700" letter-spacing="-1.5">Tachyon</text>
+      <text x="0" y="104" fill="#c9cdd6" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="500">大文件与 AI 模型的高速下载控制台</text>
+      <text x="0" y="130" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13">Rust 分片引擎 · Tauri v2 · 字节级进度与断点续传</text>
+
+      <g transform="translate(0 158)">
+        <rect width="110" height="30" rx="8" fill="#111319" stroke="#2c3038"/>
+        <text x="14" y="20" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">v0.1.4</text>
+        <text x="62" y="20" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">1.85</text>
+
+        <rect x="122" y="0" width="150" height="30" rx="8" fill="#111319" stroke="#2c3038"/>
+        <text x="136" y="20" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">HTTP · BT · HF</text>
+
+        <rect x="284" y="0" width="150" height="30" rx="8" fill="#111319" stroke="#2c3038"/>
+        <text x="298" y="20" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">Win · Linux · macOS</text>
+      </g>
+
+      <g transform="translate(0 212)">
+        <text x="0" y="0" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">PROOF</text>
+        <text x="0" y="26" fill="#edeff3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="16" font-weight="600">分片矩阵实时显示字节进度</text>
+        <text x="0" y="50" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13">约 250ms 聚合 · 快照自愈 · 协作式暂停</text>
+      </g>
+    </g>
+
+    <g id="proof-panel" transform="translate(620 36)">
+      <rect width="532" height="288" rx="16" fill="url(#panel)" stroke="#23262e" stroke-width="1.25"/>
+      <rect x="1" y="1" width="530" height="36" rx="15" fill="#0d0e13"/>
+      <circle cx="22" cy="19" r="4.5" fill="#f87171" opacity="0.9"/>
+      <circle cx="40" cy="19" r="4.5" fill="#ebbd57" opacity="0.9"/>
+      <circle cx="58" cy="19" r="4.5" fill="#49d3a1" opacity="0.9"/>
+      <text x="80" y="24" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">tachyon · task detail</text>
+      <text x="420" y="24" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">18.4 MB/s</text>
+
+      <text x="24" y="72" fill="#edeff3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="17" font-weight="600">bert-base-uncased</text>
+      <text x="24" y="94" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">hf://google-bert · 12 fragments · resume ok</text>
+
+      <rect x="24" y="112" width="484" height="10" rx="5" fill="#1a1d24"/>
+      <rect x="24" y="112" width="290" height="10" rx="5" fill="url(#vel)"/>
+      <text x="24" y="140" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">60% · 264 / 440 MB</text>
+      <text x="420" y="140" fill="#00e5ff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">ETA 00:42</text>
+
+      <g id="chunk-matrix" transform="translate(24 160)">
+        <text x="0" y="0" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">FRAGMENT MATRIX</text>
+        <rect x="0" y="14" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="48" y="14" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="96" y="14" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="144" y="14" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="192" y="14" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="240" y="14" width="40" height="24" rx="5" fill="#1a1d24" stroke="#35dde2" stroke-width="1.25"/>
+        <rect x="240" y="14" width="26" height="24" rx="5" fill="url(#fillA)"/>
+        <rect x="288" y="14" width="40" height="24" rx="5" fill="#1a1d24" stroke="#35dde2" stroke-width="1.25"/>
+        <rect x="288" y="14" width="14" height="24" rx="5" fill="url(#fillA)"/>
+        <rect x="336" y="14" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="384" y="14" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="432" y="14" width="40" height="24" rx="5" fill="#1a1d24"/>
+
+        <rect x="0" y="48" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="48" y="48" width="40" height="24" rx="5" fill="url(#fillB)"/>
+        <rect x="96" y="48" width="40" height="24" rx="5" fill="#1a1d24" stroke="#35dde2" stroke-width="1.25"/>
+        <rect x="96" y="48" width="30" height="24" rx="5" fill="url(#fillA)"/>
+        <rect x="144" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="192" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="240" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="288" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="336" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="384" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+        <rect x="432" y="48" width="40" height="24" rx="5" fill="#1a1d24"/>
+
+        <g transform="translate(0 88)">
+          <rect width="10" height="10" rx="2" fill="#14b8a6"/>
+          <text x="16" y="9" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">done</text>
+          <rect x="70" y="0" width="10" height="10" rx="2" fill="#35dde2"/>
+          <text x="86" y="9" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">active</text>
+          <rect x="148" y="0" width="10" height="10" rx="2" fill="#1a1d24" stroke="#2c3038"/>
+          <text x="164" y="9" fill="#9aa0ac" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">pending</text>
+        </g>
+      </g>
+
+      <rect x="24" y="250" width="484" height="22" rx="8" fill="#0d0e13"/>
+      <text x="36" y="265" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">io: WinFile · scheduler: Holt · hash: BLAKE3</text>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Tachyon 分层架构</title>
+  <desc id="desc">前端经 Tauri IPC 进入 tachyon-app；engine 编排 protocol、io、scheduler、crypto；core 提供共享类型与配置。</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#050608"/>
+      <stop offset="100%" stop-color="#0a0b0f"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect width="1200" height="560" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="560" fill="url(#bg)"/>
+
+    <text x="56" y="52" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" letter-spacing="2">ARCHITECTURE</text>
+    <text x="56" y="92" fill="#edeff3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="34" font-weight="700">单向依赖 · 10 crate workspace</text>
+    <text x="56" y="124" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="16">禁止跨层绕行：core → protocol/io/crypto/scheduler → engine → app</text>
+
+    <!-- L0 FE -->
+    <g transform="translate(56 156)">
+      <rect width="1088" height="54" rx="14" fill="#111319" stroke="#35dde2" stroke-width="1.5"/>
+      <text x="28" y="34" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="600">Frontend</text>
+      <text x="150" y="34" fill="#c9cdd6" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="16">SolidJS + Tailwind v4 + Bun · 任务 / 分片矩阵 / HF 浏览器 / 嗅探</text>
+    </g>
+
+    <path d="M600 210 v18" stroke="#2c3038" stroke-width="2"/>
+    <path d="M594 224 l6 10 6-10" fill="#35dde2"/>
+    <text x="620" y="228" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">Tauri IPC</text>
+
+    <!-- L1 APP -->
+    <g transform="translate(56 244)">
+      <rect width="1088" height="50" rx="14" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="28" y="31" fill="#edeff3" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600">tachyon-app</text>
+      <text x="170" y="31" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="15">命令入口 · 生命周期 · store / hub / sniffer 装配</text>
+    </g>
+
+    <path d="M600 294 v16" stroke="#2c3038" stroke-width="2"/>
+    <path d="M594 306 l6 10 6-10" fill="#35dde2"/>
+
+    <!-- L2 ENGINE + satellites -->
+    <g transform="translate(56 326)">
+      <rect width="400" height="64" rx="14" fill="#111319" stroke="#14b8a6" stroke-width="1.5"/>
+      <text x="24" y="28" fill="#14b8a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600">tachyon-engine</text>
+      <text x="24" y="48" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="13">分片规划 · 并发 · 限速 · 续传</text>
+
+      <rect x="424" y="0" width="200" height="64" rx="14" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="444" y="28" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">tachyon-store</text>
+      <text x="444" y="48" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">快照 / 文件系统 KV</text>
+
+      <rect x="648" y="0" width="208" height="64" rx="14" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="668" y="28" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">tachyon-hub</text>
+      <text x="668" y="48" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">HuggingFace API</text>
+
+      <rect x="880" y="0" width="264" height="64" rx="14" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="900" y="28" fill="#c9cdd6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">tachyon-sniffer</text>
+      <text x="900" y="48" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">浏览器资源识别</text>
+    </g>
+
+    <!-- L3 mid -->
+    <g transform="translate(56 414)">
+      <rect width="250" height="54" rx="12" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="20" y="24" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">protocol</text>
+      <text x="20" y="42" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">HTTP · magnet · HTTP3?</text>
+
+      <rect x="270" y="0" width="250" height="54" rx="12" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="290" y="24" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">io</text>
+      <text x="290" y="42" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">io_uring · IOCP · WinFile</text>
+
+      <rect x="540" y="0" width="250" height="54" rx="12" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="560" y="24" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">scheduler</text>
+      <text x="560" y="42" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">Adaptive + Holt 预测</text>
+
+      <rect x="810" y="0" width="334" height="54" rx="12" fill="#0d0e13" stroke="#2c3038"/>
+      <text x="830" y="24" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">crypto</text>
+      <text x="830" y="42" fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="12">BLAKE3 / SHA-256 流式校验</text>
+    </g>
+
+    <!-- L4 core -->
+    <g transform="translate(56 488)">
+      <rect width="1088" height="44" rx="12" fill="#111319" stroke="#35dde2" stroke-width="1.25"/>
+      <text x="28" y="28" fill="#35dde2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600">tachyon-core</text>
+      <text x="180" y="28" fill="#9aa0ac" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="14">类型 · trait · 错误 · 配置 · URL 安全 · 路径校验</text>
+    </g>
+  </g>
+</svg>
