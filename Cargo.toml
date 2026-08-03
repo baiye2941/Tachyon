@@ -108,7 +108,7 @@ http-body = "1"
 # 包装。生产代码与 workspace 成员 crate 均不直接依赖。
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13"
+rcgen = "0.14"
 # 丢包模拟:bench server 按概率丢 chunk(模拟 WAN body 截断/连接中断重试路径)
 # rand 复用 workspace 顶层声明(rand = "0.10")
 [workspace.lints.clippy]
