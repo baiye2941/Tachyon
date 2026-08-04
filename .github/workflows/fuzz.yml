@@ -60,8 +60,13 @@ jobs:
           crash=0
           for target in config_parse file_metadata http_headers ipc_deserialize magnet_parse url_safety; do
             echo "::group::Fuzz target: $target"
-            # 每个 target 运行 60 秒;crash 不中断后续 target,但记录失败
-            if ! cargo fuzz run "$target" -- -max_total_time=60; then
+            # 每个 target 运行 60 秒;crash 不中断后续 target,但记录失败。
+            # --target x86_64-unknown-linux-gnu:cargo-fuzz 官方预编译二进制内嵌
+            # musl target(current_platform 编译期常量,与运行 host 无关),默认会以
+            # `cargo build --target x86_64-unknown-linux-musl` 构建——musl std 未安装
+            # (E0463 can't find crate for core)且 ASan 与 musl 静态 libc 不兼容,
+            # 必然构建失败。显式指定 gnu target 覆盖默认值。
+            if ! cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60; then
               echo "::error::Fuzz target $target crashed"
               crash=1
             fi
