@@ -167,7 +167,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -184,7 +184,9 @@ jobs:
       - name: 安装 cargo-nextest
         run: cargo binstall -y --force --locked cargo-nextest
       - name: 运行 release 崩溃一致性测试
-        run: cargo nextest run --all --release --locked -- panic_log_e2e os_kill_resume
+        # 只构建两个 release 集成测试目标,避免 --all 额外编译整个 workspace 的
+        # release 测试二进制,Windows runner 在 20 分钟内因编译超时被取消。
+        run: cargo nextest run -p tachyon-app --test panic_log_e2e -p tachyon-engine --test os_kill_resume --release --locked
 
   docs:
     name: 文档构建
@@ -422,6 +424,9 @@ jobs:
     needs: [changes]
     if: github.event_name == 'pull_request' && needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
+    # 性能采样受共享 runner、网络/磁盘抖动影响,仅供人工排查,不应让正确性 CI 标红。
+    # bench 不在 ci-pass needs 中,关键门禁仍由独立测试/覆盖率/安全作业负责。
+    continue-on-error: true
     timeout-minutes: 30
     env:
       # ci 模式:与 bench job 一致的缩减采样

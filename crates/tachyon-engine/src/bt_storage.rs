@@ -509,6 +509,8 @@ impl Clone for TachyonStorageFactory {
 mod tests {
     use super::*;
 
+    mod extra;
+
     /// 内存 AsyncStorage 测试实现
     struct InMemStorage {
         data: parking_lot::RwLock<Vec<u8>>,

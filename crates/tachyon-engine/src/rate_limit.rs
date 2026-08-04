@@ -182,6 +182,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    mod extra;
+
     #[tokio::test]
     async fn acquire_zero_bytes_returns_immediately() {
         let limiter = RateLimiter::new(1024);

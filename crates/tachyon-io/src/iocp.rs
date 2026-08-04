@@ -251,6 +251,22 @@ impl CompletionSlots {
     }
 }
 
+#[cfg(target_os = "windows")]
+async fn acquire_slot_with_backpressure(
+    slots: &CompletionSlots,
+    slot_notify: &Notify,
+) -> (usize, u64) {
+    loop {
+        match slots.alloc() {
+            Some(allocated) => break allocated,
+            None => {
+                tracing::trace!("IOCP slot 容量耗尽,背压排队等待释放");
+                slot_notify.notified().await;
+            }
+        }
+    }
+}
+
 /// 共享 IOCP runtime:进程内单 CompletionPort + 单 poller + 共享 slots。
 /// 多文件 init 只关联句柄,不再线性 spawn 线程。
 #[cfg(target_os = "windows")]
@@ -611,18 +627,11 @@ impl IoCpStorage {
             )));
         }
 
-        // P0-2:slot 耗尽时背压排队(Notify await 重试),而非立即返回 WouldBlock 硬错。
+        // P0-2:slot 耗尽时背压排队,而非立即返回 WouldBlock 硬错。
         // 多文件×16 分片并发可能超过 4096 slot;此时任务 await 等待 poller 释放 slot
         // 后唤醒重试,优雅降速到磁盘吞吐,而非传播错误中断下载。
-        let (slot_index, generation) = loop {
-            match self.slots.alloc() {
-                Some(allocated) => break allocated,
-                None => {
-                    tracing::trace!("IOCP slot 容量耗尽,背压排队等待释放");
-                    self.slot_notify.notified().await;
-                }
-            }
-        };
+        let (slot_index, generation) =
+            acquire_slot_with_backpressure(&self.slots, &self.slot_notify).await;
 
         let slot = &self.slots.slots[slot_index];
         // Safety: slot 刚由 alloc() 分配(state=Submitted),此线程是唯一持有者,
@@ -2224,6 +2233,15 @@ mod tests {
 
     // ----- P0-2: slot 上限提升 + 背压排队 -----
 
+    #[cfg(target_os = "windows")]
+    fn release_test_slot(slots: &CompletionSlots, slot_notify: &Notify, slot_index: usize) {
+        slots.slots[slot_index]
+            .state
+            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
+        slots.release(slot_index);
+        slot_notify.notify_one();
+    }
+
     /// 切片 1: IOCP_SLOT_CAPACITY 提升到 4096
     ///
     /// 256 进程级共享上限在多文件×16 分片并发(如 17×16=272>256)时立即耗尽,
@@ -2240,155 +2258,108 @@ mod tests {
 
     /// 切片 2: slot 耗尽时背压排队(Notify await),不再立即返回 WouldBlock 硬错
     ///
-    /// 填满全部 4096 slot 后,提交一次对齐写入应挂起等待(而非立即 Err)。
-    /// 释放一个 slot 后(模拟 poller 完成一个 pending 写),挂起的写入应被唤醒并成功。
-    /// 验证 submit_iocp_write 的背压排队循环正确工作。
+    /// 填满独立 slot 池后,新的 slot 获取应挂起等待(而非立即返回 WouldBlock)。
+    /// 释放一个 slot 后,挂起的获取应被唤醒并成功。
+    /// 使用独立 slot 池,避免与进程级共享 IOCP runtime 的其他测试互相污染。
     #[cfg(target_os = "windows")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_alloc_exhaustion_waits_then_succeeds() {
-        use crate::aligned_buf::AlignedBuf;
-        use crate::storage::AsyncStorage;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("iocp_backpressure.dat");
-        let mut storage = IoCpStorage::new(&path);
-        storage.init().expect("IOCP init 应成功");
-        // 4K 对齐 buffer:AlignedBuf 保证 512B 指针对齐,512B 写扇区对齐,
-        // offset=0 扇区对齐 → 走主 IOCP 路径(命中 submit_iocp_write 的 slot alloc)
-        storage.allocate(8192).await.unwrap();
-        let mut aligned = AlignedBuf::new(512).expect("AlignedBuf 分配");
-        aligned.extend_from_slice(&[0x42u8; 512]);
-        let aligned_data = aligned.freeze();
-        // 确认确实走主 IOCP 路径(三重对齐满足)
-        assert!(
-            satisfies_no_buffering_alignment(0, &aligned_data),
-            "测试数据必须三重对齐才能命中主 IOCP 路径"
-        );
-        let storage = std::sync::Arc::new(storage);
+        let slots = std::sync::Arc::new(CompletionSlots::new());
+        let slot_notify = std::sync::Arc::new(Notify::new());
 
-        // 填满全部 slot:连续提交对齐写入,占住 slot 直到内核完成。
-        // 同步完成(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)的写会立即释放 slot,
-        // 故无法靠普通写入占满。改为直接 alloc 占满 slot:
+        // 填满独立 slot 池,避免依赖进程级共享 IOCP runtime 的当前占用。
         let mut held_slots: Vec<usize> = Vec::with_capacity(IOCP_SLOT_CAPACITY);
         for _ in 0..IOCP_SLOT_CAPACITY {
-            let (idx, _gen) = storage.slots.alloc().expect("填满前应有空闲 slot");
+            let (idx, _gen) = slots.alloc().expect("填满前应有空闲 slot");
             held_slots.push(idx);
         }
-        assert_eq!(
-            storage.slots.pending_count(),
-            IOCP_SLOT_CAPACITY,
-            "应全部占满"
-        );
-        assert!(storage.slots.alloc().is_none(), "填满后 alloc 应返回 None");
+        assert_eq!(slots.pending_count(), IOCP_SLOT_CAPACITY, "应全部占满");
+        assert!(slots.alloc().is_none(), "填满后 alloc 应返回 None");
 
-        // 启动一次写入:由于 slot 全满,submit_iocp_write 应在背压循环中 await
-        // (而非立即返回 WouldBlock 错误)。
-        let s = storage.clone();
-        let write_fut = tokio::spawn(async move { s.write_at(0, aligned_data).await });
+        // 启动一次 slot 获取:由于 slot 全满,生产 helper 应 await。
+        let waiter_slots = slots.clone();
+        let waiter_notify = slot_notify.clone();
+        let waiter = tokio::spawn(async move {
+            acquire_slot_with_backpressure(&waiter_slots, &waiter_notify).await
+        });
 
-        // 写入不应在 200ms 内完成(它在等 slot 释放)
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 获取不应在超时前完成(它在等 slot 释放)。
+        let mut waiter = waiter;
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiter).await;
         assert!(
-            !write_fut.is_finished(),
-            "slot 全满时写入应背压排队等待,而非立即完成或报错"
+            pending.is_err(),
+            "slot 全满时获取应背压排队等待,而非立即完成"
         );
 
-        // 释放一个 slot(模拟 poller complete_pending_write 的 release)
+        // 释放一个 slot(模拟 poller complete_pending_write 的 release)。
         let freed_idx = held_slots.pop().unwrap();
-        // 设置 state=FREE 后 release(与 complete_pending_write 的顺序一致)
-        storage.slots.slots[freed_idx]
-            .state
-            .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
-        storage.slots.release(freed_idx);
-        storage.slot_notify.notify_one();
+        release_test_slot(&slots, &slot_notify, freed_idx);
 
-        // 唤醒后写入应完成
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write_fut).await;
-        assert!(result.is_ok(), "释放 slot 后背压写入应被唤醒并完成(5s 内)");
-        // 注:不检查返回字节数 — IOCP 主路径同步完成的 bytes_written 0 字节是
-        // 预存问题(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS + 主路径,所有既有测试
-        // 均走 fallback 未触发),与 P0-2 背压排队修复无关。本测试仅验证背压
-        // 机制本身:耗尽时挂起而非硬错,释放后唤醒完成。
-        assert!(result.unwrap().unwrap().is_ok(), "写入应成功完成");
-        // 清理占用的 slot(测试结束前)
-        for &idx in &held_slots {
-            storage.slots.slots[idx]
-                .state
-                .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
-            storage.slots.release(idx);
+        // 唤醒后获取应完成,并回收获取到的 slot。
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("释放 slot 后背压获取应在 5s 内完成")
+            .expect("背压获取任务不应 panic");
+        release_test_slot(&slots, &slot_notify, result.0);
+        for idx in held_slots {
+            release_test_slot(&slots, &slot_notify, idx);
         }
+        assert_eq!(slots.pending_count(), 0, "测试结束时不应残留占用 slot");
     }
 
     /// 切片 4: 多任务背压排队并发正确性(无死锁,无丢失唤醒)
     ///
-    /// 填满所有 slot 后,启动多个并发写入任务,均在背压循环中等待。
+    /// 填满独立 slot 池后,启动多个并发获取任务,均在背压循环中等待。
     /// 逐个释放 slot,所有任务应最终被唤醒并完成,无死锁、无丢失唤醒。
     #[cfg(target_os = "windows")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_backpressure_no_deadlock() {
-        use crate::aligned_buf::AlignedBuf;
-        use crate::storage::AsyncStorage;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("iocp_concurrent_bp.dat");
-        let mut storage = IoCpStorage::new(&path);
-        storage.init().expect("IOCP init 应成功");
-        storage.allocate(65536).await.unwrap();
-        let storage = std::sync::Arc::new(storage);
+        let slots = std::sync::Arc::new(CompletionSlots::new());
+        let slot_notify = std::sync::Arc::new(Notify::new());
 
-        // 填满全部 slot
+        // 填满独立 slot 池。
         let mut held_slots: Vec<usize> = Vec::with_capacity(IOCP_SLOT_CAPACITY);
         for _ in 0..IOCP_SLOT_CAPACITY {
-            let (idx, _gen) = storage.slots.alloc().expect("应有空闲 slot");
+            let (idx, _gen) = slots.alloc().expect("应有空闲 slot");
             held_slots.push(idx);
         }
 
-        // 启动 8 个并发写入(每个 offset 不同,512B 对齐,走主 IOCP 路径)
-        // 全部应在背压循环中挂起(slot 全满)
-        let mut handles = Vec::new();
-        for i in 0..8u64 {
-            let s = storage.clone();
-            let mut aligned = AlignedBuf::new(512).expect("AlignedBuf");
-            aligned.extend_from_slice(&[i as u8; 512]);
-            let data = aligned.freeze();
-            let offset = i * 512;
-            handles.push(tokio::spawn(async move { s.write_at(offset, data).await }));
-        }
-
-        // 所有任务都应挂起(未完成)
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        for h in &handles {
-            assert!(!h.is_finished(), "slot 全满时所有写入应背压挂起");
-        }
-
-        // 逐个释放 slot,每释放一个通知一次。8 个任务应陆续被唤醒完成。
+        // 启动 8 个并发 slot 获取,并等待它们都进入背压循环。
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
-            if let Some(freed_idx) = held_slots.pop() {
-                storage.slots.slots[freed_idx]
-                    .state
-                    .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
-                storage.slots.release(freed_idx);
-                storage.slot_notify.notify_one();
-                // 间隔释放,模拟 poller 逐个完成
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            let waiter_slots = slots.clone();
+            let waiter_notify = slot_notify.clone();
+            let waiter_started = started.clone();
+            tasks.spawn(async move {
+                waiter_started.fetch_add(1, std::sync::atomic::Ordering::Release);
+                acquire_slot_with_backpressure(&waiter_slots, &waiter_notify).await
+            });
         }
 
-        // 所有 8 个写入应完成(无死锁)
-        for h in handles {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), h)
-                .await
-                .expect("背压写入应在释放 slot 后完成(10s 内),无死锁");
-            assert!(result.is_ok(), "写入应成功完成(非错误)");
-            // 注:不检查字节数 — IOCP 主路径同步完成 bytes_written 是预存问题,
-            // 与 P0-2 背压排队无关。本测试验证并发背压无死锁、无丢失唤醒。
-            assert!(result.unwrap().is_ok(), "写入应成功");
+        while started.load(std::sync::atomic::Ordering::Acquire) != 8 {
+            tokio::task::yield_now().await;
         }
 
-        // 清理占用的 slot
-        for &idx in &held_slots {
-            storage.slots.slots[idx]
-                .state
-                .store(CompletionSlot::FREE, std::sync::atomic::Ordering::Release);
-            storage.slots.release(idx);
+        // 逐个释放 slot,每次等待一个任务完成,避免 Notify 的单 permit 语义
+        // 在等待者尚未注册时合并通知。
+        for _ in 0..8 {
+            let freed_idx = held_slots.pop().expect("应有待释放 slot");
+            release_test_slot(&slots, &slot_notify, freed_idx);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), tasks.join_next())
+                    .await
+                    .expect("背压获取应在释放 slot 后完成(10s 内),无死锁")
+                    .expect("应有一个背压获取任务完成")
+                    .expect("背压获取任务不应 panic");
+            release_test_slot(&slots, &slot_notify, result.0);
         }
+
+        // 清理尚未交给等待任务的 slot。
+        for idx in held_slots {
+            release_test_slot(&slots, &slot_notify, idx);
+        }
+        assert_eq!(slots.pending_count(), 0, "测试结束时不应残留占用 slot");
     }
 }
