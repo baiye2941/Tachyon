@@ -1,4 +1,4 @@
-﻿//! 并发分片下载执行器
+//! 并发分片下载执行器
 //!
 //! 从 downloader.rs 拆分:execute / execute_full_download /
 //! execute_fragmented_download / spawn_fragment_task / download_single_fragment /
@@ -3021,3 +3021,7 @@ impl DownloadTask {
         Ok((total_written, elapsed, computed_hash))
     }
 }
+
+#[cfg(test)]
+#[path = "download_executor_tests.rs"]
+mod tests;

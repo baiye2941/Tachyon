@@ -182,6 +182,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[path = "../../rate_limit_extra_tests.rs"]
+    mod extra;
+
     #[tokio::test]
     async fn acquire_zero_bytes_returns_immediately() {
         let limiter = RateLimiter::new(1024);

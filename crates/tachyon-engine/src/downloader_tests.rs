@@ -11775,3 +11775,592 @@ async fn test_plan_bt_uses_small_fragment_formula() {
         frags.len()
     );
 }
+
+#[derive(Clone)]
+struct RetryFullStreamProtocol {
+    meta: FileMetadata,
+    chunks: Vec<Bytes>,
+    fail_first: bool,
+    attempts: Arc<AtomicU32>,
+}
+
+impl Protocol for RetryFullStreamProtocol {
+    fn probe(
+        &self,
+        _url: &str,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<FileMetadata>> + Send>> {
+        let meta = self.meta.clone();
+        Box::pin(async move { Ok(meta) })
+    }
+
+    fn download_range(
+        &self,
+        _url: &str,
+        _start: u64,
+        _end: u64,
+        _identity: Option<ObjectIdentity>,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+        Box::pin(async { Err(DownloadError::Protocol("不应调用 range".into())) })
+    }
+
+    fn download_range_stream(
+        &self,
+        _url: &str,
+        _start: u64,
+        _end: u64,
+        _identity: Option<ObjectIdentity>,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+        Box::pin(async { Err(DownloadError::Protocol("不应调用 range stream".into())) })
+    }
+
+    fn download_full(
+        &self,
+        _url: &str,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<Bytes>> + Send>> {
+        Box::pin(async { Err(DownloadError::Protocol("不应调用 full".into())) })
+    }
+
+    fn download_full_stream(
+        &self,
+        _url: &str,
+    ) -> Pin<Box<dyn Future<Output = DownloadResult<ByteStream>> + Send>> {
+        let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+        let chunks = self.chunks.clone();
+        if self.fail_first && attempt == 0 {
+            return Box::pin(async {
+                Err(DownloadError::Throttled {
+                    retry_after_secs: Some(0),
+                })
+            });
+        }
+        Box::pin(async move {
+            let items = chunks.into_iter().map(Ok).collect::<Vec<_>>();
+            Ok(Box::pin(futures::stream::iter(items)) as ByteStream)
+        })
+    }
+}
+
+fn full_metadata(name: &str, size: u64) -> FileMetadata {
+    FileMetadata {
+        file_name: name.into(),
+        file_size: Some(size),
+        content_type: None,
+        supports_range: false,
+        etag: None,
+        last_modified: None,
+        file_layout: None,
+        protocol_managed_storage: false,
+        resolved_host: None,
+    }
+}
+
+#[tokio::test]
+async fn test_full_download_retry_after_resets_and_retries() {
+    let payload = Bytes::from_static(b"retry-after-full-download");
+    let attempts = Arc::new(AtomicU32::new(0));
+    let protocol: Arc<dyn Protocol> = Arc::new(RetryFullStreamProtocol {
+        meta: full_metadata("retry-full.bin", payload.len() as u64),
+        chunks: vec![payload.clone()],
+        fail_first: true,
+        attempts: attempts.clone(),
+    });
+    let mut task = make_task(
+        protocol,
+        StorageKind::memory_with_capacity(payload.len()),
+        DownloadConfig {
+            max_retries: 1,
+            verify_checksum: false,
+            ..test_config()
+        },
+    );
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(8);
+    task.set_progress_sender(progress_tx);
+
+    task.run().await.expect("整块限流重试后应成功");
+    assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(task.state(), DownloadState::Completed);
+    assert!(
+        std::iter::from_fn(|| progress_rx.try_recv().ok()).any(|event| matches!(
+            event,
+            FragmentProgress::Retry {
+                fragment_index: 0,
+                attempt: 1
+            }
+        )),
+        "整块重试应发送 Retry 事件"
+    );
+}
+
+#[tokio::test]
+async fn test_full_download_large_aligned_and_unaligned_chunks() {
+    let prefix = Bytes::from_static(b"prefix");
+    let aligned_len = WRITE_BATCH_BYTES;
+    let unaligned_len = WRITE_BATCH_BYTES + 17;
+    let mut aligned = AlignedBuf::new(aligned_len).expect("分配对齐缓冲区");
+    aligned.extend_from_slice(&vec![0x11; aligned_len]);
+    let aligned = aligned.freeze();
+    assert!(
+        tachyon_io::satisfies_no_buffering_alignment(0, &aligned),
+        "AlignedBuf 应命中整块直写对齐路径"
+    );
+    let unaligned = Bytes::from(vec![0x22; unaligned_len]);
+    let total = prefix.len() + aligned.len() + unaligned.len();
+    let protocol: Arc<dyn Protocol> = Arc::new(MultiChunkFullProtocol {
+        meta: full_metadata("large-full.bin", total as u64),
+        chunks: vec![prefix, aligned, unaligned],
+    });
+    let storage = StorageKind::memory_with_capacity(total);
+    let mut task = make_task(
+        protocol,
+        storage,
+        DownloadConfig {
+            verify_checksum: false,
+            ..test_config()
+        },
+    );
+
+    task.run().await.expect("整块大块路径应成功");
+    assert_eq!(task.state(), DownloadState::Completed);
+}
+
+#[tokio::test]
+async fn test_full_download_rejects_overlong_and_incomplete_payloads() {
+    for (name, expected, chunks) in [
+        (
+            "overlong-full.bin",
+            8u64,
+            vec![Bytes::from_static(b"123456789")],
+        ),
+        ("short-full.bin", 8u64, vec![Bytes::from_static(b"1234")]),
+    ] {
+        let protocol: Arc<dyn Protocol> = Arc::new(MultiChunkFullProtocol {
+            meta: full_metadata(name, expected),
+            chunks,
+        });
+        let mut task = make_task(
+            protocol,
+            StorageKind::memory_with_capacity(expected as usize),
+            DownloadConfig {
+                max_retries: 0,
+                verify_checksum: false,
+                ..test_config()
+            },
+        );
+        let result = task.run().await;
+        assert!(result.is_err(), "{name} 应拒绝长度不匹配响应");
+        assert_eq!(task.state(), DownloadState::Failed);
+    }
+}
+
+#[tokio::test]
+async fn test_execute_rejects_missing_metadata_and_zero_concurrency() {
+    let mut no_metadata = make_task(
+        Arc::new(MockProto::new(test_metadata("missing.bin", 10))),
+        StorageKind::memory_with_capacity(10),
+        test_config(),
+    );
+    assert!(no_metadata.execute().await.is_err());
+
+    let mut zero_concurrency = make_task(
+        Arc::new(MockProto::new(test_metadata("zero.bin", 100))),
+        StorageKind::memory_with_capacity(100),
+        DownloadConfig {
+            max_concurrent_fragments: 0,
+            verify_checksum: false,
+            ..test_config()
+        },
+    );
+    zero_concurrency.scheduler_config = tachyon_core::config::SchedulerConfig {
+        min_fragment_size: 50,
+        max_fragment_size: 50,
+        ..Default::default()
+    };
+    zero_concurrency.probe().await.unwrap();
+    zero_concurrency.plan().unwrap();
+    zero_concurrency.prepare_storage().await.unwrap();
+    let error = zero_concurrency
+        .execute()
+        .await
+        .expect_err("并发度为 0 必须拒绝执行");
+    assert!(error.to_string().contains("max_concurrent_fragments"));
+}
+
+#[tokio::test]
+async fn test_protocol_managed_fragments_skip_engine_storage_write() {
+    let frag_size = 64u64;
+    let total = frag_size * 2;
+    let meta = FileMetadata {
+        protocol_managed_storage: true,
+        supports_range: true,
+        ..test_metadata("managed.bin", total)
+    };
+    let protocol: Arc<dyn Protocol> = Arc::new(
+        MockProto::new(meta)
+            .with_range_data(
+                0,
+                frag_size - 1,
+                Bytes::from(vec![0x31; frag_size as usize]),
+            )
+            .with_range_data(
+                frag_size,
+                total - 1,
+                Bytes::from(vec![0x32; frag_size as usize]),
+            ),
+    );
+    let memory = MemStorage::with_capacity(total as usize);
+    let storage = StorageKind::new(memory.clone());
+    let mut task = DownloadTask::new_for_test(
+        "http://example.com/managed.bin".into(),
+        DownloadConfig {
+            max_concurrent_fragments: 2,
+            verify_checksum: false,
+            ..test_config()
+        },
+        protocol,
+        storage,
+    );
+    task.scheduler_config = tachyon_core::config::SchedulerConfig {
+        min_fragment_size: frag_size,
+        max_fragment_size: frag_size,
+        ..Default::default()
+    };
+
+    task.probe().await.unwrap();
+    task.plan().unwrap();
+    task.prepare_storage().await.unwrap();
+    task.execute().await.expect("协议托管存储路径应完成");
+    assert_eq!(task.state(), DownloadState::Completed);
+    assert!(
+        memory.get_data().iter().all(|byte| *byte == 0),
+        "protocol_managed_storage=true 时引擎不应重复写入 StorageSet"
+    );
+}
+
+#[tokio::test]
+async fn test_write_all_at_zero_progress_returns_error() {
+    let storage = StorageSet::single(StorageKind::new(ShortWriteStorage::with_capacity(16, 0)));
+    let error = DownloadTask::write_all_at(
+        &storage,
+        0,
+        Bytes::from_static(b"zero-progress"),
+        &mut None,
+        Duration::ZERO,
+        None,
+    )
+    .await
+    .expect_err("零进度写入必须失败");
+    assert!(error.to_string().contains("未前进"));
+}
+
+#[test]
+fn test_take_clamped_write_buf_empty_and_overflow() {
+    let mut empty = AlignedBuf::new(64).unwrap();
+    assert!(DownloadTask::take_clamped_write_buf(0, 10, &mut empty).is_none());
+
+    let mut overflow = AlignedBuf::new(64).unwrap();
+    overflow.extend_from_slice(&[1; 8]);
+    assert!(DownloadTask::take_clamped_write_buf(0, u64::MAX, &mut overflow).is_none());
+    assert!(overflow.is_empty());
+}
+
+#[tokio::test]
+async fn test_fragment_circuit_open_retries_without_holding_slot() {
+    let frag_size = 100u64;
+    let total = frag_size * 2;
+    let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+        meta: test_metadata("circuit-open.bin", total),
+        frag_size,
+        fail_start: u64::MAX,
+        fail_times: 0,
+        attempts: Arc::new(AtomicU32::new(0)),
+    });
+    let mut task = flaky_task(protocol, total, frag_size, 1);
+    task.circuit_breakers = SourceCircuitBreakers::new(1, Duration::from_secs(30));
+    task.circuit_breakers.record_failure(task.url());
+
+    task.probe().await.unwrap();
+    task.plan().unwrap();
+    task.prepare_storage().await.unwrap();
+    let result = task.execute().await;
+    assert!(result.is_err(), "持续熔断的源应在重试预算耗尽后失败");
+    assert_eq!(task.state(), DownloadState::Failed);
+}
+
+#[tokio::test]
+async fn test_remote_proxy_fragment_download_uses_range_windows() {
+    const MIB: u64 = 1024 * 1024;
+    let total = 8 * MIB;
+    let frag_size = 4 * MIB;
+    let protocol: Arc<dyn Protocol> = Arc::new(FlakyFragmentProtocol {
+        meta: test_metadata("proxy-window.bin", total),
+        frag_size,
+        fail_start: u64::MAX,
+        fail_times: 0,
+        attempts: Arc::new(AtomicU32::new(0)),
+    });
+    let mut task = flaky_task(protocol, total, frag_size, 0);
+    task.config.proxy = Some("http://remote-proxy.example.com:8080".into());
+    task.scheduler_config = tachyon_core::config::SchedulerConfig {
+        min_fragment_size: frag_size,
+        max_fragment_size: frag_size,
+        sampling_interval_secs: 60,
+        ..Default::default()
+    };
+
+    task.probe().await.unwrap();
+    task.plan().unwrap();
+    assert_eq!(task.fragments.len(), 2, "应规划为两个 4MiB 分片");
+    task.prepare_storage().await.unwrap();
+    task.execute()
+        .await
+        .expect("远程代理片内 Range 窗口下载应完成");
+    assert_eq!(task.state(), DownloadState::Completed);
+}
+
+#[tokio::test]
+async fn test_execute_full_download_requires_initialized_storage() {
+    let payload = Bytes::from_static(b"storage must exist");
+    let protocol: Arc<dyn Protocol> = Arc::new(MultiChunkFullProtocol {
+        meta: full_metadata("missing-storage.bin", payload.len() as u64),
+        chunks: vec![payload],
+    });
+    let mut task = make_task(protocol, StorageKind::memory(), test_config());
+    task.probe().await.unwrap();
+    task.plan().unwrap();
+    task.storage = None;
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("未初始化 storage 时整块下载必须失败");
+    assert!(error.to_string().contains("存储未初始化"));
+}
+
+#[tokio::test]
+async fn test_execute_pause_branch_requeues_fragments_after_resume() {
+    let frag_size = 128u64;
+    let total = frag_size * 2;
+    let mut mock = MockProto::new(test_metadata("execute-pause.bin", total))
+        .with_chunk_size(16)
+        .with_chunk_delay(Duration::from_millis(40));
+    for i in 0..2u64 {
+        let start = i * frag_size;
+        mock = mock.with_range_data(
+            start,
+            start + frag_size - 1,
+            Bytes::from(vec![0x40 + i as u8; frag_size as usize]),
+        );
+    }
+    let mut task = make_task(
+        Arc::new(mock),
+        StorageKind::memory_with_capacity(total as usize),
+        DownloadConfig {
+            max_concurrent_fragments: 1,
+            verify_checksum: false,
+            ..test_config()
+        },
+    );
+    task.scheduler_config = tachyon_core::config::SchedulerConfig {
+        min_fragment_size: frag_size,
+        max_fragment_size: frag_size,
+        ..Default::default()
+    };
+    task.probe().await.unwrap();
+    task.plan().unwrap();
+    task.prepare_storage().await.unwrap();
+
+    let (tx, rx) = watch::channel(TaskCommand::Start);
+    task.set_control_rx(rx);
+    let handle = tokio::spawn(async move {
+        let result = task.execute().await;
+        (task, result)
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tx.send(TaskCommand::Pause).expect("发送 Pause");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send(TaskCommand::Resume).expect("发送 Resume");
+
+    let (task, result) = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("Resume 后 execute 应完成")
+        .expect("execute 任务不应 panic");
+    result.expect("Pause 分支重新入队后应成功");
+    assert_eq!(task.state(), DownloadState::Completed);
+}
+
+#[tokio::test]
+async fn test_verify_task_checksum_uses_fragment_size_and_stops_at_eof() {
+    let payload = Bytes::from_static(b"task checksum payload");
+    let checksum = CpuVerifier::blake3().compute_hash(&payload).unwrap();
+    let info = FragmentInfo {
+        index: 0,
+        start: 0,
+        end: payload.len() as u64 - 1,
+        size: payload.len() as u64,
+        downloaded: payload.len() as u64,
+        hash: None,
+    };
+
+    let mut task = make_task(
+        Arc::new(MockProto::new(test_metadata("task-checksum.bin", 0))),
+        StorageKind::memory_with_capacity(payload.len()),
+        DownloadConfig {
+            verify_checksum: true,
+            verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+            ..test_config()
+        },
+    );
+    task.storage
+        .as_ref()
+        .unwrap()
+        .write_at(0, payload.clone())
+        .await
+        .unwrap();
+    task.metadata = Some(FileMetadata {
+        file_name: "task-checksum.bin".into(),
+        file_size: None,
+        content_type: None,
+        supports_range: true,
+        etag: None,
+        last_modified: None,
+        file_layout: None,
+        protocol_managed_storage: false,
+        resolved_host: None,
+    });
+    task.fragments = vec![FragmentRecord::new(info.clone(), 0)];
+    task.set_expected_checksum(Some(checksum.clone()));
+    task.verify()
+        .await
+        .expect("metadata 无 file_size 时应回退分片 size 求和");
+
+    let mut short_task = make_task(
+        Arc::new(MockProto::new(test_metadata("short-checksum.bin", 0))),
+        StorageKind::memory_with_capacity(payload.len()),
+        DownloadConfig {
+            verify_checksum: true,
+            verify_strategy: tachyon_core::config::VerifyStrategy::BestEffort,
+            ..test_config()
+        },
+    );
+    short_task
+        .storage
+        .as_ref()
+        .unwrap()
+        .write_at(0, payload)
+        .await
+        .unwrap();
+    short_task.metadata = Some(FileMetadata {
+        file_name: "short-checksum.bin".into(),
+        file_size: Some(info.size + 1),
+        content_type: None,
+        supports_range: true,
+        etag: None,
+        last_modified: None,
+        file_layout: None,
+        protocol_managed_storage: false,
+        resolved_host: None,
+    });
+    short_task.fragments = vec![FragmentRecord::new(info, 0)];
+    short_task.set_expected_checksum(Some(checksum));
+    short_task
+        .verify()
+        .await
+        .expect("任务级校验应在 EOF 后结束并校验已读字节");
+}
+
+#[tokio::test]
+async fn test_with_protocol_constructs_injected_task() {
+    let task = DownloadTask::with_protocol(
+        "http://example.com/injected.bin".into(),
+        test_config(),
+        None,
+        Arc::new(AdaptiveDownloadScheduler::default_config()),
+        Arc::new(MockProto::new(test_metadata("injected.bin", 16))),
+    )
+    .await
+    .expect("with_protocol 应构造测试任务");
+    assert_eq!(task.state(), DownloadState::Pending);
+    assert_eq!(task.url(), "http://example.com/injected.bin");
+    assert!(task.metadata().is_none());
+}
+
+#[tokio::test]
+async fn test_sha256_file_and_default_sha256_verifier() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"sha256 coverage").unwrap();
+    let from_file = sha256_file(file.path(), 3)
+        .await
+        .expect("sha256_file 应成功");
+    let verifier = default_sha256_verifier();
+    let expected = verifier.compute_hash(b"sha256 coverage").unwrap();
+    assert_eq!(from_file, expected);
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn test_convenience_constructors_use_default_scheduler_paths() {
+    let with_scheduler = DownloadTask::with_scheduler(
+        "http://example.com/with-scheduler.bin".into(),
+        test_config(),
+        Arc::new(AdaptiveDownloadScheduler::default_config()),
+    )
+    .await
+    .expect("with_scheduler 应构造成功");
+    assert_eq!(with_scheduler.state(), DownloadState::Pending);
+
+    let with_pool = DownloadTask::with_pool(
+        "http://example.com/with-pool.bin".into(),
+        test_config(),
+        None,
+    )
+    .await
+    .expect("with_pool 应构造成功");
+    assert_eq!(with_pool.state(), DownloadState::Pending);
+}
+
+#[cfg(feature = "magnet")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_magnet_auto_web_seed_selects_hybrid_or_http_path() {
+    use crate::bt_session::BtSession;
+    use tachyon_core::config::MagnetConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bt_session = Arc::new(
+        BtSession::new(
+            dir.path().to_path_buf(),
+            MagnetConfig {
+                enable_dht: false,
+                enable_upnp: false,
+                disable_dht_persistence: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("BtSession 应创建成功"),
+    );
+    let mut config = test_config();
+    config.download_dir = dir.path().to_string_lossy().into_owned();
+    config.authorized_dirs = vec![config.download_dir.clone()];
+
+    let hybrid = DownloadTask::with_magnet_auto_web_seeds(
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&ws=http://mirror.example.com/file.bin".into(),
+        config.clone(),
+        None,
+        Arc::new(AdaptiveDownloadScheduler::default_config()),
+        bt_session.clone(),
+    )
+    .await
+    .expect("包含 web seed 的磁力链接应创建混合任务");
+    assert!(hybrid.has_mirrors);
+
+    let http = DownloadTask::with_magnet_auto_web_seeds(
+        "https://example.com/file.bin".into(),
+        config,
+        None,
+        Arc::new(AdaptiveDownloadScheduler::default_config()),
+        bt_session,
+    )
+    .await
+    .expect("无 web seed 的 HTTP URL 应回退普通 HTTP 构造");
+    assert!(!http.has_mirrors);
+}
