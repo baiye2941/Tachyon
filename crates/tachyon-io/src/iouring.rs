@@ -3061,18 +3061,27 @@ mod tests {
             r2.expect("RMW-B write_at(4096) 应成功");
 
             // 验证:两段数据都应可读回(C1 修复前 B 的数据会被 A 的 truncate 截掉)
-            let mut block_a = vec![0u8; 100];
-            storage.read_at(0, &mut block_a).await.expect("read A");
+            // io_uring O_DIRECT 读要求 offset/length 均按 4096 对齐,故读整块后断言
+            // 前 100 字节(非对齐 100B 读会被 validate_odirect_alignment 拒绝)。
+            let mut block_a = vec![0u8; 4096];
+            let n_a = storage.read_at(0, &mut block_a).await.expect("read A");
+            assert_eq!(n_a, 4096, "round {round}: [0,4096) 应完整读回");
             assert!(
-                block_a.iter().all(|&b| b == 0xAA),
+                block_a[..100].iter().all(|&b| b == 0xAA),
                 "round {round}: [0,100) 应为 0xAA,实际 {:?}",
                 &block_a[..16]
             );
 
-            let mut block_b = vec![0u8; 100];
-            storage.read_at(4096, &mut block_b).await.expect("read B");
+            // RMW-B padded_end=8192,但 truncate 收尾到 max(100, 4200)=4200,
+            // 读 [4096,8192) 会短读到 EOF:4200-4096=104 字节。
+            let mut block_b = vec![0u8; 4096];
+            let n_b = storage.read_at(4096, &mut block_b).await.expect("read B");
+            assert_eq!(
+                n_b, 104,
+                "round {round}: [4096,8192) 应短读到 EOF(104 字节)"
+            );
             assert!(
-                block_b.iter().all(|&b| b == 0xBB),
+                block_b[..100].iter().all(|&b| b == 0xBB),
                 "round {round}: [4096,4196) 应为 0xBB(不应被截断),实际 {:?}",
                 &block_b[..16]
             );
