@@ -3413,6 +3413,37 @@ mod tests {
         storage.close().await.expect("close");
     }
 
+    /// sync 成功路径覆盖:submit_sync → Fsync SQE → CQE → drain Sync 分发。
+    ///
+    /// submit_sync 是 io_uring Fsync 路径,此前无任何测试调用 sync(),该路径
+    /// (含 drain_completions 的 InflightReq::Sync 分支)零覆盖。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sync_success_path_via_fsync() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("iouring_sync.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+
+        // 先写一数据再 sync:覆盖 submit_sync 的完整 Fsync 提交-完成路径
+        storage
+            .write_at(0, Bytes::from(vec![0x33u8; 4096]))
+            .await
+            .expect("write_at 应成功");
+        storage.sync().await.expect("sync 应成功");
+
+        // sync 后数据可读回
+        let mut buf = vec![0u8; 4096];
+        let n = storage.read_at(0, &mut buf).await.expect("read_at");
+        assert_eq!(n, 4096);
+        assert!(buf.iter().all(|&b| b == 0x33), "数据应完整落盘");
+
+        storage.close().await.expect("close");
+    }
+
     /// F-04: IoUringStorage::drop 应在 abort driver task 后调用 pool.reset()。
     ///
     /// 契约:`Drop for IoUringStorage` 在 abort driver task 后,对 pool 调用
