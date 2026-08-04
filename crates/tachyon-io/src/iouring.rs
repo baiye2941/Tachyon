@@ -3480,8 +3480,10 @@ mod tests {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
-        // 非对齐写入:offset=100 非对齐 + 262000B → padded 266240 > 262144(buffer_size)
-        let big = vec![0x44u8; 262000];
+        // 非对齐写入:offset=100 非对齐 + 262500B → front_pad 100 + 262500 = 262600,
+        // padded 向上取整到 266240 > 262144(buffer_size),RMW 应拒绝
+        // (注意:262000B 会恰好 padded 到 262144 = buffer_size,不触发拒绝)。
+        let big = vec![0x44u8; 262500];
         let err = storage
             .write_at(100, Bytes::from(big.clone()))
             .await
