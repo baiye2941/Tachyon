@@ -1785,7 +1785,20 @@ impl AsyncStorage for IoUringStorage {
                                 let _eof_guard = self.eof_lock.lock().await;
                                 // 持 eof_lock 后重读实时 EOF:并发写入者可能已扩展文件
                                 let realtime_eof = self.file_size().await.unwrap_or(target);
-                                let safe_target = target.max(realtime_eof);
+                                // F-05-3 修正:realtime_eof <= padded_end 时,实时 EOF 最多是
+                                // 本 RMW 自己的 padded 写(同一 RMW 临界区内,无并发写入者
+                                // 在 padding 区外扩展)——截到 target 安全。只有
+                                // realtime_eof > padded_end 才说明有并发写入者把文件扩展到
+                                // padding 之外,必须保留(否则截掉并发数据)。
+                                // 旧实现 target.max(realtime_eof) 把"自己的 padding"误当
+                                // 并发数据保留,非对齐写后文件被 padding 撑大
+                                // (test_iouring_non_aligned_write_does_not_extend_file 暴露:
+                                // 写 10001 字节后 EOF=12288 而非 10001)。
+                                let safe_target = if realtime_eof > padded_end {
+                                    realtime_eof
+                                } else {
+                                    target
+                                };
                                 if padded_end > safe_target {
                                     self.truncate_to(safe_target).await?;
                                 }
@@ -3084,14 +3097,11 @@ mod tests {
             );
 
             // RMW-B padded_end=8192。truncate 收尾 target = max(write_end_B=4196, 实时 EOF):
-            // 实时 EOF 取决于并发时序——若 B 持 eof_lock 时读到的是自己的 padded 写
-            // (8192),F-05-3 保守策略无法区分"自己的 padding"与"并发写入",为不截
-            // 并发数据而保留最大 EOF(8192);否则截到 4196。数据完整性断言不受影响。
+            // F-05-3 修正后,实时 EOF <= padded_end(8192)时(本 RMW 自己的 padded 写)
+            // 截到 target=4196;仅当并发写入者把 EOF 扩展到 padding 之外才保留。
+            // 本测试两个 RMW 的 padding 区(4096/8192)内无并发扩展,EOF 恒为 4196。
             let size = storage.file_size().await.expect("file_size");
-            assert!(
-                size == 4196 || size == 8192,
-                "round {round}: EOF 应为 4196(padding 已截)或 8192(保守保留),实际 {size}"
-            );
+            assert_eq!(size, 4196, "round {round}: EOF 应为 4196,实际 {size}");
             let mut block_b = vec![0u8; 4096];
             let n_b = storage.read_at(4096, &mut block_b).await.expect("read B");
             let expected_short = size.saturating_sub(4096).min(4096) as usize;
