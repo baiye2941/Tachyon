@@ -2175,12 +2175,27 @@ mod tests {
         assert_eq!(storage.state(), IoUringState::Unavailable);
     }
 
-    /// 在非 Linux 平台上,write_at 应返回未初始化错误
-    #[cfg(not(target_os = "linux"))]
+    /// 未初始化状态(write_at 未 init)应返回 NotConnected(跨平台:Linux 上
+    /// 未初始化分支同样存在,此前 cfg(not(linux)) 导致 Linux 上该分支零覆盖)
     #[tokio::test]
     async fn test_write_at_returns_not_connected_when_uninitialized() {
         let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
         let result = storage.write_at(0, Bytes::from_static(b"test")).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("未初始化") || err_msg.contains("未打开"),
+            "错误信息应说明存储引擎未就绪,实际: {err_msg}"
+        );
+    }
+
+    /// 未初始化状态(write_at_mut 未 init)应返回 NotConnected(跨平台,同 write_at)
+    #[tokio::test]
+    async fn test_write_at_mut_returns_not_connected_when_uninitialized() {
+        let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
+        let mut data = BytesMut::from(&b"test"[..]);
+        let result = storage.write_at_mut(0, &mut data).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_msg = err.to_string();
@@ -2200,8 +2215,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// 在非 Linux 平台上,read_at 应返回未初始化错误
-    #[cfg(not(target_os = "linux"))]
+    /// 未初始化状态(read_at 未 init)应返回 NotConnected(跨平台,同 write_at)
     #[tokio::test]
     async fn test_read_at_returns_not_connected_when_uninitialized() {
         let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
@@ -2210,8 +2224,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// 在非 Linux 平台上,sync 应返回未初始化错误
-    #[cfg(not(target_os = "linux"))]
+    /// 未初始化状态(sync 未 init)应返回 NotConnected(跨平台,同 write_at)
     #[tokio::test]
     async fn test_sync_returns_not_connected_when_uninitialized() {
         let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
@@ -2219,8 +2232,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// 在非 Linux 平台上,allocate 应返回未初始化错误
-    #[cfg(not(target_os = "linux"))]
+    /// 未初始化状态(allocate 未 init)应返回 NotConnected(跨平台,同 write_at)
     #[tokio::test]
     async fn test_allocate_returns_not_connected_when_uninitialized() {
         let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
@@ -2228,8 +2240,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// 在非 Linux 平台上,file_size 应返回未初始化错误
-    #[cfg(not(target_os = "linux"))]
+    /// 未初始化状态(file_size 未 init)应返回 NotConnected(跨平台,同 write_at)
     #[tokio::test]
     async fn test_file_size_returns_not_connected_when_uninitialized() {
         let storage = IoUringStorage::new("/tmp/test.bin", IoUringConfig::default());
@@ -3339,6 +3350,66 @@ mod tests {
         );
         // 触发文件 fd 引用以消除 AsRawFd 未用告警
         let _ = storage.file_fd.as_ref().map(|f| f.as_raw_fd());
+        storage.close().await.expect("close");
+    }
+
+    /// write_at_mut 全路径覆盖:对齐快速路径 + 非对齐 RMW 慢速路径 + 读回验证。
+    ///
+    /// write_at_mut 与 write_at 同构(快速路径/RMW/truncate),但此前无任何测试
+    /// 调用该方法,Linux 上整方法零覆盖(覆盖率门禁 83% 的主要缺口之一)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_write_at_mut_covers_aligned_and_rmw_paths() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("write_at_mut.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+
+        // 对齐快速路径:offset 与长度均 4096 对齐
+        let mut aligned = BytesMut::from(&vec![0x11u8; 4096][..]);
+        let n = storage
+            .write_at_mut(0, &mut aligned)
+            .await
+            .expect("对齐 write_at_mut 应成功");
+        assert_eq!(n, 4096);
+
+        // 非对齐 RMW 慢速路径:offset=100 非对齐 + 100B 非对齐长度
+        let mut unaligned = BytesMut::from(&vec![0x22u8; 100][..]);
+        let n2 = storage
+            .write_at_mut(100, &mut unaligned)
+            .await
+            .expect("非对齐 write_at_mut(RMW)应成功");
+        assert_eq!(n2, 100);
+
+        // 读回验证:对齐写 0x11 覆盖 [0,4096);非对齐 RMW 写 0x22 覆盖 [100,200)。
+        // EOF 保持 4096(RMW truncate target = max(size_before=4096, write_end=200))。
+        let mut block0 = vec![0u8; 4096];
+        let n3 = storage.read_at(0, &mut block0).await.expect("read_at(0)");
+        assert_eq!(n3, 4096);
+        assert!(
+            block0[..100].iter().all(|&b| b == 0x11),
+            "[0,100) 应为 0x11"
+        );
+        assert!(
+            block0[100..200].iter().all(|&b| b == 0x22),
+            "非对齐区间 [100,200) 应为 0x22"
+        );
+        assert!(
+            block0[200..].iter().all(|&b| b == 0x11),
+            "[200,4096) 应为 0x11"
+        );
+
+        // EOF 未被 RMW padding 撑大:读 [4096,8192) 短读 0 字节
+        let mut block1 = vec![0u8; 4096];
+        let n4 = storage
+            .read_at(4096, &mut block1)
+            .await
+            .expect("read_at(4096)");
+        assert_eq!(n4, 0, "EOF=4096,读 [4096,8192) 应短读 0 字节");
+
         storage.close().await.expect("close");
     }
 
