@@ -380,12 +380,12 @@ impl ThrottledServer {
         // rustls 0.23 需显式安装 CryptoProvider(进程级,幂等)。
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls_acceptor = if tls == TlsMode::Tls {
-            let CertifiedKey { cert, key_pair } =
+            let CertifiedKey { cert, signing_key } =
                 rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
                     .expect("rcgen 生成自签证书失败");
             let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
             let key_der = rustls::pki_types::PrivateKeyDer::from(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
             );
             let server_cfg = rustls::ServerConfig::builder()
                 .with_no_client_auth()
