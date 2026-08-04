@@ -21,40 +21,14 @@ jobs:
           toolchain: stable
           shared-key: ubuntu-stable-covdiag-${{ hashFiles('Cargo.lock') }}
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: tachyon-io 覆盖率
+      - name: tachyon-io 覆盖率 JSON
         run: |
           cargo llvm-cov -p tachyon-io \
             --ignore-filename-regex '(test_harness|iocp|winio)' \
             --json \
             --output-path coverage-io.json
-      - name: 输出未覆盖行
-        run: |
-          python3 - <<'EOF'
-          import json
-          with open("coverage-io.json") as f:
-              data = json.load(f)
-          d0 = data["data"][0]
-          print("TOP KEYS:", list(data.keys()))
-          print("DATA0 KEYS:", list(d0.keys()))
-          files = d0.get("files", [])
-          print("NUM FILES:", len(files))
-          if files:
-              print("FILE0 KEYS:", list(files[0].keys()))
-              print("FILE0 NAME:", files[0].get("filename"))
-          for fdata in files:
-              fname = fdata["filename"]
-              if "iouring" not in fname and "storage" not in fname and "dir_sync" not in fname:
-                  continue
-              segs = fdata.get("segments", [])
-              missing = set()
-              covered = set()
-              for s in segs:
-                  # segments: [line, col, count, has_code, is_region_entry]
-                  if s[3] and s[4]:
-                      if s[2] > 0:
-                          covered.add(s[0])
-                      else:
-                          missing.add(s[0])
-              print(f"{fname}: covered lines {len(covered)}, missing lines {len(missing)}")
-              print(f"  missing: {sorted(missing)}")
-          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-io-json
+          path: coverage-io.json
+          retention-days: 1
