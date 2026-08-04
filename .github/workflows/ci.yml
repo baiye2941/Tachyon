@@ -443,7 +443,7 @@ jobs:
       # restore-keys 提供 OS 级部分回退(命中即视为 cache hit 复用旧基线)。
       - name: 恢复 criterion 基线缓存
         id: restore-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target/criterion
           key: criterion-baseline-${{ runner.os }}-${{ github.base_ref }}
