@@ -388,6 +388,30 @@ mod tests {
         );
     }
 
+    /// 主机级信号量关闭:acquire 应在 host 阶段失败,而非占用 global 名额。
+    /// 覆盖 acquire() 中 host acquire_owned 的 map_err 分支。
+    #[tokio::test]
+    async fn test_host_semaphore_closed_returns_error() {
+        let pool = ConnectionPool::new(PoolConfig {
+            max_per_host: 1,
+            max_global: 2,
+            ..Default::default()
+        });
+        let host = "closed-host.test";
+        let sem = pool.host_semaphore(host);
+        sem.close();
+        let result = pool.acquire(host).await;
+        assert!(result.is_err(), "关闭的主机信号量应返回错误而非 panic");
+        let err = match result {
+            Ok(_) => panic!("期望错误"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("主机"),
+            "错误信息应指明主机信号量,实际: {err}"
+        );
+    }
+
     #[test]
     fn test_pool_config_from_connection_config() {
         let conn_cfg = tachyon_core::config::ConnectionConfig {
