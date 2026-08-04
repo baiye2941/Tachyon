@@ -817,26 +817,20 @@ fn drain_completions(
     }
     drop(cq);
 
-    // 若 CQE 缺失,通知剩余 inflight 请求。
-    // 不回收 buf_idx——缺失的 CQE 对应的内核 op 可能仍在处理,泄漏是安全的。
+    // 剩余 inflight 是"已提交但尚未收到 CQE"的在途请求,不是错误:
+    // eventfd 单次事件只保证"至少一个 CQE 可读",并发批量提交时 CQE 分批到达,
+    // 剩余请求应保留在 inflight,等待下一次 eventfd 事件(内核完成时会再次写
+    // eventfd,edge 触发唤醒 driver 继续 drain)。
+    //
+    // 旧逻辑在此对剩余 inflight 发 "CQE 缺失" 错误并终结请求,破坏批量提交
+    // 正确性——回归守卫:test_driver_processes_commands_without_block_in_place
+    // (并发双写,llvm-cov instrument 时序下稳定复现)。
+    // buf_idx 不回收:在途 op 完成时由 CQE 分支回收,安全。
     if !inflight.is_empty() {
-        tracing::warn!(remaining = inflight.len(), "io_uring CQE 缺失");
-        for (_, req) in inflight.drain() {
-            match req {
-                InflightReq::Write(r) => {
-                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                    let _ = r.done.send(err);
-                }
-                InflightReq::Read(r) => {
-                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                    let _ = r.done.send(err);
-                }
-                InflightReq::Sync(done) => {
-                    let err = Err(DownloadError::Io(std::io::Error::other("CQE 缺失")));
-                    let _ = done.send(err);
-                }
-            }
-        }
+        tracing::debug!(
+            remaining = inflight.len(),
+            "io_uring 在途请求等待下一次事件"
+        );
     }
 }
 
