@@ -2063,6 +2063,21 @@ impl AsyncStorage for IoUringStorage {
 mod tests {
     use super::*;
 
+    /// 重试 init:GitHub runner 并发跑多个 workflow 时,io_uring 实例/内存
+    /// 资源紧张,init 偶发失败(EPERM/ENOMEM)。直接 skip 会让测试主体零覆盖
+    /// 且覆盖率随运行波动(同一代码 82%~86%)。短退避重试最多 5 次。
+    /// 仅 Linux 测试使用(Windows 上 io_uring 为空桩,无 init 可重试)。
+    #[cfg(target_os = "linux")]
+    async fn init_io_uring_retry(storage: &mut IoUringStorage) -> bool {
+        for attempt in 0..5 {
+            if storage.init().is_ok() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+        }
+        false
+    }
+
     fn assert_invalid_input_error(err: DownloadError, expected_message: &str) {
         match err {
             DownloadError::Io(io_error) => {
@@ -2796,7 +2811,7 @@ mod tests {
         for round in 0..ROUNDS {
             let path = dir.path().join(format!("iouring_rmw_{round}.bin"));
             let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-            if storage.init().is_err() {
+            if !init_io_uring_retry(&mut storage).await {
                 eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
                 return;
             }
@@ -2859,7 +2874,7 @@ mod tests {
         let path = dir.path().join("iouring_eof_extend.bin");
 
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -2922,7 +2937,7 @@ mod tests {
         let path = dir.path().join("iouring_rmw_read_silent.bin");
 
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -2999,7 +3014,7 @@ mod tests {
                 .path()
                 .join(format!("iouring_fast_rmw_disjoint_{round}.bin"));
             let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-            if storage.init().is_err() {
+            if !init_io_uring_retry(&mut storage).await {
                 eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
                 return;
             }
@@ -3059,7 +3074,7 @@ mod tests {
         for round in 0..ROUNDS {
             let path = dir.path().join(format!("iouring_crossblock_{round}.bin"));
             let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-            if storage.init().is_err() {
+            if !init_io_uring_retry(&mut storage).await {
                 eprintln!("skip: io_uring init failed");
                 return;
             }
@@ -3291,7 +3306,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("iouring_eventfd_register.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3320,7 +3335,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("iouring_no_block_worker.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3373,7 +3388,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("write_at_mut.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3433,7 +3448,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("iouring_sync.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3462,7 +3477,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("write_oversize.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3530,7 +3545,7 @@ mod tests {
         let path = dir.path().join("iouring_drop_reset.bin");
 
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3635,7 +3650,7 @@ mod tests {
         let parent: &Path = path.parent().expect("文件应有父目录");
 
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3674,7 +3689,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("iouring_truncate_overflow.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
@@ -3700,7 +3715,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let path = dir.path().join("iouring_alloc_overflow.bin");
         let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
-        if storage.init().is_err() {
+        if !init_io_uring_retry(&mut storage).await {
             eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
             return;
         }
