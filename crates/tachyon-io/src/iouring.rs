@@ -3072,13 +3072,13 @@ mod tests {
                 &block_a[..16]
             );
 
-            // RMW-B padded_end=8192,但 truncate 收尾到 max(100, 4200)=4200,
-            // 读 [4096,8192) 会短读到 EOF:4200-4096=104 字节。
+            // RMW-B padded_end=8192,但 truncate 收尾到 max(write_end_B=4196, 实时 EOF)=4196,
+            // 读 [4096,8192) 会短读到 EOF:4196-4096=100 字节。
             let mut block_b = vec![0u8; 4096];
             let n_b = storage.read_at(4096, &mut block_b).await.expect("read B");
             assert_eq!(
-                n_b, 104,
-                "round {round}: [4096,8192) 应短读到 EOF(104 字节)"
+                n_b, 100,
+                "round {round}: [4096,8192) 应短读到 EOF(100 字节)"
             );
             assert!(
                 block_b[..100].iter().all(|&b| b == 0xBB),
@@ -3086,9 +3086,9 @@ mod tests {
                 &block_b[..16]
             );
 
-            // 文件大小应 = max(100, 4200) = 4200
+            // 文件大小应 = max(write_end_A=100, write_end_B=4196) = 4196
             let size = storage.file_size().await.expect("file_size");
-            assert_eq!(size, 4200, "round {round}: 文件大小应为 4200,实际 {size}");
+            assert_eq!(size, 4196, "round {round}: 文件大小应为 4196,实际 {size}");
 
             storage.close().await.expect("close");
         }
