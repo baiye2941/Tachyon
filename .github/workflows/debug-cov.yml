@@ -25,7 +25,7 @@ jobs:
         run: |
           cargo llvm-cov -p tachyon-io \
             --ignore-filename-regex '(test_harness|iocp|winio)' \
-            --json --summary-only \
+            --json \
             --output-path coverage-io.json
       - name: 输出未覆盖行
         run: |
