@@ -1,0 +1,52 @@
+name: Debug Coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/io-uring-eventfd]
+
+permissions:
+  contents: read
+
+jobs:
+  cov:
+    name: tachyon-io 覆盖明细
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ubuntu-deps
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: ubuntu-stable-covdiag-${{ hashFiles('Cargo.lock') }}
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: tachyon-io 覆盖率
+        run: |
+          cargo llvm-cov -p tachyon-io \
+            --ignore-filename-regex '(test_harness|iocp|winio)' \
+            --json --summary-only \
+            --output-path coverage-io.json
+      - name: 输出未覆盖行
+        run: |
+          python3 - <<'EOF'
+          import json
+          with open("coverage-io.json") as f:
+              data = json.load(f)
+          for fdata in data["data"][0]["files"]:
+              fname = fdata["filename"]
+              if "iouring" not in fname and "storage" not in fname:
+                  continue
+              total = sum(s["count"] > 0 for s in fdata["segments"] if s[5] == 0)
+              # segments: [line, col, count, has_code, is_region_entry, ...]
+              missing = set()
+              covered = set()
+              for s in fdata["segments"]:
+                  if s[3] and s[5] == 0:  # has_code and is region entry
+                      if s[2] > 0:
+                          covered.add(s[0])
+                      else:
+                          missing.add(s[0])
+              print(f"{fname}: regions missing on lines: {sorted(missing)}")
+              print(f"  covered lines: {len(covered)}, missing lines: {len(missing)}")
+          EOF
