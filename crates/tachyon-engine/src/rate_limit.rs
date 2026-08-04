@@ -182,7 +182,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[path = "../../rate_limit_extra_tests.rs"]
     mod extra;
 
     #[tokio::test]
