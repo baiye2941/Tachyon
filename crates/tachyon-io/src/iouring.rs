@@ -3454,7 +3454,62 @@ mod tests {
         storage.close().await.expect("close");
     }
 
-    /// F-04: IoUringStorage::drop 应在 abort driver task 后调用 pool.reset()。
+    /// write_at/write_at_mut 超 fixed buffer 限制的错误分支:
+    /// 非对齐写入 padded 后超限(RMW 路径)与对齐写入直接超限(快速路径)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_non_aligned_write_exceeding_fixed_buffer_rejected() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join("write_oversize.bin");
+        let mut storage = IoUringStorage::new(&path, IoUringConfig::default());
+        if storage.init().is_err() {
+            eprintln!("skip: io_uring init failed (CI runner kernel may not support io_uring)");
+            return;
+        }
+        // 非对齐写入:offset=100 非对齐 + 262000B → padded 266240 > 262144(buffer_size)
+        let big = vec![0x44u8; 262000];
+        let err = storage
+            .write_at(100, Bytes::from(big.clone()))
+            .await
+            .expect_err("非对齐超限写应拒绝");
+        assert!(
+            matches!(err, tachyon_core::DownloadError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "应为 InvalidInput,实际: {err:?}"
+        );
+
+        let mut big_mut = BytesMut::from(&big[..]);
+        let err2 = storage
+            .write_at_mut(100, &mut big_mut)
+            .await
+            .expect_err("write_at_mut 非对齐超限应拒绝");
+        assert!(matches!(
+            err2,
+            tachyon_core::DownloadError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        // 对齐快速路径超限:data.len() = buffer_size + 4096(对齐)→ validate 拒绝
+        let aligned_big = vec![0x55u8; 262144 + 4096];
+        let err3 = storage
+            .write_at(0, Bytes::from(aligned_big.clone()))
+            .await
+            .expect_err("对齐超限写应拒绝");
+        assert!(matches!(
+            err3,
+            tachyon_core::DownloadError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        let mut aligned_big_mut = BytesMut::from(&aligned_big[..]);
+        let err4 = storage
+            .write_at_mut(0, &mut aligned_big_mut)
+            .await
+            .expect_err("write_at_mut 对齐超限应拒绝");
+        assert!(matches!(
+            err4,
+            tachyon_core::DownloadError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        storage.close().await.expect("close");
+    }
     ///
     /// 契约:`Drop for IoUringStorage` 在 abort driver task 后,对 pool 调用
     /// `reset()`,确保 driver 异常路径(submit_and_wait 失败、CQE 缺失、driver
