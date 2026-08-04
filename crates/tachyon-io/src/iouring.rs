@@ -519,29 +519,45 @@ async fn driver_task(
                         break;
                     }
                 };
-                // drain eventfd 计数器:读 8 字节把计数器清零,否则 readiness 不会清,
-                // readable() 会立即返回导致忙循环。try_io 在内部 read 返回 WouldBlock
-                // 时自动清 readiness;成功读取则消耗掉计数。
-                // eventfd 语义:read(8) 把计数器减去读出值(通常一次 read 把计数清零),
-                // 返回 8 字节(u64 计数值)。读后计数器为 0 → 下次 read 返回 EAGAIN/WouldBlock。
-                // guard.try_io 闭包接收 &AsyncFd<OwnedFd>(guard 已携带 readiness 兴趣,
-                // 无需再传 Interest)。
-                let _ = guard.try_io(|inner| {
-                    use std::os::fd::AsRawFd;
-                    let raw = inner.get_ref().as_raw_fd();
-                    let mut buf = [0u8; 8];
-                    // SAFETY:
-                    // - raw 是 eventfd 的合法 fd(由 init() 的 eventfd(2) 创建,OwnedFd 持有,
-                    //   driver task 生命周期内有效,本 read 不会越界关闭)。
-                    // - buf 是栈上 8 字节,eventfd read(2) 语义要求 8 字节缓冲区,长度匹配。
-                    // - read 不会写入超过 8 字节(eventfd(2) 保证),无越界写。
-                    let ret = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, 8) };
-                    if ret < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(ret)
+                // drain eventfd 计数器:循环 read 8 字节直到 EAGAIN。
+                //
+                // P0-1 回归根因(两处配合):
+                // 1. EFD_NONBLOCK:计数器为 0 时 read 返回 EAGAIN 而非阻塞。
+                //    若 eventfd 是阻塞 fd,readiness 残留导致的重复唤醒会在
+                //    计数为 0 时阻塞 read,卡死 driver task(read 命令永不处理)。
+                // 2. try_io 语义(tokio 1.52):闭包返回 Ok 时 **不** 清除 readiness
+                //    (仅 Err(WouldBlock) 内部 clear_ready)。若只 read 一次就退出,
+                //    残留 readiness 会让下一次 readable() 立即就绪,形成忙循环;
+                //    循环到 WouldBlock 时 tokio 复位 readiness,下一次唤醒完全
+                //    依赖内核写 eventfd 的新 edge 事件。
+                loop {
+                    let io_res = guard.try_io(|inner| {
+                        use std::os::fd::AsRawFd;
+                        let raw = inner.get_ref().as_raw_fd();
+                        let mut buf = [0u8; 8];
+                        // SAFETY:
+                        // - raw 是 eventfd 的合法 fd(由 init() 的 eventfd(2) 创建,OwnedFd 持有,
+                        //   driver task 生命周期内有效,本 read 不会越界关闭)。
+                        // - buf 是栈上 8 字节,eventfd read(2) 语义要求 8 字节缓冲区,长度匹配。
+                        // - read 不会写入超过 8 字节(eventfd(2) 保证),无越界写。
+                        let ret =
+                            unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, 8) };
+                        if ret < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(ret)
+                        }
+                    });
+                    match io_res {
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = ?e, "io_uring eventfd read 失败");
+                            break;
+                        }
+                        // WouldBlock:计数器已清空,readiness 已由 tokio 内部复位。
+                        Err(_) => break,
                     }
-                });
+                }
                 // drain CQE 并按 user_data 分发结果。
                 drain_completions(&mut ring, &mut inflight, &buffers, &pool);
             }
@@ -1044,12 +1060,14 @@ fn bitmap_alloc_first_free(bitmap: &[AtomicU64], buffer_count: usize) -> Option<
 #[cfg(target_os = "linux")]
 fn create_registered_eventfd(ring: &io_uring::IoUring) -> DownloadResult<(AsyncFd<OwnedFd>, i32)> {
     // EFD_CLOEXEC:exec 时自动关 fd,避免泄漏到子进程。
-    // 不加 EFD_NONBLOCK:完全依赖 AsyncFd 的 readiness 语义处理 WouldBlock
-    // (与 tokio AsyncFd 文档惯用一致)。
+    // EFD_NONBLOCK:read 在计数器为 0 时返回 EAGAIN 而非阻塞。P0-1 回归根因:
+    // 阻塞 eventfd 在"readiness 残留导致第二次 readable() 立即就绪"时,read 会
+    // 永久阻塞并卡死 driver task(见 driver_task 分支 B 的循环消费注释)。
     // SAFETY:
-    // - eventfd(2) 是 Linux 系统调用,initval=0/flags=EFD_CLOEXEC 均为合法参数。
+    // - eventfd(2) 是 Linux 系统调用,initval=0/flags=EFD_CLOEXEC|EFD_NONBLOCK
+    //   均为合法参数。
     // - 返回值 < 0 表示失败(已检查);成功返回一个新的、未占用的 fd。
-    let eventfd_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    let eventfd_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if eventfd_raw < 0 {
         return Err(DownloadError::Io(std::io::Error::last_os_error()));
     }
