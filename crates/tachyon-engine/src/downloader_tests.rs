@@ -12364,3 +12364,97 @@ async fn test_magnet_auto_web_seed_selects_hybrid_or_http_path() {
     .expect("无 web seed 的 HTTP URL 应回退普通 HTTP 构造");
     assert!(!http.has_mirrors);
 }
+
+// ---------- download_proxy 纯函数补充覆盖 ----------
+
+#[test]
+fn test_proxy_url_host_fallback_branches() {
+    // socks5 非 special scheme:url crate 常把 authority 放 path,走兜底解析
+    assert_eq!(
+        DownloadTask::proxy_url_host("socks5://user:pass@127.0.0.1:1080/path").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        DownloadTask::proxy_url_host("socks5://proxy.example.com:1080").as_deref(),
+        Some("proxy.example.com")
+    );
+    // IPv6 bracket:url crate host_str 含括号,fallback 分支(bracket 剥除)由裸 socks5 IPv6 覆盖
+    assert_eq!(
+        DownloadTask::proxy_url_host("socks5://user:pass@[::1]:1080").as_deref(),
+        Some("[::1]")
+    );
+    assert_eq!(
+        DownloadTask::proxy_url_host("socks5://[::1]:1080").as_deref(),
+        Some("[::1]")
+    );
+    // IPv6 bracket form(url crate 正常解析时 host_str 含括号)
+    assert_eq!(
+        DownloadTask::proxy_url_host("http://[::1]:8080").as_deref(),
+        Some("[::1]")
+    );
+    // 无 scheme(裸 host)
+    assert_eq!(
+        DownloadTask::proxy_url_host("localhost:3128").as_deref(),
+        Some("localhost")
+    );
+    // 裸 userinfo@ + 端口:强制 fallback 的 userinfo 剥离 + 端口剥离分支
+    assert_eq!(
+        DownloadTask::proxy_url_host("user:pass@proxy.example.com:8080").as_deref(),
+        Some("proxy.example.com")
+    );
+    // 裸 IPv6 bracket:fallback 的 bracket 剥除分支
+    assert_eq!(
+        DownloadTask::proxy_url_host("[::1]:1080").as_deref(),
+        Some("::1")
+    );
+    // 空串/仅 scheme 分隔符 → None
+    assert_eq!(DownloadTask::proxy_url_host(""), None);
+    assert_eq!(DownloadTask::proxy_url_host("://"), None);
+    // 空 host:fallback 无权威可解析,保守返回原样(:8080)而非误判
+    assert_eq!(
+        DownloadTask::proxy_url_host("http://:8080").as_deref(),
+        Some(":8080")
+    );
+    // 空格 host:trim 后为空 → None
+    assert_eq!(DownloadTask::proxy_url_host("http:// :8080"), None);
+}
+
+#[test]
+fn test_host_is_loopback_edge_cases() {
+    assert!(DownloadTask::host_is_loopback("localhost"));
+    assert!(DownloadTask::host_is_loopback("localhost."));
+    assert!(DownloadTask::host_is_loopback("  localhost  "));
+    assert!(DownloadTask::host_is_loopback("[::1]"));
+    assert!(DownloadTask::host_is_loopback("127.0.0.1"));
+    assert!(!DownloadTask::host_is_loopback("proxy.example.com"));
+    assert!(!DownloadTask::host_is_loopback("192.168.1.10"));
+}
+
+#[test]
+fn test_proxy_url_helpers_loopback_detection() {
+    // 本机 loopback 代理:不视为远程代理
+    let mut task = DownloadTask::new_for_test(
+        "http://example.com/x.bin".into(),
+        DownloadConfig {
+            proxy: Some("http://127.0.0.1:7897".into()),
+            ..test_config()
+        },
+        Arc::new(MockProto::new(test_metadata("x.bin", 100))),
+        StorageKind::memory_with_capacity(100),
+    );
+    assert!(task.http_proxy_active());
+    assert!(!task.remote_http_proxy_active());
+    assert_eq!(task.proxy_range_window_bytes(), None);
+
+    // 远程代理:cap 与 range 窗口生效
+    task.config.proxy = Some("http://proxy.example.com:8080".into());
+    assert!(task.remote_http_proxy_active());
+    assert_eq!(task.proxy_range_window_bytes(), Some(2 * 1024 * 1024));
+    assert_eq!(task.proxy_cold_start_cap_for_config(0.3), Some(2));
+    assert_eq!(task.proxy_steady_concurrency_ceiling(), Some(2));
+    assert_eq!(task.apply_proxy_concurrency_ceiling(8), 2);
+
+    // direct 哨兵:http_proxy_active 也为 false(直连)
+    task.config.proxy = Some("direct".into());
+    assert!(!task.http_proxy_active());
+}
